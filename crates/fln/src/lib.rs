@@ -1791,6 +1791,28 @@ pub struct CheckedOleanModule {
     pub declarations: Vec<OleanCheckedDeclaration>,
 }
 
+/// Whether a module stopped because the host refused memory. An explicit
+/// checking/decode allowance, a silent council and an unsupported construct do
+/// not belong here: retrying those with the same budget cannot remove another
+/// worker's memory pressure.
+fn olean_host_memory_refusal(error: &OleanCheckError) -> bool {
+    fn admission(error: &EngineAdmissionError) -> bool {
+        match error {
+            EngineAdmissionError::BatchDeclaration { error, .. } => admission(error),
+            EngineAdmissionError::AllocationFailure { .. } => true,
+            _ => false,
+        }
+    }
+    match error {
+        OleanCheckError::AllocationFailure { .. } | OleanCheckError::HostMemory { .. } => true,
+        OleanCheckError::Admission(error) => admission(error),
+        OleanCheckError::Decode(error) | OleanCheckError::ModuleDecode { error, .. } => {
+            error.is_host_allocation_refusal()
+        }
+        _ => false,
+    }
+}
+
 /// The frontier's verdict for a module whose check ended in an error.
 ///
 /// FL-INV-07: a council whose objecting seats were all silent or ran out
@@ -1919,6 +1941,7 @@ fn frontier_guarded(
         let error = frontier_unwound(payload);
         FrontierDone {
             index,
+            host_memory_refusal: olean_host_memory_refusal(&error),
             verdict: frontier_error_verdict(error.clone()),
             accepted: None,
             engine: None,
@@ -1964,7 +1987,21 @@ pub enum OleanModuleVerdict {
 pub struct OleanFrontierRow {
     pub name: Name,
     pub verdict: OleanModuleVerdict,
+    /// Total time spent checking this module, including a refused first attempt.
     pub elapsed: std::time::Duration,
+    /// A first attempt refused host memory while another module was in flight.
+    /// When present, the final verdict above comes from one full retry with no
+    /// other module check in flight, under the original limits. No more than one
+    /// retry is made, and neither attempt is an additional module row.
+    pub memory_retry: Option<OleanFrontierMemoryRetry>,
+}
+
+/// The first attempt of a module checked again in isolation. Its final attempt
+/// is the enclosing row's verdict and `elapsed - first_elapsed`.
+#[derive(Debug)]
+pub struct OleanFrontierMemoryRetry {
+    pub first_refusal: Inconclusive,
+    pub first_elapsed: std::time::Duration,
 }
 
 /// What a frontier observer is told: `Started` just before a module's
@@ -1983,6 +2020,14 @@ pub enum OleanFrontierEvent<'a> {
         position: usize,
         total: usize,
         module: &'a Name,
+    },
+    /// A host-memory refusal is retried only after all other module checks have
+    /// finished. This is attempt two, not another module or a settled verdict.
+    Retrying {
+        position: usize,
+        total: usize,
+        module: &'a Name,
+        previous: &'a OleanFrontierMemoryRetry,
     },
     Settled {
         position: usize,
@@ -2009,9 +2054,9 @@ pub struct OleanFrontier {
     pub rows: Vec<OleanFrontierRow>,
 }
 
-/// How a frontier run spreads its modules over threads. Neither field changes a
-/// row or the returned engine (or its absence); see
-/// [`Engine::check_olean_frontier_scheduled`].
+/// How a frontier run spreads its modules over threads. Logical checking uses
+/// only each module's own closure. A concurrent host-memory refusal is retried
+/// once in isolation; timings and attempt records can differ with this count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OleanFrontierJobs {
     /// Modules checked at once. One checks every module on the calling thread.
@@ -2039,6 +2084,7 @@ struct FrontierAccepted {
 }
 
 /// The accepted import a module's closure engine starts from, and its closure.
+#[derive(Clone)]
 struct FrontierBase {
     engine: std::sync::Arc<Engine>,
     closure: std::sync::Arc<BTreeSet<usize>>,
@@ -2057,9 +2103,29 @@ struct FrontierJob {
     retain: bool,
 }
 
+/// Only the already accepted, shared imports survive a failed attempt. The
+/// attempted module's decoded constants and checker state are dropped by the
+/// worker; its unchanged input bytes are decoded again for the isolated retry.
+#[derive(Clone)]
+struct FrontierRetryImports {
+    base: Option<FrontierBase>,
+    closure: Vec<std::sync::Arc<FrontierAccepted>>,
+}
+
+struct FrontierWork {
+    index: usize,
+    position: usize,
+    /// Absent only for a retry, whose original artifact was dropped.
+    artifact: Option<DecodedOlean>,
+    imports: FrontierRetryImports,
+}
+
 struct FrontierDone {
     index: usize,
     verdict: OleanModuleVerdict,
+    /// Derived from the original typed error, before its public nonanswer is
+    /// rendered. Never inferred by matching diagnostic text.
+    host_memory_refusal: bool,
     accepted: Option<FrontierAccepted>,
     /// The engine after checking an accepted module: its closure's environment
     /// plus what it admitted. A scheduler keeps it only while a module not yet
@@ -4599,11 +4665,16 @@ impl Engine {
     /// admitted, merged in frontier order under the rule the serial planner applies
     /// to a repeated name. An identical copy is one constant; a copy that subsumes
     /// or is subsumed by the first keeps the first; any other pair is a
-    /// `DuplicateDeclaration` for the importing module. So a verdict depends only on
-    /// the module and its closure, never on what ran beside it or finished first,
-    /// and the rows and the returned engine are the same at every thread count.
-    /// `Decided` events arrive in row order; `Started` events arrive as modules are
-    /// dispatched, which above one thread is not row order.
+    /// `DuplicateDeclaration` for the importing module. The logical context does
+    /// not depend on another module's completion order.
+    /// A module refused host memory while other checks were in flight is retried
+    /// once after those workers finish, under the same limits. Only that retry's
+    /// verdict is settled; both attempts remain in its row. The retry does not
+    /// raise budgets or assume any declaration. Other resource stops are final.
+    /// This does not bound unrelated host memory use or retry the initial parallel
+    /// decoding pass; it is not a claim of resource-independent verdicts.
+    /// `Decided` events arrive in row order; `Started` and `Retrying` events arrive
+    /// as modules are dispatched, which above one thread is not row order.
     pub fn check_olean_frontier_scheduled(
         &self,
         modules: &[OleanModuleInput<'_>],
@@ -4611,6 +4682,22 @@ impl Engine {
         limits: OleanCheckLimits,
         jobs: OleanFrontierJobs,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+    ) -> Result<OleanFrontier, OleanCheckError> {
+        self.check_olean_frontier_using(modules, limits, jobs, on_event, &|job| {
+            self.frontier_check_module(job, options, limits)
+        })
+    }
+
+    /// The scheduler's checking operation is private so its fault tests can
+    /// refuse a real job at the worker boundary without installing a global
+    /// allocator or changing any successful declaration-admission path.
+    fn check_olean_frontier_using(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        check: &(dyn Fn(FrontierJob) -> FrontierDone + Sync),
     ) -> Result<OleanFrontier, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
         let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> =
@@ -4718,17 +4805,58 @@ impl Engine {
         let mut rows = Vec::with_capacity(count);
         let threads = jobs.threads.get();
 
-        let base = self;
-        let check = |job: FrontierJob| base.frontier_check_module(job, options, limits);
+        let run = |work: FrontierWork| {
+            let FrontierWork {
+                index,
+                position,
+                artifact,
+                imports,
+            } = work;
+            let started = std::time::Instant::now();
+            frontier_guarded(index, false, started, || {
+                let artifact = match artifact {
+                    Some(artifact) => Ok(artifact),
+                    None => decode_olean_module_input_with(
+                        &modules[index],
+                        limits,
+                        CheckerReading::Read,
+                    ),
+                };
+                match artifact {
+                    Ok(artifact) => {
+                        let mut done = check(FrontierJob {
+                            index,
+                            position,
+                            name: modules[index].name.clone(),
+                            artifact,
+                            base: imports.base,
+                            closure: imports.closure,
+                            retain: false,
+                        });
+                        done.elapsed = started.elapsed();
+                        done
+                    }
+                    Err(error) => FrontierDone {
+                        index,
+                        host_memory_refusal: olean_host_memory_refusal(&error),
+                        verdict: frontier_error_verdict(error),
+                        accepted: None,
+                        engine: None,
+                        elapsed: started.elapsed(),
+                        retained: None,
+                    },
+                }
+            })
+        };
         std::thread::scope(|scope| -> Result<(), OleanCheckError> {
-            let (job_sender, job_receiver) = std::sync::mpsc::channel::<FrontierJob>();
+            let (job_sender, job_receiver) = std::sync::mpsc::channel::<FrontierWork>();
             let (done_sender, done_receiver) = std::sync::mpsc::channel::<FrontierDone>();
             let job_receiver = std::sync::Arc::new(std::sync::Mutex::new(job_receiver));
             if threads > 1 {
                 for worker in 0..threads {
                     let job_receiver = std::sync::Arc::clone(&job_receiver);
                     let done_sender = done_sender.clone();
-                    let check = &check;
+                    let run = &run;
                     std::thread::Builder::new()
                         .name(format!("fln-frontier-{worker}"))
                         .stack_size(jobs.worker_stack_bytes)
@@ -4739,7 +4867,7 @@ impl Engine {
                                     Err(_) => return,
                                 };
                                 let Ok(job) = next else { return };
-                                if done_sender.send(check(job)).is_err() {
+                                if done_sender.send(run(job)).is_err() {
                                     return;
                                 }
                             }
@@ -4753,6 +4881,12 @@ impl Engine {
 
             let mut running = vec![false; count];
             let mut in_flight = 0_usize;
+            let mut overlapped = vec![false; count];
+            let mut retry_imports: Vec<Option<FrontierRetryImports>> = vec![None; count];
+            let mut memory_retries: Vec<Option<OleanFrontierMemoryRetry>> =
+                (0..count).map(|_| None).collect();
+            let mut retry_pending = BTreeSet::new();
+            let mut isolated_running = None;
             // A council result's row, reported the moment it exists.
             let settle =
                 |index: usize,
@@ -4766,29 +4900,37 @@ impl Engine {
                         });
                     }
                 };
-            let record =
-                |done: FrontierDone,
-                 running: &mut Vec<bool>,
-                 decided: &mut Vec<bool>,
-                 accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
-                 engines: &mut FrontierEngines,
-                 pending_rows: &mut Vec<Option<OleanFrontierRow>>| {
-                    running[done.index] = false;
-                    decided[done.index] = true;
-                    accepted[done.index] = done.accepted.map(std::sync::Arc::new);
-                    engines.keep(done.index, done.engine);
-                    pending_rows[done.index] = Some(OleanFrontierRow {
-                        name: modules[done.index].name.clone(),
-                        verdict: done.verdict,
-                        elapsed: done.elapsed,
-                    });
-                };
+            let record = |done: FrontierDone,
+                          running: &mut Vec<bool>,
+                          decided: &mut Vec<bool>,
+                          accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
+                          engines: &mut FrontierEngines,
+                          pending_rows: &mut Vec<Option<OleanFrontierRow>>,
+                          memory_retry: Option<OleanFrontierMemoryRetry>| {
+                running[done.index] = false;
+                decided[done.index] = true;
+                accepted[done.index] = done.accepted.map(std::sync::Arc::new);
+                engines.keep(done.index, done.engine);
+                pending_rows[done.index] = Some(OleanFrontierRow {
+                    name: modules[done.index].name.clone(),
+                    verdict: done.verdict,
+                    elapsed: done.elapsed.saturating_add(
+                        memory_retry
+                            .as_ref()
+                            .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed),
+                    ),
+                    memory_retry,
+                });
+            };
             loop {
                 // Decide every module that needs no council, and collect the ready.
                 let mut ready = Vec::new();
                 for index in &order {
                     let index = *index;
-                    if decided[index] || running[index] {
+                    if decided[index]
+                        || running[index]
+                        || retry_pending.contains(&(position[index], index))
+                    {
                         continue;
                     }
                     let verdict = match &decoded[index] {
@@ -4820,12 +4962,16 @@ impl Engine {
                             detail: "frontier module was visited twice",
                         }),
                     };
+                    // A blocked module's decoded bodies are no longer needed.
+                    // Release them before any isolated retry has to allocate.
+                    decoded[index] = None;
                     decided[index] = true;
                     engines.release(index, &closures, false)?;
                     let row = pending_rows[index].insert(OleanFrontierRow {
                         name: modules[index].name.clone(),
                         verdict,
                         elapsed: std::time::Duration::ZERO,
+                        memory_retry: None,
                     });
                     on_event(OleanFrontierEvent::Settled {
                         position: position[index] + 1,
@@ -4851,7 +4997,48 @@ impl Engine {
                 }
 
                 let mut dispatched = 0_usize;
-                for index in ready {
+                if isolated_running.is_none()
+                    && in_flight == 0
+                    && let Some((_, index)) = retry_pending.pop_first()
+                {
+                    let imports =
+                        retry_imports[index]
+                            .take()
+                            .ok_or(OleanCheckError::InternalInvariant {
+                                detail: "an isolated retry lost its accepted import closure",
+                            })?;
+                    let previous = memory_retries[index].as_ref().ok_or(
+                        OleanCheckError::InternalInvariant {
+                            detail: "an isolated retry has no first memory refusal",
+                        },
+                    )?;
+                    on_event(OleanFrontierEvent::Retrying {
+                        position: position[index] + 1,
+                        total: count,
+                        module: modules[index].name,
+                        previous,
+                    });
+                    running[index] = true;
+                    isolated_running = Some(index);
+                    in_flight = 1;
+                    job_sender
+                        .send(FrontierWork {
+                            index,
+                            position: position[index],
+                            artifact: None,
+                            imports,
+                        })
+                        .map_err(|_| OleanCheckError::InternalInvariant {
+                            detail: "every frontier worker thread has stopped",
+                        })?;
+                }
+                // A queued refusal drains the current workers before retrying.
+                // Once that retry starts, no new job may overlap it, including
+                // when it was the last entry in the pending retry queue.
+                for index in ready
+                    .into_iter()
+                    .filter(|_| retry_pending.is_empty() && isolated_running.is_none())
+                {
                     if in_flight >= threads {
                         break;
                     }
@@ -4872,6 +5059,14 @@ impl Engine {
                         total: count,
                         module: modules[index].name,
                     });
+                    if in_flight > 0 {
+                        overlapped[index] = true;
+                        for (other, active) in running.iter().enumerate() {
+                            if *active {
+                                overlapped[other] = true;
+                            }
+                        }
+                    }
                     running[index] = true;
                     in_flight += 1;
                     dispatched += 1;
@@ -4897,11 +5092,27 @@ impl Engine {
                             &mut accepted,
                             &mut engines,
                             &mut pending_rows,
+                            None,
                         );
                         settle(index, &pending_rows, on_event);
                         break;
                     }
-                    if job_sender.send(job).is_err() {
+                    retry_imports[index] = Some(FrontierRetryImports {
+                        base: job.base.clone(),
+                        closure: job.closure.clone(),
+                    });
+                    if job_sender
+                        .send(FrontierWork {
+                            index,
+                            position: position[index],
+                            artifact: Some(job.artifact),
+                            imports: FrontierRetryImports {
+                                base: job.base,
+                                closure: job.closure,
+                            },
+                        })
+                        .is_err()
+                    {
                         return Err(OleanCheckError::InternalInvariant {
                             detail: "every frontier worker thread has stopped",
                         });
@@ -4928,6 +5139,27 @@ impl Engine {
                         })?;
                 in_flight -= 1;
                 let index = done.index;
+                if done.host_memory_refusal && overlapped[index] && memory_retries[index].is_none()
+                {
+                    let OleanModuleVerdict::Inconclusive(first_refusal) = done.verdict else {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "a host-memory refusal was not a typed nonanswer",
+                        });
+                    };
+                    running[index] = false;
+                    memory_retries[index] = Some(OleanFrontierMemoryRetry {
+                        first_refusal,
+                        first_elapsed: done.elapsed,
+                    });
+                    retry_pending.insert((position[index], index));
+                    continue;
+                }
+                if isolated_running == Some(index) {
+                    isolated_running = None;
+                }
+                // Drop completed jobs' extra closure references before a queued
+                // retry is dispatched. Only imports the run still needs remain.
+                retry_imports[index] = None;
                 record(
                     done,
                     &mut running,
@@ -4935,6 +5167,7 @@ impl Engine {
                     &mut accepted,
                     &mut engines,
                     &mut pending_rows,
+                    memory_retries[index].take(),
                 );
                 settle(index, &pending_rows, on_event);
             }
@@ -5442,6 +5675,7 @@ impl Engine {
             FrontierDone {
                 index,
                 verdict,
+                host_memory_refusal: false,
                 accepted,
                 engine,
                 elapsed: started.elapsed(),
@@ -5449,8 +5683,11 @@ impl Engine {
             }
         };
         let failed = |error: OleanCheckError| {
+            let host_memory_refusal = olean_host_memory_refusal(&error);
             let retained = retain.then(|| FrontierRetained::Failed(error.clone()));
-            finish(frontier_error_verdict(error), None, retained)
+            let mut done = finish(frontier_error_verdict(error), None, retained);
+            done.host_memory_refusal = host_memory_refusal;
+            done
         };
         let engine = match self.frontier_closure_engine(&job) {
             Ok(engine) => engine,
@@ -13772,6 +14009,364 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum MemoryRetryControl {
+        Accept,
+        RefuseAgain,
+        InvalidProof,
+    }
+
+    /// The real frontier scheduler, decoder, K1 and independent checker over a
+    /// diamond import graph. Only the first worker-boundary memory refusals are
+    /// planted. B and C overlap; E is ready behind them, and D needs both.
+    fn run_frontier_memory_retry(control: MemoryRetryControl, threads: usize) {
+        use super::{OleanFrontierEvent, OleanModuleVerdict};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Barrier, Mutex};
+
+        let module = |name: &str, constants: &[ConstantInfo], imports: &[&str]| {
+            (
+                fixture_name(name),
+                olean_with_imports(constants, &fixture_imports(imports)),
+            )
+        };
+        let set = vec![
+            module(
+                "Fixture.A",
+                &[
+                    fixture_axiom("Fixture.P", Expr::sort(Level::zero())),
+                    fixture_axiom("Fixture.p", fixture_constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            module(
+                "Fixture.B",
+                &[fixture_theorem(
+                    "Fixture.h",
+                    if matches!(control, MemoryRetryControl::InvalidProof) {
+                        Expr::sort(Level::zero())
+                    } else {
+                        fixture_constant("Fixture.p")
+                    },
+                )],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.C",
+                &[fixture_theorem("Fixture.q", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.D",
+                &[fixture_theorem(
+                    "Fixture.child",
+                    fixture_constant("Fixture.h"),
+                )],
+                &["Fixture.B", "Fixture.C"],
+            ),
+            module(
+                "Fixture.E",
+                &[fixture_axiom(
+                    "Fixture.other",
+                    fixture_constant("Fixture.P"),
+                )],
+                &["Fixture.A"],
+            ),
+        ];
+        let inputs = fixture_inputs(&set);
+        let limits = OleanCheckLimits::new(set.iter().map(|(_, b)| b.len()).sum(), test_budget());
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let active = AtomicUsize::new(0);
+        let rendezvous = Barrier::new(2);
+        let attempts = Mutex::new(BTreeMap::<Name, usize>::new());
+        let artifacts = Mutex::new(BTreeMap::<Name, super::DecodedOlean>::new());
+        let mut retrying = None;
+        let mut retries = Vec::new();
+        let mut settled = BTreeSet::new();
+        let mut decided = Vec::new();
+
+        struct Active<'a>(&'a AtomicUsize);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let frontier = engine
+            .check_olean_frontier_using(
+                &inputs,
+                limits,
+                fixture_jobs(threads),
+                &mut |event| match event {
+                    OleanFrontierEvent::Started { .. } => {
+                        assert!(
+                            retrying.is_none(),
+                            "a fresh job overlapped an isolated retry"
+                        );
+                    }
+                    OleanFrontierEvent::Retrying {
+                        module, previous, ..
+                    } => {
+                        assert_eq!(active.load(Ordering::SeqCst), 0, "workers must drain first");
+                        assert!(retrying.replace(module.clone()).is_none());
+                        assert!(matches!(
+                            previous.first_refusal.cause,
+                            fln_core::outcome::InconclusiveCause::DependencyUnavailable { .. }
+                        ));
+                        retries.push(module.clone());
+                    }
+                    OleanFrontierEvent::Settled { row, .. } => {
+                        assert!(
+                            settled.insert(row.name.clone()),
+                            "one settled row per module"
+                        );
+                        if retrying.as_ref() == Some(&row.name) {
+                            retrying = None;
+                        }
+                    }
+                    OleanFrontierEvent::Decided { row, .. } => decided.push(row.name.clone()),
+                },
+                &|job| {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = Active(&active);
+                    let attempt = {
+                        let mut attempts = attempts.lock().expect("attempt log lock");
+                        let at = attempts.entry(job.name.clone()).or_default();
+                        *at += 1;
+                        *at
+                    };
+                    {
+                        let mut artifacts = artifacts.lock().expect("artifact log lock");
+                        if let Some(first) = artifacts.get(&job.name) {
+                            assert_eq!(
+                                first, &job.artifact,
+                                "retry decodes the same full artifact"
+                            );
+                        } else {
+                            artifacts.insert(job.name.clone(), job.artifact.clone());
+                        }
+                    }
+                    let memory_root = matches!(
+                        job.name.to_display_string().as_str(),
+                        "Fixture.B" | "Fixture.C"
+                    );
+                    if memory_root && attempt == 1 && threads > 1 {
+                        rendezvous.wait();
+                    }
+                    if memory_root && attempt == 1
+                        || (job.name == fixture_name("Fixture.B")
+                            && matches!(control, MemoryRetryControl::RefuseAgain))
+                    {
+                        let index = job.index;
+                        drop(job);
+                        return super::frontier_guarded(
+                            index,
+                            false,
+                            std::time::Instant::now(),
+                            || {
+                                std::panic::panic_any(super::HostAllocationFailure {
+                                    requested: 4096,
+                                })
+                            },
+                        );
+                    }
+                    if attempt == 2 {
+                        assert_eq!(active.load(Ordering::SeqCst), 1, "retry must run alone");
+                    }
+                    engine.frontier_check_module(job, &options, limits)
+                },
+            )
+            .expect("a memory refusal is a module result, not a scheduler failure");
+        assert_eq!(
+            frontier.rows.len(),
+            set.len(),
+            "retries are not extra modules"
+        );
+        assert_eq!(settled.len(), set.len());
+        assert_eq!(
+            decided,
+            set.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+        );
+        assert!(retrying.is_none());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let row = |name: &str| {
+            frontier
+                .rows
+                .iter()
+                .find(|row| row.name == fixture_name(name))
+                .expect("fixture row")
+        };
+        let attempts = attempts.into_inner().expect("attempt counts");
+        for name in ["Fixture.B", "Fixture.C"] {
+            assert_eq!(
+                attempts[&fixture_name(name)],
+                if threads == 1 { 1 } else { 2 }
+            );
+            assert_eq!(row(name).memory_retry.is_some(), threads > 1);
+            if let Some(retry) = &row(name).memory_retry {
+                assert!(row(name).elapsed >= retry.first_elapsed);
+            }
+        }
+        if threads == 1 {
+            assert!(retries.is_empty(), "a refusal while alone is final");
+            assert!(matches!(
+                row("Fixture.B").verdict,
+                OleanModuleVerdict::Inconclusive(_)
+            ));
+            assert!(matches!(
+                row("Fixture.D").verdict,
+                OleanModuleVerdict::Blocked { .. }
+            ));
+            return;
+        }
+        assert_eq!(
+            retries,
+            [fixture_name("Fixture.B"), fixture_name("Fixture.C")]
+        );
+        assert!(matches!(
+            row("Fixture.C").verdict,
+            OleanModuleVerdict::Accepted { .. }
+        ));
+        assert!(row("Fixture.E").memory_retry.is_none());
+        match control {
+            MemoryRetryControl::Accept => {
+                assert!(
+                    frontier
+                        .rows
+                        .iter()
+                        .all(|row| matches!(row.verdict, OleanModuleVerdict::Accepted { .. }))
+                );
+                let baseline = engine
+                    .check_olean_frontier(&inputs, &options, limits)
+                    .expect("unplanted control");
+                assert_eq!(
+                    frontier
+                        .engine
+                        .as_ref()
+                        .expect("accepted closure")
+                        .logical_root(&options),
+                    baseline
+                        .engine
+                        .as_ref()
+                        .expect("control closure")
+                        .logical_root(&options),
+                    "retry publishes exactly the fully checked control environment",
+                );
+                assert!(baseline.rows.iter().all(|row| row.memory_retry.is_none()));
+            }
+            MemoryRetryControl::RefuseAgain => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Inconclusive(_)
+                ));
+                assert!(matches!(
+                    row("Fixture.D").verdict,
+                    OleanModuleVerdict::Blocked { .. }
+                ));
+            }
+            MemoryRetryControl::InvalidProof => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Failed(_)
+                ));
+                assert!(matches!(
+                    row("Fixture.D").verdict,
+                    OleanModuleVerdict::Blocked { .. }
+                ));
+            }
+        }
+        let accepted = frontier
+            .engine
+            .as_ref()
+            .expect("accepted modules still merge");
+        assert_eq!(
+            accepted.environment().contains(&fixture_name("Fixture.h")),
+            matches!(control, MemoryRetryControl::Accept)
+        );
+        assert_eq!(
+            accepted
+                .environment()
+                .contains(&fixture_name("Fixture.child")),
+            matches!(control, MemoryRetryControl::Accept)
+        );
+    }
+
+    #[test]
+    fn frontier_memory_retry_drains_workers_rechecks_and_unblocks_importers() {
+        run_frontier_memory_retry(MemoryRetryControl::Accept, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_stops_after_one_isolated_refusal() {
+        run_frontier_memory_retry(MemoryRetryControl::RefuseAgain, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_cannot_admit_a_refused_proof_or_its_importers() {
+        run_frontier_memory_retry(MemoryRetryControl::InvalidProof, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_does_not_repeat_a_refusal_that_was_already_alone() {
+        run_frontier_memory_retry(MemoryRetryControl::Accept, 1);
+    }
+
+    #[test]
+    fn frontier_memory_retry_uses_typed_refusals_not_diagnostic_text() {
+        let memory_errors = [
+            OleanCheckError::HostMemory { requested: 4096 },
+            OleanCheckError::AllocationFailure {
+                resource: "test",
+                requested: 3,
+            },
+            OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                index: 1,
+                error: Box::new(EngineAdmissionError::AllocationFailure {
+                    resource: "test declaration",
+                    requested: 4,
+                }),
+            }),
+            OleanCheckError::Decode(OleanDecodeError::Declaration(
+                OleanDeclarationError::AllocationRefused { requested: 7 },
+            )),
+            OleanCheckError::ModuleDecode {
+                module: fixture_name("Fixture.Decode"),
+                error: OleanDecodeError::Declaration(OleanDeclarationError::AllocationRefused {
+                    requested: 7,
+                }),
+            },
+        ];
+        for error in memory_errors {
+            assert!(super::olean_host_memory_refusal(&error), "{error:?}");
+        }
+        let other_errors = [
+            OleanCheckError::DeclarationLimit {
+                observed: 2,
+                limit: 1,
+            },
+            OleanCheckError::Admission(EngineAdmissionError::CouncilNoAnswer {
+                summary: "host memory: this text is not an allocation error".to_owned(),
+            }),
+            OleanCheckError::Admission(EngineAdmissionError::KernelRejected {
+                class: RejectClass::LooseBVar,
+                message: "host memory".to_owned(),
+            }),
+            OleanCheckError::InternalInvariant {
+                detail: "host memory",
+            },
+            OleanCheckError::Decode(OleanDecodeError::Declaration(
+                OleanDeclarationError::Budget {
+                    visited: 6,
+                    budget: 5,
+                },
+            )),
+        ];
+        for error in other_errors {
+            assert!(!super::olean_host_memory_refusal(&error), "{error:?}");
+        }
+    }
+
     /// The scheduled door's answer is the serial door's, value for value.
     fn assert_same_set_answer(
         serial: &Result<Outcome<super::CheckedOleanSet>, OleanCheckError>,
@@ -19632,6 +20227,7 @@ mod tests {
                 // assertions below.
                 super::FrontierDone {
                     index: 7,
+                    host_memory_refusal: false,
                     verdict: super::OleanModuleVerdict::Accepted {
                         declarations: block.len(),
                     },

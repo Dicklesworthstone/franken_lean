@@ -286,8 +286,11 @@ const USAGE: &str = concat!(
     "and exits 0 only when every module is accepted. --progress also streams\n",
     "JSON lines to stderr: \"started\" as a module goes to the council, and\n",
     "\"decided\" with its row once every earlier row exists. --jobs N checks up to\n",
-    "N modules at once; each module is checked against its own import closure, so\n",
-    "the rows do not depend on N, only their wall time does. With --continue,\n",
+    "N modules at once, each against its own import closure. A host-memory\n",
+    "refusal during concurrent checking is retried once with no other module\n",
+    "check in flight, under the same limits; its row records both attempts.\n",
+    "Other resource stops are not retried. --progress reports \"retrying\"\n",
+    "before that isolated attempt. With --continue,\n",
     "further ROOT directories join the module set, so a library checks together\n",
     "with the libraries it imports (a toolchain's lib/lean, a package's build);\n",
     "a module found under two roots is refused, and --max-bytes bounds the set.\n",
@@ -9191,6 +9194,28 @@ fn check_olean_module_frontier(
                             "{{\"schema\":\"fln.check-olean-frontier-progress/2\",\"event\":\"started\",\"position\":{position},\"total\":{total},\"module\":{}}}\n",
                             json_string(&module.to_display_string()),
                         ),
+                        fln::OleanFrontierEvent::Retrying {
+                            position,
+                            total,
+                            module,
+                            previous,
+                        } => {
+                            let detail = BoundedText::new(format!("{:?}", previous.first_refusal));
+                            format!(
+                                concat!(
+                                    "{{\"schema\":\"fln.check-olean-frontier-progress/2\",",
+                                    "\"event\":\"retrying\",\"position\":{position},\"total\":{total},",
+                                    "\"module\":{},\"attempt\":2,\"isolated\":true,",
+                                    "\"firstElapsedMs\":{},\"firstRefusal\":{},\"detailTruncated\":{}}}\n"
+                                ),
+                                json_string(&module.to_display_string()),
+                                previous.first_elapsed.as_millis(),
+                                json_string(detail.text()),
+                                detail.truncated(),
+                                position = position,
+                                total = total,
+                            )
+                        },
                         // In completion order, so a crash keeps every row that
                         // exists; `decided` repeats it in frontier order.
                         fln::OleanFrontierEvent::Settled {
@@ -9270,11 +9295,12 @@ struct FrontierRowFields {
     elapsed_ms: u128,
     detail: BoundedText,
     blocked_by: String,
+    memory_retry: Option<(u128, BoundedText)>,
 }
 
 impl FrontierRowFields {
     fn json_members(&self) -> String {
-        format!(
+        let mut members = format!(
             concat!(
                 "\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":{},",
                 "\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{}"
@@ -9290,7 +9316,23 @@ impl FrontierRowFields {
             } else {
                 json_string(&self.blocked_by)
             },
-        )
+        );
+        if let Some((first_elapsed_ms, first_refusal)) = &self.memory_retry {
+            members.push_str(&format!(
+                concat!(
+                    ",\"attempts\":[{{\"attempt\":1,\"isolated\":false,",
+                    "\"verdict\":\"inconclusive\",\"elapsedMs\":{},\"detail\":{},",
+                    "\"detailTruncated\":{}}},{{\"attempt\":2,\"isolated\":true,",
+                    "\"verdict\":{},\"elapsedMs\":{}}}]"
+                ),
+                first_elapsed_ms,
+                json_string(first_refusal.text()),
+                first_refusal.truncated(),
+                json_string(self.verdict),
+                self.elapsed_ms.saturating_sub(*first_elapsed_ms),
+            ));
+        }
+        members
     }
 }
 
@@ -9317,6 +9359,12 @@ fn frontier_row_fields(row: &fln::OleanFrontierRow) -> FrontierRowFields {
         elapsed_ms: row.elapsed.as_millis(),
         detail: BoundedText::new(detail),
         blocked_by,
+        memory_retry: row.memory_retry.as_ref().map(|retry| {
+            (
+                retry.first_elapsed.as_millis(),
+                BoundedText::new(format!("{:?}", retry.first_refusal)),
+            )
+        }),
     }
 }
 
@@ -9355,6 +9403,12 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
             }
             other => format!("  {other:<13} {module}: {}", detail.text()),
         });
+        if let Some((first_elapsed_ms, first_refusal)) = &fields.memory_retry {
+            lines.push(format!(
+                "    isolated retry after host-memory refusal in {first_elapsed_ms} ms: {}",
+                first_refusal.text(),
+            ));
+        }
     }
     let total = frontier.rows.len();
     let exit_code = if faulted > 0 {
@@ -15776,6 +15830,64 @@ mod tests {
         assert!(malformed.stdout.is_empty());
         assert!(malformed.stderr.contains("\"class\":\"decode\""));
         assert!(malformed.stderr.contains("bad magic"));
+    }
+
+    #[test]
+    fn check_olean_frontier_reports_both_memory_attempts_without_counting_twice() {
+        let row = |verdict| fln::OleanFrontierRow {
+            name: fln::Name::from_components(["RetryFixture"]),
+            verdict,
+            elapsed: std::time::Duration::from_millis(30),
+            memory_retry: Some(fln::OleanFrontierMemoryRetry {
+                first_refusal: fln::Inconclusive::dependency_unavailable("host memory: fixture"),
+                first_elapsed: std::time::Duration::from_millis(10),
+            }),
+        };
+        for (verdict, expected_exit, expected_count) in [
+            (
+                fln::OleanModuleVerdict::Accepted { declarations: 2 },
+                0,
+                "\"accepted\":1",
+            ),
+            (
+                fln::OleanModuleVerdict::Inconclusive(fln::Inconclusive::dependency_unavailable(
+                    "host memory: again",
+                )),
+                3,
+                "\"inconclusive\":1",
+            ),
+        ] {
+            let frontier = fln::OleanFrontier {
+                engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
+                rows: vec![row(verdict)],
+            };
+            let output = super::render_check_olean_frontier(&frontier, true);
+            assert_eq!(output.exit_code, expected_exit);
+            assert!(output.stdout.contains("\"modules\":1"));
+            assert!(output.stdout.contains(expected_count));
+            assert!(
+                output
+                    .stdout
+                    .contains("\"attempts\":[{\"attempt\":1,\"isolated\":false")
+            );
+            assert!(output.stdout.contains("\"attempt\":2,\"isolated\":true"));
+            assert!(output.stdout.contains("\"elapsedMs\":10"));
+            assert!(output.stdout.contains("\"elapsedMs\":20"));
+            let human = super::render_check_olean_frontier(&frontier, false);
+            assert_eq!(human.exit_code, expected_exit);
+            assert!(
+                human
+                    .stdout
+                    .contains("isolated retry after host-memory refusal in 10 ms")
+            );
+        }
+        let mut ordinary = row(fln::OleanModuleVerdict::Accepted { declarations: 2 });
+        ordinary.memory_retry = None;
+        assert!(
+            !super::frontier_row_fields(&ordinary)
+                .json_members()
+                .contains("attempts")
+        );
     }
 
     #[test]
