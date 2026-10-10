@@ -1,8 +1,46 @@
-use super::{FileReadError, Obj, file_result_transport, file_success_transport};
+use super::{FileIoError, FileReadError, Obj, file_result_transport, file_success_transport};
 use crate::handle::native_stdio_ctor_shape;
 use crate::stdio::FileReadFailure;
 
 impl Obj {
+    /// Write exactly the initialized, salient bytes of a borrowed native
+    /// ByteArray to this exact native Handle. World must be scalar zero;
+    /// scalar-array element width must be one and size must fit capacity.
+    /// No spare capacity is inspected, copied, or written. NUL and invalid
+    /// UTF-8 bytes are ordinary data, and neither input is consumed.
+    ///
+    /// The seven-field filesystem transport carries Unit scalar zero on
+    /// success. Success means fwrite accepted every byte, including an empty
+    /// write; it does not promise flush or close success. A post-write failure
+    /// preserves errno and the reported prefix length without claiming rollback.
+    pub fn try_file_write(&self, buffer: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(FileIoError::InvalidWorld);
+        }
+        if !canonical_file_byte_array(buffer) {
+            return Err(FileIoError::InvalidByteArray);
+        }
+        if !self.is_file_handle() {
+            return Err(FileIoError::InvalidHandle);
+        }
+        crate::stdio::initialize_io_signals();
+        // SAFETY: exact live Handle and canonical ByteArray were established
+        // before effects. Both remain borrowed; only its initialized prefix
+        // enters fwrite and the helper returns one owned native result.
+        // UNSAFE-LEDGER: FLN-UL-0657
+        #[allow(unsafe_code)]
+        let result = unsafe { crate::stdio::checked_handle_write(self.0, buffer.0) }.map_err(
+            |(errno, bytes_written)| FileIoError::UnrepresentableWrite {
+                errno,
+                bytes_written,
+            },
+        )?;
+        let (result, bytes_written) = result.ok_or(FileIoError::InvalidHandle)?;
+        let result = Obj(result);
+        file_result_transport(&result, false)
+            .ok_or(FileIoError::MalformedWriteResult { bytes_written })
+    }
+
     /// Borrow this exact native Handle and read at most the boxed native
     /// USize count with one fread. The entire requested capacity is bounded
     /// and allocated fallibly before reading. Zero count succeeds without
@@ -80,6 +118,22 @@ impl Obj {
         byte_result_transport(&result, count, bytes_consumed)
             .ok_or(FileReadError::MalformedResult { bytes_consumed })
     }
+}
+
+fn canonical_file_byte_array(buffer: &Obj) -> bool {
+    if buffer.is_scalar()
+        || buffer.header().tag != crate::contract::TAG_SCALAR_ARRAY
+        || buffer.header().other != 1
+    {
+        return false;
+    }
+    // SAFETY: exact scalar-array category precedes header-field access.
+    // Obj owns a live allocation; its salient prefix is initialized. Only
+    // size and capacity are inspected, never uninitialized spare storage.
+    // UNSAFE-LEDGER: FLN-UL-0656
+    #[allow(unsafe_code)]
+    let (_, size, capacity, _) = unsafe { crate::object::sarray_fields(buffer.0) };
+    size <= capacity
 }
 
 fn byte_result_transport(result: &Obj, capacity: usize, consumed: usize) -> Option<Obj> {

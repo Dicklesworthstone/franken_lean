@@ -1243,17 +1243,60 @@ pub(crate) unsafe fn prim_handle_write(
     h: *mut LeanObject,
     buf: *mut LeanObject,
 ) -> *mut LeanObject {
-    // SAFETY: live objects per contract; fwrite reads exactly n salient
-    // bytes from the live array's data base.
+    // SAFETY: the shared effect reads only the live array's initialized
+    // prefix; this raw ABI door retains the pin's full errno decoder.
     unsafe {
-        let fp = io_get_handle(h);
-        let (_, n, _, data) = object::sarray_fields(buf);
-        let m = fwrite(data.cast::<c_void>(), 1, n, fp);
-        if m == n {
-            io_result_mk_ok(tagged::boxi(0))
-        } else {
-            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        match handle_write_status(h, buf) {
+            Ok(_) => io_result_mk_ok(tagged::boxi(0)),
+            Err((code, _)) => io_result_mk_error(decode_io_error(code, core::ptr::null_mut())),
         }
+    }
+}
+
+/// Shared Handle.write effect, capturing errno immediately after fwrite.
+///
+/// # Safety
+/// Handle and canonical element-width-one scalar array are live and borrowed.
+/// The array's salient prefix is initialized and does not exceed its capacity.
+// UNSAFE-LEDGER: FLN-UL-0654
+#[allow(unsafe_code)]
+unsafe fn handle_write_status(
+    handle: *mut LeanObject,
+    buffer: *mut LeanObject,
+) -> Result<usize, (c_int, usize)> {
+    // SAFETY: the Handle owns FILE and fwrite reads exactly the initialized
+    // size, not capacity. Neither borrowed object is modified or released.
+    unsafe {
+        let file = io_get_handle(handle);
+        let (_, size, _, data) = object::sarray_fields(buffer);
+        let written = fwrite(data.cast::<c_void>(), 1, size, file);
+        if written == size {
+            Ok(written)
+        } else {
+            Err((errno(), written))
+        }
+    }
+}
+
+/// Checked Handle.write with the same byte effect as the raw primitive and
+/// the checked putStr error policy. No filename is invented after a write.
+///
+/// # Safety
+/// Handle is scalar or a live object; buffer is a canonical live ByteArray.
+/// Both are borrowed. A returned native IO.Result transfers one reference.
+// UNSAFE-LEDGER: FLN-UL-0655
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_write(
+    handle: *mut LeanObject,
+    buffer: *mut LeanObject,
+) -> Result<Option<(*mut LeanObject, usize)>, (c_int, usize)> {
+    // SAFETY: the exact native Handle check precedes FILE access; completion
+    // refuses filename-dependent errno arms and retains fwrite's byte count.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        checked_put_str_result(handle_write_status(handle, buffer)).map(Some)
     }
 }
 

@@ -1,4 +1,4 @@
-//! Concrete safe doors for the pinned Handle.mk and Handle.putStr rows.
+//! Concrete safe doors for the pinned Handle filesystem rows.
 //! Native packed IO.Result never escapes as the checked logical IO result.
 
 use super::{Obj, canonical_stdio_string, native_stdio_ctor_shape, stdio_result_transport};
@@ -46,6 +46,7 @@ pub enum FileIoError {
     InvalidMode,
     InvalidHandle,
     InvalidString,
+    InvalidByteArray,
     InvalidWorld,
     MalformedOpenResult,
     UnrepresentableWrite { errno: i32, bytes_written: usize },
