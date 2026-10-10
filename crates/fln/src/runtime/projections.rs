@@ -7,6 +7,7 @@
 use super::*;
 use fln_core::expr::Literal;
 use fln_core::level::Level;
+pub(super) mod query;
 
 // Types here are relative to the context *before* their binder was introduced.
 // Lifting by index + 1 reopens a selected domain in the current context.
@@ -223,6 +224,17 @@ impl Preparation<'_> {
         suffix: &[Expr],
         omitted_depth: usize,
     ) -> Result<Option<Expr>, IngressError> {
+        query::receiver_type(self, source, context, suffix, omitted_depth)
+    }
+
+    fn infer_receiver_type(
+        &mut self,
+        source: &Expr,
+        context: &[Expr],
+        suffix: &[Expr],
+        omitted_depth: usize,
+        dependency: &mut Option<query::Local>,
+    ) -> Result<Option<Expr>, IngressError> {
         let depth = omitted_depth
             .saturating_add(context.len())
             .saturating_add(suffix.len());
@@ -247,6 +259,20 @@ impl Preparation<'_> {
                     let Some(domain) = type_local(*idx, [&locals, suffix, context]) else {
                         return Ok(None);
                     };
+                    // This walk follows one head path. Its only possible
+                    // read of the caller's telescope is this terminal slot;
+                    // domains introduced along the path are already part of
+                    // the exact source expression. Subsequent unwinding uses
+                    // context-free type reduction and substitution only.
+                    if let Some(index) = usize::try_from(*idx)
+                        .ok()
+                        .and_then(|index| index.checked_sub(locals.len()))
+                    {
+                        *dependency = Some(query::Local {
+                            index,
+                            domain: domain.clone(),
+                        });
+                    }
                     let amount = idx
                         .checked_add(1)
                         .ok_or_else(|| unsupported("projection local depth"))?;

@@ -18,6 +18,7 @@ mod io;
 mod io_result;
 mod mutual;
 mod nat;
+mod native_intrinsics;
 mod partial;
 mod projections;
 mod proofs;
@@ -45,6 +46,7 @@ pub(super) struct Preparation<'a> {
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
+    native_intrinsics: native_intrinsics::Store,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
     nat_cases: Vec<NatCaseBinding>,
@@ -131,6 +133,7 @@ impl<'a> Preparation<'a> {
             visited: 0,
             externs: None,
             implementations: None,
+            native_intrinsics: native_intrinsics::Store::default(),
             lambdas: Vec::new(),
             cases: Vec::new(),
             nat_cases: Vec::new(),

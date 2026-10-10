@@ -108,14 +108,7 @@ impl Preparation<'_> {
         // Pure word adapters have their own exact data/dependency contract.
         // Recognizer errors remain refusals; none may fall back to an opaque
         // default or an ordinary body after a failed native contract.
-        let native = executable_intrinsic_binding_cached(
-            self.environment,
-            &target,
-            &mut self.visited,
-            self.limits,
-            &mut self.externs,
-        )?
-        .is_some()
+        let native = self.native_intrinsic_binding(&target)?.is_some()
             || match source_intrinsics::io::fs::Operation::from_name(&target) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(
                     self.environment,

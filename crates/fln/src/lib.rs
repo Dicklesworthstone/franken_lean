@@ -10188,13 +10188,9 @@ fn executable_dependencies(
             .or_else(|| preparation.string_bytes_intrinsic_binding(&name))
         {
             Some(binding) => Some(binding),
-            None => executable_intrinsic_binding_cached(
-                environment,
-                &name,
-                &mut visited_nodes,
-                limits,
-                &mut preparation.externs,
-            )?,
+            None => {
+                preparation.catalog_native_intrinsic_binding(&name, &mut visited_nodes, limits)?
+            }
         };
         if let Some(binding) = intrinsic {
             if preparation.nat_primitive_intrinsic_alias(&binding, &intrinsics, &mut functions)?

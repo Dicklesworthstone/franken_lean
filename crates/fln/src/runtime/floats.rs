@@ -22,15 +22,7 @@ impl Preparation<'_> {
         if !levels.is_empty() {
             return Ok(false);
         }
-        if executable_intrinsic_binding_cached(
-            self.environment,
-            callee,
-            &mut self.visited,
-            self.limits,
-            &mut self.externs,
-        )?
-        .is_some()
-        {
+        if self.native_intrinsic_binding(callee)?.is_some() {
             return Ok(true);
         }
         if callee != &name("Float.ofScientific") && callee != &name("Float32.ofScientific") {

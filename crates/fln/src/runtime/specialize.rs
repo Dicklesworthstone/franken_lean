@@ -32,6 +32,7 @@ pub(super) struct Store {
     pure: pure::Store,
     heads: heads::Store,
     pub(super) index_types: super::indexed::cache::Store,
+    pub(super) receiver_queries: super::projections::query::Store,
     factory_values: HashMap<Expr, Expr>,
     pub(super) executable_projections: HashMap<(Name, u64, Expr), Expr>,
     instances: HashMap<arguments::InstanceKey, Name>,

@@ -162,14 +162,7 @@ impl Preparation<'_> {
         {
             return Ok(false);
         }
-        let native = executable_intrinsic_binding_cached(
-            self.environment,
-            logical,
-            &mut self.visited,
-            self.limits,
-            &mut self.externs,
-        )?
-        .is_some()
+        let native = self.native_intrinsic_binding(logical)?.is_some()
             || match source_intrinsics::io::fs::Operation::from_name(logical) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(
                     self.environment,
