@@ -9,6 +9,7 @@
 use super::*;
 use std::collections::HashSet;
 pub(super) mod io;
+mod nat_div_mod;
 pub(super) mod st;
 mod string_append;
 pub(super) mod string_bootstrap;
@@ -121,7 +122,7 @@ pub(super) fn imported_nat_matches(
     limits: IngressLimits,
 ) -> Result<bool, IngressError> {
     let Some(declarations) = fln_elab::seed::imported_nat_intrinsic_model_declarations(name) else {
-        return Ok(false);
+        return nat_div_mod::matches(environment, name, &mut None, visited, limits);
     };
     let mut comparison = Comparison { visited, limits };
     for declaration in declarations {
