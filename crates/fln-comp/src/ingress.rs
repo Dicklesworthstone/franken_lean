@@ -40,7 +40,7 @@ use std::fmt;
 mod branch;
 mod constructor_case;
 mod empty_case;
-pub use branch::{BoolCaseBinding, CallableBindings};
+pub use branch::{BoolCaseBinding, CallableBindings, NatCaseBinding};
 pub use constructor_case::ConstructorCaseBinding;
 pub use empty_case::EmptyCaseBinding;
 
@@ -1211,6 +1211,7 @@ struct PreparedFunction<'a> {
 enum PreparedFunctionBody<'a> {
     Expression(&'a Expr),
     BoolCase,
+    NatCase,
     ConstructorCase(Vec<fir::ConstructorId>),
     EmptyCase,
 }
@@ -2530,6 +2531,7 @@ fn prepare_catalog<'a>(
         functions,
         lambdas,
         bool_cases,
+        nat_cases,
         constructor_cases,
         empty_cases,
     } = callables;
@@ -2542,6 +2544,7 @@ fn prepare_catalog<'a>(
     let function_count = functions
         .len()
         .saturating_add(bool_cases.len())
+        .saturating_add(nat_cases.len())
         .saturating_add(constructor_cases.len())
         .saturating_add(empty_cases.len())
         .saturating_add(1);
@@ -2634,10 +2637,19 @@ fn prepare_catalog<'a>(
 
     prepare_lambdas(&mut catalog, lambdas, interfaces, limits)?;
     branch::prepare(&mut catalog, bool_cases, functions.len(), limits)?;
+    branch::prepare_nat(
+        &mut catalog,
+        nat_cases,
+        functions.len().saturating_add(bool_cases.len()),
+        limits,
+    )?;
     constructor_case::prepare(
         &mut catalog,
         constructor_cases,
-        functions.len().saturating_add(bool_cases.len()),
+        functions
+            .len()
+            .saturating_add(bool_cases.len())
+            .saturating_add(nat_cases.len()),
         limits,
     )?;
 
@@ -2647,6 +2659,7 @@ fn prepare_catalog<'a>(
         functions
             .len()
             .saturating_add(bool_cases.len())
+            .saturating_add(nat_cases.len())
             .saturating_add(constructor_cases.len()),
         limits,
     )?;
@@ -4707,6 +4720,7 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
             functions,
             lambdas,
             bool_cases: &[],
+            nat_cases: &[],
             constructor_cases: &[],
             empty_cases: &[],
         },
@@ -4861,7 +4875,9 @@ pub fn lower_closed_expr_at_result<'a>(
                     constructor_case::assemble(function, constructors, limits)?,
                     constructors.len().saturating_mul(2).saturating_add(1),
                 ),
-                PreparedFunctionBody::BoolCase => (branch::assemble(function)?, 2),
+                PreparedFunctionBody::BoolCase | PreparedFunctionBody::NatCase => {
+                    (branch::assemble(function)?, 2)
+                }
                 PreparedFunctionBody::EmptyCase => (empty_case::assemble(function, limits)?, 1),
                 PreparedFunctionBody::Expression(_) => unreachable!("handled expression body"),
             };

@@ -31,7 +31,9 @@ mod transport;
 mod variants;
 
 use super::*;
-use fln_comp::ingress::{BoolCaseBinding, CallableBindings, ConstructorCaseBinding};
+use fln_comp::ingress::{
+    BoolCaseBinding, CallableBindings, ConstructorCaseBinding, NatCaseBinding,
+};
 use std::collections::HashSet;
 
 pub(super) struct Preparation<'a> {
@@ -43,6 +45,7 @@ pub(super) struct Preparation<'a> {
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
+    nat_cases: Vec<NatCaseBinding>,
     variant_cases: Vec<ConstructorCaseBinding>,
     empty_cases: Vec<fln_comp::ingress::EmptyCaseBinding>,
     false_family_checked: bool,
@@ -105,6 +108,7 @@ enum Task {
     },
     Case {
         name: Name,
+        parameter: ValueType,
         result: ValueType,
     },
 }
@@ -119,6 +123,7 @@ impl<'a> Preparation<'a> {
             implementations: None,
             lambdas: Vec::new(),
             cases: Vec::new(),
+            nat_cases: Vec::new(),
             variant_cases: Vec::new(),
             empty_cases: Vec::new(),
             false_family_checked: false,
@@ -152,7 +157,7 @@ impl<'a> Preparation<'a> {
         charge_catalog_node(&mut self.visited, self.limits)
     }
 
-    fn thunk(&mut self, body: &Expr) -> Result<Expr, IngressError> {
+    fn thunk(&mut self, body: &Expr, parameter: ValueType) -> Result<Expr, IngressError> {
         let observed = self.next_branch.saturating_add(1);
         if observed > self.limits.max_lambda_bindings {
             return Err(IngressError::ResourceLimit {
@@ -171,7 +176,14 @@ impl<'a> Preparation<'a> {
         // deterministic site identities keep those annotations separate.
         Ok(Expr::lam(
             Name::num(name("_fln_runtime_branch"), id),
-            Expr::const_(name("Bool"), vec![]),
+            Expr::const_(
+                name(match parameter {
+                    ValueType::Bool => "Bool",
+                    ValueType::Nat => "Nat",
+                    _ => return Err(unsupported("scalar branch parameter")),
+                }),
+                vec![],
+            ),
             lifted,
             BinderInfo::Default,
         ))
@@ -198,7 +210,11 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
-    fn branch_name(&mut self, result: ValueType) -> Result<Name, IngressError> {
+    fn branch_name(
+        &mut self,
+        result: ValueType,
+        parameter: ValueType,
+    ) -> Result<Name, IngressError> {
         let index = match result {
             ValueType::Nat => 0,
             ValueType::String => 1,
@@ -211,11 +227,24 @@ impl<'a> Preparation<'a> {
             ValueType::Closure(id) => 4 + u64::from(id.get()),
             _ => return Err(unsupported("conditional result representation")),
         };
-        let name = Name::num(Name::from_components(["_fln_runtime_bool_case"]), index);
+        let prefix = match parameter {
+            ValueType::Bool => "_fln_runtime_bool_case",
+            ValueType::Nat => "_fln_runtime_nat_case",
+            _ => return Err(unsupported("scalar branch parameter")),
+        };
+        let name = Name::num(Name::from_components([prefix]), index);
         if self.environment.contains(&name) {
             return Err(unsupported("runtime case name collision"));
         }
-        if !self.cases.iter().any(|case| case.name == name) {
+        if parameter == ValueType::Nat {
+            if !self.nat_cases.iter().any(|case| case.name == name) {
+                reserve(&mut self.nat_cases, self.limits.fir.max_functions)?;
+                self.nat_cases.push(NatCaseBinding {
+                    name: name.clone(),
+                    result,
+                });
+            }
+        } else if !self.cases.iter().any(|case| case.name == name) {
             reserve(&mut self.cases, self.limits.fir.max_functions)?;
             self.cases.push(BoolCaseBinding {
                 name: name.clone(),
@@ -225,7 +254,12 @@ impl<'a> Preparation<'a> {
         Ok(name)
     }
 
-    fn register_branch(&mut self, lambda: &Expr, result: ValueType) -> Result<(), IngressError> {
+    fn register_branch(
+        &mut self,
+        lambda: &Expr,
+        parameter: ValueType,
+        result: ValueType,
+    ) -> Result<(), IngressError> {
         if self.lambda_keys.contains(lambda) {
             return Ok(());
         }
@@ -239,7 +273,7 @@ impl<'a> Preparation<'a> {
         self.lambda_keys.insert(lambda.clone());
         self.lambdas.push(LambdaBinding {
             lambda: lambda.clone(),
-            parameters: vec![ValueType::Bool],
+            parameters: vec![parameter],
             parameter_ownership: borrowed_runtime_parameters(1)?,
             result,
             result_ownership: result_ownership(result),
@@ -412,6 +446,20 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some((case, result)) = self.nat_case(&head)? {
+                            if args.len() != 3 {
+                                return Err(unsupported("Nat case arity"));
+                            }
+                            tasks.push(Task::Case {
+                                name: case,
+                                parameter: ValueType::Nat,
+                                result,
+                            });
+                            tasks.push(Task::Visit(self.thunk(&args[2], ValueType::Nat)?));
+                            tasks.push(Task::Visit(self.thunk(&args[1], ValueType::Nat)?));
+                            tasks.push(Task::Visit(args[0].clone()));
+                            continue;
+                        }
                         if let Some(replacement) = self.implemented_by_call(&head, &args)? {
                             tasks.push(Task::Visit(replacement));
                             continue;
@@ -499,7 +547,7 @@ impl<'a> Preparation<'a> {
                             let result = self
                                 .value_type(&motive)?
                                 .ok_or_else(|| unsupported("dependent Boolean motive"))?;
-                            let case = self.branch_name(result)?;
+                            let case = self.branch_name(result, ValueType::Bool)?;
                             let yes = self.typed_callable_result(
                                 args[2].clone(),
                                 motive.clone(),
@@ -510,9 +558,13 @@ impl<'a> Preparation<'a> {
                                 motive.clone(),
                                 result,
                             )?;
-                            tasks.push(Task::Case { name: case, result });
-                            tasks.push(Task::Visit(self.thunk(&yes)?));
-                            tasks.push(Task::Visit(self.thunk(&no)?));
+                            tasks.push(Task::Case {
+                                name: case,
+                                parameter: ValueType::Bool,
+                                result,
+                            });
+                            tasks.push(Task::Visit(self.thunk(&yes, ValueType::Bool)?));
+                            tasks.push(Task::Visit(self.thunk(&no, ValueType::Bool)?));
                             tasks.push(Task::Visit(args[3].clone()));
                             continue;
                         }
@@ -875,12 +927,16 @@ impl<'a> Preparation<'a> {
                     let value = pop(&mut values)?;
                     values.push(Expr::proj(name, index, value));
                 }
-                Task::Case { name, result } => {
+                Task::Case {
+                    name,
+                    parameter,
+                    result,
+                } => {
                     let yes = pop(&mut values)?;
                     let no = pop(&mut values)?;
                     let condition = pop(&mut values)?;
-                    self.register_branch(&no, result)?;
-                    self.register_branch(&yes, result)?;
+                    self.register_branch(&no, parameter, result)?;
+                    self.register_branch(&yes, parameter, result)?;
                     values.push(
                         [condition, no, yes]
                             .into_iter()
@@ -1028,6 +1084,7 @@ impl<'a> Preparation<'a> {
             functions,
             lambdas: &self.lambdas,
             bool_cases: &self.cases,
+            nat_cases: &self.nat_cases,
             constructor_cases: &self.variant_cases,
             empty_cases: &self.empty_cases,
         }
