@@ -251,9 +251,9 @@ fn level(level: &Level, argument: bool) -> Printed {
         LevelView::Zero => return Ok(offset.to_string()),
         LevelView::Param(name) => {
             if offset == 0 {
-                return Ok(name.to_display_string());
+                return Ok(escaped_name(name));
             }
-            format!("{} + {offset}", name.to_display_string())
+            format!("{} + {offset}", escaped_name(name))
         }
         LevelView::Max(a, b) | LevelView::IMax(a, b) => {
             let keyword = if matches!(base.view(), LevelView::Max(..)) {
@@ -319,9 +319,89 @@ fn accessible(name: &Name) -> bool {
     true
 }
 
+/// One component as the pin's `escapePart` writes it (vendored `Init/Meta/Defs.lean`): an
+/// identifier as it is, anything else between `«` and `»`, and unchanged when it holds a `»`
+/// (`None` at the pin, which then prints the component as it is). `force` escapes even an
+/// identifier.
+fn escaped_part(part: &str, force: bool) -> String {
+    let mut chars = part.chars();
+    let identifier = chars.next().is_some_and(fln_syntax::token::is_id_first)
+        && chars.all(fln_syntax::token::is_id_rest);
+    if (identifier && !force) || part.contains('»') {
+        part.to_owned()
+    } else {
+        format!("«{part}»")
+    }
+}
+
+/// Whether `text` is a token of the implicit `Init` table, the pin's `isToken` when it
+/// prints a name from a file without a header.
+fn is_token(text: &str) -> bool {
+    fln_parse::reference_tokens::implicit_init_table().contains(text)
+}
+
+/// A name as the pin's `Name.toStringWithToken` prints it, with `escape := true` (vendored
+/// `Init/Meta/Defs.lean`, `toStringWithSep`). A component that is not an identifier is
+/// written `«…»`, and so is a root component that is a token. A later component is forced
+/// only when the dotted prefix would read as a token. Inaccessible names (`✝`,
+/// `_inaccessible`), macro-scoped names and the delaborator's pseudo-syntax (`_`, `#…`,
+/// `?…`) print as they are.
+fn escaped_name(name: &Name) -> String {
+    // Components root first; `Err` is a numeric component.
+    let mut parts: Vec<Result<String, u64>> = Vec::new();
+    let mut current = name.clone();
+    loop {
+        let part = match current.leaf_view() {
+            LeafView::Anonymous => break,
+            LeafView::Str(text) => Ok(text.to_owned()),
+            LeafView::Num(value) => Err(value),
+        };
+        parts.push(part);
+        current = current.parent();
+    }
+    parts.reverse();
+    let pseudo = match parts.first() {
+        Some(Ok(root)) => {
+            (parts.len() == 1 && root == "_") || root.starts_with('#') || root.starts_with('?')
+        }
+        _ => false,
+    };
+    // `isInaccessibleUserName`: the last string component, looking through numbers.
+    let inaccessible = parts.iter().rev().find_map(|part| match part {
+        Ok(text) => Some(text.contains('✝') || text == "_inaccessible"),
+        Err(_) => None,
+    }) == Some(true);
+    if pseudo || inaccessible || name.has_macro_scopes() {
+        return name.to_display_string();
+    }
+    let mut text = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        match part {
+            Ok(component) if index == 0 => {
+                text = escaped_part(component, is_token(component));
+            }
+            Ok(component) => {
+                let plain = format!("{text}.{}", escaped_part(component, false));
+                text = if is_token(&plain) {
+                    format!("{text}.{}", escaped_part(component, true))
+                } else {
+                    plain
+                };
+            }
+            Err(value) => {
+                if index > 0 {
+                    text.push('.');
+                }
+                text.push_str(&value.to_string());
+            }
+        }
+    }
+    text
+}
+
 fn binder_name(name: &Name) -> String {
     if accessible(name) {
-        name.to_display_string()
+        escaped_name(name)
     } else if name.is_anonymous() {
         "x✝".to_owned()
     } else {
@@ -634,7 +714,7 @@ impl<'a> Printer<'a> {
         };
         match spine(binder_type).0.node() {
             ExprNode::Const { name: head, .. } if *head == namespace => {
-                Some((receiver, field.to_owned()))
+                Some((receiver, escaped_part(field, false)))
             }
             _ => None,
         }
@@ -647,9 +727,9 @@ impl<'a> Printer<'a> {
             .first()
             .is_none_or(|info| *info == BinderInfo::Default);
         if explicit {
-            name.to_display_string()
+            escaped_name(name)
         } else {
-            format!("@{}", name.to_display_string())
+            format!("@{}", escaped_name(name))
         }
     }
 
@@ -815,14 +895,14 @@ impl<'a> Printer<'a> {
             .map(|info| info.constant_val().level_params.clone())
             .unwrap_or_default();
         let head = if parameters.is_empty() {
-            name.to_display_string()
+            escaped_name(name)
         } else {
             format!(
                 "{}.{{{}}}",
-                name.to_display_string(),
+                escaped_name(name),
                 parameters
                     .iter()
-                    .map(Name::to_display_string)
+                    .map(escaped_name)
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -832,5 +912,42 @@ impl<'a> Printer<'a> {
         } else {
             format!("{head} {} : {}", groups.join(" "), rest?)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(parts: &[&str]) -> Name {
+        Name::from_components(parts.iter().copied())
+    }
+
+    /// Each expected string is the pinned v4.32.0's `#check` output for a constant of that
+    /// name (measured 2026-10-09), except the pseudo-syntax and inaccessible rows, which
+    /// follow `toStringWithToken`'s documented exclusions.
+    #[test]
+    fn names_are_escaped_as_the_pin_prints_them() {
+        for (parts, expected) in [
+            (&["Nat", "succ"][..], "Nat.succ"),
+            (&["Foo", "a b"][..], "Foo.«a b»"),
+            (&["Minus", "i-love-lisp"][..], "Minus.«i-love-lisp»"),
+            (&["fun"][..], "«fun»"),
+            (&["def", "x"][..], "«def».x"),
+            (&["α"][..], "α"),
+            (&["x✝"][..], "x✝"),
+            (&["_"][..], "_"),
+            (&["?u"][..], "?u"),
+            (&["a»b"][..], "a»b"),
+        ] {
+            assert_eq!(escaped_name(&name(parts)), expected, "{parts:?}");
+        }
+        assert_eq!(
+            escaped_name(&Name::num(name(&["Foo"]), 1)),
+            "Foo.1",
+            "a numeric component is its digits"
+        );
+        assert_eq!(escaped_part("i-love-lisp", false), "«i-love-lisp»");
+        assert_eq!(escaped_part("ok", true), "«ok»");
     }
 }
