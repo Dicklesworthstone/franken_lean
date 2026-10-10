@@ -426,3 +426,65 @@ fn mutual_import_goals_use_current_editor_text_and_recover_after_a_bad_group() {
         "{messages:#?}"
     );
 }
+
+#[test]
+fn public_theorem_queries_use_public_statements_and_private_proofs() {
+    let uri = "untitled:PublicTheoremGoals.lean";
+    let prefix = "module\nprelude\nprivate theorem hiddenProof (P : Prop) (h : P) : P := h\nprivate def Hidden (P : Prop) : Prop := P\n@[expose] public def Statement (P : Prop) : Prop := P\n";
+    let pending = format!("{prefix}public theorem verified (P : Prop) (h : P) : Statement P := by");
+    let complete = format!("{pending}\n  exact hiddenProof P h");
+    let invalid_header = format!(
+        "{prefix}public theorem verified (P : Prop) (h : P) : Hidden P := by\n  exact hiddenProof P h"
+    );
+    let invalid_proof = format!("{pending}\n  exact absentProof P h");
+    let body_line = prefix.lines().count() + 1;
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let messages = run(
+            binary,
+            args,
+            vec![
+                open(uri, &pending),
+                query("goal", "$/lean/plainGoal", uri, body_line - 1, 999),
+                query("warm-goal", "$/lean/plainGoal", uri, body_line - 1, 999),
+                change(uri, 2, &complete),
+                query("private-hover", "textDocument/hover", uri, body_line, 8),
+                query("proved", "$/lean/plainGoal", uri, body_line, 999),
+                change(uri, 3, &invalid_header),
+                query("hidden-header", "$/lean/plainGoal", uri, body_line, 999),
+                change(uri, 4, &invalid_proof),
+                query("bad-proof", "$/lean/plainGoal", uri, body_line, 999),
+                change(uri, 5, &complete),
+                query("recovered", "$/lean/plainGoal", uri, body_line, 999),
+            ],
+        );
+        for id in ["goal", "warm-goal"] {
+            assert!(
+                reply(&messages, id).contains("P : Prop\\nh : P\\n⊢ (Statement P)"),
+                "{messages:#?}"
+            );
+        }
+        assert!(
+            reply(&messages, "private-hover").contains("hiddenProof"),
+            "{messages:#?}"
+        );
+        assert!(
+            !reply(&messages, "private-hover").contains("\"code\":-32803"),
+            "{messages:#?}"
+        );
+        for id in ["proved", "recovered"] {
+            assert!(
+                reply(&messages, id).contains("\"goals\":[]"),
+                "{messages:#?}"
+            );
+        }
+        for id in ["hidden-header", "bad-proof"] {
+            assert!(
+                reply(&messages, id).contains("\"code\":-32803"),
+                "{messages:#?}"
+            );
+        }
+    }
+}

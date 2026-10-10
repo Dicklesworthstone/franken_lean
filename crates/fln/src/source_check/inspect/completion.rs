@@ -179,24 +179,15 @@ impl SourceModuleSession {
             .scope
             .for_command_prefix(command_prefix)
             .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?;
-        let scope = if scope.exports_declaration() {
-            checked
-                .checked
-                .public_scope
-                .as_ref()
-                .ok_or_else(|| {
-                    invalid(
-                        entry,
-                        prefix_end,
-                        "checked public completion scope is unavailable",
-                    )
-                })?
-                .for_command_prefix(command_prefix)
+        // A public theorem's statement is elaborated against public imports,
+        // but its proof may use private implementation details. Read only the
+        // actual header boundary so a default binder's `:=`, or `let` inside
+        // the result type, cannot expose private names in the statement.
+        let public_header = scope.exports_declaration()
+            && fln_parse::command_scope::modifiers::theorem_body_start(command_prefix)
                 .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
-        } else {
-            scope
-        };
-        let environment = if scope.exports_declaration() {
+                .is_none();
+        let environment = if public_header {
             checked.checked.public_environment.as_ref().ok_or_else(|| {
                 invalid(
                     entry,
@@ -217,7 +208,7 @@ impl SourceModuleSession {
                 // map walk as a complete, schedule-independent answer.
                 return Err(limit("completion candidates", limits.max_candidates));
             }
-            let Some((label, leaf)) = source_name(name, limits.max_name_bytes)
+            let Some((label, leaf)) = source_name(name, limits.max_name_bytes, Some(&scope))
                 .map_err(|()| limit("completion name bytes", limits.max_name_bytes))?
             else {
                 continue;
@@ -275,7 +266,11 @@ fn invalid(module: &Name, offset: usize, message: &str) -> SourceModuleCheckErro
 /// Only ordinary source identifiers are emitted in this first profile. In
 /// particular, a numeric/internal component or an escaped dot is never flattened
 /// into another global's spelling. Bounds precede component copies.
-fn source_name(name: &Name, max_bytes: usize) -> Result<Option<(String, String)>, ()> {
+fn source_name(
+    name: &Name,
+    max_bytes: usize,
+    scope: Option<&fln_elab::source::scope::SourceScope>,
+) -> Result<Option<(String, String)>, ()> {
     let mut current = name.clone();
     let mut parts = Vec::new();
     let mut bytes = 0usize;
@@ -284,6 +279,12 @@ fn source_name(name: &Name, max_bytes: usize) -> Result<Option<(String, String)>
             return Ok(None);
         }
         let LeafView::Str(part) = current.leaf_view() else {
+            // The exact own-module private prefix may be omitted, after the
+            // same component/byte bounds as ordinary names. Calling user_name
+            // on this numeric prefix avoids copying an unbounded suffix first.
+            if scope.is_some_and(|scope| scope.user_name(&current).is_anonymous()) {
+                break;
+            }
             return Ok(None);
         };
         bytes = bytes
@@ -526,13 +527,42 @@ mod tests {
         ] {
             assert_eq!(token(source, source.len()), None, "{source}");
         }
-        assert_eq!(source_name(&Name::from_components(["a.b"]), 4096), Ok(None));
-        assert_eq!(source_name(&Name::default(), 4096), Ok(None));
         assert_eq!(
-            source_name(&Name::from_components(["x"]), 1),
+            source_name(&Name::from_components(["a.b"]), 4096, None),
+            Ok(None)
+        );
+        assert_eq!(source_name(&Name::default(), 4096, None), Ok(None));
+        assert_eq!(
+            source_name(&Name::from_components(["x"]), 1, None),
             Ok(Some(("x".into(), "x".into())))
         );
-        assert!(source_name(&Name::from_components(["xx"]), 1).is_err());
+        assert!(source_name(&Name::from_components(["xx"]), 1, None).is_err());
+    }
+
+    #[test]
+    fn own_private_aliases_keep_name_limits_and_foreign_names_stay_internal() {
+        let scope = fln_elab::source::scope::SourceScope {
+            private_module: Some(Name::from_components(["Main"])),
+            ..Default::default()
+        };
+        let private = |module, name: &Name| {
+            Name::num(Name::from_components(["_private", module]), 0).append_core(name)
+        };
+        let name = Name::from_components(["API", "helper"]);
+        assert_eq!(
+            source_name(&private("Main", &name), 10, Some(&scope)),
+            Ok(Some(("API.helper".into(), "helper".into())))
+        );
+        assert_eq!(
+            source_name(&private("Other", &name), 4096, Some(&scope)),
+            Ok(None)
+        );
+        assert!(source_name(&private("Main", &name), 9, Some(&scope)).is_err());
+        let deep = Name::from_components(std::iter::repeat_n("x", 257));
+        assert_eq!(
+            source_name(&private("Main", &deep), 4096, Some(&scope)),
+            Ok(None)
+        );
     }
 
     #[test]

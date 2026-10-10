@@ -1,9 +1,13 @@
 //! Native source simp sets, attached to immutable environment snapshots.
 //!
 //! This is a versioned source journal, not the Reference's serialized extension.
-//! Entries select existing safe definitions or equality lemmas; they carry no
+//! Entries select existing safe definitions or proposition lemmas; they carry no
 //! proof authority. The ordinary elaborator and both checkers validate all uses.
-use fln_core::{expr::ExprNode, name::Name};
+use fln_core::{
+    expr::{Expr, ExprNode},
+    level::{Level, LevelView},
+    name::Name,
+};
 use fln_env::{
     constants::{ConstantInfo, DefinitionSafety},
     environment::Environment,
@@ -213,12 +217,18 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
         // a proposition. Forward rules can now compile its conclusion to True
         // or a final refutation to False; no new typing authority is added here.
         ConstantInfo::Thm(_) if !reverse => return Ok(()),
+        ConstantInfo::Axiom(a) if !a.is_unsafe && !reverse => {
+            return if is_proposition(env, &a.base.type_)? {
+                Ok(())
+            } else {
+                Err(SimpSetError::UnsupportedDeclaration(name.clone()))
+            };
+        }
         ConstantInfo::Thm(t) => &t.base.type_,
         ConstantInfo::Axiom(a) if !a.is_unsafe => &a.base.type_,
         _ => return Err(SimpSetError::UnsupportedDeclaration(name.clone())),
     };
-    // Reversed rules and axioms retain the bounded equality/Iff classifier.
-    // In particular a data-valued axiom is not classified as a proposition.
+    // Reversed rules retain the bounded equality/Iff classifier.
     let mut applications = 0;
     for _ in 0..MAX_ROWS {
         match ty.node() {
@@ -242,6 +252,111 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
         }
     }
     Err(SimpSetError::Limit)
+}
+
+/// The pin's `isPropQuick` / `isArrowProp` sufficient condition, extended to
+/// closed telescope variables. Inspect only already admitted types and require
+/// their instantiated result sort to be always zero. This does not reconstruct
+/// terms or grant proof authority. Aliases/projections needing normalization
+/// remain unsupported; the ordinary tactic driver still checks every use.
+fn is_proposition(env: &Environment, expression: &Expr) -> Result<bool, SimpSetError> {
+    let mut remaining = MAX_ROWS;
+    let mut spend = || -> Result<(), SimpSetError> {
+        remaining = remaining.checked_sub(1).ok_or(SimpSetError::Limit)?;
+        Ok(())
+    };
+    let mut locals = Vec::new();
+    let mut ty = expression;
+    let mut arity = 0usize;
+    let (mut head_type, parameters, arguments) = loop {
+        spend()?;
+        match ty.node() {
+            ExprNode::MData { expr, .. } => ty = expr,
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } if arity == 0 => {
+                locals.push(binder_type);
+                ty = body;
+            }
+            ExprNode::LetE { type_, body, .. } => {
+                locals.push(type_);
+                ty = body;
+            }
+            ExprNode::App { f, .. } => {
+                arity += 1;
+                ty = f;
+            }
+            ExprNode::Const { name, levels } => {
+                let Some(info) = env.find(name) else {
+                    return Ok(false);
+                };
+                let base = info.constant_val();
+                if base.level_params.len() != levels.len() {
+                    return Ok(false);
+                }
+                break (&base.type_, base.level_params.as_slice(), levels.as_slice());
+            }
+            ExprNode::BVar { idx } => {
+                let Some(index) = locals.len().checked_sub(*idx as usize + 1) else {
+                    return Ok(false);
+                };
+                break (locals[index], &[][..], &[][..]);
+            }
+            _ => return Ok(false),
+        }
+    };
+    loop {
+        spend()?;
+        match head_type.node() {
+            ExprNode::MData { expr, .. } | ExprNode::LetE { body: expr, .. } => head_type = expr,
+            ExprNode::ForallE { body, .. } if arity != 0 => {
+                arity -= 1;
+                head_type = body;
+            }
+            ExprNode::Sort { level } if arity == 0 => {
+                return always_zero(level, parameters, arguments, &mut spend);
+            }
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// Substitute declaration universe parameters once, with the same total meter
+/// as the expression walk. Substituted arguments are in the caller's universe
+/// context and must not be interpreted as the callee's parameters a second time.
+fn always_zero(
+    level: &Level,
+    parameters: &[Name],
+    arguments: &[Level],
+    spend: &mut impl FnMut() -> Result<(), SimpSetError>,
+) -> Result<bool, SimpSetError> {
+    let mut pending = vec![(level, true)];
+    while let Some((level, substitute)) = pending.pop() {
+        spend()?;
+        match level.view() {
+            LevelView::Zero => {}
+            LevelView::Max(left, right) => {
+                pending.extend([(right, substitute), (left, substitute)]);
+            }
+            LevelView::IMax(_, right) => pending.push((right, substitute)),
+            LevelView::Param(name) if substitute => {
+                let mut replacement = None;
+                for (parameter, argument) in parameters.iter().zip(arguments) {
+                    spend()?;
+                    if parameter == name {
+                        replacement = Some(argument);
+                        break;
+                    }
+                }
+                let Some(replacement) = replacement else {
+                    return Ok(false);
+                };
+                pending.push((replacement, false));
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], SimpSetError> {
     if bytes.len() < n {

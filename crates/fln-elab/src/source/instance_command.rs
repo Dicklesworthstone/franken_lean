@@ -8,6 +8,34 @@ pub(super) struct Parts<'a> {
     pub value: &'a Syntax,
     pub priority: u32,
 }
+
+/// The pin exposes an instance body automatically exactly when its header is
+/// not a proposition (`MutualDef.finishElab`). Proof-class instances need a
+/// hidden implementation and an exported interface, which this command route
+/// does not yet provide. Classifying the result in its actual local telescope
+/// also handles parameterized instances and classes containing proof fields.
+pub(super) fn check_public_exposure(
+    context: &mut Context,
+    result: &Expr,
+) -> Result<(), NatDefinitionElabError> {
+    if !context.source_scope.exports_declaration() {
+        return Ok(());
+    }
+    let sort = context
+        .known_type(result)?
+        .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+    let sort = context.whnf(&sort)?;
+    let ExprNode::Sort { level } = sort.node() else {
+        return Err(failure(SourceInferenceError::ExpectedType));
+    };
+    if level.normalize().is_zero() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "public instances with non-Prop result types; proof instance interfaces are not yet supported",
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError> {
     let args = expect_node(
         syntax,

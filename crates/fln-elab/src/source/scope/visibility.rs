@@ -130,9 +130,10 @@ impl SourceScope {
 
     /// Compute one declaration's visibility without mutating section defaults.
     /// The caller must choose the corresponding environment *before* elaboration.
-    /// This native slice exports fully exposed definitions and complete public
-    /// data bundles. Ordinary hidden-body public definitions and proofs require
-    /// separate logical and executable entries and are explicitly refused.
+    /// This native slice exports fully exposed definitions, data instances and
+    /// complete public data bundles. A public theorem selects its exported
+    /// signature world; the theorem driver separately checks its hidden proof.
+    /// Ordinary hidden-body public definitions remain explicitly refused.
     pub fn for_declaration(&self, syntax: &Syntax) -> Result<Self, NatDefinitionElabError> {
         let declaration = expect_node(
             syntax,
@@ -178,6 +179,18 @@ impl SourceScope {
                         "@[expose] public definitions; hidden bodies are not yet exported",
                     ));
                 }
+            } else if kind == Some(&parser_kind(&["Command", "instance"])) {
+                // MutualDef.finishElab automatically exposes data instances.
+                // Whether the result is a proposition is established from the
+                // elaborated header, before entering its body. This selector
+                // only chooses the public environment for that elaboration.
+                if no_expose {
+                    return Err(refused("public data instances with exposed bodies"));
+                }
+            } else if kind == Some(&parser_kind(&["Command", "theorem"])) {
+                if expose || no_expose {
+                    return Err(refused("public theorems without exposure attributes"));
+                }
             } else if kind == Some(&parser_kind(&["Command", "inductive"]))
                 || kind == Some(&parser_kind(&["Command", "structure"]))
             {
@@ -186,7 +199,7 @@ impl SourceScope {
                 }
             } else {
                 return Err(refused(
-                    "exposed public definitions or public data declarations",
+                    "exposed public definitions, data instances, theorems or public data declarations",
                 ));
             }
         }

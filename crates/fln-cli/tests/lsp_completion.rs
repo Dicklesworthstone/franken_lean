@@ -345,3 +345,83 @@ fn public_completion_uses_exported_imports_without_parsing_the_unfinished_body()
         }
     }
 }
+
+#[test]
+fn public_theorem_completion_switches_from_public_header_to_private_proof() {
+    let fixture = Fixture::new();
+    let secret = fixture.uri("Secret.lean");
+    let api = fixture.uri("Api.lean");
+    let main = fixture.uri("Main.lean");
+    let imports = "module\nprelude\nimport Secret\npublic import Api\nprivate theorem hiddenLocal (P : Prop) (h : P) : P := h\n";
+    let cases = [
+        ("public theorem use (P : hid", false),
+        ("public theorem use (P : Prop) (h : P) : hid", false),
+        (
+            "public theorem use (P : Prop) (h : P := by assumption) : hid",
+            false,
+        ),
+        (
+            "public theorem use (P : Prop) (h : P) : let Q := P; hid",
+            false,
+        ),
+        (
+            "public theorem use (P : Prop) (h : P) : P := by exact hid",
+            true,
+        ),
+        (
+            "public section\ntheorem use (P : Prop) (h : P) : P := hid",
+            true,
+        ),
+        (
+            "set_option maxRecDepth 256 in public theorem use (P : Prop) (h : P) : P := hid",
+            true,
+        ),
+        ("public theorem use (P : Prop) : P -> P | h => hid", true),
+        ("private theorem use (P : Prop) (h : P) : hid", true),
+    ];
+    for (binary, arg) in front_doors() {
+        let visible = format!("{imports}public theorem use (P : Prop) : vis");
+        let mut requests = vec![
+            open(
+                &secret,
+                "prelude\ntheorem hiddenProof (P : Prop) (h : P) : P := h",
+            ),
+            open(&api, "prelude\ndef visibleStatement (P : Prop) : Prop := P"),
+            open(&main, &visible),
+            request(100, &main, &visible, visible.len()),
+        ];
+        for (index, (declaration, _)) in cases.iter().enumerate() {
+            let source = format!("{imports}{declaration}");
+            requests.push(change(&main, index + 2, &source));
+            requests.push(request(101 + index, &main, &source, source.len()));
+        }
+        let messages = run(binary, arg, &requests);
+        assert!(
+            has_item(&messages, 100, "visibleStatement"),
+            "{messages:#?}"
+        );
+        for (index, (declaration, private)) in cases.iter().enumerate() {
+            let id = 101 + index;
+            assert!(
+                response(&messages, id).contains("\"items\":"),
+                "{declaration}: {messages:#?}"
+            );
+            assert_eq!(
+                has_item(&messages, id, "hiddenProof"),
+                *private,
+                "{declaration}: {messages:#?}"
+            );
+            assert_eq!(
+                has_item(&messages, id, "hiddenLocal"),
+                *private,
+                "{declaration}: {messages:#?}"
+            );
+            if *private {
+                assert!(
+                    response(&messages, id).contains("\"newText\":\"_root_.hiddenLocal\""),
+                    "{messages:#?}"
+                );
+            }
+        }
+    }
+}

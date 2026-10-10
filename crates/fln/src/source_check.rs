@@ -556,25 +556,43 @@ impl Engine {
                     scopes.current.clone()
                 };
                 let exported = scope.exports_declaration() && public.is_some();
-                let predecessor = if exported {
-                    public.as_ref().expect("public module receipt").engine()
+                let (next, admitted) = if exported {
+                    match grammar
+                        .enter(|| {
+                            public
+                                .as_deref_mut()
+                                .expect("public module receipt")
+                                .admit_command(
+                                    &engine,
+                                    command,
+                                    options,
+                                    limits.admission,
+                                    &scope,
+                                    &scopes.current,
+                                )
+                        })
+                        .map_err(|error| command_error(file, count, start, error))?
+                    {
+                        Outcome::Complete(result) => result,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
                 } else {
-                    &engine
-                };
-                let result = grammar
-                    .enter(|| {
-                        predecessor.admit_source_command_in_scope(
-                            command,
-                            options,
-                            limits.admission,
-                            &scope,
-                        )
-                    })
-                    .map_err(|error| command_error(file, count, start, error))?;
-                let admitted = match result {
-                    Outcome::Complete(admitted) => admitted,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    match grammar
+                        .enter(|| {
+                            engine.admit_source_command_in_scope(
+                                command,
+                                options,
+                                limits.admission,
+                                &scope,
+                            )
+                        })
+                        .map_err(|error| command_error(file, count, start, error))?
+                    {
+                        Outcome::Complete(admitted) => (admitted.engine.clone(), admitted),
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
                 };
                 theorems += admitted
                     .admissions
@@ -587,30 +605,7 @@ impl Engine {
                         journal.push(row.declaration.clone());
                     }
                 }
-                engine = if exported {
-                    match public
-                        .as_deref_mut()
-                        .expect("public module receipt")
-                        .publish(
-                            &engine,
-                            admitted.engine,
-                            admitted
-                                .admissions
-                                .iter()
-                                .map(|row| row.declaration.clone())
-                                .collect(),
-                            &scope,
-                            options,
-                        )
-                        .map_err(|error| command_error(file, count, start, error))?
-                    {
-                        Outcome::Complete(engine) => engine,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    }
-                } else {
-                    admitted.engine
-                };
+                engine = next;
                 count += 1;
             }
             if let Some(public) = public.as_deref_mut() {

@@ -135,6 +135,9 @@ pub(super) fn module(
                     },
                 }
             })?;
+            let public_theorem =
+                scope.exports_declaration() && fln_elab::source::is_theorem(parsed.syntax());
+            let private_scope = scope.clone();
             let environment = if scope.exports_declaration() {
                 scope.instance_scopes = prefix
                     .checked
@@ -156,16 +159,31 @@ pub(super) fn module(
                 .source_view()
                 .from_original(fln_parse::BytePos(offset - prefix_end))
             {
-                let inspected =
-                    source_records::elaboration_outcome(fln_elab::source::inspect::declaration(
+                let observed = if public_theorem {
+                    fln_elab::source::inspect::public_theorem(
+                        parsed.syntax(),
+                        &fln_elab::source::TheoremWorlds {
+                            public: environment,
+                            private: prefix.checked.checked.engine.environment(),
+                            public_scope: &scope,
+                            private_scope: &private_scope,
+                        },
+                        limits.source.admission.kernel,
+                        position.0,
+                        kind,
+                    )
+                } else {
+                    fln_elab::source::inspect::declaration(
                         parsed.syntax(),
                         environment,
                         limits.source.admission.kernel,
                         &scope,
                         position.0,
                         kind,
-                    ))
-                    .map_err(|error| SourceModuleCheckError::Source {
+                    )
+                };
+                let inspected = source_records::elaboration_outcome(observed).map_err(|error| {
+                    SourceModuleCheckError::Source {
                         module: entry.clone(),
                         error: SourceCheckError::Command {
                             file: 0,
@@ -173,7 +191,8 @@ pub(super) fn module(
                             offset: prefix_end,
                             error: Box::new(error),
                         },
-                    })?;
+                    }
+                })?;
                 observation = match inspected {
                     Outcome::Complete(observation) => observation,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -194,6 +213,13 @@ pub(super) fn module(
                                 .source_view()
                                 .to_original(fln_parse::BytePos(range.end))
                                 .0;
+                }
+                if public_theorem
+                    && fln_parse::command_scope::modifiers::theorem_body_start(command)
+                        .map_err(|error| scope_error(&error.to_string()))?
+                        .is_some_and(|body| offset - prefix_end >= body)
+                {
+                    scope.instance_scopes = private_scope.instance_scopes;
                 }
             }
         }

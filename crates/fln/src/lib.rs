@@ -7356,16 +7356,18 @@ impl Engine {
             if scope.exports_declaration()
                 && let Some(public) = public.as_deref_mut()
             {
-                // Exposed public definitions and complete data bundles are
-                // checked in the export world before entering the private
-                // executable world. Queries continue to observe the latter.
-                let admission = match grammar
+                // Public interfaces are fixed in the export world; a theorem
+                // alone checks its hidden proof privately before publication.
+                // Queries continue to observe the complete private world.
+                let (next, admission) = match grammar
                     .enter(|| {
-                        public.engine().admit_source_command_in_scope(
+                        public.admit_command(
+                            &engine,
                             command_source,
                             options,
                             limits.admission(),
                             &scope,
+                            &scopes.current,
                         )
                     })
                     .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7373,31 +7375,11 @@ impl Engine {
                         error: Box::new(error),
                         at: Some(original_offset),
                     })? {
-                    Outcome::Complete(admission) => admission,
+                    Outcome::Complete(result) => result,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                engine = match public
-                    .publish(
-                        &engine,
-                        admission.engine.clone(),
-                        admission
-                            .admissions
-                            .iter()
-                            .map(|row| row.declaration.clone())
-                            .collect(),
-                        &scope,
-                        options,
-                    )
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })? {
-                    Outcome::Complete(engine) => engine,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
+                engine = next;
                 for row in &admission.admissions {
                     scopes.admitted(&row.declaration);
                 }

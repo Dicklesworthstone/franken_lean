@@ -76,9 +76,9 @@ fn hidden_public_bodies_and_public_mutual_groups_remain_explicit_refusals() {
     public.expose_definitions = true;
     for source in [
         "@[no_expose] def hidden (a : Type) (x : a) : a := x",
-        "public theorem proof (p : Prop) (h : p) : p := h",
         "@[expose] public theorem proof (p : Prop) (h : p) : p := h",
-        "public instance dictionary : Type := Type",
+        "@[no_expose] public theorem proof (p : Prop) (h : p) : p := h",
+        "@[no_expose] public instance dictionary : Type := Type",
         "mutual inductive A where | mk inductive B where | mk end",
         "mutual inductive A where | mk public inductive B where | mk end",
     ] {
@@ -103,6 +103,46 @@ fn hidden_public_bodies_and_public_mutual_groups_remain_explicit_refusals() {
             .unwrap()
             .exports_declaration()
     );
+}
+
+#[test]
+fn public_instance_and_theorem_headers_select_the_exported_world() {
+    for scope in [
+        module(),
+        SourceScope {
+            public_declarations: true,
+            expose_definitions: true,
+            ..module()
+        },
+    ] {
+        for source in [
+            "public instance dictionary : Type := Type",
+            "@[expose] public instance dictionary : Type := Type",
+            "public theorem proof (p : Prop) (h : p) : p := h",
+        ] {
+            let effective = scope.for_command_source(source.as_bytes()).unwrap();
+            assert!(effective.exports_declaration(), "{source}");
+            assert_eq!(effective.private_module, scope.private_module);
+        }
+    }
+    let public = SourceScope {
+        public_declarations: true,
+        ..module()
+    };
+    assert!(
+        public
+            .for_command_source(b"instance dictionary : Type := Type")
+            .unwrap()
+            .exports_declaration()
+    );
+    assert!(
+        !public
+            .for_command_source(b"private instance dictionary : Type := Type")
+            .unwrap()
+            .exports_declaration()
+    );
+    // Header selection grants no admission: the instance elaborator still
+    // checks the class and result sort before accepting its body.
 }
 
 #[test]

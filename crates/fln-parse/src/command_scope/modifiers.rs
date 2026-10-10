@@ -171,6 +171,49 @@ pub fn prefix(source: &[u8]) -> Result<Option<DeclarationPrefix>, DefinitionPars
     }))
 }
 
+/// Locate a theorem's value opener without parsing its unfinished proof. This
+/// uses the ordinary declaration header boundaries: a binder default or a local
+/// binding in the result type does not start the proof. An unfinished header
+/// has no value boundary yet. The returned position is in the original bytes.
+pub fn theorem_body_start(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = super::tokens(&view)?;
+    let (_, _, declaration_start) =
+        crate::declaration_prefix(&view, &tokens, DefinitionGrammar::Scalar)?;
+    if !matches!(tokens.get(declaration_start).map(|token| &token.kind),
+        Some(TokenKind::Symbol(kind)) if kind == "theorem")
+        || !matches!(
+            tokens.get(declaration_start + 1).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        )
+    {
+        return Ok(None);
+    }
+    let Ok((_, cursor)) = crate::levels::declaration_suffix(&view, &tokens, declaration_start + 2)
+    else {
+        return Ok(None);
+    };
+    let Ok((_, cursor)) =
+        crate::signature_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)
+    else {
+        return Ok(None);
+    };
+    if !matches!(tokens.get(cursor).map(|token| &token.kind),
+        Some(TokenKind::Symbol(kind)) if kind == ":")
+    {
+        return Ok(None);
+    }
+    let start = cursor + 1;
+    let mut end =
+        crate::type_end(&tokens, start, ":=").min(crate::type_end(&tokens, start, "where"));
+    let pipe = crate::type_end(&tokens, start, "|");
+    if !crate::top_level_match(&tokens, start, pipe) {
+        end = end.min(pipe);
+    }
+    Ok((start < end && end < tokens.len()).then(|| view.to_original(tokens[end].extent.start()).0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +259,50 @@ mod tests {
         ] {
             assert_eq!(prefix(source.as_bytes()).unwrap(), None, "{source}");
         }
+    }
+
+    #[test]
+    fn theorem_completion_switches_only_after_the_actual_header() {
+        for header in [
+            "public theorem",
+            "public theorem t (x :",
+            "public theorem t.{u",
+            "public theorem t (x : Nat := 0) : x = x",
+            "public theorem t : let P := True; P",
+            "public theorem t : letI : C := value; P",
+            "public theorem t : (\" := \" = \" := \")",
+            "public theorem t («:=» : Prop) : «:=»",
+            "public theorem t : match true with | true => True | false => False",
+        ] {
+            assert_eq!(
+                theorem_body_start(header.as_bytes()).unwrap(),
+                None,
+                "{header}"
+            );
+        }
+        for source in [
+            "public theorem t : True :=",
+            "public theorem t.{u} (A : Sort u) (x : A) : x = x := by",
+            "public theorem t (x : Nat := 0) : x = x := by exact (",
+            "public theorem t : let P := True; P := by exact",
+            "@[simp] public theorem t : True /- := is trivia -/ := by",
+            "/-- proof -/\r\npublic theorem t : True := by\r\n  exact",
+        ] {
+            assert_eq!(
+                theorem_body_start(source.as_bytes()).unwrap(),
+                source.rfind(":="),
+                "{source}"
+            );
+        }
+        for (source, marker) in [
+            ("public theorem t (n : Nat) : n = n\n| .zero =>", "|"),
+            ("public theorem t : True where", "where"),
+        ] {
+            assert_eq!(
+                theorem_body_start(source.as_bytes()).unwrap(),
+                source.find(marker)
+            );
+        }
+        assert_eq!(theorem_body_start(b"public def t : Nat :=").unwrap(), None);
     }
 }

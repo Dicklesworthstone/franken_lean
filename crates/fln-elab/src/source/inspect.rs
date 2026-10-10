@@ -80,7 +80,30 @@ pub fn declaration(
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
-    let mut context = Context::scoped(environment, kernel, &scope);
+    let context = Context::scoped(environment, kernel, &scope);
+    declaration_in_context(syntax, context, offset, kind)
+}
+
+/// Observe a module's public theorem with its exported header and private proof
+/// in the same worlds used by ordinary elaboration. A proof observation cannot
+/// change or rescue an incomplete exported signature.
+pub fn public_theorem(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
+    let context = Context::public_theorem(syntax, worlds, kernel)?;
+    declaration_in_context(syntax, context, offset, kind)
+}
+
+fn declaration_in_context(
+    syntax: &Syntax,
+    mut context: Context,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
     // There will be no final declaration admission to discharge earlier rigid
     // equations. Check them when generated instead of deferring to that door.
     context.attempt_depth = 1;

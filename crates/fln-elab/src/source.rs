@@ -448,6 +448,11 @@ impl SourceEquation {
 #[derive(Clone)]
 struct Context {
     inspection: Option<inspect::Probe>,
+    // A public theorem fixes its signature in the exported world before its
+    // proof may see private imports. Both environments are untrusted inputs to
+    // elaboration; the caller still admits the complete theorem ordinarily.
+    private_theorem_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
+    public_theorem_signature: Option<ConstantVal>,
     source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
@@ -535,6 +540,8 @@ impl Context {
         txn.budget.max_heartbeats = 1_000_000;
         Self {
             inspection: None,
+            private_theorem_body: None,
+            public_theorem_signature: None,
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
@@ -3829,6 +3836,109 @@ impl Context {
     }
 }
 
+/// The two checked predecessor views used by a module's public theorem. The
+/// signature sees `public`; only its proof sees `private`. Scope histories are
+/// supplied separately because each anchors a different instance journal.
+#[derive(Clone, Copy)]
+pub struct TheoremWorlds<'a> {
+    pub public: &'a Environment,
+    pub private: &'a Environment,
+    pub public_scope: &'a SourceScope,
+    pub private_scope: &'a SourceScope,
+}
+
+/// Whether the parsed command is an ordinary named theorem declaration.
+pub fn is_theorem(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Command", "declaration"])
+            && args.len() == 2
+            && args[1].kind() == Some(&parser_kind(&["Command", "theorem"])))
+}
+
+/// Elaborate a public theorem's header and proof in their respective worlds.
+/// This produces only an untrusted candidate, never an exported assumption or
+/// an environment successor. Its proof must pass ordinary declaration admission.
+pub fn elaborate_public_theorem(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let mut context = Context::public_theorem(syntax, worlds, kernel)?;
+    definition_in_context(syntax, &mut context)
+}
+
+impl Context {
+    fn public_theorem(
+        syntax: &Syntax,
+        worlds: &TheoremWorlds<'_>,
+        kernel: Budget,
+    ) -> Result<Self, NatDefinitionElabError> {
+        let scope = worlds.public_scope.for_declaration(syntax)?;
+        if !is_theorem(syntax) || !scope.exports_declaration() {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a public theorem in a module file",
+            });
+        }
+        let mut context = Self::scoped(worlds.public, kernel, &scope);
+        context.private_theorem_body = Some((
+            worlds.private.clone(),
+            worlds.private_scope.instance_scopes.clone(),
+        ));
+        Ok(context)
+    }
+
+    /// Close and retain the exact header before changing either name resolution
+    /// or instance search. Header universes become rigid parameters here, as in
+    /// the pin's `levelMVarToParamHeaders` / theorem signature publication.
+    fn enter_public_theorem_proof(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        section_parameters: &[LocalDecl],
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut roots: Vec<_> = section_parameters
+            .iter()
+            .chain(parameters)
+            .map(|local| local.type_.clone())
+            .collect();
+        roots.push(expected.clone());
+        self.generalize_declaration_universes(&roots)?;
+        let mut type_ = self.instantiate(expected)?;
+        for local in section_parameters.iter().chain(parameters).rev() {
+            self.tick()?;
+            type_ = Expr::forall_e(
+                local.user_name.clone(),
+                self.instantiate(&local.type_)?,
+                type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
+        self.require_resolved(std::slice::from_ref(&type_))?;
+        if type_.has_fvar() || type_.has_loose_bvars() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let level_params = self.declaration_levels(std::slice::from_ref(&type_))?;
+        self.public_theorem_signature = Some(ConstantVal {
+            name: name.clone(),
+            level_params,
+            type_,
+        });
+        let (environment, instance_scopes) = self
+            .private_theorem_body
+            .take()
+            .expect("a public theorem enters its proof exactly once");
+        self.txn.env = environment;
+        self.source_scope.instance_scopes = instance_scopes;
+        self.registry_cache = crate::instances::RegistryCache::default();
+        self.alias_cache = crate::aliases::AliasCache::default();
+        self.protected_cache = crate::protected_names::ProtectedCache::default();
+        Ok(())
+    }
+}
+
 pub(super) fn definition(
     syntax: &Syntax,
     environment: &Environment,
@@ -4008,6 +4118,14 @@ fn definition_in_context_named(
         // holes and unresolved header instances must not cross this boundary.
         context.require_resolved_terms(&types)?;
     }
+    if is_instance {
+        instance_command::check_public_exposure(
+            context,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?;
+    }
     if anonymous_instance {
         let expected = expected
             .as_ref()
@@ -4024,6 +4142,18 @@ fn definition_in_context_named(
     } else {
         None
     };
+    if context.private_theorem_body.is_some() {
+        context.enter_public_theorem_proof(
+            name,
+            &parameters,
+            theorem_section_parameters
+                .as_deref()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?;
+    }
     let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
     let struct_instance;
     let empty_suffix;
@@ -4170,12 +4300,25 @@ fn definition_in_context_named(
         context.check_compiled_recursors(&term.value)?;
     }
     let level_params = context.declaration_levels(&[term.type_.clone(), term.value.clone()])?;
-    let base = ConstantVal {
+    let mut base = ConstantVal {
         name: name.clone(),
         level_params,
         type_: term.type_,
     };
     if is_theorem {
+        if let Some(signature) = &context.public_theorem_signature {
+            if base.name != signature.name || base.level_params != signature.level_params {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "a public theorem proof preserving its closed signature",
+                });
+            }
+            // Equation elaboration may introduce fresh binder names or unfold
+            // a function-valued statement while building its proof. Preserve
+            // the exact original statement; ordinary theorem admission checks
+            // the produced proof against this frozen header, not that rebuilt
+            // body type. No proof can change the public declaration's type.
+            base = signature.clone();
+        }
         Ok(Declaration::Thm(fln_env::constants::TheoremVal {
             base,
             value: term.value,
