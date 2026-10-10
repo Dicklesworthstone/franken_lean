@@ -4,6 +4,7 @@
 use super::{Obj, canonical_stdio_string, native_stdio_ctor_shape, stdio_result_transport};
 
 mod bytes;
+mod directory;
 mod read;
 
 /// A bounded file-read failure. Consumed counts refer to original file bytes.
@@ -39,7 +40,7 @@ pub enum FileReadError {
 }
 
 /// Invalid inputs are rejected before filesystem effects. The remaining
-/// failures describe an attempted open/write and promise no rollback.
+/// failures describe an attempted filesystem operation and promise no rollback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileIoError {
     InvalidFilename,
@@ -51,6 +52,7 @@ pub enum FileIoError {
     MalformedOpenResult,
     UnrepresentableWrite { errno: i32, bytes_written: usize },
     MalformedWriteResult { bytes_written: usize },
+    MalformedDirectoryResult,
 }
 
 impl Obj {

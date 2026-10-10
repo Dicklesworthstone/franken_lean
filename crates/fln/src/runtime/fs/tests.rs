@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 mod bytes;
 mod read;
+mod read_dir;
 
 const STACK: usize = 256 * 1024 * 1024;
 

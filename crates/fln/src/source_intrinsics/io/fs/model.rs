@@ -76,8 +76,8 @@ pub(super) fn handle() -> ConstantInfo {
     })
 }
 
-pub(super) fn open_layout() -> Vec<ConstantInfo> {
-    let mut output = vec![
+fn path_layout() -> Vec<ConstantInfo> {
+    vec![
         inductive("System.FilePath", vec![name("System.FilePath.mk")]),
         constructor(
             "System.FilePath.mk",
@@ -98,7 +98,38 @@ pub(super) fn open_layout() -> Vec<ConstantInfo> {
             safety: DefinitionSafety::Safe,
             all: vec![name("System.FilePath.toString")],
         }),
-    ];
+    ]
+}
+
+pub(super) fn directory_layout() -> Vec<ConstantInfo> {
+    let mut output = path_layout();
+    output.push(inductive("IO.FS.DirEntry", vec![name("IO.FS.DirEntry.mk")]));
+    output.push(constructor(
+        "IO.FS.DirEntry.mk",
+        "IO.FS.DirEntry",
+        0,
+        vec![c("System.FilePath"), c("String")],
+    ));
+    for (index, label, type_) in [
+        (0, "IO.FS.DirEntry.root", c("System.FilePath")),
+        (1, "IO.FS.DirEntry.fileName", c("String")),
+    ] {
+        output.push(ConstantInfo::Defn(DefinitionVal {
+            base: base(label, pi(c("IO.FS.DirEntry"), type_, BinderInfo::Default)),
+            value: lam(
+                c("IO.FS.DirEntry"),
+                Expr::proj(name("IO.FS.DirEntry"), index, b(0)),
+            ),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![name(label)],
+        }));
+    }
+    output
+}
+
+pub(super) fn open_layout() -> Vec<ConstantInfo> {
+    let mut output = path_layout();
     let labels = ["read", "write", "writeNew", "readWrite", "append"];
     let constructors: Vec<_> = labels
         .iter()
@@ -177,30 +208,58 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
         Operation::GetLine => (vec![c("IO.FS.Handle")], c("String")),
         Operation::Read => (vec![c("IO.FS.Handle"), c("USize")], c("ByteArray")),
         Operation::Write => (vec![c("IO.FS.Handle"), c("ByteArray")], c("Unit")),
+        Operation::ReadDir => (
+            vec![c("System.FilePath")],
+            Expr::app(
+                Expr::const_(name("Array"), vec![Level::zero()]),
+                c("IO.FS.DirEntry"),
+            ),
+        ),
     };
     let action = Expr::app(c("IO"), result.clone());
-    let default = apply(
-        Expr::const_(name("Inhabited.default"), vec![Level::one()]),
-        [
-            action.clone(),
-            apply(
-                c("instInhabitedEIO"),
-                [c("IO.Error"), result, c("instInhabitedError")],
-            ),
-        ],
+    let instance = apply(
+        c("instInhabitedEIO"),
+        [c("IO.Error"), result, c("instInhabitedError")],
     );
+    let type_ = domains.iter().rev().fold(action.clone(), |body, domain| {
+        pi(domain.clone(), body, BinderInfo::Default)
+    });
+    let value = if operation == Operation::ReadDir {
+        // The pin declares readDir's entire function type after the colon.
+        // Its opaque default therefore inhabits that function through Pi,
+        // rather than lambda-wrapping the result default as Handle methods do.
+        let domain = c("System.FilePath");
+        apply(
+            Expr::const_(name("Inhabited.default"), vec![Level::one()]),
+            [
+                type_.clone(),
+                apply(
+                    Expr::const_(name("Pi.instInhabited"), vec![Level::one(), Level::one()]),
+                    [
+                        domain.clone(),
+                        lam(domain.clone(), action),
+                        lam(domain, instance),
+                    ],
+                ),
+            ],
+        )
+    } else {
+        let default = apply(
+            Expr::const_(name("Inhabited.default"), vec![Level::one()]),
+            [action, instance],
+        );
+        domains
+            .into_iter()
+            .rev()
+            .fold(default, |body, domain| lam(domain, body))
+    };
     ConstantInfo::Opaque(OpaqueVal {
         base: ConstantVal {
             name: operation.source_name(),
             level_params: Vec::new(),
-            type_: domains.iter().rev().fold(action, |body, domain| {
-                pi(domain.clone(), body, BinderInfo::Default)
-            }),
+            type_,
         },
-        value: domains
-            .into_iter()
-            .rev()
-            .fold(default, |body, domain| lam(domain, body)),
+        value,
         is_unsafe: false,
         all: vec![operation.source_name()],
     })

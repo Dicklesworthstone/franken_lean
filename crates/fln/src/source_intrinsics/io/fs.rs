@@ -6,6 +6,7 @@
 use super::*;
 
 mod bytes;
+mod directory;
 mod model;
 pub(crate) use bytes::word_matches;
 #[cfg(test)]
@@ -13,6 +14,8 @@ pub(crate) use bytes::{
     HELPERS as BYTE_HELPERS, WRITE_HELPERS as WRITE_BYTE_HELPERS,
     assert_pin_layouts as assert_pin_byte_layouts, assert_pin_write_dependencies,
 };
+#[cfg(test)]
+pub(crate) use directory::HELPERS as DIRECTORY_HELPERS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operation {
@@ -21,6 +24,7 @@ pub(crate) enum Operation {
     GetLine,
     Read,
     Write,
+    ReadDir,
 }
 
 impl Operation {
@@ -31,24 +35,29 @@ impl Operation {
             Self::GetLine,
             Self::Read,
             Self::Write,
+            Self::ReadDir,
         ]
         .into_iter()
         .find(|operation| requested == &operation.source_name())
     }
 
     pub(crate) fn source_name(self) -> Name {
-        Name::from_components([
-            "IO",
-            "FS",
-            "Handle",
-            match self {
-                Self::Open => "mk",
-                Self::PutStr => "putStr",
-                Self::GetLine => "getLine",
-                Self::Read => "read",
-                Self::Write => "write",
-            },
-        ])
+        let label = match self {
+            Self::Open => "IO.FS.Handle.mk",
+            Self::PutStr => "IO.FS.Handle.putStr",
+            Self::GetLine => "IO.FS.Handle.getLine",
+            Self::Read => "IO.FS.Handle.read",
+            Self::Write => "IO.FS.Handle.write",
+            Self::ReadDir => "System.FilePath.readDir",
+        };
+        Name::from_components(label.split('.'))
+    }
+
+    pub(crate) fn source_arity(self) -> usize {
+        match self {
+            Self::GetLine | Self::ReadDir => 1,
+            _ => 2,
+        }
     }
 
     pub(crate) fn private_name(self) -> Name {
@@ -93,11 +102,11 @@ pub(crate) fn primitive_matches(
     )? {
         return Ok(false);
     }
-    if !handle_matches(environment, externs, visited, limits)?
+    if (operation != Operation::ReadDir && !handle_matches(environment, externs, visited, limits)?)
         || !results::contract_matches(environment, externs, visited, limits)?
     {
         return Err(IngressError::UnsupportedNode {
-            kind: "native filesystem extern requires the complete checked IO and Handle models",
+            kind: "native filesystem extern requires its complete checked IO and receiver models",
         });
     }
     let mut models = vec![model::primitive(operation)];
@@ -115,6 +124,11 @@ pub(crate) fn primitive_matches(
     if operation == Operation::Write {
         bytes::write_contract_matches(environment, externs, visited, limits)?;
     }
+    if operation == Operation::ReadDir {
+        models.extend(model::directory_layout());
+        models.extend(crate::source_intrinsics::string_internal::scalar_records());
+        directory::contract_matches(environment, externs, visited, limits)?;
+    }
     let mut comparison = Comparison { visited, limits };
     for expected in &models {
         if !comparison.constant(environment, expected.clone())? {
@@ -131,14 +145,19 @@ pub(crate) fn primitive_matches(
 
 #[cfg(test)]
 pub(crate) fn assert_pin_models(environment: &Environment) {
-    for expected in model::open_layout().into_iter().chain([
-        model::handle(),
-        model::primitive(Operation::Open),
-        model::primitive(Operation::PutStr),
-        model::primitive(Operation::GetLine),
-        model::primitive(Operation::Read),
-        model::primitive(Operation::Write),
-    ]) {
+    for expected in model::open_layout()
+        .into_iter()
+        .chain(model::directory_layout())
+        .chain([
+            model::handle(),
+            model::primitive(Operation::Open),
+            model::primitive(Operation::PutStr),
+            model::primitive(Operation::GetLine),
+            model::primitive(Operation::Read),
+            model::primitive(Operation::Write),
+            model::primitive(Operation::ReadDir),
+        ])
+    {
         assert!(
             Comparison {
                 visited: &mut 0,

@@ -12,12 +12,14 @@ use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 use io_result::{ErrorLayout, choose};
 use std::collections::BTreeMap;
 mod bytes;
+mod directory;
 
 const HANDLE: &str = "_fln_runtime_fs_handle";
 const PAYLOAD: &str = "_fln_runtime_fs_payload";
 const TRANSPORT: &str = "_fln_runtime_fs_result";
 const READ_TRANSPORT: &str = "_fln_runtime_fs_read_result";
 const BYTES_TRANSPORT: &str = "_fln_runtime_fs_bytes_result";
+const DIRECTORY_TRANSPORT: &str = "_fln_runtime_fs_directory_result";
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -27,14 +29,16 @@ pub(super) struct Store {
     layout: Option<Layout>,
     read_layout: Option<Layout>,
     bytes_layout: Option<Layout>,
+    directory_layout: Option<Layout>,
     bytes: Option<bytes::Layout>,
     write_bytes: Option<bytes::WriteLayout>,
+    directory: Option<directory::Layout>,
 }
 
 #[derive(Clone)]
 struct Layout {
     error: ErrorLayout,
-    handle: Expr,
+    receiver: Expr,
     transport: Expr,
     transport_name: Name,
     world: Expr,
@@ -160,14 +164,18 @@ impl Preparation<'_> {
         let cached = match operation {
             Operation::GetLine => &self.fs.read_layout,
             Operation::Read => &self.fs.bytes_layout,
+            Operation::ReadDir => &self.fs.directory_layout,
             _ => &self.fs.layout,
         };
         if let Some(layout) = cached {
             return Ok(layout.clone());
         }
-        let handle = self
-            .fs_handle()?
-            .ok_or_else(|| unsupported("filesystem checked Handle"))?;
+        let receiver = if operation == Operation::ReadDir {
+            c("String")
+        } else {
+            self.fs_handle()?
+                .ok_or_else(|| unsupported("filesystem checked Handle"))?
+        };
         let world = self
             .st_evaluation_world()?
             .ok_or_else(|| unsupported("filesystem checked world"))?;
@@ -176,6 +184,7 @@ impl Preparation<'_> {
         let transport_label = match operation {
             Operation::GetLine => READ_TRANSPORT,
             Operation::Read => BYTES_TRANSPORT,
+            Operation::ReadDir => DIRECTORY_TRANSPORT,
             _ => TRANSPORT,
         };
         let transport = self.io_private_record(
@@ -192,7 +201,7 @@ impl Preparation<'_> {
         )?;
         let layout = Layout {
             error,
-            handle,
+            receiver,
             transport,
             transport_name: name(transport_label),
             world,
@@ -200,6 +209,7 @@ impl Preparation<'_> {
         match operation {
             Operation::GetLine => self.fs.read_layout = Some(layout.clone()),
             Operation::Read => self.fs.bytes_layout = Some(layout.clone()),
+            Operation::ReadDir => self.fs.directory_layout = Some(layout.clone()),
             _ => self.fs.layout = Some(layout.clone()),
         }
         Ok(layout)
@@ -222,11 +232,7 @@ impl Preparation<'_> {
             .iter()
             .find(|row| row.name == source)
             .ok_or_else(|| unsupported("filesystem generated primitive row"))?;
-        let arity = if operation == Operation::GetLine {
-            1
-        } else {
-            2
-        };
+        let arity = operation.source_arity() as u32;
         if row.kind != "opaque"
             || row.levels != 0
             || row.arity != arity
@@ -242,23 +248,24 @@ impl Preparation<'_> {
             ),
             Operation::PutStr => (
                 vec![ValueType::Abi, ValueType::String],
-                vec![layout.handle.clone(), c("String")],
+                vec![layout.receiver.clone(), c("String")],
             ),
-            Operation::GetLine => (vec![ValueType::Abi], vec![layout.handle.clone()]),
+            Operation::GetLine => (vec![ValueType::Abi], vec![layout.receiver.clone()]),
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (
                     vec![ValueType::Abi, ValueType::Abi],
-                    vec![layout.handle.clone(), bytes.native_word],
+                    vec![layout.receiver.clone(), bytes.native_word],
                 )
             }
             Operation::Write => {
                 let bytes = self.fs_bytes_layout()?;
                 (
                     vec![ValueType::Abi, ValueType::Abi],
-                    vec![layout.handle.clone(), bytes.packed],
+                    vec![layout.receiver.clone(), bytes.packed],
                 )
             }
+            Operation::ReadDir => (vec![ValueType::String], vec![layout.receiver.clone()]),
         };
         self.fs.bindings.insert(
             private.clone(),
@@ -321,6 +328,7 @@ impl Preparation<'_> {
             // packets carry scalar zero and never reach that projection.
             Operation::GetLine => field(layout, 0)?,
             Operation::Read => self.fs_materialize_bytes(field(layout, 0)?)?,
+            Operation::ReadDir => self.fs_materialize_directory(field(layout, 0)?)?,
         };
         let success = apply(
             Expr::const_(result.constructors[0].name.clone(), Vec::new()),
@@ -380,11 +388,7 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let source_arity = if operation == Operation::GetLine {
-            1
-        } else {
-            2
-        };
+        let source_arity = operation.source_arity();
         if arguments.len() > source_arity + 1 {
             return Ok(None);
         }
@@ -395,6 +399,7 @@ impl Preparation<'_> {
             Operation::PutStr | Operation::Write => c("Unit"),
             Operation::GetLine => c("String"),
             Operation::Read => c("ByteArray"),
+            Operation::ReadDir => directory::result_type(),
         };
         let result = self.io_checked_shape(apply(
             c("EST.Out"),
@@ -437,19 +442,32 @@ impl Preparation<'_> {
                     ],
                 )
             }
-            Operation::PutStr => (vec![layout.handle.clone(), c("String")], vec![b(2)?, b(1)?]),
-            Operation::GetLine => (vec![layout.handle.clone()], vec![b(1)?]),
+            Operation::PutStr => (
+                vec![layout.receiver.clone(), c("String")],
+                vec![b(2)?, b(1)?],
+            ),
+            Operation::GetLine => (vec![layout.receiver.clone()], vec![b(1)?]),
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (
-                    vec![layout.handle.clone(), bytes.word.source.clone()],
+                    vec![layout.receiver.clone(), bytes.word.source.clone()],
                     vec![b(2)?, self.fs_native_read_count(b(1)?)?],
                 )
             }
             Operation::Write => (
-                vec![layout.handle.clone(), c("ByteArray")],
+                vec![layout.receiver.clone(), c("ByteArray")],
                 vec![b(2)?, self.fs_native_write_bytes(b(1)?)?],
             ),
+            Operation::ReadDir => {
+                let path = self.io_checked_shape(c("System.FilePath"))?;
+                if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
+                    return Err(unsupported("directory checked FilePath layout"));
+                }
+                (
+                    vec![path.source.clone()],
+                    vec![Expr::proj(path.projection(&path.constructors[0]), 0, b(1)?)],
+                )
+            }
         };
         let returned = self.fs_result(operation, &layout, &result)?;
         let mut body = Expr::let_e(
