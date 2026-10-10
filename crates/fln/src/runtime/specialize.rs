@@ -1020,19 +1020,20 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
-        let mut needs_annotation = false;
+        let mut has_literal = false;
         for argument in args {
             if self.has_literal_callable_tail(argument)? {
-                needs_annotation = true;
+                has_literal = true;
                 break;
             }
         }
-        if !needs_annotation {
+        if !has_literal {
             return Ok(None);
         }
         let Some(mut type_) = self.callable_type(head)? else {
             return Ok(None);
         };
+        let mut needs_annotation = false;
         let mut bindings = Vec::new();
         for argument in args {
             self.tick()?;
@@ -1046,6 +1047,18 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
+            // A motive is literal lambda syntax too, but its Sort-valued
+            // domain gives it no runtime closure. Wrapping that argument alone
+            // in a type let would be undone by static let elimination and
+            // recreate this same call indefinitely. Inspect the instantiated
+            // domain, including preceding real arguments, before selecting an
+            // annotation for an executable callback.
+            if !needs_annotation
+                && !self.type_parameter(binder_type)?
+                && self.has_literal_callable_tail(argument)?
+            {
+                needs_annotation = true;
+            }
             reserve(&mut bindings, self.limits.max_context_depth)?;
             bindings.push((
                 binder_name.clone(),
@@ -1053,6 +1066,9 @@ impl Preparation<'_> {
                 argument.clone(),
             ));
             type_ = self.substitution(body, argument)?;
+        }
+        if !needs_annotation {
+            return Ok(None);
         }
         let mut result = head.clone();
         for index in (0..bindings.len()).rev() {

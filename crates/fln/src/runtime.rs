@@ -675,6 +675,15 @@ impl<'a> Preparation<'a> {
                             body,
                             non_dep: nondep,
                         } => {
+                            if self.type_parameter(type_)? {
+                                // Inlining and recursor specialization can expose
+                                // a motive binding after proof erasure has run.
+                                // Its checked Sort-valued telescope is static:
+                                // substitute it before runtime closure discovery,
+                                // preserving outer captures and dependent types.
+                                tasks.push(Task::Visit(self.substitution(body, value)?));
+                                continue;
+                            }
                             if let Some(exposed) =
                                 self.expose_callable_binding(type_, value, body)?
                             {
@@ -1118,6 +1127,12 @@ fn type_constructor_kind(mut type_: &Expr) -> bool {
 
 #[cfg(test)]
 mod templates;
+
+#[cfg(test)]
+mod late_types_tests;
+
+#[cfg(test)]
+mod annotation_tests;
 
 #[cfg(test)]
 mod tests {

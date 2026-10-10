@@ -300,6 +300,20 @@ impl Preparation<'_> {
         let mut used = false;
         while let Some((expr, depth, callee)) = pending.pop() {
             self.tick()?;
+            // The cached range includes every loose variable, including those
+            // in types. If this slot is absent, the subtree cannot change the
+            // answer. Still retain the original binder-depth refusals: only an
+            // unsaturated structural height can prove every skipped descent
+            // fits the checked context and the producer's u32 depth bound.
+            let height = expr.approx_depth();
+            if usize::try_from(expr.loose_bvar_range()).is_ok_and(|range| range <= depth)
+                && height < u8::MAX
+                && depth.checked_add(usize::from(height)).is_some_and(|end| {
+                    end <= self.limits.max_context_depth && u32::try_from(end).is_ok()
+                })
+            {
+                continue;
+            }
             match expr.node() {
                 ExprNode::BVar { idx } if usize::try_from(*idx).ok() == Some(depth) => {
                     if !callee {
@@ -557,3 +571,6 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod uses_tests;

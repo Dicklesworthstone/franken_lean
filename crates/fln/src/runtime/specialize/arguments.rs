@@ -124,8 +124,11 @@ impl Preparation<'_> {
             };
             // A dictionary indexed by an earlier retained value is not a
             // global specialization, even when this caller supplies a literal.
-            // Closed static arguments with independent domains need no lift
-            // when substituted under the retained runtime binders.
+            // A type-valued motive can mention that value only in domains
+            // which disappear under the checked representation erasure (for
+            // example `fuel -> x < fuel -> Type`). Its represented domain must
+            // be completely closed before a concrete motive may cross those
+            // retained binders. Runtime arguments keep their original slots.
             let proposition = self.erased_proposition_argument(binder_type)?;
             let is_proposition = proposition.is_some();
             let type_argument = !is_proposition && self.type_parameter(binder_type)?;
@@ -138,9 +141,12 @@ impl Preparation<'_> {
             } else {
                 None
             };
+            let independent_domain = !binder_type.has_loose_bvars()
+                || (runtime_type.as_ref().is_some_and(closed)
+                    && closed(&self.erase_runtime_type(binder_type)?));
             let selected = if is_proposition {
                 proposition
-            } else if binder_type.has_loose_bvars() {
+            } else if !independent_domain {
                 None
             } else if let Some(type_) = runtime_type {
                 closed(&type_).then_some(type_)
@@ -263,9 +269,6 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if self.specializations.definitions.contains_key(original) {
-            return Ok(None);
-        }
         let Some(mut definition) = self.executable_definition(original)? else {
             return Ok(None);
         };
@@ -282,6 +285,12 @@ impl Preparation<'_> {
         let value =
             self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
         let prepared = self.specialize_arguments(type_, value, args)?;
+        // An earlier universe or dictionary specialization can still contain
+        // an open motive, exposed later by a checked local type binding. Allow
+        // another specialization only when a new static argument is removed.
+        // Canonical definitions have no universes left, so this gate also
+        // prevents a private entry from repeatedly specializing an unchanged
+        // telescope. Each such step strictly removes a supplied binder.
         if prepared.static_arguments.is_empty() && levels.is_empty() {
             return Ok(None);
         }
