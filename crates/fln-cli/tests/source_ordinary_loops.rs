@@ -6,10 +6,10 @@
 //! values asserted here (recorded that day from `lean` v4.32.0 on the same shapes;
 //! each is also a closed-form fact: a triangular number, a list sum, a tree size).
 //!
-//! What this does not establish: speed, or tail calls. A structural recursion still
-//! costs three frames per call, so a deep enough recursion is still a typed
-//! non-answer; `the_frame_ceiling_is_a_typed_stop_never_a_crash` pins that it is
-//! exit 3 and not a host stack overflow.
+//! What this does not establish: speed. Non-tail recursion still needs frames;
+//! `the_frame_ceiling_is_a_typed_stop_never_a_crash` pins that exhaustion is
+//! exit 3 and not a host stack overflow. The execution-ceiling cases exercise
+//! the caller's limits through source, import, standard-input, and replay paths.
 #![forbid(unsafe_code)]
 use std::{
     path::Path,
@@ -129,12 +129,16 @@ fn an_emitted_artifact_replays_under_the_same_budget_it_ran_under() {
 
 #[test]
 fn the_frame_ceiling_is_a_typed_stop_never_a_crash() {
-    // Far past any frame ceiling: this must end as the documented inconclusive
-    // exit with nothing on stdout, not as a signal or an abort.
+    // A genuine non-tail recursion under a deliberately small frame ceiling:
+    // it must stop without a signal, host overflow, or buffered output escaping.
     let dir = directory();
     let source = dir.join("Main.lean");
-    std::fs::write(&source, format!("{SUM_TO}#eval sumTo 5000000\n")).unwrap();
-    let output = lean(&source);
+    std::fs::write(&source, format!("{SUM_TO}#eval sumTo 5000\n")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg("--fln-max-frames=32")
+        .arg(&source)
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!(
         "ceiling: exit={:?} stderr={}",
@@ -143,5 +147,139 @@ fn the_frame_ceiling_is_a_typed_stop_never_a_crash() {
     );
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
-    assert!(stderr.contains("RecursionDepth"), "{output:?}");
+    assert!(
+        stderr.contains("RecursionDepth { limit: 32 }"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn caller_execution_ceilings_reach_both_source_doors_and_artifact_replay() {
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    let artifact = dir.join("main.flbc");
+    std::fs::write(&source, format!("{SUM_TO}#eval sumTo 30\n")).unwrap();
+    let emitted = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&artifact)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(emitted.status.success(), "{emitted:?}");
+
+    for (binary, prefix, path) in [
+        (env!("CARGO_BIN_EXE_lean"), vec![], &source),
+        (env!("CARGO_BIN_EXE_fln"), vec!["run", "--json"], &source),
+        (
+            env!("CARGO_BIN_EXE_fln"),
+            vec!["flbc", "run", "--json"],
+            &artifact,
+        ),
+    ] {
+        for (flag, reason) in [
+            ("--fln-max-steps=0", "ExecutionSteps"),
+            ("--fln-max-frames=0", "RecursionDepth"),
+        ] {
+            let output = Command::new(binary)
+                .args(&prefix)
+                .arg(flag)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{prefix:?} {flag}: {output:?}"
+            );
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(reason), "{output:?}");
+            if !prefix.is_empty() {
+                assert!(stderr.contains("\"authority\":false"), "{output:?}");
+            }
+        }
+        let completed = Command::new(binary)
+            .args(&prefix)
+            .args(["--fln-max-steps", "100000", "--fln-max-frames=128"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(completed.status.success(), "{prefix:?}: {completed:?}");
+        assert!(String::from_utf8_lossy(&completed.stdout).contains("465"));
+    }
+}
+
+#[test]
+fn source_imports_and_stdin_cannot_bypass_an_execution_ceiling() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    std::fs::write(dir.join("Local.lean"), format!("{SUM_TO}#eval sumTo 30\n")).unwrap();
+    std::fs::write(&source, "import Local\n#eval sumTo 2\n").unwrap();
+    for (binary, prefix) in [
+        (env!("CARGO_BIN_EXE_lean"), vec![]),
+        (env!("CARGO_BIN_EXE_fln"), vec!["run", "--json"]),
+    ] {
+        let control = Command::new(binary)
+            .args(&prefix)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(control.status.success(), "{control:?}");
+        let stopped = Command::new(binary)
+            .args(&prefix)
+            .args(["--fln-max-steps", "0"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(stopped.status.code(), Some(3), "{stopped:?}");
+        assert!(stopped.stdout.is_empty(), "{stopped:?}");
+        assert!(String::from_utf8_lossy(&stopped.stderr).contains("ExecutionSteps"));
+    }
+
+    for (limit, expected_exit) in [("0", 3), ("100", 0)] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lean"))
+            .args(["--stdin", "--fln-max-steps", limit])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"#check Nat\n#eval 42\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
+        if expected_exit == 3 {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("ExecutionSteps"));
+        } else {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "Nat : Type\n42\n");
+        }
+    }
+}
+
+#[test]
+fn a_resource_stop_does_not_publish_a_source_artifact() {
+    let dir = directory();
+    let source = dir.join("Main.lean");
+    let artifact = dir.join("stopped.flbc");
+    std::fs::write(&source, "#eval 42\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--fln-max-steps=0", "--emit-flbc"])
+        .arg(&artifact)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        !artifact.exists(),
+        "a stopped program published an artifact"
+    );
 }

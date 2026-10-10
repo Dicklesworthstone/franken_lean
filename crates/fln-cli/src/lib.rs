@@ -21,6 +21,7 @@ pub fn install_json_execution_panic_hook() {
     stdout_capture::install_panic_hook();
 }
 
+use fln::source_check::modules::reuse::ImportPosture;
 use fln_core::diag::{
     DIAGNOSTIC_PROJECTION_SCHEMA, DIAGNOSTIC_SOUND_BEHAVIOR_NOTE_NAME, DiagnosticChannel,
     DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, DiagnosticPathPolicy, ExitClass,
@@ -196,12 +197,16 @@ const USAGE: &str = concat!(
     "    modules at once (default: available cores, at most 8); the result does\n",
     "    not depend on N, and --jobs 1 checks them one by one. `lake build`\n",
     "    takes the same --jobs for the imports it admits.\n",
-    "  fln run [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
+    "  fln run [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--fln-max-steps N] [--fln-max-frames N] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
     "    Explicit external imports use the same bounded loader and import posture\n",
     "    as check-source. Each source module runs in its own import context;\n",
     "    fln.source-program/1 reports raw results per module. These programs\n",
     "    currently refuse --emit-*; `prelude` starts without an ambient seed.\n",
-    "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
+    "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
+    "    Execution limits count VM instructions and simultaneous frames per\n",
+    "    evaluation (per artifact for flbc run), including imported source code.\n",
+    "    Defaults: no instruction ceiling, 4,000,000 frames. Zero permits no\n",
+    "    instructions/frames. Exhaustion exits 3; elaboration limits are separate.\n",
     "  fln olean inspect [--json] [--constants] [--max-bytes BYTES] PATH\n",
     "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
     "  fln diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
@@ -346,8 +351,8 @@ const USAGE: &str = concat!(
 
 const LEAN_USAGE: &str = concat!(
     "Usage:\n",
-    "  lean [--max-bytes BYTES] PATH\n",
-    "  lean --stdin [--max-bytes BYTES]\n",
+    "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
+    "  lean --stdin [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N]\n",
     "  lean --src-deps [--max-bytes BYTES] PATH\n",
     "  lean --help\n",
     "  lean -v | --version\n",
@@ -382,6 +387,10 @@ const LEAN_USAGE: &str = concat!(
     "the complete local A/B.lean closure is then loaded under the same aggregate\n",
     "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
     "--stdin reads one bounded import-free source from standard input.\n",
+    "--fln-max-steps and --fln-max-frames set nonnegative per-evaluation VM\n",
+    "ceilings, including imported source code. Defaults are no instruction\n",
+    "ceiling and 4,000,000 frames; zero permits no instructions/frames. These\n",
+    "FrankenLean extensions stop with exit 3 and do not change elaboration fuel.\n",
     "--src-deps prints validated direct local source imports in source order\n",
     "without elaborating or executing the file.\n",
     "-q and --quiet are accepted on source operations; this bounded personality\n",
@@ -463,6 +472,7 @@ enum MultiplexerCommand {
         paths: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
+        vm_limits: fln::VmExecutionLimits,
         jobs: Option<std::num::NonZeroUsize>,
         import_posture: fln::source_check::modules::reuse::ImportPosture,
         emit_flbc: Option<PathBuf>,
@@ -474,6 +484,7 @@ enum MultiplexerCommand {
         max_bytes: usize,
         json: bool,
         sidecar: Option<PathBuf>,
+        vm_limits: fln::VmExecutionLimits,
     },
     OleanInspect {
         path: PathBuf,
@@ -554,9 +565,19 @@ enum LeanCommand {
     PrintPrefix,
     PrintLibdir,
     Server,
-    Stdin { max_bytes: usize },
-    SourceDependencies { path: PathBuf, max_bytes: usize },
-    Source { path: PathBuf, max_bytes: usize },
+    Stdin {
+        max_bytes: usize,
+        vm_limits: fln::VmExecutionLimits,
+    },
+    SourceDependencies {
+        path: PathBuf,
+        max_bytes: usize,
+    },
+    Source {
+        path: PathBuf,
+        max_bytes: usize,
+        vm_limits: fln::VmExecutionLimits,
+    },
 }
 
 #[derive(Debug)]
@@ -761,13 +782,80 @@ fn parse_path_options(
     Ok(Some((paths, max_bytes, json)))
 }
 
+/// Explicit execution ceilings belong to Golem, not to elaboration heartbeats.
+/// The `--fln-` prefix keeps these extensions distinct from the pinned Lean CLI.
+struct VmLimitOptions {
+    limits: fln::VmExecutionLimits,
+    steps_seen: bool,
+    frames_seen: bool,
+}
+
+impl Default for VmLimitOptions {
+    fn default() -> Self {
+        Self {
+            limits: fln::VmExecutionLimits::user_program(),
+            steps_seen: false,
+            frames_seen: false,
+        }
+    }
+}
+
+impl VmLimitOptions {
+    fn supplied(&self) -> bool {
+        self.steps_seen || self.frames_seen
+    }
+
+    /// Consume one recognized option and its value. Call only before `--` and
+    /// only for an option token, never for another option's path argument.
+    fn take(
+        &mut self,
+        argument: &OsString,
+        arguments: &mut impl Iterator<Item = OsString>,
+    ) -> Result<bool, UsageError> {
+        let Some(text) = argument.to_str() else {
+            return Ok(false);
+        };
+        let (name, attached) = text
+            .split_once('=')
+            .map_or((text, None), |(name, value)| (name, Some(value)));
+        let (seen, destination) = match name {
+            "--fln-max-steps" => (&mut self.steps_seen, &mut self.limits.max_steps),
+            "--fln-max-frames" => (&mut self.frames_seen, &mut self.limits.max_stack_depth),
+            _ => return Ok(false),
+        };
+        if *seen {
+            return Err(UsageError(format!("{name} may be supplied at most once")));
+        }
+        let value = match attached {
+            Some(value) => OsString::from(value),
+            None => arguments.next().ok_or_else(|| {
+                UsageError(format!("{name} requires a following nonnegative integer"))
+            })?,
+        };
+        let parsed = value
+            .to_str()
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                UsageError(format!(
+                    "{name} requires an ASCII nonnegative integer no greater than {}",
+                    u64::MAX
+                ))
+            })?;
+        *destination = parsed;
+        *seen = true;
+        Ok(true)
+    }
+}
+
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let (arguments, jobs) = take_jobs_option(arguments)?;
-    let (arguments, import_posture) = source_check::take_import_posture_option(arguments)?;
+    let mut jobs = None;
+    let mut import_posture = None;
     let mut filtered = Vec::new();
     let mut emit_flbc = None;
     let mut emit_sidecar = None;
     let mut emit_olean_snapshot = None;
+    let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -778,6 +866,60 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         }
         if options && (argument == "--help" || argument == "-h") {
             return Ok(MultiplexerCommand::Help);
+        }
+        if options && argument == "--max-bytes" {
+            filtered.push(argument);
+            filtered.push(arguments.next().ok_or_else(|| {
+                UsageError("--max-bytes requires a following byte count".to_owned())
+            })?);
+            continue;
+        }
+        if options && vm_options.take(&argument, &mut arguments)? {
+            continue;
+        }
+        let job_count =
+            if options && argument == "--jobs" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--jobs requires a following thread count".to_owned())
+                })?)
+            } else if options {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--jobs="))
+                    .map(OsString::from)
+            } else {
+                None
+            };
+        if let Some(value) = job_count {
+            if jobs.is_some() {
+                return Err(UsageError("--jobs may be supplied at most once".to_owned()));
+            }
+            jobs = Some(parse_jobs_count(&value)?);
+            continue;
+        }
+        let posture = if options && argument == "--import-posture" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--import-posture requires `recheck` or `reuse-verified`".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--import-posture="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(value) = posture {
+            if import_posture.is_some() {
+                return Err(UsageError(
+                    "--import-posture may be supplied at most once".to_owned(),
+                ));
+            }
+            let text = value
+                .to_str()
+                .ok_or_else(|| UsageError("--import-posture is not UTF-8".to_owned()))?;
+            import_posture = Some(ImportPosture::parse(text).map_err(UsageError)?);
+            continue;
         }
         let sidecar = if options && argument == "--emit-sidecar" {
             Some(arguments.next().ok_or_else(|| {
@@ -903,8 +1045,9 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         paths,
         max_bytes,
         json,
+        vm_limits: vm_options.limits,
         jobs,
-        import_posture,
+        import_posture: import_posture.unwrap_or(ImportPosture::ReuseVerified),
         emit_flbc,
         emit_sidecar,
         emit_olean_snapshot,
@@ -1178,12 +1321,23 @@ fn parse_identity(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageE
 fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let mut filtered = Vec::new();
     let mut sidecar = None;
+    let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         if options && argument == "--" {
             options = false;
             filtered.push(argument);
+            continue;
+        }
+        if options && argument == "--max-bytes" {
+            filtered.push(argument);
+            filtered.push(arguments.next().ok_or_else(|| {
+                UsageError("--max-bytes requires a following byte count".to_owned())
+            })?);
+            continue;
+        }
+        if options && vm_options.take(&argument, &mut arguments)? {
             continue;
         }
         let selected = if options && argument == "--sidecar" {
@@ -1229,6 +1383,7 @@ fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageE
         max_bytes,
         json,
         sidecar,
+        vm_limits: vm_options.limits,
     })
 }
 
@@ -1804,11 +1959,15 @@ fn parse_lean_command(
     let mut max_bytes_seen = false;
     let mut stdin_source = false;
     let mut source_dependencies = false;
+    let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = std::iter::once(first).chain(arguments);
     while let Some(argument) = arguments.next() {
         if options && argument == "--" {
             options = false;
+            continue;
+        }
+        if options && vm_options.take(&argument, &mut arguments)? {
             continue;
         }
         if options && argument == "--max-bytes" {
@@ -1908,13 +2067,25 @@ fn parse_lean_command(
                 "--stdin does not accept a source path".to_owned(),
             ));
         }
-        return Ok(LeanCommand::Stdin { max_bytes });
+        return Ok(LeanCommand::Stdin {
+            max_bytes,
+            vm_limits: vm_options.limits,
+        });
     }
     let path = path.ok_or_else(|| UsageError("lean requires PATH or --stdin".to_owned()))?;
     if source_dependencies {
+        if vm_options.supplied() {
+            return Err(UsageError(
+                "execution limits cannot be combined with --src-deps".to_owned(),
+            ));
+        }
         Ok(LeanCommand::SourceDependencies { path, max_bytes })
     } else {
-        Ok(LeanCommand::Source { path, max_bytes })
+        Ok(LeanCommand::Source {
+            path,
+            max_bytes,
+            vm_limits: vm_options.limits,
+        })
     }
 }
 
@@ -2412,9 +2583,10 @@ fn execute_flbc_bytes_with_sidecar(
     max_bytes: usize,
     sidecar: Option<&fln::FlbcProductSidecarV1>,
     json: bool,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     stdout_capture::json(json, FLBC_RUN_SCHEMA, || {
-        execute_flbc_bytes_with_sidecar_uncaptured(bytes, max_bytes, sidecar, json)
+        execute_flbc_bytes_with_sidecar_uncaptured(bytes, max_bytes, sidecar, json, vm_limits)
     })
 }
 
@@ -2423,12 +2595,13 @@ fn execute_flbc_bytes_with_sidecar_uncaptured(
     max_bytes: usize,
     sidecar: Option<&fln::FlbcProductSidecarV1>,
     json: bool,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let mut limits = fln::FlbcExecutionLimits::default();
     limits.codec.max_artifact_bytes = max_bytes;
     // A replayed artifact is the same user program `fln run` executed, so it
     // gets the same VM budget; otherwise a run could emit what replay refuses.
-    limits.vm = fln::VmExecutionLimits::user_program();
+    limits.vm = vm_limits;
     let outcome = match fln::execute_flbc_artifact(bytes, &fln::KVMap::new(), limits) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -2481,7 +2654,13 @@ fn execute_flbc_bytes_with_sidecar_uncaptured(
 
 #[cfg(test)]
 fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
-    execute_flbc_bytes_with_sidecar(bytes, max_bytes, None, json)
+    execute_flbc_bytes_with_sidecar(
+        bytes,
+        max_bytes,
+        None,
+        json,
+        fln::VmExecutionLimits::user_program(),
+    )
 }
 
 fn read_current_toolchain_image() -> Result<Vec<u8>, BoundedReadFailure> {
@@ -2504,6 +2683,7 @@ fn run_flbc(
     max_bytes: usize,
     sidecar_path: Option<&Path>,
     json: bool,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let bytes = match read_bounded(path, max_bytes, "FLBC artifact") {
         Ok(bytes) => bytes,
@@ -2553,7 +2733,13 @@ fn run_flbc(
     } else {
         None
     };
-    execute_flbc_bytes_with_sidecar(&bytes, max_bytes, verified_sidecar.as_ref(), json)
+    execute_flbc_bytes_with_sidecar(
+        &bytes,
+        max_bytes,
+        verified_sidecar.as_ref(),
+        json,
+        vm_limits,
+    )
 }
 
 fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean, constants: bool) -> String {
@@ -11922,6 +12108,7 @@ fn execute_source_bytes_with_publisher_and_presentation<P, E>(
     module_plan: Option<SourceModulePlan>,
     publication: SourcePublication,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
     publish: P,
 ) -> MultiplexerOutput
 where
@@ -11929,7 +12116,14 @@ where
     E: SourcePublicationFailure,
 {
     stdout_capture::json(presentation.json(), SOURCE_RUN_SCHEMA, || {
-        execute_source_bytes_uncaptured(sources, module_plan, publication, presentation, publish)
+        execute_source_bytes_uncaptured(
+            sources,
+            module_plan,
+            publication,
+            presentation,
+            vm_limits,
+            publish,
+        )
     })
 }
 
@@ -11938,6 +12132,7 @@ fn execute_source_bytes_uncaptured<P, E>(
     module_plan: Option<SourceModulePlan>,
     publication: SourcePublication,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
     mut publish: P,
 ) -> MultiplexerOutput
 where
@@ -12027,7 +12222,8 @@ where
     };
     let options = fln::KVMap::new();
     // A user's program, not a probe: no instruction ceiling, real recursion depth.
-    let limits = fln::EngineExecutionLimits::for_user_program(kernel_budget);
+    let mut limits = fln::EngineExecutionLimits::for_user_program(kernel_budget);
+    limits.vm = vm_limits;
     if matches!(presentation, SourcePresentation::Lean)
         && module_plan.is_none()
         && source_refs.len() == 1
@@ -12621,6 +12817,7 @@ where
         module_plan,
         publication,
         SourcePresentation::Fln { json },
+        fln::VmExecutionLimits::user_program(),
         publish,
     )
 }
@@ -13322,6 +13519,7 @@ fn run_loaded_sources_with_presentation(
     emit_sidecar: Option<PathBuf>,
     emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let publication = match (emit_flbc, emit_sidecar, emit_olean_snapshot) {
         (Some(path), sidecar, None) => SourcePublication::Flbc {
@@ -13359,6 +13557,7 @@ fn run_loaded_sources_with_presentation(
                 module_plan,
                 publication,
                 presentation,
+                vm_limits,
                 fln::publish_file_atomic_new,
             )
         }) {
@@ -13392,6 +13591,7 @@ fn run_sources_with_presentation(
     emit_sidecar: Option<PathBuf>,
     emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     if let [entry] = paths {
         let discovered = match discover_source_closure(entry.clone(), max_bytes) {
@@ -13440,6 +13640,7 @@ fn run_sources_with_presentation(
             emit_sidecar,
             emit_olean_snapshot,
             presentation,
+            vm_limits,
         );
     }
     let sources = match read_source_batch(paths, max_bytes) {
@@ -13461,6 +13662,7 @@ fn run_sources_with_presentation(
         emit_sidecar,
         emit_olean_snapshot,
         presentation,
+        vm_limits,
     )
 }
 
@@ -13473,11 +13675,15 @@ fn is_unresolved_local_import(error: &BoundedReadFailure) -> bool {
     )
 }
 
-fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
+fn run_lean_source(
+    path: PathBuf,
+    max_bytes: usize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
     // A file that imports compiled modules runs in their admitted world, the
     // way `fln run` runs it. Only a headerless file, or one whose imports are
     // all local sources, is left to the local route below.
-    if let Some(output) = source_check::run_imported_lean(&path, max_bytes) {
+    if let Some(output) = source_check::run_imported_lean(&path, max_bytes, vm_limits) {
         return output;
     }
     let discovered = match discover_source_closure(path, max_bytes) {
@@ -13499,10 +13705,15 @@ fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
         None,
         None,
         SourcePresentation::Lean,
+        vm_limits,
     )
 }
 
-fn run_lean_stdin(input: &mut dyn Read, max_bytes: usize) -> MultiplexerOutput {
+fn run_lean_stdin(
+    input: &mut dyn Read,
+    max_bytes: usize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
     let source = match read_bounded_from(input, max_bytes, "standard input source") {
         Ok(source) => source,
         Err(error) => {
@@ -13534,6 +13745,7 @@ fn run_lean_stdin(input: &mut dyn Read, max_bytes: usize) -> MultiplexerOutput {
         None,
         None,
         SourcePresentation::Lean,
+        vm_limits,
     )
 }
 
@@ -13544,6 +13756,7 @@ fn run_sources(
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
     emit_olean_snapshot: Option<PathBuf>,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     run_sources_with_presentation(
         paths,
@@ -13552,6 +13765,7 @@ fn run_sources(
         emit_sidecar,
         emit_olean_snapshot,
         SourcePresentation::Fln { json },
+        vm_limits,
     )
 }
 
@@ -13656,6 +13870,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             paths,
             max_bytes,
             json,
+            vm_limits,
             jobs,
             import_posture,
             emit_flbc,
@@ -13668,6 +13883,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             emit_flbc.is_some() || emit_sidecar.is_some() || emit_olean_snapshot.is_some(),
             jobs.unwrap_or_else(default_import_jobs),
             import_posture,
+            vm_limits,
         )
         .unwrap_or_else(|| {
             run_sources(
@@ -13677,6 +13893,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
                 emit_flbc,
                 emit_sidecar,
                 emit_olean_snapshot,
+                vm_limits,
             )
         }),
         Ok(MultiplexerCommand::FlbcRun {
@@ -13684,7 +13901,8 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
             sidecar,
-        }) => run_flbc(&path, max_bytes, sidecar.as_deref(), json),
+            vm_limits,
+        }) => run_flbc(&path, max_bytes, sidecar.as_deref(), json, vm_limits),
         Ok(MultiplexerCommand::OleanInspect {
             path,
             max_bytes,
@@ -13881,8 +14099,11 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::PrintPrefix) => lean_installation_path_output(|paths| paths.prefix),
         Ok(LeanCommand::PrintLibdir) => lean_installation_path_output(|paths| paths.libdir),
         Ok(LeanCommand::Server) => serve_lsp(),
-        Ok(LeanCommand::Stdin { max_bytes }) => match input {
-            Some(input) => run_lean_stdin(input, max_bytes),
+        Ok(LeanCommand::Stdin {
+            max_bytes,
+            vm_limits,
+        }) => match input {
+            Some(input) => run_lean_stdin(input, max_bytes, vm_limits),
             None => MultiplexerOutput::failure(
                 format!(
                     "lean: --stdin requires an explicit input handle; use run_lean_with_input\n\n{LEAN_USAGE}"
@@ -13893,7 +14114,11 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::SourceDependencies { path, max_bytes }) => {
             run_lean_source_dependencies(&path, max_bytes)
         }
-        Ok(LeanCommand::Source { path, max_bytes }) => run_lean_source(path, max_bytes),
+        Ok(LeanCommand::Source {
+            path,
+            max_bytes,
+            vm_limits,
+        }) => run_lean_source(path, max_bytes, vm_limits),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
 }
@@ -16202,10 +16427,9 @@ mod tests {
         let help = run_lean(std::iter::empty());
         assert_eq!(help.exit_code, 0);
         assert!(help.stderr.is_empty());
-        assert!(
-            help.stdout
-                .starts_with("Usage:\n  lean [--max-bytes BYTES] PATH")
-        );
+        assert!(help.stdout.starts_with(
+            "Usage:\n  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] PATH"
+        ));
         assert!(help.stdout.contains("bounded native `lean` personality"));
         assert!(
             help.stdout
@@ -16425,6 +16649,7 @@ mod tests {
                 None,
                 SourcePublication::None,
                 SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
                 |_, _| Ok::<(), std::io::Error>(()),
             );
             assert_eq!(evaluated.exit_code, 0, "{source}: {}", evaluated.stderr);
@@ -16442,6 +16667,7 @@ mod tests {
                 None,
                 SourcePublication::None,
                 SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
                 |_, _| Ok::<(), std::io::Error>(()),
             )
         };
@@ -16516,6 +16742,7 @@ mod tests {
             None,
             SourcePublication::None,
             SourcePresentation::Lean,
+            fln::VmExecutionLimits::user_program(),
             |_, _| Ok::<(), std::io::Error>(()),
         );
         assert_eq!(evaluated.exit_code, 0, "{}", evaluated.stderr);
@@ -16533,6 +16760,7 @@ mod tests {
             None,
             SourcePublication::None,
             SourcePresentation::Lean,
+            fln::VmExecutionLimits::user_program(),
             |_, _| Ok::<(), std::io::Error>(()),
         );
         assert_eq!(function_only.exit_code, 0, "{}", function_only.stderr);
@@ -16548,6 +16776,7 @@ mod tests {
                 None,
                 SourcePublication::None,
                 SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
                 |_, _| Ok::<(), std::io::Error>(()),
             );
         assert_eq!(
@@ -17141,6 +17370,7 @@ mod tests {
             expected_product.len(),
             Some(&verified),
             true,
+            fln::VmExecutionLimits::user_program(),
         );
         assert_eq!(replay.exit_code, 0, "{}", replay.stderr);
         assert!(replay.stdout.contains("\"sidecar\":{\"verified\":true"));
@@ -17166,6 +17396,184 @@ mod tests {
         );
         assert_eq!(failed.exit_code, 1);
         assert_eq!(failed_publications, 0);
+    }
+
+    #[test]
+    fn execution_limit_options_share_strict_parsing_across_the_three_doors() {
+        for args in [
+            vec!["--fln-max-steps=17", "--fln-max-frames", "23", "Main.lean"],
+            vec!["Main.lean", "--fln-max-steps", "17", "--fln-max-frames=23"],
+        ] {
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            let super::MultiplexerCommand::SourceRun { vm_limits, .. } =
+                super::parse_source_run(args.clone()).unwrap()
+            else {
+                panic!("source command")
+            };
+            assert_eq!((vm_limits.max_steps, vm_limits.max_stack_depth), (17, 23));
+            let super::MultiplexerCommand::FlbcRun { vm_limits, .. } =
+                super::parse_flbc_run(args.clone()).unwrap()
+            else {
+                panic!("artifact command")
+            };
+            assert_eq!((vm_limits.max_steps, vm_limits.max_stack_depth), (17, 23));
+            let super::LeanCommand::Source { vm_limits, .. } =
+                super::parse_lean_command(args).unwrap()
+            else {
+                panic!("lean command")
+            };
+            assert_eq!((vm_limits.max_steps, vm_limits.max_stack_depth), (17, 23));
+        }
+        for flag in ["--fln-max-steps", "--fln-max-frames"] {
+            for value in ["", "-1", "+1", "1.5", " 1", "١", "18446744073709551616"] {
+                let args = vec![format!("{flag}={value}").into(), "Main.lean".into()];
+                assert!(
+                    super::parse_source_run(args.clone()).is_err(),
+                    "{flag}={value}"
+                );
+                assert!(
+                    super::parse_flbc_run(args.clone()).is_err(),
+                    "{flag}={value}"
+                );
+                assert!(super::parse_lean_command(args).is_err(), "{flag}={value}");
+            }
+            let duplicate = vec![
+                flag.into(),
+                "3".into(),
+                format!("{flag}=4").into(),
+                "Main.lean".into(),
+            ];
+            assert!(super::parse_source_run(duplicate.clone()).is_err());
+            assert!(super::parse_flbc_run(duplicate.clone()).is_err());
+            assert!(super::parse_lean_command(duplicate).is_err());
+            let missing = vec![flag.into()];
+            assert!(super::parse_source_run(missing.clone()).is_err());
+            assert!(super::parse_flbc_run(missing.clone()).is_err());
+            assert!(super::parse_lean_command(missing).is_err());
+            for value in [0, u64::MAX] {
+                let args = vec![format!("{flag}={value}").into(), "Main.lean".into()];
+                assert!(super::parse_source_run(args.clone()).is_ok());
+                assert!(super::parse_flbc_run(args.clone()).is_ok());
+                assert!(super::parse_lean_command(args).is_ok());
+            }
+        }
+        let stopped = vec!["--".into(), "--fln-max-steps=7".into()];
+        let super::LeanCommand::Source {
+            path, vm_limits, ..
+        } = super::parse_lean_command(stopped.clone()).unwrap()
+        else {
+            panic!("literal source path")
+        };
+        assert_eq!(path, PathBuf::from("--fln-max-steps=7"));
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+        let super::MultiplexerCommand::SourceRun {
+            paths, vm_limits, ..
+        } = super::parse_source_run(stopped.clone()).unwrap()
+        else {
+            panic!("literal source paths")
+        };
+        assert_eq!(paths, vec![path.clone()]);
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+        let super::MultiplexerCommand::FlbcRun {
+            path: actual,
+            vm_limits,
+            ..
+        } = super::parse_flbc_run(stopped).unwrap()
+        else {
+            panic!("literal artifact path")
+        };
+        assert_eq!(actual, path);
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+        assert!(
+            super::parse_lean_command([
+                "--src-deps".into(),
+                "--fln-max-steps=1".into(),
+                "Main.lean".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn execution_limit_options_preserve_operand_boundaries() {
+        for args in [
+            vec!["--max-bytes", "--fln-max-steps=0", "12", "Main.lean"],
+            vec!["--max-bytes", "--fln-max-frames=0", "12", "Main.lean"],
+            vec!["--fln-max-steps", "--jobs=1", "12", "Main.lean"],
+            vec!["--fln-max-frames", "--jobs=1", "12", "Main.lean"],
+            vec![
+                "--fln-max-steps",
+                "--import-posture=recheck",
+                "12",
+                "Main.lean",
+            ],
+            vec![
+                "--fln-max-frames",
+                "--import-posture=recheck",
+                "12",
+                "Main.lean",
+            ],
+            vec!["--jobs", "--fln-max-steps=0", "2", "Main.lean"],
+            vec![
+                "--import-posture",
+                "--fln-max-steps=0",
+                "recheck",
+                "Main.lean",
+            ],
+            vec!["--fln-max-steps", "--", "12", "Main.lean"],
+        ] {
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(super::parse_source_run(args.clone()).is_err(), "{args:?}");
+            assert!(super::parse_flbc_run(args.clone()).is_err(), "{args:?}");
+            assert!(super::parse_lean_command(args.clone()).is_err(), "{args:?}");
+        }
+
+        let super::MultiplexerCommand::SourceRun {
+            jobs,
+            import_posture,
+            emit_flbc,
+            emit_sidecar,
+            vm_limits,
+            ..
+        } = super::parse_source_run(
+            [
+                "--jobs=2",
+                "--import-posture",
+                "recheck",
+                "--emit-flbc",
+                "--fln-max-steps=17",
+                "--emit-sidecar",
+                "--jobs=3",
+                "Main.lean",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap()
+        else {
+            panic!("source command")
+        };
+        assert_eq!(jobs.unwrap().get(), 2);
+        assert_eq!(import_posture, super::ImportPosture::Recheck);
+        assert_eq!(emit_flbc, Some(PathBuf::from("--fln-max-steps=17")));
+        assert_eq!(emit_sidecar, Some(PathBuf::from("--jobs=3")));
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+
+        let super::MultiplexerCommand::FlbcRun {
+            sidecar, vm_limits, ..
+        } = super::parse_flbc_run(
+            ["--sidecar", "--fln-max-frames=17", "product.flbc"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap()
+        else {
+            panic!("artifact command")
+        };
+        assert_eq!(sidecar, Some(PathBuf::from("--fln-max-frames=17")));
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
     }
 
     #[test]

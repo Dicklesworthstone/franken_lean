@@ -94,6 +94,7 @@ pub(in crate::source_check) fn run(
     emit_artifact: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
 ) -> Option<MultiplexerOutput> {
     let sources = read_source_batch(paths, max_bytes).ok()?;
     let paths = paths.to_vec();
@@ -177,6 +178,7 @@ pub(in crate::source_check) fn run(
             let mut limits = SourceProgramLimits::new(fln::EngineExecutionLimits::for_user_program(
                 fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
             ));
+            limits.execution.vm = vm_limits;
             limits.modules.source.max_bytes = max_bytes;
             if let Err(error) = preflight_source_program(&inputs, limits.modules) {
                 return Some(failure(module_error(error), presentation));

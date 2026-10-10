@@ -115,6 +115,36 @@ fn without_import_report(text: &str) -> String {
 }
 
 #[test]
+fn caller_execution_ceilings_apply_after_real_import_admission() {
+    let Some(lib) = pinned_lib() else { return };
+    let ws = Workspace::new("imported-execution-limits");
+    let main = ws.write(
+        "Main.lean",
+        "prelude\nimport Init.Prelude\n#check Nat\n#eval id (42 : Nat)\n",
+    );
+    let completed = ws.run(
+        &main,
+        Some(&lib),
+        &["--jobs=1", "--fln-max-steps=10000", "--fln-max-frames=128"],
+    );
+    let text = completed.complete();
+    assert!(
+        text.contains("\"schema\":\"fln.source-program/1\""),
+        "{text}"
+    );
+    assert!(text.contains("\"value\":42"), "{text}");
+    for (flag, reason) in [
+        ("--fln-max-steps=0", "ExecutionSteps"),
+        ("--fln-max-frames=0", "RecursionDepth"),
+    ] {
+        let stopped = ws.run(&main, Some(&lib), &["--jobs=1", flag]);
+        let stderr = stopped.refused("inconclusive", 3);
+        assert!(stderr.contains("\"authority\":false"), "{stopped:?}");
+        assert!(stderr.contains(reason), "{stopped:?}");
+    }
+}
+
+#[test]
 fn actual_prelude_runs_with_recheck_reuse_isolation_order_and_atomic_failures() {
     let Some(lib) = pinned_lib() else { return };
     let ws = Workspace::new("pinned");

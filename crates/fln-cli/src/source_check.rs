@@ -31,6 +31,7 @@ pub(super) fn run_imported(
     emit_artifact: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
 ) -> Option<MultiplexerOutput> {
     imports::execution::run(
         paths,
@@ -39,6 +40,7 @@ pub(super) fn run_imported(
         emit_artifact,
         jobs,
         posture,
+        vm_limits,
     )
 }
 
@@ -48,7 +50,11 @@ pub(super) fn run_imported(
 /// admitted under the interactive doors' default posture. `None` leaves a
 /// headerless file, or one whose imports are local sources, to the existing
 /// local route.
-pub(super) fn run_imported_lean(path: &Path, max_bytes: usize) -> Option<MultiplexerOutput> {
+pub(super) fn run_imported_lean(
+    path: &Path,
+    max_bytes: usize,
+    vm_limits: fln::VmExecutionLimits,
+) -> Option<MultiplexerOutput> {
     imports::execution::run(
         &[path.to_path_buf()],
         max_bytes,
@@ -56,6 +62,7 @@ pub(super) fn run_imported_lean(path: &Path, max_bytes: usize) -> Option<Multipl
         false,
         default_import_jobs(),
         ImportPosture::ReuseVerified,
+        vm_limits,
     )
 }
 
