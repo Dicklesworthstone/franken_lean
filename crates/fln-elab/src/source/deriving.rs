@@ -513,11 +513,17 @@ pub fn elaborate_handler(
     let Some(ConstantInfo::Induct(family)) = environment.find(type_name) else {
         return Err(unsupported(type_name));
     };
-    if family.num_indices != 0 || family.is_unsafe {
+    if family.is_unsafe || (family.num_indices != 0 && !is_repr) {
         return Err(unsupported(type_name));
     }
     let budget = crate::records::RecordBudget::default();
-    if family.num_params as usize > budget.max_binders || family.ctors.len() > budget.max_binders {
+    if family.num_params as usize > budget.max_binders
+        || family.num_indices as usize
+            > budget
+                .max_binders
+                .saturating_sub(family.num_params as usize)
+        || family.ctors.len() > budget.max_binders
+    {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     context.level_params = family.base.level_params.clone();

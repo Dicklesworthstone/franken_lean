@@ -290,17 +290,18 @@ fn inductive_format(
             .iter()
             .zip(hypotheses)
             .filter(|(field, _)| field.binder_info == BinderInfo::Default)
-            .map(|(field, hypothesis)| (value(field), hypothesis.as_ref())),
+            .map(|(field, hypothesis)| (value(field), hypothesis.as_ref().map(value))),
     );
     for (field, hypothesis) in arguments {
         context.tick()?;
         let line = context.constant(&named("Std.Format.line"))?;
         result = append(context, result, line)?;
         // Init.Notation's max_prec macro expands to 1024.
-        // A direct recursive field uses the checked recursor's IH, matching
-        // the pin's recursive call to this printer instead of instance search.
         let field = if let Some(hypothesis) = hypothesis {
-            context.match_apply(value(hypothesis), nat(1024))?
+            // The recursor provides the printer for this actual recursive
+            // child. Parameter payloads continue through ordinary Repr search,
+            // even when a parameter is instantiated with the same family.
+            context.match_apply(hypothesis, nat(1024))?
         } else {
             repr(context, field, nat(1024))?
         };
@@ -329,6 +330,7 @@ fn inductive_body(
     context: &mut Context,
     family: &InductiveVal,
     parameters: &[LocalDecl],
+    indices: &[LocalDecl],
     target: &Expr,
     receiver: &LocalDecl,
     precedence: &LocalDecl,
@@ -339,7 +341,7 @@ fn inductive_body(
     };
     if recursor.is_unsafe
         || recursor.num_motives != 1
-        || recursor.num_indices != 0
+        || recursor.num_indices != family.num_indices
         || recursor.num_params != family.num_params
         || recursor.num_minors as usize != family.ctors.len()
         || recursor.rules.len() != family.ctors.len()
@@ -357,15 +359,27 @@ fn inductive_body(
         Expr::const_(named("Std.Format"), Vec::new()),
         BinderInfo::Default,
     );
-    let motive = typed(
-        context,
-        Expr::lam(
-            Name::anonymous(),
-            target.clone(),
-            result_type.clone(),
-            BinderInfo::Default,
-        ),
-    )?;
+    let mut motive = Expr::lam(
+        Name::anonymous(),
+        target.clone(),
+        result_type.clone(),
+        BinderInfo::Default,
+    );
+    // The recursor refines indices for each constructor and recursive child.
+    // Quantify them in the motive instead of fixing them to the receiver's
+    // indices or treating them as uniform family parameters.
+    for index in indices.iter().rev() {
+        context.tick()?;
+        motive = Expr::lam(
+            index.user_name.clone(),
+            index.type_.clone(),
+            motive
+                .abstract_fvar(&index.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?,
+            index.binder_info,
+        );
+    }
+    let motive = typed(context, motive)?;
     function = context.match_apply(function, motive)?;
     for rule in &recursor.rules {
         context.tick()?;
@@ -390,35 +404,42 @@ fn inductive_body(
         };
         let saved = context.txn.lctx.clone();
         let mut cursor = binder_type.clone();
+        let recursive = context.constructor_recursive_fields(&constructor)?;
         let mut fields = Vec::new();
         for _ in 0..constructor.num_fields {
             fields.push(open_binder(context, &mut cursor)?);
         }
-        let mut binders = fields.clone();
+        let mut branch_locals = fields.clone();
         let mut hypotheses = Vec::new();
-        for field in &fields {
-            context.tick()?;
-            // The pin tests the instantiated field's application head here;
-            // delta-reducing an alias would broaden its recursive-call branch.
-            let type_ = context.instantiate(&field.type_)?;
-            let mut head = &type_;
-            while let ExprNode::App { f, .. } = head.node() {
-                context.tick()?;
-                head = f;
-            }
-            if matches!(head.node(), ExprNode::Const { name, .. } if name == &family.base.name) {
-                context.constrain_type(&field.type_, target)?;
+        for (field, recursive) in fields.iter().zip(recursive) {
+            if recursive {
+                // Function-valued recursive fields require their own Repr
+                // instance; an induction hypothesis for their results is not
+                // a printer for the function. This lane handles direct children.
+                // The pin selects this printer from the field's raw type
+                // head. An alias must not bypass ordinary Repr search merely
+                // because the kernel also supplies an induction hypothesis.
+                let domain = context.instantiate(&field.type_)?;
+                let mut head = &domain;
+                while let ExprNode::App { f, .. } = head.node() {
+                    context.tick()?;
+                    head = f;
+                }
+                if !matches!(head.node(), ExprNode::Const { name, .. } if name == &family.base.name)
+                {
+                    return Err(unsupported(&family.base.name));
+                }
                 let hypothesis = open_binder(context, &mut cursor)?;
                 context.constrain_type(&hypothesis.type_, &result_type)?;
-                binders.push(hypothesis.clone());
+                branch_locals.push(hypothesis.clone());
                 hypotheses.push(Some(hypothesis));
             } else {
                 hypotheses.push(None);
             }
         }
-        // The kernel places IHs after all constructor fields. Any remaining
-        // higher-order recursive IH must not be mistaken for the precedence
-        // binder; only the exact Nat -> Format result is supported here.
+        // The kernel places IHs after all constructor fields. Check the
+        // remaining result before opening precedence, including for families
+        // whose child indices differ from the receiver's indices.
         context.constrain_type(&cursor, &result_type)?;
         let prec = open_binder(context, &mut cursor)?;
         let format = inductive_format(
@@ -430,13 +451,53 @@ fn inductive_body(
             &prec,
         )?;
         context.constrain_type(&format.type_, &cursor)?;
-        binders.push(prec);
-        let branch = bind(context, format, &binders)?;
+        branch_locals.push(prec);
+        let branch = bind(context, format, &branch_locals)?;
         function = context.match_apply(function, branch)?;
         context.txn.lctx = saved;
     }
+    for index in indices {
+        function = context.match_apply(function, value(index))?;
+    }
     function = context.match_apply(function, value(receiver))?;
     context.match_apply(function, value(precedence))
+}
+
+/// Repr's helper and instance quantify the complete family telescope, including
+/// indices. Data indices require no additional Repr dictionaries in the motive.
+/// Type-valued indices need dictionary generalization across recursive calls,
+/// which is a separate elaboration case and is not guessed here.
+fn family_indices(
+    context: &mut Context,
+    family: &InductiveVal,
+    target: &Expr,
+) -> Result<(Vec<LocalDecl>, Expr), NatDefinitionElabError> {
+    let mut target = typed(context, target.clone())?;
+    let mut indices = Vec::new();
+    for _ in 0..family.num_indices {
+        context.tick()?;
+        let cursor = context.whnf(&target.type_)?;
+        let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            ..
+        } = cursor.node()
+        else {
+            return Err(unsupported(&family.base.name));
+        };
+        if matches!(context.whnf(binder_type)?.node(), ExprNode::Sort { .. }) {
+            return Err(unsupported(&family.base.name));
+        }
+        let index = local(
+            context,
+            binder_name.clone(),
+            binder_type.clone(),
+            BinderInfo::Implicit,
+        )?;
+        target = context.match_apply(target, value(&index))?;
+        indices.push(index);
+    }
+    Ok((indices, target.value))
 }
 
 pub(super) fn elaborate(
@@ -466,10 +527,12 @@ pub(super) fn elaborate(
         }
         parameter_type = body;
     }
-    let class = class_type(context, target)?;
-    let instance = context.generated_instance_name(parameters, &class.value)?;
-    let helper = Name::str(instance.clone(), "repr");
+    let (indices, target) = family_indices(context, family, target)?;
+    let class = class_type(context, &target)?;
     let mut header = parameters.to_vec();
+    header.extend(indices.iter().cloned());
+    let instance = context.generated_instance_name(&header, &class.value)?;
+    let helper = Name::str(instance.clone(), "repr");
     // Unlike Inhabited, the pin's generic Repr handler retains every
     // well-typed parameter hypothesis, even when no field uses it.
     for (index, parameter) in parameters.iter().enumerate() {
@@ -501,7 +564,15 @@ pub(super) fn elaborate(
     let body = if is_record {
         record_body(context, family, parameters, &receiver)?
     } else {
-        inductive_body(context, family, parameters, target, &receiver, &precedence)?
+        inductive_body(
+            context,
+            family,
+            parameters,
+            &indices,
+            &target,
+            &receiver,
+            &precedence,
+        )?
     };
     let mut helper_header = header.clone();
     helper_header.extend([receiver, precedence]);
@@ -520,7 +591,7 @@ pub(super) fn elaborate(
     for parameter in &header {
         helper_call = context.match_apply(helper_call, value(parameter))?;
     }
-    let carrier = typed(context, target.clone())?;
+    let carrier = typed(context, target)?;
     let dictionary = call(context, "Repr.mk", &[carrier, helper_call])?;
     context.constrain_type(&dictionary.type_, &class.value)?;
     let instance_term = close(context, dictionary, &header)?;

@@ -159,6 +159,354 @@ fn alpha_type(expr: &Expr) -> Expr {
 }
 
 #[test]
+fn admitted_numeric_printers_preserve_logical_values_and_replay_native_printing() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let engine = &imported.engine;
+            let options = KVMap::new();
+            let original_root = engine.logical_root(&options);
+            // The actual transitive library has passed both module checkers.
+            // These expressions retain logical USize and Subtype values at
+            // source boundaries, including first-class uses of both leaves.
+            let source = br#"
+#eval USize.repr (USize.ofNat 0)
+#eval USize.repr (USize.ofNat 42)
+#eval USize.repr (USize.ofNat 18446744073709551615)
+#eval USize.repr (USize.ofNat 18446744073709551616)
+#eval let print := USize.repr; print (USize.ofNat 7)
+#eval let ofNat := USize.ofNat; USize.repr (ofNat 9)
+#eval USize.repr (USize.ofNat (USize.toNat (USize.ofNat 123)))
+#eval USize.repr (USize.ofNat System.Platform.numBits)
+#eval let width := System.Platform.getNumBits; USize.repr (USize.ofNat (width ()).val)
+#eval Nat.repr 0
+#eval Nat.repr 127
+#eval Nat.repr 128
+#eval Nat.repr 18446744073709551615
+#eval Nat.repr 18446744073709551616
+#eval Nat.repr 123456789012345678901234567890
+#eval let print := Nat.repr; print 256
+#eval reprStr (42 : Nat)
+"#;
+            let expected = [
+                "0",
+                "42",
+                "18446744073709551615",
+                "0",
+                "7",
+                "9",
+                "123",
+                "64",
+                "64",
+                "0",
+                "127",
+                "128",
+                "18446744073709551615",
+                "18446744073709551616",
+                "123456789012345678901234567890",
+                "256",
+                "42",
+            ];
+            let execute = || {
+                engine
+                    .execute_source_definitions(
+                        &[source],
+                        &options,
+                        fln::EngineExecutionLimits::new(admission().kernel),
+                    )
+                    .expect("actual native word printing compiles within default ingress limits")
+                    .into_complete()
+                    .expect("actual native word printing executes within default VM limits")
+            };
+            let first = execute();
+            assert_eq!(first.executions.len(), expected.len());
+            let mut rows = std::collections::BTreeSet::new();
+            for (execution, expected) in first.executions.iter().zip(expected) {
+                assert_eq!(
+                    execution.checker.ground,
+                    fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                );
+                let expected = Some(fln::ClosedVmValue::String(expected.to_owned()));
+                assert_eq!(fln::closed_vm_value(&execution.exit).unwrap(), expected);
+                let decoded =
+                    fln_comp::flbc::decode_canonical(&execution.flbc_artifact, Default::default())
+                        .unwrap();
+                assert_eq!(
+                    fln_comp::flbc::encode_canonical(&decoded, Default::default()).unwrap(),
+                    execution.flbc_artifact
+                );
+                for instruction in decoded
+                    .functions()
+                    .iter()
+                    .flat_map(|function| &function.code)
+                {
+                    if let fln_comp::flbc::Instruction::Intrinsic { row, .. } = instruction {
+                        rows.insert(row.clone());
+                    }
+                }
+                let replay = fln::execute_flbc_artifact(
+                    &execution.flbc_artifact,
+                    &options,
+                    Default::default(),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("canonical numeric-printer bytecode replays without the source engine");
+                assert_eq!(fln::closed_vm_value(&replay).unwrap(), expected);
+            }
+            for row in [
+                "extern:USize.ofNat",
+                "extern:USize.toNat",
+                "extern:USize.repr",
+                "extern:System.Platform.getNumBits",
+                "extern:Nat.div",
+                "extern:Nat.mod",
+            ] {
+                assert!(
+                    rows.contains(row),
+                    "the genuine native leaf remains in bytecode: {row}"
+                );
+            }
+            assert!(!rows.iter().any(|row| row.starts_with("extern:IO.")));
+            let repeated = execute();
+            for (first, repeated) in first.executions.iter().zip(&repeated.executions) {
+                assert_eq!(first.flbc_artifact, repeated.flbc_artifact);
+            }
+            assert_eq!(engine.logical_root(&options), original_root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn rendered(engine: &Engine, expression: &str, expected: &str) {
+    let source = format!("#eval {expression}");
+    let execution = engine
+        .execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(admission().kernel),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("the actual imported Format renderer completes");
+    assert_eq!(execution.executions.len(), 1);
+    let execution = &execution.executions[0];
+    let expected = Some(fln::ClosedVmValue::String(expected.to_owned()));
+    assert_eq!(fln::closed_vm_value(&execution.exit).unwrap(), expected);
+    let replay =
+        fln::execute_flbc_artifact(&execution.flbc_artifact, &KVMap::new(), Default::default())
+            .expect("the emitted printer artifact decodes and validates")
+            .into_complete()
+            .expect("the serialized printer executes without the source engine");
+    assert_eq!(fln::closed_vm_value(&replay).unwrap(), expected);
+}
+
+#[test]
+fn k1_checked_alias_recursive_fields_keep_the_reference_deriving_boundary() {
+    use fln_core::expr::{BinderInfo, FVarId};
+    use fln_core::level::Level;
+    use fln_elab::NatDefinitionElabError;
+    use fln_elab::inductive::{ConstructorSpec, InductiveSpec, inductive_declaration};
+    use fln_elab::lctx::LocalDecl;
+    use fln_elab::records::RecordBudget;
+    use fln_elab::source::SourceInferenceError;
+    use fln_elab::source::deriving::{DerivingError, elaborate_handler};
+    use fln_elab::source::scope::SourceScope;
+
+    // The public elaborator accepts an Environment without admission authority.
+    // Build a K1-checked alias signature for that API; the independent checker
+    // currently defers this family, so this fixture must never become an Engine.
+    fn preserve_child_alias(source: &Expr, family: &Expr, alias: &Expr) -> Expr {
+        match source.node() {
+            ExprNode::App { f, a } => Expr::app(
+                preserve_child_alias(f, family, alias),
+                preserve_child_alias(a, family, alias),
+            ),
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            }
+            | ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                let domain = if binder_name == &name("child") && binder_type == family {
+                    alias.clone()
+                } else {
+                    preserve_child_alias(binder_type, family, alias)
+                };
+                let body = preserve_child_alias(body, family, alias);
+                if matches!(source.node(), ExprNode::Lam { .. }) {
+                    Expr::lam(binder_name.clone(), domain, body, *binder_info)
+                } else {
+                    Expr::forall_e(binder_name.clone(), domain, body, *binder_info)
+                }
+            }
+            _ => source.clone(),
+        }
+    }
+
+    fn candidate(label: &str, preserve_alias: bool) -> fln::Declaration {
+        let family = Expr::const_(name(label), vec![]);
+        let spec = InductiveSpec {
+            name: name(label),
+            parameters: vec![],
+            indices: vec![],
+            level_params: vec![],
+            result_level: Level::one(),
+            constructors: vec![
+                ConstructorSpec {
+                    name: name("leaf"),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+                ConstructorSpec {
+                    name: name("node"),
+                    fields: vec![LocalDecl {
+                        id: FVarId(name("child")),
+                        user_name: name("child"),
+                        type_: family.clone(),
+                        value: None,
+                        binder_info: BinderInfo::Default,
+                        index: 0,
+                    }],
+                    result_indices: vec![],
+                },
+            ],
+        };
+        let fln::Declaration::Inductive(mut block) =
+            inductive_declaration(&spec, RecordBudget::default()).unwrap()
+        else {
+            unreachable!()
+        };
+        if preserve_alias {
+            let alias = Expr::app(
+                Expr::const_(name("Id"), vec![Level::zero()]),
+                family.clone(),
+            );
+            for constructor in &mut block.ctors {
+                constructor.base.type_ =
+                    preserve_child_alias(&constructor.base.type_, &family, &alias);
+            }
+            for recursor in &mut block.recursors {
+                recursor.base.type_ = preserve_child_alias(&recursor.base.type_, &family, &alias);
+                for rule in &mut recursor.rules {
+                    rule.rhs = preserve_child_alias(&rule.rhs, &family, &alias);
+                }
+            }
+        }
+        fln::Declaration::Inductive(block)
+    }
+
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let engine = imported
+                .engine
+                .admit_declaration(
+                    candidate("DirectReprChild", false),
+                    &KVMap::new(),
+                    admission(),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("both checkers admit the ordinary recursive control")
+                .engine;
+            let alias = candidate("AliasedReprChild", true);
+            let verdict = fln_kernel::check(engine.environment(), &alias, admission().kernel);
+            assert!(
+                matches!(
+                    &verdict,
+                    fln::Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+                ),
+                "the alias and its complete recursor must be K1-checked: {verdict:?}"
+            );
+            let fln::Declaration::Inductive(block) = alias else {
+                unreachable!()
+            };
+            // This scratch environment is only an elaborator input. It is
+            // neither an Engine admission result nor an executable snapshot.
+            let mut alias_environment = engine.environment().clone();
+            for info in block
+                .types
+                .into_iter()
+                .map(ConstantInfo::Induct)
+                .chain(block.ctors.into_iter().map(ConstantInfo::Ctor))
+                .chain(block.recursors.into_iter().map(ConstantInfo::Rec))
+            {
+                alias_environment = alias_environment.add_decl(info).unwrap();
+            }
+            let constructor = alias_environment
+                .find(&name("AliasedReprChild.node"))
+                .unwrap()
+                .constant_val();
+            let ExprNode::ForallE { binder_type, .. } = constructor.type_.node() else {
+                unreachable!()
+            };
+            assert_eq!(
+                binder_type,
+                &Expr::app(
+                    Expr::const_(name("Id"), vec![Level::zero()]),
+                    Expr::const_(name("AliasedReprChild"), vec![]),
+                ),
+                "the elaborator sees the original checked child domain"
+            );
+            let root = engine.logical_root(&KVMap::new());
+            let refused = elaborate_handler(
+                &name("Repr"),
+                &name("AliasedReprChild"),
+                false,
+                &alias_environment,
+                admission().kernel,
+                &SourceScope::default(),
+            );
+            // The bounded direct-child handler refuses this preserved alias
+            // head as an unsupported family before constructing its printer.
+            assert!(
+                matches!(&refused,
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Deriving(
+                        DerivingError::UnsupportedFamily(family)
+                    ))) if family == &name("AliasedReprChild")),
+                "the preserved Id child must produce the explicit family refusal: {refused:?}"
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), root);
+            assert!(!engine.environment().contains(&name("AliasedReprChild")));
+            assert!(!alias_environment.contains(&name("instReprAliasedReprChild")));
+            assert!(!alias_environment.contains(&name("instReprAliasedReprChild.repr")));
+            let direct = elaborate_handler(
+                &name("Repr"),
+                &name("DirectReprChild"),
+                false,
+                engine.environment(),
+                admission().kernel,
+                &SourceScope::default(),
+            )
+            .expect("ordinary direct recursion still derives after the refusal");
+            let admitted = engine
+                .admit_declarations(&direct.declarations, &KVMap::new(), admission())
+                .unwrap()
+                .into_complete()
+                .expect("the complete direct printer and dictionary pass both checkers");
+            assert!(admitted.engine.environment().contains(&direct.instance));
+            assert!(!engine.environment().contains(&direct.instance));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn admitted_string_quote_executes_escaping_callbacks_and_replays_native_bytecode() {
     std::thread::Builder::new()
         .stack_size(STACK)
@@ -240,6 +588,160 @@ fn admitted_string_quote_executes_escaping_callbacks_and_replays_native_bytecode
                 assert_eq!(first.flbc_artifact, repeated.flbc_artifact);
             }
             assert_eq!(engine.logical_root(&options), original_root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn recursive_repr_uses_child_hypotheses_and_executes_the_real_format_renderer() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            // The Expr declaration is the unmodified data definition in the
+            // pinned Init/Grind/AC.lean, including its three deriving handlers.
+            let source = r#"
+namespace Lean.Grind.AC
+abbrev Var := Nat
+inductive Expr where
+  | var (x : Var)
+  | op (lhs rhs : Expr)
+  deriving Inhabited, Repr, BEq
+end Lean.Grind.AC
+universe u
+inductive Chain (A : Type u) where
+  | nil
+  | cons (head : A) (tail : Chain A)
+deriving Repr
+inductive Tree (A : Type) where
+  | leaf (value : A)
+  | branch (left right : Tree A)
+deriving Repr
+inductive ErasedTree : Type 1 where
+  | leaf
+  | node (kind : Type) (proof : True) (child : ErasedTree)
+deriving Repr
+inductive Hidden where
+  | leaf
+  | node {child : Hidden}
+deriving Repr
+def generic {A : Type u} [Repr A] : Repr (Chain A) := inferInstance
+def genericHelper {A : Type u} [Repr A] : Chain A -> Nat -> Std.Format := instReprChain.repr
+theorem boolean :
+  (Lean.Grind.AC.Expr.op (.var 7) (.var 9) == Lean.Grind.AC.Expr.op (.var 7) (.var 9)) = true := by rfl
+"#;
+            let base = &imported.engine;
+            let root = base.logical_root(&KVMap::new());
+            let result = checked(base, source);
+            for (generated, expected) in [
+                ("instReprChain", "generic"),
+                ("instReprChain.repr", "genericHelper"),
+            ] {
+                let actual = result.environment().find(&name(generated)).unwrap().constant_val();
+                let expected = result.environment().find(&name(expected)).unwrap().constant_val();
+                assert_eq!(actual.level_params, expected.level_params);
+                assert_eq!(alpha_type(&actual.type_), alpha_type(&expected.type_));
+            }
+            for (expression, expected) in [
+                (
+                    "reprStr (Lean.Grind.AC.Expr.op (.var 7) (.var 9))",
+                    "Lean.Grind.AC.Expr.op (Lean.Grind.AC.Expr.var 7) (Lean.Grind.AC.Expr.var 9)",
+                ),
+                (
+                    "reprStr (Chain.cons 7 (Chain.cons 9 Chain.nil))",
+                    "Chain.cons 7 (Chain.cons 9 (Chain.nil))",
+                ),
+                (
+                    "reprStr (Tree.branch (Tree.leaf 1) (Tree.branch (Tree.leaf 2) (Tree.leaf 3)))",
+                    "Tree.branch (Tree.leaf 1) (Tree.branch (Tree.leaf 2) (Tree.leaf 3))",
+                ),
+                (
+                    "reprStr (Tree.leaf (Tree.leaf 7))",
+                    "Tree.leaf (Tree.leaf 7)",
+                ),
+                (
+                    "reprStr (ErasedTree.node Nat True.intro ErasedTree.leaf)",
+                    "ErasedTree.node _ _ (ErasedTree.leaf)",
+                ),
+                ("reprStr (@Hidden.node Hidden.leaf)", "Hidden.node"),
+            ] {
+                rendered(&result, expression, expected);
+            }
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+            assert!(!base.environment().contains(&name("instReprChain")));
+            let again = checked(base, source);
+            assert_eq!(result.logical_root(&KVMap::new()), again.logical_root(&KVMap::new()));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn indexed_repr_refines_constructor_indices_and_preserves_the_generic_statement() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let result = checked(
+                &imported.engine,
+                r#"
+universe u
+inductive Vec (A : Type u) : Nat -> Type u where
+  | nil : Vec A 0
+  | cons {n : Nat} (head : A) (tail : Vec A n) : Vec A (n + 1)
+deriving Repr
+inductive Mark : Nat -> Type where
+  | zero : Mark 0
+  | succ (n : Nat) : Mark (n + 1)
+deriving Repr
+inductive Grid (A : Type) : Nat -> Nat -> Type where
+  | empty : Grid A 0 0
+  | step {m n : Nat} (value : A) (child : Grid A m n) : Grid A (m + 1) (n + 2)
+deriving Repr
+def vecPrinter {A : Type u} {n : Nat} [Repr A] : Repr (Vec A n) := inferInstance
+def vecHelper {A : Type u} {n : Nat} [Repr A] : Vec A n -> Nat -> Std.Format := instReprVec.repr
+def gridPrinter {A : Type} {m n : Nat} [Repr A] : Repr (Grid A m n) := inferInstance
+"#,
+            );
+            for (generated, expected) in [
+                ("instReprVec", "vecPrinter"),
+                ("instReprVec.repr", "vecHelper"),
+                ("instReprGrid", "gridPrinter"),
+            ] {
+                let actual = result
+                    .environment()
+                    .find(&name(generated))
+                    .unwrap()
+                    .constant_val();
+                let expected = result
+                    .environment()
+                    .find(&name(expected))
+                    .unwrap()
+                    .constant_val();
+                assert_eq!(actual.level_params, expected.level_params);
+                assert_eq!(alpha_type(&actual.type_), alpha_type(&expected.type_));
+            }
+            for (expression, expected) in [
+                (
+                    "reprStr (Vec.cons 7 (Vec.cons 9 Vec.nil))",
+                    "Vec.cons 7 (Vec.cons 9 (Vec.nil))",
+                ),
+                ("reprStr Mark.zero", "Mark.zero"),
+                ("reprStr (Mark.succ 4)", "Mark.succ 4"),
+                (
+                    "reprStr (Grid.step 7 (Grid.step 9 Grid.empty))",
+                    "Grid.step 7 (Grid.step 9 (Grid.empty))",
+                ),
+            ] {
+                rendered(&result, expression, expected);
+            }
         })
         .unwrap()
         .join()
@@ -356,8 +858,10 @@ theorem chain_ne : Not (Chain.cons 7 (Chain.cons 9 Chain.nil) = Chain.cons 7 (Ch
                 "structure Bad where\n  run : Nat → Nat\nderiving Repr",
                 "structure DictBox (A : Type) [Repr A] where\n  val : A\nderiving Repr",
                 "inductive HigherOrder where\n | node (next : Nat → HigherOrder)\nderiving Repr",
-                "inductive Indexed : Nat → Type where\n | zero : Indexed 0\nderiving Repr",
+                "inductive Nested where\n | node (children : List Nested)\nderiving Repr",
+                "inductive Indexed : Type -> Type 1 where\n | nat : Indexed Nat\n | bool : Indexed Bool\nderiving Repr",
                 "structure Partial where\n n : Nat\nderiving Repr, BEq, UnknownHandler",
+                "inductive Partial where\n | leaf\n | node (child : Partial)\nderiving Repr, BEq, UnknownHandler",
             ] {
                 assert!(
                     base.check_source_files(
