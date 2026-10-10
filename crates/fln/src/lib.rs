@@ -6770,33 +6770,51 @@ impl Engine {
                     ),
                 ))
             })?;
-        let declared = match &declaration {
-            Declaration::Defn(definition) => Some(definition.base.name.clone()),
-            _ => None,
-        };
         let result = self
             .admit_declaration(declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut admitted) => {
                 if let Some((name, priority)) = registration {
-                    // An anonymous instance: the name its elaboration generated.
-                    let name = match (name.is_anonymous(), declared) {
-                        (true, Some(declared)) => declared,
-                        _ => name,
+                    // A proof instance is admitted as a theorem. Both it and
+                    // a data definition register the actual completed name,
+                    // including names generated for anonymous instances.
+                    let declared = match &admitted.declaration {
+                        Declaration::Defn(definition) => &definition.base.name,
+                        Declaration::Thm(theorem) => &theorem.base.name,
+                        _ => {
+                            return Err(EngineExecutionError::NotImplemented {
+                                feature: "an instance command must admit a definition or theorem",
+                            });
+                        }
                     };
-                    admitted.engine.environment = fln_elab::instances::register_instance(
-                        admitted.engine.environment(),
+                    let name = if name.is_anonymous() {
+                        declared.clone()
+                    } else {
+                        self.base_source_scope()
+                            .declaration_name(&name)
+                            .map_err(|error| {
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::NameScope(error),
+                                    ),
+                                ))
+                            })?
+                    };
+                    if &name != declared {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "instance metadata must name the completed checked declaration",
+                        });
+                    }
+                    admitted.engine = match admitted.engine.register_checked_source_instance(
                         &name,
                         priority,
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
-                            ),
-                        ))
-                    })?;
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some((name, priority, reverse)) = simp {
@@ -7647,7 +7665,33 @@ impl Engine {
             let is_template = !is_evaluation
                 && matches!(&declaration,
                 Declaration::Defn(definition) if runtime::is_template(definition));
-            if matches!(declaration, Declaration::Thm(_)) || is_template {
+            // A named proof definition has no runtime result. Classify its
+            // closed header before compilation, then retain its original
+            // definition and the ordinary dual-admission evidence below.
+            let is_proof_definition = match &declaration {
+                Declaration::Defn(definition) if !is_evaluation && !is_template => {
+                    match source_records::declaration_is_proposition(
+                        engine.environment(),
+                        &definition.base,
+                        limits.kernel,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                        Outcome::Complete(proof) => proof,
+                        Outcome::Inconclusive(reason) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Outcome::InternalFault(fault) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if matches!(declaration, Declaration::Thm(_)) || is_template || is_proof_definition {
                 let admission = match engine
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {

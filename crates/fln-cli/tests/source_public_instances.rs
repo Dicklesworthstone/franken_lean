@@ -125,11 +125,15 @@ fn installed_runtime_evaluates_the_exposed_instance_body() {
         "{result}"
     );
     // Native run projects the checked Bool directly. The compatibility door
-    // must still refuse instance-directed printing without a real Init/Repr.
+    // requires an actual Repr or ToString instance from the checked world.
     let lean = p.lean();
     assert!(!lean.status.success());
     assert!(lean.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&lean.stderr).contains("do not reach `Init`"));
+    assert!(
+        String::from_utf8_lossy(&lean.stderr)
+            .contains("#eval requires an existing Repr or ToString instance"),
+        "{lean:?}"
+    );
 }
 
 #[test]

@@ -134,6 +134,11 @@ impl SourceModuleSession {
         super::super::inspect::module(self, modules, entry, offset, kind, self.limits)
     }
 
+    /// Header-only editor observations use this session's fixed checking budget.
+    pub(in crate::source_check) fn inspection_kernel_budget(&self) -> Budget {
+        self.limits.source.admission.kernel
+    }
+
     /// Check a module closure and encode its own checked declarations as real
     /// `.olean` artifacts. Reuse is process-local, bound to this session's exact
     /// base, options, source bytes and dependency identities. No disk cache or

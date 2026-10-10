@@ -69,7 +69,7 @@ impl From<RecordError> for InductiveError {
             RecordError::InvalidName => Self::InvalidName,
             RecordError::DuplicateField => Self::DuplicateConstructor,
             RecordError::InvalidTelescope => Self::InvalidTelescope,
-            RecordError::UnsupportedSort => Self::UnsupportedSort,
+            RecordError::UnsupportedSort | RecordError::NonProofField => Self::UnsupportedSort,
             RecordError::ResourceLimit => Self::ResourceLimit,
         }
     }

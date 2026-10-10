@@ -40,7 +40,8 @@ fn empty_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
     Ok(())
 }
 
-/// Elaborate a Type-valued, nonrecursive structure/class with named fields.
+/// Elaborate a nonrecursive structure/class with named fields. Prop-valued
+/// records require proof fields, as in the pin's projection generator.
 /// Registration is intentionally absent here: only checked successors can own it.
 pub fn elaborate_record(
     syntax: &Syntax,
@@ -337,6 +338,22 @@ pub(super) fn elaborate_record_scoped(
         }
         None => inferred,
     };
+    if result_level.normalize_fixpoint().is_zero() {
+        for field in &output {
+            context.tick()?;
+            let domain = context.instantiate(&field.type_)?;
+            let sort = context
+                .known_type(&domain)?
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            if !matches!(context.whnf(&sort)?.node(), ExprNode::Sort { level }
+                if level.normalize_fixpoint().is_zero())
+            {
+                return Err(failure(SourceInferenceError::Record(
+                    crate::records::RecordError::NonProofField,
+                )));
+            }
+        }
+    }
     let mut parameters = parameters;
     for param in &mut parameters {
         param.type_ = context.instantiate(&param.type_)?;

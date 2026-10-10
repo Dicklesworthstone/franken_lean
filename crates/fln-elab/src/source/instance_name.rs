@@ -155,6 +155,13 @@ impl Context {
                 .txn
                 .env
                 .contains(&self.source_scope.private_name(&user_name))
+            // A public header resolves in the exported environment. Generated
+            // names still avoid the current module's private declarations, as
+            // Macro.hasDecl does, without using them for source resolution.
+            || self.private_proof_body.as_ref().is_some_and(|(environment, _)| {
+                environment.contains(&user_name)
+                    || environment.contains(&self.source_scope.private_name(&user_name))
+            })
         {
             self.tick()?;
             user_name = candidate(Some(next));

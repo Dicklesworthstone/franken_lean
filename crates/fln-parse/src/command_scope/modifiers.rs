@@ -176,24 +176,56 @@ pub fn prefix(source: &[u8]) -> Result<Option<DeclarationPrefix>, DefinitionPars
 /// binding in the result type does not start the proof. An unfinished header
 /// has no value boundary yet. The returned position is in the original bytes.
 pub fn theorem_body_start(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
+    declaration_body_start(source, false)
+}
+
+/// Locate a named or anonymous instance's value opener without parsing its
+/// unfinished body. This establishes a syntax boundary only: the elaborator
+/// must classify the header before a private proof world may be selected.
+pub fn instance_body_start(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
+    declaration_body_start(source, true)
+}
+
+fn declaration_body_start(
+    source: &[u8],
+    instance: bool,
+) -> Result<Option<usize>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let tokens = super::tokens(&view)?;
     let (_, _, declaration_start) =
         crate::declaration_prefix(&view, &tokens, DefinitionGrammar::Scalar)?;
     if !matches!(tokens.get(declaration_start).map(|token| &token.kind),
-        Some(TokenKind::Symbol(kind)) if kind == "theorem")
-        || !matches!(
-            tokens.get(declaration_start + 1).map(|token| &token.kind),
-            Some(TokenKind::Ident(_))
-        )
+        Some(TokenKind::Symbol(kind)) if kind == if instance { "instance" } else { "theorem" })
     {
         return Ok(None);
     }
-    let Ok((_, cursor)) = crate::levels::declaration_suffix(&view, &tokens, declaration_start + 2)
-    else {
+    let mut cursor = declaration_start + 1;
+    if instance
+        && matches!(tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(kind)) if kind == "(")
+        && matches!(tokens.get(cursor + 2).map(|token| &token.kind),
+            Some(TokenKind::Symbol(kind)) if kind == ":=")
+    {
+        let leaves = Leaves::build(view.normalized(), &tokens)?;
+        let Ok(Some((_, end))) =
+            super::syntax_decls::named_priority(&view, &tokens, &leaves, cursor)
+        else {
+            return Ok(None);
+        };
+        cursor = end;
+    }
+    if matches!(
+        tokens.get(cursor).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        let Ok((_, end)) = crate::levels::declaration_suffix(&view, &tokens, cursor + 1) else {
+            return Ok(None);
+        };
+        cursor = end;
+    } else if !instance {
         return Ok(None);
-    };
+    }
     let Ok((_, cursor)) =
         crate::signature_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)
     else {
@@ -304,5 +336,50 @@ mod tests {
             );
         }
         assert_eq!(theorem_body_start(b"public def t : Nat :=").unwrap(), None);
+    }
+
+    #[test]
+    fn instance_completion_locates_named_anonymous_and_priority_headers() {
+        for header in [
+            "public instance",
+            "public instance named.{u",
+            "public instance (priority := 12",
+            "public instance named (x : Nat := 0) : Law (x = x)",
+            "public instance : let P := True; Law P",
+            "public instance : Law (\" := \" = \" := \")",
+            "public instance : match true with | true => Law True | false => Law False",
+            "public theorem named : True := by",
+        ] {
+            assert_eq!(
+                instance_body_start(header.as_bytes()).unwrap(),
+                None,
+                "{header}"
+            );
+        }
+        for source in [
+            "public instance : Law True :=",
+            "public instance named : Law True := by exact",
+            "public instance (priority := 23) : Law True := by",
+            "public instance (priority := 23) named.{u} (A : Sort u) : Law (A = A) := by",
+            "public instance (x : Nat := 0) : Law (x = x) := by",
+            "public instance : let P := True; Law P := by",
+            "@[no_expose] public instance named : Law True /- := -/ := by",
+            "/-- proof -/\r\npublic instance : Law True := by\r\n exact",
+        ] {
+            assert_eq!(
+                instance_body_start(source.as_bytes()).unwrap(),
+                source.rfind(":="),
+                "{source}"
+            );
+        }
+        for (source, marker) in [
+            ("public instance (n : Nat) : Law (n = n)\n| .zero =>", "|"),
+            ("public instance : Law True where", "where"),
+        ] {
+            assert_eq!(
+                instance_body_start(source.as_bytes()).unwrap(),
+                source.find(marker)
+            );
+        }
     }
 }

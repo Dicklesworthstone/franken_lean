@@ -451,11 +451,18 @@ impl SourceEquation {
 #[derive(Clone)]
 struct Context {
     inspection: Option<inspect::Probe>,
-    // A public theorem fixes its signature in the exported world before its
-    // proof may see private imports. Both environments are untrusted inputs to
-    // elaboration; the caller still admits the complete theorem ordinarily.
-    private_theorem_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
+    // Public proof declarations fix their signatures in the exported world
+    // before their bodies may see private imports. Both environments remain
+    // untrusted elaborator inputs; complete bodies require ordinary admission.
+    private_proof_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
     public_theorem_signature: Option<ConstantVal>,
+    public_instance_signature: Option<instance_command::PublicHeader>,
+    /// A frozen public instance header does not itself imply a private body:
+    /// an explicitly exposed proof is checked in the public predecessor.
+    private_instance_body: bool,
+    // Completion may observe only a resolved instance header. The value is
+    // returned at that boundary; no body or declaration is constructed.
+    instance_header_probe: Option<bool>,
     source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
@@ -543,8 +550,11 @@ impl Context {
         txn.budget.max_heartbeats = 1_000_000;
         Self {
             inspection: None,
-            private_theorem_body: None,
+            private_proof_body: None,
             public_theorem_signature: None,
+            public_instance_signature: None,
+            private_instance_body: false,
+            instance_header_probe: None,
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
@@ -3839,7 +3849,7 @@ impl Context {
     }
 }
 
-/// The two checked predecessor views used by a module's public theorem. The
+/// The two checked predecessor views used by a module's public proof declaration. The
 /// signature sees `public`; only its proof sees `private`. Scope histories are
 /// supplied separately because each anchors a different instance journal.
 #[derive(Clone, Copy)]
@@ -3856,6 +3866,70 @@ pub fn is_theorem(syntax: &Syntax) -> bool {
         if kind == &parser_kind(&["Command", "declaration"])
             && args.len() == 2
             && args[1].kind() == Some(&parser_kind(&["Command", "theorem"])))
+}
+
+/// Whether the parsed command is a named or anonymous instance declaration.
+pub fn is_instance(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Command", "declaration"])
+            && args.len() == 2
+            && args[1].kind() == Some(&parser_kind(&["Command", "instance"])))
+}
+
+/// An untrusted instance candidate and the header-selected body visibility.
+/// These flags grant no export authority: the module driver checks the actual
+/// theorem or definition before constructing and admitting its interface.
+#[derive(Debug)]
+pub struct PublicInstance {
+    pub declaration: Declaration,
+    pub proof_valued: bool,
+    pub hidden_body: bool,
+}
+
+/// Elaborate a public instance once, choosing its body world from the resolved
+/// header. Data instances and explicitly exposed proofs stay entirely public.
+/// Proof instances become theorems with frozen public types, as in the pin's
+/// `addNonRecAux`; their body exposure does not change their declaration kind.
+pub fn elaborate_public_instance(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+) -> Result<PublicInstance, NatDefinitionElabError> {
+    let mut context = Context::public_instance(syntax, worlds, kernel)?;
+    let declaration = definition_in_context(syntax, &mut context)?;
+    Ok(PublicInstance {
+        proof_valued: matches!(&declaration, Declaration::Thm(_)),
+        hidden_body: context.private_instance_body,
+        declaration,
+    })
+}
+
+/// Observe whether a complete public instance header selects a private proof
+/// body. The syntax may contain a placeholder body: it is never elaborated.
+/// This bounded query grants no declaration or export authority.
+pub fn public_instance_header_is_hidden(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<bool, NatDefinitionElabError> {
+    let scope = scope.for_declaration(syntax)?;
+    if !is_instance(syntax) || !scope.exports_declaration() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a public instance header in a module file",
+        });
+    }
+    let mut context = Context::scoped(environment, kernel, &scope);
+    context.instance_header_probe = Some(false);
+    match definition_in_context(syntax, &mut context) {
+        Err(NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)) => {
+            context
+                .instance_header_probe
+                .ok_or_else(|| failure(SourceInferenceError::Scope))
+        }
+        Err(error) => Err(error),
+        Ok(_) => Err(failure(SourceInferenceError::Scope)),
+    }
 }
 
 /// Elaborate a public theorem's header and proof in their respective worlds.
@@ -3883,7 +3957,26 @@ impl Context {
             });
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope);
-        context.private_theorem_body = Some((
+        context.private_proof_body = Some((
+            worlds.private.clone(),
+            worlds.private_scope.instance_scopes.clone(),
+        ));
+        Ok(context)
+    }
+
+    fn public_instance(
+        syntax: &Syntax,
+        worlds: &TheoremWorlds<'_>,
+        kernel: Budget,
+    ) -> Result<Self, NatDefinitionElabError> {
+        let scope = worlds.public_scope.for_declaration(syntax)?;
+        if !is_instance(syntax) || !scope.exports_declaration() {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a public instance in a module file",
+            });
+        }
+        let mut context = Self::scoped(worlds.public, kernel, &scope);
+        context.private_proof_body = Some((
             worlds.private.clone(),
             worlds.private_scope.instance_scopes.clone(),
         ));
@@ -3929,10 +4022,16 @@ impl Context {
             level_params,
             type_,
         });
-        let (environment, instance_scopes) = self
-            .private_theorem_body
-            .take()
-            .expect("a public theorem enters its proof exactly once");
+        self.enter_private_proof()
+    }
+
+    fn enter_private_proof(&mut self) -> Result<(), NatDefinitionElabError> {
+        let (environment, instance_scopes) =
+            self.private_proof_body
+                .take()
+                .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "separate public and private predecessors for a hidden proof body",
+                })?;
         self.txn.env = environment;
         self.source_scope.instance_scopes = instance_scopes;
         self.registry_cache = crate::instances::RegistryCache::default();
@@ -4127,19 +4226,37 @@ fn definition_in_context_named(
         // holes and unresolved header instances must not cross this boundary.
         context.require_resolved_terms(&types)?;
     }
-    if is_instance {
-        instance_command::check_public_exposure(
-            context,
+    let (proof_instance, hidden_instance) = if is_instance {
+        context.validate_instance_binder(
             expected
                 .as_ref()
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
         )?;
-    }
+        instance_command::prepare_header(
+            context,
+            &parameters,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+            &modifiers[1],
+        )?
+    } else {
+        (false, false)
+    };
     if anonymous_instance {
         let expected = expected
             .as_ref()
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         owned_name = context.generated_instance_name(&parameters, expected)?;
+    }
+    if is_instance && !hidden_instance {
+        // Naming may consult the private predecessor only for collisions. Once
+        // the name is chosen, an exposed body retains only its public world.
+        context.private_proof_body = None;
+    }
+    if let Some(probe) = &mut context.instance_header_probe {
+        *probe = hidden_instance;
+        return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
     let theorem_section_parameters = if is_theorem {
@@ -4151,7 +4268,20 @@ fn definition_in_context_named(
     } else {
         None
     };
-    if context.private_theorem_body.is_some() {
+    if proof_instance && context.source_scope.exports_declaration() {
+        context.public_instance_signature = Some(instance_command::PublicHeader::freeze(
+            context,
+            name,
+            &parameters,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?);
+        if hidden_instance {
+            context.enter_private_proof()?;
+            context.private_instance_body = true;
+        }
+    } else if context.private_proof_body.is_some() {
         context.enter_public_theorem_proof(
             name,
             &parameters,
@@ -4220,13 +4350,6 @@ fn definition_in_context_named(
     if !is_theorem && !is_instance && !is_abbrev {
         expect_empty_null(&definition[4], "absent definition clauses")?;
     }
-    if is_instance {
-        context.validate_instance_binder(
-            expected
-                .as_ref()
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
-        )?;
-    }
     let header_parameters = parameters.len();
     let generated;
     let body = if equations {
@@ -4264,6 +4387,11 @@ fn definition_in_context_named(
         roots.extend([term.type_.clone(), term.value.clone()]);
         context.section_parameters(&roots, false)?
     };
+    let instance_type = context
+        .public_instance_signature
+        .clone()
+        .map(|header| header.close(context, name, &section_parameters))
+        .transpose()?;
     parameters.splice(0..0, section_parameters);
     let mut universe_roots: Vec<_> = parameters
         .iter()
@@ -4305,16 +4433,17 @@ fn definition_in_context_named(
         return Err(failure(SourceInferenceError::Scope));
     }
     // The pin compiles every declaration but a theorem (`codegen.rs`).
-    if !is_theorem {
+    if !is_theorem && !proof_instance {
         context.check_compiled_recursors(&term.value)?;
     }
-    let level_params = context.declaration_levels(&[term.type_.clone(), term.value.clone()])?;
+    let type_ = instance_type.unwrap_or(term.type_);
+    let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
     let mut base = ConstantVal {
         name: name.clone(),
         level_params,
-        type_: term.type_,
+        type_,
     };
-    if is_theorem {
+    if is_theorem || proof_instance {
         if let Some(signature) = &context.public_theorem_signature {
             if base.name != signature.name || base.level_params != signature.level_params {
                 return Err(NatDefinitionElabError::UnexpectedSyntax {

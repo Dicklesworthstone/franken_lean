@@ -137,6 +137,8 @@ pub(super) fn module(
             })?;
             let public_theorem =
                 scope.exports_declaration() && fln_elab::source::is_theorem(parsed.syntax());
+            let public_instance =
+                scope.exports_declaration() && fln_elab::source::is_instance(parsed.syntax());
             let private_scope = scope.clone();
             let environment = if scope.exports_declaration() {
                 scope.instance_scopes = prefix
@@ -159,7 +161,25 @@ pub(super) fn module(
                 .source_view()
                 .from_original(fln_parse::BytePos(offset - prefix_end))
             {
-                let observed = if public_theorem {
+                let mut private_instance_body = false;
+                let observed = if public_instance {
+                    fln_elab::source::inspect::public_instance(
+                        parsed.syntax(),
+                        &fln_elab::source::TheoremWorlds {
+                            public: environment,
+                            private: prefix.checked.checked.engine.environment(),
+                            public_scope: &scope,
+                            private_scope: &private_scope,
+                        },
+                        limits.source.admission.kernel,
+                        position.0,
+                        kind,
+                    )
+                    .map(|inspected| {
+                        private_instance_body = inspected.private_body;
+                        inspected.observation
+                    })
+                } else if public_theorem {
                     fln_elab::source::inspect::public_theorem(
                         parsed.syntax(),
                         &fln_elab::source::TheoremWorlds {
@@ -214,10 +234,11 @@ pub(super) fn module(
                                 .to_original(fln_parse::BytePos(range.end))
                                 .0;
                 }
-                if public_theorem
-                    && fln_parse::command_scope::modifiers::theorem_body_start(command)
-                        .map_err(|error| scope_error(&error.to_string()))?
-                        .is_some_and(|body| offset - prefix_end >= body)
+                if private_instance_body
+                    || (public_theorem
+                        && fln_parse::command_scope::modifiers::theorem_body_start(command)
+                            .map_err(|error| scope_error(&error.to_string()))?
+                            .is_some_and(|body| offset - prefix_end >= body))
                 {
                     scope.instance_scopes = private_scope.instance_scopes;
                 }

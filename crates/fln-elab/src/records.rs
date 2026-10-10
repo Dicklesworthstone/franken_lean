@@ -1,4 +1,4 @@
-//! Candidate generation for nonrecursive Type-valued records and classes.
+//! Candidate generation for nonrecursive records and classes.
 //!
 //! This module owns no admission authority. The generated block (including its
 //! proposed eliminator) and each projection must pass the ordinary kernel and
@@ -12,7 +12,7 @@ use fln_core::level::Level;
 use fln_core::name::{LeafView, Name};
 use fln_env::constants::{
     ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal, InductiveVal, RecursorRule,
-    RecursorVal, ReducibilityHints,
+    RecursorVal, ReducibilityHints, TheoremVal,
 };
 use fln_kernel::{Declaration, InductiveBlock};
 use std::collections::HashSet;
@@ -49,6 +49,7 @@ pub enum RecordError {
     DuplicateField,
     InvalidTelescope,
     UnsupportedSort,
+    NonProofField,
     ResourceLimit,
 }
 impl std::fmt::Display for RecordError {
@@ -59,7 +60,10 @@ impl std::fmt::Display for RecordError {
             Self::InvalidTelescope => {
                 "record field escapes its preceding telescope or remains unresolved"
             }
-            Self::UnsupportedSort => "record generation requires a Type-valued result sort",
+            Self::UnsupportedSort => {
+                "record generation requires Prop or a determined Type-valued result sort"
+            }
+            Self::NonProofField => "a field of a Prop-valued record must be a proof",
             Self::ResourceLimit => "record generation resource limit reached",
         })
     }
@@ -331,7 +335,8 @@ pub fn record_declarations(
     {
         return Err(RecordError::ResourceLimit);
     }
-    if spec.result_level.has_mvar() || !spec.result_level.is_never_zero() {
+    let proposition = spec.result_level.normalize_fixpoint().is_zero();
+    if spec.result_level.has_mvar() || (!proposition && !spec.result_level.is_never_zero()) {
         return Err(RecordError::UnsupportedSort);
     }
     let mut builder = Builder {
@@ -471,7 +476,11 @@ pub fn record_declarations(
                 nfields: fields,
                 rhs,
             }],
-            k: false,
+            // A proof-only singleton admits large elimination. Both checkers
+            // reconstruct that condition from the constructor's actual fields;
+            // source elaboration checks their sorts before proposing this block.
+            // Only the field-free predicate has the pin's K-target flag.
+            k: proposition && spec.fields.is_empty(),
             is_unsafe: false,
         }],
     })];
@@ -521,17 +530,29 @@ pub fn record_declarations(
         // changes the declaration type only, not the value's binder metadata.
         let value = builder.close(&projection_parameters, value, true, false)?;
         let name = spec.name.append_core(&field.user_name);
-        declarations.push(Declaration::Defn(DefinitionVal {
-            base: ConstantVal {
-                name: name.clone(),
-                level_params: spec.level_params.clone(),
-                type_,
-            },
-            value,
-            hints: ReducibilityHints::Abbrev,
-            safety: DefinitionSafety::Safe,
-            all: vec![name],
-        }));
+        let base = ConstantVal {
+            name: name.clone(),
+            level_params: spec.level_params.clone(),
+            type_,
+        };
+        declarations.push(if proposition {
+            // mkProjections emits theorems for proof fields. An invalid data
+            // field cannot obtain a projection through this candidate API:
+            // theorem checking and the projection leak check both still apply.
+            Declaration::Thm(TheoremVal {
+                base,
+                value,
+                all: vec![name],
+            })
+        } else {
+            Declaration::Defn(DefinitionVal {
+                base,
+                value,
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![name],
+            })
+        });
     }
     Ok(declarations)
 }

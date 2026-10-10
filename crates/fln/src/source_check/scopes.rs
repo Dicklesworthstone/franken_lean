@@ -236,6 +236,54 @@ impl Scopes {
         }
         scopes
     }
+
+    /// Resume an editor's completed lexical prefix. Preserve both journals'
+    /// original activation points; only the pending wrappers may activate new
+    /// namespaces. Namespace discovery grants no declaration authority and is
+    /// bounded independently by the editor's lookup limits.
+    pub(super) fn from_checked_prefix(
+        current: SourceScope,
+        public_instances: ActiveScopes,
+        env: &Environment,
+        max_names: usize,
+        max_name_bytes: usize,
+    ) -> Result<Self, (&'static str, usize)> {
+        let mut scopes = Self {
+            current,
+            public_instances,
+            ..Self::default()
+        };
+        for (index, (name, _)) in env.constants().enumerate() {
+            if index >= max_names {
+                return Err(("completion scope candidates", max_names));
+            }
+            let mut current = name.clone();
+            let mut bytes = 0usize;
+            while !current.is_anonymous() {
+                let component = match current.leaf_view() {
+                    fln_core::name::LeafView::Str(text) => text.len(),
+                    fln_core::name::LeafView::Num(value) => value.to_string().len(),
+                    fln_core::name::LeafView::Anonymous => unreachable!(),
+                };
+                bytes = bytes
+                    .checked_add(component)
+                    .and_then(|bytes| bytes.checked_add(1))
+                    .filter(|bytes| *bytes <= max_name_bytes)
+                    .ok_or(("completion scope name bytes", max_name_bytes))?;
+                current = current.parent();
+            }
+            let mut parent = scopes.current.user_name(name).parent();
+            while !parent.is_anonymous() && !scopes.namespaces.contains(&parent) {
+                if scopes.namespaces.len() >= max_names {
+                    return Err(("completion scope namespaces", max_names));
+                }
+                scopes.namespaces.insert(parent.clone());
+                parent = parent.parent();
+            }
+        }
+        Ok(scopes)
+    }
+
     fn observe(&mut self, name: &Name) {
         let mut parent = self.current.user_name(name).parent();
         while !parent.is_anonymous() && self.namespaces.insert(parent.clone()) {

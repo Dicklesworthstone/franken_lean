@@ -1,6 +1,6 @@
 //! Separate public and private source worlds. Exported declarations are checked
-//! against exported imports and prior exports. A theorem fixes its statement in
-//! that world, checks its proof privately, and exports the exact checked signature.
+//! against exported imports and prior exports. A hidden proof fixes its statement
+//! in that world, checks its implementation privately, and exports the checked signature.
 //! Every declaration still passes ordinary admission; no caller-authored proof is trusted.
 use super::*;
 
@@ -96,7 +96,7 @@ impl<'a> PublicWorld<'a> {
             .iter()
             .map(|row| row.declaration.clone())
             .collect();
-        let Some(mut checked) = staged.private_theorem else {
+        let Some(mut checked) = staged.private_implementation else {
             return Ok(
                 match self.publish(
                     private,
@@ -116,8 +116,10 @@ impl<'a> PublicWorld<'a> {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         }
-        // The private successor already contains the checked theorem. Replay
-        // only attributes, never the same-name public axiom over that theorem.
+        // The private successor already contains its checked theorem, including
+        // a proof-valued instance. Replay only metadata, never the same-name
+        // public axiom over that theorem. Both worlds retain identical
+        // instance priorities and reducibility without exposing a private body.
         let metadata = replay::Export::capture(
             &self.module,
             self.engine.environment(),
@@ -145,7 +147,7 @@ impl<'a> PublicWorld<'a> {
             .is_some_and(CancellationProbe::is_cancelled)
         {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
-                "source-module/public-theorem",
+                "source-module/public-proof",
             )));
         }
         checked.engine = engine.clone();

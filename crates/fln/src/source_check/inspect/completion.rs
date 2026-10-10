@@ -157,10 +157,11 @@ impl SourceModuleSession {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         // Temporary scope commands wrap one declaration without changing its
-        // visibility. Read their headers only: a public body under `open … in`
-        // or `set_option … in` must not expose the private completion world.
+        // visibility. A complete instance header also needs their real name and
+        // option scopes, using the same transitions as ordinary checking.
         let mut command_prefix = &source[prefix_end..range.start];
         let mut wrappers = 0usize;
+        let mut wrapper_scopes = None;
         loop {
             let Some(body) = fln_parse::command_scope::wrapper_body(command_prefix)
                 .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
@@ -171,22 +172,137 @@ impl SourceModuleSession {
             if wrappers > limits.max_commands {
                 return Err(limit("completion commands", limits.max_commands));
             }
+            use fln_parse::command_scope::ScopeCommand;
+            let transition = match fln_parse::command_scope::parse(command_prefix)
+                .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
+            {
+                Some(ScopeCommand::OpenIn { names, scoped, .. }) => Some(if scoped {
+                    ScopeCommand::OpenScoped(names)
+                } else {
+                    ScopeCommand::Open(names)
+                }),
+                Some(ScopeCommand::SetOptionIn { name, value, .. }) => {
+                    Some(ScopeCommand::SetOption { name, value })
+                }
+                // A guard changes presentation, not the body's lexical scope.
+                // Completion makes no claim that its messages are satisfied.
+                Some(ScopeCommand::GuardMsgs { .. }) => None,
+                _ => return Err(invalid(entry, prefix_end, "expected a command wrapper")),
+            };
+            if let Some(transition) = transition {
+                if wrapper_scopes.is_none() {
+                    wrapper_scopes = Some(
+                        scopes::Scopes::from_checked_prefix(
+                            checked.checked.checked.scope.clone(),
+                            checked
+                                .checked
+                                .public_scope
+                                .as_ref()
+                                .map(|scope| scope.instance_scopes.clone())
+                                .unwrap_or_default(),
+                            checked.checked.checked.engine.environment(),
+                            limits.max_candidates,
+                            limits.max_name_bytes,
+                        )
+                        .map_err(|(resource, maximum)| limit(resource, maximum))?,
+                    );
+                }
+                let scopes = wrapper_scopes.as_mut().expect("initialized wrapper scope");
+                scopes
+                    .check_limits(&transition)
+                    .map_err(|(resource, maximum)| limit(resource, maximum))?;
+                scopes
+                    .transition_worlds(
+                        transition,
+                        checked.checked.checked.engine.environment(),
+                        checked.checked.public_environment.as_ref(),
+                    )
+                    .map_err(|error| invalid(entry, prefix_end, &error.message()))?;
+            }
             command_prefix = &command_prefix[body..];
         }
-        let scope = checked
-            .checked
-            .checked
-            .scope
+        let enclosing = wrapper_scopes
+            .as_ref()
+            .map_or(&checked.checked.checked.scope, |scopes| &scopes.current);
+        let scope = enclosing
             .for_command_prefix(command_prefix)
             .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?;
-        // A public theorem's statement is elaborated against public imports,
-        // but its proof may use private implementation details. Read only the
-        // actual header boundary so a default binder's `:=`, or `let` inside
-        // the result type, cannot expose private names in the statement.
-        let public_header = scope.exports_declaration()
-            && fln_parse::command_scope::modifiers::theorem_body_start(command_prefix)
+        // Public proof headers see only exported names. The theorem boundary
+        // is syntactic; an instance additionally needs its actual result sort
+        // and exposure attributes, never a guess from its source spelling.
+        let mut private_body = false;
+        if scope.exports_declaration() {
+            private_body = fln_parse::command_scope::modifiers::theorem_body_start(command_prefix)
                 .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
-                .is_none();
+                .is_some();
+            if let Some(body) =
+                fln_parse::command_scope::modifiers::instance_body_start(command_prefix)
+                    .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
+            {
+                let size = body
+                    .checked_add(5)
+                    .filter(|size| *size <= limits.max_source_bytes)
+                    .ok_or_else(|| limit("completion header bytes", limits.max_source_bytes))?;
+                let mut header = Vec::new();
+                header
+                    .try_reserve_exact(size)
+                    .map_err(|_| limit("completion header allocation", limits.max_source_bytes))?;
+                header.extend_from_slice(&command_prefix[..body]);
+                // The query stops at the resolved header, before this unused
+                // placeholder can produce a goal, candidate, or declaration.
+                header.extend_from_slice(b" := _");
+                let parsed = fln_parse::parse_definition(&header)
+                    .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?;
+                let public = checked.checked.public_environment.as_ref().ok_or_else(|| {
+                    invalid(
+                        entry,
+                        prefix_end,
+                        "checked public completion prefix is unavailable",
+                    )
+                })?;
+                let mut public_scope = scope.clone();
+                public_scope.instance_scopes = if let Some(scopes) = &wrapper_scopes {
+                    scopes.public_scope().instance_scopes
+                } else {
+                    checked
+                        .checked
+                        .public_scope
+                        .as_ref()
+                        .ok_or_else(|| {
+                            invalid(
+                                entry,
+                                prefix_end,
+                                "checked public completion scope is unavailable",
+                            )
+                        })?
+                        .instance_scopes
+                        .clone()
+                };
+                let classified = source_records::elaboration_outcome(
+                    fln_elab::source::public_instance_header_is_hidden(
+                        parsed.syntax(),
+                        public,
+                        self.inspection_kernel_budget(),
+                        &public_scope,
+                    ),
+                )
+                .map_err(|error| SourceModuleCheckError::Source {
+                    module: entry.clone(),
+                    error: SourceCheckError::Command {
+                        file: 0,
+                        command: commands.len() - 1,
+                        offset: prefix_end,
+                        error: Box::new(error),
+                    },
+                })?;
+                private_body = match classified {
+                    Outcome::Complete(hidden) => hidden,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+            }
+        }
+        let public_header = scope.exports_declaration() && !private_body;
         let environment = if public_header {
             checked.checked.public_environment.as_ref().ok_or_else(|| {
                 invalid(

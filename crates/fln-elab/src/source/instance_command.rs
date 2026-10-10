@@ -9,18 +9,18 @@ pub(super) struct Parts<'a> {
     pub priority: u32,
 }
 
-/// The pin exposes an instance body automatically exactly when its header is
-/// not a proposition (`MutualDef.finishElab`). Proof-class instances need a
-/// hidden implementation and an exported interface, which this command route
-/// does not yet provide. Classifying the result in its actual local telescope
-/// also handles parameterized instances and classes containing proof fields.
-pub(super) fn check_public_exposure(
+/// The pin exposes data instances automatically, while a proof instance needs
+/// its own `expose` attribute. An expose section only supplies a default for
+/// ordinary definitions, and `no_expose` wins over either exposure source.
+/// Classify the complete header before the body can constrain its universes or
+/// use any private declaration (`MutualDef.finishElab`). Return whether its
+/// result is a proposition and whether its body uses the private predecessor.
+pub(super) fn prepare_header(
     context: &mut Context,
+    parameters: &[LocalDecl],
     result: &Expr,
-) -> Result<(), NatDefinitionElabError> {
-    if !context.source_scope.exports_declaration() {
-        return Ok(());
-    }
+    attributes: &Syntax,
+) -> Result<(bool, bool), NatDefinitionElabError> {
     let sort = context
         .known_type(result)?
         .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
@@ -28,12 +28,122 @@ pub(super) fn check_public_exposure(
     let ExprNode::Sort { level } = sort.node() else {
         return Err(failure(SourceInferenceError::ExpectedType));
     };
-    if level.normalize().is_zero() {
+    let is_proof = level.normalize().is_zero();
+    if is_proof {
+        // `levelMVarToParamHeaders` runs before exposure is chosen. Even an
+        // explicitly exposed proof may not use its body to specialize an
+        // unresolved header universe. Ordinary data instances retain the
+        // later generalization path.
+        let mut roots: Vec<_> = context
+            .source_scope
+            .variables
+            .locals()
+            .decls()
+            .iter()
+            .chain(parameters)
+            .map(|local| local.type_.clone())
+            .collect();
+        roots.push(result.clone());
+        context.generalize_declaration_universes(&roots)?;
+    }
+    if !context.source_scope.exports_declaration() {
+        return Ok((is_proof, false));
+    }
+    let mut expose = false;
+    let mut no_expose = false;
+    for attribute in scope::visibility::attributes(attributes)? {
+        match scope::visibility::exposure_attribute(attribute)? {
+            Some(true) => expose = true,
+            Some(false) => no_expose = true,
+            None => {}
+        }
+    }
+    if !is_proof && no_expose {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "public instances with non-Prop result types; proof instance interfaces are not yet supported",
+            expected: "public data instances with exposed bodies",
         });
     }
-    Ok(())
+    Ok((is_proof, is_proof && (no_expose || !expose)))
+}
+
+/// An instance's declaration binders and result are fixed in the public world.
+/// Unlike theorems, instances may use extra section variables in their bodies:
+/// retain their already elaborated public domains, then close only the selected
+/// subset. No private inference result can replace any part of this template.
+#[derive(Clone)]
+pub(super) struct PublicHeader {
+    name: Name,
+    type_: Expr,
+    sections: Vec<LocalDecl>,
+}
+
+impl PublicHeader {
+    pub(super) fn freeze(
+        context: &mut Context,
+        name: &Name,
+        parameters: &[LocalDecl],
+        result: &Expr,
+    ) -> Result<Self, NatDefinitionElabError> {
+        let mut sections = context.source_scope.variables.locals().decls().to_vec();
+        // The complete proof header's universes were made rigid before the
+        // exposure decision; retain that exact public template here.
+        let mut type_ = context.instantiate(result)?;
+        for local in parameters.iter().rev() {
+            context.tick()?;
+            type_ = Expr::forall_e(
+                local.user_name.clone(),
+                context.instantiate(&local.type_)?,
+                type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
+        for local in &mut sections {
+            context.tick()?;
+            local.type_ = context.instantiate(&local.type_)?;
+            context.require_resolved(std::slice::from_ref(&local.type_))?;
+        }
+        context.require_resolved(std::slice::from_ref(&type_))?;
+        Ok(Self {
+            name: name.clone(),
+            type_,
+            sections,
+        })
+    }
+
+    pub(super) fn close(
+        &self,
+        context: &mut Context,
+        name: &Name,
+        selected: &[LocalDecl],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if name != &self.name {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let selected: std::collections::HashSet<_> =
+            selected.iter().map(|local| &local.id).collect();
+        let mut count = 0usize;
+        let mut type_ = self.type_.clone();
+        for local in self.sections.iter().rev() {
+            context.tick()?;
+            if selected.contains(&local.id) {
+                count += 1;
+                type_ = Expr::forall_e(
+                    local.user_name.clone(),
+                    local.type_.clone(),
+                    type_
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+        }
+        if count != selected.len() || type_.has_fvar() || type_.has_loose_bvars() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        Ok(type_)
+    }
 }
 
 pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError> {

@@ -10,7 +10,7 @@ use fln::{
     Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits,
     SourceModuleInput,
 };
-use fln_elab::instances::{InstanceRegistry, register_class};
+use fln_elab::instances::InstanceRegistry;
 use fln_elab::reducibility::{Reducibility, ReducibilityTable};
 
 fn n(text: &str) -> Name {
@@ -210,51 +210,47 @@ fn hidden_instance_bodies_and_visibility_collisions_remain_explicit_refusals() {
 }
 
 #[test]
-fn proof_class_instances_are_refused_before_hidden_bodies_can_be_exported() {
-    // The source record builder does not yet author Prop classes. Start with an
-    // ordinarily dual-checked propositional inductive and attach class metadata
-    // to that checked snapshot, as an imported class supplies it.
-    let base = Engine::builder()
-        .build_empty()
-        .check_source_files(
-            &[b"inductive Law (P : Prop) : Prop where\n| mk (proof : P)"],
-            &KVMap::new(),
-            limits().source,
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap()
-        .engine;
-    let env = register_class(base.environment(), &n("Law")).unwrap();
-    let base = Engine::from_environment(env);
-    let main = n("Main");
-    let private = "module\nprelude\ninstance law (P : Prop) (h : P) : Law P := Law.mk h";
-    let inputs = [SourceModuleInput {
-        name: &main,
-        source: private.as_bytes(),
-    }];
-    base.check_source_modules(&inputs, &main, &KVMap::new(), limits())
-        .unwrap()
-        .into_complete()
-        .unwrap();
+fn proof_class_instances_export_checked_interfaces_even_with_explicit_exposure() {
     for prefix in ["public", "@[expose] public"] {
-        let source = format!(
-            "module\nprelude\n{prefix} instance law (P : Prop) (h : P) : Law P := Law.mk h"
+        let api = format!(
+            "module\nprelude\npublic class Law (P : Prop) : Prop where\n  proof : P\n{prefix} instance law (P : Prop) (h : P) : Law P := Law.mk h"
         );
-        let inputs = [SourceModuleInput {
-            name: &main,
-            source: source.as_bytes(),
-        }];
-        let error = base
-            .check_source_modules(&inputs, &main, &KVMap::new(), limits())
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("public instances with non-Prop result types"),
-            "{error}"
-        );
-        assert!(!base.environment().contains(&n("law")));
+        let main =
+            "prelude\nimport Api\ntheorem used (P : Prop) (h : P) : P := @Law.proof P (law P h)";
+        let local = check_both(&[("Api", &api)])
+            .into_iter()
+            .map(|result| result.unwrap().into_complete().unwrap())
+            .collect::<Vec<_>>();
+        for checked in &local {
+            assert!(matches!(
+                checked.checked.engine.environment().find(&n("law")),
+                Some(fln::ConstantInfo::Thm(_))
+            ));
+        }
+        for result in check_both(&[("Main", main), ("Api", &api)]) {
+            let checked = result.unwrap().into_complete().unwrap();
+            let env = checked.checked.engine.environment();
+            let fln::ConstantInfo::Axiom(interface) = env.find(&n("law")).unwrap() else {
+                panic!("a module proof instance must export its checked interface");
+            };
+            assert!(!interface.is_unsafe);
+            for defining_module in &local {
+                assert_eq!(
+                    &interface.base,
+                    defining_module
+                        .checked
+                        .engine
+                        .environment()
+                        .find(&n("law"))
+                        .unwrap()
+                        .constant_val()
+                );
+            }
+            assert_eq!(
+                ReducibilityTable::effective(env).unwrap().status(&n("law")),
+                Reducibility::Semireducible
+            );
+        }
     }
 }
 

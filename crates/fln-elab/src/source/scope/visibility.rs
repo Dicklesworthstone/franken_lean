@@ -131,8 +131,8 @@ impl SourceScope {
     /// Compute one declaration's visibility without mutating section defaults.
     /// The caller must choose the corresponding environment *before* elaboration.
     /// This native slice exports fully exposed definitions, data instances and
-    /// complete public data bundles. A public theorem selects its exported
-    /// signature world; the theorem driver separately checks its hidden proof.
+    /// complete public data bundles. A public theorem or proof instance selects
+    /// its exported signature world; its driver checks the hidden proof privately.
     /// Ordinary hidden-body public definitions remain explicitly refused.
     pub fn for_declaration(&self, syntax: &Syntax) -> Result<Self, NatDefinitionElabError> {
         let declaration = expect_node(
@@ -182,11 +182,10 @@ impl SourceScope {
             } else if kind == Some(&parser_kind(&["Command", "instance"])) {
                 // MutualDef.finishElab automatically exposes data instances.
                 // Whether the result is a proposition is established from the
-                // elaborated header, before entering its body. This selector
-                // only chooses the public environment for that elaboration.
-                if no_expose {
-                    return Err(refused("public data instances with exposed bodies"));
-                }
+                // elaborated header, before entering its body. Proof instances
+                // may explicitly retain a hidden body with no_expose; a data
+                // instance with that attribute is refused after classification.
+                // This selector only chooses the public header environment.
             } else if kind == Some(&parser_kind(&["Command", "theorem"])) {
                 if expose || no_expose {
                     return Err(refused("public theorems without exposure attributes"));

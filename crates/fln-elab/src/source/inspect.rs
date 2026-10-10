@@ -80,8 +80,8 @@ pub fn declaration(
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
-    let context = Context::scoped(environment, kernel, &scope);
-    declaration_in_context(syntax, context, offset, kind)
+    let mut context = Context::scoped(environment, kernel, &scope);
+    declaration_in_context(syntax, &mut context, offset, kind)
 }
 
 /// Observe a module's public theorem with its exported header and private proof
@@ -94,26 +94,49 @@ pub fn public_theorem(
     offset: usize,
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
-    let context = Context::public_theorem(syntax, worlds, kernel)?;
-    declaration_in_context(syntax, context, offset, kind)
+    let mut context = Context::public_theorem(syntax, worlds, kernel)?;
+    declaration_in_context(syntax, &mut context, offset, kind)
+}
+
+/// A provisional observation and the world actually entered at its position.
+/// Header observations never select the hidden implementation's instance scope.
+#[derive(Debug)]
+pub struct PublicInstanceObservation {
+    pub observation: Option<SourceObservation>,
+    pub private_body: bool,
+}
+
+pub fn public_instance(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<PublicInstanceObservation, NatDefinitionElabError> {
+    let mut context = Context::public_instance(syntax, worlds, kernel)?;
+    let observation = declaration_in_context(syntax, &mut context, offset, kind)?;
+    Ok(PublicInstanceObservation {
+        observation,
+        private_body: context.private_instance_body,
+    })
 }
 
 fn declaration_in_context(
     syntax: &Syntax,
-    mut context: Context,
+    context: &mut Context,
     offset: usize,
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
     // There will be no final declaration admission to discharge earlier rigid
     // equations. Check them when generated instead of deferring to that door.
     context.attempt_depth = 1;
-    let Some(site) = select(&mut context, syntax, offset, kind)? else {
+    let Some(site) = select(context, syntax, offset, kind)? else {
         return Ok(None);
     };
     context.inspection = Some(Probe { site, result: None });
-    match definition_in_context(syntax, &mut context) {
+    match definition_in_context(syntax, context) {
         Err(NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)) => {
-            Ok(context.inspection.and_then(|probe| probe.result))
+            Ok(context.inspection.take().and_then(|probe| probe.result))
         }
         Ok(_) => Ok(None),
         Err(error) => Err(error),
