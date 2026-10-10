@@ -25,6 +25,7 @@ pub use subst::SubstError;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
+pub mod evaluation;
 mod inductive;
 mod infer;
 mod instance_command;
@@ -63,6 +64,7 @@ pub enum SourceInferenceError {
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     Deriving(deriving::DerivingError),
+    EvaluationPrinting(evaluation::PrintingError),
     UnknownConstant(Name),
     /// More than one interpretation of an overloaded identifier elaborates against
     /// the expected type (the pin's `elabAppAux`), listed in the order it tries them.
@@ -251,6 +253,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
             Self::Deriving(error) => write!(f, "{error}"),
+            Self::EvaluationPrinting(error) => write!(f, "{error}"),
             // The pin's two wordings for `lean.unknownIdentifier`, verbatim.
             Self::UnknownConstant(name) => {
                 write!(f, "Unknown identifier `{}`", name.to_display_string())
@@ -4368,6 +4371,16 @@ fn query_in(
     mut context: Context,
     evaluate: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    let (term, level_params) = query_term(syntax, &name, &mut context, evaluate)?;
+    Ok(query_declaration(name, term, level_params))
+}
+
+fn query_term(
+    syntax: &Syntax,
+    name: &Name,
+    context: &mut Context,
+    evaluate: bool,
+) -> Result<(Typed, Vec<Name>), NatDefinitionElabError> {
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
         return Err(if evaluate {
             NatDefinitionElabError::InvalidGeneratedEvaluationName
@@ -4419,7 +4432,11 @@ fn query_in(
     if evaluate {
         context.check_compiled_recursors(&term.value)?;
     }
-    Ok(Declaration::Defn(DefinitionVal {
+    Ok((term, level_params))
+}
+
+fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declaration {
+    Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),
             level_params,
@@ -4429,7 +4446,7 @@ fn query_in(
         hints: ReducibilityHints::Regular(1),
         safety: DefinitionSafety::Safe,
         all: vec![name],
-    }))
+    })
 }
 
 /// Registration requested by a canonical named source instance. The caller must

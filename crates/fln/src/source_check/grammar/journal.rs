@@ -419,7 +419,7 @@ mod tests {
         load(&recorded, &mut loaded).unwrap();
         assert_eq!(
             loaded.native_namespace_anchors(),
-            [declaration.decl.clone()]
+            std::slice::from_ref(&declaration.decl)
         );
         assert_eq!(
             loaded.rules().find(|(name, _)| **name == kind).unwrap().1,

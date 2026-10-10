@@ -3,7 +3,7 @@
 //! Source exports retain declarations and metadata; evaluation candidates and
 //! scratch queries never become another module's declarations.
 use super::*;
-use crate::{EngineExecutionLimits, SourceCommandBatchExecution};
+use crate::{EngineExecutionLimits, EvaluationPresentation, SourceCommandBatchExecution};
 
 mod preflight;
 
@@ -185,6 +185,29 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        self.execute_source_modules_with_presentation(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            EvaluationPresentation::Raw,
+        )
+    }
+
+    /// Execute the same explicit import graph with an opt-in presentation for
+    /// pure `#eval` values. Lean presentation uses only actual imported Repr or
+    /// ToString instances; each checked printer result is marked on its private
+    /// execution evidence. Imported worlds, source exports and IO stay exact.
+    pub fn execute_source_modules_with_presentation(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
         self.execute_source_modules_with_implicit_init(
             modules,
             entry,
@@ -192,6 +215,7 @@ impl imported::SourceOleanImport {
             limits,
             cancellation,
             false,
+            presentation,
         )
     }
 
@@ -219,9 +243,11 @@ impl imported::SourceOleanImport {
             limits,
             cancellation,
             true,
+            EvaluationPresentation::Raw,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_source_modules_with_implicit_init(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -230,6 +256,7 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
         implicit_init: bool,
+        presentation: EvaluationPresentation,
     ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -340,6 +367,7 @@ impl imported::SourceOleanImport {
                         plan.headers[index].module_system.then_some(module.name),
                         Some(module.name),
                         public.as_mut(),
+                        presentation,
                     )
                     .map_err(|error| source_error(module.name, error))?
                 {

@@ -128,9 +128,7 @@ fn public_and_private_instance_priorities_keep_independent_recency() {
             assert!(!env.contains(&private("Api", "hidden")));
             assert!(!env.contains(&private("Api", "localChoice")));
         }
-        let wrong = format!(
-            "prelude\nimport Api\ndef observed : Token := chosen\ndef wrong (P : Token -> Prop) (h : P Token.right) : P observed := h"
-        );
+        let wrong = "prelude\nimport Api\ndef observed : Token := chosen\ndef wrong (P : Token -> Prop) (h : P Token.right) : P observed := h".to_owned();
         for result in check_both(&[("Main", &wrong), ("Api", &api), ("Base", BASE)]) {
             assert!(
                 matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))

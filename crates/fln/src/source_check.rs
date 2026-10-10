@@ -141,6 +141,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
+            SourceInferenceError::EvaluationPrinting(_) => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
             )

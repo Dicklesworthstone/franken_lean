@@ -6,6 +6,14 @@
 
 use super::*;
 
+/// Whether source evaluations retain their raw values or explicitly request
+/// the supported Lean presentation through actual class instances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationPresentation {
+    Raw,
+    Lean,
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Entry {
     Value,
@@ -50,6 +58,13 @@ impl fmt::Display for IoEvaluationProjectionError {
 impl std::error::Error for IoEvaluationProjectionError {}
 
 impl DefinitionExecution {
+    /// The supported message width when this execution is a checked Repr or
+    /// ToString printer result. The VM result is `Std.Format`; ordinary values
+    /// of that type and raw Strings never acquire this presentation marker.
+    pub fn evaluation_format_width(&self) -> Option<usize> {
+        self.evaluation_format_width
+    }
+
     /// Read the typed result of explicit `#eval` IO execution. Ordinary
     /// definitions and pure evaluations return `None`; this never runs a
     /// deferred action or changes the retained environment.
@@ -94,4 +109,67 @@ impl DefinitionExecution {
             }
         }))
     }
+}
+
+pub(super) fn elaborate(
+    engine: &Engine,
+    syntax: &fln_syntax::tree::Syntax,
+    name: Name,
+    scope: &fln_elab::source::scope::SourceScope,
+    options: &KVMap,
+    limits: EngineExecutionLimits,
+    presentation: EvaluationPresentation,
+) -> Result<Outcome<(Declaration, Option<usize>)>, EngineExecutionError> {
+    if presentation == EvaluationPresentation::Raw {
+        return Ok(
+            match source_records::elaboration_outcome(
+                fln_elab::elaborate_evaluation_in_scope_with_budget(
+                    syntax,
+                    name,
+                    engine.environment(),
+                    limits.kernel,
+                    scope,
+                ),
+            )? {
+                Outcome::Complete(declaration) => Outcome::Complete((declaration, None)),
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        );
+    }
+    let mut effective_scope = scope.clone();
+    effective_scope.options = options.clone();
+    for (name, value) in scope.options.entries() {
+        effective_scope.options.insert(name.clone(), value.clone());
+    }
+    let prepared = match source_records::elaboration_outcome(
+        fln_elab::source::evaluation::PreparedEvaluation::new(
+            syntax,
+            name,
+            engine.environment(),
+            limits.kernel,
+            &effective_scope,
+        ),
+    )? {
+        Outcome::Complete(prepared) => prepared,
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    };
+    // This is the same metered logical type classifier as the existing IO
+    // entry adapter, including safe aliases and exposed world-token arrows.
+    // Classification never executes an action or grants its runtime contract.
+    let mut preparation = runtime::Preparation::new(engine.environment(), limits.ingress);
+    if preparation
+        .is_evaluation_action(prepared.type_())
+        .map_err(EngineExecutionError::Ingress)?
+    {
+        return Ok(Outcome::Complete((prepared.into_raw(), None)));
+    }
+    Ok(
+        match source_records::elaboration_outcome(prepared.into_format())? {
+            Outcome::Complete(declaration) => Outcome::Complete((declaration, Some(120))),
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        },
+    )
 }

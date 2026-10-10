@@ -788,7 +788,7 @@ instance computed : Action computedToken := { call := fun n => n }
         let application = Expr::app(Expr::bvar(0).unwrap(), argument.clone());
         let mut prep = Preparation::new(&engine.environment, limits);
         assert_eq!(
-            prep.projection_receiver_type(&application, &[dependent.clone()])
+            prep.projection_receiver_type(&application, std::slice::from_ref(&dependent))
                 .unwrap(),
             Some(equality(argument))
         );

@@ -79,8 +79,8 @@ fn imported() -> Option<&'static SourceOleanImport> {
                 eprintln!("SKIP: pinned Reference lib/lean absent");
                 return None;
             };
-            let root = name("Init.Data.Repr");
-            let mut pending = vec![root.clone()];
+            let roots = [name("Init.Data.Repr"), name("Init.Data.ToString.Basic")];
+            let mut pending = roots.to_vec();
             let mut artifacts = BTreeMap::new();
             while let Some(module) = pending.pop() {
                 if artifacts.contains_key(&module) {
@@ -118,8 +118,8 @@ fn imported() -> Option<&'static SourceOleanImport> {
             };
             Some(
                 Engine::from_environment(Environment::new())
-                    .import_olean_modules_for_source(&modules, &[root], &KVMap::new(), limits)
-                    .expect("import the actual pinned Repr dependency closure")
+                    .import_olean_modules_for_source(&modules, &roots, &KVMap::new(), limits)
+                    .expect("import the actual pinned Repr and ToString dependency closure")
                     .into_complete()
                     .expect("the actual closure passes both checking engines"),
             )
@@ -574,4 +574,288 @@ theorem implicit_recursive_field_is_not_printed :
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn lean_presentation_executes_actual_printers_and_replays_exact_formats() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let engine = checked(
+                &imported.engine,
+                r#"
+inductive PrintTree where
+  | leaf (value : Bool)
+  | branch (left right : PrintTree)
+deriving Repr
+structure PrintRecord where
+  value : Bool
+deriving Repr
+inductive Both where | mk
+instance : Repr Both where
+  reprPrec _ _ := Std.Format.text "selected Repr"
+instance : ToString Both where
+  toString _ := "incorrect ToString"
+inductive StringOnly where | mk
+instance : ToString StringOnly where
+  toString _ := "unquoted λ\nsecond line"
+inductive Counted where | done
+instance : Repr Counted where
+  reprPrec _ _ := Std.Format.text "done"
+def counted : Nat → Counted
+  | 0 => .done
+  | n + 1 => counted n
+"#,
+            );
+            let limits = fln::EngineExecutionLimits::for_user_program(admission().kernel);
+            let original = engine.logical_root(&KVMap::new());
+            let mut failures = Vec::new();
+            let mut failed = |label: &str, phase: &str, detail: String| {
+                let message = format!("{label} {phase}: {detail}");
+                eprintln!("checked presentation failure: {message}");
+                failures.push(message);
+            };
+            for (label, source, expected) in [
+                ("Bool", "#eval true", "true"),
+                ("Nat", "#eval 42", "42"),
+                ("String", r#"#eval "λ\n\"quoted\"""#, r#""λ\n\"quoted\"""#),
+                ("List", "#eval [true, false]", "[true, false]"),
+                ("record", "#eval PrintRecord.mk true", "{ value := true }"),
+                (
+                    "recursive data",
+                    "#eval PrintTree.branch (PrintTree.leaf true) (PrintTree.leaf false)",
+                    "PrintTree.branch (PrintTree.leaf true) (PrintTree.leaf false)",
+                ),
+                ("printer priority", "#eval Both.mk", "selected Repr"),
+                ("fallback", "#eval StringOnly.mk", "unquoted λ\nsecond line"),
+            ] {
+                eprintln!("checked presentation: {label}");
+                let executed = match engine.execute_source_commands_with_presentation(
+                    source.as_bytes(),
+                    &KVMap::new(),
+                    limits,
+                    fln::EvaluationPresentation::Lean,
+                ) {
+                    Ok(fln::Outcome::Complete(executed)) => executed,
+                    other => {
+                        failed(label, "execution", format!("{other:?}"));
+                        continue;
+                    }
+                };
+                assert_eq!(executed.batch.executions.len(), 1, "{label}");
+                assert_eq!(executed.batch.engine.logical_root(&KVMap::new()), original);
+                let execution = &executed.batch.executions[0];
+                assert_eq!(execution.evaluation_format_width(), Some(120));
+                assert!(execution.io_evaluation_outcome().unwrap().is_none());
+                let fln::Declaration::Defn(candidate) = &execution.declaration else {
+                    panic!("evaluation creates an ordinary checked definition");
+                };
+                assert!(!engine.environment().contains(&candidate.base.name));
+                assert!(
+                    execution
+                        .engine
+                        .environment()
+                        .contains(&candidate.base.name)
+                );
+                match fln::source_format::render(execution, 120, Default::default()) {
+                    Ok(actual) if actual == expected => {}
+                    other => {
+                        failed(
+                            label,
+                            "render",
+                            format!("expected {expected:?}, got {other:?}"),
+                        );
+                        continue;
+                    }
+                }
+                let replay = match fln::execute_flbc_artifact(
+                    &execution.flbc_artifact,
+                    &KVMap::new(),
+                    fln::FlbcExecutionLimits {
+                        codec: limits.flbc_codec,
+                        vm: limits.vm,
+                    },
+                ) {
+                    Ok(fln::Outcome::Complete(replay)) => replay,
+                    other => {
+                        failed(label, "FLBC replay", format!("{other:?}"));
+                        continue;
+                    }
+                };
+                match fln::source_format::render_vm(
+                    execution.engine.environment(),
+                    &execution.runtime_type,
+                    &replay,
+                    120,
+                    Default::default(),
+                ) {
+                    Ok(actual) if actual == expected => {}
+                    other => {
+                        failed(
+                            label,
+                            "replay render",
+                            format!("expected {expected:?}, got {other:?}"),
+                        );
+                    }
+                }
+            }
+
+            // A constant printer must neither discard its strict operand nor
+            // duplicate it. Compare the VM work added by the same recursive
+            // value computation with an existing, explicitly strict raw let.
+            let steps = |source: &str, presentation| {
+                let executed = engine
+                    .execute_source_commands_with_presentation(
+                        source.as_bytes(),
+                        &KVMap::new(),
+                        limits,
+                        presentation,
+                    )
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+                let execution = &executed.batch.executions[0];
+                assert_eq!(
+                    fln::source_format::render(execution, 120, Default::default()).unwrap(),
+                    "done",
+                );
+                let fln::VmExit::Returned(returned) = &execution.exit else {
+                    panic!("the strict value computation must return");
+                };
+                returned.usage.steps
+            };
+            let lean_zero = steps("#eval counted 0", fln::EvaluationPresentation::Lean);
+            let lean_many = steps("#eval counted 40", fln::EvaluationPresentation::Lean);
+            let raw_zero = steps(
+                "#eval let value := counted 0; Std.Format.text \"done\"",
+                fln::EvaluationPresentation::Raw,
+            );
+            let raw_many = steps(
+                "#eval let value := counted 40; Std.Format.text \"done\"",
+                fln::EvaluationPresentation::Raw,
+            );
+            assert!(
+                raw_many > raw_zero,
+                "the existing raw let retains strict work"
+            );
+            assert_eq!(lean_many - lean_zero, raw_many - raw_zero);
+
+            let raw = engine
+                .execute_source_commands_with_checks(b"#eval true", &KVMap::new(), limits)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_eq!(raw.batch.executions[0].evaluation_format_width(), None);
+            assert_eq!(
+                fln::closed_vm_shaped_value(
+                    &raw.batch.executions[0].exit,
+                    &fln::ClosedValueShape::Bool,
+                    10,
+                )
+                .unwrap(),
+                fln::ClosedShapedValue::Bool(true),
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), original);
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn lean_presentation_preserves_original_obligations_and_source_transactions() {
+    use fln::source_check::modules::execution::SourceProgramLimits;
+    use fln_elab::source::SourceInferenceError;
+    use fln_elab::source::evaluation::PrintingError;
+
+    fn reason(mut error: &fln::EngineExecutionError) -> &SourceInferenceError {
+        while let fln::EngineExecutionError::BatchCommand { error: inner, .. } = error {
+            error = inner;
+        }
+        let fln::EngineExecutionError::Frontend(fln::NatDefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(reason),
+        )) = error
+        else {
+            panic!("expected typed elaboration refusal: {error:?}");
+        };
+        reason
+    }
+
+    std::thread::Builder::new().stack_size(STACK).spawn(|| {
+        let Some(imported) = imported() else { return; };
+        let engine = checked(&imported.engine, r#"
+inductive MissingPrinter where | mk
+class Need where
+  bit : Bool
+def needs [Need] : Bool := true
+"#);
+        let original = engine.logical_root(&KVMap::new());
+        let limits = fln::EngineExecutionLimits::for_user_program(admission().kernel);
+        let run = |source: &[u8], options: &KVMap| {
+            engine.execute_source_commands_with_presentation(
+                source, options, limits, fln::EvaluationPresentation::Lean,
+            )
+        };
+        let missing = run(b"#eval MissingPrinter.mk", &KVMap::new()).unwrap_err();
+        assert!(matches!(reason(&missing), SourceInferenceError::EvaluationPrinting(
+            PrintingError::MissingPrinter,
+        )));
+        // The original query has an unsolved dictionary, even though its Bool
+        // result has both valid printers. Printer fallback must not catch it.
+        let unresolved = run(b"#eval needs", &KVMap::new()).unwrap_err();
+        assert!(matches!(reason(&unresolved), SourceInferenceError::InstanceSynthesisRequired));
+        let mut options = KVMap::new();
+        options.insert(name("format.width"), fln_core::options::DataValue::OfNat(80));
+        let width = run(b"#eval true", &options).unwrap_err();
+        assert!(matches!(reason(&width), SourceInferenceError::EvaluationPrinting(
+            PrintingError::UnsupportedOption(option),
+        ) if option == &name("format.width")));
+        assert!(run(b"#eval true\n#eval MissingPrinter.mk", &KVMap::new()).is_err());
+        assert_eq!(engine.logical_root(&KVMap::new()), original);
+
+        // Receipts select instances in each actual module world and never
+        // replay the auxiliary candidates as another source module's exports.
+        let library = name("PrintingLibrary");
+        let main = name("PrintingMain");
+        let library_source = b"prelude\nimport Init.Data.ToString.Basic\ninductive Visible where | mk\ninstance : ToString Visible where\n toString _ := \"receipt fallback\"\n#eval Visible.mk";
+        let main_source = b"prelude\nimport PrintingLibrary\n#eval Visible.mk\n#check Visible";
+        let modules = [
+            SourceModuleInput { name: &main, source: main_source },
+            SourceModuleInput { name: &library, source: library_source },
+        ];
+        let program = imported.execute_source_modules_with_presentation(
+            &modules, &main, &KVMap::new(), SourceProgramLimits::new(limits), None,
+            fln::EvaluationPresentation::Lean,
+        ).unwrap().into_complete().unwrap();
+        assert_eq!(program.modules.len(), 2);
+        for module in &program.modules {
+            let candidate = module.commands.batch.executions.last().unwrap();
+            assert_eq!(candidate.evaluation_format_width(), Some(120));
+            assert_eq!(
+                fln::source_format::render(candidate, 120, Default::default()).unwrap(),
+                "receipt fallback",
+            );
+            let fln::Declaration::Defn(definition) = &candidate.declaration else {
+                panic!("checked query candidate");
+            };
+            assert!(!module.commands.batch.engine.environment().contains(&definition.base.name));
+        }
+        assert_eq!(program.modules[1].commands.checks.len(), 1);
+        assert!(!imported.engine.environment().contains(&name("Visible")));
+
+        let refusal = imported.execute_source_modules_with_presentation(
+            &[SourceModuleInput {
+                name: &main,
+                source: b"prelude\nimport Init.Data.Repr\ninductive NoPrinter where | mk\n#eval NoPrinter.mk",
+            }],
+            &main, &KVMap::new(), SourceProgramLimits::new(limits), None,
+            fln::EvaluationPresentation::Lean,
+        ).unwrap_err();
+        assert_eq!(refusal.disposition(), ("capability", false, 5));
+        assert!(!imported.engine.environment().contains(&name("NoPrinter")));
+    }).unwrap().join().unwrap();
 }

@@ -214,7 +214,7 @@ fn existing_no_op_and_malformed_arity_paths_keep_their_original_work() {
     );
     assert_eq!(
         preparation
-            .universe_instance(&natural(), &[u.clone()], &[Level::one()])
+            .universe_instance(&natural(), std::slice::from_ref(&u), &[Level::one()])
             .unwrap(),
         natural()
     );

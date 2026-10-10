@@ -25,16 +25,16 @@
 //! long-lived server transport remains a separate, unfinished product surface.
 
 #![forbid(unsafe_code)]
-// The one unstable feature, for one hook: a refused host allocation must unwind
-// to the frontier's per-module guard instead of aborting every thread at once
-// (fln-frontier-oom-abort-w9dx; see `install_host_allocation_failure_hook`).
-#![feature(alloc_error_hook)]
+// Allocation failure unwinds to the import frontier's per-module guard; bounded
+// runtime Format projection also uses fallible boxes for untrusted output.
+#![feature(alloc_error_hook, allocator_api)]
 
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;
 mod source_evaluation;
 mod source_execution;
+pub mod source_format;
 mod source_intrinsics;
 #[cfg(test)]
 mod source_nat_add_binding_tests;
@@ -171,7 +171,9 @@ pub use fln_vm::interpreter::{
     ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit, nat_decimal,
     value_kind as vm_value_kind,
 };
-pub use source_evaluation::{IoEvaluationOutcome, IoEvaluationProjectionError};
+pub use source_evaluation::{
+    EvaluationPresentation, IoEvaluationOutcome, IoEvaluationProjectionError,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -7012,6 +7014,24 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        self.execute_source_commands_with_presentation(
+            source,
+            options,
+            limits,
+            EvaluationPresentation::Raw,
+        )
+    }
+
+    /// Execute an import-free command stream with an explicitly selected
+    /// evaluation presentation. `Raw` retains the original checked result;
+    /// `Lean` requests actual Repr/ToString instances for supported pure values.
+    pub fn execute_source_commands_with_presentation(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        presentation: EvaluationPresentation,
+    ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         let partitioned = fln_parse::partition_source_module(source)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
@@ -7034,6 +7054,7 @@ impl Engine {
             None,
             None,
             None,
+            presentation,
         )
     }
 
@@ -7070,6 +7091,7 @@ impl Engine {
         private_module: Option<&Name>,
         source_module: Option<&Name>,
         mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
+        presentation: EvaluationPresentation,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -7566,58 +7588,55 @@ impl Engine {
             }
 
             let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
-            let declaration = source_records::elaboration_outcome(match parsed.kind() {
-                fln_parse::SourceCommandKind::Evaluation => {
-                    let name = fresh_generated_command_name(engine.environment(), command_index)
-                        .map_err(|error| EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        })?;
-                    if scoped {
-                        fln_elab::elaborate_evaluation_in_scope_with_budget(
+            let declaration = if is_evaluation {
+                let name = fresh_generated_command_name(engine.environment(), command_index)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
+                source_evaluation::elaborate(
+                    &engine,
+                    parsed.syntax(),
+                    name,
+                    &scope,
+                    options,
+                    limits,
+                    presentation,
+                )
+            } else {
+                source_records::elaboration_outcome(match parsed.kind() {
+                    fln_parse::SourceCommandKind::Definition if scoped => {
+                        fln_elab::elaborate_definition_in_scope_with_budget(
                             parsed.syntax(),
-                            name,
                             engine.environment(),
                             limits.kernel,
                             &scope,
                         )
-                    } else {
-                        fln_elab::elaborate_evaluation_in_with_budget(
+                    }
+                    fln_parse::SourceCommandKind::Definition => {
+                        fln_elab::elaborate_definition_in_with_budget(
                             parsed.syntax(),
-                            name,
                             engine.environment(),
                             limits.kernel,
                         )
                     }
-                }
-                fln_parse::SourceCommandKind::Definition if scoped => {
-                    fln_elab::elaborate_definition_in_scope_with_budget(
-                        parsed.syntax(),
-                        engine.environment(),
-                        limits.kernel,
-                        &scope,
-                    )
-                }
-                fln_parse::SourceCommandKind::Definition => {
-                    fln_elab::elaborate_definition_in_with_budget(
-                        parsed.syntax(),
-                        engine.environment(),
-                        limits.kernel,
-                    )
-                }
-                fln_parse::SourceCommandKind::Check | fln_parse::SourceCommandKind::Example => {
-                    return Err(EngineExecutionError::UnexpectedPublication {
-                        detail: "source check escaped its scratch-only command branch",
-                    });
-                }
-            })
+                    fln_parse::SourceCommandKind::Check
+                    | fln_parse::SourceCommandKind::Example
+                    | fln_parse::SourceCommandKind::Evaluation => {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "source check escaped its scratch-only command branch",
+                        });
+                    }
+                })
+                .map(|outcome| outcome.map_complete(|declaration| (declaration, None)))
+            }
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: command_index,
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
-            let declaration = match declaration {
+            let (declaration, evaluation_format_width) = match declaration {
                 Outcome::Complete(declaration) => declaration,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -7664,7 +7683,7 @@ impl Engine {
                 }
                 merged
             });
-            let execution = match engine.execute_definition_entry(
+            let mut execution = match engine.execute_definition_entry(
                 declaration,
                 scoped_options.as_ref().unwrap_or(options),
                 limits,
@@ -7686,8 +7705,14 @@ impl Engine {
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
+            execution.evaluation_format_width = evaluation_format_width;
             let execution_index = executions.len();
-            engine = execution.engine.clone();
+            // Printer candidates retain their checked successor in the
+            // execution evidence, but never become source declarations.
+            // Raw evaluation and IO keep their established transitions.
+            if evaluation_format_width.is_none() {
+                engine = execution.engine.clone();
+            }
             executions.push(execution);
             execution_command_indices.push(command_index);
             if is_evaluation {
@@ -8095,6 +8120,7 @@ impl Engine {
                 None,
                 None,
                 None,
+                EvaluationPresentation::Raw,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -8528,6 +8554,7 @@ impl Engine {
                 None,
                 None,
                 None,
+                EvaluationPresentation::Raw,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -8649,6 +8676,7 @@ impl Engine {
                 None,
                 None,
                 None,
+                EvaluationPresentation::Raw,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.
@@ -8887,6 +8915,7 @@ impl Engine {
             declaration: admission.declaration,
             runtime_type,
             io_result_types,
+            evaluation_format_width: None,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -11094,6 +11123,9 @@ pub struct DefinitionExecution {
     /// Present only when the source command explicitly requested IO evaluation.
     /// The public projection validates the retained logical ST/EST result.
     io_result_types: Option<source_evaluation::IoResultTypes>,
+    /// Set only by the opt-in source command adapter after executing a checked
+    /// printer. The original raw and IO paths never manufacture this marker.
+    evaluation_format_width: Option<usize>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.
@@ -11229,7 +11261,10 @@ pub struct DefinitionBatchExecution {
     pub base_logical_root: LogicalRoot,
     /// The final environment identity under the same options.
     pub result_logical_root: LogicalRoot,
-    /// Every completed definition in input order, including its root transition.
+    /// Completed definitions and evaluations in input order, each retaining
+    /// its checked root transition. Marked printer evaluations keep private
+    /// scratch successors as execution evidence; those successors are absent
+    /// from `engine` and do not form part of the published command-stream chain.
     pub executions: Vec<DefinitionExecution>,
     /// Canonical dependency order for a closed source-module execution.
     /// Empty for declaration batches and legacy caller-ordered source batches.

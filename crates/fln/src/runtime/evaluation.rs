@@ -29,6 +29,11 @@ fn family(label: &Name) -> Option<(Family, usize)> {
 }
 
 impl Preparation<'_> {
+    pub(crate) fn is_evaluation_action(&mut self, source: &Expr) -> Result<bool, IngressError> {
+        self.evaluation_action_type(source)
+            .map(|action| action.is_some())
+    }
+
     fn checked_io_world(&mut self) -> Result<bool, IngressError> {
         self.tick()?;
         if !self.io_world_checked {
