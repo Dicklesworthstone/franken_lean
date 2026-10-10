@@ -267,7 +267,7 @@ theorem chain_ne : Not (Chain.cons 7 (Chain.cons 9 Chain.nil) = Chain.cons 7 (Ch
             for invalid in [
                 "structure Bad where\n  run : Nat → Nat\nderiving Repr",
                 "structure DictBox (A : Type) [Repr A] where\n  val : A\nderiving Repr",
-                "inductive Recursive where\n | node (next : Recursive)\nderiving Repr",
+                "inductive HigherOrder where\n | node (next : Nat → HigherOrder)\nderiving Repr",
                 "inductive Indexed : Nat → Type where\n | zero : Indexed 0\nderiving Repr",
                 "structure Partial where\n n : Nat\nderiving Repr, BEq, UnknownHandler",
             ] {
@@ -341,6 +341,147 @@ theorem chain_ne : Not (Chain.cons 7 (Chain.cons 9 Chain.nil) = Chain.cons 7 (Ch
                 .unwrap();
             assert!(hidden.checked.engine.environment().is_empty());
             checked(base, "structure Retry where\n value : Nat\nderiving Repr");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn recursive_repr_uses_checked_induction_hypotheses_and_executes_actual_formats() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else {
+                return;
+            };
+            let base = &imported.engine;
+            let original = base.logical_root(&KVMap::new());
+            // The pin's Deriving/Repr.lean sends each explicit same-family
+            // field to the recursive helper at max_prec. These checks use the
+            // actual admitted Repr, Format and Bool printer, not replacement
+            // classes or an unchecked mirror of their declarations.
+            let source = r#"
+namespace Recursive
+inductive Tree (A B : Type) where
+  | leaf (value : A)
+  | branch (left right : Tree A B)
+deriving Repr
+inductive Chain where
+  | nil
+  | cons (head : Bool) (tail : Chain) (proof : True) (kind : Type)
+deriving Repr
+inductive Hidden where
+  | stop
+  | next {child : Hidden} (visible : Bool)
+deriving Repr
+def sample : Tree Bool Nat := .branch (.leaf true) (.leaf false)
+def chain : Chain := .cons true .nil True.intro Bool
+def hidden : Hidden := @Hidden.next (@Hidden.next Hidden.stop false) true
+def dictionaryExpected {A B : Type} [Repr A] [Repr B] : Repr (Tree A B) := inferInstance
+def helperExpected {A B : Type} [Repr A] [Repr B] : Tree A B → Nat → Std.Format := instReprTree.repr
+end Recursive
+
+def formatTokens : Std.Format → List String
+  | .nil => []
+  | .line => [" "]
+  | .align _ => []
+  | .text text => [text]
+  | .nest _ body => formatTokens body
+  | .append left right => List.append (formatTokens left) (formatTokens right)
+  | .group body _ => formatTokens body
+  | .tag _ body => formatTokens body
+
+theorem recursive_tokens :
+    formatTokens (Repr.reprPrec Recursive.sample 0) =
+      ["Recursive.Tree.branch", " ", "(", "Recursive.Tree.leaf", " ", "true", ")",
+       " ", "(", "Recursive.Tree.leaf", " ", "false", ")"] := by rfl
+theorem recursive_precedence :
+    formatTokens (Repr.reprPrec Recursive.sample 1024) =
+      ["(", "Recursive.Tree.branch", " ", "(", "Recursive.Tree.leaf", " ", "true", ")",
+       " ", "(", "Recursive.Tree.leaf", " ", "false", ")", ")"] := by rfl
+theorem recursive_erased_fields :
+    formatTokens (Repr.reprPrec Recursive.chain 0) =
+      ["Recursive.Chain.cons", " ", "true", " ", "(", "Recursive.Chain.nil", ")",
+       " ", "_", " ", "_"] := by rfl
+theorem implicit_recursive_field_is_not_printed :
+    formatTokens (Repr.reprPrec Recursive.hidden 0) = ["Recursive.Hidden.next", " ", "true"] := by rfl
+"#;
+            let checked = checked(base, source);
+            for (generated, expected) in [
+                ("Recursive.instReprTree", "Recursive.dictionaryExpected"),
+                ("Recursive.instReprTree.repr", "Recursive.helperExpected"),
+            ] {
+                let actual = checked.environment().find(&name(generated)).unwrap().constant_val();
+                let expected = checked.environment().find(&name(expected)).unwrap().constant_val();
+                assert_eq!(actual.level_params, expected.level_params, "{generated}");
+                assert_eq!(alpha_type(&actual.type_), alpha_type(&expected.type_), "{generated}");
+            }
+            // Execute the checked printers and compare every resulting token,
+            // independently of the logical reductions above. Their Format
+            // constructors and the consumer's List String values are native.
+            let program = b"#eval formatTokens (Repr.reprPrec Recursive.sample 0)\n#eval formatTokens (Repr.reprPrec Recursive.sample 1024)\n#eval formatTokens (Repr.reprPrec Recursive.chain 0)\n#eval formatTokens (Repr.reprPrec Recursive.hidden 0)";
+            let executed = checked
+                .execute_source_definitions(
+                    &[program],
+                    &KVMap::new(),
+                    fln::EngineExecutionLimits::new(admission().kernel),
+                )
+                .expect("derived recursive printers compile against the actual imported library")
+                .into_complete()
+                .expect("derived recursive printers execute within the budget");
+            assert_eq!(executed.executions.len(), 4);
+            let expected: &[&[&str]] = &[
+                &["Recursive.Tree.branch", " ", "(", "Recursive.Tree.leaf", " ", "true", ")",
+                  " ", "(", "Recursive.Tree.leaf", " ", "false", ")"],
+                &["(", "Recursive.Tree.branch", " ", "(", "Recursive.Tree.leaf", " ", "true", ")",
+                  " ", "(", "Recursive.Tree.leaf", " ", "false", ")", ")"],
+                &["Recursive.Chain.cons", " ", "true", " ", "(", "Recursive.Chain.nil", ")",
+                  " ", "_", " ", "_"],
+                &["Recursive.Hidden.next", " ", "true"],
+            ];
+            let shape = fln::ClosedValueShape::List(Box::new(fln::ClosedValueShape::String));
+            for (execution, tokens) in executed.executions.iter().zip(expected) {
+                let expected = fln::ClosedShapedValue::List(
+                    tokens.iter().map(|token| fln::ClosedShapedValue::String((*token).to_owned())).collect(),
+                );
+                assert_eq!(
+                    fln::closed_vm_shaped_value(&execution.exit, &shape, 1_000).unwrap(),
+                    expected,
+                );
+                let replay = fln::execute_flbc_artifact(
+                    &execution.flbc_artifact,
+                    &KVMap::new(),
+                    Default::default(),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("serialized recursive printers decode, validate and execute");
+                assert_eq!(
+                    fln::closed_vm_shaped_value(&replay, &shape, 1_000).unwrap(),
+                    expected,
+                );
+            }
+
+            for invalid in [
+                "inductive Nested where\n | node (children : List Nested)\nderiving Repr",
+                "inductive HigherOrder where\n | node (next : Nat → HigherOrder)\nderiving Repr",
+                "inductive Rollback where\n | nil\n | cons (tail : Rollback)\nderiving Repr, UnknownHandler",
+            ] {
+                assert!(
+                    base.check_source_files(
+                        &[invalid.as_bytes()],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(admission()),
+                    ).is_err(),
+                    "the unsupported recursive family or handler must refuse atomically: {invalid}",
+                );
+                assert_eq!(base.logical_root(&KVMap::new()), original);
+                for generated in ["Nested", "HigherOrder", "Rollback", "instReprRollback.repr"] {
+                    assert!(!base.environment().contains(&name(generated)), "{generated}");
+                }
+            }
+            assert_eq!(base.logical_root(&KVMap::new()), original);
         })
         .unwrap()
         .join()

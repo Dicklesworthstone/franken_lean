@@ -264,6 +264,7 @@ fn inductive_format(
     constructor: &ConstructorVal,
     parameters: &[LocalDecl],
     fields: &[LocalDecl],
+    hypotheses: &[Option<LocalDecl>],
     precedence: &LocalDecl,
 ) -> Result<Typed, NatDefinitionElabError> {
     let mut result = text(context, &constructor.base.name.to_display_string())?;
@@ -280,22 +281,29 @@ fn inductive_format(
         // Fixed indices promoted to parameters retain their explicit
         // constructor binders. They are still visible arguments in the pin.
         if *binder_info == BinderInfo::Default {
-            arguments.push(value(parameter));
+            arguments.push((value(parameter), None));
         }
         constructor_type = body;
     }
     arguments.extend(
         fields
             .iter()
-            .filter(|field| field.binder_info == BinderInfo::Default)
-            .map(value),
+            .zip(hypotheses)
+            .filter(|(field, _)| field.binder_info == BinderInfo::Default)
+            .map(|(field, hypothesis)| (value(field), hypothesis.as_ref())),
     );
-    for field in arguments {
+    for (field, hypothesis) in arguments {
         context.tick()?;
         let line = context.constant(&named("Std.Format.line"))?;
         result = append(context, result, line)?;
         // Init.Notation's max_prec macro expands to 1024.
-        let field = repr(context, field, nat(1024))?;
+        // A direct recursive field uses the checked recursor's IH, matching
+        // the pin's recursive call to this printer instead of instance search.
+        let field = if let Some(hypothesis) = hypothesis {
+            context.match_apply(value(hypothesis), nat(1024))?
+        } else {
+            repr(context, field, nat(1024))?
+        };
         result = append(context, result, field)?;
     }
     let high = call(context, "Nat.ble", &[nat(1024), value(precedence)])?;
@@ -354,7 +362,7 @@ fn inductive_body(
         Expr::lam(
             Name::anonymous(),
             target.clone(),
-            result_type,
+            result_type.clone(),
             BinderInfo::Default,
         ),
     )?;
@@ -386,11 +394,44 @@ fn inductive_body(
         for _ in 0..constructor.num_fields {
             fields.push(open_binder(context, &mut cursor)?);
         }
+        let mut binders = fields.clone();
+        let mut hypotheses = Vec::new();
+        for field in &fields {
+            context.tick()?;
+            // The pin tests the instantiated field's application head here;
+            // delta-reducing an alias would broaden its recursive-call branch.
+            let type_ = context.instantiate(&field.type_)?;
+            let mut head = &type_;
+            while let ExprNode::App { f, .. } = head.node() {
+                context.tick()?;
+                head = f;
+            }
+            if matches!(head.node(), ExprNode::Const { name, .. } if name == &family.base.name) {
+                context.constrain_type(&field.type_, target)?;
+                let hypothesis = open_binder(context, &mut cursor)?;
+                context.constrain_type(&hypothesis.type_, &result_type)?;
+                binders.push(hypothesis.clone());
+                hypotheses.push(Some(hypothesis));
+            } else {
+                hypotheses.push(None);
+            }
+        }
+        // The kernel places IHs after all constructor fields. Any remaining
+        // higher-order recursive IH must not be mistaken for the precedence
+        // binder; only the exact Nat -> Format result is supported here.
+        context.constrain_type(&cursor, &result_type)?;
         let prec = open_binder(context, &mut cursor)?;
-        let format = inductive_format(context, &constructor, parameters, &fields, &prec)?;
+        let format = inductive_format(
+            context,
+            &constructor,
+            parameters,
+            &fields,
+            &hypotheses,
+            &prec,
+        )?;
         context.constrain_type(&format.type_, &cursor)?;
-        fields.push(prec);
-        let branch = bind(context, format, &fields)?;
+        binders.push(prec);
+        let branch = bind(context, format, &binders)?;
         function = context.match_apply(function, branch)?;
         context.txn.lctx = saved;
     }
@@ -405,7 +446,7 @@ pub(super) fn elaborate(
     target: &Expr,
     is_record: bool,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
-    if family.all.len() != 1 || family.num_nested != 0 || family.is_rec {
+    if family.all.len() != 1 || family.num_nested != 0 {
         return Err(unsupported(&family.base.name));
     }
     let mut parameter_type = &family.base.type_;
