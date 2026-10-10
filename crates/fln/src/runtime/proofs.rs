@@ -78,15 +78,17 @@ impl Preparation<'_> {
         context: &[Expr],
     ) -> Result<bool, IngressError> {
         self.proof_context_depth(context.len())?;
-        // An admitted closed type cannot refer to any outer local. Avoid
-        // copying that unrelated telescope for every domain/result query.
-        // Its lexical depth still counts against introduced-binder limits.
-        let omitted_depth = if specialize::closed(input) {
-            context.len()
+        // Borrow the caller's original telescope. Only domains introduced
+        // while inspecting this Pi spine belong to the local suffix. A closed
+        // input cannot refer to the outer prefix, but its lexical depth still
+        // counts against introduced-binder limits.
+        let depth = context.len();
+        let (prefix, omitted_depth) = if specialize::closed(input) {
+            (&[][..], depth)
         } else {
-            0
+            (context, 0)
         };
-        let mut locals = self.copy_proof_context(if omitted_depth == 0 { context } else { &[] })?;
+        let mut locals = Vec::new();
         let mut type_ = input.clone();
         loop {
             self.tick()?;
@@ -95,15 +97,13 @@ impl Preparation<'_> {
                 ExprNode::ForallE {
                     binder_type, body, ..
                 } => {
-                    self.proof_context_depth(
-                        omitted_depth.saturating_add(locals.len()).saturating_add(1),
-                    )?;
+                    self.proof_context_depth(depth.saturating_add(locals.len()).saturating_add(1))?;
                     self.push_proof_local(&mut locals, binder_type.clone())?;
                     type_ = body.clone();
                 }
                 _ => {
                     let Some(sort) =
-                        self.projection_receiver_type_in(&type_, &locals, omitted_depth)?
+                        self.projection_receiver_type_in(&type_, prefix, &locals, omitted_depth)?
                     else {
                         return Ok(false);
                     };

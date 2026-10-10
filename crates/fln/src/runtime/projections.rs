@@ -17,6 +17,21 @@ enum TypeFrame {
     Let(Expr),
 }
 
+/// The inference worklist owns only its newly introduced domains. The two
+/// borrowed prefixes are the caller's context and any Pi domains a surrounding
+/// proposition query already opened. Indices still count from the end of the
+/// complete telescope, independently of where its slices are stored.
+fn type_local(index: u32, scopes: [&[Expr]; 3]) -> Option<&Expr> {
+    let mut index = usize::try_from(index).ok()?;
+    for scope in scopes {
+        if index < scope.len() {
+            return scope.get(scope.len() - 1 - index);
+        }
+        index -= scope.len();
+    }
+    None
+}
+
 enum ProjectionFrame {
     Visit(Expr),
     Apply,
@@ -195,7 +210,7 @@ impl Preparation<'_> {
         source: &Expr,
         context: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
-        self.projection_receiver_type_in(source, context, 0)
+        self.projection_receiver_type_in(source, context, &[], 0)
     }
 
     /// `omitted_depth` retains the lexical size of an unrelated outer context
@@ -205,21 +220,19 @@ impl Preparation<'_> {
         &mut self,
         source: &Expr,
         context: &[Expr],
+        suffix: &[Expr],
         omitted_depth: usize,
     ) -> Result<Option<Expr>, IngressError> {
-        let depth = omitted_depth.saturating_add(context.len());
+        let depth = omitted_depth
+            .saturating_add(context.len())
+            .saturating_add(suffix.len());
         self.proof_context_depth(depth)?;
-        let (context, omitted_depth) = if specialize::closed(source) {
-            (&[][..], depth)
+        let (context, suffix) = if specialize::closed(source) {
+            (&[][..], &[][..])
         } else {
-            (context, omitted_depth)
+            (context, suffix)
         };
         let mut locals = Vec::new();
-        for local in context {
-            self.tick()?;
-            reserve(&mut locals, self.limits.max_context_depth)?;
-            locals.push(local.clone());
-        }
         let mut frames = Vec::new();
         let mut head = source.clone();
         let mut type_ = loop {
@@ -231,13 +244,13 @@ impl Preparation<'_> {
                     );
                 }
                 ExprNode::BVar { idx } => {
-                    let Some(position) = locals.len().checked_sub(*idx as usize + 1) else {
+                    let Some(domain) = type_local(*idx, [&locals, suffix, context]) else {
                         return Ok(None);
                     };
                     let amount = idx
                         .checked_add(1)
                         .ok_or_else(|| unsupported("projection local depth"))?;
-                    break self.lift(&locals[position], amount)?;
+                    break self.lift(domain, amount)?;
                 }
                 ExprNode::Const { name, levels } => {
                     let base = if let Some(info) = self.environment.find(name) {
@@ -282,9 +295,7 @@ impl Preparation<'_> {
                     body,
                     binder_info,
                 } => {
-                    self.proof_context_depth(
-                        omitted_depth.saturating_add(locals.len()).saturating_add(1),
-                    )?;
+                    self.proof_context_depth(depth.saturating_add(locals.len()).saturating_add(1))?;
                     reserve(&mut locals, self.limits.max_context_depth)?;
                     locals.push(binder_type.clone());
                     let frame =
@@ -295,9 +306,7 @@ impl Preparation<'_> {
                 ExprNode::LetE {
                     type_, value, body, ..
                 } => {
-                    self.proof_context_depth(
-                        omitted_depth.saturating_add(locals.len()).saturating_add(1),
-                    )?;
+                    self.proof_context_depth(depth.saturating_add(locals.len()).saturating_add(1))?;
                     reserve(&mut locals, self.limits.max_context_depth)?;
                     locals.push(type_.clone());
                     let frame = TypeFrame::Let(value.clone());
