@@ -410,12 +410,44 @@ fn binder_name(name: &Name) -> String {
 }
 
 /// The printer: an environment for binder information and proposition tests, and the
-/// names of the binders in scope (innermost last).
+/// names and types of the binders in scope (innermost last).
 pub struct Printer<'a> {
     env: &'a Environment,
     scope: Option<&'a fln_elab::source::scope::SourceScope>,
     names: Vec<String>,
+    /// Each binder's type, relative to the binders outside it.
+    types: Vec<Expr>,
+    /// Inside a call to [`Printer::expr`]: the root call decides `proofs`.
+    nested: bool,
+    /// The pin's `pp.proofs`: false by default, true when the printed term is itself a
+    /// proof. When false, a proof inside the term that is not atomic prints as `⋯`.
+    proofs: bool,
     budget: usize,
+}
+
+/// The pin's `Expr.isAtomic`: no subterms.
+fn atomic(e: &Expr) -> bool {
+    matches!(
+        e.node(),
+        ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Lit { .. }
+    )
+}
+
+/// Whether a type ends in `Prop` after its `∀`s.
+fn ends_in_prop(type_: &Expr) -> bool {
+    let mut type_ = type_;
+    loop {
+        match type_.node() {
+            ExprNode::ForallE { body, .. } => type_ = body,
+            ExprNode::MData { expr, .. } => type_ = expr,
+            _ => return matches!(type_.node(), ExprNode::Sort { level } if level.is_zero()),
+        }
+    }
 }
 
 impl<'a> Printer<'a> {
@@ -424,8 +456,23 @@ impl<'a> Printer<'a> {
             env,
             scope: None,
             names: Vec::new(),
+            types: Vec::new(),
+            nested: false,
+            proofs: false,
             budget: 100_000,
         }
+    }
+
+    /// Enter a binder: its shown name and its type.
+    fn bind(&mut self, shown: String, type_: &Expr) {
+        self.names.push(shown);
+        self.types.push(type_.clone());
+    }
+
+    /// Leave every binder entered after `depth`.
+    fn unbind_to(&mut self, depth: usize) {
+        self.names.truncate(depth);
+        self.types.truncate(depth);
     }
 
     /// Print current-module private names through their source spelling, as
@@ -470,38 +517,89 @@ impl<'a> Printer<'a> {
         infos
     }
 
-    /// Whether a constant's type ends in `Prop` (so an application of it is a
-    /// proposition).
-    fn returns_prop(&self, name: &Name) -> bool {
-        let Some(info) = self.env.find(name) else {
-            return false;
-        };
-        let mut type_ = &info.constant_val().type_;
-        while let ExprNode::ForallE { body, .. } = type_.node() {
-            type_ = body;
-        }
-        matches!(type_.node(), ExprNode::Sort { level } if level.is_zero())
+    /// Whether `e` is (syntactically) a proposition: a sort-`Prop` application, a
+    /// connective, or a `∀` into one. The head is a constant whose type ends in `Prop`, or
+    /// a bound variable whose type does (a motive into `Prop`).
+    fn is_prop(&self, e: &Expr) -> bool {
+        Self::prop_in(self.env, &self.types, e)
     }
 
-    /// Whether `e` is (syntactically) a proposition: a sort-`Prop` application, a
-    /// connective, or a `∀` into one.
-    fn is_prop(&self, e: &Expr) -> bool {
+    /// [`Printer::is_prop`] for `e` under the binder types `scope` (innermost last).
+    fn prop_in(env: &Environment, scope: &[Expr], e: &Expr) -> bool {
+        let mut local: Vec<&Expr> = Vec::new();
         let mut e = e;
         loop {
             match e.node() {
-                ExprNode::ForallE { body, .. } => e = body,
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    local.push(binder_type);
+                    e = body;
+                }
                 ExprNode::MData { expr, .. } => e = expr,
                 _ => break,
             }
         }
         let (head, _) = spine(e);
         match head.node() {
-            ExprNode::Const { name, .. } => self.returns_prop(name),
+            ExprNode::Const { name, .. } => env
+                .find(name)
+                .is_some_and(|info| ends_in_prop(&info.constant_val().type_)),
+            ExprNode::BVar { idx } => {
+                let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
+                if idx < local.len() {
+                    ends_in_prop(local[local.len() - 1 - idx])
+                } else {
+                    let outer = idx - local.len();
+                    scope
+                        .len()
+                        .checked_sub(outer + 1)
+                        .is_some_and(|at| ends_in_prop(&scope[at]))
+                }
+            }
             _ => false,
         }
     }
 
+    /// Whether `e` is a proof: its type is a proposition. The type is read from the head's
+    /// type, which suffices for a constant or a bound variable at the head.
+    fn is_proof(&self, e: &Expr) -> bool {
+        let (head, _) = spine(e);
+        match head.node() {
+            ExprNode::Const { name, .. } => self
+                .env
+                .find(name)
+                .is_some_and(|info| Self::prop_in(self.env, &[], &info.constant_val().type_)),
+            ExprNode::BVar { idx } => {
+                let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
+                // A binder's type is relative to the binders outside it.
+                self.types
+                    .len()
+                    .checked_sub(idx + 1)
+                    .is_some_and(|at| Self::prop_in(self.env, &self.types[..at], &self.types[at]))
+            }
+            _ => false,
+        }
+    }
+
+    /// Print `e` with the pin's `pp.proofs`: a proof inside the printed term that is not
+    /// atomic is `⋯`, unless the term itself is a proof (the delaborator then sets
+    /// `pp.proofs`, vendored `PrettyPrinter/Delaborator/Basic.lean:510-514`).
     pub fn expr(&mut self, e: &Expr, outer: u32) -> Printed {
+        if self.nested {
+            if !self.proofs && !atomic(e) && self.is_proof(e) {
+                return Ok("⋯".to_owned());
+            }
+            return self.subterm(e, outer);
+        }
+        self.nested = true;
+        self.proofs = self.is_proof(e);
+        let printed = self.subterm(e, outer);
+        self.nested = false;
+        printed
+    }
+
+    fn subterm(&mut self, e: &Expr, outer: u32) -> Printed {
         self.tick()?;
         match e.node() {
             ExprNode::BVar { idx } => {
@@ -538,17 +636,18 @@ impl<'a> Printer<'a> {
                 let depth = self.names.len();
                 while let ExprNode::Lam {
                     binder_name: name,
+                    binder_type,
                     body: inner,
                     ..
                 } = body.node()
                 {
                     let shown = self.bound_name(name, inner);
                     binders.push(shown.clone());
-                    self.names.push(shown);
+                    self.bind(shown, binder_type);
                     body = inner;
                 }
                 let printed = self.expr(body, 0);
-                self.names.truncate(depth);
+                self.unbind_to(depth);
                 Ok(parens(
                     format!("fun {} => {}", binders.join(" "), printed?),
                     0,
@@ -567,15 +666,17 @@ impl<'a> Printer<'a> {
             // group's width, which is not reproduced.
             ExprNode::LetE {
                 decl_name: name,
+                type_,
                 value,
                 body,
                 ..
             } if outer == 0 && self.names.is_empty() => {
                 let value = self.expr(value, 0)?;
                 let shown = binder_name(name);
-                self.names.push(shown.clone());
+                let depth = self.names.len();
+                self.bind(shown.clone(), type_);
                 let printed = self.expr(body, 0);
-                self.names.pop();
+                self.unbind_to(depth);
                 Ok(format!("let {shown} := {value};\n{}", printed?))
             }
             ExprNode::LetE { .. } => Err(Unsupported("a nested let expression")),
@@ -817,9 +918,10 @@ impl<'a> Printer<'a> {
         if !dependent && *binder_info == BinderInfo::Default {
             let domain = self.expr(binder_type, ARROW_PREC + 1)?;
             let shown = self.bound_name(name, body);
-            self.names.push(shown);
+            let depth = self.names.len();
+            self.bind(shown, binder_type);
             let codomain = self.expr(body, ARROW_PREC);
-            self.names.pop();
+            self.unbind_to(depth);
             return Ok(parens(
                 format!("{domain} → {}", codomain?),
                 ARROW_PREC,
@@ -848,7 +950,7 @@ impl<'a> Printer<'a> {
             let type_text = self.expr(binder_type, 0)?;
             let hidden = !dependent && !accessible(name);
             let mut names = vec![self.bound_name(name, body)];
-            self.names.push(names[0].clone());
+            self.bind(names[0].clone(), binder_type);
             let mut next = body;
             // The pin groups a following binder with the same kind and the same type.
             while let ExprNode::ForallE {
@@ -868,7 +970,7 @@ impl<'a> Printer<'a> {
                 }
                 let shown = self.bound_name(other, other_body);
                 names.push(shown.clone());
-                self.names.push(shown);
+                self.bind(shown, other_type);
                 next = other_body;
             }
             if proposition && *binder_info == BinderInfo::Default {
@@ -883,16 +985,23 @@ impl<'a> Printer<'a> {
             }
             // `(x : A) → B`: each group is its own arrow.
             let rest = self.pi_tail(current);
-            self.names.truncate(depth);
+            self.unbind_to(depth);
             return Ok(parens(
                 format!("{} → {}", groups.join(" → "), rest?),
                 ARROW_PREC,
                 outer,
             ));
         };
-        self.names.truncate(depth);
+        self.unbind_to(depth);
         let body = result?;
-        Ok(parens(format!("∀ {}, {body}", groups.join(" ")), 0, outer))
+        // A trailing `∀` needs no parentheses as an arrow's codomain (the pin prints
+        // `… → ∀ {a : Nat} (t : Q a), motive a t`), only where something tighter encloses it:
+        // an arrow's domain or an argument.
+        Ok(parens(
+            format!("∀ {}, {body}", groups.join(" ")),
+            ARROW_PREC,
+            outer,
+        ))
     }
 
     fn pi_tail(&mut self, e: &Expr) -> Printed {
@@ -917,7 +1026,7 @@ impl<'a> Printer<'a> {
             }
             let type_text = self.expr(binder_type, 0)?;
             let mut names = vec![binder_name(binder)];
-            self.names.push(names[0].clone());
+            self.bind(names[0].clone(), binder_type);
             let mut next = body;
             while let ExprNode::ForallE {
                 binder_name: other,
@@ -935,7 +1044,7 @@ impl<'a> Printer<'a> {
                 }
                 let shown = binder_name(other);
                 names.push(shown.clone());
-                self.names.push(shown);
+                self.bind(shown, other_type);
                 next = other_body;
             }
             let hidden = !accessible(binder);
@@ -943,7 +1052,7 @@ impl<'a> Printer<'a> {
             current = next;
         }
         let rest = self.expr(current, 0);
-        self.names.truncate(depth);
+        self.unbind_to(depth);
         // The signature names the constant's universe parameters (`List.map.{u_1, u_2}`).
         let parameters = self
             .env
@@ -1053,6 +1162,73 @@ mod tests {
         assert_eq!(
             printer.expr(&shadowing(var(1)), 0).unwrap(),
             "fun x x_1 => x"
+        );
+    }
+
+    /// A `∀` whose body's head is a bound motive into `Prop` is a proposition. At the pin,
+    /// `axiom fooAx : ∀ {motive : Nat → Prop} (n : Nat), motive n` prints as written, and
+    /// a non-dependent proof binder is an arrow: `∀ {motive : Nat → Prop}, (∀ (n : Nat),
+    /// motive n) → motive 0`. A proof that is not atomic is `⋯` inside a term that is not
+    /// itself a proof (`@P.rec : … → motive ⋯ → …` at the pin).
+    #[test]
+    fn a_motive_headed_body_is_a_proposition_and_proofs_inside_terms_are_omitted() {
+        let env = Environment::new();
+        let nat = || Expr::const_(name(&["Nat"]), Vec::new());
+        let var = |i| Expr::bvar(i).unwrap();
+        let zero = || Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+        let motive_type = || {
+            Expr::forall_e(
+                Name::anonymous(),
+                nat(),
+                Expr::sort(Level::zero()),
+                BinderInfo::Default,
+            )
+        };
+        let every = |body: Expr| Expr::forall_e(name(&["n"]), nat(), body, BinderInfo::Default);
+        let foo = Expr::forall_e(
+            name(&["motive"]),
+            motive_type(),
+            every(Expr::app(var(1), var(0))),
+            BinderInfo::Implicit,
+        );
+        let mut printer = Printer::new(&env);
+        assert_eq!(
+            printer.expr(&foo, 0).unwrap(),
+            "∀ {motive : Nat → Prop} (n : Nat), motive n"
+        );
+        let baz = Expr::forall_e(
+            name(&["motive"]),
+            motive_type(),
+            Expr::forall_e(
+                name(&["f"]),
+                every(Expr::app(var(1), var(0))),
+                Expr::app(var(1), zero()),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        );
+        assert_eq!(
+            printer.expr(&baz, 0).unwrap(),
+            "∀ {motive : Nat → Prop}, (∀ (n : Nat), motive n) → motive 0"
+        );
+        // `{motive : Nat → Prop} → (f : ∀ (n : Nat), motive n) → R (f 0)`: `f 0` is a proof.
+        let omitted = Expr::forall_e(
+            name(&["motive"]),
+            motive_type(),
+            Expr::forall_e(
+                name(&["f"]),
+                every(Expr::app(var(1), var(0))),
+                Expr::app(
+                    Expr::const_(name(&["R"]), Vec::new()),
+                    Expr::app(var(0), zero()),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        );
+        assert_eq!(
+            printer.expr(&omitted, 0).unwrap(),
+            "{motive : Nat → Prop} → (f : ∀ (n : Nat), motive n) → R ⋯"
         );
     }
 }

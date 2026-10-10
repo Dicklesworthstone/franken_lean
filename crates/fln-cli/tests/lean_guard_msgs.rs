@@ -59,6 +59,11 @@ fn a_matching_guard_is_silent_and_its_neighbours_still_print() {
         // The pin's suite (`tests/elab/fieldNamesWithMinus.lean`): a name that is not an
         // identifier prints escaped, `«i-love-lisp»`.
         "structure Minus where\n  «i-love-lisp» : Bool\n/-- info: Minus.«i-love-lisp» (self : Minus) : Bool -/\n#guard_msgs in\n#check Minus.«i-love-lisp»\n",
+        // `pp.proofs`: a proof that is not atomic is `⋯` inside a term that is not a proof,
+        // and in full when the term printed is one. A promoted index binds `a`. The pin
+        // passes all three guards (exit 0, silent).
+        "inductive P : Nat → Prop where\n  | mk (n : Nat) : P n\n/-- info: @P.rec : {a : Nat} → {motive : P a → Sort u_1} → motive ⋯ → (t : P a) → motive t -/\n#guard_msgs in\n#check @P.rec\n",
+        "inductive Q : Nat → Prop where\n  | zero : Q 0\n  | succ (n : Nat) : Q n → Q (n + 1)\n/-- info: Q.succ 0 Q.zero : Q (0 + 1) -/\n#guard_msgs in\n#check Q.succ 0 Q.zero\n/-- info: Q.succ : ∀ (n : Nat), Q n → Q (n + 1) -/\n#guard_msgs in\n#check @Q.succ\n",
     ] {
         let output = lean(program);
         assert_eq!(output.status.code(), Some(0), "{program}\n{output:?}");
