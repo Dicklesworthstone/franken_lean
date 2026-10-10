@@ -61,6 +61,7 @@ use std::fmt;
 mod array_construction;
 mod arrays;
 mod floats;
+mod strings;
 mod tail_calls;
 
 /// Caller-supplied execution limits. `max_steps` is a FrankenLean-owned FLBC
@@ -560,6 +561,7 @@ struct IntrinsicPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
     Float(floats::Intrinsic),
+    StringInternal(strings::Intrinsic),
     BaseIoAsTask,
     BaseIoBindTask,
     BaseIoMapTask,
@@ -1247,6 +1249,7 @@ impl IntrinsicImplementation {
                     array_construction::Intrinsic::for_row(row).map(Self::ArrayConstruction)
                 })
                 .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))
+                .or_else(|| strings::Intrinsic::for_row(row).map(Self::StringInternal))
                 .unwrap_or(Self::Unsupported),
         }
     }
@@ -1855,6 +1858,7 @@ enum IntrinsicFailure {
     Refused(VmRefusal),
     NatMagnitudeLimit { allowed: u64, observed: u64 },
     FileReadResource(FileReadError),
+    StringResource(strings::ResourceError),
 }
 
 impl From<VmRefusal> for IntrinsicFailure {
@@ -2610,6 +2614,9 @@ fn run(
                         }
                         Err(IntrinsicFailure::FileReadResource(error)) => {
                             return Err(file_read_exhausted(error, &location.to_string()));
+                        }
+                        Err(IntrinsicFailure::StringResource(error)) => {
+                            return Err(strings::resource_exhausted(error, &location.to_string()));
                         }
                     }
                 }
@@ -4078,6 +4085,7 @@ fn invoke_intrinsic(
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::StringInternal(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
             let sum = with_nat_views(
@@ -7037,6 +7045,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayConstruction(_)
         | IntrinsicImplementation::ArrayExtra(_)
         | IntrinsicImplementation::Float(_)
+        | IntrinsicImplementation::StringInternal(_)
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }),
