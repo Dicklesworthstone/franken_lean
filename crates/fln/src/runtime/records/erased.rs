@@ -79,12 +79,18 @@ impl Preparation<'_> {
         let source = self.normalize_type(&source)?;
         let mut work = vec![Work::Visit(source)];
         let mut values = Vec::new();
-        let mut locals = Vec::new();
-        for local in context {
-            self.tick()?;
-            reserve(&mut locals, self.limits.max_context_depth)?;
-            locals.push(local.clone());
+        // The caller owns this immutable telescope. Retain its lexical depth
+        // without cloning it on every metadata query; only binders entered by
+        // this traversal need an owned suffix. Keep the original table bound
+        // even when the source never inspects a caller variable.
+        if context.len() > self.limits.max_context_depth {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.max_context_depth,
+                observed: self.limits.max_context_depth.saturating_add(1),
+            });
         }
+        let mut locals = Vec::new();
         while let Some(task) = work.pop() {
             self.tick()?;
             match task {
@@ -123,7 +129,8 @@ impl Preparation<'_> {
                         idx,
                         expr,
                     } => {
-                        let mut receiver_type = self.projection_receiver_type(expr, &locals)?;
+                        let mut receiver_type =
+                            self.projection_receiver_type_in(expr, context, &locals, 0)?;
                         if receiver_type.is_none()
                             && matches!(self.environment.find(struct_name),
                                 Some(ConstantInfo::Induct(family))
@@ -166,7 +173,20 @@ impl Preparation<'_> {
                 }
                 Work::Domain(name, original, body, info, lambda) => {
                     let domain = pop(&mut values)?;
-                    reserve(&mut locals, self.limits.max_context_depth)?;
+                    let observed = context.len().saturating_add(locals.len()).saturating_add(1);
+                    if observed > self.limits.max_context_depth {
+                        return Err(IngressError::ResourceLimit {
+                            resource: IngressResource::ProgramTables,
+                            limit: self.limits.max_context_depth,
+                            observed,
+                        });
+                    }
+                    locals
+                        .try_reserve(1)
+                        .map_err(|_| IngressError::AllocationFailure {
+                            resource: IngressResource::ProgramTables,
+                            requested: observed,
+                        })?;
                     locals.push(original);
                     reserve(&mut work, self.limits.max_nodes)?;
                     work.push(Work::Body(name, domain, info, lambda));
@@ -184,7 +204,7 @@ impl Preparation<'_> {
                 }
             }
         }
-        if values.len() != 1 || locals.len() != context.len() {
+        if values.len() != 1 || !locals.is_empty() {
             return Err(unsupported("hidden type representation stack"));
         }
         pop(&mut values)
@@ -354,3 +374,6 @@ impl Preparation<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod context_tests;

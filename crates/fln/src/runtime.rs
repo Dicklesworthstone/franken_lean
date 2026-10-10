@@ -336,6 +336,15 @@ impl<'a> Preparation<'a> {
     }
 
     fn local_lambda(&mut self, value: &Expr, type_: &Expr) -> Result<Expr, IngressError> {
+        if !matches!(value.node(), ExprNode::Lam { .. }) {
+            return Ok(value.clone());
+        }
+        // Late unfolding can leave a value-only gap after this initializer's
+        // children have already registered. Keep the exact closed child as an
+        // executable call target; never revisit or beta-inline the forwarding
+        // wrapper and invalidate its metadata.
+        let forwarded = self.forward_closed_administrative_tail(value)?;
+        let value = forwarded.as_ref().unwrap_or(value);
         let ExprNode::Lam {
             binder_type,
             body,

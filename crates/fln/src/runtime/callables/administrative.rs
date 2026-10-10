@@ -6,6 +6,101 @@
 use super::*;
 
 impl Preparation<'_> {
+    /// A prepared gap can expose a closed callback only after its body has
+    /// acquired exact lambda metadata. Forward to that existing lambda value
+    /// instead of splicing or re-preparing it: its row and every nested row
+    /// remain executable with their original keys, captures and recursion.
+    pub(in crate::runtime) fn forward_closed_administrative_tail(
+        &mut self,
+        input: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut outer = Vec::new();
+        let mut body = input.clone();
+        while let ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body: next,
+            binder_info,
+        } = body.node()
+        {
+            self.producer_depth(outer.len().saturating_add(1))?;
+            reserve(&mut outer, self.limits.max_context_depth)?;
+            outer.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            body = next.clone();
+        }
+        if outer.is_empty()
+            || !matches!(body.node(), ExprNode::LetE { .. } | ExprNode::MData { .. })
+        {
+            return Ok(None);
+        }
+        let Some(target) = self.administrative_callable_gap(&body)? else {
+            return Ok(None);
+        };
+        if !specialize::closed(&target) {
+            return Ok(None);
+        }
+        let mut arity = None;
+        for index in (0..self.lambdas.len()).rev() {
+            self.tick()?;
+            let binding = &self.lambdas[index];
+            if binding.lambda != target {
+                continue;
+            }
+            // A recursive row includes synthetic peer/self slots. A captured
+            // row would change scope when moved, and non-borrowed parameters
+            // need a separate ownership-preserving adapter.
+            if binding.recursion != LambdaRecursion::NonRecursive
+                || binding.parameters.is_empty()
+                || binding.parameters.len() != binding.parameter_ownership.len()
+                || binding
+                    .parameter_ownership
+                    .iter()
+                    .any(|ownership| *ownership != fln_comp::flbc::ArgumentOwnership::Borrowed)
+            {
+                return Ok(None);
+            }
+            arity = Some(binding.parameters.len());
+            break;
+        }
+        let Some(arity) = arity else {
+            return Ok(None);
+        };
+        let mut tail = Vec::new();
+        let mut spine = target.clone();
+        while let ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = spine.node()
+        {
+            self.producer_depth(outer.len().saturating_add(tail.len()).saturating_add(1))?;
+            reserve(&mut tail, self.limits.max_context_depth)?;
+            tail.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            spine = body.clone();
+        }
+        if tail.len() != arity {
+            return Ok(None);
+        }
+        // Every copied domain keeps its original dependent binder scope. The
+        // fully closed target stays unchanged beneath the new binders, and
+        // remains an actual application head for ordinary FIR validation.
+        let mut result = target;
+        for index in (0..arity).rev() {
+            self.tick()?;
+            let index = u32::try_from(index)
+                .map_err(|_| unsupported("closed callback forwarding argument"))?;
+            let argument =
+                Expr::bvar(index).map_err(|_| unsupported("closed callback forwarding scope"))?;
+            result = Expr::app(result, argument);
+        }
+        for (name, domain, info) in tail.into_iter().rev().chain(outer.into_iter().rev()) {
+            self.tick()?;
+            result = Expr::lam(name, domain, result, info);
+        }
+        Ok(Some(result))
+    }
+
     pub(in crate::runtime) fn administrative_callable_value(
         &mut self,
         input: &Expr,
@@ -172,3 +267,6 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod forwarding_tests;

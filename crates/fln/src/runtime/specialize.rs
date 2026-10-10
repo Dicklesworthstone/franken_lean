@@ -31,6 +31,7 @@ pub(super) struct Store {
     normalized_definitions: HashMap<Name, NormalizedDefinition>,
     pure: pure::Store,
     heads: heads::Store,
+    pub(super) index_types: super::indexed::cache::Store,
     factory_values: HashMap<Expr, Expr>,
     pub(super) executable_projections: HashMap<(Name, u64, Expr), Expr>,
     instances: HashMap<arguments::InstanceKey, Name>,

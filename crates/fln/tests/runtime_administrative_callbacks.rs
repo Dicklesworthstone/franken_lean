@@ -86,6 +86,19 @@ def forwardSelected (select : Bool) (consumer : (Bool -> Nat -> Nat) -> Nat) (ca
 "#,
             "42",
         ),
+        (
+            r#"
+def forwardPrepared (consumer : (Bool -> Nat -> Nat) -> Nat) (captured : Nat) : Nat :=
+  consumer (fun _ =>
+    let message := (fun text : String => text) "unreachable"
+    let unused := captured
+    let action : Nat -> Nat := fun n => n + 32
+    let result := action
+    result)
+#eval forwardPrepared (fun callback => callback false 10) 7
+"#,
+            "42",
+        ),
     ] {
         let run = || {
             engine

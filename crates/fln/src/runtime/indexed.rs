@@ -9,6 +9,8 @@ use fln_core::level::Level;
 use fln_env::constants::InductiveVal;
 use std::collections::HashMap;
 
+pub(super) mod cache;
+
 /// Stands for an unknown value parameter while a family or constructor
 /// telescope is opened. A free variable selects no reduction, so a type still
 /// mentioning it after runtime erasure depends on the parameter's actual value
@@ -216,6 +218,10 @@ impl Preparation<'_> {
     /// postorder is heap-backed and memoized; erased indices are never traversed
     /// or normalized, so a large index expression cannot expand into a layout.
     pub(super) fn erase_data_indices(&mut self, input: &Expr) -> Result<Expr, IngressError> {
+        cache::erase_data_indices(self, input)
+    }
+
+    fn erase_data_indices_uncached(&mut self, input: &Expr) -> Result<Expr, IngressError> {
         enum Work {
             Enter(Expr),
             Finish(Expr, Expr),
