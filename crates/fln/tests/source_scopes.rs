@@ -109,10 +109,112 @@ fn section_variables_generalize_runtime_definitions_and_restore_after_end() {
 fn scoped_instance_activation_changes_runtime_values_and_ends_with_the_section() {
     let completed = executed(
         &engine(),
-        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef fallbackSelection : Selection := Selection.mk 1\nattribute [instance] fallbackSelection\nnamespace Alternative\ndef dictionary : Selection := Selection.mk 7\nattribute [scoped instance] dictionary\nend Alternative\n#eval (selected : Nat)\nsection\nopen scoped Alternative\n#eval (selected : Nat)\nend\n#eval (selected : Nat)",
+        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef fallbackSelection : Selection := Selection.mk 1\nattribute [instance] fallbackSelection\nnamespace Alternative\ndef dictionary : Selection := Selection.mk 7\nattribute [scoped instance] dictionary\nend Alternative\n#eval selected\nsection\nopen scoped Alternative\n#eval (selected)\nend\n#eval selected",
     );
     assert_eq!(evaluated(&completed), [1, 7, 1]);
     assert_eq!(completed.batch.source_evaluation_indices.len(), 3);
+}
+
+#[test]
+fn bare_evaluations_synthesize_consecutive_instances_and_refuse_missing_dictionaries() {
+    let missing = checked(
+        &engine(),
+        "class FirstChoice where\n  value : Nat\nclass SecondChoice where\n  value : Nat\ndef combined [FirstChoice] [SecondChoice] : Nat := FirstChoice.value + SecondChoice.value\ndef firstDictionary : FirstChoice := FirstChoice.mk 17\nattribute [instance] firstDictionary\ndef secondDictionary : SecondChoice := SecondChoice.mk 25",
+    );
+    let parsed = fln_parse::parse_source_command(b"#eval combined").unwrap();
+    assert!(matches!(
+        fln_elab::elaborate_evaluation_in_with_budget(
+            parsed.syntax(),
+            Name::num(Name::anonymous(), 0),
+            missing.environment(),
+            limits().kernel,
+        ),
+        Err(fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::InstanceSynthesisRequired
+        ))
+    ));
+    let registered = checked(&missing, "attribute [instance] secondDictionary");
+    assert_eq!(
+        evaluated(&executed(&registered, "#eval combined\n#eval (combined)")),
+        [42, 42]
+    );
+}
+
+#[test]
+fn instance_query_insertion_preserves_explicit_and_polymorphic_function_values() {
+    let base = checked(
+        &engine(),
+        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef dictionary : Selection := Selection.mk 7\nattribute [instance] dictionary\ndef explicitFunction (x : Nat) : Nat := x\ndef polymorphic {A : Type} (x : A) : A := x\ndef strict ⦃A : Type⦄ (x : A) : A := x\ndef ordinaryImplicit {A : Type} : Nat := 0\ndef remaining [Selection] {A : Type} (x : A) : Nat := Selection.value",
+    );
+    let candidate = |source: &str| {
+        let parsed = fln_parse::parse_source_command(source.as_bytes()).unwrap();
+        let name = Name::num(Name::anonymous(), 0);
+        let declaration = if parsed.kind() == fln_parse::SourceCommandKind::Check {
+            fln_elab::elaborate_check_in_with_budget(
+                parsed.syntax(),
+                name,
+                base.environment(),
+                limits().kernel,
+            )
+        } else {
+            fln_elab::elaborate_evaluation_in_with_budget(
+                parsed.syntax(),
+                name,
+                base.environment(),
+                limits().kernel,
+            )
+        }
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert!(matches!(
+            fln_kernel::check(base.environment(), &declaration, limits().kernel),
+            fln::Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+        ));
+        let fln::Declaration::Defn(definition) = declaration else {
+            panic!("query must produce a definition candidate");
+        };
+        definition
+    };
+    for (source, name) in [
+        ("#eval @selected", "selected"),
+        ("#eval (@selected)", "selected"),
+        ("#check selected", "selected"),
+        ("#eval explicitFunction", "explicitFunction"),
+        ("#eval polymorphic", "polymorphic"),
+        ("#eval strict", "strict"),
+        ("#eval ordinaryImplicit", "ordinaryImplicit"),
+        ("#check @polymorphic", "polymorphic"),
+    ] {
+        assert_eq!(
+            candidate(source).base.type_,
+            base.environment()
+                .find(&n(name))
+                .unwrap()
+                .constant_val()
+                .type_,
+            "{source} must retain the checked function type"
+        );
+    }
+    let remaining = candidate("#eval remaining");
+    assert!(matches!(
+        remaining.base.type_.node(),
+        fln::ExprNode::ForallE {
+            binder_info: fln::BinderInfo::Implicit,
+            ..
+        }
+    ));
+    assert_eq!(
+        remaining.value,
+        fln::Expr::app(
+            fln::Expr::const_(n("remaining"), vec![]),
+            fln::Expr::const_(n("dictionary"), vec![]),
+        )
+    );
+    let computed = candidate("#eval let paid : Nat := 40 + 2; fun (x : Nat) => x");
+    assert!(matches!(
+        computed.value.node(),
+        fln::ExprNode::LetE { body, .. }
+            if matches!(body.node(), fln::ExprNode::Lam { .. })
+    ));
 }
 
 #[test]

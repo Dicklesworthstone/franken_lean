@@ -381,6 +381,7 @@ struct Typed {
 enum ImplicitInsertion<'a> {
     ExplicitArgument,
     ApplicationEnd,
+    InstanceQuery,
     Expected(Option<&'a Expr>),
     FieldReceiver,
 }
@@ -1147,9 +1148,11 @@ impl Context {
             };
             let insert = match binder_info {
                 BinderInfo::Default => false,
-                BinderInfo::Implicit | BinderInfo::InstImplicit => {
-                    !matches!(insertion, ImplicitInsertion::Expected(None))
-                }
+                BinderInfo::Implicit => !matches!(
+                    insertion,
+                    ImplicitInsertion::Expected(None) | ImplicitInsertion::InstanceQuery
+                ),
+                BinderInfo::InstImplicit => !matches!(insertion, ImplicitInsertion::Expected(None)),
                 BinderInfo::StrictImplicit => {
                     matches!(insertion, ImplicitInsertion::ExplicitArgument)
                 }
@@ -4197,7 +4200,22 @@ fn query_in(
         if evaluate { "#eval" } else { "#check" },
         "query keyword",
     )?;
-    let term = context.term(&parts[1], None)?;
+    let mut term = context.term(&parts[1], None)?;
+    if evaluate {
+        let (head, explicit) = context.explicit_application_head(&parts[1])?;
+        if !explicit
+            && (matches!(head, Syntax::Ident { .. })
+                || head.kind() == Some(&parser_kind(&["Term", "explicitUniv"])))
+        {
+            // The pin elaborates an identifier through `elabAppArgs`, even
+            // with no written arguments, and synthesizes its instance binders
+            // (`Lean/Elab/App.lean`, `elabAtom`/`processInstImplicitArg`).
+            // A bare `#eval selected` must evaluate the selected dictionary's
+            // value. Do not guess ordinary implicit parameters or apply a
+            // function's explicit arguments; `@selected` stays explicit.
+            term = context.insert_implicits(term, ImplicitInsertion::InstanceQuery)?;
+        }
+    }
     // `#check` generalizes universe metavariables the term leaves open to fresh
     // parameters `u_1`, `u_2`, … (the pin's `levelMVarToParam`), so `#check @List.map`
     // has a type; `#eval` needs a closed, concrete term and keeps the refusal.
