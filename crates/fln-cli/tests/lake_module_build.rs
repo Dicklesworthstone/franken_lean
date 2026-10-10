@@ -271,7 +271,10 @@ fn cycles_leaked_sibling_declarations_and_resource_overflow_never_publish() {
         "Lib/Sibling.lean",
         "prelude\ndef leak (A : Type) (a : A) : A := Lib.identity A a\n",
     );
-    package.write("Lib/Top.lean", "prelude\nimport Lib.Base Lib.Sibling\n");
+    package.write(
+        "Lib/Top.lean",
+        "prelude\nimport Lib.Base\nimport Lib.Sibling\n",
+    );
     assert!(failure(&package.build(&["+Lib.Top:olean"])).contains("Lib.Sibling"));
     package.write("Lib/Base.lean", vec![b' '; 1024 * 1024 + 1]);
     assert!(failure(&package.build(&["+Lib.Base:olean"])).contains("resource"));

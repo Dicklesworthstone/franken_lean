@@ -413,6 +413,7 @@ fn binder_name(name: &Name) -> String {
 /// names of the binders in scope (innermost last).
 pub struct Printer<'a> {
     env: &'a Environment,
+    scope: Option<&'a fln_elab::source::scope::SourceScope>,
     names: Vec<String>,
     budget: usize,
 }
@@ -421,9 +422,27 @@ impl<'a> Printer<'a> {
     pub fn new(env: &'a Environment) -> Self {
         Self {
             env,
+            scope: None,
             names: Vec::new(),
             budget: 100_000,
         }
+    }
+
+    /// Print current-module private names through their source spelling, as
+    /// the pin's default `pp.privateNames = false` delaborator does. All core
+    /// lookups and notation decisions retain the original declaration name.
+    pub fn in_scope(env: &'a Environment, scope: &'a fln_elab::source::scope::SourceScope) -> Self {
+        Self {
+            scope: Some(scope),
+            ..Self::new(env)
+        }
+    }
+
+    fn display_name(&self, name: &Name) -> String {
+        self.scope.map_or_else(
+            || escaped_name(name),
+            |scope| escaped_name(&scope.user_name(name)),
+        )
     }
 
     fn tick(&mut self) -> Result<(), Unsupported> {
@@ -663,6 +682,7 @@ impl<'a> Printer<'a> {
                     shown.push(self.expr(arg, MAX_PREC)?);
                 }
             }
+            let text = self.display_name(name);
             if shown.is_empty() {
                 return Ok(text);
             }
@@ -727,9 +747,9 @@ impl<'a> Printer<'a> {
             .first()
             .is_none_or(|info| *info == BinderInfo::Default);
         if explicit {
-            escaped_name(name)
+            self.display_name(name)
         } else {
-            format!("@{}", escaped_name(name))
+            format!("@{}", self.display_name(name))
         }
     }
 
@@ -895,11 +915,11 @@ impl<'a> Printer<'a> {
             .map(|info| info.constant_val().level_params.clone())
             .unwrap_or_default();
         let head = if parameters.is_empty() {
-            escaped_name(name)
+            self.display_name(name)
         } else {
             format!(
                 "{}.{{{}}}",
-                escaped_name(name),
+                self.display_name(name),
                 parameters
                     .iter()
                     .map(escaped_name)

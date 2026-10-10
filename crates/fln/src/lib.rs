@@ -6773,12 +6773,13 @@ impl Engine {
                 self.empty_source_command_execution(options),
             ));
         }
-        self.execute_source_command_stream(partitioned.commands, options, limits, true, &[])
+        self.execute_source_command_stream(partitioned.commands, options, limits, true, &[], None)
     }
 
     fn empty_source_command_execution(&self, options: &KVMap) -> SourceCommandBatchExecution {
         let root = self.logical_root(options);
         SourceCommandBatchExecution {
+            scope: self.base_source_scope(),
             batch: DefinitionBatchExecution {
                 engine: self.clone(),
                 base_logical_root: root,
@@ -6804,6 +6805,7 @@ impl Engine {
         limits: EngineExecutionLimits,
         allow_checks: bool,
         file_starts: &[usize],
+        private_module: Option<&Name>,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -6866,6 +6868,7 @@ impl Engine {
         let mut file_base = engine.environment.clone();
         let mut file_starts = file_starts.iter().copied().peekable();
         let mut scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+        scopes.current.private_module = private_module.cloned();
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
             .enumerate()
@@ -6899,14 +6902,13 @@ impl Engine {
                     continue;
                 }
             };
-            // Flattened source sets retain declaration order, but a new file
-            // starts a fresh lexical scope and cannot change a predecessor's
-            // reducibility. Consume each boundary once: `open ... in` and
-            // `set_option ... in` revisit their command index during expansion.
+            // Consume each file boundary once, including when a temporary
+            // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
                 file_starts.next();
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+                scopes.current.private_module = private_module.cloned();
             }
             let control = fln_parse::command_scope::parse(command_source)
                 .map_err(|error| error.with_original_offset(original_offset))
@@ -7349,6 +7351,7 @@ impl Engine {
         execution_indices.extend_from_slice(&execution_command_indices);
         let result_logical_root = engine.logical_root(options);
         Ok(Outcome::Complete(SourceCommandBatchExecution {
+            scope: scopes.current,
             batch: DefinitionBatchExecution {
                 engine,
                 base_logical_root,
@@ -7725,6 +7728,7 @@ impl Engine {
                 limits,
                 true,
                 &[],
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -8155,6 +8159,7 @@ impl Engine {
                 limits,
                 policy.allow_scratch_checks(),
                 &file_starts,
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -8273,6 +8278,7 @@ impl Engine {
                 limits,
                 false,
                 file_starts,
+                None,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.
@@ -10772,6 +10778,9 @@ pub enum SourceCommandOutput {
 #[derive(Debug)]
 pub struct SourceCommandBatchExecution {
     pub batch: DefinitionBatchExecution,
+    /// Final source scope, including the module identity needed to present its
+    /// private declarations by their source names. This grants no authority.
+    pub scope: fln_elab::source::scope::SourceScope,
     pub command_count: usize,
     pub execution_command_indices: Vec<usize>,
     pub outputs: Vec<SourceCommandOutput>,

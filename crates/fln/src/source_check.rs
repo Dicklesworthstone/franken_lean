@@ -314,7 +314,7 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
-        self.check_source_files_recording(sources, options, limits, None)
+        self.check_source_files_recording(sources, options, limits, None, None)
     }
 
     // Module imports record only the candidates that survived ordinary admission.
@@ -325,6 +325,7 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
         mut declarations: Option<&mut Vec<Declaration>>,
+        private_module: Option<&Name>,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         if sources.is_empty() {
             return Err(SourceCheckError::EmptyInput);
@@ -355,6 +356,7 @@ impl Engine {
             // in this file, never declarations supplied by its predecessor.
             let file_base = engine.environment.clone();
             let mut scopes = scopes::Scopes::new(engine.environment(), engine.mode());
+            scopes.current.private_module = private_module.cloned();
             let commands = partition_commands(source, file, count)?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
                 return Err(SourceCheckError::Limit {
@@ -547,6 +549,7 @@ pub fn preflight_source_module(
             error,
         }
     })?;
+    modules::validate_source_header(module, &header)?;
     let body = &source[header.body_start.0..];
     if body.is_empty() {
         return Ok(());

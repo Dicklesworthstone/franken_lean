@@ -114,7 +114,7 @@ fn only_owned_class_rows_are_exported_across_a_diamond() {
     let built = compiled(&[
         (
             "Main",
-            "prelude\nimport Left Right\nclass Outer (A : Type) where\n  apply : A -> A",
+            "prelude\nimport Left\nimport Right\nclass Outer (A : Type) where\n  apply : A -> A",
         ),
         ("Left", "prelude\nimport Base"),
         ("Right", "prelude\nimport Base"),

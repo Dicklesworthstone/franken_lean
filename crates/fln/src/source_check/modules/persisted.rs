@@ -739,7 +739,7 @@ mod tests {
         ),
         (
             "Main",
-            "prelude\nimport Left Right\ntheorem use (P : Prop) (h : P) : P := left P (right P h)\n",
+            "prelude\nimport Left\nimport Right\ntheorem use (P : Prop) (h : P) : P := left P (right P h)\n",
         ),
     ];
 

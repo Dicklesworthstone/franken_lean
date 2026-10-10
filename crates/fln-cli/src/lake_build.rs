@@ -297,6 +297,10 @@ fn load_sources(
         source_bytes += source.len();
         let header = parse_source_header(&source)
             .map_err(|error| Failure::input(format!("{}: {error}", path.display())))?;
+        fln::source_check::modules::validate_source_header(&module, &header).map_err(|error| {
+            let (class, _, _) = error.disposition();
+            Failure::new(class, error.to_string())
+        })?;
         let mut imports = header.imports;
         if !header.prelude && !imports.contains(&Name::from_components(["Init"])) {
             imports.insert(0, Name::from_components(["Init"]));

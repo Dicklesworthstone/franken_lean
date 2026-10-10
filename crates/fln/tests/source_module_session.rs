@@ -57,7 +57,7 @@ fn checked(session: &mut SourceModuleSession, files: &[(&str, &str)]) -> SourceM
 const GRAPH: [(&str, &str); 4] = [
     (
         "Main",
-        "import Left Right\ntheorem use : left = right := by rfl",
+        "import Left\nimport Right\ntheorem use : left = right := by rfl",
     ),
     ("Left", "import Base\ndef left := value"),
     ("Right", "import Base\ndef right := value"),
@@ -99,7 +99,7 @@ fn leaf_edits_reuse_dependencies_and_a_sibling_edit_invalidates_only_its_consume
     let original = checked(&mut session, &GRAPH);
     let original_root = original.checked.checked.result_logical_root;
     let mut changed = GRAPH;
-    changed[0].1 = "import Left Right\ntheorem useAgain : left = right := by rfl";
+    changed[0].1 = "import Left\nimport Right\ntheorem useAgain : left = right := by rfl";
     let leaf = checked(&mut session, &changed);
     assert_eq!((leaf.reused_modules, leaf.elaborated_modules), (3, 1));
     assert!(
@@ -137,7 +137,7 @@ fn late_false_proofs_do_not_publish_partial_cache_updates_or_stale_success() {
     let good = checked(&mut session, &GRAPH);
     let mut broken = GRAPH;
     broken[3].1 = "def value := 9";
-    broken[0].1 = "import Left Right\ntheorem bad : left = 7 := by rfl";
+    broken[0].1 = "import Left\nimport Right\ntheorem bad : left = 7 := by rfl";
     assert!(check_with(&mut session, &broken, None).is_err());
     assert_eq!(session.retained_modules(), 4);
     let recovery = checked(&mut session, &GRAPH);
@@ -146,7 +146,7 @@ fn late_false_proofs_do_not_publish_partial_cache_updates_or_stale_success() {
         recovery.checked.checked.result_logical_root,
         good.checked.checked.result_logical_root
     );
-    broken[0].1 = "import Left Right\ntheorem repaired : left = 9 := by rfl";
+    broken[0].1 = "import Left\nimport Right\ntheorem repaired : left = 9 := by rfl";
     assert_eq!(checked(&mut session, &broken).elaborated_modules, 4);
 }
 
@@ -191,7 +191,7 @@ fn changing_imported_instances_rechecks_consumers_but_not_independent_siblings()
     let mut files = [
         (
             "Main",
-            "import Choice Independent\ntheorem fixed : independent = 0 := by rfl\ntheorem current : (default : Nat) = 7 := by rfl",
+            "import Choice\nimport Independent\ntheorem fixed : independent = 0 := by rfl\ntheorem current : (default : Nat) = 7 := by rfl",
         ),
         ("Choice", "instance seven : Inhabited Nat := Inhabited.mk 7"),
         ("Independent", "def independent : Nat := default"),
@@ -199,7 +199,7 @@ fn changing_imported_instances_rechecks_consumers_but_not_independent_siblings()
     checked(&mut session, &files);
     files[1].1 = "instance nine : Inhabited Nat := Inhabited.mk 9";
     assert!(check_with(&mut session, &files, None).is_err());
-    files[0].1 = "import Choice Independent\ntheorem fixed : independent = 0 := by rfl\ntheorem current : (default : Nat) = 9 := by rfl";
+    files[0].1 = "import Choice\nimport Independent\ntheorem fixed : independent = 0 := by rfl\ntheorem current : (default : Nat) = 9 := by rfl";
     let result = checked(&mut session, &files);
     assert_eq!((result.reused_modules, result.elaborated_modules), (1, 2));
 }
@@ -276,7 +276,7 @@ fn cached_modules_still_count_against_aggregate_source_command_limits() {
         SourceModuleCacheLimits::default(),
     );
     let mut files = [
-        ("Main", "import A B"),
+        ("Main", "import A\nimport B"),
         ("A", "def a := 1"),
         ("B", "def b := 2"),
     ];

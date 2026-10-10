@@ -292,7 +292,10 @@ fn expand_matches(mut syntax: Syntax, pattern: bool) -> Syntax {
                 vec![null(vec![]), value],
             )]),
             atom("with"),
-            Syntax::node(parser_kind(&["Term", "matchAlts"]), vec![null(alternatives)]),
+            Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null(alternatives)],
+            ),
         ],
     )
 }
@@ -326,7 +329,10 @@ fn expand_let_pattern(mut syntax: Syntax, pattern: bool) -> Syntax {
         unreachable!("checked let");
     };
     let body = std::mem::replace(&mut args[4], null(vec![]));
-    let Syntax::Node { args: declaration, .. } = &mut args[2] else {
+    let Syntax::Node {
+        args: declaration, ..
+    } = &mut args[2]
+    else {
         unreachable!("checked declaration");
     };
     let Syntax::Node { args: parts, .. } = &mut declaration[0] else {
@@ -1055,9 +1061,17 @@ impl Context {
                             // environment already. Preserve that identity on
                             // re-entry: an enclosing namespace may contain a
                             // different declaration with the same suffix.
-                            identifier(
-                                Name::from_components(["_root_"]).append_core(&resolved.name),
-                            )
+                            let name =
+                                if self.source_scope.user_name(&resolved.name) != resolved.name {
+                                    // A current-module private core name is
+                                    // already exact. `_root_` is a source prefix;
+                                    // putting it before an internal numeric name
+                                    // would make that identity unrecognizable.
+                                    resolved.name.clone()
+                                } else {
+                                    Name::from_components(["_root_"]).append_core(&resolved.name)
+                                };
+                            identifier(name)
                         };
                         let pattern = if fields.is_empty() {
                             head

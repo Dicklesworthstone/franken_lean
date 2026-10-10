@@ -87,7 +87,7 @@ fn siblings_select_different_dictionaries_without_changing_their_checked_types()
             ),
             (
                 "Main",
-                "prelude\nimport Left Right\ndef leftAgain : Family a := left\ndef rightAgain : Family b := right\n",
+                "prelude\nimport Left\nimport Right\ndef leftAgain : Family a := left\ndef rightAgain : Family b := right\n",
             ),
         ],
     );
@@ -103,15 +103,15 @@ fn equal_external_sets_keep_each_modules_own_import_order() {
         &[
             (
                 "Left",
-                "prelude\nimport A B\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueB\n",
+                "prelude\nimport A\nimport B\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueB\n",
             ),
             (
                 "Right",
-                "prelude\nimport B A\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueA\n",
+                "prelude\nimport B\nimport A\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueA\n",
             ),
             (
                 "Main",
-                "prelude\nimport Left Right\ndef checkLeft : Family b := left\ndef checkRight : Family a := right\n",
+                "prelude\nimport Left\nimport Right\ndef checkLeft : Family b := left\ndef checkRight : Family a := right\n",
             ),
         ],
     );
@@ -120,7 +120,7 @@ fn equal_external_sets_keep_each_modules_own_import_order() {
 #[test]
 fn source_registrations_stay_between_the_external_imports_that_surround_them() {
     let receipt = imported(&fixture());
-    for (order, value) in [("Local B", "valueB"), ("B Local", "valueA")] {
+    for (order, value) in [("Local\nimport B", "valueB"), ("B\nimport Local", "valueA")] {
         let main = format!(
             "prelude\nimport {order}\ndef use [d : Class] : Class := d\ndef chosen : Family use := {value}\n"
         );
@@ -154,7 +154,7 @@ fn unrelated_external_constants_and_instances_cannot_leak_into_a_sibling() {
         "prelude\nimport B\ndef use [d : Class] : Class := d\ndef bad : Family use := valueA\n",
     ] {
         let names = [n("Right"), n("Main")];
-        let source = [right, "prelude\nimport A Right\n"];
+        let source = [right, "prelude\nimport A\nimport Right\n"];
         assert!(
             receipt
                 .check_source_modules(
@@ -196,11 +196,14 @@ fn source_graph_errors_and_request_budgets_remain_atomic() {
     let receipt = imported(&fixture());
     let names = [n("Left"), n("Main")];
     for sources in [
-        ["prelude\nimport Main\n", "prelude\nimport Left A\n"],
-        ["prelude\nimport Missing\n", "prelude\nimport Left A\n"],
+        ["prelude\nimport Main\n", "prelude\nimport Left\nimport A\n"],
+        [
+            "prelude\nimport Missing\n",
+            "prelude\nimport Left\nimport A\n",
+        ],
         [
             "prelude\nimport A\ndef bad : Class := Family\n",
-            "prelude\nimport Left B\n",
+            "prelude\nimport Left\nimport B\n",
         ],
     ] {
         assert!(
@@ -217,7 +220,7 @@ fn source_graph_errors_and_request_budgets_remain_atomic() {
     }
     let sources = [
         "prelude\nimport A\ndef first : Class := a\n",
-        "prelude\nimport Left B\ndef second : Class := b\n",
+        "prelude\nimport Left\nimport B\ndef second : Class := b\n",
     ];
     let inputs = inputs(&names, &sources);
     for budget in [0, 1, 8] {
@@ -261,7 +264,7 @@ fn separate_context_artifacts_round_trip_through_both_checkers() {
     let sources = [
         "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n",
         "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n",
-        "prelude\nimport Left Right\ndef leftAgain : Family a := left\ndef rightAgain : Family b := right\n",
+        "prelude\nimport Left\nimport Right\ndef leftAgain : Family a := left\ndef rightAgain : Family b := right\n",
     ];
     let built = receipt
         .compile_source_modules(
@@ -325,7 +328,7 @@ fn cancellation_at_each_observed_checkpoint_never_returns_a_partial_engine() {
     let names = [n("Local"), n("Main")];
     let sources = [
         "prelude\nimport A\ninstance localChoice : Class := a\n",
-        "prelude\nimport Local B\ndef use [d : Class] : Class := d\ndef chosen : Family use := valueB\n",
+        "prelude\nimport Local\nimport B\ndef use [d : Class] : Class := d\ndef chosen : Family use := valueB\n",
     ];
     let inputs = inputs(&names, &sources);
     let probe = StopAfter {
@@ -434,7 +437,7 @@ fn full_receipt_retains_checked_repeated_proofs_without_lending_them_to_a_subset
         &receipt,
         &[(
             "Main",
-            "prelude\nimport A B\ntheorem useShared : P := shared\n",
+            "prelude\nimport A\nimport B\ntheorem useShared : P := shared\n",
         )],
     );
     // The full checker keeps the first coherent copy. A receipt for B alone
@@ -468,7 +471,7 @@ fn private_context_sessions_reuse_artifacts_without_lending_sibling_dictionaries
     let sources = [
         "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n",
         "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n",
-        "prelude\nimport Left Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n",
+        "prelude\nimport Left\nimport Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n",
     ];
     let run = |session: &mut SourceModuleSession, sources: &[&str]| {
         session.compile(
@@ -540,7 +543,7 @@ fn warm_context_session_cancellation_preserves_the_successful_cache() {
     let names = [n("Local"), n("Main")];
     let sources = [
         "prelude\nimport A\ndef localValue : Class := a\n",
-        "prelude\nimport Local B\ndef mainValue : Class := b\n",
+        "prelude\nimport Local\nimport B\ndef mainValue : Class := b\n",
     ];
     let inputs = inputs(&names, &sources);
     session

@@ -67,7 +67,8 @@ impl Plan {
                     error,
                 }
             })?;
-            if implicit_init && !header.prelude {
+            validate_source_header(module.name, &header)?;
+            if (implicit_init || header.module_system) && !header.prelude {
                 // The two implicit Import rows have one graph dependency.
                 // Preserve the original explicit rows, including duplicates.
                 header.imports.insert(0, Name::from_components(["Init"]));
@@ -114,13 +115,48 @@ impl Plan {
         })
     }
 
+    /// Imports visible through this module to its consumers. The pin's
+    /// implicit Init rows use Import's default `isExported = true`, even in a
+    /// module-system file; its explicit unmodified imports remain private.
+    pub(super) fn visible_imports(&self, module: usize) -> &[Name] {
+        let header = &self.headers[module];
+        if !header.module_system {
+            &header.imports
+        } else if header.prelude {
+            &[]
+        } else {
+            // with_implicit_init always inserts this dependency first.
+            &header.imports[..1]
+        }
+    }
+
     pub(super) fn dependencies_of(
         &self,
         module: usize,
         modules: &[SourceModuleInput<'_>],
         meter: &mut Meter,
     ) -> Result<Vec<usize>, SourceModuleCheckError> {
-        let mut order = postorder(module, &self.dependencies, modules, meter)?;
+        // Ordinary imports in a module-system file are private. Check those
+        // dependencies in the file itself without exposing them to consumers.
+        meter.work(self.dependencies.len())?;
+        let visible: Vec<_> = self
+            .dependencies
+            .iter()
+            .enumerate()
+            .map(|(index, imports)| {
+                if index != module && self.headers[index].module_system {
+                    let exported = self.visible_imports(index);
+                    imports
+                        .iter()
+                        .copied()
+                        .filter(|dependency| exported.contains(modules[*dependency].name))
+                        .collect()
+                } else {
+                    imports.clone()
+                }
+            })
+            .collect();
+        let mut order = postorder(module, &visible, modules, meter)?;
         let last = order.pop();
         debug_assert_eq!(last, Some(module));
         Ok(order)

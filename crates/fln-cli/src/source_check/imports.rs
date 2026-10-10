@@ -115,6 +115,11 @@ impl Loaded {
         posture: ImportPosture,
     ) -> Result<(fln::Engine, Option<OleanBase>), Failure> {
         if self.oleans.is_empty() {
+            if matches!(&self.inputs, Inputs::Modules { sources, .. }
+                if sources.iter().any(|source| parse_source_header(source).is_ok_and(|header| header.module_system)))
+            {
+                return Ok((fln::Engine::builder().build_empty(), None));
+            }
             return seed().map(|engine| (engine, None));
         }
         let inputs: Vec<fln::OleanModuleInput<'_>> = self
@@ -292,7 +297,7 @@ pub(super) fn load(
     for (path, source) in paths.iter().zip(&sources) {
         let header = parse_source_header(source)
             .map_err(|error| Failure::input(format!("{}: {error}", path.display())))?;
-        has_headers |= !header.imports.is_empty() || header.prelude;
+        has_headers |= !header.imports.is_empty() || header.prelude || header.module_system;
     }
     if !has_headers {
         return Ok(Loaded {
@@ -337,12 +342,21 @@ pub(super) fn load(
     let mut olean_roots: Vec<Name> = Vec::new();
     let mut source_imports = BTreeMap::new();
     while cursor < sources.len() {
-        let header = parse_source_header(&sources[cursor]).map_err(|error| {
+        let mut header = parse_source_header(&sources[cursor]).map_err(|error| {
             Failure::input(format!(
                 "module `{}`: {error}",
                 names[cursor].to_display_string()
             ))
         })?;
+        fln::source_check::modules::validate_source_header(&names[cursor], &header).map_err(
+            |error| {
+                let (class, authority, exit) = error.disposition();
+                Failure::new(class, &error.to_string(), authority, exit)
+            },
+        )?;
+        if header.module_system && !header.prelude {
+            header.imports.insert(0, Name::from_components(["Init"]));
+        }
         import_rows = import_rows
             .checked_add(header.imports.len())
             .filter(|n| *n <= MAX_IMPORTS)

@@ -159,7 +159,11 @@ impl ImportContexts {
                 continue;
             }
             let imports = if let Some(&source) = local.get(&name) {
-                &plan.headers[source].imports
+                if source != index {
+                    plan.visible_imports(source)
+                } else {
+                    &plan.headers[source].imports
+                }
             } else if let Some(module) = self.modules.get(&name) {
                 &module.imports
             } else if self.origin.imported_modules().contains(&name) {

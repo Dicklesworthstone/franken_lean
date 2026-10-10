@@ -20,6 +20,36 @@ pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildEr
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
 
+/// Retain unsupported import semantics and refuse at the modifier itself,
+/// before resolving or admitting the requested import.
+pub fn validate_source_header(
+    module: &Name,
+    header: &SourceHeader,
+) -> Result<(), SourceModuleCheckError> {
+    for import in &header.import_specs {
+        let unsupported = [
+            (import.public_at, "`public import` export visibility"),
+            (import.meta_at, "`meta import` execution phases"),
+            (import.all_at, "`import all` private import visibility"),
+        ];
+        if let Some((at, feature)) = unsupported
+            .into_iter()
+            .find_map(|(at, feature)| at.map(|at| (at, feature)))
+        {
+            return Err(SourceModuleCheckError::Source {
+                module: module.clone(),
+                error: SourceCheckError::Command {
+                    file: 0,
+                    command: 0,
+                    offset: at.0,
+                    error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceModuleCheckLimits {
     pub source: SourceCheckLimits,

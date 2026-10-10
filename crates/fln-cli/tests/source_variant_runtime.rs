@@ -117,7 +117,7 @@ fn imported_variants_keep_module_visibility_and_failure_atomicity() {
     }
     let sibling = dir.join("Sibling.lean");
     std::fs::write(&sibling, "def stolen : Response := Response.value 42").unwrap();
-    std::fs::write(&entry, "import Types Sibling\n#eval 42").unwrap();
+    std::fs::write(&entry, "import Types\nimport Sibling\n#eval 42").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(&entry)
         .output()

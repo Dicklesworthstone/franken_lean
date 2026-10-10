@@ -130,6 +130,12 @@ impl PendingArtifact {
         checked: &Environment,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
+        if header.module_system {
+            return Err(SourceModuleCheckError::ImportContext {
+                module: name.clone(),
+                reason: "module-system .olean emission requires public/private split artifacts",
+            });
+        }
         let mut constants = Vec::new();
         for (name, constant) in checked.constants() {
             meter.work(1)?;

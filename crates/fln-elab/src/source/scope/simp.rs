@@ -163,6 +163,10 @@ pub fn registration(
 }
 
 const MAGIC: &[u8] = b"FLNSIMP\x01";
+// Preserve the original bytes for ordinary source names. Internal names use
+// the shared tagged structural codec in a separately versioned payload, so a
+// private numeric component can never be mistaken for a source string "0".
+const STRUCTURAL_MAGIC: &[u8] = b"FLNSIMP\x02";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 16384;
 
@@ -297,11 +301,17 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
             return Err(SimpSetError::Limit);
         }
         let mut bytes: &[u8] = &row.payload;
-        if take(&mut bytes, MAGIC.len())? != MAGIC {
-            return Err(SimpSetError::Malformed);
-        }
+        let structural = match take(&mut bytes, MAGIC.len())? {
+            header if header == MAGIC => false,
+            header if header == STRUCTURAL_MAGIC => true,
+            _ => return Err(SimpSetError::Malformed),
+        };
         let operation = take(&mut bytes, 1)?[0];
-        let declaration = read_name(&mut bytes)?;
+        let declaration = if structural {
+            crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?
+        } else {
+            read_name(&mut bytes)?
+        };
         let priority = number(&mut bytes)?;
         let reverse = match take(&mut bytes, 1)?[0] {
             0 => false,
@@ -369,24 +379,37 @@ pub fn update(
     {
         return Err(SimpSetError::Limit);
     }
-    let parts = super::components(declaration).map_err(|_| SimpSetError::Limit)?;
-    if parts.is_empty() {
-        return Err(SimpSetError::Malformed);
-    }
-    let size = parts
-        .iter()
-        .try_fold(MAGIC.len() + 10, |n, s| n.checked_add(4 + s.len()))
-        .ok_or(SimpSetError::Limit)?;
-    if size > MAX_BYTES {
-        return Err(SimpSetError::Limit);
-    }
-    let mut payload = MAGIC.to_vec();
-    payload.push(u8::from(rule.is_none()));
-    payload.extend((parts.len() as u32).to_le_bytes());
-    for part in parts {
-        payload.extend((part.len() as u32).to_le_bytes());
-        payload.extend(part.as_bytes());
-    }
+    let mut payload = if let Ok(parts) = super::components(declaration) {
+        if parts.is_empty() {
+            return Err(SimpSetError::Malformed);
+        }
+        let size = parts
+            .iter()
+            .try_fold(MAGIC.len() + 10, |n, s| n.checked_add(4 + s.len()))
+            .ok_or(SimpSetError::Limit)?;
+        if size > MAX_BYTES {
+            return Err(SimpSetError::Limit);
+        }
+        let mut payload = MAGIC.to_vec();
+        payload.push(u8::from(rule.is_none()));
+        payload.extend((parts.len() as u32).to_le_bytes());
+        for part in parts {
+            payload.extend((part.len() as u32).to_le_bytes());
+            payload.extend(part.as_bytes());
+        }
+        payload
+    } else {
+        let mut payload = STRUCTURAL_MAGIC.to_vec();
+        payload.push(u8::from(rule.is_none()));
+        crate::instances::write_name(declaration, &mut payload).map_err(|error| match error {
+            crate::instances::InstanceRegistryError::Limit => SimpSetError::Limit,
+            _ => SimpSetError::Malformed,
+        })?;
+        if payload.len().saturating_add(5) > MAX_BYTES {
+            return Err(SimpSetError::Limit);
+        }
+        payload
+    };
     let (priority, reverse) = rule.unwrap_or((0, false));
     payload.extend(priority.to_le_bytes());
     payload.push(u8::from(reverse));
@@ -476,5 +499,74 @@ mod tests {
                 .unwrap();
             assert_eq!(read(&env), Err(SimpSetError::Malformed));
         }
+    }
+
+    #[test]
+    fn structural_names_coexist_with_legacy_rows_and_erase_by_exact_identity() {
+        use fln_core::{expr::Expr, level::Level};
+        use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
+
+        let source_name = Name::from_components(["_private", "Main", "0", "rule"]);
+        let private_name = Name::str(
+            Name::num(Name::from_components(["_private", "Main"]), 0),
+            "rule",
+        );
+        let mut env = Environment::new();
+        for name in [&source_name, &private_name] {
+            env = env
+                .add_decl(ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: name.clone(),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::one()),
+                    },
+                    value: Expr::sort(Level::zero()),
+                    hints: ReducibilityHints::Abbrev,
+                    safety: DefinitionSafety::Safe,
+                    all: vec![name.clone()],
+                }))
+                .unwrap();
+        }
+        let legacy = update(&env, &source_name, Some((500, false))).unwrap();
+        let both = update(&legacy, &private_name, Some((1000, false))).unwrap();
+        let rows = read(&both).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| &row.declaration).collect::<Vec<_>>(),
+            [&private_name, &source_name]
+        );
+        let payloads: Vec<_> = both
+            .extension(&descriptor().name)
+            .unwrap()
+            .entries()
+            .map(|row| row.payload.clone())
+            .collect();
+        assert!(payloads[0].starts_with(MAGIC));
+        assert!(payloads[1].starts_with(STRUCTURAL_MAGIC));
+        assert_eq!(
+            legacy
+                .extension(&descriptor().name)
+                .unwrap()
+                .entries()
+                .next()
+                .unwrap()
+                .payload,
+            payloads[0]
+        );
+        let erased = update(&both, &private_name, None).unwrap();
+        assert_eq!(read(&erased).unwrap(), read(&legacy).unwrap());
+        assert_eq!(read(&both).unwrap(), rows);
+
+        // A partial tagged name is a malformed registry, not a missing rule.
+        let malformed = legacy
+            .push_extension_entry(
+                &descriptor().name,
+                STRUCTURAL_MAGIC
+                    .iter()
+                    .copied()
+                    .chain([0, 1, 0, 1, 0])
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(read(&malformed), Err(SimpSetError::Malformed));
     }
 }

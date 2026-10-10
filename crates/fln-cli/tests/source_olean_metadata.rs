@@ -201,7 +201,7 @@ fn source(imports: &str, selected: &str) -> String {
 #[test]
 fn cli_replays_dictionary_order_and_reports_uninterpreted_metadata() {
     let p = fixture();
-    for (imports, selected) in [("A B", "valueB"), ("B A", "valueA")] {
+    for (imports, selected) in [("A\nimport B", "valueB"), ("B\nimport A", "valueA")] {
         let source = source(imports, selected);
         p.write("Main.lean", &source);
         let report = p.success();
@@ -240,17 +240,17 @@ fn cli_replays_dictionary_order_and_reports_uninterpreted_metadata() {
 #[test]
 fn imports_through_local_modules_preserve_declared_not_discovery_order() {
     let p = fixture();
-    p.write("Wrapper.lean", "prelude\nimport B A\ndef wrapperUse [d : Class] : Class := d\ndef wrapperChoice : Family wrapperUse := valueA\n");
+    p.write("Wrapper.lean", "prelude\nimport B\nimport A\ndef wrapperUse [d : Class] : Class := d\ndef wrapperChoice : Family wrapperUse := valueA\n");
     // Filesystem discovery sees external A before visiting Wrapper. Metadata
     // replay must nevertheless visit Wrapper's B before the following A.
-    p.write("Main.lean", source("Wrapper A", "valueA"));
+    p.write("Main.lean", source("Wrapper\nimport A", "valueA"));
     p.success();
-    p.write("Main.lean", source("A Wrapper", "valueB"));
+    p.write("Main.lean", source("A\nimport Wrapper", "valueB"));
     p.success();
     // The wrapper's dictionary remains A even while its consumer chooses B.
     // Supplying A for the consumer is still rejected, not accepted by the
     // wrapper's otherwise correctly isolated context.
-    p.write("Main.lean", source("A Wrapper", "valueA"));
+    p.write("Main.lean", source("A\nimport Wrapper", "valueA"));
     let refused = p.run();
     assert!(!refused.status.success(), "{refused:?}");
     assert!(refused.stdout.is_empty());
@@ -309,8 +309,8 @@ fn invalid_metadata_and_invalid_declarations_never_publish_success() {
 #[test]
 fn source_cycles_remain_refusals_after_external_root_planning() {
     let p = fixture();
-    p.write("Wrapper.lean", "prelude\nimport Main B\n");
-    p.write("Main.lean", source("Wrapper A", "valueA"));
+    p.write("Wrapper.lean", "prelude\nimport Main\nimport B\n");
+    p.write("Main.lean", source("Wrapper\nimport A", "valueA"));
     let failed = p.run();
     assert!(!failed.status.success(), "{failed:?}");
     assert!(failed.stdout.is_empty());
@@ -323,8 +323,8 @@ fn lake_build_uses_checked_metadata_and_original_external_import_order() {
         "lakefile.toml",
         "name = \"metadata\"\n[[lean_lib]]\nname = \"Main\"\nroots = [\"Main\", \"Wrapper\"]\n",
     );
-    p.write("Wrapper.lean", "prelude\nimport B A\n");
-    p.write("Main.lean", source("Wrapper A", "valueA"));
+    p.write("Wrapper.lean", "prelude\nimport B\nimport A\n");
+    p.write("Main.lean", source("Wrapper\nimport A", "valueA"));
     let output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .arg("--dir")
         .arg(&p.0)

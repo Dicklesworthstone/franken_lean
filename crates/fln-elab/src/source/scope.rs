@@ -11,6 +11,10 @@ use fln_core::name::LeafView;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceScope {
     pub namespace: Name,
+    /// A `module` file's declarations are private by default. This is the
+    /// actual source module identity, not a namespace opened by the user.
+    /// Private names follow the pin's `mkPrivateNameCore` encoding.
+    pub private_module: Option<Name>,
     pub opened: Vec<Name>,
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
@@ -33,6 +37,7 @@ pub enum ScopeError {
     VariableSelectionLimit,
     /// `protected` on an atomic name in the root namespace (the pin's `mkDeclName`).
     ProtectedOutsideNamespace,
+    PrivateShadowsPublic(Name),
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,6 +57,11 @@ impl std::fmt::Display for ScopeError {
             Self::ProtectedOutsideNamespace => {
                 write!(f, "protected declarations must be in a namespace")
             }
+            Self::PrivateShadowsPublic(name) => write!(
+                f,
+                "private declaration `{}` conflicts with an existing public declaration",
+                name.to_display_string()
+            ),
             Self::Ambiguous(name, candidates) => {
                 write!(f, "ambiguous name `{}`: ", name.to_display_string())?;
                 for (i, candidate) in candidates.iter().enumerate() {
@@ -127,6 +137,40 @@ fn settle(name: &Name, found: Vec<Name>) -> Result<Option<Name>, ScopeError> {
 
 impl SourceScope {
     pub fn declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
+        self.user_declaration_name(name)
+            .map(|name| self.private_name(&name))
+    }
+
+    pub(super) fn private_name(&self, name: &Name) -> Name {
+        self.private_module.as_ref().map_or_else(
+            || name.clone(),
+            |module| {
+                Name::num(Name::from_components(["_private"]).append_core(module), 0)
+                    .append_core(name)
+            },
+        )
+    }
+
+    /// Recover a local declaration's user-facing namespace for scope tracking.
+    /// An unrelated module's private names are never aliases in this scope.
+    pub fn user_name(&self, name: &Name) -> Name {
+        let Some(module) = &self.private_module else {
+            return name.clone();
+        };
+        let prefix = Name::num(Name::from_components(["_private"]).append_core(module), 0);
+        let mut cursor = name.clone();
+        let mut suffix = Vec::new();
+        while cursor != prefix {
+            match cursor.leaf_view() {
+                LeafView::Str(part) => suffix.push(part.to_owned()),
+                _ => return name.clone(),
+            }
+            cursor = cursor.parent();
+        }
+        Name::from_components(suffix.iter().rev().map(String::as_str))
+    }
+
+    fn user_declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
         let parts = components(name)?;
         if parts.is_empty() {
             return Err(ScopeError::InvalidName);
@@ -200,17 +244,32 @@ impl SourceScope {
         let mut exists = |candidate: &Name| {
             !crate::seed::protected::source_unreachable(candidate) && declared(candidate)
         };
+        // Internally generated field/method names may already carry this
+        // module's private prefix. Do not prefix them a second time.
+        if self.user_name(name) != *name {
+            return Ok(exists(name).then(|| name.clone()));
+        }
+        let resolve = |candidate: &Name, exists: &mut dyn FnMut(&Name) -> bool| {
+            let private = self.private_name(candidate);
+            if private != *candidate && exists(&private) {
+                Some(private)
+            } else {
+                exists(candidate).then(|| candidate.clone())
+            }
+        };
         let parts = components(name)?;
         if parts.first().is_some_and(|p| p == "_root_") {
             let absolute = Name::from_components(parts[1..].iter().map(String::as_str));
-            return Ok(exists(&absolute).then_some(absolute));
+            return Ok(resolve(&absolute, &mut exists));
         }
         let atomic = parts.len() == 1;
         let qualified =
             |namespace: &Name, found: &mut Vec<Name>, exists: &mut dyn FnMut(&Name) -> bool| {
                 let candidate = namespace.append_core(name);
-                if !(atomic && protected.contains(&candidate)) && exists(&candidate) {
-                    found.push(candidate.clone());
+                if let Some(target) = resolve(&candidate, exists)
+                    && !(atomic && protected.contains(&target))
+                {
+                    found.push(target);
                 }
                 for target in aliases.targets(&candidate) {
                     if !(atomic && protected.contains(target)) {
@@ -229,14 +288,14 @@ impl SourceScope {
             namespace = namespace.parent();
         }
         // 2. `resolveExact env id`: only a non-atomic name.
-        if !atomic && exists(name) {
-            return Ok(Some(name.clone()));
+        if !atomic && let Some(target) = resolve(name, &mut exists) {
+            return Ok(Some(target));
         }
         // 3. The root declaration, then `resolveOpenDecls` over the open declarations,
         // most recent first, each prepending what it finds, then the root aliases.
         let mut found = Vec::new();
-        if exists(name) {
-            found.push(name.clone());
+        if let Some(target) = resolve(name, &mut exists) {
+            found.push(target);
         }
         for opened in self.opened.iter().rev() {
             let mut here = Vec::new();
@@ -307,7 +366,8 @@ impl Context {
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         // A protected declaration's own recursive reference by its atomic name
         // is held back too: the pin names that local `<namespace>.<short>`.
-        let atomic = components(name).map_err(error)?.len() == 1;
+        let user_name = self.source_scope.user_name(name);
+        let atomic = components(&user_name).map_err(error)?.len() == 1 && user_name == *name;
         let held_back_recursion =
             |candidate: &Name| atomic && self.protected_declaration.as_ref() == Some(candidate);
         // The declaration being defined is a local of its own body at the pin (the
@@ -332,6 +392,10 @@ impl Context {
                 let candidate = namespace.append_core(name);
                 if local(&candidate) {
                     return Ok(Ok(Some(candidate)));
+                }
+                let private = self.source_scope.private_name(&candidate);
+                if private != candidate && local(&private) {
+                    return Ok(Ok(Some(private)));
                 }
                 if namespace.is_anonymous() {
                     break;
@@ -375,8 +439,15 @@ impl Context {
         name: &Name,
     ) -> Result<Name, NatDefinitionElabError> {
         self.tick()?;
+        let user_name = self
+            .source_scope
+            .user_declaration_name(name)
+            .map_err(error)?;
+        if self.source_scope.private_module.is_some() && self.txn.env.contains(&user_name) {
+            return Err(error(ScopeError::PrivateShadowsPublic(user_name)));
+        }
         let name = self.source_scope.declaration_name(name).map_err(error)?;
-        self.source_scope.namespace = name.parent();
+        self.source_scope.namespace = user_name.parent();
         Ok(name)
     }
 }
@@ -544,6 +615,7 @@ mod tests {
     fn export_aliases_resolve_beside_declarations_at_each_namespace() {
         let scope = SourceScope {
             namespace: n("Outer"),
+            private_module: None,
             opened: vec![n("O")],
             universes: vec![],
             variables: variables::SectionVariables::default(),
@@ -729,6 +801,7 @@ mod tests {
         let aliases = AliasTable::read(&env).unwrap();
         let protected = ProtectedNames::read(&env).unwrap();
         let scope = |namespace: &str, opened: &[&str]| SourceScope {
+            private_module: None,
             namespace: n(namespace),
             opened: opened.iter().map(|o| n(o)).collect(),
             universes: vec![],
@@ -798,6 +871,7 @@ mod tests {
     #[test]
     fn namespace_prefixes_root_escapes_and_ambiguous_opens_have_distinct_rules() {
         let scope = SourceScope {
+            private_module: None,
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
             universes: vec![],

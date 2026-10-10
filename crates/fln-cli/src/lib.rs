@@ -11337,6 +11337,7 @@ fn lean_evaluation_line(
 fn render_lean_source_check_line(
     checked: &fln::SourceCheck,
     environment: &fln::Environment,
+    printer: &mut fln::pretty::Printer<'_>,
 ) -> Result<String, MultiplexerOutput> {
     let Some(term) = checked.parsed.query_term_normalized() else {
         return Err(source_failure(
@@ -11370,7 +11371,6 @@ fn render_lean_source_check_line(
         }
         _ => None,
     };
-    let mut printer = fln::pretty::Printer::new(environment);
     let rendered = match &constant {
         Some((name, type_)) => printer.signature(name, type_),
         // The pin prints the elaborated term, not its source spelling.
@@ -11678,6 +11678,10 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 let line = match render_lean_source_check_line(
                     check,
                     completed.batch.engine.environment(),
+                    &mut fln::pretty::Printer::in_scope(
+                        completed.batch.engine.environment(),
+                        &completed.scope,
+                    ),
                 ) {
                     Ok(line) => line,
                     Err(error) => return error,

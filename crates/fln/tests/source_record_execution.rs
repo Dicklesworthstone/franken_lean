@@ -330,7 +330,7 @@ fn unimported_sibling_types_constructors_projections_defaults_and_proofs_are_ref
         let modules = [
             SourceModuleInput {
                 name: &entry,
-                source: b"import A B\n#eval 42",
+                source: b"import A\nimport B\n#eval 42",
             },
             SourceModuleInput {
                 name: &b,

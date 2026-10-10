@@ -17,7 +17,7 @@ fn lake(project: &Project, targets: &[&str]) -> Output {
 fn separate_sources(project: &Project) {
     project.write("Left.lean", "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n");
     project.write("Right.lean", "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n");
-    project.write("Main.lean", "prelude\nimport Left Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n");
+    project.write("Main.lean", "prelude\nimport Left\nimport Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n");
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn installed_source_and_artifact_journals_preserve_interleaved_import_order() {
         "Local.lean",
         "prelude\nimport A\ninstance localChoice : Class := a\n",
     );
-    for (order, value) in [("Local B", "valueB"), ("B Local", "valueA")] {
+    for (order, value) in [("Local\nimport B", "valueB"), ("B\nimport Local", "valueA")] {
         project.write("Main.lean", source(order, value));
         project.success();
         let wrong = if value == "valueA" {
@@ -141,7 +141,7 @@ fn installed_distinct_contexts_keep_shared_dependency_reuse_across_targets() {
     ] {
         let project = fixture();
         separate_sources(&project);
-        project.write("Second.lean", "prelude\nimport Left Right\ndef secondLeft : Family a := left\ndef secondRight : Family b := right\n");
+        project.write("Second.lean", "prelude\nimport Left\nimport Right\ndef secondLeft : Family a := left\ndef secondRight : Family b := right\n");
         project.write("lakefile.toml", "name = \"contexts\"\n[[lean_lib]]\nname = \"Main\"\nroots = [\"Main\", \"Second\", \"Left\", \"Right\"]\n");
         let report = success(lake(&project, &targets));
         assert!(report.contains("\"modules_built\":4"), "{report}");

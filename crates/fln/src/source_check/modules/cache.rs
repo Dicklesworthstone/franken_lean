@@ -663,7 +663,10 @@ pub(super) fn run_collecting(
                         theorems: 0,
                         base_logical_root: root,
                         result_logical_root: root,
-                        scope: fln_elab::source::scope::SourceScope::default(),
+                        scope: fln_elab::source::scope::SourceScope {
+                            private_module: header.module_system.then(|| module.name.clone()),
+                            ..Default::default()
+                        },
                     }))
                 } else {
                     imported.check_source_files_recording(
@@ -671,6 +674,7 @@ pub(super) fn run_collecting(
                         options,
                         source_limits,
                         Some(&mut declarations),
+                        header.module_system.then_some(module.name),
                     )
                 }
                 .map_err(|mut error| {
@@ -694,8 +698,16 @@ pub(super) fn run_collecting(
                 let export = Arc::new(replay::Export::capture(
                     module.name,
                     imported.environment(),
-                    checked.engine.environment(),
-                    declarations,
+                    if header.module_system {
+                        imported.environment()
+                    } else {
+                        checked.engine.environment()
+                    },
+                    if header.module_system {
+                        Vec::new()
+                    } else {
+                        declarations
+                    },
                     &mut meter,
                 )?);
                 let artifact = if collect_artifacts {

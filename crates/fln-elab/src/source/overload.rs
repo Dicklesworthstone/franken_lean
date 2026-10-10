@@ -65,7 +65,7 @@ impl Context {
         let mut undetermined: Option<Name> = None;
         for candidate in candidates {
             self.tick()?;
-            let syntax = interpretation_syntax(head, arguments, candidate)?;
+            let syntax = interpretation_syntax(head, arguments, candidate, &self.source_scope)?;
             let mut trial = Box::new(self.clone());
             trial.overload_depth += 1;
             let outcome = trial.interpretation(&syntax, expected);
@@ -192,11 +192,13 @@ impl Context {
     }
 }
 
-/// `head` written `_root_.<candidate>`, applied to `arguments` when present.
+/// An exact candidate, applied to `arguments` when present. Public names use
+/// `_root_`; a current-module private core identity is already exact.
 fn interpretation_syntax(
     head: &Syntax,
     arguments: Option<&[Syntax]>,
     candidate: &Name,
+    scope: &scope::SourceScope,
 ) -> Result<Syntax, NatDefinitionElabError> {
     let Syntax::Ident { info, raw_val, .. } = head else {
         return Err(failure(SourceInferenceError::Scope));
@@ -204,7 +206,11 @@ fn interpretation_syntax(
     let head = Syntax::Ident {
         info: *info,
         raw_val: *raw_val,
-        val: Name::from_components(["_root_"]).append_core(candidate),
+        val: if scope.user_name(candidate) != *candidate {
+            candidate.clone()
+        } else {
+            Name::from_components(["_root_"]).append_core(candidate)
+        },
         preresolved: Vec::new(),
     };
     Ok(match arguments {

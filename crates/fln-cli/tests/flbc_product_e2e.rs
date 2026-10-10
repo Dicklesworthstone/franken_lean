@@ -760,7 +760,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     let dependency_probe = root.join("DependencyProbe.lean");
     std::fs::write(
         &dependency_probe,
-        b"import Project.Middle Project.Base Project.Middle\ntheorem bodyIsNotExecuted : Nat := missing\n",
+        b"import Project.Middle\nimport Project.Base\nimport Project.Middle\ntheorem bodyIsNotExecuted : Nat := missing\n",
     )
     .expect("write the direct source-dependency probe");
     let dependencies = run_lean(&[
@@ -799,7 +799,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     let missing_dependency_probe = root.join("MissingDependencyProbe.lean");
     std::fs::write(
         &missing_dependency_probe,
-        b"import Project.Middle Project.Absent\ntheorem bodyIsStillNotExecuted : Nat := missing\n",
+        b"import Project.Middle\nimport Project.Absent\ntheorem bodyIsStillNotExecuted : Nat := missing\n",
     )
     .expect("write the missing direct source-dependency probe");
     let missing_dependencies = run_lean(&[Path::new("--src-deps"), &missing_dependency_probe]);

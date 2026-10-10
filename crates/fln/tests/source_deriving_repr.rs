@@ -242,6 +242,39 @@ fn repr_helpers_are_checked_and_match_reference_statements_and_module_replay() {
             for generated in ["instReprBox", "instReprBox.repr", "importedPrinter"] {
                 assert!(replayed.checked.engine.environment().contains(&name(generated)));
             }
+
+            // The same checked expansion must use private core names in a
+            // module-system file, including the generated printer helper.
+            let private_source = b"module\nprelude\nimport Init.Data.Repr\nnamespace Wire\nstructure Box where\n value : Nat\nderiving Repr\ndef printer : Repr Box := inferInstance\ndef helper : Box -> Nat -> Std.Format := instReprBox.repr\nend Wire";
+            let private_input = SourceModuleInput { name: &library, source: private_source };
+            let local = imported
+                .check_source_modules(
+                    &[private_input],
+                    &library,
+                    &KVMap::new(),
+                    SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),
+                    None,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            for generated in ["Wire.instReprBox", "Wire.instReprBox.repr", "Wire.printer", "Wire.helper"] {
+                let private = Name::num(name("_private.Library"), 0).append_core(&name(generated));
+                assert!(local.checked.engine.environment().contains(&private), "{generated}");
+                assert!(!local.checked.engine.environment().contains(&name(generated)), "{generated}");
+            }
+            let hidden = imported
+                .check_source_modules(
+                    &[private_input, SourceModuleInput { name: &main, source: b"prelude\nimport Library" }],
+                    &main,
+                    &KVMap::new(),
+                    SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),
+                    None,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert!(hidden.checked.engine.environment().is_empty());
             checked(base, "structure Retry where\n value : Nat\nderiving Repr");
         })
         .unwrap()

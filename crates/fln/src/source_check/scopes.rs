@@ -187,7 +187,7 @@ impl Scopes {
         scopes
     }
     fn observe(&mut self, name: &Name) {
-        let mut parent = name.parent();
+        let mut parent = self.current.user_name(name).parent();
         while !parent.is_anonymous() && self.namespaces.insert(parent.clone()) {
             parent = parent.parent();
         }

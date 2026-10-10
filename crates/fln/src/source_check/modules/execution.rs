@@ -123,6 +123,7 @@ pub fn preflight_source_program(
                 module: module.name.clone(),
                 error,
             })?;
+        validate_source_header(module.name, &header)?;
         for (index, (mut at, mut bytes)) in commands(module.name, module.source, &header)?
             .into_iter()
             .enumerate()
@@ -349,10 +350,21 @@ impl imported::SourceOleanImport {
             let module = modules[index];
             let body = commands(module.name, module.source, &plan.headers[index])?;
             let completed = if body.is_empty() {
-                engine.empty_source_command_execution(options)
+                let mut completed = engine.empty_source_command_execution(options);
+                completed.scope.private_module = plan.headers[index]
+                    .module_system
+                    .then(|| module.name.clone());
+                completed
             } else {
                 match engine
-                    .execute_source_command_stream(body, options, limits.execution, true, &[])
+                    .execute_source_command_stream(
+                        body,
+                        options,
+                        limits.execution,
+                        true,
+                        &[],
+                        plan.headers[index].module_system.then_some(module.name),
+                    )
                     .map_err(|error| source_error(module.name, error))?
                 {
                     Outcome::Complete(completed) => completed,
@@ -372,8 +384,16 @@ impl imported::SourceOleanImport {
                     replay::Export::capture(
                         module.name,
                         engine.environment(),
-                        completed.batch.engine.environment(),
-                        declarations,
+                        if plan.headers[index].module_system {
+                            engine.environment()
+                        } else {
+                            completed.batch.engine.environment()
+                        },
+                        if plan.headers[index].module_system {
+                            Vec::new()
+                        } else {
+                            declarations
+                        },
                         &mut meter,
                     )?,
                 );

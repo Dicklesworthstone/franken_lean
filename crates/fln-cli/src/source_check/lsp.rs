@@ -104,7 +104,11 @@ impl Checker {
         // Header parsing uses the complete lexical source view. Keep its exact
         // error offset instead of flattening a syntax error into an I/O failure.
         match fln::source_check::modules::parse_source_header(text.as_bytes()) {
-            Ok(header) if header.imports.is_empty() => self.dependencies.no_imports(uri),
+            Ok(header)
+                if header.imports.is_empty() && (!header.module_system || header.prelude) =>
+            {
+                self.dependencies.no_imports(uri)
+            }
             Ok(_) => {}
             Err(error) => {
                 return project(
@@ -230,6 +234,7 @@ fn failure(
 #[derive(Default)]
 struct Sessions {
     seed: Option<SourceModuleSession>,
+    unseeded: Option<SourceModuleSession>,
     world: Option<World>,
 }
 
@@ -270,6 +275,20 @@ fn select<'a>(
     sources: &Sources,
 ) -> Result<(&'a mut SourceModuleSession, Option<WorldUse>), Unavailable> {
     if sources.olean_roots.is_empty() {
+        if sources.sources.iter().any(|source| {
+            fln::source_check::modules::parse_source_header(source)
+                .is_ok_and(|header| header.module_system)
+        }) {
+            let session = sessions.unseeded.get_or_insert_with(|| {
+                SourceModuleSession::new(
+                    fln::Engine::builder().build_empty(),
+                    fln::KVMap::new(),
+                    check_limits(),
+                    SourceModuleCacheLimits::default(),
+                )
+            });
+            return Ok((session, None));
+        }
         ensure_session(&mut sessions.seed).map_err(Unavailable::Snapshot)?;
         return Ok((
             sessions.seed.as_mut().expect("initialized seed session"),

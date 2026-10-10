@@ -73,7 +73,7 @@ fn transitive_diamond_consumers_refresh_once_without_rechecking_unrelated_files(
         open(&right, "import Base\ndef right := value"),
         open(
             &main,
-            "import Left Right\ntheorem fixed : left = right := by rfl",
+            "import Left\nimport Right\ntheorem fixed : left = right := by rfl",
         ),
         open(&other, "def unrelated := 7"),
         change(&base, 2, "def value := 1"),
@@ -109,6 +109,37 @@ fn opening_a_previously_missing_import_repairs_its_waiting_consumer() {
     assert_eq!(successes_for(&messages, &main).len(), 1, "{messages:#?}");
     assert!(!root.join("New.lean").exists());
     assert!(messages[response_index(&messages, 73)].contains("\"result\":{}"));
+}
+
+#[test]
+fn opening_init_repairs_a_failed_implicit_import_without_editing_the_module() {
+    let root = scratch();
+    // Fail while loading the header, before a completed source graph can
+    // replace the conservative dependency watch with its observed paths.
+    std::fs::write(root.join("Init.lean"), "import").unwrap();
+    let init = uri(&root.join("Init.lean"));
+    let main = uri(&root.join("Main.lean"));
+    let messages = fln(&[
+        open(
+            &main,
+            "module\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        ),
+        open(
+            &init,
+            "prelude\ndef identity.{u} {A : Sort u} (x : A) : A := x",
+        ),
+        wait(&main, 1, 173),
+    ]);
+    assert_eq!(errors(&messages, &main).len(), 1, "{messages:#?}");
+    assert_eq!(successes_for(&messages, &main).len(), 1, "{messages:#?}");
+    assert!(
+        messages[response_index(&messages, 173)].contains("\"result\":{}"),
+        "{messages:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Init.lean")).unwrap(),
+        "import"
+    );
 }
 
 #[test]

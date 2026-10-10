@@ -108,27 +108,27 @@ pub(in crate::source_check) fn run(
                 .map(|source| parse_source_header(source))
                 .collect::<Result<Vec<_>, _>>()
                 .ok()?;
-            if !headers.iter().any(|header| header.prelude || !header.imports.is_empty()) {
+            if !headers.iter().any(|header| header.prelude || header.module_system || !header.imports.is_empty()) {
                 return None;
             }
             // Explicit source batches keep their existing caller-ordered route.
             // A prelude must never fall through to that route's synthetic seed.
             if paths.len() != 1 {
-                return headers.iter().any(|header| header.prelude).then(|| {
-                    failure(Failure::input("a prelude source program requires one entry path"), presentation)
+                return headers.iter().any(|header| header.prelude || header.module_system).then(|| {
+                    failure(Failure::input("a prelude or module-system source program requires one entry path"), presentation)
                 });
             }
             // The established source-only runner resolves an unambiguous root
             // among bounded ancestors. Preserve that route before the import
             // loader (whose explicit module root is the entry's directory).
             // A transitive `prelude` still requires an empty, isolated world.
-            let local = (!headers[0].prelude)
+            let local = (!headers[0].prelude && !headers[0].module_system)
                 .then(|| discover_source_closure(paths[0].clone(), max_bytes));
             match &local {
                 Some(Ok(discovered))
                     if discovered.sources.iter().all(|source| {
                         parse_source_header(source).is_ok_and(|header| {
-                            !header.prelude
+                            !header.prelude && !header.module_system
                                 && fln::partition_source_module(source)
                                     .is_ok_and(|module| module.imports == header.imports)
                         })
@@ -158,7 +158,7 @@ pub(in crate::source_check) fn run(
             };
             let explicit_world = !loaded.oleans.is_empty()
                 || sources.iter().any(|source| {
-                    parse_source_header(source).is_ok_and(|header| header.prelude)
+                    parse_source_header(source).is_ok_and(|header| header.prelude || header.module_system)
                 });
             if !explicit_world {
                 return None;
@@ -532,7 +532,7 @@ fn render_commands(
                         .parsed
                         .query_term_normalized()
                         .ok_or_else(|| internal("source program check has no query term"))?;
-                    let type_ = fln::pretty::Printer::new(commands.batch.engine.environment())
+                    let type_ = fln::pretty::Printer::in_scope(commands.batch.engine.environment(), &commands.scope)
                         .expr(&check.checked_type, 0)
                         .map_err(|fln::pretty::Unsupported(what)| Failure::new(
                             "capability", &format!("module `{module}`, command {command}: cannot print checked type {what}"),
