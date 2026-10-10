@@ -41,9 +41,28 @@ fn line_breaks_separate_fields_as_commas_do() {
 }
 #[test]
 fn dependent_fields_see_actual_earlier_values_even_when_written_last() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    // The pin preserves wrapped.carrier during numeral instance synthesis.
+    // Keep the original source as a refusal control beside its typed positive.
+    let original = "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := { value := 23, carrier := Nat }\ntheorem value_ok : Package.value wrapped = 23 := by rfl";
+    let Err(error) = base.check_source_files(
+        &[original.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ) else {
+        panic!("accepted an unannotated dependent-field numeral");
+    };
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["wrapped"]))
+    );
     check(
-        &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := { value := 23, carrier := Nat }\ntheorem value_ok : Package.value wrapped = 23 := by rfl",
+        &base,
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := { value := 23, carrier := Nat }\ntheorem value_ok : Package.value wrapped = (23 : Nat) := by rfl",
     );
 }
 #[test]

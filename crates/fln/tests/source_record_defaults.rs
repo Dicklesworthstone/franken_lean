@@ -1,4 +1,4 @@
-//! Defaults produce ordinary helper applications checked by K1 and the council.
+//! Defaults instantiate registered checked bodies before dependent fields.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Outcome, SourceCheckLimits};
 use fln_core::name::Name;
@@ -39,6 +39,64 @@ fn dependent_types_proofs_and_method_parameters_are_closed_in_order() {
         &engine(),
         "structure Package where\n  carrier : Type := Nat\n  value : carrier\n  copy : carrier := value\n  proof : value = value := rfl\n  ident (x : carrier) : carrier := x\ndef p : Package := { value := 9 }\ndef q : Package := { carrier := String, value := \"hi\" }\ntheorem p_ok : p.copy = (9 : Nat) := by rfl\ntheorem q_ok : q.ident q.copy = \"hi\" := by rfl",
     );
+}
+#[test]
+fn defaults_instantiate_actual_universes_parameters_and_method_binders() {
+    check(
+        &engine(),
+        r#"
+universe u
+structure Envelope (A : Type u) where
+  carrier : Type u := A
+  value : carrier
+  copy : carrier := value
+  ident (value : carrier) : carrier := value
+def natural : Envelope Nat := { value := 9 }
+def text : Envelope String := { value := "hi" }
+def changed : Envelope Nat := { carrier := String, value := "override" }
+def types : Envelope Type := { value := Nat }
+theorem natural_copy : natural.copy = (9 : Nat) := by rfl
+theorem natural_method : natural.ident (12 : Nat) = (12 : Nat) := by rfl
+theorem text_copy : text.copy = "hi" := by rfl
+theorem changed_copy : changed.copy = "override" := by rfl
+theorem type_copy : types.copy = Nat := by rfl
+
+structure Scoped (A : Type) (fallback : A) where
+  value : A := fallback
+  get (fallback : A) : A := value
+  copy : A := value
+def withFallback : Scoped Nat 42 := {}
+theorem scopes : withFallback.get 7 = 42 := by rfl
+theorem copied : withFallback.copy = 42 := by rfl
+"#,
+    );
+}
+#[test]
+fn default_instantiation_keeps_ordinary_projection_transparency_and_failure_atomicity() {
+    let base = check(
+        &engine(),
+        "structure Package where\n  carrier : Type := Nat\n  value : carrier\n  copy : carrier := value\ndef p : Package := { value := 9 }",
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    // Instantiating a registered default does not make a later definition's
+    // carrier visible to typeclass search. The pin requires the ascription.
+    for source in [
+        "theorem unannotated : p.copy = 9 := by rfl",
+        "def q : Package := { value := 10 }\ntheorem wrong : q.copy = (9 : Nat) := by rfl",
+    ] {
+        let Err(error) = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        ) else {
+            panic!("default instantiation erased a typing or proof obligation: {source}");
+        };
+        assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&Name::from_components(["q"])));
+    }
+    check(&base, "theorem annotated : p.copy = (9 : Nat) := by rfl");
 }
 #[test]
 fn defaults_use_explicit_record_instance_parameters() {

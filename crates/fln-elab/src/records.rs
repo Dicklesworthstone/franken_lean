@@ -386,7 +386,7 @@ pub fn record_declarations(
         spec.parameters.iter().map(fv),
     );
     let constructor = app(
-        Expr::const_(ctor.clone(), levels),
+        Expr::const_(ctor.clone(), levels.clone()),
         spec.parameters.iter().chain(&spec.fields).map(fv),
     );
     let major = fresh(&mut used, "t", record_type.clone(), BinderInfo::Default);
@@ -489,18 +489,27 @@ pub fn record_declarations(
     for (index, field) in spec.fields.iter().enumerate() {
         builder.tick()?;
         let mut domain = field.type_.clone();
-        // Later domains refer to earlier fields via projections of the same
-        // receiver, not dangling telescope locals or independently chosen values.
-        for (prior, prior_field) in spec.fields[..index].iter().enumerate() {
+        // As in the pin's mkProjections, later domains retain named projections
+        // of the same receiver. Raw Expr::proj belongs in the projection body:
+        // putting it here loses the named type expression that instance
+        // synthesis must preserve (for example, OfNat package.carrier).
+        for prior_field in &spec.fields[..index] {
             builder.tick()?;
+            let mut projection = Expr::const_(
+                spec.name.append_core(&prior_field.user_name),
+                levels.clone(),
+            );
+            for parameter in &spec.parameters {
+                builder.tick()?;
+                projection = Expr::app(projection, fv(parameter));
+            }
+            builder.tick()?;
+            projection = Expr::app(projection, fv(&receiver));
             domain = domain
                 .abstract_fvar(&prior_field.id, 0)
                 .map_err(|_| RecordError::InvalidTelescope)?;
             domain = domain
-                .subst_loose(
-                    0,
-                    &[Expr::proj(spec.name.clone(), prior as u64, fv(&receiver))],
-                )
+                .subst_loose(0, &[projection])
                 .map_err(|_| RecordError::InvalidTelescope)?;
         }
         let type_ = builder.close(std::slice::from_ref(&receiver), domain, false, false)?;

@@ -1185,7 +1185,16 @@ impl Context {
                     return Err(failure(SourceInferenceError::Scope));
                 };
                 let mut value = Typed {
-                    value: Expr::const_(helper.clone(), state.levels.clone()),
+                    // The pin's instantiateStructDefaultValueFn? instantiates
+                    // the registered helper's checked body, rather than leaving
+                    // an application of its semireducible name. Later fields
+                    // must see the actual chosen value at their expected type,
+                    // without changing ordinary instance-search transparency.
+                    value: self.instantiate_params(
+                        &definition.value,
+                        &definition.base.level_params,
+                        &state.levels,
+                    )?,
                     type_: self.instantiate_params(
                         &definition.base.type_,
                         &definition.base.level_params,
@@ -1208,7 +1217,10 @@ impl Context {
                         return Err(failure(SourceInferenceError::Scope));
                     };
                     value.type_ = self.substitute(body, &argument)?;
-                    value.value = Expr::app(value.value, argument);
+                    let ExprNode::Lam { body, .. } = value.value.node() else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    value.value = self.substitute(body, &argument)?;
                 }
                 let value = self.finish_term(value, Some(binder_type))?;
                 return Ok(RecordStep::Copy {

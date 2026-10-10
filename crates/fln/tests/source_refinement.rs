@@ -54,8 +54,13 @@ fn lambda_holes_keep_separate_shadowed_variable_identities() {
 }
 #[test]
 fn dependent_holes_schedule_type_and_witness_before_consumers() {
-    check(
+    // The pin refuses OfNat synthesis through package.carrier. Preserve that
+    // original program as a control, and check the explicitly typed witness.
+    reject(
         "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by refine Package.mk ?_ ?_; exact Nat; exact 7\ntheorem checked : package.value = 7 := by rfl",
+    );
+    check(
+        "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by refine Package.mk ?_ ?_; exact Nat; exact 7\ntheorem checked : package.value = (7 : Nat) := by rfl",
     );
     check(
         "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem existsLemma : Witness (fun n => n = 7) := by refine Witness.intro ?w ?p; exact 7; rfl",

@@ -106,8 +106,13 @@ fn focused_contexts_do_not_export_local_facts_to_siblings() {
 }
 #[test]
 fn dependent_refinement_goals_keep_their_checked_parent_continuations() {
-    check(
+    // The pin cannot synthesize OfNat at the named package.carrier type;
+    // the original unannotated theorem is refused, while the ascription checks.
+    reject(
         "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by\n  refine Package.mk ?_ ?_\n  · exact Nat\n  · exact 7\ntheorem result : package.value = 7 := by rfl",
+    );
+    check(
+        "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by\n  refine Package.mk ?_ ?_\n  · exact Nat\n  · exact 7\ntheorem result : package.value = (7 : Nat) := by rfl",
     );
     check(
         "structure Pair where\n first : Nat\n second : Nat\ndef pair : Pair := by\n  refine Pair.mk ?same ?same\n  all_goals exact 9\ntheorem result : pair.second = 9 := by rfl",
