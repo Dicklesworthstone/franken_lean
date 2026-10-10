@@ -1,4 +1,4 @@
-//! Checked TOML package module builds. Only the Reference's `+Module:olean`
+//! Checked TOML and native Lean package module builds. Only the Reference's `+Module:olean`
 //! facet is complete here; library defaults also require other Lean artifacts.
 use super::*;
 use fln::source_check::modules::persisted::{ModuleProvenance, PersistedModules};
@@ -11,6 +11,8 @@ use fln_lake::{LakeConfig, TargetKind};
 use std::path::Component;
 
 mod explain;
+#[path = "lake_config.rs"]
+mod lean_config;
 mod snapshot;
 pub(crate) use explain::explain;
 
@@ -41,10 +43,14 @@ impl Failure {
         Self::new("io", format!("{}: {error}", path.display()))
     }
     fn render(self, json: bool) -> MultiplexerOutput {
+        self.render_as(json, "fln.lake-build/2", "lake build")
+    }
+    fn render_as(self, json: bool, schema: &str, command: &str) -> MultiplexerOutput {
         let detail = BoundedText::new(self.detail);
         let output = if json {
             format!(
-                "{{\"schema\":\"fln.lake-build/2\",\"status\":{},\"class\":{},\"authority\":{},\"error\":{},\"detailTruncated\":{}}}\n",
+                "{{\"schema\":{},\"status\":{},\"class\":{},\"authority\":{},\"error\":{},\"detailTruncated\":{}}}\n",
+                json_string(schema),
                 json_string(if self.class == "unsupported" {
                     "unsupported"
                 } else {
@@ -56,7 +62,7 @@ impl Failure {
                 detail.truncated()
             )
         } else {
-            format!("lake build: {}: {}\n", self.class, detail.text())
+            format!("{command}: {}: {}\n", self.class, detail.text())
         };
         MultiplexerOutput::failure(output, 1)
     }
@@ -185,7 +191,7 @@ fn config(root: &Path) -> Result<LakeConfig, Failure> {
             )));
         }
         return Err(Failure::unsupported(
-            "native Lake module builds require lakefile.toml; executable lakefile.lean configuration is unavailable",
+            "build explain requires lakefile.toml because it does not elaborate or execute lakefile.lean configuration",
         ));
     }
     check_path(root, &path, false)?;
@@ -597,7 +603,12 @@ fn build(
     let root = directory
         .canonicalize()
         .map_err(|error| Failure::io(&directory, error))?;
-    let config = config(&root)?;
+    let (config, configuration_imports) = if root.join("lakefile.toml").is_file() {
+        (config(&root)?, None)
+    } else {
+        let loaded = lean_config::load(&root, jobs, posture)?;
+        (loaded.config, Some(loaded.imports))
+    };
     let (libraries, entries) = plan(&root, &config, &targets)?;
     let modules = load_sources(&root, &libraries, &entries)?;
     let records = source_check::module_records(posture);
@@ -641,6 +652,15 @@ fn build(
             .map(|report| format!("{{{}}}", source_check::posture_json(report)))
             .collect::<Vec<_>>()
             .join(",");
+        let configuration_imports = configuration_imports
+            .as_ref()
+            .map(|report| {
+                format!(
+                    ",\"configuration_imports\":[{{{}}}]",
+                    source_check::posture_json(report)
+                )
+            })
+            .unwrap_or_default();
         let rows = provenance
             .iter()
             .map(|row| {
@@ -674,7 +694,7 @@ fn build(
             ),
         };
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}],\"module_records\":{}{unavailable},\"modules\":[{rows}],{snapshot}}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}],{snapshot}}}\n",
             json_string(&config.name),
             artifacts.len(),
             json_string(posture.as_str()),
@@ -685,12 +705,21 @@ fn build(
             .iter()
             .map(|report| format!(" Imports: {}.", source_check::posture_sentence(report)))
             .collect::<String>();
+        let configuration_imports = configuration_imports
+            .as_ref()
+            .map(|report| {
+                format!(
+                    " Configuration imports: {}.",
+                    source_check::posture_sentence(report)
+                )
+            })
+            .unwrap_or_default();
         let snapshot = match &snapshot {
             Ok(()) => String::new(),
             Err(reason) => format!(" The build snapshot was not written: {reason}."),
         };
         format!(
-            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{snapshot}\n",
+            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{snapshot}\n",
             artifacts.len(),
             config.name
         )
@@ -806,4 +835,36 @@ pub(super) fn run(
         )
         .render(json),
     }
+}
+
+/// `check-build` loads a Lean configuration before asking whether it has defaults. The
+/// subsequent presence check still does not elaborate package sources or build artifacts.
+pub(super) fn lean_configuration_for_presence(
+    directory: PathBuf,
+    json: bool,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+) -> Result<(LakeConfig, ImportPostureReport), MultiplexerOutput> {
+    let worker = std::thread::Builder::new()
+        .name("fln-lake-configuration".to_owned())
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let root = directory
+                .canonicalize()
+                .map_err(|error| Failure::io(&directory, error))?;
+            lean_config::load(&root, jobs, posture).map(|loaded| (loaded.config, loaded.imports))
+        });
+    let result = match worker {
+        Ok(worker) => worker.join().unwrap_or_else(|_| {
+            Err(Failure::new(
+                "internal-fault",
+                "configuration worker panicked",
+            ))
+        }),
+        Err(error) => Err(Failure::new(
+            "resource",
+            format!("could not start configuration worker: {error}"),
+        )),
+    };
+    result.map_err(|error| error.render_as(json, "fln.lake-check-build/1", "lake check-build"))
 }

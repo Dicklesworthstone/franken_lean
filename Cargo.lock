@@ -59,11 +59,14 @@ version = "0.0.0"
 dependencies = [
  "fln",
  "fln-core",
+ "fln-elab",
  "fln-hash",
  "fln-lake",
  "fln-olean",
+ "fln-parse",
  "fln-rt",
  "fln-server",
+ "fln-syntax",
 ]
 
 [[package]]

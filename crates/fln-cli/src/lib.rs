@@ -14437,13 +14437,15 @@ const LAKE_USAGE: &str = concat!(
     "\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean builds checked +Module:olean facets from declared TOML libraries.\n",
+    "\nFrankenLean builds checked +Module:olean facets from declared libraries.\n",
+    "TOML and native Lean package/lean_lib configurations are supported; Lean\n",
+    "srcDir/buildDir terms are checked against real Init and evaluated by Golem.\n",
     "Default library, executable and other facets remain unavailable.\n",
     "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
     "a record of this binary's earlier admission of the identical .olean bytes\n",
     "is rebuilt and re-proved by logical root; --import-posture recheck admits\n",
     "them again. No built output is ever reused from disk.\n",
-    "`check-build` only checks default-target presence in TOML configuration.\n",
+    "`check-build` loads the configuration and checks default-target presence.\n",
 );
 
 const LAKE_HELP_BUILD: &str = concat!(
@@ -14457,7 +14459,10 @@ const LAKE_HELP_BUILD: &str = concat!(
     "  [@[<package>]/][<target>|[+]<module>][:<facet>]\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean supports +Module:olean for modules owned by a TOML lean_lib.\n",
+    "\nFrankenLean supports +Module:olean for modules owned by a declared lean_lib.\n",
+    "A native lakefile.lean may define checked helpers, package srcDir/buildDir\n",
+    "and lean_lib srcDir, with @[default_target] and each library's default root.\n",
+    "Other Lake commands, fields and custom roots are explicitly unavailable.\n",
     "Local source imports are built first; external imports (including implicit\n",
     "Init) are read from LEAN_PATH or the pinned toolchain and admitted by K1\n",
     "and the independent checker, or under the default --import-posture\n",
@@ -14908,7 +14913,33 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
             // The pinned Lake command tests only default-target presence. It is
             // neither a dry build nor a source/type/target validity check.
-            match fln_lake::LakeConfig::discover(&target_dir) {
+            let mut configuration_imports = None;
+            let discovered = match fln_lake::LakeConfig::discover(&target_dir) {
+                Err(fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)) => {
+                    if let Some(option) = ignored_options.first() {
+                        return lake_operation_failure(
+                            "fln.lake-check-build/1",
+                            &format!("configuration option `{option}` is unavailable"),
+                            true,
+                            is_json,
+                        );
+                    }
+                    match lake_build::lean_configuration_for_presence(
+                        target_dir,
+                        is_json,
+                        jobs.unwrap_or_else(default_import_jobs),
+                        import_posture,
+                    ) {
+                        Ok((config, report)) => {
+                            configuration_imports = Some(report);
+                            Ok(config)
+                        }
+                        Err(output) => return output,
+                    }
+                }
+                other => other,
+            };
+            match discovered {
                 Ok(config) => {
                     if config.default_targets.is_empty() {
                         return lake_operation_failure(
@@ -14925,8 +14956,17 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                             .map(|s| json_string(s))
                             .collect::<Vec<_>>()
                             .join(",");
+                        let configuration_imports = configuration_imports
+                            .as_ref()
+                            .map(|report| {
+                                format!(
+                                    ",\"configuration_imports\":[{{{}}}]",
+                                    source_check::posture_json(report)
+                                )
+                            })
+                            .unwrap_or_default();
                         MultiplexerOutput::success(format!(
-                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"check\":\"default-target-presence\",\"package\":{},\"targets\":[{targets_json}]}}\n",
+                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"check\":\"default-target-presence\",\"package\":{},\"targets\":[{targets_json}]{configuration_imports}}}\n",
                             json_string(&config.name)
                         ))
                     } else {

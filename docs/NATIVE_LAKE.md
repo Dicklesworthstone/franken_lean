@@ -1,7 +1,7 @@
 # Native Lake boundaries
 
 `lake build +Module:olean` now builds the checked `.olean` facet of a module
-owned by a declared TOML `lean_lib`. It reads the complete local source import
+owned by a declared TOML or supported native Lean `lean_lib`. It reads the complete local source import
 closure, checks modules in dependency order through K1 and the independent
 checker, and emits one pinned-format artifact per module. Each artifact contains
 only that module's declarations and its actual imports. Source seeds and full
@@ -50,6 +50,50 @@ EOF
 LEAN_PATH="$PWD/.lake/build/lib/lean" fln check-source consumer/Use.lean
 ```
 
+A package configured with `lakefile.lean` can use checked Lean definitions and
+file-local notation to compute its source and build directories:
+
+```lean
+import Lake
+open System Lake DSL
+
+def sourceFolder (part : String) : FilePath := FilePath.mk ("sources/" ++ part)
+
+package checked_proofs where
+  srcDir := sourceFolder "lean"
+  buildDir := FilePath.mk (".lake/" ++ "native")
+
+@[default_target] lean_lib Proofs where
+  srcDir := "library"
+```
+
+Here `lake build +Proofs:olean` reads `sources/lean/library/Proofs.lean` and
+writes `.lake/native/lib/lean/Proofs.olean`. A library's default root is its
+declared name, and `@[default_target]` selects the ordered default-target list.
+Without explicit fields, package `srcDir` is `.`, `buildDir` is `.lake/build`,
+and library `srcDir` is `.`. When both configuration files exist, TOML retains
+precedence.
+
+The native adapter handles `import Lake`, `package` and `lean_lib` itself.
+It loads the real pinned `Init.System.FilePath` artifact closure using the
+selected import posture; that closure must be available through `LEAN_PATH`
+or the installed pinned toolchain. Every ordinary declaration and generated
+field definition is checked before any configuration expression executes.
+Fields have the actual `System.FilePath` type, including the imported String
+coercion. Only the selected fields' String projections execute on Golem;
+unused closed definitions are checked but are not evaluated. No upstream Lake
+elaborator or loader executes, and no replacement logical FilePath is seeded.
+
+This configuration slice supports the ordinary `import Lake` header,
+top-level `package` and `lean_lib` after `open Lake DSL`, package `srcDir` and
+`buildDir`, and library `srcDir`. Layout `where` fields and empty configurations
+are supported. Additional imports, commands such as `require`, `lean_exe` or
+scripts, other fields, custom roots, arbitrary declaration attributes,
+same-line field separators, and trailing local `where` declarations are
+explicitly refused. All configured directories must remain within the package.
+Bad types, invalid later declarations, unsafe execution, or failed evaluation
+prevent artifact publication.
+
 External imports are read from `LEAN_PATH`, or the pinned toolchain's `lib/lean`
 when that variable does not supply a search path. How their `.olean` closure
 reaches the environment is the import posture (bead `fln-uyuz`), and every
@@ -72,6 +116,12 @@ report names it per closure (`import_posture`, and `imports[]` with `trust`,
   and never reads or writes a record. `fln check-olean`, its `--continue` frontier
   and its receipts take no posture at all: G1 evidence is always `recheck`.
 - `trust-producer` (plan §7.2) is refused as not implemented.
+
+Lean configurations additionally report their own checked import closure in
+`configuration_imports[]`, separately from the compiled modules' `imports[]`.
+This report is present even when every package module uses `prelude` and thus
+has no external imports. `lake check-build --json` reports the configuration
+closure as well.
 
 Every source file without `prelude` requires
 the real `Init` import; absence or rejection of that dependency fails the build.
@@ -149,8 +199,8 @@ is reported as non-authoritative failure, never as successful compilation.
 
 Bare `lake build` of a library still refuses: its default `leanArts` facet also
 requires products such as `.ilean` and compiler outputs. Executable/native
-facets, dependency fetching, custom globs, custom compiler options, executable
-`lakefile.lean` configuration, new module-system artifact families, and native
+facets, dependency fetching, custom globs, custom compiler options, Lake
+configuration outside the slice above, new module-system artifact families, and native
 extension metadata without a pinned export encoding remain unsupported.
 Unsupported TOML build settings are rejected rather than silently ignored.
 These boundaries are not full Lake compatibility, fresh-artifact byte identity
@@ -167,7 +217,8 @@ reads the snapshot: module reuse is decided by the record store alone.
 
 `fln build explain [--dir D] [--json] [MODULE]` compares that snapshot with the
 current tree and reports why each module of the recorded build (or of `MODULE`'s
-closure) would rebuild. It elaborates and admits nothing.
+closure) would rebuild. It elaborates and admits nothing, so this command still
+requires a TOML configuration and explicitly refuses `lakefile.lean`.
 - The Reference decision follows Lake's file-cone model. A module rebuilds when
   its source bytes, its ordered imports, or the bytes of an external `.olean` in
   its import cone changed, or when a local import rebuilds.
@@ -188,16 +239,18 @@ with status `incomplete` and decision `unknown`. 1 for a malformed snapshot or a
 module outside the recorded build. JSON uses `fln.build-explain/2`.
 
 `lake check-build` has the narrow meaning in the pinned Reference's
-`Lake/CLI/Help.lean` and `Lake/CLI/Main.lean`: return zero exactly when default
-build targets are specified. It does not check target validity, source, freshness,
-or artifacts. Empty or omitted `defaultTargets` stay empty; a package name is
+`Lake/CLI/Help.lean` and `Lake/CLI/Main.lean`: load the configuration, then return
+zero exactly when default build targets are specified. It does not build targets
+or check package sources, freshness, or artifacts. Empty or omitted
+`defaultTargets` stay empty; a package name is
 not a default target. Human success is silent. The native JSON extension labels
 its check `default-target-presence`. Additional target arguments are rejected.
 
-Executable `lakefile.lean` configuration is not implemented and is refused, not
-replaced with metadata guessed from its directory name. Supported declarative
-`lakefile.toml` configuration remains available. Malformed default-target array
-elements are rejected, not silently filtered out.
+The same checked native Lean configuration slice serves `check-build` and
+`build`; unsupported configuration is never replaced with metadata guessed
+from its directory name. Supported declarative `lakefile.toml` configuration
+remains available. Malformed default-target array elements are rejected, not
+silently filtered out.
 
 `lake clean` removes the `buildDir` that `lakefile.toml` names, `.lake/build`
 when it names none, and nothing else. A `buildDir` that is absolute, empty, or
@@ -229,3 +282,10 @@ source, missing or cyclic imports, sibling-name leakage, unsupported facets and
 settings, forged artifacts, source changes with preserved mtimes, output
 preflight failures, symlinks, and source resource limits. Existing refusal and
 build-provenance tests remain active.
+
+`crates/fln-cli/tests/lake_lean_config.rs` exercises the installed binaries over
+actual pinned FilePath imports: computed directories choose different source
+trees, emitted artifacts decode and can be imported by a separate client, and
+invalid configuration preserves previous outputs. The companion internal
+configuration test bounds Golem instructions so accidentally evaluating an
+unused ten-million-step computation fails, while the selected fields complete.

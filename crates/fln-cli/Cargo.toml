@@ -13,8 +13,11 @@ fln = { path = "../fln" }
 fln-core = { path = "../fln-core" }
 fln-hash = { path = "../fln-hash" }
 fln-lake = { path = "../fln-lake" }
+fln-parse = { path = "../fln-parse" }
 fln-server = { path = "../fln-server" }
+fln-syntax = { path = "../fln-syntax" }
 
 [dev-dependencies]
+fln-elab = { path = "../fln-elab" }
 fln-olean = { path = "../fln-olean" }
 fln-rt = { path = "../fln-rt" }

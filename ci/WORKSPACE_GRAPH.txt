@@ -87,11 +87,14 @@ edge fln -> fln-verdict            # checked bv_decide publication through the e
 edge fln -> fln-vm                 # canonical FLBC execution result facade (franken_lean-7kc)
 edge fln-cli -> fln                # executable multiplexer delegates to the embeddable engine
 edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)
+edge fln-cli -> fln-elab           # dev-only: actual imported metadata for bounded Lake execution diagnostics; not module-closure admission
 edge fln-cli -> fln-hash         # chained check-olean run receipts over the transparency-leaf domain
 edge fln-cli -> fln-lake           # Lake personality package management and build execution (§13.3, §17.1, rank 21 -> 16)
 edge fln-cli -> fln-olean          # checked olean instance metadata activation for source and Lake builds (7e3887f7, 2026-09-28)
+edge fln-cli -> fln-parse          # native Lake command partitioning and file-local syntax state (§13.3, rank 21 -> 8)
 edge fln-cli -> fln-rt             # same activation path reaches Marrow objects (7e3887f7, 2026-09-28)
 edge fln-cli -> fln-server         # serve-lsp verb routes stdio transport through the diagnostic projector (§14, rank 21 -> 17)
+edge fln-cli -> fln-syntax         # retain Lake field tokens and exact source spans for checked Lean elaboration (§13.3, rank 21 -> 7)
 edge fln-server -> fln-core        # LSP diagnostic adapter (franken_lean-wlan)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
 edge fln-bench -> fln-hash         # canonical benchmark evidence records and roots (franken_lean-oy62)
