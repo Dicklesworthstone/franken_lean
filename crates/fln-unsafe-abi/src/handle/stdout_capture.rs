@@ -161,7 +161,7 @@ pub(super) fn write_if_captured(callback: &Obj, text: &Obj) -> Result<bool, Stdo
         if let Some(error) = frame.error {
             return Err(error);
         }
-        let Some((size, _, _, bytes)) = text.try_string_view() else {
+        let Some((size, _, _, bytes)) = text.try_borrow_string_view() else {
             // The caller established canonical String shape before this hook.
             frame.error = Some(StdoutCaptureError::ScopeUnavailable);
             return Err(StdoutCaptureError::ScopeUnavailable);

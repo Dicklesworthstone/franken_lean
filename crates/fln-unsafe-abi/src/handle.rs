@@ -1249,7 +1249,7 @@ impl Obj {
 }
 
 fn canonical_stdio_string(value: &Obj) -> bool {
-    let Some((size, _, length, bytes)) = value.try_string_view() else {
+    let Some((size, _, length, bytes)) = value.try_borrow_string_view() else {
         return false;
     };
     std::str::from_utf8(&bytes[..size - 1]).is_ok_and(|text| text.chars().count() == length)

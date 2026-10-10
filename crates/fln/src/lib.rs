@@ -36,6 +36,7 @@ mod source_evaluation;
 mod source_execution;
 pub mod source_format;
 mod source_intrinsics;
+pub mod source_main;
 #[cfg(test)]
 mod source_nat_add_binding_tests;
 mod source_records;

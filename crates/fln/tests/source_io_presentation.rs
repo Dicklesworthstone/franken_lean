@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "source_io_presentation/fixture.rs"]
 mod fixture;
+#[path = "source_io_presentation/executable_main.rs"]
+mod executable_main;
 
 const STACK: usize = 256 * 1024 * 1024;
 const BYTES: usize = 256 * 1024 * 1024;

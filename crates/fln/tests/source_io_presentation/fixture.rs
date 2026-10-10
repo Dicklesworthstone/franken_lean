@@ -30,6 +30,7 @@ def ioSelectEio := (pure 42 : EIO IO.Error Nat)
 def ioSelectUnit := (pure () : IO Unit)
 def ioSelectBaseUnit := (pure () : BaseIO Unit)
 def ioSelectString := (pure "λ🙂" : IO String)
+def ioSelectAppend : String := String.append "[" "]"
 def ioSelectRecord := (pure (IoPrintRecord.mk true) : IO IoPrintRecord)
 def ioSelectTree := (pure (IoPrintTree.leaf true) : IO IoPrintTree)
 def ioSelectAlias := (pure (show IoPayloadAlias from (42 : Nat)) : IO IoPayloadAlias)
@@ -576,6 +577,11 @@ pub(super) fn admitted(library: &Path) -> Engine {
             .environment()
             .contains(&name("System.FilePath.toString"))
     );
+    // The main argv formatter uses the public append from String.Defs. Its
+    // actual declaration/proof closure and extern journal are retained by
+    // ioSelectAppend's checked references, not supplied as comparison models.
+    assert!(engine.environment().contains(&name("String.append")));
+    assert!(!engine.environment().contains(&name("ioSelectAppend")));
     assert!(!engine.environment().contains(&name("ioSelectEffect")));
     eprintln!(
         "IO printing fixture: selected declarations and actual metadata ready in {:?}",

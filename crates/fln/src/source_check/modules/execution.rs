@@ -107,6 +107,15 @@ pub fn preflight_source_program(
     preflight::check(modules, limits, false)
 }
 
+/// Preflight ordinary Lean modules with their implicit `Init` import edges.
+/// Source bytes and diagnostic positions remain the caller's original input.
+pub fn preflight_lean_source_program(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+) -> Result<(), SourceModuleCheckError> {
+    preflight::check(modules, limits, true)
+}
+
 fn declarations(
     completed: &SourceCommandBatchExecution,
     meter: &mut Meter,
@@ -236,6 +245,28 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        self.execute_lean_source_modules_with_presentation(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            EvaluationPresentation::Raw,
+        )
+    }
+
+    /// Execute the ordinary implicit-Init graph with checked source printing.
+    /// The graph, source positions and admission rules are identical to
+    /// [`Self::execute_lean_source_modules`].
+    pub fn execute_lean_source_modules_with_presentation(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
         self.execute_source_modules_with_implicit_init(
             modules,
             entry,
@@ -243,7 +274,7 @@ impl imported::SourceOleanImport {
             limits,
             cancellation,
             true,
-            EvaluationPresentation::Raw,
+            presentation,
         )
     }
 
