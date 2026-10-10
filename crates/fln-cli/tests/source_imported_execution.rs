@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "source_imported_execution/io_printing.rs"]
+mod io_printing;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Workspace(PathBuf);

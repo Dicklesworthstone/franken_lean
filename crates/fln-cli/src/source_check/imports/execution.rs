@@ -347,7 +347,7 @@ fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
 /// `without_init`: the entry is a `prelude` file whose imports never reach `Init`. The pin
 /// prints an `#eval` through a `Repr` or `ToString` instance and refuses it without one, which
 /// such a world may lack (`Init.Prelude` declares neither). Only an execution retaining
-/// the checked instance-directed printer marker can bypass this guard. A non-`prelude`
+/// checked pure/IO printer intent or validated silent IO Unit intent bypasses this guard. A non-`prelude`
 /// file imports `Init` implicitly at the pin, so its instances exist whatever this closure holds.
 fn lean_output(
     program: &SourceProgramExecution,
@@ -369,7 +369,7 @@ fn lean_output(
                 .batch
                 .executions
                 .get(*execution_index)
-                .is_none_or(|execution| execution.evaluation_format_width().is_none()),
+                .is_none_or(|execution| !source_evaluation::has_checked_presentation(execution)),
             _ => false,
         })
     {
@@ -377,7 +377,7 @@ fn lean_output(
             "capability",
             "this prelude file's imports do not reach `Init`; the pin prints an #eval through \
              the Repr or ToString instance its world declares and refuses it without one, and \
-             no checked instance-directed printer was selected for this evaluation",
+             no checked printer or silent IO Unit presentation was selected for this evaluation",
             false,
             CAPABILITY_NOT_IMPLEMENTED_EXIT,
         ));

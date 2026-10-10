@@ -172,7 +172,8 @@ pub use fln_vm::interpreter::{
     value_kind as vm_value_kind,
 };
 pub use source_evaluation::{
-    EvaluationPresentation, IoEvaluationOutcome, IoEvaluationProjectionError,
+    EvaluationPresentation, EvaluationResultPresentation, IoEvaluationOutcome,
+    IoEvaluationProjectionError,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -7654,11 +7655,32 @@ impl Engine {
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
-            let (declaration, evaluation_format_width) = match declaration {
+            let (declaration, evaluation_presentation) = match declaration {
                 Outcome::Complete(declaration) => declaration,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
+            if matches!(
+                evaluation_presentation,
+                Some(
+                    EvaluationResultPresentation::IoFormat { .. }
+                        | EvaluationResultPresentation::IoUnit
+                )
+            ) && guards
+                .last()
+                .is_some_and(|guard| guard.command_index == command_index)
+            {
+                // IO effects are not isolated into guard messages. Refuse
+                // before executing the action, never after its stdout or
+                // filesystem effects have already escaped the guard.
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`#guard_msgs` over an IO action",
+                    }),
+                    at: Some(original_offset),
+                });
+            }
             // Parametric definitions are checked templates, not standalone VM
             // entry points. Compile concrete uses on demand; never use a failed
             // compilation as a reason to silently admit an executable command.
@@ -7749,12 +7771,19 @@ impl Engine {
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
-            execution.evaluation_format_width = evaluation_format_width;
+            execution.evaluation_presentation = evaluation_presentation;
             let execution_index = executions.len();
             // Printer candidates retain their checked successor in the
             // execution evidence, but never become source declarations.
-            // Raw evaluation and IO keep their established transitions.
-            if evaluation_format_width.is_none() {
+            // Raw evaluation and silent Unit actions keep their established
+            // transitions; mapped IO printers remain private as well.
+            if !matches!(
+                evaluation_presentation,
+                Some(
+                    EvaluationResultPresentation::Format { .. }
+                        | EvaluationResultPresentation::IoFormat { .. }
+                )
+            ) {
                 engine = execution.engine.clone();
             }
             executions.push(execution);
@@ -8959,7 +8988,7 @@ impl Engine {
             declaration: admission.declaration,
             runtime_type,
             io_result_types,
-            evaluation_format_width: None,
+            evaluation_presentation: None,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -11164,8 +11193,8 @@ pub struct DefinitionExecution {
     /// The public projection validates the retained logical ST/EST result.
     io_result_types: Option<source_evaluation::IoResultTypes>,
     /// Set only by the opt-in source command adapter after executing a checked
-    /// printer. The original raw and IO paths never manufacture this marker.
-    evaluation_format_width: Option<usize>,
+    /// printer or a checked silent Unit action. Raw APIs never set this marker.
+    evaluation_presentation: Option<EvaluationResultPresentation>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.
@@ -11302,9 +11331,10 @@ pub struct DefinitionBatchExecution {
     /// The final environment identity under the same options.
     pub result_logical_root: LogicalRoot,
     /// Completed definitions and evaluations in input order, each retaining
-    /// its checked root transition. Marked printer evaluations keep private
-    /// scratch successors as execution evidence; those successors are absent
-    /// from `engine` and do not form part of the published command-stream chain.
+    /// its checked root transition. Pure and mapped IO printer evaluations
+    /// keep private scratch successors as execution evidence; those successors
+    /// are absent from `engine` and do not form part of the published command-
+    /// stream chain. Silent Unit actions retain their ordinary IO transition.
     pub executions: Vec<DefinitionExecution>,
     /// Canonical dependency order for a closed source-module execution.
     /// Empty for declaration batches and legacy caller-ordered source batches.

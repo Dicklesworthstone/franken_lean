@@ -57,6 +57,13 @@ pub struct PreparedEvaluation {
     term: Typed,
 }
 
+/// An unadmitted action whose successful result is either silent Unit or a
+/// checked Format. The caller must still admit and execute the declaration.
+pub enum PreparedIoEvaluation {
+    Unit(Declaration),
+    Format(Declaration),
+}
+
 impl PreparedEvaluation {
     pub fn new(
         syntax: &Syntax,
@@ -89,6 +96,122 @@ impl PreparedEvaluation {
     /// the original expression exactly once. Missing printers remain explicit
     /// refusals; this does not silently derive or invent an instance.
     pub fn into_format(mut self) -> Result<Declaration, NatDefinitionElabError> {
+        let result = self.format_value()?;
+        self.context.check_compiled_recursors(&result.value)?;
+        Ok(query_declaration(self.name, result, Vec::new()))
+    }
+
+    /// Map the selected printer over one already resolved IO action, using its
+    /// canonical checked monad rather than inferring a Reader functor from an
+    /// exposed world-token arrow. This constructs ordinary `Functor.map` code;
+    /// no action is executed during selection, and its original expression
+    /// occurs exactly once in the resulting declaration.
+    pub fn into_io_presentation(
+        mut self,
+        monad: Expr,
+        payload: Expr,
+    ) -> Result<PreparedIoEvaluation, NatDefinitionElabError> {
+        let monad_type = self
+            .context
+            .known_type(&monad)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let payload_type = self
+            .context
+            .known_type(&payload)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let action_type = self.context.match_apply(
+            Typed {
+                value: monad.clone(),
+                type_: monad_type.clone(),
+            },
+            Typed {
+                value: payload.clone(),
+                type_: payload_type,
+            },
+        )?;
+        self.context
+            .constrain_type(&self.term.type_, &action_type.value)?;
+        self.context.flush(true)?;
+
+        let unit_name = name("Unit");
+        if self.context.txn.env.contains(&unit_name) {
+            let unit = self.context.constant(&unit_name)?;
+            if self.context.defeq_guarded(&payload, &unit.value)? {
+                // The pin's monadic Unit branch does not ask for any printer
+                // and ignores options that only affect a printed value.
+                return Ok(PreparedIoEvaluation::Unit(self.into_raw()));
+            }
+        }
+
+        let original = self.term.clone();
+        let saved_locals = self.context.txn.lctx.clone();
+        let id = FVarId(self.context.fresh_name()?);
+        self.context.txn.lctx.add_param(
+            id.clone(),
+            Name::anonymous(),
+            payload.clone(),
+            BinderInfo::Default,
+        );
+        self.term = Typed {
+            value: Expr::fvar(id.clone()),
+            type_: payload.clone(),
+        };
+        let printed = self.format_value()?;
+        let printer = Typed {
+            value: Expr::lam(
+                Name::anonymous(),
+                payload.clone(),
+                printed
+                    .value
+                    .abstract_fvar(&id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            ),
+            type_: Expr::forall_e(
+                Name::anonymous(),
+                payload,
+                printed
+                    .type_
+                    .abstract_fvar(&id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            ),
+        };
+        self.context.txn.lctx = saved_locals;
+        self.term = original.clone();
+
+        let map_name = name("Functor.map");
+        if !self.context.txn.env.contains(&map_name) {
+            return Err(error(PrintingError::MissingComponent(map_name)));
+        }
+        let map = self.context.constant(&map_name)?;
+        // Its first implicit argument is fixed explicitly. In particular,
+        // normalizing `IO A` to its arrow cannot redirect instance selection.
+        let map = self.context.match_apply(
+            map,
+            Typed {
+                value: monad.clone(),
+                type_: monad_type,
+            },
+        )?;
+        let map = self
+            .context
+            .insert_implicits(map, ImplicitInsertion::ExplicitArgument)?;
+        let map = self.context.match_apply(map, printer)?;
+        let result = self.context.match_apply(map, original)?;
+        let result = self.context.finish(result)?;
+        let expected = Expr::app(monad, Expr::const_(name("Std.Format"), Vec::new()));
+        self.context.constrain_type(&result.type_, &expected)?;
+        self.context.flush(true)?;
+        self.context.check_compiled_recursors(&result.value)?;
+        Ok(PreparedIoEvaluation::Format(query_declaration(
+            self.name,
+            result,
+            Vec::new(),
+        )))
+    }
+
+    fn format_value(&mut self) -> Result<Typed, NatDefinitionElabError> {
         if self
             .context
             .txn
@@ -140,8 +263,7 @@ impl PreparedEvaluation {
         }
         let format = self.context.constant(&format_name)?;
         self.context.constrain_type(&result.type_, &format.value)?;
-        self.context.check_compiled_recursors(&result.value)?;
-        Ok(query_declaration(self.name, result, Vec::new()))
+        Ok(result)
     }
 
     fn try_printer(

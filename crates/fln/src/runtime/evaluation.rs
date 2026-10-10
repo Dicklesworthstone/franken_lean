@@ -16,6 +16,14 @@ struct ActionType {
     aliases: Vec<Name>,
 }
 
+/// Logical inputs for a checked source printer map. The caller still checks
+/// the application and the runtime entry still authenticates its complete IO
+/// representation. In particular, this does not expose a world inhabitant.
+pub(crate) struct EvaluationAction {
+    pub monad: Expr,
+    pub value: Expr,
+}
+
 fn family(label: &Name) -> Option<(Family, usize)> {
     if label == &name("BaseIO") {
         Some((Family::Base, 1))
@@ -29,9 +37,36 @@ fn family(label: &Name) -> Option<(Family, usize)> {
 }
 
 impl Preparation<'_> {
-    pub(crate) fn is_evaluation_action(&mut self, source: &Expr) -> Result<bool, IngressError> {
-        self.evaluation_action_type(source)
-            .map(|action| action.is_some())
+    pub(crate) fn evaluation_presentation_type(
+        &mut self,
+        source: &Expr,
+    ) -> Result<Option<EvaluationAction>, IngressError> {
+        let Some(action) = self.evaluation_action_type(source)? else {
+            return Ok(None);
+        };
+        if !self.checked_io_world()? {
+            return Err(unsupported(
+                "#eval IO presentation requires the checked world representation",
+            ));
+        }
+        self.evaluation_result_types(&action)?;
+        // Printer lookup must retain the source carrier. Runtime type
+        // normalization may unfold an alias that has its own Repr instance;
+        // the printer's checked fallback owns any later unfolding.
+        let value = action.arguments[match action.family {
+            Family::Base | Family::Io => 0,
+            Family::Eio => 1,
+        }]
+        .clone();
+        let monad = match action.family {
+            Family::Base => Expr::const_(name("BaseIO"), vec![]),
+            Family::Io => Expr::const_(name("IO"), vec![]),
+            Family::Eio => Expr::app(
+                Expr::const_(name("EIO"), vec![]),
+                Expr::const_(name("IO.Error"), vec![]),
+            ),
+        };
+        Ok(Some(EvaluationAction { monad, value }))
     }
 
     fn checked_io_world(&mut self) -> Result<bool, IngressError> {
@@ -213,6 +248,48 @@ impl Preparation<'_> {
         }))
     }
 
+    fn evaluation_result_types(
+        &mut self,
+        action: &ActionType,
+    ) -> Result<IoResultTypes, IngressError> {
+        let (value, error) = match action.family {
+            Family::Base => (&action.arguments[0], None),
+            Family::Io => (
+                &action.arguments[0],
+                Some(Expr::const_(name("IO.Error"), vec![])),
+            ),
+            Family::Eio => {
+                let error = self.normalize_type(&action.arguments[0])?;
+                if error != Expr::const_(name("IO.Error"), vec![]) {
+                    // The pin has no default MonadEval adapter for arbitrary
+                    // EIO errors. A source EIO.toIO adapter remains ordinary
+                    // checked code and produces a supported IO entry.
+                    return Err(unsupported("#eval monad requires a checked IO adapter"));
+                }
+                (&action.arguments[1], Some(error))
+            }
+        };
+        // Mapping changes the outer type to a canonical monad. Check the
+        // original aliases now so their explicit foreign metadata cannot be
+        // lost with that type spelling. Raw entries share the same gate.
+        for alias in &action.aliases {
+            source_intrinsics::check_selected_extern_attribute(
+                self.environment,
+                alias,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?;
+        }
+        Ok(IoResultTypes {
+            value: self.normalize_type(value)?,
+            error: error
+                .as_ref()
+                .map(|error| self.normalize_type(error))
+                .transpose()?,
+        })
+    }
+
     /// Build a runtime-only action application after both checkers accepted
     /// the unchanged declaration. The token never becomes a logical argument
     /// to either checker, an environment constant, or a proof.
@@ -221,47 +298,13 @@ impl Preparation<'_> {
         expression: &Expr,
         declared_type: &Expr,
     ) -> Result<Option<(Expr, Expr, IoResultTypes)>, IngressError> {
-        let Some(ActionType {
-            family,
-            arguments,
-            aliases,
-        }) = self.evaluation_action_type(declared_type)?
-        else {
+        let Some(action) = self.evaluation_action_type(declared_type)? else {
             return Ok(None);
         };
         if !self.checked_io_world()? {
             return Ok(None);
         }
-        let (value, error) = match family {
-            Family::Base => (&arguments[0], None),
-            Family::Io => (&arguments[0], Some(Expr::const_(name("IO.Error"), vec![]))),
-            Family::Eio => {
-                let error = self.normalize_type(&arguments[0])?;
-                if error != Expr::const_(name("IO.Error"), vec![]) {
-                    // The pin has no default MonadEval adapter for arbitrary
-                    // EIO errors. A source EIO.toIO adapter remains ordinary
-                    // checked code and produces a supported IO entry.
-                    return Err(unsupported("#eval monad requires a checked IO adapter"));
-                }
-                (&arguments[1], Some(error))
-            }
-        };
-        for alias in aliases {
-            source_intrinsics::check_selected_extern_attribute(
-                self.environment,
-                &alias,
-                &mut self.externs,
-                &mut self.visited,
-                self.limits,
-            )?;
-        }
-        let types = IoResultTypes {
-            value: self.normalize_type(value)?,
-            error: error
-                .as_ref()
-                .map(|error| self.normalize_type(error))
-                .transpose()?,
-        };
+        let types = self.evaluation_result_types(&action)?;
         let Some(world) = self.st_evaluation_world()? else {
             return Err(unsupported(
                 "IO evaluation requires the checked ST world representation",

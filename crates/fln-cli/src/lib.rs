@@ -11754,6 +11754,19 @@ fn guard_message(severity: &str, text: &str) -> String {
     message
 }
 
+fn io_guard_refusal(command_index: usize) -> MultiplexerOutput {
+    source_failure(
+        "capability",
+        &format!(
+            "evaluation command {command_index}: `#guard_msgs` over an IO \
+             action is not implemented; its output is written while it runs"
+        ),
+        false,
+        SourcePresentation::Lean,
+        CAPABILITY_NOT_IMPLEMENTED_EXIT,
+    )
+}
+
 fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> MultiplexerOutput {
     if completed.execution_command_indices.len() != completed.batch.executions.len() {
         return source_failure(
@@ -11855,20 +11868,38 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     );
                 }
                 evaluation_output_position += 1;
+                // The source adapter refuses guarded IO before execution.
+                // Keep this defensive boundary for externally retained batches:
+                // an IO result's Format does not capture its stdout effects.
+                if guarded.contains_key(&command_index)
+                    && matches!(
+                        execution.evaluation_presentation(),
+                        Some(
+                            fln::EvaluationResultPresentation::IoFormat { .. }
+                                | fln::EvaluationResultPresentation::IoUnit
+                        )
+                    )
+                {
+                    return io_guard_refusal(command_index);
+                }
                 let formatted = match source_evaluation::formatted(execution) {
                     Ok(formatted) => formatted,
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
-                if let Some(text) = formatted {
-                    // Repr/ToString already chose and constructed this Format.
-                    // Applying the scalar String printer would quote it again.
-                    let messages = guarded
-                        .get_mut(&command_index)
-                        .map(|(messages, _)| messages);
-                    if let Err(error) = formatted_output.append(&text, &mut stdout, messages) {
-                        return error.failure(command_index, SourcePresentation::Lean);
+                match formatted {
+                    Some(source_evaluation::PresentedEvaluation::Text(text)) => {
+                        // Repr/ToString already constructed the pure or IO result
+                        // Format. Apply the same bounded exact-text presentation.
+                        let messages = guarded
+                            .get_mut(&command_index)
+                            .map(|(messages, _)| messages);
+                        if let Err(error) = formatted_output.append(&text, &mut stdout, messages) {
+                            return error.failure(command_index, SourcePresentation::Lean);
+                        }
+                        continue;
                     }
-                    continue;
+                    Some(source_evaluation::PresentedEvaluation::IoUnit) => continue,
+                    None => {}
                 }
                 let value = match source_evaluation::value(execution) {
                     Ok(Some(value)) => value,
@@ -11888,16 +11919,7 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 if let Some((messages, _)) = guarded.get_mut(&command_index) {
                     // An IO action's output was written while it ran, not returned here.
                     if matches!(value, SourceFinalValue::IoUnit) {
-                        return source_failure(
-                            "capability",
-                            &format!(
-                                "evaluation command {command_index}: `#guard_msgs` over an IO \
-                                 action is not implemented; its output is written while it runs"
-                            ),
-                            false,
-                            SourcePresentation::Lean,
-                            CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                        );
+                        return io_guard_refusal(command_index);
                     }
                     match lean_evaluation_line(command_index, &value) {
                         Ok(line) => {

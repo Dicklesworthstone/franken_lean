@@ -1,8 +1,9 @@
 //! Explicit source evaluation intent and typed IO results.
 //!
 //! The command adapter, not a value's runtime tag, requests IO execution. The
-//! original declaration is checked unchanged; its selected action is applied
-//! to the runtime-owned ST token inside the retained FIR/FLBC program.
+//! selected declaration, including any requested printer map, passes ordinary
+//! checking before its action is applied to the runtime-owned ST token inside
+//! the retained FIR/FLBC program.
 
 use super::*;
 
@@ -12,6 +13,20 @@ use super::*;
 pub enum EvaluationPresentation {
     Raw,
     Lean,
+}
+
+/// Presentation selected by the source adapter before ordinary admission and
+/// execution. Familiar type names or runtime tags never create this marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationResultPresentation {
+    /// The complete VM result is a checked `Std.Format` value.
+    Format { width: usize },
+    /// The checked IO action maps its successful payload to `Std.Format`.
+    /// Its exception result remains an exception and has no printable Format.
+    IoFormat { width: usize },
+    /// The checked action's payload is definitionally Unit. Success is silent;
+    /// the ordinary typed IO projection must still validate it or its exception.
+    IoUnit,
 }
 
 #[derive(Clone, Copy)]
@@ -61,8 +76,18 @@ impl DefinitionExecution {
     /// The supported message width when this execution is a checked Repr or
     /// ToString printer result. The VM result is `Std.Format`; ordinary values
     /// of that type and raw Strings never acquire this presentation marker.
+    /// IO results use `evaluation_presentation` and typed payload projection.
     pub fn evaluation_format_width(&self) -> Option<usize> {
-        self.evaluation_format_width
+        match self.evaluation_presentation {
+            Some(EvaluationResultPresentation::Format { width }) => Some(width),
+            _ => None,
+        }
+    }
+
+    /// The explicit checked presentation of a source evaluation, if selected.
+    /// This does not execute an action or project its runtime representation.
+    pub fn evaluation_presentation(&self) -> Option<EvaluationResultPresentation> {
+        self.evaluation_presentation
     }
 
     /// Read the typed result of explicit `#eval` IO execution. Ordinary
@@ -119,7 +144,7 @@ pub(super) fn elaborate(
     options: &KVMap,
     limits: EngineExecutionLimits,
     presentation: EvaluationPresentation,
-) -> Result<Outcome<(Declaration, Option<usize>)>, EngineExecutionError> {
+) -> Result<Outcome<(Declaration, Option<EvaluationResultPresentation>)>, EngineExecutionError> {
     if presentation == EvaluationPresentation::Raw {
         return Ok(
             match source_records::elaboration_outcome(
@@ -157,17 +182,39 @@ pub(super) fn elaborate(
     };
     // This is the same metered logical type classifier as the existing IO
     // entry adapter, including safe aliases and exposed world-token arrows.
-    // Classification never executes an action or grants its runtime contract.
+    // Classification also retains a canonical monad for Functor.map rather
+    // than letting an exposed world arrow infer a Reader instance. It validates
+    // the original aliases before mapping can change their type spelling.
     let mut preparation = runtime::Preparation::new(engine.environment(), limits.ingress);
-    if preparation
-        .is_evaluation_action(prepared.type_())
+    if let Some(action) = preparation
+        .evaluation_presentation_type(prepared.type_())
         .map_err(EngineExecutionError::Ingress)?
     {
-        return Ok(Outcome::Complete((prepared.into_raw(), None)));
+        use fln_elab::source::evaluation::PreparedIoEvaluation;
+        return Ok(
+            match source_records::elaboration_outcome(
+                prepared.into_io_presentation(action.monad, action.value),
+            )? {
+                Outcome::Complete(PreparedIoEvaluation::Unit(declaration)) => {
+                    Outcome::Complete((declaration, Some(EvaluationResultPresentation::IoUnit)))
+                }
+                Outcome::Complete(PreparedIoEvaluation::Format(declaration)) => {
+                    Outcome::Complete((
+                        declaration,
+                        Some(EvaluationResultPresentation::IoFormat { width: 120 }),
+                    ))
+                }
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        );
     }
     Ok(
         match source_records::elaboration_outcome(prepared.into_format())? {
-            Outcome::Complete(declaration) => Outcome::Complete((declaration, Some(120))),
+            Outcome::Complete(declaration) => Outcome::Complete((
+                declaration,
+                Some(EvaluationResultPresentation::Format { width: 120 }),
+            )),
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         },

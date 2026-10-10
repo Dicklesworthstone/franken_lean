@@ -11,6 +11,7 @@ pub(super) enum Error {
         observed: usize,
     },
     OutputAllocation,
+    InvalidIoPresentation,
     InvalidUnit,
     InvalidException,
     Raised {
@@ -32,6 +33,9 @@ impl fmt::Display for Error {
                 "formatted source output limit {limit} exceeded by {observed} bytes"
             ),
             Self::OutputAllocation => f.write_str("could not allocate formatted source output"),
+            Self::InvalidIoPresentation => {
+                f.write_str("selected IO presentation did not retain a checked IO result")
+            }
             Self::InvalidUnit => f.write_str("IO unit result has an invalid representation"),
             Self::InvalidException => {
                 f.write_str("IO exception disagrees with its admitted constructor layout")
@@ -263,16 +267,73 @@ pub(super) fn check(execution: &fln::DefinitionExecution) -> Result<(), Error> {
     }
 }
 
-/// A selected Lean printer returns an admitted Format, not a scalar value.
-/// The private execution marker is the authority for this presentation path;
-/// a user definition merely returning Format does not select its printer.
-pub(super) fn formatted(execution: &fln::DefinitionExecution) -> Result<Option<String>, Error> {
-    let Some(width) = execution.evaluation_format_width() else {
-        return Ok(None);
-    };
-    fln::source_format::render(execution, width, fln::source_format::Limits::default())
-        .map(Some)
-        .map_err(Error::Format)
+#[derive(Debug)]
+pub(super) enum PresentedEvaluation {
+    Text(String),
+    IoUnit,
+}
+
+/// Only the source adapter's retained intent authorizes Lean presentation.
+/// The runtime type or constructor of an ordinary result supplies no marker.
+pub(super) fn has_checked_presentation(execution: &fln::DefinitionExecution) -> bool {
+    matches!(
+        execution.evaluation_presentation(),
+        Some(
+            fln::EvaluationResultPresentation::Format { .. }
+                | fln::EvaluationResultPresentation::IoFormat { .. }
+                | fln::EvaluationResultPresentation::IoUnit
+        )
+    )
+}
+
+/// Project the result of the already-run action. Neither reading its outcome
+/// nor rendering its Format executes the action or calls its printer again.
+fn io_formatted(
+    execution: &fln::DefinitionExecution,
+    width: Option<usize>,
+) -> Result<PresentedEvaluation, Error> {
+    match execution.io_evaluation_outcome().map_err(Error::Io)? {
+        Some(fln::IoEvaluationOutcome::Returned { runtime_type, exit }) => match width {
+            Some(width) => fln::source_format::render_vm(
+                execution.engine.environment(),
+                &runtime_type,
+                &exit,
+                width,
+                fln::source_format::Limits::default(),
+            )
+            .map(PresentedEvaluation::Text)
+            .map_err(Error::Format),
+            None => {
+                unit_payload(execution.engine.environment(), &runtime_type, &exit)?;
+                Ok(PresentedEvaluation::IoUnit)
+            }
+        },
+        Some(fln::IoEvaluationOutcome::Raised { runtime_type, exit }) => {
+            Err(raised(execution, &runtime_type, exit))
+        }
+        None => Err(Error::InvalidIoPresentation),
+    }
+}
+
+/// A selected Lean printer returns an admitted Format, either directly or in
+/// a checked IO result. The private execution marker selects the projection;
+/// any refusal remains a refusal and never retries the scalar presentation.
+pub(super) fn formatted(
+    execution: &fln::DefinitionExecution,
+) -> Result<Option<PresentedEvaluation>, Error> {
+    match execution.evaluation_presentation() {
+        None => Ok(None),
+        Some(fln::EvaluationResultPresentation::Format { width }) => {
+            fln::source_format::render(execution, width, fln::source_format::Limits::default())
+                .map(PresentedEvaluation::Text)
+                .map(Some)
+                .map_err(Error::Format)
+        }
+        Some(fln::EvaluationResultPresentation::IoFormat { width }) => {
+            io_formatted(execution, Some(width)).map(Some)
+        }
+        Some(fln::EvaluationResultPresentation::IoUnit) => io_formatted(execution, None).map(Some),
+    }
 }
 
 /// One cumulative bound for marked printer output, including text retained
@@ -408,6 +469,7 @@ mod tests {
         ] {
             let execution = execute(source);
             assert!(execution.evaluation_format_width().is_none());
+            assert!(!has_checked_presentation(&execution));
             assert!(formatted(&execution).unwrap().is_none());
             let value = value(&execution).unwrap().unwrap();
             assert_eq!(lean_evaluation_line(0, &value).unwrap(), expected);
@@ -419,7 +481,24 @@ mod tests {
             "inductive Std.Format where\n  | text (value : String)\n#eval Std.Format.text \"ordinary data\"",
         );
         assert!(named_format.evaluation_format_width().is_none());
+        assert!(!has_checked_presentation(&named_format));
         assert!(formatted(&named_format).unwrap().is_none());
+    }
+
+    #[test]
+    fn ordinary_unit_and_scalar_values_do_not_supply_an_io_presentation() {
+        for execution in [unit_execution(), execute("#eval 42")] {
+            assert!(!has_checked_presentation(&execution));
+            assert!(formatted(&execution).unwrap().is_none());
+            for width in [None, Some(120)] {
+                let error = io_formatted(&execution, width).unwrap_err();
+                assert!(matches!(error, Error::InvalidIoPresentation));
+                let refusal = error.failure(7, SourcePresentation::Lean);
+                assert_eq!(refusal.exit_code, 4);
+                assert!(refusal.stdout.is_empty());
+                assert!(refusal.stderr.starts_with("lean: internal-fault: "));
+            }
+        }
     }
 
     #[test]
