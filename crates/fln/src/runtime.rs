@@ -696,7 +696,13 @@ impl<'a> Preparation<'a> {
                                 nondep: *nondep,
                             });
                             tasks.push(Task::Visit(body.clone()));
-                            tasks.push(Task::Visit(self.annotate_callable_tail(value, type_)?));
+                            // This checked local annotation owns its lambda's
+                            // actual prefix arity. Normalize value-only gaps
+                            // before any nested closure metadata is created.
+                            // Synthetic case/recursor lambdas instead keep the
+                            // fixed stage boundary supplied by their scheduler.
+                            let value = self.administrative_callable_value(value)?;
+                            tasks.push(Task::Visit(self.annotate_callable_tail(&value, type_)?));
                         }
                         ExprNode::MData { expr, .. } => tasks.push(Task::Visit(expr.clone())),
                         ExprNode::Proj {

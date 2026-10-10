@@ -21,7 +21,7 @@ fn variable(index: usize) -> Result<Expr, IngressError> {
 }
 
 impl Preparation<'_> {
-    fn producer_depth(&mut self, depth: usize) -> Result<u32, IngressError> {
+    pub(in crate::runtime) fn producer_depth(&mut self, depth: usize) -> Result<u32, IngressError> {
         self.tick()?;
         if depth > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {

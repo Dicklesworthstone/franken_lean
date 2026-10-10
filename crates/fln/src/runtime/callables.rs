@@ -7,10 +7,13 @@ mod intrinsic_types;
 #[cfg(test)]
 mod projected;
 mod recursors;
+mod signatures;
 mod stages;
 
 use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
+
+mod administrative;
 
 impl Preparation<'_> {
     /// Recognize a literal callback after strict lets or administrative record
@@ -378,6 +381,7 @@ impl Preparation<'_> {
                 &mut self.visited,
             )?;
         }
+        signatures::deduplicate_unowned(&mut signatures, self.limits, &mut self.visited)?;
         let mut ranks = (0..self.interfaces.len())
             .map(|index| u32::try_from(index).map_err(|_| unsupported("callback rank width")))
             .collect::<Result<Vec<_>, _>>()?;
