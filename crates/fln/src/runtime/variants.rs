@@ -156,6 +156,61 @@ impl Preparation<'_> {
             .filter(|result| !matches!(result, ValueType::Closure(_))))
     }
 
+    /// An applied identity ascription may expose a checked variant only when
+    /// all of its remaining arguments reach a data result. Escaping callbacks
+    /// and underapplication keep their original typed anchor. Inspect strict
+    /// producer prefixes without evaluating or discarding any initializer.
+    pub(super) fn saturated_variant_ascription(
+        &mut self,
+        value: &Expr,
+        type_: &Expr,
+        arguments: usize,
+    ) -> Result<bool, IngressError> {
+        if self.saturated_variant_result(type_, arguments)?.is_none() {
+            return Ok(false);
+        }
+        let mut value = value.clone();
+        loop {
+            self.tick()?;
+            value = match value.node() {
+                ExprNode::MData { expr, .. } => expr.clone(),
+                ExprNode::LetE { value, body, .. }
+                    if matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
+                {
+                    value.clone()
+                }
+                ExprNode::LetE { body, .. } => body.clone(),
+                _ => break,
+            };
+        }
+        let (head, args) = self.spine(&value)?;
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(false);
+        };
+        let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
+            return Ok(false);
+        };
+        if rec.is_unsafe
+            || rec.num_indices != 0
+            || rec.num_motives != 1
+            || rec.num_minors < 2
+            || rec.all.len() != 1
+            || rec.rules.len() != rec.num_minors as usize
+            || levels.len() != rec.base.level_params.len()
+            || args.len()
+                < rec
+                    .rules
+                    .len()
+                    .saturating_add(rec.num_params as usize)
+                    .saturating_add(2)
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .recursor_shape(rec, levels, &args)?
+            .is_some_and(|shape| !shape.recursive && shape.constructors.len() == rec.rules.len()))
+    }
+
     pub(super) fn register_constructor_branch(
         &mut self,
         lambda: &Expr,

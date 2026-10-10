@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 use fln::{
     Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, KVMap,
-    Mode, VmExit,
+    Mode, SourceCheckLimits, VmExit,
 };
 use fln_comp::ingress::IngressError;
 fn limits() -> EngineExecutionLimits {
@@ -184,6 +184,132 @@ def use (choice : Choice) (stage before after : Nat) : Nat :=
         "the unselected function's stage must remain lazy"
     );
 }
+
+#[test]
+fn nested_variant_ascriptions_preserve_strict_prefixes_and_replay() {
+    let definitions = r#"
+inductive Choice where
+  | empty
+  | offset (value : Nat)
+def expensive (n : Nat) : Nat := match n with
+  | .zero => 0
+  | .succ k => expensive k
+def prefixed (choice : Choice) (setupFuel stage before after : Nat) : Nat :=
+  (((by
+      let setup := expensive setupFuel
+      exact match choice with
+        | .empty => fun (x y : Nat) => x * 10 + y + setup
+        | .offset value => fun (x : Nat) => by
+          let spent := expensive stage
+          exact fun (y : Nat) => x * 10 + y + value + setup + spent
+    ) : Nat -> Nat -> Nat) : Nat -> Nat -> Nat)
+    (by let spent := expensive before; exact 4)
+    (by let spent := expensive after; exact 2)
+"#;
+    let options = KVMap::new();
+    let base = engine()
+        .check_source_files(
+            &[definitions.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits().admission()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    let steps = |expression: &str, expected| {
+        let source = format!("#eval {expression}");
+        let batch = base
+            .execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+            .into_complete()
+            .unwrap();
+        let execution = batch.executions.last().unwrap();
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("ascribed variant evaluation did not return");
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some(expected));
+        let VmExit::Returned(replayed) =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                .unwrap()
+                .into_complete()
+                .unwrap()
+        else {
+            panic!("ascribed variant bytecode did not return");
+        };
+        assert_eq!(fln::nat_decimal(&replayed.value).as_deref(), Some(expected));
+        assert_eq!(value.usage.steps, replayed.usage.steps);
+        value.usage.steps
+    };
+    let work = steps("expensive 20", "0") - steps("expensive 0", "0");
+    assert!(work > 20);
+    let staged = steps("prefixed (Choice.offset 5) 0 0 0 0", "47");
+    assert_eq!(
+        steps("prefixed (Choice.offset 5) 20 0 0 0", "47") - staged,
+        work,
+        "the strict prefix executes exactly once before constructing the callback"
+    );
+    assert_eq!(
+        steps("prefixed (Choice.offset 5) 20 20 20 20", "47") - staged,
+        4 * work
+    );
+    let flat = steps("prefixed Choice.empty 0 0 0 0", "42");
+    assert_eq!(
+        steps("prefixed Choice.empty 20 100000 0 0", "42") - flat,
+        work,
+        "prefix work stays strict while the unselected branch's stage stays lazy"
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn escaping_and_underapplied_variant_ascriptions_keep_exact_interfaces() {
+    let definitions = r#"
+inductive Choice where
+  | empty
+  | offset (value : Nat)
+def expensive (n : Nat) : Nat := match n with
+  | .zero => 0
+  | .succ k => expensive k
+def take (f : Nat -> Nat -> Nat) : Nat := f 4 2
+"#;
+    let branches = r#"
+match choice with
+  | .empty => fun (x y : Nat) => x * 10 + y
+  | .offset value => fun (x : Nat) => by
+    let spent := expensive stage
+    exact fun (y : Nat) => x * 10 + y + value + spent
+"#;
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    for operation in [
+        format!(
+            "def escaped (choice : Choice) (stage : Nat) : Nat := take (({branches}) : Nat -> Nat -> Nat)\n#eval escaped (Choice.offset 5) 0"
+        ),
+        format!(
+            "def partiallySelected (choice : Choice) (stage : Nat) : Nat -> Nat := (({branches}) : Nat -> Nat -> Nat) 4\n#eval partiallySelected (Choice.offset 5) 0 2"
+        ),
+    ] {
+        let source = format!("{definitions}\n{operation}");
+        let mut error = base
+            .execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .expect_err("escaping mixed-stage branches still require one exact callable interface");
+        while let EngineExecutionError::BatchCommand { error: inner, .. } = error {
+            error = *inner;
+        }
+        assert!(
+            matches!(
+                error,
+                EngineExecutionError::Ingress(IngressError::LambdaResultType { .. })
+            ),
+            "logical admission must succeed before the representation refusal: {error:?}"
+        );
+        assert_eq!(base.logical_root(&options), root);
+    }
+}
+
 #[test]
 fn nested_matches_and_shared_payloads_preserve_owned_strings() {
     run(

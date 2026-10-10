@@ -649,6 +649,15 @@ impl Preparation<'_> {
             non_dep,
         } = head.node()
         {
+            if matches!(body.node(), ExprNode::BVar { idx: 0 })
+                && self.saturated_variant_ascription(value, type_, args.len())?
+            {
+                // A checked identity ascription must not make a fully supplied
+                // variant join at a shared callback ABI before its operands
+                // reach the selected branch. The initializer still occurs
+                // once, before every argument; strict prefixes stay intact.
+                return Ok(Some(application(value.clone(), args.iter().cloned())));
+            }
             let mut lifted = Vec::new();
             for argument in args {
                 reserve(&mut lifted, self.limits.max_application_args)?;
