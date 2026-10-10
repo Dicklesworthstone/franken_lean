@@ -4,6 +4,7 @@
 //! closure. In particular, the annotation on a captured alias is not evidence
 //! of its call boundaries. Walk prepared syntax once with scope-local value
 //! types; never substitute, execute, eta-expand, or cast the captured value.
+use super::lookup::LambdaIndex;
 use super::*;
 
 fn push<T>(
@@ -46,7 +47,8 @@ impl Preparation<'_> {
         &mut self,
         expression: &Expr,
     ) -> Result<(), IngressError> {
-        self.captured_result(expression, &[])?;
+        let lambdas = LambdaIndex::new(self)?;
+        self.captured_result_in(expression, &[], &lambdas)?;
         Ok(())
     }
 
@@ -56,17 +58,29 @@ impl Preparation<'_> {
         &mut self,
         functions: &[FunctionBinding],
     ) -> Result<(), IngressError> {
+        let lambdas = LambdaIndex::new(self)?;
         for function in functions {
             self.tick()?;
-            self.captured_result(&function.body, &function.parameters)?;
+            self.captured_result_in(&function.body, &function.parameters, &lambdas)?;
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn captured_result(
         &mut self,
         body: &Expr,
         parameters: &[ValueType],
+    ) -> Result<Option<ValueType>, IngressError> {
+        let lambdas = LambdaIndex::new(self)?;
+        self.captured_result_in(body, parameters, &lambdas)
+    }
+
+    fn captured_result_in(
+        &mut self,
+        body: &Expr,
+        parameters: &[ValueType],
+        lambdas: &LambdaIndex,
     ) -> Result<Option<ValueType>, IngressError> {
         let mut context = Vec::new();
         for &parameter in parameters {
@@ -126,14 +140,7 @@ impl Preparation<'_> {
                         )?;
                     }
                     ExprNode::Lam { .. } => {
-                        let mut found = None;
-                        for index in (0..self.lambdas.len()).rev() {
-                            self.tick()?;
-                            if self.lambdas[index].lambda == expr {
-                                found = Some(index);
-                                break;
-                            }
-                        }
+                        let found = lambdas.get(self, &expr)?;
                         let Some(index) = found else {
                             // No representation authority: ordinary ingress
                             // will refuse an unannotated executable lambda.

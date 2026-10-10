@@ -71,6 +71,21 @@ def forwardRecursive (consumer : (Bool -> Nat -> Nat) -> Nat) (captured : Nat) :
 "#,
             "42",
         ),
+        (
+            r#"
+def forwardSelected (select : Bool) (consumer : (Bool -> Nat -> Nat) -> Nat) (captured : Nat) : Nat :=
+  let callback : Bool -> Nat -> Nat := if select then
+    (fun _ =>
+      let unused := captured
+      let action : Nat -> Nat := fun n => n + captured
+      let result := action
+      result)
+    else (fun _ => fun n => n)
+  consumer callback
+#eval forwardSelected true (fun callback => callback false 10) 32
+"#,
+            "42",
+        ),
     ] {
         let run = || {
             engine

@@ -137,6 +137,10 @@ impl Preparation<'_> {
         self.specializations.definitions.get(name).cloned()
     }
 
+    pub(in crate::runtime) fn canonical_definition_generation(&self) -> usize {
+        self.specializations.definitions.len()
+    }
+
     /// Private function, constructor and native-primitive identities remain
     /// eligible for callable preparation without logical declarations. This is
     /// only a dispatch filter: ordinary signature and contract checks still run.

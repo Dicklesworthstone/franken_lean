@@ -61,6 +61,7 @@ pub(super) struct Preparation<'a> {
     next_nat: u64,
     nat_family_checked: bool,
     value_types: ExecutableValueTypes,
+    proposition_queries: proofs::query::Store,
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
     partial_stages: global::PartialStages,
     specializations: specialize::Store,
@@ -90,6 +91,10 @@ enum Task {
         signatures: Vec<(Vec<ValueType>, ValueType)>,
     },
     Visit(Expr),
+    VisitFixedLambdas {
+        value: Expr,
+        remaining: usize,
+    },
     Callee(Expr),
     Apply(usize),
     Lam {
@@ -139,6 +144,7 @@ impl<'a> Preparation<'a> {
             next_nat: 0,
             nat_family_checked: false,
             value_types: ExecutableValueTypes::bounded_source(environment),
+            proposition_queries: proofs::query::Store::default(),
             interfaces: Vec::new(),
             partial_stages: global::PartialStages::default(),
             specializations: specialize::Store::default(),
@@ -455,8 +461,14 @@ impl<'a> Preparation<'a> {
                                 parameter: ValueType::Nat,
                                 result,
                             });
-                            tasks.push(Task::Visit(self.thunk(&args[2], ValueType::Nat)?));
-                            tasks.push(Task::Visit(self.thunk(&args[1], ValueType::Nat)?));
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&args[2], ValueType::Nat)?,
+                                remaining: 1,
+                            });
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&args[1], ValueType::Nat)?,
+                                remaining: 1,
+                            });
                             tasks.push(Task::Visit(args[0].clone()));
                             continue;
                         }
@@ -563,8 +575,14 @@ impl<'a> Preparation<'a> {
                                 parameter: ValueType::Bool,
                                 result,
                             });
-                            tasks.push(Task::Visit(self.thunk(&yes, ValueType::Bool)?));
-                            tasks.push(Task::Visit(self.thunk(&no, ValueType::Bool)?));
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&yes, ValueType::Bool)?,
+                                remaining: 1,
+                            });
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&no, ValueType::Bool)?,
+                                remaining: 1,
+                            });
                             tasks.push(Task::Visit(args[3].clone()));
                             continue;
                         }
@@ -589,11 +607,15 @@ impl<'a> Preparation<'a> {
                             })?;
                             tasks.push(Task::Apply(args.len() - 3));
                             tasks.extend(args[3..].iter().rev().cloned().map(Task::Visit));
+                            let fixed = recursion.parameters.len().saturating_add(1);
                             tasks.push(Task::RecursiveLambda {
                                 parameters: recursion.parameters,
                                 result: recursion.result,
                             });
-                            tasks.push(Task::Visit(recursion.lambda));
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: recursion.lambda,
+                                remaining: fixed,
+                            });
                             continue;
                         }
                         if matches!(head.node(), ExprNode::Const { name: n, levels }
@@ -713,12 +735,26 @@ impl<'a> Preparation<'a> {
                             body,
                             binder_info,
                         } => {
+                            // Ordinary callback syntax can become literal only
+                            // after a projection or application is exposed.
+                            // Contract its inert gap before descendants acquire
+                            // closure/recursion identities. Synthetic fixed
+                            // prefixes take VisitFixedLambdas instead.
+                            let body = if matches!(
+                                body.node(),
+                                ExprNode::LetE { .. } | ExprNode::MData { .. }
+                            ) {
+                                self.administrative_callable_gap(body)?
+                                    .unwrap_or_else(|| body.clone())
+                            } else {
+                                body.clone()
+                            };
                             tasks.push(Task::Lam {
                                 name: binder_name.clone(),
                                 type_: self.normalize_type(binder_type)?,
                                 info: *binder_info,
                             });
-                            tasks.push(Task::Visit(body.clone()));
+                            tasks.push(Task::Visit(body));
                         }
                         ExprNode::LetE {
                             decl_name: name,
@@ -832,6 +868,37 @@ impl<'a> Preparation<'a> {
                         }
                         _ => values.push(expr.clone()),
                     }
+                }
+                Task::VisitFixedLambdas { value, remaining } => {
+                    // The scheduler, rather than source spelling, owns this
+                    // exact branch/recursive prefix. Keep its return anchor
+                    // and normalize only ordinary callbacks inside its body.
+                    self.producer_depth(remaining)?;
+                    let ExprNode::Lam {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } = value.node()
+                    else {
+                        return Err(unsupported("fixed runtime lambda prefix"));
+                    };
+                    if remaining == 0 {
+                        return Err(unsupported("empty fixed runtime lambda prefix"));
+                    }
+                    tasks.push(Task::Lam {
+                        name: binder_name.clone(),
+                        type_: self.normalize_type(binder_type)?,
+                        info: *binder_info,
+                    });
+                    tasks.push(if remaining == 1 {
+                        Task::Visit(body.clone())
+                    } else {
+                        Task::VisitFixedLambdas {
+                            value: body.clone(),
+                            remaining: remaining - 1,
+                        }
+                    });
                 }
                 Task::Callee(expr) => {
                     if let ExprNode::Const { name, .. } = expr.node() {
@@ -1040,7 +1107,15 @@ impl<'a> Preparation<'a> {
             result: case.result,
             branches: case.branches.len(),
         });
-        tasks.extend(case.branches.into_iter().rev().map(Task::Visit));
+        tasks.extend(
+            case.branches
+                .into_iter()
+                .rev()
+                .map(|value| Task::VisitFixedLambdas {
+                    value,
+                    remaining: 1,
+                }),
+        );
         tasks.push(Task::Visit(case.major));
         Ok(())
     }

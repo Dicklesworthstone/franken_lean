@@ -6,6 +6,7 @@ use super::*;
 use fln_core::level::Level;
 mod locals;
 mod projections;
+pub(super) mod query;
 
 // Bool.false is the existing, checked scalar-zero binding. Source typing forbids
 // observing a proof as a Bool; this representation exists only after admission.
@@ -77,43 +78,7 @@ impl Preparation<'_> {
         input: &Expr,
         context: &[Expr],
     ) -> Result<bool, IngressError> {
-        self.proof_context_depth(context.len())?;
-        // Borrow the caller's original telescope. Only domains introduced
-        // while inspecting this Pi spine belong to the local suffix. A closed
-        // input cannot refer to the outer prefix, but its lexical depth still
-        // counts against introduced-binder limits.
-        let depth = context.len();
-        let (prefix, omitted_depth) = if specialize::closed(input) {
-            (&[][..], depth)
-        } else {
-            (context, 0)
-        };
-        let mut locals = Vec::new();
-        let mut type_ = input.clone();
-        loop {
-            self.tick()?;
-            match type_.node() {
-                ExprNode::Sort { .. } => return Ok(false),
-                ExprNode::ForallE {
-                    binder_type, body, ..
-                } => {
-                    self.proof_context_depth(depth.saturating_add(locals.len()).saturating_add(1))?;
-                    self.push_proof_local(&mut locals, binder_type.clone())?;
-                    type_ = body.clone();
-                }
-                _ => {
-                    let Some(sort) =
-                        self.projection_receiver_type_in(&type_, prefix, &locals, omitted_depth)?
-                    else {
-                        return Ok(false);
-                    };
-                    let sort = self.type_head(&sort)?;
-                    return Ok(
-                        matches!(sort.node(), ExprNode::Sort { level } if level == &Level::zero()),
-                    );
-                }
-            }
-        }
+        query::proposition_type(self, input, context)
     }
 
     /// Only runtime domains/results are replaced. Type arguments to a family

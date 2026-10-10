@@ -4,6 +4,7 @@
 use super::*;
 
 mod captures;
+mod lookup;
 
 impl Preparation<'_> {
     fn stage_interface(&mut self, signature: ClosureSignature) -> Result<ValueType, IngressError> {

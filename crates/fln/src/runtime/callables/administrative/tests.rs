@@ -226,3 +226,50 @@ fn identity_lets_expose_only_an_existing_literal_lambda() {
             .is_none()
     );
 }
+
+#[test]
+fn a_callback_exposed_after_application_gets_its_exact_captured_flat_interface() {
+    let engine = crate::Engine::with_source_seed(crate::EngineAdmissionLimits::new(
+        crate::Budget::for_stack_bytes(2 * 1024 * 1024),
+    ))
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    let bool_type = constant("Bool");
+    let callback_type = Expr::forall_e(
+        name("flag"),
+        bool_type.clone(),
+        action(),
+        BinderInfo::Default,
+    );
+    let add = |a, z| Expr::app(Expr::app(constant("Nat.add"), a), z);
+    // The typed initializer is an application, so its callback is exposed
+    // only after that annotation has been scheduled. The resulting strict
+    // binding captures the caller's Nat while the value-only inner gap can
+    // disappear before any callback metadata is registered.
+    let callback = Expr::lam(
+        name("flag"),
+        bool_type,
+        local("unused", constant("Nat"), b(1), alias(lam(add(b(0), b(3))))),
+        BinderInfo::Default,
+    );
+    let initializer = Expr::app(lam(callback), b(0));
+    let input = local("callback", callback_type, initializer, b(0));
+    let mut preparation = Preparation::new(engine.environment(), IngressLimits::default());
+    let prepared = preparation.expression(&input).unwrap();
+    let binding = preparation
+        .lambdas
+        .iter()
+        .find(|binding| binding.parameters == [ValueType::Bool, ValueType::Nat])
+        .expect("the exposed callback retains its two-argument interface");
+    assert_eq!(binding.result, ValueType::Nat);
+    assert_eq!(binding.recursion, LambdaRecursion::NonRecursive);
+    let ExprNode::Lam { body, .. } = binding.lambda.node() else {
+        panic!("the callback owns its literal lambda");
+    };
+    assert_eq!(body, &lam(add(b(0), b(2))));
+    let ExprNode::LetE { value, .. } = prepared.node() else {
+        panic!("the original checked callback annotation survives");
+    };
+    assert!(matches!(value.node(), ExprNode::LetE { value, .. } if value == &b(0)));
+}
