@@ -18,7 +18,7 @@ fn source_diamond(extra_base: &str) -> Artifacts {
     let files = [
         (
             "Main",
-            "prelude\nimport Left Right\ndef run.{u} {A : Sort u} (x : A) : A := leftId (rightId x)",
+            "prelude\nimport Left\nimport Right\ndef run.{u} {A : Sort u} (x : A) : A := leftId (rightId x)",
         ),
         (
             "Left",
@@ -158,6 +158,236 @@ fn same_source_contexts(council: &SourceOleanImport, composed: &SourceOleanImpor
             right
         );
     }
+}
+
+#[test]
+fn ready_councils_overlap_and_each_waits_for_its_declared_dependencies() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Visits {
+        started: BTreeSet<Name>,
+        finished: BTreeSet<Name>,
+        active: usize,
+        peak: usize,
+    }
+
+    on_import_stack(|| {
+        let artifacts = source_diamond("");
+        let all = inputs(&artifacts);
+        let options = KVMap::new();
+        let engine = Engine::builder().build_empty();
+        let (cold, _) = import_with(&all, &[n("Main")], ImportPostureRequest::Recheck);
+        for threads in [2, 8] {
+            for warm_base in [false, true] {
+                let store = Memory::default();
+                let checker = identity("concurrent module councils");
+                let visits = Mutex::new(Visits::default());
+                let wake = Condvar::new();
+                if warm_base {
+                    let base = subset(&artifacts, &["Base"]);
+                    import_with(&inputs(&base), &[n("Base")], reuse(checker, &store));
+                    visits.lock().unwrap().finished.insert(n("Base"));
+                }
+                let limits = limits(threads);
+                let council = |name: &Name, context: &Engine, decoded: DecodedOlean| {
+                    let mut seen = visits.lock().unwrap();
+                    for import in &decoded.module.imports {
+                        assert!(
+                            seen.finished.contains(&import.module),
+                            "{} began before its import {} completed",
+                            name.to_display_string(),
+                            import.module.to_display_string(),
+                        );
+                    }
+                    if *name == n("Left") {
+                        assert!(!context.environment.contains(&n("rightId")));
+                    }
+                    if *name == n("Right") {
+                        assert!(!context.environment.contains(&n("leftId")));
+                    }
+                    assert!(seen.started.insert(name.clone()), "one council per miss");
+                    seen.active += 1;
+                    seen.peak = seen.peak.max(seen.active);
+                    wake.notify_all();
+                    if *name == n("Left") || *name == n("Right") {
+                        let other = if *name == n("Left") {
+                            n("Right")
+                        } else {
+                            n("Left")
+                        };
+                        let (after, _) = wake
+                            .wait_timeout_while(seen, Duration::from_secs(10), |seen| {
+                                !seen.started.contains(&other)
+                            })
+                            .unwrap();
+                        seen = after;
+                        // The timeout is only a deadlock watchdog: correctness is
+                        // the observed rendezvous, not either operation's speed.
+                        assert!(
+                            seen.started.contains(&other),
+                            "ready councils were serialized"
+                        );
+                    }
+                    drop(seen);
+                    let result = context.check_decoded_olean(decoded, &options, limits.check);
+                    let mut seen = visits.lock().unwrap();
+                    seen.active -= 1;
+                    if matches!(result, Ok(Outcome::Complete(_))) {
+                        seen.finished.insert(name.clone());
+                    }
+                    wake.notify_all();
+                    result
+                };
+                let composed = engine
+                    .compose_recorded_modules_with(
+                        &all,
+                        &options,
+                        limits,
+                        &ReuseVerified {
+                            checker,
+                            store: &store,
+                        },
+                        None,
+                        &council,
+                    )
+                    .expect("real councils complete")
+                    .into_complete()
+                    .expect("the scheduler returns a complete answer")
+                    .expect("the diamond uses only declared imports");
+                assert_eq!(composed.reused, usize::from(warm_base));
+                assert_eq!(composed.records.len(), 4 - usize::from(warm_base));
+                let seen = visits.lock().unwrap();
+                assert_eq!(seen.active, 0);
+                assert_eq!(
+                    seen.peak, 2,
+                    "the diamond has two ready independent siblings"
+                );
+                assert!(seen.peak <= threads);
+                assert_eq!(seen.finished.len(), 4);
+                drop(seen);
+                let actual = engine
+                    .activate_source_metadata(
+                        composed.checked,
+                        &all,
+                        &[n("Main")],
+                        &options,
+                        limits,
+                        None,
+                    )
+                    .expect("the common metadata activation succeeds")
+                    .into_complete()
+                    .expect("metadata is complete");
+                same_import(&cold, &actual);
+                same_source_contexts(&cold, &actual);
+            }
+        }
+    });
+}
+
+#[test]
+fn parallel_cold_mixed_and_reused_imports_publish_the_serial_roots() {
+    on_import_stack(|| {
+        let artifacts = source_diamond("");
+        let all = inputs(&artifacts);
+        let roots = [n("Main")];
+        let options = KVMap::new();
+        let engine = Engine::builder().build_empty();
+        let (cold, _) = import_with(&all, &roots, ImportPostureRequest::Recheck);
+        for threads in [1, 8] {
+            for warm_base in [false, true] {
+                let store = Memory::default();
+                let checker = identity("public parallel module reuse");
+                if warm_base {
+                    let base = subset(&artifacts, &["Base"]);
+                    import_with(&inputs(&base), &[n("Base")], reuse(checker, &store));
+                }
+                let import = || {
+                    engine
+                        .import_olean_modules_with_posture(
+                            &all,
+                            &roots,
+                            &options,
+                            limits(threads),
+                            reuse(checker, &store),
+                            None,
+                        )
+                        .expect("public import succeeds")
+                        .into_complete()
+                        .expect("public import is complete")
+                };
+                let (actual, report) = import();
+                assert_eq!(report.reused_modules, usize::from(warm_base));
+                assert_eq!(report.council_modules, 4 - usize::from(warm_base));
+                assert_eq!(module_records(&store).len(), 4);
+                same_import(&cold, &actual);
+                same_source_contexts(&cold, &actual);
+                let (again, report) = import();
+                assert_eq!((report.reused_modules, report.council_modules), (4, 0));
+                assert_eq!(report.record, RecordLookup::Hit);
+                same_import(&cold, &again);
+            }
+        }
+    });
+}
+
+#[test]
+fn cancellation_after_parallel_councils_never_dispatches_their_importer() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Cancelled(AtomicBool);
+    impl CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    on_import_stack(|| {
+        let artifacts = source_diamond("");
+        let all = inputs(&artifacts);
+        let options = KVMap::new();
+        let store = Memory::default();
+        let checker = identity("cancel parallel module councils");
+        let cancelled = Cancelled(AtomicBool::new(false));
+        let started = Mutex::new(BTreeSet::new());
+        let limits = limits(8);
+        let council = |name: &Name, context: &Engine, decoded: DecodedOlean| {
+            started.lock().unwrap().insert(name.clone());
+            let result = context.check_decoded_olean(decoded, &options, limits.check);
+            if *name == n("Left") {
+                cancelled.0.store(true, Ordering::SeqCst);
+            }
+            result
+        };
+        let outcome = Engine::builder()
+            .build_empty()
+            .compose_recorded_modules_with(
+                &all,
+                &options,
+                limits,
+                &ReuseVerified {
+                    checker,
+                    store: &store,
+                },
+                Some(&cancelled),
+                &council,
+            )
+            .expect("cancellation remains a nonanswer");
+        assert!(matches!(outcome, Outcome::Inconclusive(reason)
+            if matches!(reason.cause, fln_core::outcome::InconclusiveCause::Cancelled { .. })));
+        assert_eq!(
+            *started.lock().unwrap(),
+            [n("Base"), n("Left"), n("Right")].into_iter().collect(),
+            "the already-dispatched siblings settle, and Main never starts",
+        );
+        assert!(store.0.lock().unwrap().is_empty());
+        let (recovered, report) = import_with(&all, &[n("Main")], reuse(checker, &store));
+        assert_eq!((report.reused_modules, report.council_modules), (0, 4));
+        let (cold, _) = import_with(&all, &[n("Main")], ImportPostureRequest::Recheck);
+        same_import(&cold, &recovered);
+    });
 }
 
 #[test]
@@ -386,50 +616,53 @@ fn cancelled_or_exhausted_composition_publishes_nothing_and_retries_cleanly() {
             target: module_reuse_key(right, &[base_key], &KVMap::new(), checker),
             observed: AtomicBool::new(false),
         };
-        let cancelled = Engine::builder()
-            .build_empty()
-            .import_olean_modules_with_posture(
-                &all,
-                &[n("Main")],
-                &KVMap::new(),
-                limits(1),
-                reuse(checker, &cancel),
-                Some(&cancel),
-            )
-            .expect("cancellation is a nonanswer, not an import error");
-        assert!(
-            cancel.observed.load(Ordering::SeqCst),
-            "composition reached the new sibling"
-        );
-        assert!(matches!(cancelled, Outcome::Inconclusive(reason)
+        for threads in [1, 8] {
+            cancel.observed.store(false, Ordering::SeqCst);
+            let cancelled = Engine::builder()
+                .build_empty()
+                .import_olean_modules_with_posture(
+                    &all,
+                    &[n("Main")],
+                    &KVMap::new(),
+                    limits(threads),
+                    reuse(checker, &cancel),
+                    Some(&cancel),
+                )
+                .expect("cancellation is a nonanswer, not an import error");
+            assert!(
+                cancel.observed.load(Ordering::SeqCst),
+                "composition reached the new sibling"
+            );
+            assert!(matches!(cancelled, Outcome::Inconclusive(reason)
             if matches!(reason.cause, InconclusiveCause::Cancelled { .. })));
-        assert_eq!(
-            *store.0.lock().unwrap(),
-            before,
-            "cancelled work publishes no records"
-        );
+            assert_eq!(
+                *store.0.lock().unwrap(),
+                before,
+                "cancelled work publishes no records"
+            );
 
-        let mut limited = limits(1);
-        let kernel = limited.check.admission.kernel;
-        limited.check.admission.kernel = kernel.narrowed(0, kernel.depth);
-        let exhausted = Engine::builder()
-            .build_empty()
-            .import_olean_modules_with_posture(
-                &all,
-                &[n("Main")],
-                &KVMap::new(),
-                limited,
-                reuse(checker, &store),
-                None,
-            )
-            .expect("an exhausted council is a nonanswer, not an import error");
-        assert!(matches!(exhausted, Outcome::Inconclusive(reason)
+            let mut limited = limits(threads);
+            let kernel = limited.check.admission.kernel;
+            limited.check.admission.kernel = kernel.narrowed(0, kernel.depth);
+            let exhausted = Engine::builder()
+                .build_empty()
+                .import_olean_modules_with_posture(
+                    &all,
+                    &[n("Main")],
+                    &KVMap::new(),
+                    limited,
+                    reuse(checker, &store),
+                    None,
+                )
+                .expect("an exhausted council is a nonanswer, not an import error");
+            assert!(matches!(exhausted, Outcome::Inconclusive(reason)
             if matches!(reason.cause, InconclusiveCause::ResourceExhausted { .. })));
-        assert_eq!(
-            *store.0.lock().unwrap(),
-            before,
-            "exhausted work publishes no records"
-        );
+            assert_eq!(
+                *store.0.lock().unwrap(),
+                before,
+                "exhausted work publishes no records"
+            );
+        }
 
         let (cold, _) = import_with(&all, &[n("Main")], ImportPostureRequest::Recheck);
         let (recovered, report) = import_with(&all, &[n("Main")], reuse(checker, &store));
@@ -493,6 +726,120 @@ fn raw_module(name: &str, constants: &[ConstantInfo], imports: &[&str]) -> (Name
     )
     .expect("the native writer emits a real checking artifact");
     (n(name), [encoded.bytes, Vec::new(), Vec::new()])
+}
+
+#[test]
+fn an_earlier_dependent_failure_wins_over_a_later_ready_failure() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    on_import_stack(|| {
+        let artifacts = vec![
+            raw_module(
+                "Fixture.A",
+                &[
+                    axiom("Fixture.P", Expr::sort(Level::zero())),
+                    axiom("Fixture.p", constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            raw_module(
+                "Fixture.B",
+                &[theorem("Fixture.invalidProof", constant("Fixture.P"))],
+                &["Fixture.A"],
+            ),
+            raw_module(
+                "Fixture.C",
+                &[axiom("Fixture.missingType", constant("Fixture.absent"))],
+                &[],
+            ),
+            raw_module(
+                "Fixture.D",
+                &[axiom("Fixture.unneeded", Expr::sort(Level::zero()))],
+                &[],
+            ),
+        ];
+        let all = inputs(&artifacts);
+        let options = KVMap::new();
+        let engine = Engine::builder().build_empty();
+        let serial = match engine.check_olean_modules(&all, &options, limits(1).check) {
+            Err(error @ OleanCheckError::Admission(_)) => error,
+            other => panic!("the serial door must reach B's bad proof: {other:?}"),
+        };
+        let store = Memory::default();
+        let checker = identity("canonical parallel module refusal");
+        let visits = Mutex::new((BTreeSet::new(), BTreeSet::new()));
+        let wake = Condvar::new();
+        let parallel = limits(2);
+        let council = |name: &Name, context: &Engine, decoded: DecodedOlean| {
+            let mut seen = visits.lock().unwrap();
+            seen.0.insert(name.clone());
+            if *name == n("Fixture.A") {
+                let (after, _) = wake
+                    .wait_timeout_while(seen, Duration::from_secs(10), |seen| {
+                        !seen.1.contains(&n("Fixture.C"))
+                    })
+                    .unwrap();
+                seen = after;
+                assert!(seen.1.contains(&n("Fixture.C")), "C must settle first");
+            }
+            if *name == n("Fixture.B") {
+                assert!(seen.1.contains(&n("Fixture.A")), "B waits for A");
+                assert!(seen.1.contains(&n("Fixture.C")), "C has already failed");
+            }
+            drop(seen);
+            let result = context.check_decoded_olean(decoded, &options, parallel.check);
+            if *name == n("Fixture.C") {
+                assert!(matches!(
+                    result,
+                    Err(OleanCheckError::MissingConstants { .. })
+                ));
+            }
+            visits.lock().unwrap().1.insert(name.clone());
+            wake.notify_all();
+            result
+        };
+        let actual = engine.compose_recorded_modules_with(
+            &all,
+            &options,
+            parallel,
+            &ReuseVerified {
+                checker,
+                store: &store,
+            },
+            None,
+            &council,
+        );
+        match actual {
+            Err(error) => assert_eq!(error, serial, "canonical B wins over faster C"),
+            _ => panic!("composition must preserve the serial failure"),
+        }
+        assert_eq!(
+            visits.lock().unwrap().0,
+            [n("Fixture.A"), n("Fixture.B"), n("Fixture.C")]
+                .into_iter()
+                .collect(),
+            "no new work is dispatched beyond the known failure",
+        );
+        assert!(store.0.lock().unwrap().is_empty());
+        for threads in [1, 8] {
+            let outcome = engine.import_olean_modules_with_posture(
+                &all,
+                &[n("Fixture.B"), n("Fixture.C"), n("Fixture.D")],
+                &options,
+                limits(threads),
+                reuse(checker, &store),
+                None,
+            );
+            assert!(
+                matches!(outcome, Err(SourceOleanImportError::Check(error)) if *error == serial)
+            );
+            assert!(
+                store.0.lock().unwrap().is_empty(),
+                "failed imports publish nothing"
+            );
+        }
+    });
 }
 
 #[test]

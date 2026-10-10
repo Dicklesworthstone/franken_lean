@@ -882,6 +882,147 @@ struct ComposedModules {
     reused: usize,
 }
 
+/// A module keeps only its declared import world while its council is running.
+/// Record storage stays on the coordinator; workers never need a shared store.
+struct ComposedModuleContext {
+    index: usize,
+    name: Name,
+    engine: Engine,
+    key: ImportClosureKey,
+    content_root: LogicalRoot,
+}
+
+struct ComposedCouncilJob<'a> {
+    context: ComposedModuleContext,
+    decoded: DecodedOlean,
+    parts: Vec<&'a [u8]>,
+}
+
+type ComposedCouncilResult = Result<Outcome<CheckedOlean>, OleanCheckError>;
+
+struct ComposedModuleDone {
+    context: ComposedModuleContext,
+    result: ComposedCouncilResult,
+    reused: bool,
+}
+
+struct ComposedModuleAdmission {
+    scheduled: ScheduledOleanModule,
+    engine: Engine,
+    record: Option<Result<(ImportClosureKey, ModuleReuseRecord), ImportReuseRefusal>>,
+}
+
+impl ComposedModuleContext {
+    fn retain(
+        self,
+        checked: CheckedOlean,
+        reused: bool,
+        checker: CheckerIdentity,
+        limits: OleanCheckLimits,
+    ) -> Result<ComposedModuleAdmission, OleanCheckError> {
+        let record = (!reused).then(|| {
+            ModuleReuseRecord::from_checked(
+                &self.name,
+                &checked,
+                self.key,
+                checker,
+                self.content_root,
+            )
+            .map(|record| (self.key, record))
+        });
+        let mut admitted = Vec::new();
+        let mut closure_digests = Vec::with_capacity(checked.decoded.constants.len());
+        for info in &checked.decoded.constants {
+            let Some(entry) = checked.engine.environment.entry(info.name()) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "a checked module reuse constant has no environment entry",
+                });
+            };
+            closure_digests.push(Some(entry.digest()));
+            if !self.engine.environment.contains(info.name()) {
+                admitted.push(entry);
+            }
+        }
+        let checker_entries = if reused {
+            BTreeMap::new()
+        } else {
+            frontier_checker_entries(&checked.engine, &admitted, limits)
+        };
+        let mut engine = checked.engine;
+        let mut imported = (*engine.imported_modules).clone();
+        imported.insert(self.name.clone());
+        engine.imported_modules = std::sync::Arc::new(imported);
+        let module = std::sync::Arc::new(FrontierAccepted {
+            index: self.index,
+            position: self.index,
+            name: self.name,
+            admitted,
+        });
+        Ok(ComposedModuleAdmission {
+            scheduled: ScheduledOleanModule {
+                module,
+                decoded: checked.decoded,
+                declarations: checked.declarations,
+                closure_digests,
+                checker_entries,
+            },
+            engine,
+            record,
+        })
+    }
+}
+
+/// Dispatch a bounded ready batch before joining any worker. Joining in dispatch
+/// order does not choose the import's answer: a later ready module can fail before
+/// an earlier dependent module is ready, so the coordinator retains that failure.
+fn run_composed_councils(
+    jobs: Vec<ComposedCouncilJob<'_>>,
+    limits: SourceOleanImportLimits,
+    council: &(impl Fn(&Name, &Engine, DecodedOlean) -> ComposedCouncilResult + Sync),
+) -> Result<Vec<ComposedModuleDone>, OleanCheckError> {
+    let check = |job: ComposedCouncilJob<'_>| {
+        let ComposedCouncilJob {
+            context,
+            mut decoded,
+            parts,
+        } = job;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The independent seat reads the original bytes itself only for
+            // misses. A primary decode never stands in for that reading.
+            decoded.independent = independent_reading(&parts, limits.check.decode);
+            council(&context.name, &context.engine, decoded)
+        }))
+        .unwrap_or_else(|payload| Err(frontier_unwound(payload)));
+        ComposedModuleDone {
+            context,
+            result,
+            reused: false,
+        }
+    };
+    if limits.jobs.threads.get() == 1 {
+        return Ok(jobs.into_iter().map(check).collect());
+    }
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let check = &check;
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("fln-import-reuse-{}", job.context.index))
+                    .stack_size(limits.jobs.worker_stack_bytes)
+                    .spawn_scoped(scope, move || check(job))
+                    .map_err(|_| OleanCheckError::InternalInvariant {
+                        detail: "could not start a module reuse council worker",
+                    })?,
+            );
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(frontier_unwound))
+            .collect()
+    })
+}
+
 impl Engine {
     /// [`Engine::import_olean_modules_for_source_with_cancel`] under an explicit posture.
     ///
@@ -1076,6 +1217,28 @@ impl Engine {
         reuse: &ReuseVerified<'_>,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<Option<ComposedModules>>, OleanCheckError> {
+        self.compose_recorded_modules_with(
+            modules,
+            options,
+            limits,
+            reuse,
+            cancellation,
+            &|_, context, decoded| context.check_decoded_olean(decoded, options, limits.check),
+        )
+    }
+
+    /// The supplied council is the actual module admission operation. Keeping the
+    /// scheduler separate lets its tests synchronize real councils at entry without
+    /// substituting an admission or adding timing assumptions to their assertions.
+    fn compose_recorded_modules_with(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+        reuse: &ReuseVerified<'_>,
+        cancellation: Option<&dyn CancellationProbe>,
+        council: &(impl Fn(&Name, &Engine, DecodedOlean) -> ComposedCouncilResult + Sync),
+    ) -> Result<Outcome<Option<ComposedModules>>, OleanCheckError> {
         if self.environment != Environment::new() || !self.imported_modules.is_empty() {
             return Ok(Outcome::Complete(None));
         }
@@ -1137,163 +1300,207 @@ impl Engine {
                 .collect(),
         );
         let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
-        let mut scheduled = Vec::with_capacity(count);
-        let mut records = Vec::new();
-        let mut unrecordable = None;
+        let mut scheduled: Vec<Option<ScheduledOleanModule>> = (0..count).map(|_| None).collect();
+        let mut module_records = (0..count).map(|_| None).collect::<Vec<_>>();
         let mut reused = 0;
-        let mut ambient = self.environment.clone();
         let names: Vec<Name> = ordered.iter().map(|(name, _)| name.clone()).collect();
-        for (index, (name, artifact)) in ordered.into_iter().enumerate() {
-            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
-                    "import-reuse/module",
-                )));
+        let mut artifacts: Vec<_> = ordered
+            .into_iter()
+            .map(|(_, artifact)| Some(artifact))
+            .collect();
+        let mut decided = vec![false; count];
+        let mut stop_at = count;
+        let mut stopped: Option<ComposedModuleDone> = None;
+        let mut cancelled = false;
+        loop {
+            cancelled |= cancellation.is_some_and(CancellationProbe::is_cancelled);
+            if cancelled || decided[..stop_at].iter().all(|done| *done) {
+                break;
             }
-            let base = engines.release(index, &closures, true)?;
-            let closure = closures[index]
-                .iter()
-                .filter(|member| **member != index)
-                .filter_map(|member| accepted[*member].clone())
-                .collect();
-            let job = FrontierJob {
-                index,
-                position: index,
-                name: name.clone(),
-                artifact,
-                base,
-                closure,
-                retain: true,
-            };
-            let context = self.frontier_closure_engine(&job)?;
-            let mut decoded = job.artifact;
-            let content_root = match module_content_root(&decoded, options, cancellation) {
-                Outcome::Complete(root) => root,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            let key = keys[index];
-            let record = reuse
-                .store
-                .load(key)
-                .ok()
-                .flatten()
-                .and_then(|bytes| ModuleReuseRecord::parse(&bytes).ok());
-            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
-                    "import-reuse/module-lookup",
-                )));
-            }
-            let hit = match record {
-                Some(record) => match context.rebuild_recorded_module(
-                    &name,
-                    &decoded,
-                    key,
-                    reuse.checker,
-                    &record,
-                    content_root,
-                    options,
-                    cancellation,
-                ) {
-                    Outcome::Complete(Ok(checked)) => Some(checked),
-                    Outcome::Complete(Err(_)) => None,
+            let mut cold = Vec::new();
+            let mut completed = Vec::new();
+            // Only accepted dependencies make a module ready. A warm hit takes a
+            // batch slot too, bounding retained contexts before they are released.
+            for index in 0..stop_at {
+                if cold.len() + completed.len() >= limits.jobs.threads.get() {
+                    break;
+                }
+                if decided[index]
+                    || !dependencies[index]
+                        .iter()
+                        .all(|dependency| accepted[*dependency].is_some())
+                {
+                    continue;
+                }
+                let Some(artifact) = artifacts[index].take() else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "a ready reuse module has no decoded artifact",
+                    });
+                };
+                let base = engines.release(index, &closures, true)?;
+                let closure = closures[index]
+                    .iter()
+                    .filter(|member| **member != index)
+                    .filter_map(|member| accepted[*member].clone())
+                    .collect();
+                let job = FrontierJob {
+                    index,
+                    position: index,
+                    name: names[index].clone(),
+                    artifact,
+                    base,
+                    closure,
+                    retain: true,
+                };
+                let engine = self.frontier_closure_engine(&job)?;
+                let decoded = job.artifact;
+                let content_root = match module_content_root(&decoded, options, cancellation) {
+                    Outcome::Complete(root) => root,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                },
-                None => None,
-            };
-            let from_record = hit.is_some();
-            let checked = match hit {
-                Some(checked) => {
-                    reused += 1;
-                    checked
+                };
+                let key = keys[index];
+                let record = reuse
+                    .store
+                    .load(key)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| ModuleReuseRecord::parse(&bytes).ok());
+                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                        "import-reuse/module-lookup",
+                    )));
                 }
-                None => {
-                    // The independent seat reads the original bytes itself only for
-                    // misses. A primary decode is never passed off as its reading.
-                    let input = inputs[&name];
+                let hit = match record {
+                    Some(record) => match engine.rebuild_recorded_module(
+                        &names[index],
+                        &decoded,
+                        key,
+                        reuse.checker,
+                        &record,
+                        content_root,
+                        options,
+                        cancellation,
+                    ) {
+                        Outcome::Complete(Ok(checked)) => Some(checked),
+                        Outcome::Complete(Err(_)) => None,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    },
+                    None => None,
+                };
+                let context = ComposedModuleContext {
+                    index,
+                    name: names[index].clone(),
+                    engine,
+                    key,
+                    content_root,
+                };
+                if let Some(checked) = hit {
+                    completed.push(ComposedModuleDone {
+                        context,
+                        result: Ok(Outcome::Complete(checked)),
+                        reused: true,
+                    });
+                } else {
+                    let input = inputs[&names[index]];
                     let mut parts = vec![input.artifact];
                     parts.extend(input.server_artifact);
                     parts.extend(input.private_artifact);
-                    decoded.independent = independent_reading(&parts, limits.check.decode);
-                    match context.check_composed_module(decoded, options, limits) {
-                        Ok(Outcome::Complete(checked)) => checked,
-                        Ok(Outcome::Inconclusive(reason)) => {
-                            return Ok(Outcome::Inconclusive(reason));
+                    cold.push(ComposedCouncilJob {
+                        context,
+                        decoded,
+                        parts,
+                    });
+                }
+            }
+            if cold.is_empty() && completed.is_empty() {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "the module reuse schedule stalled with modules undecided",
+                });
+            }
+            completed.extend(run_composed_councils(cold, limits, council)?);
+            completed.sort_by_key(|done| done.context.index);
+            for done in completed {
+                let ComposedModuleDone {
+                    context,
+                    result,
+                    reused: from_record,
+                } = done;
+                let index = context.index;
+                decided[index] = true;
+                match result {
+                    Ok(Outcome::Complete(checked)) => {
+                        let kept =
+                            context.retain(checked, from_record, reuse.checker, limits.check)?;
+                        accepted[index] = Some(std::sync::Arc::clone(&kept.scheduled.module));
+                        engines.keep(index, Some(kept.engine));
+                        scheduled[index] = Some(kept.scheduled);
+                        module_records[index] = kept.record;
+                        reused += usize::from(from_record);
+                    }
+                    result => {
+                        if index < stop_at {
+                            stop_at = index;
+                            stopped = Some(ComposedModuleDone {
+                                context,
+                                result,
+                                reused: from_record,
+                            });
                         }
-                        Ok(Outcome::InternalFault(fault)) => {
-                            return Ok(Outcome::InternalFault(fault));
-                        }
-                        Err(OleanCheckError::MissingConstants { names, .. })
-                            if !names.is_empty()
-                                && names.iter().all(|name| {
-                                    ambient.contains(name) && !context.environment.contains(name)
-                                }) =>
-                        {
-                            // Preserve the serial door's established behavior for a
-                            // declaration relying on an undeclared sibling module.
-                            // None of this abandoned attempt's records is published.
-                            return Ok(Outcome::Complete(None));
-                        }
-                        Err(error) => return Err(error),
                     }
                 }
-            };
-            if !from_record {
-                match ModuleReuseRecord::from_checked(
-                    &name,
-                    &checked,
-                    key,
-                    reuse.checker,
-                    content_root,
-                ) {
-                    Ok(record) => records.push((key, record)),
-                    Err(refusal) => unrecordable = Some(refusal),
-                }
             }
-            let mut admitted = Vec::new();
-            let mut closure_digests = Vec::with_capacity(checked.decoded.constants.len());
-            for info in &checked.decoded.constants {
-                let Some(entry) = checked.engine.environment.entry(info.name()) else {
-                    return Err(OleanCheckError::InternalInvariant {
-                        detail: "a checked module reuse constant has no environment entry",
-                    });
-                };
-                closure_digests.push(Some(entry.digest()));
-                if !context.environment.contains(info.name()) {
-                    ambient = merge_frontier_entry(ambient, &entry)?;
-                    admitted.push(entry);
+        }
+        if !decided[..stop_at].iter().all(|done| *done) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/module",
+            )));
+        }
+        if let Some(stopped) = stopped {
+            return match stopped.result {
+                Err(error @ OleanCheckError::MissingConstants { .. }) => {
+                    let OleanCheckError::MissingConstants { names, .. } = &error else {
+                        unreachable!();
+                    };
+                    // Only canonical predecessors can justify the established
+                    // serial fallback, never a later sibling that finished early.
+                    let mut ambient = self.environment.clone();
+                    for scheduled in scheduled[..stop_at].iter().flatten() {
+                        for entry in &scheduled.module.admitted {
+                            ambient = merge_frontier_entry(ambient, entry)?;
+                        }
+                    }
+                    if !names.is_empty()
+                        && names.iter().all(|name| {
+                            ambient.contains(name)
+                                && !stopped.context.engine.environment.contains(name)
+                        })
+                    {
+                        // No record from this abandoned composition is published.
+                        Ok(Outcome::Complete(None))
+                    } else {
+                        Err(error)
+                    }
                 }
-            }
-            let checker_entries = if from_record {
-                BTreeMap::new()
-            } else {
-                frontier_checker_entries(&checked.engine, &admitted, limits.check)
+                Err(error) => Err(error),
+                Ok(Outcome::Inconclusive(reason)) => Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => Ok(Outcome::InternalFault(fault)),
+                Ok(Outcome::Complete(_)) => Err(OleanCheckError::InternalInvariant {
+                    detail: "a stopped module reuse council retained a successful result",
+                }),
             };
-            let mut engine = checked.engine;
-            let mut imported = (*engine.imported_modules).clone();
-            imported.insert(name.clone());
-            engine.imported_modules = std::sync::Arc::new(imported);
-            let module = std::sync::Arc::new(FrontierAccepted {
-                index,
-                position: index,
-                name,
-                admitted,
-            });
-            accepted[index] = Some(std::sync::Arc::clone(&module));
-            engines.keep(index, Some(engine));
-            scheduled.push(ScheduledOleanModule {
-                module,
-                decoded: checked.decoded,
-                declarations: checked.declarations,
-                closure_digests,
-                checker_entries,
-            });
         }
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                 "import-reuse/assemble",
             )));
         }
+        let scheduled = scheduled.into_iter().collect::<Option<Vec<_>>>().ok_or(
+            OleanCheckError::InternalInvariant {
+                detail: "a completed module reuse schedule lost an accepted module",
+            },
+        )?;
         let checked = if reused == 0 {
             self.reassemble_olean_module_set(names, scheduled, true, options, limits.check)?
         } else {
@@ -1303,37 +1510,20 @@ impl Engine {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             }
         };
+        let mut records = Vec::new();
+        let mut unrecordable = None;
+        for record in module_records.into_iter().flatten() {
+            match record {
+                Ok(record) => records.push(record),
+                Err(refusal) => unrecordable = Some(refusal),
+            }
+        }
         Ok(Outcome::Complete(Some(ComposedModules {
             checked,
             records,
             unrecordable,
             reused,
         })))
-    }
-
-    /// A cold module uses the same configured worker stack as the scheduled council
-    /// door. The caller's admission budget was calibrated for that stack; silently
-    /// running it on the calling thread would change its resource contract.
-    fn check_composed_module(
-        &self,
-        decoded: DecodedOlean,
-        options: &KVMap,
-        limits: SourceOleanImportLimits,
-    ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
-        let check = || self.check_decoded_olean(decoded, options, limits.check);
-        if limits.jobs.threads.get() == 1 {
-            return check();
-        }
-        std::thread::scope(|scope| {
-            let worker = std::thread::Builder::new()
-                .name("fln-import-reuse-council".to_owned())
-                .stack_size(limits.jobs.worker_stack_bytes)
-                .spawn_scoped(scope, check)
-                .map_err(|_| OleanCheckError::InternalInvariant {
-                    detail: "could not start a module reuse council worker",
-                })?;
-            worker.join().map_err(frontier_unwound)?
-        })
     }
 
     /// The module form of the D6 carve-out, confined to this same file. It starts
