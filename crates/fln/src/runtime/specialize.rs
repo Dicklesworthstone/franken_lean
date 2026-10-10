@@ -771,7 +771,7 @@ impl Preparation<'_> {
                 continue;
             }
             if let Some(literal) = self.inert_callable(argument)? {
-                let literal = self.retain_staged_callable_type(literal, binder_type)?;
+                let literal = self.retain_substituted_callable_type(literal, binder_type, body)?;
                 head = self.substitution(body, &literal)?;
                 consumed += 1;
                 continue;

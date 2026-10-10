@@ -273,6 +273,28 @@ impl Preparation<'_> {
         self.typed_callable_result(value, type_, result)
     }
 
+    /// Substituting an inert function argument can forward it to a runtime
+    /// consumer whose type is no longer available to expression preparation.
+    /// Preserve the checked outer type at such value occurrences, including
+    /// ordinary flat callbacks. Direct callee uses still expose their literal
+    /// syntax, while staged callbacks retain their existing return annotations.
+    pub(in crate::runtime) fn retain_substituted_callable_type(
+        &mut self,
+        value: Expr,
+        type_: &Expr,
+        body: &Expr,
+    ) -> Result<Expr, IngressError> {
+        if !self.type_parameter(type_)? {
+            let type_ = self.normalize_type(type_)?;
+            if let Some(result @ ValueType::Closure(_)) = self.value_type(&type_)?
+                && !self.only_callee_uses(body)?
+            {
+                return self.typed_callable_result(value, type_, result);
+            }
+        }
+        self.retain_staged_callable_type(value, type_)
+    }
+
     fn only_callee_uses(&mut self, body: &Expr) -> Result<bool, IngressError> {
         let mut pending = vec![(body.clone(), 0usize, false)];
         let mut used = false;
@@ -490,7 +512,7 @@ impl Preparation<'_> {
             let offset = self.producer_depth(bindings.len())?;
             let argument = self.lift(argument, offset)?;
             if let Some(lambda) = self.inert_callable(&argument)? {
-                let lambda = self.retain_staged_callable_type(lambda, domain)?;
+                let lambda = self.retain_substituted_callable_type(lambda, domain, body)?;
                 // Captures already name runtime values, not initializer code.
                 // The charged capture-avoiding substitution adjusts both the
                 // removed parameter and all retained strict argument slots.
