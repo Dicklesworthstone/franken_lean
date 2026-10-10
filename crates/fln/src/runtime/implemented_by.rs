@@ -41,12 +41,11 @@ impl Preparation<'_> {
             .expect("only validated implementation tables are cached"))
     }
 
-    /// Static dictionary evidence cannot unfold the logical body of an
-    /// executable replacement. Leave such values on the ordinary execution
-    /// path; substituting replacement fields into dependent types would also
-    /// change the logical type plane.
+    /// Static dictionaries cannot unfold a logical body with an explicit
+    /// replacement or recursive executable companion. Leave these values on
+    /// the execution path; neither body may replace dependent type metadata.
     pub(super) fn has_implementation(&mut self, name: &Name) -> Result<bool, IngressError> {
-        Ok(self.implementations()?.get(name).is_some())
+        Ok(self.implementations()?.get(name).is_some() || self.has_recursive_companion(name)?)
     }
 
     /// An attribute authorizes selecting this checked target, not executing an
@@ -57,9 +56,39 @@ impl Preparation<'_> {
         &mut self,
         requested: &Name,
     ) -> Result<Option<Name>, IngressError> {
-        let Some(target) = self.implementations()?.implementation(requested).cloned() else {
+        let parent = self.recursive_parent_candidate(requested);
+        if self
+            .implementations()?
+            .get(parent.as_ref().unwrap_or(requested))
+            .is_none()
+        {
             return Ok(None);
-        };
+        }
+        let mut target = requested.clone();
+        let mut replaced = false;
+        let mut seen = HashSet::new();
+        loop {
+            self.tick()?;
+            if let Some(parent) = self.recursive_parent(&target)? {
+                target = parent;
+            }
+            seen.try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: seen.len().saturating_add(1),
+                })?;
+            if !seen.insert(target.clone()) {
+                return Err(unsupported("implemented_by recursive companion cycle"));
+            }
+            let Some(next) = self.implementations()?.get(&target).cloned() else {
+                break;
+            };
+            replaced = true;
+            target = next;
+        }
+        if !replaced {
+            return Ok(None);
+        }
         self.tick()?;
         let safe_target = match self.environment.find(&target) {
             Some(ConstantInfo::Defn(value)) => value.safety != DefinitionSafety::Unsafe,
@@ -99,9 +128,9 @@ impl Preparation<'_> {
         if native {
             return Ok(Some(target));
         }
-        // `target` is a terminal table entry: this call cannot recurse through
-        // another replacement. It applies the existing safe/partial body gate.
-        if self.executable_definition(&target)?.is_none() {
+        // Attribute and companion-parent edges were resolved iteratively above.
+        // Only the raw body/linkage gate runs here, never recursive lookup.
+        if self.recursive_definition(&target)?.is_none() {
             return Err(unsupported(
                 "implemented_by target has no supported safe or partial executable body",
             ));
@@ -125,8 +154,9 @@ impl Preparation<'_> {
         Ok(Some(target))
     }
 
-    /// Rewrite only the executable head. Universes and argument evaluation
-    /// order stay exactly as supplied; type/proof syntax is never traversed.
+    /// Rewrite only the executable head, giving explicit attributes precedence
+    /// over a recursive companion. Universes and argument order are retained;
+    /// type and proof syntax are never traversed by this selector.
     pub(super) fn implemented_by_call(
         &mut self,
         head: &Expr,
@@ -135,7 +165,11 @@ impl Preparation<'_> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
-        let Some(target) = self.implementation_target(name)? else {
+        let target = match self.implementation_target(name)? {
+            Some(target) => Some(target),
+            None => self.recursive_companion_target(name)?,
+        };
+        let Some(target) = target else {
             return Ok(None);
         };
         let source = self

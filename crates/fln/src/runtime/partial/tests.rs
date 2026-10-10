@@ -2,7 +2,7 @@ use super::*;
 use fln_core::level::Level;
 use fln_env::constants::{ConstantVal, OpaqueVal, ReducibilityHints};
 
-fn pair(label: &str) -> (OpaqueVal, DefinitionVal) {
+pub(super) fn pair(label: &str) -> (OpaqueVal, DefinitionVal) {
     let logical = name(label);
     let type_ = Expr::forall_e(
         Name::anonymous(),
