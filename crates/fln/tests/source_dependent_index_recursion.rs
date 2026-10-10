@@ -25,7 +25,7 @@ fn check(text: &str) -> fln::SourceFileCheck {
 const TRACE: &str = "inductive Trace (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n\
   | stop (a : A) (v : P a) : Trace A P a v\n\
   | step (a b : A) (v : P a) (w : P b) (child : Trace A P a v) : Trace A P b w\n\
-def trace : Trace Nat (fun a => Bool) 2 false := Trace.step 1 2 true false (Trace.stop 1 true)\n";
+def trace : Trace Nat (fun a => Bool) 2 false := Trace.step (P := fun a => Bool) 1 2 true false (Trace.stop (P := fun a => Bool) 1 true)\n";
 
 #[test]
 fn dependent_index_matches_refine_result_domains_without_casts() {
@@ -36,8 +36,8 @@ fn dependent_index_matches_refine_result_domains_without_casts() {
         def rebuild {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with
           | .stop x vx => Trace.stop x vx
           | .step x y vx vy child => Trace.step x y vx vy child
-        theorem extracted : extract 2 false trace = false := by rfl
-        theorem rebuilt : rebuild 2 false trace = trace := by rfl"));
+        theorem extracted : extract (P := fun a => Bool) 2 false trace = false := by rfl
+        theorem rebuilt : rebuild (P := fun a => Bool) 2 false trace = trace := by rfl"));
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn recursive_dependent_indices_and_inferred_fixed_families_are_preserved() {
         def copyTrace {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with
           | .stop x vx => Trace.stop x vx
           | .step x y vx vy child => Trace.step x y vx vy (copyTrace x vx child)
-        theorem compute : copyTrace 2 false trace = trace := by rfl
+        theorem compute : copyTrace (P := fun a => Bool) 2 false trace = trace := by rfl
         theorem identity {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (t : Trace A P a v) : copyTrace a v t = t := by
           induction t with
           | stop x vx => rfl
@@ -62,7 +62,7 @@ fn dependent_original_index_names_follow_the_current_constructor() {
         def sumIndices (a : Nat) (v : Bool) (t : Trace Nat (fun a => Bool) a v) : Nat := match t with
           | .stop x vx => a
           | .step x y vx vy child => sumIndices x vx child + a
-        theorem value : current 2 false trace = false := by rfl
+        theorem value : current (P := fun a => Bool) 2 false trace = false := by rfl
         theorem indices : sumIndices 2 false trace = 3 := by rfl"));
 }
 
@@ -75,8 +75,8 @@ fn dependent_prefix_arguments_and_trailing_values_are_generalized_together() {
         def other {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (spare : Trace A P a v) (t : Trace A P a v) : Nat := match t with
           | .stop x vx => 0
           | .step x y vx vy child => other x vx child child + 1
-        theorem count_ok : count 2 false rfl trace 9 = 10 := by rfl
-        theorem other_ok : other 2 false trace trace = 1 := by rfl"));
+        theorem count_ok : count (P := fun a => Bool) 2 false rfl trace 9 = 10 := by rfl
+        theorem other_ok : other (P := fun a => Bool) 2 false trace trace = 1 := by rfl"));
 }
 
 #[test]
@@ -179,9 +179,9 @@ fn field_index_equations_preserve_the_original_major_at_its_actual_type() {
         def original {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with
           | .stop x vx => t
           | .step x y vx vy child => t
-        theorem same : original 2 false trace = trace := by rfl
-        def terminal : Trace Nat (fun a => Bool) 1 true := Trace.stop 1 true
-        theorem stopped : original 1 true terminal = terminal := by rfl"));
+        theorem same : original (P := fun a => Bool) 2 false trace = trace := by rfl
+        def terminal : Trace Nat (fun a => Bool) 1 true := Trace.stop (P := fun a => Bool) 1 true
+        theorem stopped : original (P := fun a => Bool) 1 true terminal = terminal := by rfl"));
 }
 
 #[test]

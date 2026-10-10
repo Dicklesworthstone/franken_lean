@@ -24,7 +24,7 @@
 //! the pin admits is never refused here; universe levels are not compared, which can only admit.
 use super::*;
 use fln_env::constants::ConstantInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Deeper expressions than this are outside the model; each step is one bounded frame.
 const DEPTH: usize = 96;
@@ -82,6 +82,12 @@ struct Model<'c> {
     next: u64,
     /// Source names of pattern variables and placeholders, for messages.
     names: HashMap<FVarId, Name>,
+    /// Arguments whose elaboration the pin postponed (application mode): synthetic placeholders
+    /// that no unification assigns before the application meets its expected type.
+    placeholders: HashSet<Name>,
+    /// Application mode: an unassigned metavariable applied to arguments is the pin's stuck
+    /// equation, which fails against a rigid term (measured, see `check_application_typing`).
+    applications: bool,
 }
 
 impl Context {
@@ -98,6 +104,8 @@ impl Context {
             assigned: HashMap::new(),
             next: 0,
             names: HashMap::new(),
+            placeholders: HashSet::new(),
+            applications: false,
         };
         match model.run(discriminants, alternatives)? {
             Some((actual, expected)) => Err(failure(SourceInferenceError::TypeMismatch {
@@ -107,6 +115,81 @@ impl Context {
             None => Ok(()),
         }
     }
+}
+
+impl Context {
+    /// R1 of franken_lean-z8j.1.6.3: refuse an application the pin refuses because it postponed
+    /// one of its arguments. When an explicit argument's expected type is a metavariable applied
+    /// to terms (`?P 7`, `?P n` for an implicit `{P : A → Type}` the expected type was not
+    /// propagated to, since the result type depends on the explicit arguments) and the
+    /// argument's own type is rigid (`Bool`), `ensureArgType` fails and the coercion is
+    /// postponed: the argument becomes a synthetic placeholder (`Witness.intro 7 ?m.8`). The
+    /// application then meets its expected type before that placeholder is resolved, so where
+    /// the result type puts the placeholder against a rigid term (`… 7 true`) the pin reports a
+    /// type mismatch. So does a result type that is itself such a stuck application against a
+    /// rigid expected type (`g 3 true : ?P 3` against `(fun _ => Bool) 3`). Measured at the pin
+    /// on 2026-10-10 (one file per program): refused with a literal or a local index, a local
+    /// value, under an ascription; accepted when `P` is given (`@`, `(P := …)`), when the
+    /// result does not depend on the explicit arguments (the expected type is propagated
+    /// first), and when the result mentions only `P` itself (`Sigma P`).
+    pub(super) fn check_application_typing(
+        &mut self,
+        syntax: &Syntax,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut model = Model {
+            cx: self,
+            assigned: HashMap::new(),
+            next: 0,
+            names: HashMap::new(),
+            placeholders: HashSet::new(),
+            applications: true,
+        };
+        match model.application_verdict(syntax, expected)? {
+            Some((actual, expected)) => Err(failure(SourceInferenceError::TypeMismatch {
+                actual,
+                expected,
+            })),
+            None => Ok(()),
+        }
+    }
+}
+
+/// An explicit argument as the application model reads it.
+enum Argument {
+    Hole,
+    Numeral(u64),
+    /// A value of a known type (a Boolean constant, a local without a value).
+    Typed(Expr, Expr),
+    /// Anything else: elaborated by the pin in ways the model does not follow.
+    Other,
+}
+
+/// Head-lambda applications reduced (`(fun x => b) a` to `b[a]`), as `whnfCore` does.
+fn beta(expr: Expr, depth: usize) -> Result<Expr, NatDefinitionElabError> {
+    let (head, args) = spine(&expr);
+    if args.is_empty() || !matches!(head.node(), ExprNode::Lam { .. }) || depth > DEPTH {
+        return Ok(expr);
+    }
+    let mut body = head.clone();
+    let mut rest = args.into_iter().cloned().collect::<Vec<_>>().into_iter();
+    let mut leftover = Vec::new();
+    for arg in rest.by_ref() {
+        match body.node() {
+            ExprNode::Lam { body: inner, .. } => {
+                body = inner
+                    .subst_loose(0, std::slice::from_ref(&arg))
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+            }
+            _ => {
+                leftover.push(arg);
+                break;
+            }
+        }
+    }
+    leftover.extend(rest);
+    let reduced = leftover.into_iter().fold(body, Expr::app);
+    beta(reduced, depth + 1)
 }
 
 fn nat() -> Name {
@@ -445,6 +528,46 @@ impl Model<'_> {
         )))
     }
 
+    fn fresh_placeholder(&mut self) -> Expr {
+        self.next += 1;
+        let id = Name::num(Name::from_components(["_fln_pin_pattern", "o"]), self.next);
+        self.placeholders.insert(id.clone());
+        Expr::mvar(MVarId(id))
+    }
+
+    fn placeholder(&self, expr: &Expr) -> bool {
+        matches!(expr.node(), ExprNode::MVar { id } if self.placeholders.contains(&id.0))
+    }
+
+    /// A term that no reduction or assignment turns into anything else: a literal, a rigid
+    /// local, a constructor or type application, a Nat offset.
+    fn rigid_term(&self, expr: &Expr) -> bool {
+        if offset_term(expr).is_some() {
+            return true;
+        }
+        match expr.node() {
+            ExprNode::Lit { .. } => return true,
+            ExprNode::FVar { id } => return self.rigid(id),
+            _ => {}
+        }
+        let (head, _) = spine(expr);
+        const_name(head).is_some_and(|name| self.rigid_head(name))
+    }
+
+    /// `stuck` is an unassigned metavariable applied to terms; against a rigid `other` the pin's
+    /// unifier fails (application mode only).
+    fn stuck_against(&self, stuck: &Expr, other: &Expr) -> Option<Answer> {
+        let (head, args) = spine(stuck);
+        if args.is_empty() || self.model_mvar(head).is_none() {
+            return None;
+        }
+        Some(if self.rigid_term(other) {
+            Answer::No
+        } else {
+            Answer::Unknown
+        })
+    }
+
     fn model_mvar(&self, expr: &Expr) -> Option<Name> {
         let ExprNode::MVar { id } = expr.node() else {
             return None;
@@ -564,8 +687,8 @@ impl Model<'_> {
             return Ok(Answer::Unknown);
         };
         // `e + 0` reduces to `e` (`Nat.add`'s zero case), the shape `whnfD` leaves under a
-        // `Nat.succ` it peeled from `e + 1`.
-        let (left, right) = (without_zero(left), without_zero(right));
+        // `Nat.succ` it peeled from `e + 1`; a head lambda's application reduces (`whnfCore`).
+        let (left, right) = (without_zero(beta(left, 0)?), without_zero(beta(right, 0)?));
         if left == right {
             return Ok(Answer::Yes);
         }
@@ -574,6 +697,27 @@ impl Model<'_> {
         }
         if let Some(id) = self.model_mvar(&right) {
             return Ok(self.assign(id, &left));
+        }
+        // A postponed argument's placeholder is assigned by nothing here, so it never meets a
+        // rigid term.
+        if self.placeholder(&left) || self.placeholder(&right) {
+            let other = if self.placeholder(&left) {
+                &right
+            } else {
+                &left
+            };
+            return Ok(if self.rigid_term(other) {
+                Answer::No
+            } else {
+                Answer::Unknown
+            });
+        }
+        if self.applications
+            && let Some(answer) = self
+                .stuck_against(&left, &right)
+                .or_else(|| self.stuck_against(&right, &left))
+        {
+            return Ok(answer);
         }
         // `isDefEqOffsetNat`: two offset terms compare by their bases once the common offset
         // is cancelled; a smaller literal than the offset is never equal.
@@ -745,10 +889,10 @@ impl Model<'_> {
                 }
             }
             Syntax::Ident { val, .. } => {
-                let resolved = self
-                    .cx
-                    .resolve_source_name(val)?
-                    .unwrap_or_else(|| val.clone());
+                let Ok(resolved) = self.cx.resolve_source_name(val) else {
+                    return Ok(Err(Stop::Unknown));
+                };
+                let resolved = resolved.unwrap_or_else(|| val.clone());
                 if self.constructor(&resolved).is_some() {
                     resolved
                 } else if matches!(val.to_display_string().as_str(), "true" | "false") {
@@ -861,6 +1005,263 @@ impl Model<'_> {
             ))),
             Answer::Unknown => Ok(Err(Stop::Unknown)),
         }
+    }
+
+    /// The pin's `elabAppArgs` over an application written as `c a₁ … aₙ` against `expected`,
+    /// as far as R1 needs it (`check_application_typing`). `None` where the pin's verdict is
+    /// not decided here.
+    fn application_verdict(
+        &mut self,
+        syntax: &Syntax,
+        expected: &Expr,
+    ) -> Result<Option<(String, String)>, NatDefinitionElabError> {
+        let mut syntax = syntax;
+        while let Some(inner) = parenthesized_inner(syntax)? {
+            syntax = inner;
+        }
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return Ok(None);
+        };
+        if kind != &parser_kind(&["Term", "app"]) {
+            return Ok(None);
+        }
+        let [
+            Syntax::Ident { val, .. },
+            Syntax::Node {
+                args: arguments, ..
+            },
+        ] = args.as_slice()
+        else {
+            return Ok(None);
+        };
+        if self.cx.txn.lctx.find_by_user_name(val).is_some() {
+            return Ok(None);
+        }
+        // An ambiguous or unknown head is the elaborator's to report, in the pin's words.
+        let Ok(Some(name)) = self.cx.resolve_source_name(val) else {
+            return Ok(None);
+        };
+        let Some(constant) = self.cx.txn.env.find(&name).cloned() else {
+            return Ok(None);
+        };
+        let expected = self.cx.instantiate(expected)?;
+        if expected.has_expr_mvar() || expected.has_loose_bvars() {
+            return Ok(None);
+        }
+        let mut type_ = constant.constant_val().type_.clone();
+        let mut remaining = arguments.iter();
+        let mut propagated = false;
+        let mut uncertain = false;
+        // The metavariables implicit binders introduced: the measured stuck heads (`{P}`).
+        let mut implicit = HashSet::new();
+        while let ExprNode::ForallE {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = type_.node()
+        {
+            self.cx.tick()?;
+            let (binder_type, body) = (binder_type.clone(), body.clone());
+            let value = if *binder_info == BinderInfo::Default {
+                let Some(syntax) = remaining.next() else {
+                    return Ok(None);
+                };
+                let argument = self.app_argument(syntax)?;
+                if !propagated {
+                    propagated = true;
+                    if !matches!(argument, Argument::Hole)
+                        && let Some(result) = result_type(&type_)
+                        && self.def_eq(&result, &expected)? == Answer::Unknown
+                    {
+                        return Ok(None);
+                    }
+                }
+                let Some(binder) = self.inst(&binder_type, 0)? else {
+                    return Ok(None);
+                };
+                let binder = beta(binder, 0)?;
+                let stuck = {
+                    let (head, args) = spine(&binder);
+                    !args.is_empty()
+                        && self
+                            .model_mvar(head)
+                            .is_some_and(|name| implicit.contains(&name))
+                };
+                match argument {
+                    Argument::Hole => self.fresh_mvar(),
+                    Argument::Numeral(value) => {
+                        if self.model_mvar(&binder).is_some() || const_name(&binder) == Some(&nat())
+                        {
+                            nat_literal(value)
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    Argument::Typed(value, argument_type) => {
+                        if stuck {
+                            // `ensureArgType` fails on the stuck equation and the coercion is
+                            // postponed. An earlier argument the model did not follow could have
+                            // assigned the head, so the placeholder is only certain before one.
+                            if uncertain || !self.rigid_term(&argument_type) {
+                                return Ok(None);
+                            }
+                            self.fresh_placeholder()
+                        } else if self.def_eq(&argument_type, &binder)? == Answer::Yes {
+                            value
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    Argument::Other => {
+                        uncertain = true;
+                        self.fresh_mvar()
+                    }
+                }
+            } else {
+                let hole = self.fresh_mvar();
+                if let Some(name) = self.model_mvar(&hole) {
+                    implicit.insert(name);
+                }
+                hole
+            };
+            type_ = body
+                .subst_loose(0, std::slice::from_ref(&value))
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+        }
+        if remaining.next().is_some() {
+            return Ok(None);
+        }
+        // The application meets its expected type before any postponed argument is resolved.
+        if self.pinned(&type_, &expected, 0)? {
+            return Ok(Some((self.render(&type_, 0)?, self.render(&expected, 0)?)));
+        }
+        if !uncertain && self.def_eq(&type_, &expected)? == Answer::No {
+            let (Some(result), Some(wanted)) = (self.inst(&type_, 0)?, self.inst(&expected, 0)?)
+            else {
+                return Ok(None);
+            };
+            let (result, wanted) = (beta(result, 0)?, beta(wanted, 0)?);
+            // Only the measured stuck result is refused here (`?P 3` for an implicit `{P}` against
+            // a rigid type); any other `No` is left alone. An argument that is a local makes the
+            // equation a pattern the pin may solve (`False.rec _ h : ?motive h`).
+            let (head, args) = spine(&result);
+            let implicit_head = self
+                .model_mvar(head)
+                .is_some_and(|name| implicit.contains(&name));
+            let pattern = args
+                .iter()
+                .any(|arg| matches!(arg.node(), ExprNode::FVar { .. }));
+            if implicit_head && !pattern && self.stuck_against(&result, &wanted) == Some(Answer::No)
+            {
+                return Ok(Some((self.render(&result, 0)?, self.render(&wanted, 0)?)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// An explicit argument's syntax, read as far as R1 needs.
+    fn app_argument(&mut self, syntax: &Syntax) -> Result<Argument, NatDefinitionElabError> {
+        let mut syntax = syntax;
+        while let Some(inner) = parenthesized_inner(syntax)? {
+            syntax = inner;
+        }
+        let hole = parser_kind(&["Term", "hole"]);
+        let synthetic = parser_kind(&["Term", "syntheticHole"]);
+        if matches!(syntax.kind(), Some(kind) if kind == &hole || kind == &synthetic) {
+            return Ok(Argument::Hole);
+        }
+        if syntax.kind() == Some(&Name::from_components(["num"])) {
+            if let Syntax::Node { args, .. } = syntax
+                && let [Syntax::Atom { val, .. }] = args.as_slice()
+                && let Ok(Literal::Nat(value)) = decode_natural(val)
+                && let Some(value) = value.to_u64()
+            {
+                return Ok(Argument::Numeral(value));
+            }
+            return Ok(Argument::Other);
+        }
+        // `(e : T)` with `T` a parameterless inductive type (`Nat`, `Bool`): its type is known
+        // and rigid; its value is left to the elaborator.
+        if syntax.kind() == Some(&parser_kind(&["Term", "typeAscription"])) {
+            if let Syntax::Node { args, .. } = syntax
+                && args.len() == 5
+                && let Syntax::Node {
+                    args: annotation, ..
+                } = &args[3]
+                && let [Syntax::Ident { val, .. }] = annotation.as_slice()
+                && self.cx.txn.lctx.find_by_user_name(val).is_none()
+                && let Ok(Some(name)) = self.cx.resolve_source_name(val)
+                && let Some(info) = self.inductive(&name)
+                && info.num_params == 0
+                && info.num_indices == 0
+                && info.base.level_params.is_empty()
+            {
+                let value = self.fresh_mvar();
+                return Ok(Argument::Typed(value, Expr::const_(name, vec![])));
+            }
+            return Ok(Argument::Other);
+        }
+        let Syntax::Ident { val, .. } = syntax else {
+            return Ok(Argument::Other);
+        };
+        if let Some(decl) = self.cx.txn.lctx.find_by_user_name(val).cloned() {
+            let type_ = self.cx.instantiate(&decl.type_)?;
+            if decl.value.is_some() || type_.has_expr_mvar() {
+                return Ok(Argument::Other);
+            }
+            return Ok(Argument::Typed(Expr::fvar(decl.id), type_));
+        }
+        let display = val.to_display_string();
+        if display == "true" || display == "false" {
+            let bool_ = Name::from_components(["Bool"]);
+            return Ok(Argument::Typed(
+                Expr::const_(bool_.append_core(val), vec![]),
+                Expr::const_(bool_, vec![]),
+            ));
+        }
+        Ok(Argument::Other)
+    }
+
+    /// Whether the result type puts a postponed argument's placeholder against a rigid term of
+    /// the expected type, walking both through the same rigid heads.
+    fn pinned(
+        &mut self,
+        result: &Expr,
+        expected: &Expr,
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.cx.tick()?;
+        if depth > DEPTH {
+            return Ok(false);
+        }
+        let (Some(result), Some(expected)) = (self.inst(result, 0)?, self.inst(expected, 0)?)
+        else {
+            return Ok(false);
+        };
+        let (result, expected) = (beta(result, 0)?, beta(expected, 0)?);
+        if self.placeholder(&result) {
+            return Ok(self.rigid_term(&expected));
+        }
+        let (result_head, result_args) = spine(&result);
+        let (expected_head, expected_args) = spine(&expected);
+        let (Some(name), Some(other)) = (const_name(result_head), const_name(expected_head)) else {
+            return Ok(false);
+        };
+        if name != other || !self.rigid_head(name) || result_args.len() != expected_args.len() {
+            return Ok(false);
+        }
+        let pairs: Vec<(Expr, Expr)> = result_args
+            .into_iter()
+            .cloned()
+            .zip(expected_args.into_iter().cloned())
+            .collect();
+        for (left, right) in pairs {
+            if self.pinned(&left, &right, depth + 1)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// `eraseIndices`: the family's indices replaced by fresh metavariables, its parameters

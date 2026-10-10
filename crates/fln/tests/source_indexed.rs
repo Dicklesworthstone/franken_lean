@@ -47,8 +47,8 @@ fn multiple_indices_can_depend_on_prior_indices() {
     check(
         "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n\
         | intro (a : A) (value : P a) : Witness A P a value\n\
-        def witness : Witness Nat (fun n => Bool) 7 true := Witness.intro 7 true\n\
-        theorem same : witness = Witness.intro 7 true := by rfl",
+        def witness : Witness Nat (fun n => Bool) 7 true := Witness.intro (P := fun n => Bool) 7 true\n\
+        theorem same : witness = Witness.intro (P := fun n => Bool) 7 true := by rfl",
     );
 }
 

@@ -1275,6 +1275,11 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // An application whose argument the pin postpones and then refuses (`pattern_typing`,
+        // R1 of franken_lean-z8j.1.6.3).
+        if let Some(expected) = &expected {
+            self.check_application_typing(syntax, expected)?;
+        }
         let syntax = self.lower_pattern_matrices(syntax)?;
         self.term_prepared(&syntax, expected)
     }
@@ -2586,6 +2591,11 @@ impl Context {
                                     Some(goal.target.clone())
                                 };
                                 self.txn.lctx = goal.lctx.clone();
+                                // `exact e` elaborates `e` against the goal, as a definition
+                                // body against its type (`pattern_typing`, R1).
+                                if let Some(target) = &expected {
+                                    self.check_application_typing(syntax, target)?;
+                                }
                                 // Written arguments can insert implicit dictionaries
                                 // before apply starts opening the remaining telescope.
                                 let instance_start = apply.then_some(self.instance_goals.len());

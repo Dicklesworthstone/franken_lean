@@ -1,6 +1,7 @@
-//! A match's patterns are typed as the pin types them (bead `franken_lean-z8j.1.6.3`): a named
-//! pattern variable is rigid, `_` is not, a top-level pattern whose type does not unify is
-//! refined only along a path to a free variable, and a nested pattern is never refined.
+//! A match's patterns, and an application's postponed arguments, are typed as the pin types them
+//! (bead `franken_lean-z8j.1.6.3`). For patterns (R2): a named pattern variable is rigid, `_` is
+//! not, a top-level pattern whose type does not unify is refined only along a path to a free
+//! variable, and a nested pattern is never refined. For applications (R1): see the last two tests.
 //!
 //! Every program's verdict was taken from the pinned `lean` (v4.32.0) on 2026-10-10 first, each
 //! on its own file; `set_option trace.Elab.match true` showed the refinement steps cited.
@@ -147,4 +148,45 @@ fn an_equations_named_index_column_is_rigid() {
     mismatched(&format!(
         "{VEC}def f : (n : Nat) → Vec Nat n → Nat\n  | n, .nil => 0\n  | n, .cons k x _ => x + k\n"
     ));
+}
+
+/// R1: an explicit argument whose expected type is `?P a` (an implicit `{P : A → Type}` the
+/// expected type was not propagated to, since the result type depends on the explicit arguments)
+/// is postponed when its own type is rigid, and the placeholder that stands for it cannot meet
+/// the rigid term the expected type puts there (`Witness.intro 7 true` against `… 7 true`); a
+/// result type `?P 3` cannot meet `Bool` either. Each verdict is the pin's, one file per program.
+#[test]
+fn an_argument_the_pin_postpones_cannot_meet_the_expected_type() {
+    for source in [
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n  | intro (a : A) (value : P a) : Witness A P a value\ndef witness : Witness Nat (fun n => Bool) 7 true := Witness.intro 7 true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w : W (fun _ => Bool) 3 true := W.mk 3 true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w (n : Nat) : W (fun _ => Bool) n true := W.mk n true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w (b : Bool) : W (fun _ => Bool) 3 b := W.mk 3 b\n",
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n  | intro (a : A) (value : P a) : Witness A P a value\ndef witness : Witness Nat (fun n => Bool) 7 true := Witness.intro (7 : Nat) true\n",
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n  | intro (a : A) (value : P a) : Witness A P a value\ndef witness : Witness Nat (fun n => Bool) 7 true := Witness.intro 7 (true : Bool)\n",
+        "def g {P : Nat -> Type} (n : Nat) (v : P n) : P n := v\ndef x : (fun _ : Nat => Bool) 3 := g 3 true\n",
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n  | intro (a : A) (value : P a) : Witness A P a value\ndef witness : Witness Nat (fun n => Bool) 7 true := by exact Witness.intro 7 true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w : W (fun _ => Bool) 3 true := by exact W.mk 3 true\n",
+    ] {
+        mismatched(source);
+    }
+}
+
+/// R1's accepted side: `P` given (`@`, `(P := …)`), a hole for the value, no expected type, a
+/// result that does not depend on the explicit arguments (the expected type is propagated
+/// first), or an earlier argument that fixes `P`.
+#[test]
+fn an_application_the_pin_resolves_is_accepted() {
+    for source in [
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n  | intro (a : A) (value : P a) : Witness A P a value\ndef witness : Witness Nat (fun n => Bool) 7 true := @Witness.intro Nat (fun n => Bool) 7 true\n",
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where\n  | intro (a : A) (value : P a) : Witness A P a value\ndef witness : Witness Nat (fun n => Bool) 7 true := Witness.intro (P := fun n => Bool) 7 true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w : W (fun _ => Bool) 3 true := W.mk 3 _\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w : W (fun _ => Bool) 3 true := W.mk (P := fun _ => Bool) 3 true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ndef w := W.mk (P := fun _ => Bool) 3 true\n",
+        "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\ntheorem t : W.mk (P := fun _ => Bool) 3 true = W.mk (P := fun _ => Bool) 3 true := rfl\n",
+        "inductive V (P : Nat -> Type) : Type where\n  | mk (f : (n : Nat) -> P n) (n : Nat) : V P\ndef v : V (fun _ => Bool) := V.mk (fun _ => true) 3\n",
+        "inductive N (P : Nat -> Type) : Type where\n  | mk (n : Nat) (v : P n) : N P\ndef x : N (fun _ => Bool) := N.mk 3 true\n",
+    ] {
+        accepted(source);
+    }
 }
