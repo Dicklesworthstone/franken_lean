@@ -733,6 +733,39 @@ pub fn independent_reading(parts: &[&[u8]], limits: OleanDecodeLimits) -> Indepe
 /// The checker's own reading of one artifact, by name, as its seat consults it.
 struct ArtifactReadings(std::collections::HashMap<CheckerName, fln_hash::domain::Digest>);
 
+/// An unread artifact and a refused allocation both leave the checker without
+/// an answer, but only the allocation can recover when sibling workers stop.
+#[derive(Debug)]
+enum ArtifactReadingsError {
+    Unavailable(String),
+    AllocationFailure { requested: usize },
+}
+
+impl fmt::Display for ArtifactReadingsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(reason) => formatter.write_str(reason),
+            Self::AllocationFailure { requested } => {
+                write!(formatter, "could not reserve {requested} checker readings")
+            }
+        }
+    }
+}
+
+impl ArtifactReadingsError {
+    fn into_nonanswer<T>(self) -> Result<Outcome<T>, OleanCheckError> {
+        match self {
+            Self::Unavailable(reason) => Ok(Outcome::Inconclusive(
+                Inconclusive::dependency_unavailable(reason),
+            )),
+            Self::AllocationFailure { requested } => Err(OleanCheckError::AllocationFailure {
+                resource: ".olean independent checker readings",
+                requested,
+            }),
+        }
+    }
+}
+
 /// Why the checker seat will not vouch for a declaration as the artifact's.
 enum ReadingObjection {
     /// Its reading of the artifact says something else: one decoder is wrong, and
@@ -773,25 +806,39 @@ impl ArtifactReadings {
     /// Index a reading, or say why there is none to consult. An artifact the
     /// checker could not read, or that names one constant twice, gives it no
     /// independent answer about any of its declarations.
-    fn new(reading: &IndependentReading) -> Result<Self, String> {
+    fn new(reading: &IndependentReading) -> Result<Self, ArtifactReadingsError> {
+        Self::new_with_reserve(reading, |index, count| index.try_reserve(count))
+    }
+
+    /// Fault tests refuse this allocation through the same typed constructor
+    /// used by the council, without changing the global allocator.
+    fn new_with_reserve(
+        reading: &IndependentReading,
+        reserve: impl FnOnce(
+            &mut std::collections::HashMap<CheckerName, fln_hash::domain::Digest>,
+            usize,
+        ) -> Result<(), std::collections::TryReserveError>,
+    ) -> Result<Self, ArtifactReadingsError> {
         let entries = match reading {
             IndependentReading::Read(entries) => entries,
             IndependentReading::Unread(reason) => {
-                return Err(format!(
+                return Err(ArtifactReadingsError::Unavailable(format!(
                     "fln-checker could not read the .olean itself: {reason}"
-                ));
+                )));
             }
         };
         let mut readings = std::collections::HashMap::new();
-        readings
-            .try_reserve(entries.len())
-            .map_err(|_| format!("could not reserve {} checker readings", entries.len()))?;
+        reserve(&mut readings, entries.len()).map_err(|_| {
+            ArtifactReadingsError::AllocationFailure {
+                requested: entries.len(),
+            }
+        })?;
         for (name, digest) in entries {
             if readings.insert(name.clone(), *digest).is_some() {
-                return Err(format!(
+                return Err(ArtifactReadingsError::Unavailable(format!(
                     "fln-checker read `{}` twice in one .olean",
                     checker_name_text(name)
-                ));
+                )));
             }
         }
         Ok(Self(readings))
@@ -6223,11 +6270,7 @@ impl Engine {
         // independent answer about any of them.
         let readings = match ArtifactReadings::new(&decoded.independent) {
             Ok(readings) => readings,
-            Err(reason) => {
-                return Ok(Outcome::Inconclusive(Inconclusive::dependency_unavailable(
-                    reason,
-                )));
-            }
+            Err(error) => return error.into_nonanswer(),
         };
         // A constant already present is reported checked because the primary
         // decode equals one admitted earlier, and no council reviews it.
@@ -14227,6 +14270,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MemoryRetryControl {
         Accept,
+        ReadingIndexRefusal,
         RefuseAgain,
         InvalidProof,
     }
@@ -14374,6 +14418,36 @@ mod tests {
                             && matches!(control, MemoryRetryControl::RefuseAgain))
                     {
                         let index = job.index;
+                        if matches!(control, MemoryRetryControl::ReadingIndexRefusal) {
+                            let started = std::time::Instant::now();
+                            let error = super::ArtifactReadings::new_with_reserve(
+                                &job.artifact.independent,
+                                // Produce a real TryReserveError without asking
+                                // the host to consume an enormous allocation.
+                                |readings, _| readings.try_reserve(usize::MAX),
+                            )
+                            .err()
+                            .expect("the reading index reservation is refused");
+                            let error = error
+                                .into_nonanswer::<()>()
+                                .expect_err("a reading-index allocation stays a typed check error");
+                            assert!(matches!(&error, OleanCheckError::AllocationFailure {
+                                resource: ".olean independent checker readings",
+                                requested,
+                            } if *requested == job.artifact.constants.len()));
+                            let host_memory_refusal = super::olean_host_memory_refusal(&error);
+                            assert!(host_memory_refusal);
+                            drop(job);
+                            return super::FrontierDone {
+                                index,
+                                host_memory_refusal,
+                                verdict: super::frontier_error_verdict(error),
+                                accepted: None,
+                                engine: None,
+                                elapsed: started.elapsed(),
+                                retained: None,
+                            };
+                        }
                         drop(job);
                         return super::frontier_guarded(
                             index,
@@ -14452,7 +14526,7 @@ mod tests {
         ));
         assert!(row("Fixture.E").memory_retry.is_none());
         match control {
-            MemoryRetryControl::Accept => {
+            MemoryRetryControl::Accept | MemoryRetryControl::ReadingIndexRefusal => {
                 assert!(
                     frontier
                         .rows
@@ -14504,19 +14578,30 @@ mod tests {
             .expect("accepted modules still merge");
         assert_eq!(
             accepted.environment().contains(&fixture_name("Fixture.h")),
-            matches!(control, MemoryRetryControl::Accept)
+            matches!(
+                control,
+                MemoryRetryControl::Accept | MemoryRetryControl::ReadingIndexRefusal
+            )
         );
         assert_eq!(
             accepted
                 .environment()
                 .contains(&fixture_name("Fixture.child")),
-            matches!(control, MemoryRetryControl::Accept)
+            matches!(
+                control,
+                MemoryRetryControl::Accept | MemoryRetryControl::ReadingIndexRefusal
+            )
         );
     }
 
     #[test]
     fn frontier_memory_retry_drains_workers_rechecks_and_unblocks_importers() {
         run_frontier_memory_retry(MemoryRetryControl::Accept, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_recovers_a_checker_reading_index_allocation() {
+        run_frontier_memory_retry(MemoryRetryControl::ReadingIndexRefusal, 2);
     }
 
     #[test]
@@ -14587,6 +14672,63 @@ mod tests {
         for error in other_errors {
             assert!(!super::olean_host_memory_refusal(&error), "{error:?}");
         }
+    }
+
+    #[test]
+    fn checker_reading_index_unavailability_does_not_become_a_memory_refusal() {
+        use super::{ArtifactReadings, ArtifactReadingsError, Inconclusive, IndependentReading};
+
+        for description in [
+            "host memory: diagnostic text only",
+            "object budget exhausted after 5",
+        ] {
+            let reading = IndependentReading::Unread(description.to_owned());
+            let error = ArtifactReadings::new_with_reserve(&reading, |_, _| {
+                panic!("an unread artifact must not reserve a reading index")
+            })
+            .err()
+            .expect("the checker has no reading");
+            assert!(matches!(error, ArtifactReadingsError::Unavailable(_)));
+            assert_eq!(
+                error.to_string(),
+                format!("fln-checker could not read the .olean itself: {description}")
+            );
+            assert_eq!(
+                error
+                    .into_nonanswer::<()>()
+                    .expect("unread input is not an allocation error"),
+                Outcome::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                    "fln-checker could not read the .olean itself: {description}"
+                ))),
+            );
+        }
+
+        let bytes = standalone_olean(&binder_declarations(BinderInfo::Default));
+        let decoded = decode_olean_artifact(&bytes, OleanDecodeLimits::new(bytes.len()))
+            .expect("real artifact decodes");
+        let IndependentReading::Read(mut entries) = decoded.independent else {
+            panic!("the independent reader also reads the fixture");
+        };
+        let first = entries.first().expect("a nonempty reading").clone();
+        let expected = format!(
+            "fln-checker read `{}` twice in one .olean",
+            super::checker_name_text(&first.0)
+        );
+        let control = ArtifactReadings::new(&IndependentReading::Read(entries.clone()))
+            .unwrap_or_else(|error| panic!("a valid reading is indexed: {error}"));
+        assert_eq!(control.0.len(), entries.len());
+        entries.push(first);
+        let error = ArtifactReadings::new(&IndependentReading::Read(entries))
+            .err()
+            .expect("a repeated reader name is unavailable");
+        assert!(matches!(error, ArtifactReadingsError::Unavailable(_)));
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(
+            error
+                .into_nonanswer::<()>()
+                .expect("a duplicate reading is not an allocation error"),
+            Outcome::Inconclusive(Inconclusive::dependency_unavailable(expected)),
+        );
     }
 
     #[derive(Clone, Copy)]
