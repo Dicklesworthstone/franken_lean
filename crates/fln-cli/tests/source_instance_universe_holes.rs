@@ -5,6 +5,7 @@
 //!   `instInhabitedPUnit.{?u}`.
 //! - The search may choose a universe: `(default : Sort _)` is `True`, from `instInhabitedProp`.
 //! - An answer may keep a hole of the goal.
+//!
 //! Every program here was run through the pinned `lean` v4.32.0 with the same header first
 //! (2026-10-11), with the same verdict.
 #![forbid(unsafe_code)]

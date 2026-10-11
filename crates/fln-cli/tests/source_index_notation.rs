@@ -4,6 +4,7 @@
 //! - `x[i]'h` is `getElem x i h`;
 //! - `x[i]?` is `getElem? x i`;
 //! - `x[i]!` is `getElem! x i`.
+//!
 //! The proof is attempted only by the first alternatives of the pin's `get_elem_tactic`, `done` then
 //! `assumption`, which run here as they do there. Where the pin goes on to
 //! `get_elem_tactic_extensible` (`omega`, `simp +arith`, ...), the index is refused here. Every

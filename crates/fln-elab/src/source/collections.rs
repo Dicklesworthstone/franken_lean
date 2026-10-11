@@ -117,6 +117,7 @@ fn get_elem_tactic() -> Syntax {
 /// - `x[i]'h` is `getElem x i h`;
 /// - `x[i]?` is `getElem? x i`;
 /// - `x[i]!` is `getElem! x i`.
+///
 /// None is a pattern.
 fn expand_index(
     kind: &Name,
