@@ -251,6 +251,58 @@ pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
 }
 
 impl Context {
+    /// The universe holes of `exprs`, instantiated. Shared subterms are walked once per occurrence;
+    /// a subterm without a universe hole is skipped whole.
+    fn level_holes(
+        &mut self,
+        exprs: &[Expr],
+    ) -> Result<std::collections::HashSet<LMVarId>, NatDefinitionElabError> {
+        let mut holes = std::collections::HashSet::new();
+        let mut pending = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            pending.push(self.instantiate(expr)?);
+        }
+        while let Some(expr) = pending.pop() {
+            self.tick()?;
+            if !expr.has_level_mvar() {
+                continue;
+            }
+            let mut levels: Vec<Level> = Vec::new();
+            match expr.node() {
+                ExprNode::Sort { level } => levels.push(level.clone()),
+                ExprNode::Const { levels: args, .. } => levels.extend(args.iter().cloned()),
+                ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type.clone(), body.clone()]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_.clone(), value.clone(), body.clone()]),
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    pending.push(expr.clone());
+                }
+                _ => {}
+            }
+            while let Some(level) = levels.pop() {
+                match level.view() {
+                    fln_core::level::LevelView::MVar(id) => {
+                        holes.insert(id.clone());
+                    }
+                    fln_core::level::LevelView::Succ(inner) => levels.push(inner.clone()),
+                    fln_core::level::LevelView::Max(a, b)
+                    | fln_core::level::LevelView::IMax(a, b) => {
+                        levels.extend([a.clone(), b.clone()]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(holes)
+    }
+
     fn instance_type(&mut self, type_: &Expr) -> Result<Expr, NatDefinitionElabError> {
         // Class discovery unfolds abbreviations, but neither ordinary
         // definitions nor local type aliases. Candidate matching can still
@@ -839,13 +891,28 @@ impl Context {
         registry: &InstanceRegistry,
         default: Option<&Name>,
     ) -> Result<SearchResult, NatDefinitionElabError> {
-        let ambient = self
+        let decl = self
             .txn
             .mvars
             .get_decl(&root)
             .ok_or_else(|| failure(SourceInferenceError::Scope))?
-            .lctx
             .clone();
+        let ambient = decl.lctx;
+        // The pin searches under `withNewMCtxDepth (allowLevelAssignments := true)`
+        // (vendored Lean/Meta/SynthInstance.lean, `synthInstance?`): a universe hole of the goal or
+        // of its local context may stay open in an answer, as `inst : Inhabited.{?u} α` answers
+        // `Inhabited.{?u} α` for `{α} [Inhabited α]`, and is generalized with the declaration. Only a
+        // hole the search itself opened and left unconstrained (an instance's unsolved universe)
+        // leaves an answer open. The scope is read again at each answer, as unification may have
+        // solved a goal hole by an instance's universe.
+        let mut scope = vec![decl.type_];
+        scope.extend(
+            ambient
+                .decls()
+                .iter()
+                .filter(|local| local.type_.has_level_mvar())
+                .map(|local| local.type_.clone()),
+        );
         let Some(first) = self.instance_frame(root, registry, &ambient, default, true)? else {
             return Ok(SearchResult::Stuck);
         };
@@ -929,9 +996,11 @@ impl Context {
                 let mut value = self.instantiate(&expansion.value)?;
                 let actual = self.instantiate(&frames[index].target)?;
                 if value.has_expr_mvar()
-                    || value.has_level_mvar()
                     || actual.has_expr_mvar()
-                    || actual.has_level_mvar()
+                    || ((value.has_level_mvar() || actual.has_level_mvar())
+                        && !self
+                            .level_holes(&[value.clone(), actual.clone()])?
+                            .is_subset(&self.level_holes(&scope)?))
                 {
                     self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
