@@ -840,6 +840,39 @@ fn sorry_is_admitted_with_the_pins_warnings() {
     assert!(refused.stdout.is_empty(), "{refused:?}");
 }
 
+/// `#guard_msgs` is syntax `Init/Notation.lean` declares. A `prelude` file whose imports reach
+/// it judges its guard (the pin passes this one and prints nothing); one whose imports stop at
+/// `Init.Prelude` is refused, as the pin refuses it ("expected token", exit 1). Before the
+/// check, this door judged the guard there too and passed it.
+#[test]
+fn guard_msgs_exists_only_where_init_notation_is_imported() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-guard-world");
+    let body =
+        "/-- warning: declaration uses `sorry` -/\n#guard_msgs in\ntheorem t : Eq 1 2 := sorry\n";
+    let reached = workspace.write(
+        "Reached.lean",
+        format!("prelude\nimport Init.Notation\n{body}"),
+    );
+    let ours = lean_door(&workspace, &reached, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (0, "", ""),
+        "{ours:?}"
+    );
+    let unreached = workspace.write(
+        "Unreached.lean",
+        format!("prelude\nimport Init.Prelude\n{body}"),
+    );
+    let refused = lean_door(&workspace, &unreached, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.contains("parse refused source") && refused.stderr.contains("byte 69"),
+        "{refused:?}"
+    );
+}
+
 /// The drop-in `lean` on one file, with the search path and the record store
 /// both inside the workspace so a run neither reads nor leaves anything else.
 fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {

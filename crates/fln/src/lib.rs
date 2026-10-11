@@ -7335,6 +7335,33 @@ impl Engine {
                             error: Box::new(EngineExecutionError::NotImplemented { feature }),
                             at: Some(original_offset),
                         };
+                        // `#guard_msgs` is syntax `Init/Notation.lean` declares
+                        // (`Lean.guardMsgsCmd`). A world built from `.olean`s that does not reach
+                        // it reads the command as an unknown token, as the pin does ("expected
+                        // token"); the seed stands for the implicit `Init`, which declares it.
+                        if !engine.imported_modules.is_empty()
+                            && !engine
+                                .environment()
+                                .contains(&Name::from_components(["Lean", "guardMsgsCmd"]))
+                        {
+                            let keyword = command_source
+                                .windows(b"#guard_msgs".len())
+                                .position(|window| window == b"#guard_msgs")
+                                .unwrap_or(0);
+                            return Err(EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::Frontend(
+                                    DefinitionFrontendError::Parse(
+                                        fln_parse::NatDefinitionParseError::OutsideSeedGrammar {
+                                            at: fln_parse::BytePos(original_offset.0 + keyword),
+                                            expected:
+                                                fln_parse::NatDefinitionExpectation::DefinitionKeyword,
+                                        },
+                                    ),
+                                )),
+                                at: Some(original_offset),
+                            });
+                        }
                         if specified {
                             return Err(not_implemented("`#guard_msgs` with a specification"));
                         }
