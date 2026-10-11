@@ -82,7 +82,7 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
                 server_artifact: None,
                 private_artifact: None,
             }],
-            &[primitive_module.clone()],
+            std::slice::from_ref(&primitive_module),
             &KVMap::new(),
             SourceOleanImportLimits::new(OleanCheckLimits::new(1 << 20, admission().kernel)),
         )
@@ -247,7 +247,7 @@ fn real_prelude_auxiliary_tags_activate_after_both_seats_check_the_definitions()
             let receipt = base
                 .import_olean_modules_for_source(
                     &inputs,
-                    &[module.clone()],
+                    std::slice::from_ref(&module),
                     &KVMap::new(),
                     SourceOleanImportLimits::new(OleanCheckLimits::new(
                         16 << 20,
@@ -371,7 +371,7 @@ fn imported_tags_require_an_owned_definition_and_preserve_the_base_on_failure() 
                 server_artifact: None,
                 private_artifact: None,
             }],
-            &[module.clone()],
+            std::slice::from_ref(&module),
             &KVMap::new(),
             SourceOleanImportLimits::new(OleanCheckLimits::new(1 << 20, admission().kernel)),
         );
@@ -410,7 +410,7 @@ fn imported_tags_require_an_owned_definition_and_preserve_the_base_on_failure() 
                 private_artifact: None,
             },
         ],
-        &[module.clone()],
+        std::slice::from_ref(&module),
         &KVMap::new(),
         SourceOleanImportLimits::new(OleanCheckLimits::new(1 << 20, admission().kernel)),
     );
