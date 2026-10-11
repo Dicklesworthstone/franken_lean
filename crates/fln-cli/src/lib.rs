@@ -385,20 +385,26 @@ const LEAN_USAGE: &str = concat!(
     "and #eval commands. Each is inferred and admitted through\n",
     "K1 plus the independent checker in a discarded scratch successor, then\n",
     "printed as `term : type` without compilation, VM execution, or publication.\n",
-    "A query sees the checked source seed and every preceding command successor.\n",
+    "A query sees its admitted import world and every preceding command successor.\n",
     "Check and #eval output is buffered in source order until the whole source\n",
     "succeeds; a later failure leaves stdout empty. A local-import entry gets the\n",
     "same ordered command stream after its transitive dependency closure completes.\n",
-    "An empty source file or empty --stdin stream succeeds silently.\n",
+    "An empty source file or empty --stdin stream succeeds silently after imports.\n",
     "Dependency definitions, #eval, and scratch-only #check run silently.\n",
     "Every dependency query is checked against that module's transitive imports.\n",
     "An import-only entry succeeds silently after its checked dependency closure.\n",
     "The bounded renderer does not pretty-print dependent or other unsupported types.\n",
-    "For `import A.B`,\n",
-    "the first direct import must identify exactly one ancestor source root;\n",
-    "the complete local A/B.lean closure is then loaded under the same aggregate\n",
-    "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
-    "--stdin reads one bounded import-free source from standard input.\n",
+    "Each source module imports Init unless that module declares prelude.\n",
+    "For `import A.B`, the complete local A/B.lean closure is resolved from\n",
+    "the entry's directory under aggregate input limits. Compiled imports\n",
+    "resolve from LEAN_PATH, else the pinned toolchain. Missing imports and\n",
+    "source symlinks are refused. A missing Init never substitutes a source seed.\n",
+    "--stdin reads one bounded source module with the same import semantics,\n",
+    "rooted at the current directory. The stream is the virtual _stdin module;\n",
+    "its input bytes never come from or replace a file on disk.\n",
+    "-j N / --threads=N sets parallel import-admission workers. Admission is\n",
+    "serial by default to limit peak memory; zero also\n",
+    "selects serial admission. Counts are unsigned 32-bit decimals.\n",
     "--fln-max-steps and --fln-max-frames set nonnegative per-evaluation VM\n",
     "ceilings, including imported source code. Defaults are no instruction\n",
     "ceiling and 4,000,000 frames; zero permits no instructions/frames. These\n",
@@ -587,6 +593,7 @@ enum LeanCommand {
     Server,
     Stdin {
         max_bytes: usize,
+        import_jobs: std::num::NonZeroUsize,
         vm_limits: fln::VmExecutionLimits,
     },
     SourceDependencies {
@@ -596,12 +603,14 @@ enum LeanCommand {
     Source {
         path: PathBuf,
         max_bytes: usize,
+        import_jobs: std::num::NonZeroUsize,
         vm_limits: fln::VmExecutionLimits,
     },
     Run {
         path: PathBuf,
         arguments: Result<Vec<String>, source_main::ArgumentsError>,
         max_bytes: usize,
+        import_jobs: std::num::NonZeroUsize,
         vm_limits: fln::VmExecutionLimits,
     },
 }
@@ -1985,6 +1994,9 @@ fn parse_lean_command(
     let mut max_bytes_seen = false;
     let mut stdin_source = false;
     let mut source_dependencies = false;
+    // Every ordinary Lean input imports Init. Keep the default admission
+    // footprint to one council worker; -j/--threads opts into parallelism.
+    let mut import_jobs = std::num::NonZeroUsize::MIN;
     let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = std::iter::once(first).chain(arguments);
@@ -2010,11 +2022,49 @@ fn parse_lean_command(
                 path: PathBuf::from(path),
                 arguments: source_main::arguments(arguments, max_bytes),
                 max_bytes,
+                import_jobs,
                 vm_limits: vm_options.limits,
             });
         }
         if options && vm_options.take(&argument, &mut arguments)? {
             continue;
+        }
+        if options {
+            let threads = if argument == "-j" || argument == "--threads" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--threads requires a following thread count".to_owned())
+                })?)
+            } else {
+                argument.to_str().and_then(|argument| {
+                    argument
+                        .strip_prefix("--threads=")
+                        .or_else(|| {
+                            argument
+                                .strip_prefix("-j")
+                                .filter(|value| !value.is_empty())
+                        })
+                        .map(OsString::from)
+                })
+            };
+            if let Some(value) = threads {
+                // ShellOptions.process accepts decimal UInt32 counts; zero
+                // disables the pool, which is serial admission here.
+                let count = value
+                    .to_str()
+                    .filter(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        UsageError("--threads requires an unsigned 32-bit decimal count".to_owned())
+                    })?;
+                let count = usize::try_from(count).map_err(|_| {
+                    UsageError("thread count exceeds this platform's capacity".to_owned())
+                })?;
+                import_jobs =
+                    std::num::NonZeroUsize::new(count).unwrap_or(std::num::NonZeroUsize::MIN);
+                continue;
+            }
         }
         if options && argument == "--max-bytes" {
             if max_bytes_seen {
@@ -2115,6 +2165,7 @@ fn parse_lean_command(
         }
         return Ok(LeanCommand::Stdin {
             max_bytes,
+            import_jobs,
             vm_limits: vm_options.limits,
         });
     }
@@ -2130,6 +2181,7 @@ fn parse_lean_command(
         Ok(LeanCommand::Source {
             path,
             max_bytes,
+            import_jobs,
             vm_limits: vm_options.limits,
         })
     }
@@ -13814,52 +13866,19 @@ fn run_sources_with_presentation(
     )
 }
 
-/// Whether local source discovery stopped because an import names no local
-/// source file. The three places that say so all begin their detail this way.
-fn is_unresolved_local_import(error: &BoundedReadFailure) -> bool {
-    matches!(
-        error,
-        BoundedReadFailure::Input { detail, .. } if detail.contains("cannot resolve import `")
-    )
-}
-
 fn run_lean_source(
     path: PathBuf,
     max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
     vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
-    // A file that imports compiled modules runs in their admitted world, the
-    // way `fln run` runs it. Only a headerless file, or one whose imports are
-    // all local sources, is left to the local route below.
-    if let Some(output) = source_check::run_imported_lean(&path, max_bytes, vm_limits) {
-        return output;
-    }
-    let discovered = match discover_source_closure(path, max_bytes) {
-        Ok(discovered) => discovered,
-        Err(error) => {
-            return source_failure(
-                error.class(),
-                &error.to_string(),
-                false,
-                SourcePresentation::Lean,
-                error.exit_code(),
-            );
-        }
-    };
-    run_loaded_sources_with_presentation(
-        &discovered.paths,
-        discovered.sources,
-        None,
-        None,
-        None,
-        SourcePresentation::Lean,
-        vm_limits,
-    )
+    source_check::run_imported_lean(&path, max_bytes, import_jobs, vm_limits)
 }
 
 fn run_lean_stdin(
     input: &mut dyn Read,
     max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
     vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let source = match read_bounded_from(input, max_bytes, "standard input source") {
@@ -13874,27 +13893,7 @@ fn run_lean_stdin(
             );
         }
     };
-    if let Ok(module) = fln::partition_source_module(&source)
-        && !module.imports.is_empty()
-    {
-        return source_failure(
-            "input",
-            "bounded --stdin execution does not resolve imports; provide a local source path instead",
-            false,
-            SourcePresentation::Lean,
-            1,
-        );
-    }
-    let paths = [PathBuf::from("stdin.lean")];
-    run_loaded_sources_with_presentation(
-        &paths,
-        vec![source],
-        None,
-        None,
-        None,
-        SourcePresentation::Lean,
-        vm_limits,
-    )
+    source_check::run_imported_lean_stdin(source, max_bytes, import_jobs, vm_limits)
 }
 
 fn run_sources(
@@ -14268,9 +14267,10 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::Server) => serve_lsp(),
         Ok(LeanCommand::Stdin {
             max_bytes,
+            import_jobs,
             vm_limits,
         }) => match input {
-            Some(input) => run_lean_stdin(input, max_bytes, vm_limits),
+            Some(input) => run_lean_stdin(input, max_bytes, import_jobs, vm_limits),
             None => MultiplexerOutput::failure(
                 format!(
                     "lean: --stdin requires an explicit input handle; use run_lean_with_input\n\n{LEAN_USAGE}"
@@ -14284,14 +14284,16 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::Source {
             path,
             max_bytes,
+            import_jobs,
             vm_limits,
-        }) => run_lean_source(path, max_bytes, vm_limits),
+        }) => run_lean_source(path, max_bytes, import_jobs, vm_limits),
         Ok(LeanCommand::Run {
             path,
             arguments,
             max_bytes,
+            import_jobs,
             vm_limits,
-        }) => source_main::run(path, arguments, max_bytes, vm_limits),
+        }) => source_main::run(path, arguments, max_bytes, import_jobs, vm_limits),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
 }
@@ -16742,6 +16744,54 @@ mod tests {
     }
 
     #[test]
+    fn lean_thread_options_reach_sources_and_stop_before_script_arguments() {
+        for (flags, expected) in [
+            (vec![], 1),
+            (vec!["-j", "0"], 1),
+            (vec!["-j3"], 3),
+            (vec!["--threads", "2"], 2),
+            (vec!["--threads=4"], 4),
+            (vec!["-j8", "--threads=2"], 2),
+        ] {
+            for stdin in [false, true] {
+                let mut args = flags.iter().map(OsString::from).collect::<Vec<_>>();
+                args.push(if stdin { "--stdin" } else { "Main.lean" }.into());
+                let parsed = super::parse_lean_command(args).unwrap();
+                let jobs = match parsed {
+                    super::LeanCommand::Source { import_jobs, .. }
+                    | super::LeanCommand::Stdin { import_jobs, .. } => import_jobs,
+                    other => panic!("wrong source mode: {other:?}"),
+                };
+                assert_eq!(jobs.get(), expected);
+            }
+        }
+        let super::LeanCommand::Run {
+            import_jobs,
+            arguments,
+            ..
+        } = super::parse_lean_command(
+            ["-j2", "--run", "Main.lean", "--threads=8"].map(OsString::from),
+        )
+        .unwrap()
+        else {
+            panic!("script mode");
+        };
+        assert_eq!(import_jobs.get(), 2);
+        assert_eq!(arguments.unwrap(), ["--threads=8"]);
+        for flags in [
+            vec!["--threads"],
+            vec!["-j"],
+            vec!["--threads="],
+            vec!["--threads=-1", "Main.lean"],
+            vec!["--threads=+1", "Main.lean"],
+            vec!["--threads=4294967296", "Main.lean"],
+            vec!["-junk", "Main.lean"],
+        ] {
+            assert!(super::parse_lean_command(flags.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
     fn lean_personality_help_version_and_usage_are_explicitly_bounded() {
         let help = run_lean(std::iter::empty());
         assert_eq!(help.exit_code, 0);
@@ -16756,7 +16806,10 @@ mod tests {
         );
         assert!(help.stdout.contains("complete local A/B.lean closure"));
         assert!(help.stdout.contains("lean --stdin"));
-        assert!(help.stdout.contains("bounded import-free source"));
+        assert!(
+            help.stdout
+                .contains("bounded source module with the same import semantics")
+        );
         assert!(
             help.stdout
                 .contains("Import-free #check commands may appear anywhere")
@@ -16835,17 +16888,18 @@ mod tests {
                 .stderr
                 .contains("requires an explicit input handle")
         );
-        let mut input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
+        let source = b"prelude\ninductive Local where\n  | value\n#check Local\n";
+        let mut input = std::io::Cursor::new(source.as_slice());
         let piped = run_lean_with_input([OsString::from("--stdin")], &mut input);
         assert_eq!(piped.exit_code, 0);
-        assert_eq!(piped.stdout, "42\n");
+        assert_eq!(piped.stdout, "Local : Type\n");
         assert!(piped.stderr.is_empty());
-        let mut check_input = std::io::Cursor::new(b"#check Nat\n".as_slice());
+        let mut check_input = std::io::Cursor::new(source.as_slice());
         let checked = run_lean_with_input([OsString::from("--stdin")], &mut check_input);
         assert_eq!(checked.exit_code, 0, "{}", checked.stderr);
-        assert_eq!(checked.stdout, "Nat : Type\n");
+        assert_eq!(checked.stdout, "Local : Type\n");
         assert!(checked.stderr.is_empty());
-        let mut quiet_input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
+        let mut quiet_input = std::io::Cursor::new(source.as_slice());
         let quiet_piped = run_lean_with_input(
             [
                 OsString::from("-q"),
@@ -16855,7 +16909,7 @@ mod tests {
             &mut quiet_input,
         );
         assert_eq!(quiet_piped.exit_code, 0);
-        assert_eq!(quiet_piped.stdout, "42\n");
+        assert_eq!(quiet_piped.stdout, "Local : Type\n");
         assert!(quiet_piped.stderr.is_empty());
         let mut unselected_input = std::io::Cursor::new(b"must remain unread".as_slice());
         let short_version =
@@ -16904,10 +16958,16 @@ mod tests {
     /// Doc comments are the pin's syntax: a module doc and a declaration's doc change nothing,
     /// and one that nothing can carry is refused. Verdicts measured at the pin on 2026-10-07.
     #[test]
-    fn the_lean_door_reads_doc_comments_as_the_pin_does() {
+    fn source_doc_comments_follow_the_pin_syntax() {
         let lean = |source: &str| {
-            let mut input = std::io::Cursor::new(source.as_bytes().to_vec());
-            run_lean_with_input([OsString::from("--stdin")], &mut input)
+            super::execute_source_bytes_with_publisher_and_presentation(
+                vec![source.as_bytes().to_vec()],
+                None,
+                SourcePublication::None,
+                SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
+                |_, _| Ok::<(), std::io::Error>(()),
+            )
         };
         // Pin: `43`.
         let documented = lean(
@@ -17069,7 +17129,16 @@ mod tests {
         assert!(evaluated.stderr.is_empty());
 
         let source = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
-        let definition_only = run_lean([source.into_os_string()]);
+        // This test exercises presentation against the same explicit seed as
+        // the adjacent cases. Actual file import worlds have installed tests.
+        let definition_only = super::execute_source_bytes_with_publisher_and_presentation(
+            vec![std::fs::read(source).unwrap()],
+            None,
+            SourcePublication::None,
+            SourcePresentation::Lean,
+            fln::VmExecutionLimits::user_program(),
+            |_, _| Ok::<(), std::io::Error>(()),
+        );
         assert_eq!(definition_only.exit_code, 0, "{}", definition_only.stderr);
         assert!(definition_only.stdout.is_empty());
         assert!(definition_only.stderr.is_empty());
@@ -17134,10 +17203,17 @@ mod tests {
         // which the hand-written token table refused; with the derived table every byte of it
         // lexes, and it is refused at `import Lean` as a module-graph input instead.)
         let source = repository_path("crates/fln-cli/tests/fixtures/lexical_refusal.lean");
-        let refused = run_lean([source.into_os_string()]);
+        // Explicit prelude keeps the lexer witness independent of whether
+        // the pinned library is installed; no Init lookup can mask its error.
+        let mut bytes = b"prelude\n".to_vec();
+        bytes.extend(std::fs::read(source).unwrap());
+        let refused = run_lean_with_input(
+            [OsString::from("--stdin")],
+            &mut std::io::Cursor::new(bytes),
+        );
         assert_eq!(refused.exit_code, 1);
         assert!(refused.stdout.is_empty());
-        assert!(refused.stderr.starts_with("lean: execution: "));
+        assert!(refused.stderr.starts_with("lean: input: "), "{refused:?}");
         assert!(refused.stderr.contains("frontend refused source"));
         assert!(!refused.stderr.contains(SOURCE_RUN_SCHEMA));
         assert!(!refused.stderr.contains("native source batch"));

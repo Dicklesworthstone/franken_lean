@@ -101,8 +101,7 @@ instance root {A : Type} {a : A} [warm : D A a] [fixed : D Nat 7] : Root := Root
             &KVMap::new(),
             limits(),
         )
-        .err()
-        .expect("the selected root instance has incompatible output parameters");
+        .expect_err("the selected root instance has incompatible output parameters");
     assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&KVMap::new()), before);
     checked(
@@ -190,8 +189,7 @@ theorem secondValue : result.second = 7 := by rfl"#,
             &KVMap::new(),
             limits(),
         )
-        .err()
-        .expect("the old DFS answer must not survive consumer resumption");
+        .expect_err("the old DFS answer must not survive consumer resumption");
     assert_eq!(mutant.disposition(), ("elaboration", false, 1));
     assert_eq!(result.logical_root(&KVMap::new()), before);
 }
@@ -249,8 +247,7 @@ instance root {A : Type} [d : D A] [ok : @Accept A d] : Root := Root.mk ok.value
             &KVMap::new(),
             limits(),
         )
-        .err()
-        .expect("a duplicate answer type cannot rescue the rejected dictionary");
+        .expect_err("a duplicate answer type cannot rescue the rejected dictionary");
     assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&KVMap::new()), before);
     checked(

@@ -11,6 +11,15 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
+
+static LEAN_PROCESS: Mutex<()> = Mutex::new(());
+
+fn lean_process() -> MutexGuard<'static, ()> {
+    LEAN_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn run_fln(arguments: &[&Path]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
@@ -28,8 +37,54 @@ fn run_lean(arguments: &[&Path]) -> Output {
     command.output().expect("run the real lean binary")
 }
 
-fn run_lean_stdin(arguments: &[&Path], input: &[u8]) -> Output {
+fn pinned_lib() -> Option<PathBuf> {
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+        })
+        .filter(|lib| lib.join("Init.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference Init library is required"
+    );
+    if lib.is_none() {
+        eprintln!("SKIP: ordinary Lean execution requires the pinned Reference lib/lean");
+    }
+    lib
+}
+
+fn lean_command(lib: &Path, workspace: &Path) -> Command {
+    let records = std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .filter(|directory| directory.is_absolute())
+        .unwrap_or_else(|| workspace.join("records"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_lean"));
+    command
+        .current_dir(workspace)
+        .env("LEAN_PATH", lib)
+        .env("FLN_IMPORT_REUSE_DIR", records);
+    command
+}
+
+fn run_lean_in(lib: &Path, workspace: &Path, arguments: &[&Path]) -> Output {
+    // A full Init admission is substantial; keep parallel test cases from
+    // multiplying its memory use within this target.
+    let _process = lean_process();
+    lean_command(lib, workspace)
+        .args(arguments)
+        .output()
+        .expect("run Lean with the actual pinned library")
+}
+
+fn run_lean_stdin_in(lib: &Path, workspace: &Path, arguments: &[&Path], input: &[u8]) -> Output {
+    let _process = lean_process();
+    let mut command = lean_command(lib, workspace);
     for argument in arguments {
         command.arg(argument);
     }
@@ -139,6 +194,17 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
 
     std::fs::write(&source, b"-- intentionally empty native Lean module\n")
         .expect("write an empty native Lean source");
+    // The raw FLBC producer and installation metadata do not require Init.
+    let empty_product_run = run_fln(&[Path::new("run"), Path::new("--json"), &source]);
+    assert!(!empty_product_run.status.success());
+    assert!(empty_product_run.stdout.is_empty());
+    assert!(utf8(&empty_product_run.stderr).contains("\"class\":\"execution\""));
+    assert!(utf8(&empty_product_run.stderr).contains("definition batch must not be empty"));
+
+    let Some(lib) = pinned_lib() else { return };
+    let run_lean = |arguments: &[&Path]| run_lean_in(&lib, &root, arguments);
+    let run_lean_stdin =
+        |arguments: &[&Path], input: &[u8]| run_lean_stdin_in(&lib, &root, arguments, input);
     let empty_file = run_lean(&[&source]);
     assert!(
         empty_file.status.success(),
@@ -147,12 +213,6 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(empty_file.stdout.is_empty());
     assert!(empty_file.stderr.is_empty());
-
-    let empty_product_run = run_fln(&[Path::new("run"), Path::new("--json"), &source]);
-    assert!(!empty_product_run.status.success());
-    assert!(empty_product_run.stdout.is_empty());
-    assert!(utf8(&empty_product_run.stderr).contains("\"class\":\"execution\""));
-    assert!(utf8(&empty_product_run.stderr).contains("definition batch must not be empty"));
 
     let empty_stdin = run_lean_stdin(&[Path::new("--stdin")], b"");
     assert!(
@@ -314,7 +374,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!unknown_check.status.success());
     assert!(unknown_check.stdout.is_empty());
-    assert!(utf8(&unknown_check.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&unknown_check.stderr).starts_with("lean: input: "));
     assert!(utf8(&unknown_check.stderr).contains("no inferable type"));
 
     let terminal_check = run_lean_stdin(
@@ -366,7 +426,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!late_check_refusal.status.success());
     assert!(late_check_refusal.stdout.is_empty());
-    assert!(utf8(&late_check_refusal.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&late_check_refusal.stderr).starts_with("lean: input: "));
     assert!(utf8(&late_check_refusal.stderr).contains("no inferable type"));
 
     let future_definition = run_lean_stdin(
@@ -375,7 +435,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!future_definition.status.success());
     assert!(future_definition.stdout.is_empty());
-    assert!(utf8(&future_definition.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&future_definition.stderr).starts_with("lean: input: "));
     assert!(utf8(&future_definition.stderr).contains("no inferable type"));
 
     let piped_late_refusal = run_lean_stdin(
@@ -384,7 +444,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!piped_late_refusal.status.success());
     assert!(piped_late_refusal.stdout.is_empty());
-    assert!(utf8(&piped_late_refusal.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&piped_late_refusal.stderr).starts_with("lean: input: "));
     // The pin, on this stdin: `<stdin>:2:20: error(lean.unknownIdentifier): Unknown
     // identifier `missing`` (v4.32.0, 2026-10-05). An elaboration error, not a K1 rejection.
     assert!(utf8(&piped_late_refusal.stderr).contains("Unknown identifier `missing`"));
@@ -405,7 +465,9 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(!piped_import.status.success());
     assert!(piped_import.stdout.is_empty());
     assert!(utf8(&piped_import.stderr).starts_with("lean: input: "));
-    assert!(utf8(&piped_import.stderr).contains("does not resolve imports"));
+    assert!(
+        utf8(&piped_import.stderr).contains("import `Project.Missing` is neither a source file")
+    );
 
     let piped_after_refusals = run_lean_stdin(&[Path::new("--stdin")], b"#eval 42\n");
     assert!(piped_after_refusals.status.success());
@@ -461,7 +523,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     let refused = run_lean(&[&source]);
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
-    assert!(utf8(&refused.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&refused.stderr).starts_with("lean: input: "));
     // The pin on this file: `2:20: error(lean.unknownIdentifier): Unknown identifier
     // `missing`` (v4.32.0, 2026-10-05).
     assert!(utf8(&refused.stderr).contains("Unknown identifier `missing`"));
@@ -689,66 +751,70 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         base_before_alias
     );
 
-    let native = run_lean(&[&main]);
-    assert!(
-        native.status.success(),
-        "native lean import discovery stderr: {}",
-        utf8(&native.stderr)
-    );
-    assert_eq!(utf8(&native.stdout), "42\n");
-    assert!(native.stderr.is_empty());
+    let lib = pinned_lib();
+    if let Some(lib) = &lib {
+        let run_lean = |arguments: &[&Path]| run_lean_in(lib, &root, arguments);
+        let native = run_lean(&[&main]);
+        assert!(
+            native.status.success(),
+            "native lean import discovery stderr: {}",
+            utf8(&native.stderr)
+        );
+        assert_eq!(utf8(&native.stdout), "42\n");
+        assert!(native.stderr.is_empty());
 
-    std::fs::write(
+        std::fs::write(
         &main,
         b"import Project.Middle\n#check middle\n#eval middle + 2\ndef answer : Nat := middle + 3\n#check answer\n#eval answer\n",
     )
     .expect("write a mixed imported entry command stream");
-    let mixed_native = run_lean(&[&main]);
-    assert!(
-        mixed_native.status.success(),
-        "mixed imported native lean stderr: {}",
-        utf8(&mixed_native.stderr)
-    );
-    assert_eq!(
-        utf8(&mixed_native.stdout),
-        "middle : Nat\n42\nanswer : Nat\n43\n"
-    );
-    assert!(mixed_native.stderr.is_empty());
+        let mixed_native = run_lean(&[&main]);
+        assert!(
+            mixed_native.status.success(),
+            "mixed imported native lean stderr: {}",
+            utf8(&mixed_native.stderr)
+        );
+        assert_eq!(
+            utf8(&mixed_native.stdout),
+            "middle : Nat\n42\nanswer : Nat\n43\n"
+        );
+        assert!(mixed_native.stderr.is_empty());
 
-    std::fs::write(
-        &main,
-        b"import Project.Middle\n#check later\ndef later : Nat := middle\n",
-    )
-    .expect("plant a future-definition imported entry query");
-    let future_entry = run_lean(&[&main]);
-    assert!(!future_entry.status.success());
-    assert!(future_entry.stdout.is_empty());
-    assert!(utf8(&future_entry.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&future_entry.stderr).contains("no inferable type"));
+        std::fs::write(
+            &main,
+            b"import Project.Middle\n#check later\ndef later : Nat := middle\n",
+        )
+        .expect("plant a future-definition imported entry query");
+        let future_entry = run_lean(&[&main]);
+        assert!(!future_entry.status.success());
+        assert!(future_entry.stdout.is_empty());
+        assert!(utf8(&future_entry.stderr).starts_with("lean: input: "));
+        assert!(utf8(&future_entry.stderr).contains("no inferable type"));
 
-    std::fs::write(&base, b"#eval 99\ndef base : Nat := 20\n")
-        .expect("plant an output-producing imported dependency");
-    std::fs::write(&main, b"import Project.Base\n#check base\n")
-        .expect("write an entry over the noisy dependency");
-    let noisy_dependency = run_lean(&[&main]);
-    assert!(
-        noisy_dependency.status.success(),
-        "silent dependency evaluation stderr: {}",
-        utf8(&noisy_dependency.stderr)
-    );
-    assert_eq!(utf8(&noisy_dependency.stdout), "base : Nat\n");
-    assert!(noisy_dependency.stderr.is_empty());
+        std::fs::write(&base, b"#eval 99\ndef base : Nat := 20\n")
+            .expect("plant an output-producing imported dependency");
+        std::fs::write(&main, b"import Project.Base\n#check base\n")
+            .expect("write an entry over the noisy dependency");
+        let noisy_dependency = run_lean(&[&main]);
+        assert!(
+            noisy_dependency.status.success(),
+            "silent dependency evaluation stderr: {}",
+            utf8(&noisy_dependency.stderr)
+        );
+        assert_eq!(utf8(&noisy_dependency.stdout), "base : Nat\n");
+        assert!(noisy_dependency.stderr.is_empty());
 
-    std::fs::write(&main, b"import Project.Base\n")
-        .expect("write an import-only native lean entry");
-    let import_only = run_lean(&[&main]);
-    assert!(
-        import_only.status.success(),
-        "import-only native lean stderr: {}",
-        utf8(&import_only.stderr)
-    );
-    assert!(import_only.stdout.is_empty());
-    assert!(import_only.stderr.is_empty());
+        std::fs::write(&main, b"import Project.Base\n")
+            .expect("write an import-only native lean entry");
+        let import_only = run_lean(&[&main]);
+        assert!(
+            import_only.status.success(),
+            "import-only native lean stderr: {}",
+            utf8(&import_only.stderr)
+        );
+        assert!(import_only.stdout.is_empty());
+        assert!(import_only.stderr.is_empty());
+    }
 
     std::fs::write(&base, b"def base : Nat := 20\n").expect("restore the base dependency");
     std::fs::write(
@@ -821,13 +887,15 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         b"import Project.Middle\n#eval middle + 2\ndef broken : Nat := missing\n",
     )
     .expect("plant a late entry failure after a discovered evaluation");
-    let late_refusal = run_lean(&[&main]);
-    assert!(!late_refusal.status.success());
-    assert!(late_refusal.stdout.is_empty());
-    assert!(utf8(&late_refusal.stderr).starts_with("lean: execution: "));
-    // The pin on this project (Base and Middle compiled to .olean, then Main): `3:20:
-    // error(lean.unknownIdentifier): Unknown identifier `missing`` (v4.32.0, 2026-10-05).
-    assert!(utf8(&late_refusal.stderr).contains("Unknown identifier `missing`"));
+    if let Some(lib) = &lib {
+        let late_refusal = run_lean_in(lib, &root, &[&main]);
+        assert!(!late_refusal.status.success());
+        assert!(late_refusal.stdout.is_empty());
+        assert!(utf8(&late_refusal.stderr).starts_with("lean: input: "));
+        // The pin on this project (Base and Middle compiled to .olean, then Main): `3:20:
+        // error(lean.unknownIdentifier): Unknown identifier `missing`` (v4.32.0, 2026-10-05).
+        assert!(utf8(&late_refusal.stderr).contains("Unknown identifier `missing`"));
+    }
 
     let late_product = root.join("LateFailure.flbc");
     let late_fln = run_fln(&[
@@ -851,39 +919,43 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     )
     .expect("restore the checked import entry");
 
-    let entry_only_limit = format!(
-        "--max-bytes={}",
-        std::fs::read(&main)
-            .expect("read the import entry for its exact byte length")
-            .len()
-    );
-    let exhausted = run_lean(&[Path::new(&entry_only_limit), &main]);
-    assert!(!exhausted.status.success());
-    assert!(exhausted.stdout.is_empty());
-    assert!(utf8(&exhausted.stderr).starts_with("lean: resource: "));
-    assert!(utf8(&exhausted.stderr).contains("source import closure"));
+    if let Some(lib) = &lib {
+        let run_lean = |arguments: &[&Path]| run_lean_in(lib, &root, arguments);
+        let entry_only_limit = format!(
+            "--max-bytes={}",
+            std::fs::read(&main)
+                .expect("read the import entry for its exact byte length")
+                .len()
+        );
+        let exhausted = run_lean(&[Path::new(&entry_only_limit), &main]);
+        assert!(!exhausted.status.success());
+        assert!(exhausted.stdout.is_empty());
+        assert!(utf8(&exhausted.stderr).starts_with("lean: resource: "));
+        assert!(utf8(&exhausted.stderr).contains("imported Lean source"));
+        assert!(utf8(&exhausted.stderr).contains("input limit"));
 
-    std::fs::write(&middle, b"import Project.Absent\ndef middle : Nat := 40\n")
-        .expect("plant a missing transitive import");
-    let open_native = run_lean(&[&main]);
-    assert!(!open_native.status.success());
-    assert!(open_native.stdout.is_empty());
-    assert!(utf8(&open_native.stderr).starts_with("lean: input: "));
-    assert!(utf8(&open_native.stderr).contains("Project.Absent"));
+        std::fs::write(&middle, b"import Project.Absent\ndef middle : Nat := 40\n")
+            .expect("plant a missing transitive import");
+        let open_native = run_lean(&[&main]);
+        assert!(!open_native.status.success());
+        assert!(open_native.stdout.is_empty());
+        assert!(utf8(&open_native.stderr).starts_with("lean: input: "));
+        assert!(utf8(&open_native.stderr).contains("Project.Absent"));
 
-    std::fs::write(
-        &middle,
-        b"import Project.Base\ndef middle : Nat := Nat.mul base 2\n",
-    )
-    .expect("restore the transitive import closure");
-    let recovered_native = run_lean(&[&main]);
-    assert!(
-        recovered_native.status.success(),
-        "recovered native lean import stderr: {}",
-        utf8(&recovered_native.stderr)
-    );
-    assert_eq!(utf8(&recovered_native.stdout), "42\n");
-    assert!(recovered_native.stderr.is_empty());
+        std::fs::write(
+            &middle,
+            b"import Project.Base\ndef middle : Nat := Nat.mul base 2\n",
+        )
+        .expect("restore the transitive import closure");
+        let recovered_native = run_lean(&[&main]);
+        assert!(
+            recovered_native.status.success(),
+            "recovered native lean import stderr: {}",
+            utf8(&recovered_native.stderr)
+        );
+        assert_eq!(utf8(&recovered_native.stdout), "42\n");
+        assert!(recovered_native.stderr.is_empty());
+    }
 
     let nested = root.join("Nested");
     let nested_project = nested.join("Project");
@@ -894,13 +966,14 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         .expect("write the nearer ambiguous module");
     std::fs::write(&ambiguous_main, b"import Project.Base\n#eval base\n")
         .expect("write an entry with two possible source roots");
-    let ambiguous = run_lean(&[&ambiguous_main]);
-    assert!(!ambiguous.status.success());
-    assert!(ambiguous.stdout.is_empty());
-    assert!(utf8(&ambiguous.stderr).starts_with("lean: input: "));
-    assert!(utf8(&ambiguous.stderr).contains("is ambiguous"));
-    assert!(utf8(&ambiguous.stderr).contains(&nested_base.display().to_string()));
-    assert!(utf8(&ambiguous.stderr).contains(&base.display().to_string()));
+    // Ordinary execution resolves from the entry directory. The source-only
+    // dependency listing retains its ancestor-ambiguity contract below.
+    if let Some(lib) = &lib {
+        let nearest = run_lean_in(lib, &root, &[&ambiguous_main]);
+        assert!(nearest.status.success(), "{nearest:?}");
+        assert_eq!(utf8(&nearest.stdout), "99\n");
+        assert!(nearest.stderr.is_empty());
+    }
     let ambiguous_dependencies = run_lean(&[Path::new("--src-deps"), &ambiguous_main]);
     assert!(!ambiguous_dependencies.status.success());
     assert!(ambiguous_dependencies.stdout.is_empty());
@@ -914,11 +987,13 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         std::os::unix::fs::symlink(&base, &linked).expect("plant a source-import symlink");
         std::fs::write(&linked_main, b"import Linked\n#eval base\n")
             .expect("write an entry naming the source-import symlink");
-        let refused_link = run_lean(&[&linked_main]);
-        assert!(!refused_link.status.success());
-        assert!(refused_link.stdout.is_empty());
-        assert!(utf8(&refused_link.stderr).starts_with("lean: input: "));
-        assert!(utf8(&refused_link.stderr).contains("refusing symlink source import"));
+        if let Some(lib) = &lib {
+            let refused_link = run_lean_in(lib, &root, &[&linked_main]);
+            assert!(!refused_link.status.success());
+            assert!(refused_link.stdout.is_empty());
+            assert!(utf8(&refused_link.stderr).starts_with("lean: input: "));
+            assert!(utf8(&refused_link.stderr).contains("refusing symlink in source import"));
+        }
         let refused_link_dependencies = run_lean(&[Path::new("--src-deps"), &linked_main]);
         assert!(!refused_link_dependencies.status.success());
         assert!(refused_link_dependencies.stdout.is_empty());
@@ -1104,11 +1179,16 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(stderr.contains("\"class\":\"module-graph\""));
     assert!(stderr.contains("source import graph contains a cycle"));
 
-    let native_cycle = run_lean(&[&cycle_a]);
-    assert!(!native_cycle.status.success());
-    assert!(native_cycle.stdout.is_empty());
-    assert!(utf8(&native_cycle.stderr).starts_with("lean: module-graph: "));
-    assert!(utf8(&native_cycle.stderr).contains("source import graph contains a cycle"));
+    if let Some(lib) = &lib {
+        let cycle_main = root.join("CycleMain.lean");
+        std::fs::write(&cycle_main, b"import Cycle.A\n")
+            .expect("root the ordinary entry above both cyclic modules");
+        let native_cycle = run_lean_in(lib, &root, &[&cycle_main]);
+        assert!(!native_cycle.status.success());
+        assert!(native_cycle.stdout.is_empty());
+        assert!(utf8(&native_cycle.stderr).starts_with("lean: input: "));
+        assert!(utf8(&native_cycle.stderr).contains("source import cycle through `Cycle."));
+    }
 
     let provider = root.join("A.lean");
     let consumer = root.join("B.lean");

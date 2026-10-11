@@ -29,8 +29,7 @@ fn refuses(engine: &Engine, source: &str) {
     let before = engine.logical_root(&KVMap::new());
     let error = engine
         .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
-        .err()
-        .expect("the conflicting selected-instance value must be refused");
+        .expect_err("the conflicting selected-instance value must be refused");
     assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }

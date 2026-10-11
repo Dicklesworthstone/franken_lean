@@ -67,13 +67,14 @@ pub(super) fn run(
     path: PathBuf,
     arguments: Result<Vec<String>, ArgumentsError>,
     max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
     vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let arguments = match arguments {
         Ok(arguments) => arguments,
         Err(error) => return error.output(),
     };
-    source_check::run_imported_lean_main(&path, arguments, max_bytes, vm_limits)
+    source_check::run_imported_lean_main(&path, arguments, max_bytes, import_jobs, vm_limits)
 }
 
 fn failure(class: &'static str, detail: &str, authority: bool, code: u8) -> MultiplexerOutput {

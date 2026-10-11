@@ -45,27 +45,35 @@ pub(super) fn run_imported(
     )
 }
 
-/// The drop-in `lean` on a file with explicit imports: the same admitted
-/// module world `fln run` uses, presented as `lean` presents a file. Imports
-/// resolve from `LEAN_PATH`, else the pinned toolchain's library, and are
-/// admitted under the interactive doors' default posture. `None` leaves a
-/// headerless file, or one whose imports are local sources, to the existing
-/// local route.
+/// The drop-in `lean` gives every source module its ordinary implicit Init
+/// import unless that module declares `prelude`. Imports resolve from
+/// `LEAN_PATH`, else the pinned library, under the interactive reuse posture.
+/// A missing import never falls back to a synthetic source environment.
 pub(super) fn run_imported_lean(
     path: &Path,
     max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
     vm_limits: fln::VmExecutionLimits,
-) -> Option<MultiplexerOutput> {
+) -> MultiplexerOutput {
     imports::execution::run(
         &[path.to_path_buf()],
         max_bytes,
         imports::execution::Presentation::Lean,
         SourcePublication::None,
-        default_import_jobs(),
+        import_jobs,
         ImportPosture::ReuseVerified,
         vm_limits,
         None,
     )
+    .unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the Lean source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    })
 }
 
 /// Execute a script in its ordinary Lean import world, then invoke its main.
@@ -74,6 +82,7 @@ pub(super) fn run_imported_lean_main(
     path: &Path,
     arguments: Vec<String>,
     max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
     vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     imports::execution::run(
@@ -81,7 +90,7 @@ pub(super) fn run_imported_lean_main(
         max_bytes,
         imports::execution::Presentation::Lean,
         SourcePublication::None,
-        default_import_jobs(),
+        import_jobs,
         ImportPosture::ReuseVerified,
         vm_limits,
         Some(arguments),
@@ -90,6 +99,24 @@ pub(super) fn run_imported_lean_main(
         source_failure(
             "internal-fault",
             "the executable source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    })
+}
+
+/// Standard input has the same import and admission semantics as a Lean file.
+pub(super) fn run_imported_lean_stdin(
+    source: Vec<u8>,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    imports::execution::run_stdin(source, max_bytes, import_jobs, vm_limits).unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the standard input source route did not retain its import context",
             false,
             SourcePresentation::Lean,
             4,

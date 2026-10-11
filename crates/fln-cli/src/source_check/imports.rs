@@ -300,7 +300,20 @@ pub(super) fn load(
     total_bytes: usize,
     max_bytes: usize,
 ) -> Result<Loaded, Failure> {
-    load_with_implicit_init(paths, sources, total_bytes, max_bytes, false)
+    load_with_implicit_init(
+        paths,
+        sources,
+        total_bytes,
+        max_bytes,
+        false,
+        EntryOrigin::File,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum EntryOrigin {
+    File,
+    StandardInput,
 }
 
 /// Ordinary Lean execution gives every non-prelude source module an implicit
@@ -311,7 +324,29 @@ pub(super) fn load_lean(
     total_bytes: usize,
     max_bytes: usize,
 ) -> Result<Loaded, Failure> {
-    load_with_implicit_init(paths, sources, total_bytes, max_bytes, true)
+    load_with_implicit_init(
+        paths,
+        sources,
+        total_bytes,
+        max_bytes,
+        true,
+        EntryOrigin::File,
+    )
+}
+
+/// Standard input is a retained virtual module rooted at the current directory.
+/// The pin names this module `_stdin`; a real `stdin.lean` remains importable.
+/// Its source bytes never come from, or replace, a file on disk.
+fn load_lean_stdin(source: Vec<u8>, max_bytes: usize) -> Result<Loaded, Failure> {
+    let total_bytes = source.len();
+    load_with_implicit_init(
+        &[PathBuf::from("_stdin.lean")],
+        vec![source],
+        total_bytes,
+        max_bytes,
+        true,
+        EntryOrigin::StandardInput,
+    )
 }
 
 fn load_with_implicit_init(
@@ -320,6 +355,7 @@ fn load_with_implicit_init(
     mut total_bytes: usize,
     max_bytes: usize,
     implicit_init: bool,
+    origin: EntryOrigin,
 ) -> Result<Loaded, Failure> {
     let mut has_headers = implicit_init;
     for (path, source) in paths.iter().zip(&sources) {
@@ -357,7 +393,10 @@ fn load_with_implicit_init(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let root = std::fs::canonicalize(parent).map_err(|e| Failure::io(parent, e))?;
-    let entry_path = std::fs::canonicalize(entry).map_err(|e| Failure::io(entry, e))?;
+    let entry_path = match origin {
+        EntryOrigin::File => std::fs::canonicalize(entry).map_err(|e| Failure::io(entry, e))?,
+        EntryOrigin::StandardInput => root.join("_stdin.lean"),
+    };
     if !entry_path.starts_with(&root) {
         return Err(Failure::input("source entry escaped its module root"));
     }

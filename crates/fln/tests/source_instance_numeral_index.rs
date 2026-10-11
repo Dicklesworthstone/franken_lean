@@ -46,8 +46,7 @@ instance root {A : Type} {a : A} [warm : D A a] [fixed : D Nat 7] : Root := Root
             &KVMap::new(),
             limits(),
         )
-        .err()
-        .expect("the root selects high, whose Bool output cannot reconcile with Nat");
+        .expect_err("the root selects high, whose Bool output cannot reconcile with Nat");
     assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&KVMap::new()), before);
 

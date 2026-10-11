@@ -49,7 +49,7 @@ fn refusing_a_completed_dependency_stops_before_a_consumers_independent_error() 
         SourceProgramExecutionError::Validation { module, error }
             if module == dependency && error == "dependency validation failed"
     ));
-    assert_eq!(visited, [dependency.clone()]);
+    assert_eq!(visited.as_slice(), std::slice::from_ref(&dependency));
     assert_eq!(receipt.engine.logical_root(&options), before);
 
     // The same consumer has a real elaboration error. Allowing its dependency
@@ -76,7 +76,7 @@ fn refusing_a_completed_dependency_stops_before_a_consumers_independent_error() 
     };
     assert_eq!(module, entry);
     assert!(error.to_string().contains("missing"), "{error}");
-    assert_eq!(visited, [dependency.clone()]);
+    assert_eq!(visited.as_slice(), std::slice::from_ref(&dependency));
     assert_eq!(receipt.engine.logical_root(&options), before);
 
     // The existing API retains the source-error type without a validation

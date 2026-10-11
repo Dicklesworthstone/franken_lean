@@ -18,11 +18,17 @@ struct Workspace(PathBuf);
 impl Workspace {
     fn new(case: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "fln-program-{case}-{}-{}",
+            "fln-program-{case}-{}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        // PIDs can recur across sandboxed invocations. Reusing a fixture root
+        // can make a missing-import test accidentally load a previous Init.
+        std::fs::create_dir(&path).unwrap();
         Self(path)
     }
 
@@ -696,7 +702,36 @@ fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
         .output()
         .expect("run the installed lean");
     Run {
-        code: output.status.code().expect("normal process exit"),
+        code: output
+            .status
+            .code()
+            .unwrap_or_else(|| panic!("lean terminated: {output:?}")),
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+}
+
+fn lean_stdin(workspace: &Workspace, source: &[u8], lib: &Path, extra: &[&str]) -> Run {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg("--stdin")
+        .args(extra)
+        .current_dir(&workspace.0)
+        .env("LEAN_PATH", lib)
+        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("records"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the installed lean with standard input");
+    child.stdin.take().unwrap().write_all(source).unwrap();
+    let output = child.wait_with_output().unwrap();
+    Run {
+        code: output
+            .status
+            .code()
+            .unwrap_or_else(|| panic!("lean terminated: {output:?}")),
         stdout: String::from_utf8(output.stdout).unwrap(),
         stderr: String::from_utf8(output.stderr).unwrap(),
     }
@@ -828,15 +863,18 @@ instance : Repr Multiline where
     );
 }
 
-/// What did not change, and what a missing import now says. No pin is needed:
-/// the search path is an empty directory.
+/// Ordinary Lean source must resolve Init, even without an explicit import.
+/// No pin is needed to test a missing dependency or a small source-only world.
 #[test]
-fn the_lean_door_keeps_its_local_route_and_names_an_import_that_is_nowhere() {
+fn ordinary_lean_requires_init_and_keeps_prelude_local_to_each_module() {
     let workspace = Workspace::new("lean-door-local");
     let empty = workspace.0.join("lib");
     std::fs::create_dir_all(&empty).unwrap();
 
-    let missing = workspace.write("Missing.lean", "import No.Such.Module\n\n#eval 1\n");
+    let missing = workspace.write(
+        "Missing.lean",
+        "prelude\nimport No.Such.Module\n\n#eval 1\n",
+    );
     let refused = lean_door(&workspace, &missing, &empty);
     assert_eq!(refused.code, 1, "{refused:?}");
     assert!(refused.stdout.is_empty(), "{refused:?}");
@@ -848,19 +886,248 @@ fn the_lean_door_keeps_its_local_route_and_names_an_import_that_is_nowhere() {
     );
     assert!(refused.stderr.contains("nor an .olean on the search path"));
 
-    // A headerless file never had imports to resolve.
+    // These previously ran in a synthetic seed despite the missing Init.
     let plain = workspace.write(
         "Plain.lean",
         "def g (n : Nat) : Nat := n + 2\n\n#eval g 40\n",
     );
-    let ran = lean_door(&workspace, &plain, &empty);
-    assert_eq!((ran.code, ran.stdout.as_str()), (0, "42\n"), "{ran:?}");
-
-    // An import that is a local source file is still loaded as source.
     workspace.write("Helper.lean", "def h (n : Nat) : Nat := n + 2\n");
     let local = workspace.write("UsesHelper.lean", "import Helper\n\n#eval h 40\n");
-    let ran = lean_door(&workspace, &local, &empty);
-    assert_eq!((ran.code, ran.stdout.as_str()), (0, "42\n"), "{ran:?}");
+    for entry in [&plain, &local] {
+        let refused = lean_door(&workspace, entry, &empty);
+        assert_eq!(refused.code, 1, "{refused:?}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert!(
+            refused
+                .stderr
+                .contains("import `Init` is neither a source file"),
+            "{refused:?}"
+        );
+    }
+
+    workspace.write("Init.lean", "prelude\ninductive Marker where\n  | token\n");
+    workspace.write("Helper.lean", "def marker : Marker := Marker.token\n");
+    for header in ["", "prelude\n"] {
+        let entry = workspace.write(
+            "UsesHelper.lean",
+            format!("{header}import Helper\n#check marker\n"),
+        );
+        let ran = lean_door(&workspace, &entry, &empty);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (0, "marker : Marker\n", ""),
+            "{ran:?}"
+        );
+    }
+
+    // An entry's own Init cannot leak into a prelude dependency.
+    workspace.write(
+        "Helper.lean",
+        "prelude\ndef marker : Marker := Marker.token\n",
+    );
+    let entry = workspace.write("UsesHelper.lean", "import Helper\n#check marker\n");
+    let refused = lean_door(&workspace, &entry, &empty);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.contains("Unknown identifier `Marker`"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn stdin_is_a_virtual_lean_module_with_real_import_resolution() {
+    let workspace = Workspace::new("lean-stdin-imports");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+    let on_disk = workspace.write("stdin.lean", "this file must not be read or overwritten\n");
+    let original = std::fs::read(&on_disk).unwrap();
+    let refused = lean_stdin(&workspace, b"#check Nat\n", &empty, &[]);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("import `Init` is neither a source file"),
+        "{refused:?}"
+    );
+
+    let own = lean_stdin(
+        &workspace,
+        b"prelude\ninductive Local where\n  | value\n#check Local\n",
+        &empty,
+        &[],
+    );
+    assert_eq!(
+        (own.code, own.stdout.as_str(), own.stderr.as_str()),
+        (0, "Local : Type\n", ""),
+        "{own:?}"
+    );
+    workspace.write("Init.lean", "prelude\ninductive Marker where\n  | token\n");
+    workspace.write("Helper.lean", "def marker : Marker := Marker.token\n");
+    for (source, extra) in [
+        (b"#check Marker\n".as_slice(), vec![]),
+        (b"import Helper\n#check Marker\n", vec!["--threads=0"]),
+        (b"import Helper\n#check Marker\n", vec!["-j2"]),
+    ] {
+        let ran = lean_stdin(&workspace, source, &empty, &extra);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (0, "Marker : Type\n", ""),
+            "{ran:?}"
+        );
+    }
+    let stopped = lean_stdin(
+        &workspace,
+        b"import Helper\n#check marker\n",
+        &empty,
+        &["--max-bytes=80"],
+    );
+    assert_eq!(stopped.code, 3, "{stopped:?}");
+    assert!(stopped.stdout.is_empty(), "{stopped:?}");
+    assert!(
+        stopped.stderr.contains("imported Lean source exceeded")
+            && stopped.stderr.contains("input limit"),
+        "{stopped:?}"
+    );
+    let missing = lean_stdin(&workspace, b"prelude\nimport Missing\n", &empty, &[]);
+    assert_eq!(missing.code, 1, "{missing:?}");
+    assert!(missing.stdout.is_empty(), "{missing:?}");
+    assert!(
+        missing
+            .stderr
+            .contains("import `Missing` is neither a source file"),
+        "{missing:?}"
+    );
+    assert_eq!(std::fs::read(on_disk).unwrap(), original);
+}
+
+#[test]
+fn stdin_uses_the_pinned_virtual_module_identity() {
+    let workspace = Workspace::new("stdin-module-identity");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+    workspace.write("stdin.lean", "prelude\ninductive Local where\n  | value\n");
+    let imported = lean_stdin(
+        &workspace,
+        b"prelude\nimport stdin\n#check Local\n",
+        &empty,
+        &[],
+    );
+    assert_eq!(
+        (
+            imported.code,
+            imported.stdout.as_str(),
+            imported.stderr.as_str()
+        ),
+        (0, "Local : Type\n", ""),
+        "{imported:?}"
+    );
+    // The pin's anonymous main module is `_stdin`, so an import back to it
+    // is a cycle even when an unrelated `_stdin.lean` exists on disk.
+    workspace.write("_stdin.lean", "prelude\n");
+    workspace.write("Helper.lean", "prelude\nimport _stdin\n");
+    let cycle = lean_stdin(&workspace, b"prelude\nimport Helper\n", &empty, &[]);
+    assert_eq!(cycle.code, 1, "{cycle:?}");
+    assert!(cycle.stdout.is_empty(), "{cycle:?}");
+    assert!(
+        cycle.stderr.contains("cycle") && cycle.stderr.contains("_stdin"),
+        "{cycle:?}"
+    );
+}
+
+#[test]
+fn dependency_message_guards_fail_ordinary_files_and_stdin() {
+    let workspace = Workspace::new("ordinary-dependency-guard");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+    workspace.write(
+        "Dependency.lean",
+        "prelude\ninductive N where\n  | z\n/-- info: unexpected -/\n#guard_msgs in\ndef value : N := N.z\n",
+    );
+    let source = b"prelude\nimport Dependency\n#check value\n";
+    let entry = workspace.write("Main.lean", source);
+    for ran in [
+        lean_door(&workspace, &entry, &empty),
+        lean_stdin(&workspace, source, &empty, &[]),
+    ] {
+        assert_eq!(ran.code, 1, "{ran:?}");
+        assert!(ran.stdout.is_empty(), "{ran:?}");
+        assert!(ran.stderr.contains("guard-msgs"), "{ran:?}");
+    }
+    // This independent entry error would win if dependency guards were only
+    // judged after the full module graph had already executed.
+    let blocked = lean_stdin(
+        &workspace,
+        b"prelude\nimport Dependency\n#check missingAfterGuard\n",
+        &empty,
+        &[],
+    );
+    assert_eq!(blocked.code, 1, "{blocked:?}");
+    assert!(blocked.stdout.is_empty(), "{blocked:?}");
+    assert!(blocked.stderr.contains("guard-msgs"), "{blocked:?}");
+    assert!(!blocked.stderr.contains("missingAfterGuard"), "{blocked:?}");
+    // A matching silent guard completes, with only entry output published.
+    workspace.write(
+        "Dependency.lean",
+        "prelude\ninductive N where\n  | z\n#guard_msgs in\ndef value : N := N.z\n",
+    );
+    let recovered = lean_stdin(&workspace, source, &empty, &[]);
+    assert_eq!(
+        (
+            recovered.code,
+            recovered.stdout.as_str(),
+            recovered.stderr.as_str()
+        ),
+        (0, "value : N\n", ""),
+        "{recovered:?}"
+    );
+}
+
+/// The ordinary path must admit the real Init closure and use its printers.
+/// A main declaration is checked but only --run may invoke it.
+#[test]
+fn ordinary_file_and_stdin_admit_actual_init_without_invoking_main() {
+    let Some(library) = pinned_lib() else { return };
+    assert!(library.join("Init.olean").is_file());
+    let workspace = Workspace::new("ordinary-lean-init");
+    let source =
+        b"#check Int\n#eval (42 : Nat)\ndef main : IO Unit := IO.println \"main must not run\"\n";
+    let entry = workspace.write("Main.lean", source);
+    for ran in [
+        lean_door(&workspace, &entry, &library),
+        lean_stdin(&workspace, source, &library, &[]),
+    ] {
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (0, "Int : Type\n42\n", ""),
+            "{ran:?}"
+        );
+    }
+    // The same admitted closure is available to ordinary local dependencies.
+    workspace.write("Helper.lean", "def answer : Int := 42\n");
+    let entry = workspace.write(
+        "UsesHelper.lean",
+        "import Helper\n#check answer\n#eval (42 : Nat)\n",
+    );
+    let ran = lean_door(&workspace, &entry, &library);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+        (0, "answer : Int\n42\n", ""),
+        "{ran:?}"
+    );
+    let stopped = lean_stdin(&workspace, source, &library, &["--fln-max-steps=0"]);
+    assert_eq!(stopped.code, 3, "{stopped:?}");
+    assert!(stopped.stdout.is_empty(), "{stopped:?}");
+    let invalid = lean_stdin(
+        &workspace,
+        b"#check Int\n#eval (42 : Nat)\n#check missing\n",
+        &library,
+        &[],
+    );
+    assert_eq!(invalid.code, 1, "{invalid:?}");
+    assert!(invalid.stdout.is_empty(), "{invalid:?}");
+    assert!(invalid.stderr.contains("missing"), "{invalid:?}");
 }
 
 /// `prelude` means no imports at all, not even the implicit one. The door used

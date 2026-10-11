@@ -84,8 +84,7 @@ fn cached_answer_size_counts_every_use_and_the_scoped_bound_recovers() {
     ] {
         let error = base
             .check_source_files(&[rejected.as_bytes()], &KVMap::new(), limits())
-            .err()
-            .expect("the result exceeds the synthesis size bound");
+            .expect_err("the result exceeds the synthesis size bound");
         assert_eq!(error.disposition(), ("elaboration", false, 1));
         assert_eq!(base.logical_root(&KVMap::new()), before);
     }

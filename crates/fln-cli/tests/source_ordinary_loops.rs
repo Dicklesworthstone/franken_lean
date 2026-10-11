@@ -12,12 +12,23 @@
 //! the caller's limits through source, import, standard-input, and replay paths.
 #![forbid(unsafe_code)]
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+static LEAN_PROCESS: Mutex<()> = Mutex::new(());
+
+fn lean_process() -> MutexGuard<'static, ()> {
+    // Full Init admission must not fan out with Rust's test-thread count.
+    LEAN_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn directory() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -29,18 +40,63 @@ fn directory() -> std::path::PathBuf {
     path
 }
 
-fn lean(source: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lean"))
-        .arg(source)
-        .output()
-        .unwrap()
+fn pinned_lib() -> Option<PathBuf> {
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+        })
+        .filter(|lib| lib.join("Init.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference Init library is required"
+    );
+    if lib.is_none() {
+        eprintln!("SKIP: ordinary Lean execution requires the pinned Reference lib/lean");
+    }
+    lib
+}
+
+fn source_command(binary: &str, lib: Option<&Path>, workspace: &Path) -> Option<Command> {
+    let mut command = Command::new(binary);
+    if binary == env!("CARGO_BIN_EXE_lean") {
+        let lib = lib?;
+        let records = std::env::var_os("FLN_IMPORT_REUSE_DIR")
+            .map(PathBuf::from)
+            .filter(|directory| directory.is_absolute())
+            .unwrap_or_else(|| workspace.join("records"));
+        command
+            .current_dir(workspace)
+            .env("LEAN_PATH", lib)
+            .env("FLN_IMPORT_REUSE_DIR", records);
+    }
+    Some(command)
+}
+
+fn lean(lib: &Path, source: &Path) -> Output {
+    let _process = lean_process();
+    source_command(
+        env!("CARGO_BIN_EXE_lean"),
+        Some(lib),
+        source.parent().unwrap(),
+    )
+    .unwrap()
+    .arg(source)
+    .output()
+    .unwrap()
 }
 
 fn expect_output(name: &str, program: &str, expected: &str) {
+    let Some(lib) = pinned_lib() else { return };
     let dir = directory();
     let source = dir.join("Main.lean");
     std::fs::write(&source, program).unwrap();
-    let output = lean(&source);
+    let output = lean(&lib, &source);
     eprintln!(
         "{name}: exit={:?} stdout={:?} stderr_bytes={}",
         output.status.code(),
@@ -131,10 +187,13 @@ fn an_emitted_artifact_replays_under_the_same_budget_it_ran_under() {
 fn the_frame_ceiling_is_a_typed_stop_never_a_crash() {
     // A genuine non-tail recursion under a deliberately small frame ceiling:
     // it must stop without a signal, host overflow, or buffered output escaping.
+    let Some(lib) = pinned_lib() else { return };
     let dir = directory();
     let source = dir.join("Main.lean");
     std::fs::write(&source, format!("{SUM_TO}#eval sumTo 5000\n")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+    let _process = lean_process();
+    let output = source_command(env!("CARGO_BIN_EXE_lean"), Some(&lib), &dir)
+        .unwrap()
         .arg("--fln-max-frames=32")
         .arg(&source)
         .output()
@@ -166,6 +225,7 @@ fn caller_execution_ceilings_reach_both_source_doors_and_artifact_replay() {
         .output()
         .unwrap();
     assert!(emitted.status.success(), "{emitted:?}");
+    let lib = pinned_lib();
 
     for (binary, prefix, path) in [
         (env!("CARGO_BIN_EXE_lean"), vec![], &source),
@@ -176,11 +236,16 @@ fn caller_execution_ceilings_reach_both_source_doors_and_artifact_replay() {
             &artifact,
         ),
     ] {
+        if binary == env!("CARGO_BIN_EXE_lean") && lib.is_none() {
+            continue;
+        }
+        let _process = (binary == env!("CARGO_BIN_EXE_lean")).then(lean_process);
         for (flag, reason) in [
             ("--fln-max-steps=0", "ExecutionSteps"),
             ("--fln-max-frames=0", "RecursionDepth"),
         ] {
-            let output = Command::new(binary)
+            let output = source_command(binary, lib.as_deref(), &dir)
+                .unwrap()
                 .args(&prefix)
                 .arg(flag)
                 .arg(path)
@@ -198,9 +263,16 @@ fn caller_execution_ceilings_reach_both_source_doors_and_artifact_replay() {
                 assert!(stderr.contains("\"authority\":false"), "{output:?}");
             }
         }
-        let completed = Command::new(binary)
+        // The imported Repr printer also needs execution steps and frames.
+        let recovery_limits = if binary == env!("CARGO_BIN_EXE_lean") {
+            ["--fln-max-steps", "1000000", "--fln-max-frames=1024"]
+        } else {
+            ["--fln-max-steps", "100000", "--fln-max-frames=128"]
+        };
+        let completed = source_command(binary, lib.as_deref(), &dir)
+            .unwrap()
             .args(&prefix)
-            .args(["--fln-max-steps", "100000", "--fln-max-frames=128"])
+            .args(recovery_limits)
             .arg(path)
             .output()
             .unwrap();
@@ -218,17 +290,19 @@ fn source_imports_and_stdin_cannot_bypass_an_execution_ceiling() {
     let source = dir.join("Main.lean");
     std::fs::write(dir.join("Local.lean"), format!("{SUM_TO}#eval sumTo 30\n")).unwrap();
     std::fs::write(&source, "import Local\n#eval sumTo 2\n").unwrap();
+    let lib = pinned_lib();
     for (binary, prefix) in [
         (env!("CARGO_BIN_EXE_lean"), vec![]),
         (env!("CARGO_BIN_EXE_fln"), vec!["run", "--json"]),
     ] {
-        let control = Command::new(binary)
-            .args(&prefix)
-            .arg(&source)
-            .output()
-            .unwrap();
+        let Some(mut command) = source_command(binary, lib.as_deref(), &dir) else {
+            continue;
+        };
+        let _process = (binary == env!("CARGO_BIN_EXE_lean")).then(lean_process);
+        let control = command.args(&prefix).arg(&source).output().unwrap();
         assert!(control.status.success(), "{control:?}");
-        let stopped = Command::new(binary)
+        let stopped = source_command(binary, lib.as_deref(), &dir)
+            .unwrap()
             .args(&prefix)
             .args(["--fln-max-steps", "0"])
             .arg(&source)
@@ -239,8 +313,13 @@ fn source_imports_and_stdin_cannot_bypass_an_execution_ceiling() {
         assert!(String::from_utf8_lossy(&stopped.stderr).contains("ExecutionSteps"));
     }
 
-    for (limit, expected_exit) in [("0", 3), ("100", 0)] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lean"))
+    let Some(lib) = lib else { return };
+    let _process = lean_process();
+    // The checked Repr printer exceeds 100_000 steps for this control.
+    // Give the positive recovery control enough room to finish printing.
+    for (limit, expected_exit) in [("0", 3), ("1000000", 0)] {
+        let mut child = source_command(env!("CARGO_BIN_EXE_lean"), Some(&lib), &dir)
+            .unwrap()
             .args(["--stdin", "--fln-max-steps", limit])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
