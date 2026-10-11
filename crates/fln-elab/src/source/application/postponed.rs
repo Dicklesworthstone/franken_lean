@@ -1,7 +1,8 @@
-//! The pin postpones a callee whose type is still a metavariable application
-//! (`Elab/App.lean`, `elabAppArgs` / `tryPostponeIfMVar`). The containing
-//! argument is retried on the ordinary term worklist after later arguments
-//! constrain its expected type. No function shape or coercion is guessed.
+//! The pin postpones a callee whose type is still a metavariable application,
+//! and expected-type notation whose constructor or namespace is not yet known
+//! (`Elab/App.lean` / `Elab/BuiltinNotation.lean`, `tryPostponeIfMVar`). The
+//! containing argument is retried on the ordinary term worklist after later
+//! arguments constrain its expected type. No function or constructor is guessed.
 //!
 //! Rolling back the whole argument avoids keeping its newly opened lambda
 //! locals in a hole that the surrounding lambda has already closed. Pending
@@ -11,11 +12,17 @@
 use super::*;
 
 #[derive(Clone)]
+pub(in crate::source) struct Blocker {
+    pub id: MVarId,
+    pub problem: NatDefinitionElabError,
+}
+
+#[derive(Clone)]
 pub(in crate::source) struct Argument<'a> {
     pub syntax: &'a Syntax,
     pub expected: Expr,
     waiting: Expr,
-    blocker: MVarId,
+    blocker: Blocker,
     lctx: LocalContext,
     options: KVMap,
     hole: Expr,
@@ -56,15 +63,18 @@ impl<'a> Queue<'a> {
     pub fn scope_blockers(
         &self,
         context: &mut Context,
-    ) -> Result<Vec<MVarId>, NatDefinitionElabError> {
+    ) -> Result<Vec<Blocker>, NatDefinitionElabError> {
         let mut blockers = Vec::new();
         for argument in &self.arguments {
             context.tick()?;
             if argument.lctx == context.txn.lctx
-                && let Some(blocker) =
-                    context.application_type_unavailable(&Expr::mvar(argument.blocker.clone()))?
+                && let Some(blocker) = context
+                    .application_type_unavailable(&Expr::mvar(argument.blocker.id.clone()))?
             {
-                blockers.push(blocker);
+                blockers.push(Blocker {
+                    id: blocker,
+                    problem: argument.blocker.problem.clone(),
+                });
             }
         }
         Ok(blockers)
@@ -75,10 +85,10 @@ impl<'a> Queue<'a> {
         while index < self.arguments.len() {
             context.tick()?;
             if self.arguments[index].lctx == context.txn.lctx {
-                self.arguments.remove(index);
+                let argument = self.arguments.remove(index);
                 context
                     .postponed_application_errors
-                    .push(failure(SourceInferenceError::ExpectedFunction));
+                    .push(argument.blocker.problem);
             } else {
                 index += 1;
             }
@@ -87,11 +97,11 @@ impl<'a> Queue<'a> {
     }
 
     pub fn finish(&mut self, context: &mut Context) -> Result<(), NatDefinitionElabError> {
-        while self.arguments.pop().is_some() {
+        while let Some(argument) = self.arguments.pop() {
             context.tick()?;
             context
                 .postponed_application_errors
-                .push(failure(SourceInferenceError::ExpectedFunction));
+                .push(argument.blocker.problem);
         }
         Ok(())
     }
@@ -177,10 +187,26 @@ impl<'a> Checkpoint<'a> {
     pub fn outer_blocker(
         &self,
         context: &mut Context,
-        blockers: &[MVarId],
-    ) -> Result<Option<MVarId>, NatDefinitionElabError> {
+        blockers: &[Blocker],
+    ) -> Result<Option<Blocker>, NatDefinitionElabError> {
         let saved = &self.context.txn.lctx;
         if saved.len() >= context.txn.lctx.len() {
+            return Ok(None);
+        }
+        self.owned_blocker(context, blockers)
+    }
+
+    /// Suspension belongs to the nearest argument whose saved expected type
+    /// owns the unavailable dependency. Finding that owner before unwinding
+    /// also keeps an inner tactic alternative from treating suspension as a
+    /// failure and choosing a different term prematurely.
+    pub fn owned_blocker(
+        &self,
+        context: &mut Context,
+        blockers: &[Blocker],
+    ) -> Result<Option<Blocker>, NatDefinitionElabError> {
+        let saved = &self.context.txn.lctx;
+        if saved.len() > context.txn.lctx.len() {
             return Ok(None);
         }
         for index in 0..saved.len() {
@@ -208,8 +234,11 @@ impl<'a> Checkpoint<'a> {
             let dependencies = context.txn.mvars.collect_mvars(&current);
             for blocker in blockers {
                 context.tick()?;
-                if dependencies.contains(blocker) {
-                    return Ok(Some(owner));
+                if dependencies.contains(&blocker.id) {
+                    return Ok(Some(Blocker {
+                        id: owner,
+                        problem: blocker.problem.clone(),
+                    }));
                 }
             }
         }
@@ -221,6 +250,7 @@ impl<'a> Checkpoint<'a> {
         context: &mut Context,
         queue: &mut Queue<'a>,
         blocker: &MVarId,
+        problem: &NatDefinitionElabError,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let expected = context.instantiate(&self.expected)?;
         // An unrelated inner argument's result hole cannot unblock this
@@ -237,7 +267,10 @@ impl<'a> Checkpoint<'a> {
             syntax: self.syntax,
             expected: expected.clone(),
             waiting: expected.clone(),
-            blocker: blocker.clone(),
+            blocker: Blocker {
+                id: blocker.clone(),
+                problem: problem.clone(),
+            },
             lctx: context.txn.lctx.clone(),
             options: self.options.clone(),
             hole: hole.clone(),
@@ -250,6 +283,35 @@ impl<'a> Checkpoint<'a> {
 }
 
 impl Context {
+    pub(in crate::source) fn notation_type_unavailable(
+        &mut self,
+        problem: &NatDefinitionElabError,
+        expected: Option<&Expr>,
+    ) -> Result<Option<MVarId>, NatDefinitionElabError> {
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        match problem {
+            NatDefinitionElabError::Inference(SourceInferenceError::AnonymousCtor(
+                anonymous_ctor::AnonymousCtorError::ExpectedTypeUnknown,
+            )) => self.application_type_unavailable(expected),
+            NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(
+                dotted_ident::DottedIdentError::ExpectedTypeUnknown { .. }
+                | dotted_ident::DottedIdentError::NotConstantHeaded { .. },
+            )) => {
+                // `resolveDottedIdentFn` also waits for a metavariable at the
+                // result head of an expected function type (`withForallBody`).
+                let expected = self.instantiate(expected)?;
+                let result = self.dotted_result_type(&expected)?;
+                Ok(match operators::spine(&result).0.node() {
+                    ExprNode::MVar { id } => Some(id.clone()),
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(in crate::source) fn application_type_unavailable(
         &mut self,
         type_: &Expr,

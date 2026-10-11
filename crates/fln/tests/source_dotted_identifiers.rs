@@ -119,19 +119,14 @@ fn a_computing_proof_gets_the_same_verdict_dotted_or_spelled_out() {
     assert_eq!(dotted, spelled);
 }
 
-/// Not yet: `[.leaf, .node .leaf .leaf] : List T`. As for `⟨…⟩` in a list, the pin
-/// propagates `List T` into `List.cons`'s `α` before elaborating the elements, and postpones
-/// `.leaf` while its expected type is a metavariable; this elaborator does neither, so the
-/// element meets an unknown expected type and is refused with the pin's message for that.
+/// The pin accepts this original frontier fixture: both a dotted value and an
+/// application head wait for the surrounding list to determine their namespace.
 #[test]
-fn an_unknown_element_type_is_refused_until_expected_types_propagate() {
+fn list_elements_wait_for_the_expected_namespace() {
     let source = format!("{T}def k : List T := [.leaf, .node .leaf .leaf]");
-    let error = check(&source).expect_err(&source);
-    assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
     assert!(
-        error
-            .to_string()
-            .contains("The expected type of `.leaf` could not be determined"),
-        "{error}"
+        matches!(check(&source), Ok(Outcome::Complete(_))),
+        "{source}: {:?}",
+        check(&source)
     );
 }

@@ -111,6 +111,22 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
         NatDefinitionElabError::Inference(SourceInferenceError::Tactic(reason)) => {
             !matches!(reason, TacticError::MalformedScript)
         }
+        // With a known expected type, these are ordinary elaboration errors.
+        // An unknown-type suspension is routed to its owning argument before
+        // reaching tactic backtracking; on replay, `first` can try the next
+        // branch if the now-known constructor or namespace makes this one fail.
+        NatDefinitionElabError::Inference(SourceInferenceError::AnonymousCtor(reason)) => {
+            !matches!(
+                reason,
+                anonymous_ctor::AnonymousCtorError::NestedFieldsUnsupported { .. }
+            )
+        }
+        NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(reason)) => {
+            !matches!(
+                reason,
+                dotted_ident::DottedIdentError::OverloadUnsupported { .. }
+            )
+        }
         NatDefinitionElabError::Inference(
             SourceInferenceError::UnknownConstant(_)
             | SourceInferenceError::ExpectedFunction

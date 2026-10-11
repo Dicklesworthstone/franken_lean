@@ -1618,11 +1618,9 @@ impl Context {
                                         // Rewind the whole containing argument,
                                         // not an already-closed inner lambda.
                                         // The blocker belongs to that snapshot.
-                                        blocked_application = Some(blocker);
+                                        blocked_application = Some(blocker.id);
                                         containing_argument = Some(index);
-                                        return Err(failure(
-                                            SourceInferenceError::ExpectedFunction,
-                                        ));
+                                        return Err(blocker.problem);
                                     }
                                 }
                             }
@@ -2261,7 +2259,14 @@ impl Context {
                                             values.push(self.term_prepared(&nested, expected)?);
                                             continue;
                                         }
-                                        other => other?,
+                                        Ok(function) => function,
+                                        Err(problem) => {
+                                            blocked_application = self.notation_type_unavailable(
+                                                &problem,
+                                                expected.as_ref(),
+                                            )?;
+                                            return Err(problem);
+                                        }
                                     };
                                     tasks.push(Task::Apply(
                                         function,
@@ -2462,6 +2467,8 @@ impl Context {
                                         )?);
                                         continue;
                                     }
+                                    blocked_application =
+                                        self.notation_type_unavailable(&error, expected.as_ref())?;
                                     return Err(error);
                                 }
                             };
@@ -2910,7 +2917,19 @@ impl Context {
                                     let Syntax::Node { args, .. } = head else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
-                                    values.push(self.dotted_identifier(args, expected.as_ref())?);
+                                    let function = match self
+                                        .dotted_identifier(args, expected.as_ref())
+                                    {
+                                        Ok(function) => function,
+                                        Err(problem) => {
+                                            blocked_application = self.notation_type_unavailable(
+                                                &problem,
+                                                expected.as_ref(),
+                                            )?;
+                                            return Err(problem);
+                                        }
+                                    };
+                                    values.push(function);
                                     tasks.push(Task::Function(arguments, expected, explicit));
                                 }
                                 None => {
@@ -3459,7 +3478,28 @@ impl Context {
             match result {
                 Ok(value) => return Ok(value),
                 Err(problem) => {
-                    if !tactics::backtrack::recoverable(&problem) {
+                    if let Some(blocker) = &blocked_application
+                        && containing_argument.is_none()
+                    {
+                        let blockers = [postponed::Blocker {
+                            id: blocker.clone(),
+                            problem: problem.clone(),
+                        }];
+                        for (index, attempt) in attempts.iter().enumerate().rev() {
+                            self.tick()?;
+                            if let Attempt::Argument(checkpoint) = attempt
+                                && let Some(owner) = checkpoint.owned_blocker(self, &blockers)?
+                            {
+                                blocked_application = Some(owner.id);
+                                containing_argument = Some(index);
+                                break;
+                            }
+                        }
+                        if containing_argument.is_none() {
+                            return Err(problem);
+                        }
+                    }
+                    if blocked_application.is_none() && !tactics::backtrack::recoverable(&problem) {
                         return Err(problem);
                     }
                     loop {
@@ -3486,8 +3526,12 @@ impl Context {
                                 checkpoint.restore(self, &mut pending);
                                 self.tick()?;
                                 if let Some(blocker) = &blocked_application
-                                    && let Some(value) =
-                                        checkpoint.postpone(self, &mut pending, blocker)?
+                                    && let Some(value) = checkpoint.postpone(
+                                        self,
+                                        &mut pending,
+                                        blocker,
+                                        &problem,
+                                    )?
                                 {
                                     if checkpoint.hole.is_none() {
                                         values.push(value);

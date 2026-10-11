@@ -12,10 +12,10 @@
 //! Fewer than `n` arguments is the pin's "Insufficient number of fields" error (the pin then
 //! fills sorries under `errToSorry`; an error is an error here). More than `n` arguments nest
 //! the extra ones into a `⟨…⟩` for the last field ([`nest_fields`]), as at the pin, so
-//! `⟨1, 2, rfl⟩ : ∃ x y, x + y = 3` is `⟨1, ⟨2, rfl⟩⟩`. The pin postpones elaboration while the expected type is
-//! unknown or a metavariable (`tryPostponeIfNoneOrMVar`); this elaborator has no postponement
-//! here, so it refuses where the pin would wait, which can refuse a program the pin accepts
-//! but never accepts one it rejects.
+//! `⟨1, 2, rfl⟩ : ∃ x y, x + y = 3` is `⟨1, ⟨2, rfl⟩⟩`. When the expected type is a
+//! metavariable, the application worklist postpones the containing argument
+//! (`tryPostponeIfNoneOrMVar`) until later arguments determine the constructor.
+//! An unresolved expected type retains its original diagnostic.
 use super::*;
 use fln_env::constants::{ConstantInfo, ConstructorVal};
 

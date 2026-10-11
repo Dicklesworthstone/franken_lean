@@ -22,6 +22,9 @@ impl Context {
         if holes.is_empty() {
             Ok(())
         } else {
+            if let Some(error) = self.postponed_application_errors.first() {
+                return Err(error.clone());
+            }
             Err(failure(SourceInferenceError::UnresolvedHoles {
                 count: holes.len(),
             }))
