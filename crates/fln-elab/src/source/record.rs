@@ -40,6 +40,39 @@ fn empty_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
     Ok(())
 }
 
+/// `(x y : T := d)` (`structExplicitBinder`) declares each name as the field `x : T := d`, as the
+/// pin's `expandFields` reads it: one `structSimpleBinder` per name, sharing the modifiers, the
+/// signature and the default. The implicit and instance binder forms stay refused.
+fn simple_fields(fields: &[Syntax]) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+    let mut output = Vec::with_capacity(fields.len());
+    for field in fields {
+        if field.kind() != Some(&parser_kind(&["Command", "structExplicitBinder"])) {
+            output.push(field.clone());
+            continue;
+        }
+        let parts = expect_node(
+            field,
+            &parser_kind(&["Command", "structExplicitBinder"]),
+            6,
+            "explicit structure field",
+        )?;
+        expect_atom(&parts[1], "(", "explicit structure field bracket")?;
+        expect_atom(&parts[5], ")", "explicit structure field bracket")?;
+        for name in expect_null_args(&parts[2], "explicit structure field names")? {
+            output.push(Syntax::node(
+                parser_kind(&["Command", "structSimpleBinder"]),
+                vec![
+                    parts[0].clone(),
+                    name.clone(),
+                    parts[3].clone(),
+                    parts[4].clone(),
+                ],
+            ));
+        }
+    }
+    Ok(output)
+}
+
 /// Elaborate a nonrecursive structure/class with named fields. Prop-valued
 /// records require proof fields, as in the pin's projection generator.
 /// Registration is intentionally absent here: only checked successors can own it.
@@ -140,7 +173,11 @@ pub(super) fn elaborate_record_scoped(
     let fields = match expect_null_args(&parts[4], "record body")? {
         [] => &[][..],
         [keyword, ctor, fields] => {
-            expect_atom(keyword, "where", "record body keyword")?;
+            // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
+            // `expandFields` only logs a deprecation lint, a warning.
+            if expect_atom(keyword, ":=", "record body keyword").is_err() {
+                expect_atom(keyword, "where", "record body keyword")?;
+            }
             expect_empty_null(ctor, "unsupported custom constructor")?;
             let fields = expect_node(
                 fields,
@@ -152,6 +189,7 @@ pub(super) fn elaborate_record_scoped(
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
+    let fields = &simple_fields(fields)?;
     if parameters.len().saturating_add(fields.len()) > budget.max_binders {
         return Err(failure(SourceInferenceError::Record(
             crate::records::RecordError::ResourceLimit,

@@ -2873,6 +2873,37 @@ const BINDER_FIELDS: &[Accepted] = &[
     },
 ];
 
+/// The older structure body `:=` (`" := " <|> " where "`), bracketed fields sharing a line, and
+/// `structFields`'s `manyIndent`: the first field at any column (even 0), a later one at any
+/// column from the first one's. Captured 2026-10-11 from one file the pin elaborated, in this
+/// order; its only messages are the deprecation lints (warnings) on the four `:=` bodies.
+const OLD_STYLE_STRUCTURES: &[Accepted] = &[
+    Accepted {
+        source: "structure OS1 :=\n  (x : Nat)\n  (y : Bool := true)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `OS1 []) (Command.optDeclSig [] []) [] [":=" [] (Command.structFields [(Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`x] (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [] ")") (Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`y] (Command.optDeclSig [] [(Term.typeSpec ":" `Bool)]) [(Term.binderDefault ":=" `true)] ")")])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "class OS2 (α : Type) := (op : α → α)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.classTk "class") (Command.declId `OS2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`α] [":" (Term.type "Type" [])] [] ")")] []) [] [":=" [] (Command.structFields [(Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`op] (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `α "→" `α))]) [] ")")])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure OS3 where\nx : Nat\ny : Nat",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `OS3 []) (Command.optDeclSig [] []) [] ["where" [] (Command.structFields [(Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `x (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) []) (Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `y (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure OS4 := (a b : Nat) (c : Bool)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `OS4 []) (Command.optDeclSig [] []) [] [":=" [] (Command.structFields [(Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`a `b] (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [] ")") (Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`c] (Command.optDeclSig [] [(Term.typeSpec ":" `Bool)]) [] ")")])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure OS5 where\n  (x : Nat)\n    y : Nat",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `OS5 []) (Command.optDeclSig [] []) [] ["where" [] (Command.structFields [(Command.structExplicitBinder (Command.declModifiers [] [] [] [] [] [] []) "(" [`x] (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [] ")") (Command.structSimpleBinder (Command.declModifiers [] [] [] [] [] [] []) `y (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) [])])] (Command.optDeriving [])))"#,
+    },
+    Accepted {
+        source: "structure OS6 :=",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.structure (Command.structureTk "structure") (Command.declId `OS6 []) (Command.optDeclSig [] []) [] [":=" [] (Command.structFields [])] (Command.optDeriving [])))"#,
+    },
+];
+
 /// `change e at h` (`(location)?`), an anonymous tactic `let` (`let : C := v`, `letIdLhs`'s
 /// `hygieneInfo`), and a term `if _ : c` (`termDepIfThenElse`, its `binderIdent` the hole).
 /// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
@@ -5280,6 +5311,14 @@ fn proof_pipes_in_terms_produce_the_pins_trees() {
 #[test]
 fn binder_fields_produce_the_pins_trees() {
     for row in BINDER_FIELDS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn old_style_structures_produce_the_pins_trees() {
+    for row in OLD_STYLE_STRUCTURES {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

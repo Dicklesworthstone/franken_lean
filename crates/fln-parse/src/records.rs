@@ -345,7 +345,6 @@ fn fields(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
-    keyword: usize,
     start: usize,
 ) -> Result<Vec<Syntax>, NatDefinitionParseError> {
     if start == tokens.len() {
@@ -359,12 +358,18 @@ fn fields(
             .expect("token's line exists")
             .0
     };
+    // `structFields` is `manyIndent`: the first field may sit at any column, even 0 (the pin
+    // accepts `structure A where` then `x : Nat` at the line start), and each later field at
+    // a line start sits at the first one's column.
     let base = column(start);
-    if source.line_of(tokens[start].extent.start()) > source.line_of(tokens[keyword].extent.start())
-        && base <= column(keyword)
-    {
-        return Err(refuse(view, tokens, start));
-    }
+    // A field's own bracket (`(x : Nat)`), after its doc comment and visibility: the field ends
+    // where that bracket closes, so `(x : Nat) (y : Nat)` on one line is two fields. The next
+    // one passes `checkColGe` at any column from the first field's on: a line starting further
+    // left is refused below, as the pin ends the command there and fails on the rest.
+    let opening = |first: usize| {
+        let at = first + usize::from(doc_at(tokens, first));
+        at + usize::from(symbol(tokens, at, "private") || symbol(tokens, at, "protected"))
+    };
     let mut output = Vec::new();
     let mut first = start;
     let mut stack = Vec::new();
@@ -392,6 +397,17 @@ fn fields(
                     if stack.pop() != Some(crate::canonical_bracket(s.as_str())) =>
                 {
                     return Err(refuse(view, tokens, index));
+                }
+                ")" | "}" | "]"
+                    if stack.is_empty()
+                        && ["(", "{", "["]
+                            .into_iter()
+                            .any(|open| symbol(tokens, opening(first), open))
+                        && index + 1 < tokens.len()
+                        && column(index + 1) >= base =>
+                {
+                    output.push(field(leaves, view, tokens, first..index + 1)?);
+                    first = index + 1;
                 }
                 "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
                 _ => {}
@@ -500,13 +516,16 @@ pub(super) fn parse(
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
     let end_body = deriving_start(&tokens, cursor);
     let body_tokens = &tokens[..end_body];
+    // The body opens with `where` or, in the pin's older spelling, `:=` (`" := " <|> " where "`).
     let end_result = if symbol(&tokens, cursor, ":") {
-        type_end(body_tokens, cursor, "where").min(type_end(body_tokens, cursor, "extends"))
+        type_end(body_tokens, cursor, "where")
+            .min(type_end(body_tokens, cursor, ":="))
+            .min(type_end(body_tokens, cursor, "extends"))
     } else {
         cursor
     };
     let end_header = if symbol(&tokens, end_result, "extends") {
-        type_end(body_tokens, end_result, "where")
+        type_end(body_tokens, end_result, "where").min(type_end(body_tokens, end_result, ":="))
     } else {
         end_result
     };
@@ -519,7 +538,7 @@ pub(super) fn parse(
     let body = if end_header == end_body {
         null_node(Vec::new())
     } else {
-        if !symbol(&tokens, end_header, "where") {
+        if !symbol(&tokens, end_header, "where") && !symbol(&tokens, end_header, ":=") {
             return Err(refuse(&view, &tokens, end_header));
         }
         // `structCtor := declModifiers ident " :: "`: the constructor's own name, after its doc
@@ -557,8 +576,7 @@ pub(super) fn parse(
             null_node(Vec::new())
         };
         let first_field = if named_ctor { name + 2 } else { end_header + 1 };
-        // Fields are indented past the command's start, its modifiers included.
-        let fields = fields(&leaves, &view, body_tokens, 0, first_field)?;
+        let fields = fields(&leaves, &view, body_tokens, first_field)?;
         null_node(vec![
             leaves.leaf(end_header)?,
             ctor,
@@ -634,8 +652,9 @@ mod tests {
     fn unsupported_record_forms_and_bad_indentation_do_not_disappear() {
         for text in [
             "structure A extends where x : Nat",
-            "structure A where\nx : Nat",
             "structure A where\n  x : Nat\n y : Nat",
+            "structure A := (x : Nat)\n  (y : Nat)",
+            "structure A := (x : Nat) :=",
             "structure A where\n  x : Nat :=",
             "structure A where\n  x : Nat\nderiving",
             "structure A where\n  x Nat",
@@ -653,6 +672,13 @@ mod tests {
             "structure Empty : Type where",
             // A named constructor and no fields (`structCtor`), which the elaborator refuses.
             "structure A where\n  mk ::",
+            // `structFields` is `manyIndent`: the first field may start a line at column 0.
+            "structure A where\nx : Nat",
+            "structure A where\nx : Nat\ny : Nat",
+            // The older `:=` body, and bracketed fields sharing a line.
+            "structure A :=\n(x : Nat)",
+            "structure A := (x : Nat) (y z : Bool := true)",
+            "class A (α : Type) := (op : α → α)",
         ] {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
         }
