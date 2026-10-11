@@ -2904,6 +2904,28 @@ const OLD_STYLE_STRUCTURES: &[Accepted] = &[
     },
 ];
 
+/// `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`): `∃`'s `explicitBinders` under their own
+/// kinds. Captured 2026-10-11 from one file the pin parsed, in this order; its only message is
+/// the type mismatch of the `Prop`-typed `Σ'` (a `PSigma` is a `Type`), an elaboration error.
+const SIGMA_BINDERS: &[Accepted] = &[
+    Accepted {
+        source: "def s1 : Type := Σ n : Nat, Fin (n + 1)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s1 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.type "Type" []))]) (Command.declValSimple ":=" («termΣ_,_» "Σ" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `n)] [":" `Nat])) "," (Term.app `Fin [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "1")) ")")])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def s2 : Type := Σ (a : Nat) (b : Nat), Fin (a + b + 1)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s2 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.type "Type" []))]) (Command.declValSimple ":=" («termΣ_,_» "Σ" (Lean.explicitBinders [(Lean.bracketedExplicitBinders "(" [(Lean.binderIdent `a)] ":" `Nat ")") (Lean.bracketedExplicitBinders "(" [(Lean.binderIdent `b)] ":" `Nat ")")]) "," (Term.app `Fin [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» («term_+_» `a "+" `b) "+" (num "1")) ")")])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def s3 : Prop := Σ' x, x = 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s3 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.prop "Prop"))]) (Command.declValSimple ":=" («termΣ'_,_» "Σ'" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `x)] [])) "," («term_=_» `x "=" (num "1"))) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def s4 : Type 1 := Σ α n, Fin (n + 1) → α",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s4 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.type "Type" [(num "1")]))]) (Command.declValSimple ":=" («termΣ_,_» "Σ" (Lean.explicitBinders (Lean.unbracketedExplicitBinders [(Lean.binderIdent `α) (Lean.binderIdent `n)] [])) "," (Term.arrow (Term.app `Fin [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) («term_+_» `n "+" (num "1")) ")")]) "→" `α)) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 /// `change e at h` (`(location)?`), an anonymous tactic `let` (`let : C := v`, `letIdLhs`'s
 /// `hygieneInfo`), and a term `if _ : c` (`termDepIfThenElse`, its `binderIdent` the hole).
 /// Captured 2026-10-09 from one file the pin elaborated without a message, in this order.
@@ -5319,6 +5341,14 @@ fn binder_fields_produce_the_pins_trees() {
 #[test]
 fn old_style_structures_produce_the_pins_trees() {
     for row in OLD_STYLE_STRUCTURES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn sigma_binders_produce_the_pins_trees() {
+    for row in SIGMA_BINDERS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

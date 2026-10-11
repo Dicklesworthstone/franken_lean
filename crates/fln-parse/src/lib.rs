@@ -3979,7 +3979,10 @@ fn bounded_term_token(
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar
-                && matches!(symbol.as_str(), "forall" | "∀" | "∃" | "fun" | "λ") =>
+                && matches!(
+                    symbol.as_str(),
+                    "forall" | "∀" | "∃" | "Σ" | "Σ'" | "fun" | "λ"
+                ) =>
         {
             let prefix =
                 term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;

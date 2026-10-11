@@ -11,6 +11,9 @@ pub(super) struct Prefix {
     /// sublanguage of it), built as the pin's `«term∃_,_»` node. The elaborator's
     /// expansion pass rewrites it to nested `Exists fun x => ...`, as the pin's macro.
     exists: bool,
+    /// `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`): `∃`'s `explicitBinders` grammar under
+    /// their own node kinds, `«termΣ_,_»` and `«termΣ'_,_»`, with no binder predicate.
+    sigma: Option<&'static str>,
     dependent_arrow: bool,
     binders: Vec<Syntax>,
     annotation: Option<(usize, Syntax)>,
@@ -105,7 +108,16 @@ impl Prefix {
             keyword,
             lambda: symbol(tokens, keyword, "fun") || symbol(tokens, keyword, "λ"),
             record_field: false,
-            exists: symbol(tokens, keyword, "∃"),
+            exists: ["∃", "Σ", "Σ'"]
+                .into_iter()
+                .any(|word| symbol(tokens, keyword, word)),
+            sigma: if symbol(tokens, keyword, "Σ") {
+                Some("termΣ_,_")
+            } else if symbol(tokens, keyword, "Σ'") {
+                Some("termΣ'_,_")
+            } else {
+                None
+            },
             dependent_arrow,
             binders: Vec::new(),
             annotation: None,
@@ -133,6 +145,7 @@ impl Prefix {
             lambda: false,
             record_field: true,
             exists: false,
+            sigma: None,
             dependent_arrow: false,
             binders: Vec::new(),
             annotation: None,
@@ -218,6 +231,7 @@ impl Prefix {
                 if self.binders.len() == 1
                     && !self.lambda
                     && !self.record_field
+                    && self.sigma.is_none()
                     && predicate_operator(tokens, *cursor)
                 {
                     self.phase = Phase::Predicate(*cursor);
@@ -527,7 +541,7 @@ impl Prefix {
         if self.exists {
             let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
             let syntax = Syntax::node(
-                Name::str(Name::anonymous(), "term∃_,_"),
+                Name::str(Name::anonymous(), self.sigma.unwrap_or("term∃_,_")),
                 vec![
                     leaves.leaf(self.keyword)?,
                     explicit_binders(self.binders, self.annotation, leaves)?,
