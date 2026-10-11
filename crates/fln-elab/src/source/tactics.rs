@@ -30,6 +30,9 @@ pub enum TacticError {
     ExplicitFailure,
     /// The tactic given to `fail_if_success` succeeded (`evalFailIfSuccess`).
     FailIfSuccessSucceeded,
+    /// A tactic this engine does not run, named by its syntax kind. Like a malformed script it
+    /// is never caught by `first`/`try`: the pin would run it, and could succeed.
+    UnsupportedTactic(Name),
     /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
     /// expected to be …").
     GuardTargetMismatch,
@@ -98,6 +101,9 @@ impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
+            Self::UnsupportedTactic(kind) => {
+                write!(f, "unsupported tactic `{}`", kind.to_display_string())
+            }
             Self::FailIfSuccessSucceeded => write!(
                 f,
                 "the tactic provided to `fail_if_success` succeeded but was expected to fail"
@@ -1104,7 +1110,7 @@ impl Context {
             } else {
                 let apply = kind == &parser_kind(&["Tactic", "apply"]);
                 if !apply && kind != &parser_kind(&["Tactic", "exact"]) {
-                    return Err(error(TacticError::MalformedScript));
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
                 }
                 let [keyword, term] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
