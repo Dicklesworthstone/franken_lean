@@ -1,0 +1,58 @@
+name: Native quotation scope
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln/src/source_check/grammar.rs'
+      - 'crates/fln/src/source_check/grammar/**'
+      - 'crates/fln/tests/source_quotation_scope.rs'
+      - '.github/workflows/fln-notation-scope.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  quotation-scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Prepare pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/notation-scope
+          git rev-parse HEAD > target/notation-scope/source-commit.txt
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/notation-scope/compiler.txt
+      - name: Test quotation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib source_check::grammar::quotation_scope -- --nocapture 2>&1 | tee target/notation-scope/unit-tests.log
+          if test -f crates/fln/tests/source_quotation_scope.rs; then
+            cargo test --locked -p fln --test source_quotation_scope -- --nocapture 2>&1 | tee target/notation-scope/engine-tests.log
+          fi
+      - name: Check workspace compilation
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/notation-scope/workspace.log
+      - name: Check production lints and formatting
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p fln --lib -- -D warnings 2>&1 | tee target/notation-scope/clippy.log
+          rustfmt --edition 2024 --check crates/fln/src/source_check/grammar/quotation_scope.rs 2>&1 | tee target/notation-scope/fmt.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: notation-scope-${{ github.sha }}
+          path: target/notation-scope

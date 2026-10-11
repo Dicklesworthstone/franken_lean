@@ -15,8 +15,9 @@
 //!
 //! The pin also checks a notation's right-hand side when it is declared (the quotation
 //! precheck): a free identifier must name something. Here every free identifier must name a
-//! global constant in the current scope, and a template that binds names (`fun x => …`), whose
-//! scoping this does not analyse, is refused as not implemented rather than admitted unchecked.
+//! global constant in the current scope. Literal lambda binders are tracked lexically: a
+//! group's domain sees earlier binders, and its names scope over the following groups and
+//! body. Binding constructs whose scope is not analysed remain typed refusals.
 //!
 //! A quotation's identifiers are pre-resolved where it is written (`Syntax.ident`'s
 //! `preresolved`), and a use takes those constants before any of its own scope: a notation
@@ -43,11 +44,13 @@ use fln_core::name::Name;
 use fln_elab::source::scope::SourceScope;
 use fln_parse::command_scope::ScopeCommand;
 use fln_parse::extensions::{FileGrammar, NotationRule, with_grammar};
-use fln_syntax::tree::{Preresolved, Syntax};
+use fln_syntax::tree::Syntax;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod journal;
+mod quotation_scope;
+use quotation_scope::preresolve;
 
 /// Tactic kinds that bind names (the pin's binder reads the identifier as written, never its
 /// pre-resolution): a tactic template holding one is not prechecked here.
@@ -82,7 +85,8 @@ const DECLARING: [&str; 7] = [
 ];
 
 /// Node kinds that bind names in a term, or hold a name that is no global reference (`.foo`, a
-/// field, a named argument, a projection): a template holding one is not prechecked here.
+/// field, a named argument, a projection). `quotation_scope` handles supported binder
+/// shapes before applying this refusal list.
 const BINDING: [&str; 15] = [
     "fun",
     "forall",
@@ -341,87 +345,4 @@ fn may_declare(command: &[u8]) -> bool {
         }
     }
     false
-}
-
-/// The quotation precheck of a template, and its pre-resolution: every identifier that is not
-/// one of its variables names a global, and is written `_root_.<global>`; a template that binds
-/// names is not checked, so it is refused.
-fn preresolve(
-    rule: &NotationRule,
-    resolve: &impl Fn(&Name) -> Resolution,
-) -> Result<Syntax, EngineExecutionError> {
-    let (rhs, variables) = (&rule.rhs, &rule.variables);
-    enum Task<'a> {
-        Visit(&'a Syntax),
-        Build(fln_syntax::source::SourceInfo, &'a Name, usize),
-    }
-    let mut tasks = vec![Task::Visit(rhs)];
-    let mut built: Vec<Syntax> = Vec::new();
-    while let Some(task) = tasks.pop() {
-        match task {
-            Task::Visit(Syntax::Node { info, kind, args }) => {
-                if BINDING
-                    .iter()
-                    .any(|leaf| *kind == Name::from_components(["Lean", "Parser", "Term", leaf]))
-                    || TACTIC_BINDING.iter().any(|leaf| {
-                        *kind == Name::from_components(["Lean", "Parser", "Tactic", leaf])
-                    })
-                {
-                    return Err(EngineExecutionError::NotImplemented {
-                        feature: "a notation whose right-hand side binds names or names a field",
-                    });
-                }
-                tasks.push(Task::Build(*info, kind, args.len()));
-                tasks.extend(args.iter().rev().map(Task::Visit));
-            }
-            Task::Visit(
-                ident @ Syntax::Ident {
-                    info, raw_val, val, ..
-                },
-            ) => {
-                // A variable, or `hygieneInfo`'s anonymous identifier (a parenthesis's).
-                if val.is_anonymous() || variables.iter().any(|(_, variable)| variable == val) {
-                    built.push(ident.clone());
-                    continue;
-                }
-                match resolve(val) {
-                    Resolution::Global(global) => built.push(Syntax::Ident {
-                        info: *info,
-                        raw_val: *raw_val,
-                        val: Name::from_components(["_root_"]).append_core(&global),
-                        preresolved: vec![Preresolved::Decl {
-                            name: global,
-                            fields: Vec::new(),
-                        }],
-                    }),
-                    Resolution::Unchecked => built.push(ident.clone()),
-                    // A `macro`'s name is not prechecked: unknown here, it is resolved where the
-                    // expansion is elaborated, as the pin's empty pre-resolution is.
-                    Resolution::Nothing if !rule.prechecked => built.push(ident.clone()),
-                    Resolution::Nothing => {
-                        return Err(EngineExecutionError::ScopeTransition {
-                            message: format!("unknown identifier '{}'", val.to_display_string()),
-                        });
-                    }
-                    Resolution::Undetermined => {
-                        return Err(EngineExecutionError::NotImplemented {
-                            feature: "a notation whose right-hand side names several declarations",
-                        });
-                    }
-                }
-            }
-            Task::Visit(leaf) => built.push(leaf.clone()),
-            Task::Build(info, kind, count) => {
-                let args = built.split_off(built.len() - count);
-                built.push(Syntax::Node {
-                    info,
-                    kind: kind.clone(),
-                    args,
-                });
-            }
-        }
-    }
-    built.pop().ok_or(EngineExecutionError::NotImplemented {
-        feature: "an empty notation template",
-    })
 }
