@@ -50,6 +50,11 @@ fn admitted_prelude_arithmetic_and_recursive_consumers_run_without_a_seed() {
             ("#eval 20 + 22", 42),
             ("#eval Nat.add 0 42", 42),
             ("#eval Nat.add 42 0", 42),
+            ("def transport (a b : Nat) (h : a = b) (n : Nat) : Nat := Eq.rec (motive := fun k proof => Nat) n h\n#eval transport 1 1 (by rfl) 42", 42),
+            ("def transfer (a b : Nat) (h : a = b) (f : Nat -> Nat -> Nat) : Nat -> Nat -> Nat := Eq.rec (motive := fun k proof => Nat -> Nat -> Nat) f h\ndef result (offset : Nat) : Nat := let f := transfer 1 1 (by rfl) (fun x y => offset + x + y); let g := f 2; g 3\n#eval result 37", 42),
+            ("def Q : Type := Quot (fun (a b : Nat) => a = b)\ndef readQ (q : Q) : Nat := Quot.lift (fun (n : Nat) => n) (fun (a b : Nat) (h : a = b) => h) q\n#eval readQ (Quot.mk (fun a b => a = b) 42)", 42),
+            ("def Q : Type := Quot (fun (a b : Nat) => a = b)\n#eval let lift := @Quot.lift Nat (fun (a b : Nat) => a = b) Nat; lift (fun n => n) (fun a b h => h) (Quot.mk (fun a b => a = b) 42)", 42),
+            ("structure Box where\n  value : Nat\ndef unbox (q : Quot (fun (a b : Box) => a.value = b.value)) : Nat := Quot.lift (fun (a : Box) => a.value) (fun (a b : Box) (h : a.value = b.value) => h) q\n#eval unbox (Quot.mk (fun (a b : Box) => a.value = b.value) { value := 42 })", 42),
             ("def total (xs : List Nat) : Nat := match xs with | [] => 0 | x :: tail => x + total tail\n#eval total [20, 22]", 42),
             ("def twice (f : Nat -> Nat) (n : Nat) : Nat := f (f n)\n#eval twice (Nat.add 1) 40", 42),
             ("def extract (x : Option Nat) : Nat := match x with | none => 0 | some n => n\n#eval extract (Option.map (fun n => n + 1) (some 41))", 42),
@@ -125,5 +130,20 @@ fn admitted_prelude_arithmetic_and_recursive_consumers_run_without_a_seed() {
             assert_eq!(last.flbc_artifact, second.batch.executions.last().unwrap().flbc_artifact, "deterministic imported execution: {source}");
             assert_eq!(root, engine.logical_root(&options));
         }
+        for source in [
+            "def transport (a b : Nat) (h : a = b) (n : Nat) : Nat := Eq.rec (motive := fun k proof => Nat) n h\n#eval transport 0 1 (by rfl) 42",
+            "#eval Quot.lift (fun (n : Nat) => n) (fun (a b : Nat) (h : True) => rfl) (Quot.mk (fun (a b : Nat) => True) 42)",
+        ] {
+            assert!(engine.execute_source_commands_with_checks(source.as_bytes(), &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK))).is_err(),
+                "invalid evidence must be rejected before runtime erasure: {source}");
+            assert_eq!(root, engine.logical_root(&options));
+        }
+        let recovery = engine.execute_source_commands_with_checks(b"#eval Nat.add 20 22", &options,
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)))
+            .unwrap().into_complete().unwrap();
+        assert_eq!(fln::closed_vm_value(&recovery.batch.executions.last().unwrap().exit).unwrap(),
+            Some(ClosedVmValue::Scalar(42)));
+        assert_eq!(root, engine.logical_root(&options));
     }).unwrap().join().unwrap();
 }
