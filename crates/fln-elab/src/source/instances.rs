@@ -440,6 +440,9 @@ impl Context {
                     continue;
                 }
                 if final_pass && self.resolve_default_instance(&registry)? {
+                    // As after an ordinary answer: the default's assignments may decide
+                    // suspended equations (`?β × ?γ =?= Nat × Nat`) that block other goals.
+                    self.flush(false)?;
                     continue;
                 }
                 break;
@@ -986,6 +989,17 @@ impl Context {
                     continue;
                 }
                 if remaining {
+                    // `tryToSynthesizeUsingDefaultInstance` (vendored
+                    // Lean/Elab/SyntheticMVars.lean) assigns the goal to the default
+                    // instance applied to fresh holes and registers its instance arguments as
+                    // new goals, solved by later synthesis or by another default: `instHAdd`
+                    // answers `HAdd ?α ?β ?γ`, and `instOfNatNat` then fixes `?α` for `Add ?α`.
+                    // Its blocked prerequisites are already instance goals here.
+                    if index == 0 && frames[0].default_application {
+                        let value = self.instantiate(&expansion.value)?;
+                        self.assign_instance_answer(&frames[0], value)?;
+                        return Ok(SearchResult::Solved);
+                    }
                     self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
