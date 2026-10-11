@@ -7,7 +7,6 @@
 //! No new admission authority, assumed proof, or arbitrary field is introduced.
 
 use super::*;
-use crate::instances::InstanceRegistry;
 
 impl Engine<'_> {
     pub(super) fn invert_singleton_projection(
@@ -100,18 +99,15 @@ impl Engine<'_> {
         structure: &Name,
     ) -> Result<bool, UnificationError> {
         // Class inversion bypasses instance selection (Reference issue #2011).
-        // Meter the bounded journal before its decoder runs. A corrupt journal
-        // cannot establish that a family is a non-class, so this rung refuses.
-        let registry_name = Name::from_components(["FrankenLean", "sourceInstances", "v1"]);
-        if let Some(extension) = self.work.env.extension(&registry_name) {
-            for entry in extension.entries() {
-                self.meter.node()?;
-                for _ in entry.payload.iter() {
-                    self.meter.node()?;
-                }
-            }
-        }
-        Ok(InstanceRegistry::read(&self.work.env)
+        // Use the same validated, bounded registry as class projection reduction.
+        // Charging every unrelated imported journal byte to this one lookup makes
+        // an ordinary singleton equation exhaust its budget under real Init.
+        // The cache binds both journals and the declarations they validate; failed
+        // reads are not cached and cannot establish that a family is a non-class.
+        self.meter.node()?;
+        Ok(self
+            .projection_registry
+            .read(&self.work.env)
             .is_ok_and(|registry| !registry.is_class(structure)))
     }
 }
