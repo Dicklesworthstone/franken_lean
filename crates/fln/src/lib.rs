@@ -4157,6 +4157,16 @@ impl EngineBuilder {
                 detail: "Nat recursion source reducibility registration failed",
             })?;
         }
+        // These are the seed's already checked generated definitions. The
+        // helper `Nat.brecOn.go` deliberately has no tag of its own, matching
+        // the pin's auxRecExt; it is identified through its tagged parent.
+        let auxiliary_names = ["Nat.casesOn", "Nat.below", "Nat.brecOn"]
+            .map(|name| Name::from_components(name.split('.')));
+        engine.environment =
+            fln_elab::aux_recursors::register_module(&engine.environment, &auxiliary_names)
+                .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                    detail: "source seed auxiliary-recursion registration failed",
+                })?;
         for class in ["Inhabited", "Decidable"] {
             engine.environment = fln_elab::instances::register_class(
                 &engine.environment,

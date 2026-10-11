@@ -21,6 +21,9 @@ use fln_env::constants::{
 };
 use std::collections::HashSet;
 
+mod course_of_values;
+pub use course_of_values::{below_declaration, brec_on_declarations};
+
 /// A candidate could not be constructed; this is not a kernel verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuxiliaryError {

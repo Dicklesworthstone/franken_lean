@@ -4861,7 +4861,7 @@ fn definition_in_context_named(
     }
     // The pin compiles every declaration but a theorem (`codegen.rs`).
     if !is_theorem && !proof_instance {
-        context.check_compiled_recursors(&term.value)?;
+        context.check_compiled_recursors(&term)?;
     }
     let type_ = instance_type.unwrap_or(term.type_);
     let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
@@ -5107,7 +5107,7 @@ fn query_term(
     let term = context.finish(term)?;
     // `#eval` compiles its term (`codegen.rs`); `#check` does not.
     if evaluate {
-        context.check_compiled_recursors(&term.value)?;
+        context.check_compiled_recursors(&term)?;
     }
     Ok((term, level_params))
 }

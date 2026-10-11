@@ -11,7 +11,9 @@
 //! `Prop` or in a sort is never compiled.
 //!
 //! FrankenLean has no pre-definition: `match`, `cases` and structural recursion are all
-//! lowered to `T.rec` here, where the pin uses `casesOn` and `brecOn`, which it compiles.
+//! lowered to `T.rec` here, where the pin compiles its pre-definition lowering.
+//! Directly naming a generated `recOn`, `brecOn`, or `brecOn.go` is different:
+//! those definitions have no compiled LCNF signature in the pin.
 //! So only the recursors the source itself names are checked: a recursor constant the
 //! source resolves (`T.rec`, `@T.rec`, `T.rec (motive := …)`) and the one an `induction`
 //! tactic applies. Each relevant application of such a recursor in the elaborated value
@@ -106,6 +108,34 @@ fn type_former_motive(motive: &Expr) -> bool {
     }
 }
 
+/// Return the explicit tag and underlying checked recursor for a generated
+/// wrapper. The helper carries its parent's tag, not one of its own. Spelling
+/// alone is never sufficient: the caller must validate that tag in the journal.
+fn auxiliary_origin(name: &Name) -> Option<(Name, Name)> {
+    let helper = matches!(name.leaf_view(), LeafView::Str("go"));
+    let tagged = if helper { name.parent() } else { name.clone() };
+    let suffix = match tagged.leaf_view() {
+        LeafView::Str("recOn") if !helper => "",
+        LeafView::Str("brecOn") => "",
+        LeafView::Str(s) => {
+            let suffix = s.strip_prefix("brecOn_")?;
+            let index = suffix.parse::<u32>().ok()?;
+            if index == 0 || suffix != index.to_string() {
+                return None;
+            }
+            return Some((
+                tagged.clone(),
+                Name::str(tagged.parent(), format!("rec_{index}")),
+            ));
+        }
+        _ => return None,
+    };
+    Some((
+        tagged.clone(),
+        Name::str(tagged.parent(), format!("rec{suffix}")),
+    ))
+}
+
 impl Context {
     /// Track both ordinary constants and constants with explicit universe arguments.
     /// Elaboration's own eliminations construct their recursor constants directly.
@@ -114,11 +144,17 @@ impl Context {
         name: &Name,
         info: &ConstantInfo,
     ) -> Result<(), NatDefinitionElabError> {
-        if matches!(info, ConstantInfo::Rec(_))
-            || (matches!(info, ConstantInfo::Defn(_))
-                && matches!(name.leaf_view(), LeafView::Str("recOn"))
-                && self.is_auxiliary_recursor(name)?)
-        {
+        let generated = if matches!(info, ConstantInfo::Defn(_)) {
+            if let Some((tagged, recursor)) = auxiliary_origin(name) {
+                self.is_auxiliary_recursor(&tagged)?
+                    && matches!(self.txn.env.find(&recursor), Some(ConstantInfo::Rec(_)))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if matches!(info, ConstantInfo::Rec(_)) || generated {
             self.note_source_recursor(name);
         }
         Ok(())
@@ -136,7 +172,7 @@ impl Context {
     /// position the pin does not erase.
     pub(super) fn check_compiled_recursors(
         &mut self,
-        value: &Expr,
+        term: &Typed,
     ) -> Result<(), NatDefinitionElabError> {
         if self.source_scope.frontier_recursors {
             return Ok(());
@@ -150,8 +186,20 @@ impl Context {
         if named.is_empty() {
             return Ok(());
         }
+        // Proof declarations and type formers have no runtime body. This is
+        // also necessary for brecOn.go: its PProd result is data even with a
+        // Prop-valued motive, but a projection used solely as a proof erases.
+        if type_former_motive(&term.type_) {
+            return Ok(());
+        }
+        if let Some(sort) = self.known_type(&term.type_)? {
+            let sort = self.whnf(&sort)?;
+            if matches!(sort.node(), ExprNode::Sort { level } if level.is_zero()) {
+                return Ok(());
+            }
+        }
         let mut seen = HashSet::new();
-        let mut work = vec![value.clone()];
+        let mut work = vec![term.value.clone()];
         while let Some(expr) = work.pop() {
             self.tick()?;
             if !seen.insert(expr.allocation_identity()) {
@@ -167,7 +215,7 @@ impl Context {
                     }
                     args.reverse();
                     if let ExprNode::Const { name, levels } = head.node() {
-                        if named.contains(name) && self.compiled_application(name, levels, &args) {
+                        if named.contains(name) && self.compiled_application(name, levels, &args)? {
                             if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
                                 return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
                                     name.clone(),
@@ -199,39 +247,97 @@ impl Context {
 
     /// Whether an application of the recursor `name` at `levels` to `args` produces data
     /// the pin compiles: neither a proof nor a type.
-    fn compiled_application(&self, name: &Name, levels: &[Level], args: &[Expr]) -> bool {
+    fn compiled_application(
+        &mut self,
+        name: &Name,
+        levels: &[Level],
+        args: &[Expr],
+    ) -> Result<bool, NatDefinitionElabError> {
         let recursor = match self.txn.env.find(name) {
             Some(ConstantInfo::Rec(recursor)) => recursor,
-            // Only explicitly tagged recOn definitions enter source_recursors.
-            // Reordering its major/minor premises leaves the motive positions
-            // and elimination universe identical to the original recursor.
+            // Only explicitly tagged wrappers (or their checked go helper)
+            // enter source_recursors. Their motive parameter positions agree
+            // with the original recursor even though its minors are replaced.
             Some(ConstantInfo::Defn(_)) => {
-                let recursor_name = Name::str(name.parent(), "rec");
+                // go returns PProd, including for a Prop-valued motive. Its
+                // complete proof/type uses were erased above; a remaining data
+                // application always requires the missing compiled signature.
+                if matches!(name.leaf_view(), LeafView::Str("go")) {
+                    return Ok(true);
+                }
+                let Some((_, recursor_name)) = auxiliary_origin(name) else {
+                    return Ok(true);
+                };
                 let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(&recursor_name) else {
-                    return true;
+                    return Ok(true);
                 };
                 recursor
             }
-            _ => return false,
+            _ => return Ok(false),
         };
-        let family = name.parent();
+        let family = recursor.base.name.parent();
         let Some(ConstantInfo::Induct(inductive)) = self.txn.env.find(&family) else {
-            return true;
+            return Ok(true);
         };
         // Without a universe of its own the recursor eliminates only into `Prop`.
         if recursor.base.level_params.len() <= inductive.base.level_params.len()
             || levels.first().is_some_and(Level::is_zero)
         {
-            return false;
+            return Ok(false);
         }
-        let index = recursor
-            .all
-            .iter()
-            .position(|member| *member == family)
-            .unwrap_or(0);
-        match args.get(recursor.num_params as usize + index) {
+        let type_ = recursor.base.type_.clone();
+        let params = recursor.num_params as usize;
+        let motives = recursor.num_motives as usize;
+        let Some(index) = self.result_motive_argument(&type_, params, motives)? else {
+            return Ok(true);
+        };
+        Ok(match args.get(index) {
             Some(motive) => !type_former_motive(motive),
             None => true,
+        })
+    }
+
+    /// The actual result motive can belong to a nested container rather than
+    /// the recursor's owning inductive. Read its bound-variable position from
+    /// the checked telescope instead of inferring it from the owner's name.
+    fn result_motive_argument(
+        &mut self,
+        type_: &Expr,
+        params: usize,
+        motives: usize,
+    ) -> Result<Option<usize>, NatDefinitionElabError> {
+        let mut body = type_;
+        let mut binders = 0usize;
+        loop {
+            self.tick()?;
+            match body.node() {
+                ExprNode::ForallE { body: next, .. } => {
+                    let Some(next_count) = binders.checked_add(1) else {
+                        return Ok(None);
+                    };
+                    binders = next_count;
+                    body = next;
+                }
+                ExprNode::MData { expr, .. } => body = expr,
+                _ => break,
+            }
+        }
+        loop {
+            self.tick()?;
+            match body.node() {
+                ExprNode::App { f, .. } => body = f,
+                ExprNode::MData { expr, .. } => body = expr,
+                ExprNode::BVar { idx } => {
+                    let Some(index) = binders.checked_sub(*idx as usize + 1) else {
+                        return Ok(None);
+                    };
+                    return Ok(index
+                        .checked_sub(params)
+                        .filter(|motive| *motive < motives)
+                        .map(|_| index));
+                }
+                _ => return Ok(None),
+            }
         }
     }
 }

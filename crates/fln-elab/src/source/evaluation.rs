@@ -97,7 +97,7 @@ impl PreparedEvaluation {
     /// refusals; this does not silently derive or invent an instance.
     pub fn into_format(mut self) -> Result<Declaration, NatDefinitionElabError> {
         let result = self.format_value()?;
-        self.context.check_compiled_recursors(&result.value)?;
+        self.context.check_compiled_recursors(&result)?;
         Ok(query_declaration(self.name, result, Vec::new()))
     }
 
@@ -203,7 +203,7 @@ impl PreparedEvaluation {
         let expected = Expr::app(monad, Expr::const_(name("Std.Format"), Vec::new()));
         self.context.constrain_type(&result.type_, &expected)?;
         self.context.flush(true)?;
-        self.context.check_compiled_recursors(&result.value)?;
+        self.context.check_compiled_recursors(&result)?;
         Ok(PreparedIoEvaluation::Format(query_declaration(
             self.name,
             result,

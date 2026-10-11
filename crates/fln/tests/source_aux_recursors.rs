@@ -44,7 +44,8 @@ fn metadata(bytes: &[u8]) -> source_extensions::SourceExtensions {
 
 #[test]
 fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
-    // casesOn generation requires the existing polymorphic PUnit primitive.
+    // casesOn and course-of-values generation require the polymorphic PUnit
+    // and PProd primitives.
     // The native source frontend does not yet accept `PUnit.{u} : Sort u`, and
     // an ambient seed has no artifact import identity. Extract only the seed's
     // already checked primitive declarations, then check their Primitives
@@ -54,10 +55,21 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
             .unwrap()
             .into_complete()
             .unwrap();
-        ["PUnit", "PUnit.unit", "PUnit.rec"]
-            .into_iter()
-            .map(|name| seed.environment().find(&n(name)).unwrap().clone())
-            .collect()
+        [
+            "PUnit",
+            "PUnit.unit",
+            "PUnit.rec",
+            "PProd",
+            "PProd.mk",
+            "PProd.rec",
+            "Eq",
+            "Eq.refl",
+            "Eq.rec",
+            "rfl",
+        ]
+        .into_iter()
+        .map(|name| seed.environment().find(&n(name)).unwrap().clone())
+        .collect()
     };
     let primitive_module = n("Primitives");
     let primitive_artifact = encoded(&primitive_constants, &[], &[]);
@@ -89,6 +101,8 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
             n("Base"),
             "prelude\nimport Primitives\n\
              inductive Flag : Type where | off | on\n\
+             structure Prod (A B : Type) where\n  fst : A\n  snd : B\n\
+             inductive Tick : Type where | stop | step : Tick -> Tick\n\
              def Fake.casesOn (A : Type) (x : A) : A := x",
         ),
         (n("Left"), "prelude\nimport Base"),
@@ -96,7 +110,8 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
         (
             n("Main"),
             "prelude\nimport Left\nimport Right\n\
-             def chosen (b : Flag) (A : Type) (x y : A) : A := Flag.casesOn b x y",
+             def chosen (b : Flag) (A : Type) (x y : A) : A := Flag.casesOn b x y\n\
+             theorem recurse (A : Type) (x : A) : Tick.brecOn Tick.stop (fun _ _ => x) = x := rfl",
         ),
     ];
     let inputs: Vec<_> = files
@@ -118,14 +133,24 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
         .into_complete()
         .unwrap();
     let expected = AuxRecursors::read(cold.checked.checked.engine.environment()).unwrap();
-    assert_eq!(expected.len(), 2);
-    for name in ["Flag.recOn", "Flag.casesOn"] {
+    assert_eq!(expected.len(), 8);
+    for name in [
+        "Flag.recOn",
+        "Flag.casesOn",
+        "Prod.recOn",
+        "Prod.casesOn",
+        "Tick.recOn",
+        "Tick.casesOn",
+        "Tick.below",
+        "Tick.brecOn",
+    ] {
         assert!(expected.contains(&n(name)), "{name}");
     }
     assert!(!expected.contains(&n("Fake.casesOn")));
+    assert!(!expected.contains(&n("Tick.brecOn.go")));
     for artifact in &cold.artifacts {
         let tags = metadata(&artifact.bytes).aux_recursors;
-        assert_eq!(tags.len(), if artifact.name == n("Base") { 2 } else { 0 });
+        assert_eq!(tags.len(), if artifact.name == n("Base") { 8 } else { 0 });
     }
     let warm = session
         .compile(&inputs, &n("Main"), OleanWriteBudget::default())
@@ -179,7 +204,7 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
             .iter()
             .map(|m| m.aux_recursors)
             .sum::<usize>(),
-        2
+        8
     );
     assert_eq!(
         AuxRecursors::read(receipt.engine.environment()).unwrap(),
@@ -188,7 +213,8 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
     receipt
         .engine
         .check_source_files(
-            &[b"def use (A : Type) (x y : A) : A := Flag.casesOn Flag.off x y"],
+            &[b"def use (A : Type) (x y : A) : A := Flag.casesOn Flag.off x y\n\
+                theorem useHistory (A : Type) (x : A) : Tick.brecOn (Tick.step Tick.stop) (fun _ _ => x) = x := rfl"],
             &KVMap::new(),
             SourceCheckLimits::new(admission()),
         )
@@ -250,6 +276,35 @@ fn real_prelude_auxiliary_tags_activate_after_both_seats_check_the_definitions()
             assert!(tags.contains(&n("Nat.casesOn")));
             assert!(!tags.contains(&n("Nat.add")));
             assert!(!tags.contains(&n("Eq.ndrec")));
+
+            // These are the real nested Array/List recursors retained in
+            // Prelude. Their data-producing motive is not the first motive.
+            // The pinned Reference refuses all three exact partial applications.
+            let boundary_cases = [
+                (
+                    "def blocked := @Lean.Syntax.brecOn_1 (fun _ => Prop) (fun _ => Nat) (fun _ => Prop)",
+                    "Failed to find LCNF signature for Lean.Syntax.brecOn_1",
+                ),
+                (
+                    "def blocked := @Lean.Syntax.brecOn_2.{1} (fun _ => Prop) (fun _ => Prop) (fun _ => Nat)",
+                    "Failed to find LCNF signature for Lean.Syntax.brecOn_2",
+                ),
+                (
+                    "def blocked := @Lean.Syntax.rec_1 (fun _ => Prop) (fun _ => Nat) (fun _ => Prop)",
+                    "code generator does not support recursor `Lean.Syntax.rec_1`",
+                ),
+            ];
+            for (source, expected) in boundary_cases {
+                let error = receipt
+                    .engine
+                    .check_source_files(
+                        &[source.as_bytes()],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(admission()),
+                    )
+                    .expect_err("a nested data motive must require the compiled signature");
+                assert!(error.to_string().contains(expected), "{source}\n{error}");
+            }
         })
         .unwrap()
         .join()
