@@ -64,6 +64,13 @@ pub enum ScopeCommand {
         specified: bool,
         body: usize,
     },
+    /// `export Ns (a b …)` (`Lean.Parser.Command.export`): the pin's `elabExport` makes each
+    /// `currentNamespace ++ a` an alias of the declaration `a` names in the namespaces `Ns`
+    /// resolves to.
+    Export {
+        namespace: Name,
+        names: Vec<Name>,
+    },
     Trivia,
 }
 
@@ -520,6 +527,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     if keyword == "#guard_msgs" || (keyword == "/--" && guarded(1)) {
         return guard_msgs(&view, &tokens, source.len()).map(Some);
     }
+    if keyword == "export" {
+        return export(&view, &tokens, source.len()).map(Some);
+    }
     if !control(keyword) {
         return Ok(None);
     }
@@ -607,6 +617,40 @@ pub fn wrapper_body(source: &[u8]) -> Result<Option<usize>, DefinitionParseError
 /// command. A numeral is read in its own radix and refused past `u64`, the width of the
 /// `DataValue` it becomes. A string is read only without escapes or gaps, so nothing here decodes
 /// one differently from the pin; one with a backslash is refused.
+/// `"export " ident " (" ident+ ")"`: exactly a namespace and a parenthesized list of names.
+fn export(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    source_len: usize,
+) -> Result<ScopeCommand, DefinitionParseError> {
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens
+            .get(index)
+            .map_or(BytePos(source_len), |t| view.to_original(t.extent.start())),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let symbol = |index: usize, text: &str| matches!(tokens.get(index).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let Some(TokenKind::Ident(namespace)) = tokens.get(1).map(|t| &t.kind) else {
+        return Err(bad(1).into());
+    };
+    if !symbol(2, "(") {
+        return Err(bad(2).into());
+    }
+    let mut names = Vec::new();
+    let mut at = 3;
+    while let Some(TokenKind::Ident(name)) = tokens.get(at).map(|t| &t.kind) {
+        names.push(name.clone());
+        at += 1;
+    }
+    if names.is_empty() || !symbol(at, ")") || at + 1 != tokens.len() {
+        return Err(bad(at).into());
+    }
+    Ok(ScopeCommand::Export {
+        namespace: namespace.clone(),
+        names,
+    })
+}
+
 fn set_option(
     view: &SourceView,
     tokens: &[LexedToken],

@@ -7448,6 +7448,7 @@ impl Engine {
                     | ScopeCommand::Omit(_)
                     | ScopeCommand::Simp(_)
                     | ScopeCommand::Instance(_)
+                    | ScopeCommand::Export { .. }
                     | ScopeCommand::Reducibility(_) => {
                         grammar.observe(&control);
                         match source_check::apply_module_control_command(

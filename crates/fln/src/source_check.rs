@@ -329,6 +329,29 @@ pub(crate) fn apply_module_control_command(
 ) -> Result<Outcome<()>, SourceCheckError> {
     use fln_parse::command_scope::ScopeCommand;
 
+    if let ScopeCommand::Export { namespace, names } = &control {
+        let (file, command, offset) = position;
+        let refuse = |message: String| SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message,
+        };
+        // A module file's public world receives no alias here: refused, never dropped.
+        if public.is_some() {
+            return Err(refuse("export in a module file is not implemented".into()));
+        }
+        let aliases = scopes
+            .export_aliases(engine.environment(), namespace, names)
+            .map_err(refuse)?;
+        let mut environment = engine.environment.clone();
+        for (alias, declaration) in aliases {
+            environment = fln_elab::aliases::register(&environment, &alias, &declaration)
+                .map_err(|error| refuse(format!("{error:?}")))?;
+        }
+        engine.environment = environment;
+        return Ok(Outcome::Complete(()));
+    }
     if !matches!(
         control,
         ScopeCommand::Variable(_)

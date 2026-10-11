@@ -170,6 +170,51 @@ impl Scopes {
         Ok(scope)
     }
 
+    /// The pin's `elabExport` (vendored Lean/Elab/BuiltinCommand.lean): `namespace` resolves as
+    /// `open` resolves it (`resolveNamespace`), a single resolution equal to the current namespace
+    /// is a self export, and each name must denote exactly one declaration `ns ++ name` among
+    /// those namespaces (`resolveNameUsingNamespaces`). The result pairs each alias,
+    /// `currentNamespace ++ name`, with its declaration.
+    pub fn export_aliases(
+        &self,
+        env: &Environment,
+        namespace: &Name,
+        names: &[Name],
+    ) -> Result<Vec<(Name, Name)>, String> {
+        let namespaces = self.resolve_open_in(&self.current, namespace)?;
+        if namespaces.is_empty() {
+            return Err(format!(
+                "unknown namespace `{}`",
+                namespace.to_display_string()
+            ));
+        }
+        if namespaces == [self.current.namespace.clone()] {
+            return Err("invalid 'export', self export".into());
+        }
+        let mut aliases = Vec::with_capacity(names.len());
+        for name in names {
+            let candidates: Vec<Name> = namespaces
+                .iter()
+                .map(|ns| ns.append_core(name))
+                .filter(|candidate| env.contains(candidate))
+                .collect();
+            let [declaration] = candidates.as_slice() else {
+                return Err(if candidates.is_empty() {
+                    format!("unknown declaration `{}`", name.to_display_string())
+                } else {
+                    format!("ambiguous identifier `{}`", name.to_display_string())
+                });
+            };
+            let alias = if self.current.namespace.is_anonymous() {
+                name.clone()
+            } else {
+                self.current.namespace.append_core(name)
+            };
+            aliases.push((alias, declaration.clone()));
+        }
+        Ok(aliases)
+    }
+
     /// Namespace lookup is not global-constant lookup. The Reference's
     /// `resolveNamespace` pools the first enclosing/root namespace with every
     /// opened namespace's matching child. A plain `open` opens all those
@@ -384,6 +429,9 @@ impl Scopes {
         match command {
             ScopeCommand::Instance(_) => {
                 return Err("instance attributes require an environment transition".into());
+            }
+            ScopeCommand::Export { .. } => {
+                return Err("export requires an environment transition".into());
             }
             ScopeCommand::Reducibility(_) => {
                 return Err("reducibility attributes require an environment transition".into());
