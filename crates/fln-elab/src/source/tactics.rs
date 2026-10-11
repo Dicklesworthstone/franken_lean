@@ -408,19 +408,36 @@ impl Context {
                 }
                 continue;
             }
-            let sequence = expect_node(
-                syntax,
-                &parser_kind(&["Tactic", "tacticSeq"]),
-                1,
-                "tactic sequence",
-            )?;
-            let sequence = expect_node(
-                &sequence[0],
-                &parser_kind(&["Tactic", "tacticSeq1Indented"]),
-                1,
-                "flat tactic sequence",
-            )?;
-            let rows = expect_null_args(&sequence[0], "tactic sequence rows")?;
+            // `{ tacs }` (`tacticSeqBracketed := "{" sepByIndent tactic "; " "}"`) is the body of
+            // its own focus here; as a sequence, it is that one focused instruction.
+            let rows = if let Syntax::Node { kind, args, .. } = syntax
+                && kind == &parser_kind(&["Tactic", "tacticSeqBracketed"])
+            {
+                let [open, rows, close] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(open, "{", "bracketed tactic sequence opening")?;
+                expect_atom(close, "}", "bracketed tactic sequence closing")?;
+                rows
+            } else {
+                let sequence = expect_node(
+                    syntax,
+                    &parser_kind(&["Tactic", "tacticSeq"]),
+                    1,
+                    "tactic sequence",
+                )?;
+                if sequence[0].kind() == Some(&parser_kind(&["Tactic", "tacticSeqBracketed"])) {
+                    pending.push((&sequence[0], false));
+                    continue;
+                }
+                &expect_node(
+                    &sequence[0],
+                    &parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                    1,
+                    "flat tactic sequence",
+                )?[0]
+            };
+            let rows = expect_null_args(rows, "tactic sequence rows")?;
             for (index, row) in rows.iter().enumerate().rev() {
                 self.tick()?;
                 if index % 2 == 0 {
@@ -740,6 +757,10 @@ impl Context {
                 };
                 expect_atom(separator, "<;>", "goal sequencing operator")?;
                 self.start_goal_sequence(proof, goal, left, right)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticSeqBracketed"]) {
+                // The pin's `evalTacticSeqBracketed` runs its tactics under `closeUsingOrAdmit`:
+                // on the main goal alone, which they must close, as `·` does.
+                self.start_goal_control(proof, goal, instruction, control::Mode::Solve)?;
             } else if let Some(mode) = control::mode(kind) {
                 let [keyword, sequence] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
