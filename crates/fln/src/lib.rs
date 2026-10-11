@@ -9093,8 +9093,15 @@ impl Engine {
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
-        let lowered =
-            fln_comp::fir::lower_to_flbc(ingress.fir()).map_err(EngineExecutionError::Lowering)?;
+        // Run the program with matchers absorbed and known closures called
+        // directly, as the pin's compiler builds it. If the simplified program
+        // is refused by either validator, lower the one ingress produced, so
+        // the simplification can change how fast a program runs, never whether.
+        let lowered = fln_comp::fir::optimize(ingress.fir(), limits.ingress.fir)
+            .ok()
+            .and_then(|optimized| fln_comp::fir::lower_to_flbc(&optimized).ok())
+            .map_or_else(|| fln_comp::fir::lower_to_flbc(ingress.fir()), Ok)
+            .map_err(EngineExecutionError::Lowering)?;
         let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
             .map_err(EngineExecutionError::Codec)?;
         let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)

@@ -280,12 +280,14 @@ fn an_ordinary_loop_runs_under_the_user_program_profile_and_stops_under_the_prob
         fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
         Some("50005000")
     );
+    // Far past the probe on the axis that stops it: ten thousand frames
+    // against its thousand. Instructions per level are what this bead lowers,
+    // so they cannot measure distance from the probe.
     assert!(
-        result.usage.steps > limits().vm.max_steps / 10,
+        result.usage.peak_stack_depth > 10 * limits().vm.max_stack_depth,
         "the run should be far past anything the probe budget's depth allows: {:?}",
         result.usage
     );
-    assert!(result.usage.peak_stack_depth > limits().vm.max_stack_depth);
 }
 
 /// The engine runs its compiled programs through Golem's inline caches. The
