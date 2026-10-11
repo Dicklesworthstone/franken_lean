@@ -146,8 +146,15 @@ fn indexed_fields_and_indices_have_independent_telescope_scopes() {
         | put (x : A) : Box A x\n\
         def good : Box Nat 7 := Box.put 7",
     );
+    // The index binder does not scope over constructors: under the default `autoImplicit` the
+    // pin (v4.32.0) instead auto-binds `n`, giving `Bad.intro : {n : Nat} -> Bad n`.
+    check(
+        "inductive Bad : forall n : Nat, Type where | intro : Bad n\n\
+        def bad_seven : Bad 7 := Bad.intro",
+    );
     for bad in [
-        "inductive Bad : forall n : Nat, Type where | intro : Bad n",
+        "set_option autoImplicit false in\n\
+        inductive Bad : forall n : Nat, Type where | intro : Bad n",
         "inductive Bad : Nat -> Type where | intro (n : Nat) : Bad missing",
         "inductive Bad : Nat -> Type where | intro (n : Nat) (n : Bool) : Bad n",
     ] {

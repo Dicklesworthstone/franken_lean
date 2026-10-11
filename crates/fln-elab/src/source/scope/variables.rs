@@ -82,7 +82,11 @@ pub fn declare(
     let mut context = Context::scoped(env, kernel, scope);
     context.declare_levels(&Syntax::node(Name::from_components(["null"]), vec![]))?;
     context.infer_level_params = true;
-    context.bind_parameters(syntax)?;
+    // Auto-bound implicits become implicit variables of their own, included where used, as at the
+    // pin (`@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), …` after `variable (R : α → α → Prop)`).
+    let (autos, written) =
+        context.with_auto_bound_implicits(&[], |context| context.bind_parameters(syntax))?;
+    context.refuse_auto_bound_dependencies(&autos, &written)?;
     if context.txn.lctx.len() > MAX_SECTION_VARIABLES {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }

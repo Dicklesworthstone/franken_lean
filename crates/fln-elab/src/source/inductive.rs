@@ -32,7 +32,9 @@ pub(super) fn checked_type(
     let mut locals = context.txn.lctx.decls().to_vec();
     for local in &mut locals {
         local.type_ = context.instantiate(&local.type_)?;
-        context.require_resolved(std::slice::from_ref(&local.type_))?;
+        // A universe hole may remain: an auto-bound implicit's `Sort ?u` is settled only once
+        // the declaration is complete. A term hole may not.
+        context.require_resolved_terms(std::slice::from_ref(&local.type_))?;
     }
     let mut closer = Builder {
         remaining: budget.max_nodes,
@@ -40,21 +42,41 @@ pub(super) fn checked_type(
     let type_ = closer
         .close(&locals, term.value.clone(), false, false)
         .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
+    // Check the closed type with its remaining universe holes generalized, in a copy of the
+    // context: a type well-formed at a fresh parameter `u` is well-formed at whatever `?u`
+    // becomes, and the copy leaves the real holes open for the rest of the declaration.
+    let mut probe;
+    let (checker, type_, generalized) = if type_.has_level_mvar() {
+        probe = context.clone();
+        let generalized = probe.generalize_level_mvars(&Typed {
+            value: type_.clone(),
+            type_: type_.clone(),
+        })?;
+        let type_ = probe.instantiate(&type_)?;
+        (&mut probe, type_, generalized)
+    } else {
+        (&mut *context, type_, Vec::new())
+    };
     let name = loop {
-        let name = context.fresh_name()?;
-        if !context.txn.env.contains(&name) {
+        let name = checker.fresh_name()?;
+        if !checker.txn.env.contains(&name) {
             break name;
         }
     };
     let candidate = Declaration::Axiom(fln_env::constants::AxiomVal {
         base: ConstantVal {
             name,
-            level_params: context.level_params.clone(),
+            level_params: checker
+                .level_params
+                .iter()
+                .chain(&generalized)
+                .cloned()
+                .collect(),
             type_,
         },
         is_unsafe: false,
     });
-    match check(&context.txn.env, &candidate, context.kernel) {
+    match check(&checker.txn.env, &candidate, checker.kernel) {
         Outcome::Complete(Verdict::Accepted { .. }) => Ok(term.value),
         outcome => Err(failure(SourceInferenceError::TypeObligation(Box::new(
             outcome,
@@ -426,14 +448,24 @@ fn header<'a>(
     }
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
-    let parameters = context.bind_parameters(&sig[0])?;
+    // Auto-bound implicits become leading parameters, as at the pin (`@G : {n : Nat} → F n → Type`
+    // for `inductive G : F n → Type`, 2026-10-11).
+    let (autos, (mut parameters, annotation)) =
+        context.with_auto_bound_implicits(&super::own_short_name(&short_name), |context| {
+            let parameters = context.bind_parameters(&sig[0])?;
+            let annotation = optional_type_syntax(&sig[1])?
+                .map(|annotation| context.type_term(annotation))
+                .transpose()?;
+            Ok((parameters, annotation))
+        })?;
+    context.refuse_auto_bound_dependencies(&autos, &parameters)?;
+    parameters.splice(0..0, autos);
     if parameters.iter().any(|p| p.user_name == name) {
         return Err(invalid());
     }
     let parameter_context = context.txn.lctx.clone();
     let mut indices = Vec::new();
-    let explicit = if let Some(annotation) = optional_type_syntax(&sig[1])? {
-        let value = context.type_term(annotation)?;
+    let explicit = if let Some(value) = annotation {
         let value = checked_type(&mut context, value, budget)?;
         let mut value = context.whnf(&value)?;
         while let ExprNode::ForallE {
@@ -747,10 +779,20 @@ fn bodies(
             2,
             "constructor signature",
         )?;
-        let mut fields = context.bind_parameters(&sig[0])?;
+        // Auto-bound implicits become leading implicit fields, after the family's parameters
+        // (`@V.cons : {α : Type} → {n : Nat} → α → V α n → V α (n + 1)` at the pin, 2026-10-11).
+        let (autos, (mut fields, annotation)) =
+            context.with_auto_bound_implicits(&super::own_short_name(ctor_name), |context| {
+                let fields = context.bind_parameters(&sig[0])?;
+                let annotation = optional_type_syntax(&sig[1])?
+                    .map(|result| context.type_term(result))
+                    .transpose()?;
+                Ok((fields, annotation))
+            })?;
+        context.refuse_auto_bound_dependencies(&autos, &fields)?;
+        fields.splice(0..0, autos);
         let mut result_indices = Vec::new();
-        if let Some(result) = optional_type_syntax(&sig[1])? {
-            let annotation = context.type_term(result)?;
+        if let Some(annotation) = annotation {
             let annotation_context = context.txn.lctx.clone();
             let mut result = annotation.clone();
             loop {

@@ -2,6 +2,7 @@
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
 pub mod options;
+mod reserved;
 pub mod simp;
 pub mod variables;
 pub(super) mod visibility;
@@ -48,6 +49,15 @@ pub enum ScopeError {
     ProtectedOutsideNamespace,
     PrivateShadowsPublic(Name),
     PublicShadowsPrivate(Name),
+    /// One of the pin's reserved-name predicates claims the name ([`reserved`]).
+    ReservedName(Name),
+    /// The pin declares this auxiliary with its definition (`reserved::is_declared_auxiliary`).
+    AuxiliaryDeclared(Name),
+    /// A definition's equation name is already declared (`ensureEqnReservedNamesAvailable`).
+    ReservedNameTaken {
+        declaration: Name,
+        taken: Name,
+    },
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,6 +86,22 @@ impl std::fmt::Display for ScopeError {
                 f,
                 "public declaration `{}` conflicts with an existing private declaration",
                 name.to_display_string()
+            ),
+            Self::ReservedName(name) => {
+                write!(f, "`{}` is a reserved name", name.to_display_string())
+            }
+            Self::AuxiliaryDeclared(name) => {
+                write!(
+                    f,
+                    "`{}` has already been declared",
+                    name.to_display_string()
+                )
+            }
+            Self::ReservedNameTaken { declaration, taken } => write!(
+                f,
+                "failed to declare `{}` because `{}` has already been declared",
+                declaration.to_display_string(),
+                taken.to_display_string()
             ),
             Self::Ambiguous(name, candidates) => {
                 write!(f, "ambiguous name `{}`: ", name.to_display_string())?;
@@ -489,8 +515,36 @@ impl Context {
         self.source_scope
             .check_public_name(&user_name, &self.txn.env)?;
         let name = self.source_scope.declaration_name(name).map_err(error)?;
+        let private = self.source_scope.private_name(&user_name);
+        if reserved::is_declared_auxiliary(&self.txn.env, &name)
+            || reserved::is_declared_auxiliary(&self.txn.env, &user_name)
+        {
+            return Err(error(ScopeError::AuxiliaryDeclared(name)));
+        }
+        if reserved::is_reserved(&self.txn.env, &user_name)
+            || reserved::is_reserved(&self.txn.env, &private)
+        {
+            return Err(error(ScopeError::ReservedName(name)));
+        }
         self.source_scope.namespace = user_name.parent();
         Ok(name)
+    }
+
+    /// `ensureEqnReservedNamesAvailable`, which the pin runs for every definition, theorem,
+    /// abbreviation, instance and `opaque` (Lean/Elab/PreDefinition/Main.lean:306,
+    /// Structural/Eqns.lean:159), not for an axiom or an inductive type.
+    pub(super) fn ensure_equation_names_available(
+        &mut self,
+        declaration: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.tick()?;
+        match reserved::taken_equation_name(&self.txn.env, declaration) {
+            Some(taken) => Err(error(ScopeError::ReservedNameTaken {
+                declaration: declaration.clone(),
+                taken,
+            })),
+            None => Ok(()),
+        }
     }
 }
 

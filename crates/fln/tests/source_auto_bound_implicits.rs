@@ -5,7 +5,6 @@
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
-use fln_env::constants::ConstantInfo;
 
 fn limits() -> EngineAdmissionLimits {
     EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
@@ -47,10 +46,7 @@ fn binders(engine: &Engine, name: &str, count: usize) -> Vec<(String, BinderInfo
         .environment()
         .find(&Name::from_components(name.split('.')))
         .unwrap_or_else(|| panic!("{name} not declared"));
-    let ConstantInfo::Defn(definition) = info else {
-        panic!("{name} is not a definition");
-    };
-    let mut type_ = &definition.base.type_;
+    let mut type_ = &info.constant_val().type_;
     let mut found = Vec::new();
     for _ in 0..count {
         let ExprNode::ForallE {
@@ -125,4 +121,54 @@ fn the_option_the_own_name_and_later_binders_refuse_as_at_the_pin() {
     let own = refused("def α (x : α) : Nat := 0\n");
     assert!(own.contains("Unknown identifier `α`"), "{own}");
     refused("def bad (A : Type) (x : A) (h : x = y) : Nat := 0\n");
+}
+
+/// Inductive, constructor and structure/class headers bind as the pin's `#check` shows:
+/// `@G : {n : Nat} → F n → Type`, `@V.cons : {α : Type} → {n : Nat} → α → V α n → V α (n + 1)`,
+/// `@Box : {α : Sort u_1} → α → Type`, `@OpAssoc : {α : Sort u_1} → (α → α → α) → Prop`.
+#[test]
+fn inductive_constructor_and_structure_headers_bind_leading_implicits() {
+    let engine = checked(
+        "inductive F : Nat → Type where\n  | mk (n : Nat) : F n\n\
+         inductive G : F n → Type where\n  | mk : G (F.mk n)\n\
+         inductive V (α : Type) : Nat → Type where\n  | nil : V α 0\n  | cons (x : α) (xs : V α n) : V α (n + 1)\n\
+         structure Box (x : α) where\n  val : Nat\n\
+         class OpAssoc (op : α → α → α) : Prop where\n  assoc : ∀ a b c, op (op a b) c = op a (op b c)\n",
+    );
+    let styles = |name: &str, count: usize| {
+        binders(&engine, name, count)
+            .into_iter()
+            .map(|(name, style, _)| (name, style))
+            .collect::<Vec<_>>()
+    };
+    let implicit = |name: &str| (name.to_owned(), BinderInfo::Implicit);
+    assert_eq!(styles("G", 1), [implicit("n")]);
+    assert_eq!(binders(&engine, "G", 1)[0].2, constant("Nat"));
+    assert_eq!(styles("V.cons", 2), [implicit("α"), implicit("n")]);
+    assert_eq!(binders(&engine, "V.cons", 2)[1].2, constant("Nat"));
+    assert_eq!(styles("Box", 1), [implicit("α")]);
+    assert_eq!(styles("OpAssoc", 1), [implicit("α")]);
+}
+
+/// `variable (R : α → α → Prop)` makes `α` an implicit variable, included where `R` is:
+/// `@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), R x x → R x x`; an unused section leaves
+/// `s : Nat → Nat` alone. A field never auto-binds: the pin refuses `structure P where x : α`.
+#[test]
+fn variables_bind_and_fields_do_not() {
+    let engine = checked(
+        "section\nvariable (R : α → α → Prop)\ndef r (x : α) (h : R x x) : R x x := h\ndef s (n : Nat) : Nat := n\nend\n",
+    );
+    let r = binders(&engine, "r", 3);
+    assert_eq!(
+        r.iter()
+            .map(|(name, style, _)| (name.as_str(), *style))
+            .collect::<Vec<_>>(),
+        [
+            ("α", BinderInfo::Implicit),
+            ("R", BinderInfo::Default),
+            ("x", BinderInfo::Default)
+        ]
+    );
+    assert_eq!(binders(&engine, "s", 1)[0].2, constant("Nat"));
+    refused("structure P where\n  x : α\n");
 }

@@ -3791,6 +3791,14 @@ impl Context {
     }
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
+        let term = self.finish_open_universes(term)?;
+        self.require_resolved(&[term.value.clone(), term.type_.clone()])?;
+        Ok(term)
+    }
+
+    /// `finish`, but a universe hole may remain for the enclosing declaration to generalize, as
+    /// a record field's may under an auto-bound implicit (`α : Sort ?u`). A term hole may not.
+    fn finish_open_universes(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
         if let Some(error) = self.postponed_application_errors.first() {
             return Err(error.clone());
         }
@@ -3799,7 +3807,7 @@ impl Context {
         self.flush(true)?;
         let value = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
-        self.require_resolved(&[value.clone(), type_.clone()])?;
+        self.require_resolved_terms(&[value.clone(), type_.clone()])?;
         Ok(Typed { value, type_ })
     }
 }
@@ -4174,6 +4182,80 @@ fn auto_bound_name(name: &Name, options: &KVMap) -> bool {
         && chars.all(|c| c.is_ascii_digit() || subscript(c) || c == '_' || c == '\'')
 }
 
+impl Context {
+    /// The pin's `withAutoBoundImplicit` (Lean/Elab/Term/TermElabM.lean:1932-1955) around a header's
+    /// binders and type: an unknown name `auto_bound_name` admits, other than `own_names`, restores
+    /// the state from before the attempt, becomes an implicit local of a fresh type, and `elaborate`
+    /// runs again. Returns those locals, in order (they precede whatever `elaborate` binds), and its
+    /// result. The pin's `addAutoBoundImplicits` refusal of an auto whose type mentions a written
+    /// binder is `refuse_auto_bound_dependencies`.
+    pub(super) fn with_auto_bound_implicits<T>(
+        &mut self,
+        own_names: &[Name],
+        mut elaborate: impl FnMut(&mut Self) -> Result<T, NatDefinitionElabError>,
+    ) -> Result<(Vec<LocalDecl>, T), NatDefinitionElabError> {
+        let mut state = self.clone();
+        let mut autos: Vec<LocalDecl> = Vec::new();
+        loop {
+            match elaborate(self) {
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
+                    found,
+                ))) if !own_names.contains(&found)
+                    && !autos.iter().any(|auto| auto.user_name == found)
+                    && auto_bound_name(&found, &self.txn.options) =>
+                {
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    *self = state;
+                    self.txn.budget.heartbeats_consumed = spent;
+                    self.tick()?;
+                    let sort = self.type_expected()?;
+                    let type_ = self.hole(sort)?;
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn
+                        .lctx
+                        .add_param(id.clone(), found, type_, BinderInfo::Implicit);
+                    autos.push(self.txn.lctx.find(&id).expect("auto-bound local").clone());
+                    state = self.clone();
+                }
+                other => return other.map(|value| (autos, value)),
+            }
+        }
+    }
+
+    /// `addAutoBoundImplicits` (Lean/Elab/Term/TermElabM.lean:2044-2058): an auto-bound implicit
+    /// precedes the written binders, so its type may not mention one.
+    pub(super) fn refuse_auto_bound_dependencies(
+        &mut self,
+        autos: &[LocalDecl],
+        written: &[LocalDecl],
+    ) -> Result<(), NatDefinitionElabError> {
+        for auto in autos {
+            let type_ = self.instantiate(&auto.type_)?;
+            for binder in written {
+                self.tick()?;
+                let abstracted = type_
+                    .abstract_fvar(&binder.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                if abstracted.has_loose_bvar(0) {
+                    return Err(failure(SourceInferenceError::AutoBoundDependsOnExplicit {
+                        auto: auto.user_name.clone(),
+                        explicit: binder.user_name.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A declaration's own short name, which its header never auto-binds (MutualDef.lean:213).
+pub(super) fn own_short_name(name: &Name) -> Vec<Name> {
+    match name.leaf_view() {
+        LeafView::Str(spelled) => vec![Name::from_components([spelled])],
+        _ => Vec::new(),
+    }
+}
+
 fn definition_in_context(
     syntax: &Syntax,
     context: &mut Context,
@@ -4328,7 +4410,13 @@ fn definition_in_context_named(
     let mut owned_name = match generated_name {
         Some(generated) => generated,
         None if anonymous_instance => Name::anonymous(),
-        None => context.enter_declaration(name)?,
+        None => {
+            let owned = context.enter_declaration(name)?;
+            if !is_axiom {
+                context.ensure_equation_names_available(&owned)?;
+            }
+            owned
+        }
     };
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
@@ -4353,14 +4441,8 @@ fn definition_in_context_named(
     // atomic name in the header restores the header's state, becomes an implicit local of a
     // fresh type, and the header is elaborated again. Never the definition's own name
     // (MutualDef.lean:213). See `auto_bound_name` for which names.
-    let own_name = match name.leaf_view() {
-        LeafView::Str(spelled) => Some(spelled.to_owned()),
-        _ => None,
-    };
-    let mut header_state = context.clone();
-    let mut autos = Vec::new();
-    let (mut parameters, mut expected) = loop {
-        let attempt: Result<_, NatDefinitionElabError> = (|| {
+    let (autos, (mut parameters, mut expected)) =
+        context.with_auto_bound_implicits(&own_short_name(name), |context| {
             let parameters = context.bind_parameters(&signature[0])?;
             let expected = if is_theorem || is_instance || is_opaque || is_axiom {
                 let parts = expect_node(
@@ -4377,56 +4459,8 @@ fn definition_in_context_named(
                     .transpose()?
             };
             Ok((parameters, expected))
-        })();
-        match attempt {
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
-                found,
-            ))) if !matches!(found.leaf_view(), LeafView::Str(spelled) if own_name.as_deref() == Some(spelled))
-                && auto_bound_name(&found, &context.txn.options) =>
-            {
-                let spent = context.txn.budget.heartbeats_consumed;
-                *context = header_state;
-                context.txn.budget.heartbeats_consumed = spent;
-                context.tick()?;
-                let sort = context.type_expected()?;
-                let type_ = context.hole(sort)?;
-                let id = FVarId(context.fresh_name()?);
-                context
-                    .txn
-                    .lctx
-                    .add_param(id.clone(), found, type_, BinderInfo::Implicit);
-                autos.push(
-                    context
-                        .txn
-                        .lctx
-                        .find(&id)
-                        .expect("auto-bound local")
-                        .clone(),
-                );
-                header_state = context.clone();
-            }
-            other => break other?,
-        }
-    };
-    for auto in &autos {
-        let type_ = context.instantiate(&auto.type_)?;
-        let mut explicit = None;
-        for parameter in &parameters {
-            let abstracted = type_
-                .abstract_fvar(&parameter.id, 0)
-                .map_err(|_| failure(SourceInferenceError::Scope))?;
-            if abstracted.has_loose_bvar(0) {
-                explicit = Some(parameter);
-                break;
-            }
-        }
-        if let Some(explicit) = explicit {
-            return Err(failure(SourceInferenceError::AutoBoundDependsOnExplicit {
-                auto: auto.user_name.clone(),
-                explicit: explicit.user_name.clone(),
-            }));
-        }
-    }
+        })?;
+    context.refuse_auto_bound_dependencies(&autos, &parameters)?;
     parameters.splice(0..0, autos);
     context.infer_level_params = false;
     // Later binders may determine earlier class inputs, but the body may not

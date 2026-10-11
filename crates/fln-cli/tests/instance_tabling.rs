@@ -24,8 +24,12 @@ fn installed_command_checks_repeated_output_dictionaries_and_their_proof() {
             "class C{depth} (A : outParam Type) where\n  value : A\ninstance c{depth} [a : C{previous} Nat] [b : C{previous} Nat] : C{depth} Nat := C{depth}.mk a.value\n"
         ));
     }
+    // The solution doubles at each level, so it is far larger than the pin's default
+    // `synthInstance.maxSize` (128): there the request is refused (`failed to synthesize`), as it
+    // is here since df2f1d37. The test measures tabling, not that limit, so it raises the limit
+    // as a user would; both the pin (v4.32.0, 2026-10-11) and this checker accept then.
     source.push_str(
-        "def result : C12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl\n",
+        "set_option synthInstance.maxSize 8192\ndef result : C12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl\n",
     );
     let path = file("outputs", &source);
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))

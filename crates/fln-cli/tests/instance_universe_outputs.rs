@@ -16,7 +16,11 @@ fn inferred_universe_outputs_keep_checked_success_and_failure_boundaries() {
         let previous = level - 1;
         source.push_str(&format!("class U{level}.{{u}} (A : outParam (Type u)) where\n  value : Nat\ninstance u{level}.{{u,v}} {{A : Type u}} {{B : Type v}} [left : U{previous} A] [right : U{previous} B] : U{level} Nat := U{level}.mk left.value\n"));
     }
-    source.push_str("class Answer where\n  value : Nat\ninstance answer.{u} {A : Type u} [dict : U9 A] : Answer := Answer.mk dict.value\ndef result : Answer := inferInstance\n");
+    // The solution doubles at each level, so it is far larger than the pin's default
+    // `synthInstance.maxSize` (128): there the request is refused (`failed to synthesize`), as it
+    // is here since df2f1d37. The test measures tabling, not that limit, so it raises the limit
+    // as a user would; both the pin (v4.32.0, 2026-10-11) and this checker accept then.
+    source.push_str("class Answer where\n  value : Nat\ninstance answer.{u} {A : Type u} [dict : U9 A] : Answer := Answer.mk dict.value\nset_option synthInstance.maxSize 8192\ndef result : Answer := inferInstance\n");
     std::fs::write(&declarations, &source).unwrap();
     for expected in [7, 8, 7] {
         std::fs::write(

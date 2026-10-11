@@ -50,6 +50,24 @@ instance root {A : Type} {a : A} [warm : D A a] [fixed : D Nat 7] : Root := Root
     assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&KVMap::new()), before);
 
+    // An ascribed numeral, `D Nat (7 : Nat)`, is the same literal key: the pin indexes the
+    // elaborated `7`, and refuses this request too (v4.32.0, 2026-10-11).
+    let ascribed = checked(
+        &engine,
+        r#"class D (A : outParam Type) (a : outParam A) where
+  value : Nat
+instance low : D Nat (7 : Nat) := D.mk 7
+instance high : D Bool true := D.mk 99"#,
+    );
+    let error = ascribed
+        .check_source_files(
+            &[b"def rejected : D Nat 7 := inferInstance"],
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("high is tried first, and its Bool output cannot reconcile with Nat");
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
+
     // Registration order within the numeral's discrimination-tree leaf is
     // still significant; correcting literal indexing must not freeze low.
     checked(

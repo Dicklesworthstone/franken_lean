@@ -111,20 +111,29 @@ pub(super) fn elaborate_record_scoped(
         2,
         "record signature",
     )?;
+    let own = super::own_short_name(name);
     let mut context = Context::scoped(environment, kernel, &scope);
     let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
-    let parameters = context.bind_parameters(&signature[0])?;
-    let explicit = optional_type_syntax(&signature[1])?
-        .map(|syntax| {
-            let term = context.term(syntax, None)?;
-            // Inspecting only the reduced Sort would discard invalid ascriptions
-            // or unused let initializers. Check the original type before any
-            // record-field locals enter the telescope. This publishes nothing.
-            inductive::checked_type(&mut context, term.value, budget)
-        })
-        .transpose()?;
+    // Auto-bound implicits become leading parameters, as at the pin (`@Box : {α : Sort u_1} → α →
+    // Type` for `structure Box (x : α)`, 2026-10-11). A field never auto-binds: the pin refuses one.
+    let (autos, (mut parameters, explicit)) =
+        context.with_auto_bound_implicits(&own, |context| {
+            let parameters = context.bind_parameters(&signature[0])?;
+            let explicit = optional_type_syntax(&signature[1])?
+                .map(|syntax| {
+                    let term = context.term(syntax, None)?;
+                    // Inspecting only the reduced Sort would discard invalid ascriptions
+                    // or unused let initializers. Check the original type before any
+                    // record-field locals enter the telescope. This publishes nothing.
+                    inductive::checked_type(context, term.value, budget)
+                })
+                .transpose()?;
+            Ok((parameters, explicit))
+        })?;
+    context.refuse_auto_bound_dependencies(&autos, &parameters)?;
+    parameters.splice(0..0, autos);
     let inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = inheritance.labels;
     let mut inferred = inheritance.level;
@@ -305,7 +314,8 @@ pub(super) fn elaborate_record_scoped(
         let type_ = context
             .known_type(&domain)?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-        let completed = context.finish(Typed {
+        // Universe holes are generalized once the whole record is elaborated (below).
+        let completed = context.finish_open_universes(Typed {
             value: domain,
             type_,
         })?;
@@ -386,6 +396,40 @@ pub(super) fn elaborate_record_scoped(
         > budget.max_binders
     {
         return Err(failure(SourceInferenceError::ResourceLimit));
+    }
+    // An auto-bound implicit (or a written `Sort _`) leaves a universe hole in the telescope:
+    // generalize it into a level parameter as a definition does (the pin's
+    // `@Box : {α : Sort u_1} → α → Type` for `structure Box (x : α)`, 2026-10-11).
+    context.generalize_declaration_universes(&roots)?;
+    for local in parameters
+        .iter_mut()
+        .chain(section.iter_mut())
+        .chain(output.iter_mut())
+    {
+        context.tick()?;
+        local.type_ = context.instantiate(&local.type_)?;
+    }
+    let result_level = match context.instantiate(&Expr::sort(result_level))?.node() {
+        ExprNode::Sort { level } => level.clone(),
+        _ => return Err(failure(SourceInferenceError::ExpectedType)),
+    };
+    for helper in &mut helpers {
+        if let Declaration::Defn(definition) = helper {
+            definition.base.type_ = context.instantiate(&definition.base.type_)?;
+            definition.value = context.instantiate(&definition.value)?;
+        }
+    }
+    let mut roots: Vec<_> = parameters
+        .iter()
+        .chain(&section)
+        .chain(&output)
+        .map(|p| p.type_.clone())
+        .collect();
+    roots.push(Expr::sort(result_level.clone()));
+    for helper in &helpers {
+        if let Declaration::Defn(definition) = helper {
+            roots.extend([definition.base.type_.clone(), definition.value.clone()]);
+        }
     }
     let level_params = context.declaration_levels(&roots)?;
     let mut closer = crate::records::Builder {

@@ -31,6 +31,24 @@ struct Indexer<'a> {
     locals: Vec<Local>,
 }
 
+/// The source driver keeps an ascription `(e : T)` as the identity let `let _ : T := e; #0`
+/// (inductive.rs `without_ascription`); the pin's elaborated term, which it indexes, is `e`.
+fn without_ascription(expr: &Expr) -> Expr {
+    let mut expr = expr;
+    while let ExprNode::LetE {
+        decl_name,
+        value,
+        body,
+        ..
+    } = expr.node()
+        && decl_name.is_anonymous()
+        && matches!(body.node(), ExprNode::BVar { idx: 0 })
+    {
+        expr = value;
+    }
+    expr.clone()
+}
+
 pub(super) fn derive(
     env: &Environment,
     classes: &BTreeSet<Name>,
@@ -176,7 +194,7 @@ impl Indexer<'_> {
             self.tick()?;
             match head.node() {
                 ExprNode::App { f, a } => {
-                    args.push(a.clone());
+                    args.push(without_ascription(a));
                     head = f;
                 }
                 ExprNode::MData { data, expr } if data.is_empty() => head = expr,
@@ -586,6 +604,7 @@ impl Indexer<'_> {
                 keys.push(Key::Star);
                 continue;
             };
+            let expr = without_ascription(&expr);
             if !root && let Some(literal) = self.numeral(&expr)? {
                 keys.push(Key::Lit(literal));
                 continue;
