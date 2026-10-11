@@ -747,6 +747,11 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(eliminated));
                             continue;
                         }
+                        let args = if matches!(head.node(), ExprNode::Const { .. }) {
+                            self.eta_expand_callbacks(&head, args)?
+                        } else {
+                            args
+                        };
                         let required = args.len().saturating_add(2);
                         if tasks.len().saturating_add(required) > limit {
                             return Err(IngressError::ResourceLimit {

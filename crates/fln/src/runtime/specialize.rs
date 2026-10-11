@@ -818,6 +818,116 @@ impl Preparation<'_> {
     /// axiom name is insufficient: intrinsics require the complete admitted
     /// native contract and any selected extern metadata.
     /// Ground constructors use the same telescope that produced their layout.
+    /// A lambda passed where the callee's parameter takes more arguments than the lambda binds
+    /// (`List`'s `ForIn` passes `fun a _ => f a` where `forIn'` calls back with three) is
+    /// eta-expanded to the parameter's full telescope: `fun a h b => f a b`. A Pi type is one
+    /// flat closure signature, so the staged lambda's closure type is not the parameter's. A
+    /// lambda is seen through the anonymous `let` that annotates its staged type. One whose
+    /// body is a strict `let` keeps its stages: expanding would move that work under the new
+    /// binders. Other arguments, and callees with no known telescope, are returned as they are.
+    pub(super) fn eta_expand_callbacks(
+        &mut self,
+        head: &Expr,
+        mut args: Vec<Expr>,
+    ) -> Result<Vec<Expr>, IngressError> {
+        if !args.iter().any(|arg| annotated_lambda(arg).is_some()) {
+            return Ok(args);
+        }
+        let Some(mut type_) = self.callable_type(head)? else {
+            return Ok(args);
+        };
+        for arg in &mut args {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                break;
+            };
+            let next = self.substitution(body, arg)?;
+            if let Some(lambda) = annotated_lambda(arg) {
+                let parameter = self.normalize_type(binder_type)?;
+                if let Some(expanded) = self.eta_expand_lambda(lambda, &parameter)? {
+                    *arg = match arg.node() {
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            body,
+                            non_dep,
+                            ..
+                        } => Expr::let_e(
+                            decl_name.clone(),
+                            type_.clone(),
+                            expanded,
+                            body.clone(),
+                            *non_dep,
+                        ),
+                        _ => expanded,
+                    };
+                }
+            }
+            type_ = next;
+        }
+        Ok(args)
+    }
+
+    /// `lambda` with the binders its normalized `parameter` telescope has beyond its own.
+    fn eta_expand_lambda(
+        &mut self,
+        lambda: &Expr,
+        parameter: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut binders = Vec::new();
+        let mut body = lambda.clone();
+        let mut remaining = parameter.clone();
+        while let ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body: inner,
+            binder_info,
+        } = body.node()
+        {
+            self.tick()?;
+            let ExprNode::ForallE { body: rest, .. } = remaining.node() else {
+                return Ok(None);
+            };
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            let (inner, rest) = (inner.clone(), rest.clone());
+            body = inner;
+            remaining = rest;
+        }
+        let mut extra = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body: rest,
+            binder_info,
+        } = remaining.node()
+        {
+            self.tick()?;
+            extra.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            let rest = rest.clone();
+            remaining = rest;
+        }
+        if extra.is_empty() || matches!(body.node(), ExprNode::LetE { .. } | ExprNode::MData { .. })
+        {
+            return Ok(None);
+        }
+        let count = u32::try_from(extra.len()).map_err(|_| unsupported("callback arity"))?;
+        let mut expanded = self.lift(&body, count)?;
+        for index in (0..count).rev() {
+            let variable =
+                Expr::bvar(index).map_err(|_| unsupported("callback eta-expansion scope"))?;
+            expanded = Expr::app(expanded, variable);
+        }
+        // Innermost first: the last extra binder, out to the lambda's first.
+        for (name, type_, info) in binders.into_iter().chain(extra).rev() {
+            expanded = Expr::lam(name, type_, expanded, info);
+        }
+        Ok(Some(expanded))
+    }
+
     pub(super) fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
         self.original_callable_type(head)?
             .map(|type_| self.erase_runtime_type(&type_))
@@ -1115,6 +1225,21 @@ impl Preparation<'_> {
             );
         }
         Ok(Some(result))
+    }
+}
+
+/// `arg` itself when it is a lambda, or the lambda that an anonymous annotating `let _ : T := λ; _`
+/// returns.
+fn annotated_lambda(arg: &Expr) -> Option<&Expr> {
+    match arg.node() {
+        ExprNode::Lam { .. } => Some(arg),
+        ExprNode::LetE { value, body, .. }
+            if matches!(value.node(), ExprNode::Lam { .. })
+                && matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
+        {
+            Some(value)
+        }
+        _ => None,
     }
 }
 
