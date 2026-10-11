@@ -4,6 +4,8 @@
 //! admitted recursor rules. Stuck majors are rebuilt once and unwound, never
 //! resubmitted in an unproductive loop. Neither reduction nor transparency can
 //! publish a declaration or eliminate an original source typing obligation.
+#[cfg(test)]
+mod projection_tests;
 mod quotient;
 
 use super::*;
@@ -19,6 +21,11 @@ enum Continuation {
         structure: Name,
         index: u64,
         arguments: Vec<Expr>,
+    },
+    ClassProjection {
+        head: Expr,
+        arguments: Vec<Expr>,
+        projection: crate::records::projection::ClassProjection,
     },
     Recursor {
         head: Expr,
@@ -140,7 +147,48 @@ impl Context {
                                 }
                                 UnificationTransparency::SafeDefinitions => true,
                             } {
-                                break;
+                                // Class fields stay semireducible in the pin,
+                                // but `unfoldProjInst?` can project a dictionary
+                                // whose constructor is exposed at instances
+                                // transparency. Do not unfold a named ordinary
+                                // definition supplying that dictionary.
+                                if transparency != UnificationTransparency::Instances
+                                    || definition.base.level_params.len() != levels.len()
+                                {
+                                    break;
+                                }
+                                let env = self.txn.env.clone();
+                                let Some(projection) =
+                                    crate::records::projection::class_projection(
+                                        &env,
+                                        &definition,
+                                        || self.tick(),
+                                    )?
+                                else {
+                                    break;
+                                };
+                                if arguments.len() <= projection.parameters
+                                    || crate::reducibility::table(&self.txn.env)
+                                        .map_err(|error| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                UnificationError::Reducibility(error),
+                                            )))
+                                        })?
+                                        .status(name)
+                                        == crate::reducibility::Reducibility::Irreducible
+                                    || !self.instance_registry()?.is_class(&projection.structure)
+                                {
+                                    break;
+                                }
+                                let receiver =
+                                    arguments[arguments.len() - projection.parameters - 1].clone();
+                                continuations.push(Continuation::ClassProjection {
+                                    head,
+                                    arguments: std::mem::take(&mut arguments),
+                                    projection,
+                                });
+                                head = receiver;
+                                continue;
                             }
                             if definition.base.level_params.len() != levels.len() {
                                 return Err(failure(SourceInferenceError::Scope));
@@ -229,6 +277,27 @@ impl Context {
                         }
                         head = self.rebuild_application(head, arguments)?;
                         head = Expr::proj(structure, index, head);
+                        arguments = outer;
+                    }
+                    Continuation::ClassProjection {
+                        head: projection_head,
+                        arguments: mut outer,
+                        projection,
+                    } => {
+                        if let Some(field) = crate::records::constructor_field(
+                            &self.txn.env,
+                            &projection.structure,
+                            projection.index,
+                            &head,
+                            &arguments,
+                        ) {
+                            changed = true;
+                            outer.truncate(outer.len() - projection.parameters - 1);
+                            head = field;
+                            arguments = outer;
+                            continue 'reduce;
+                        }
+                        head = projection_head;
                         arguments = outer;
                     }
                     Continuation::Recursor {

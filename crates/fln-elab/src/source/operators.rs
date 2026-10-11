@@ -286,7 +286,8 @@ pub(super) fn probe_says_no(error: &NatDefinitionElabError) -> bool {
             | UnificationError::NodeLimit { .. }
             | UnificationError::AssignmentLimit { .. }
             | UnificationError::HeartbeatLimit
-            | UnificationError::Reducibility(_) => false,
+            | UnificationError::Reducibility(_)
+            | UnificationError::InstanceRegistry(_) => false,
             UnificationError::ConversionCheck { outcome }
             | UnificationError::AssignmentCheck { outcome, .. }
             | UnificationError::ConstraintCheck { outcome, .. } => complete(outcome),

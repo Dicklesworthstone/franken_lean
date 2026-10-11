@@ -39,6 +39,11 @@ enum Continuation {
         index: u64,
         arguments: Vec<Expr>,
     },
+    ClassProjection {
+        head: Expr,
+        arguments: Vec<Expr>,
+        projection: crate::records::projection::ClassProjection,
+    },
     Recursor {
         head: Expr,
         recursor: Box<RecursorVal>,
@@ -194,6 +199,46 @@ impl Engine<'_> {
                                     levels,
                                 )?;
                             }
+                            Some(ConstantInfo::Defn(definition))
+                                if self.budget.transparency
+                                    == UnificationTransparency::Instances
+                                    && definition.base.level_params.len() == levels.len() =>
+                            {
+                                // `WHNF.unfoldProjInst?`: the class field may be
+                                // semireducible, but its receiver must project at
+                                // instances transparency. A stuck receiver keeps
+                                // the original named call, not a bare Expr::Proj.
+                                let Some(projection) =
+                                    crate::records::projection::class_projection(
+                                        &self.work.env,
+                                        definition,
+                                        || self.meter.node(),
+                                    )?
+                                else {
+                                    break;
+                                };
+                                if args.len() <= projection.parameters
+                                    || crate::reducibility::table(&self.work.env)
+                                        .map_err(UnificationError::Reducibility)?
+                                        .status(name)
+                                        == crate::reducibility::Reducibility::Irreducible
+                                    || !self
+                                        .projection_registry
+                                        .read(&self.work.env)
+                                        .map_err(UnificationError::InstanceRegistry)?
+                                        .is_class(&projection.structure)
+                                {
+                                    break;
+                                }
+                                let receiver =
+                                    args[args.len() - projection.parameters - 1].clone();
+                                continuations.push(Continuation::ClassProjection {
+                                    head,
+                                    arguments: std::mem::take(&mut args),
+                                    projection,
+                                });
+                                head = receiver;
+                            }
                             Some(ConstantInfo::Quot(_)) => {
                                 let Some(major) = self.quotient_major_index(&head, args.len())?
                                 else {
@@ -322,6 +367,26 @@ impl Engine<'_> {
                         }
                         head = self.rebuild_application(head, args)?;
                         head = Expr::proj(structure, index, head);
+                        args = outer;
+                    }
+                    Continuation::ClassProjection {
+                        head: projection_head,
+                        arguments: mut outer,
+                        projection,
+                    } => {
+                        if let Some(field) = crate::records::constructor_field(
+                            &self.work.env,
+                            &projection.structure,
+                            projection.index,
+                            &head,
+                            &args,
+                        ) {
+                            outer.truncate(outer.len() - projection.parameters - 1);
+                            head = field;
+                            args = outer;
+                            continue 'reduce;
+                        }
+                        head = projection_head;
                         args = outer;
                     }
                     Continuation::Recursor {

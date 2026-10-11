@@ -179,8 +179,13 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
                     | fln_elab::reducibility::ReducibilityError::Instances(
                         fln_elab::instances::InstanceRegistryError::Limit,
                     ),
+                )
+                | UnificationError::InstanceRegistry(
+                    fln_elab::instances::InstanceRegistryError::Limit,
                 ) => ("resource", false, 3),
-                UnificationError::Reducibility(_) => ("internal-fault", false, 4),
+                UnificationError::Reducibility(_) | UnificationError::InstanceRegistry(_) => {
+                    ("internal-fault", false, 4)
+                }
                 UnificationError::Cancelled => ("cancelled", false, 3),
                 UnificationError::Universe(
                     UniverseInstantiationError::VisitLimit { .. }

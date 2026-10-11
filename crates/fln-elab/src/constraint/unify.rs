@@ -127,6 +127,8 @@ pub enum UnificationError {
     ExpressionScope,
     /// The reducibility journal an `Instances`/`Default` unfold consults was unreadable.
     Reducibility(crate::reducibility::ReducibilityError),
+    /// Class projection reduction could not establish the admitted class registry.
+    InstanceRegistry(crate::instances::InstanceRegistryError),
     Metavariable(MetavarError),
     Universe(UniverseInstantiationError),
     /// A native proof-conversion check stopped without a Boolean answer.
@@ -162,6 +164,7 @@ impl std::fmt::Display for UnificationError {
             Self::Metavariable(error) => write!(f, "{error}"),
             Self::Universe(error) => write!(f, "{error}"),
             Self::Reducibility(error) => write!(f, "{error}"),
+            Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::ConversionCheck { .. } => {
                 write!(f, "kernel proof-conversion check did not complete")
             }
@@ -505,6 +508,7 @@ struct Engine<'a> {
     // freed temporary cannot donate its address to an unrelated expression.
     fact_cache: HashMap<usize, (Expr, Facts)>,
     nat_literals_valid: Option<bool>,
+    projection_registry: crate::instances::RegistryCache,
     pending: pending::PendingState<'a>,
 }
 
@@ -1594,6 +1598,7 @@ impl ElabTxn {
             kernel_checks: 0,
             fact_cache: HashMap::new(),
             nat_literals_valid: None,
+            projection_registry: crate::instances::RegistryCache::default(),
             pending: pending::PendingState::new(pending, remaining),
         };
         let result = engine.solve(equations, typings, delayed);
