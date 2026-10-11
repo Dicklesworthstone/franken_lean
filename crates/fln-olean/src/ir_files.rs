@@ -156,7 +156,7 @@ pub fn check_ir_files(
 /// Decode, structurally validate, then check expression representations before
 /// returning any graph. Both passes share `validation.max_work`; a type-rule
 /// refusal or resource stop returns no partial result. This does not check
-/// ownership, constructor layouts or full application ABI signatures.
+/// ownership, complete allocation safety or full application ABI signatures.
 pub fn check_ir_files_with_types(
     paths: &[PathBuf],
     census_externs: &BTreeMap<Name, usize>,

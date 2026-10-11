@@ -80,11 +80,23 @@ types iteratively, without recursive cloning or printing of hostile types.
 `void` belongs to the pin's object category but is not a valid `proj` source;
 `tagged` projections retain the pin's permissive result-type rule.
 
+Constructor expressions also check the pin's layout metadata: reference
+constructor tags, object-field counts, and scalar bytes including `usize`
+fields. The limits come from the generated ABI contract. Word-sized fields
+use the decoded artifact's LP64 representation, and the combined size is
+computed without integer wraparound. Fieldless constructors retain the pin's
+separate immediate-value rule. These checks run in nested join and case bodies
+as well as at the top level, under the same cumulative work limit.
+
+The expression checker permits the inclusive field-count and scalar-byte
+boundaries used by the pinned `IR.Checker`. The runtime allocator has stricter
+boundaries; passing this check does not authorize an allocation or IR execution.
+
 This is not complete IR typing or runtime safety. As in the pin's expression
 checker, full applications do not compare argument/result types, numeric
 literals have no result-type rule, and returns/mutation/RC instructions retain
-structural checks only. Constructor-layout bounds, ownership, reference-count
-balance and linear aggregate use remain unproved. External arities do not
+structural checks only. Ownership, reference-count balance and linear aggregate
+use remain unproved. External arities do not
 establish ABI type signatures.
 
 ## Evidence and remaining contract

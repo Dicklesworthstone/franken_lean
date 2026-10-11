@@ -9,17 +9,19 @@
 //! soundness or ownership proof. As in that checker, full applications do not
 //! compare argument/result types, numeric literals have no result-type rule,
 //! and returns and mutation/RC instructions retain structural checks only.
-//! Constructor layout bounds, linear aggregate use and runtime-tag/RC balance
+//! Constructor metadata also obeys the pin's IR checker bounds, using the
+//! generated ABI limits and the codec's LP64 scalar-word layout. Those bounds
+//! are inclusive, unlike the runtime allocator's stricter assertions; this is
+//! not an allocation permit. Linear aggregate use and runtime-tag/RC balance
 //! are separate obligations. Successful checking grants no execution authority.
 
 use crate::ir::{
-    IrAlt, IrBody, IrDecl, IrExpr, IrIndex, IrLit, IrModule, IrParam, IrStmt, IrTerminal,
-    IrType,
+    IrAlt, IrBody, IrCtorInfo, IrDecl, IrExpr, IrIndex, IrLit, IrModule, IrParam, IrStmt,
+    IrTerminal, IrType,
 };
-use crate::ir_validate::{
-    IrValidationError, IrValidationLimits, IrValidationSummary, validate_ir,
-};
+use crate::ir_validate::{IrValidationError, IrValidationLimits, IrValidationSummary, validate_ir};
 use fln_core::name::Name;
+use fln_rt::abi::{MAX_CTOR_FIELDS, MAX_CTOR_SCALARS_SIZE, TAG_MAX_CTOR_TAG};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,14 @@ pub enum IrTypeValidationError {
         binding: IrIndex,
         index: u64,
         fields: usize,
+    },
+    ConstructorLayout {
+        declaration: Name,
+        binding: IrIndex,
+        constructor: Name,
+        field: &'static str,
+        observed: u128,
+        allowed: u128,
     },
     /// Defensive: the preceding structural pass normally prevents this.
     UnknownVariable {
@@ -175,6 +185,56 @@ impl Meter {
 
     fn scalar(&mut self, operation: &'static str, ty: &IrType) -> Result<()> {
         self.require(operation, "scalar", ty, is_scalar(ty))
+    }
+
+    fn constructor_bound(
+        &mut self,
+        info: &IrCtorInfo,
+        field: &'static str,
+        observed: u128,
+        allowed: u128,
+    ) -> Result<()> {
+        self.charge()?;
+        if observed > allowed {
+            return Err(IrTypeValidationError::ConstructorLayout {
+                declaration: self.name(),
+                binding: self.binding,
+                constructor: info.name.clone(),
+                field,
+                observed,
+                allowed,
+            });
+        }
+        Ok(())
+    }
+
+    /// `IR/Checker.lean::checkExpr`, ctor arm; `Basic.lean::CtorInfo.isRef`.
+    /// A fieldless constructor is a scalar tag and has no reference-tag cap.
+    /// The pin checks metadata, not argument count or allocator eligibility.
+    fn constructor_layout(&mut self, info: &IrCtorInfo) -> Result<bool> {
+        let is_reference = info.size != 0 || info.usize != 0 || info.ssize != 0;
+        if is_reference {
+            self.constructor_bound(info, "tag", info.cidx.into(), TAG_MAX_CTOR_TAG.into())?;
+        }
+        self.constructor_bound(
+            info,
+            "object fields",
+            info.size.into(),
+            MAX_CTOR_FIELDS as u128,
+        )?;
+        // The region codec reads LP64 size_t words, even on another host. Do
+        // not use size_of::<usize> here: this validates the artifact's layout.
+        // u128 preserves the pin's Nat arithmetic for all decoded u64 fields,
+        // including metadata whose multiplication or sum would overflow u64.
+        let scalar_bytes =
+            u128::from(info.ssize) + u128::from(info.usize) * std::mem::size_of::<u64>() as u128;
+        self.constructor_bound(
+            info,
+            "scalar bytes",
+            scalar_bytes,
+            MAX_CTOR_SCALARS_SIZE as u128,
+        )?;
+        Ok(is_reference)
     }
 
     /// No recursive clone/equality/formatting of aggregate types, even for
@@ -314,7 +374,12 @@ fn check_declaration(declaration: &IrDecl, meter: &mut Meter) -> Result<()> {
     Ok(())
 }
 
-fn check_expr(result: &IrType, expr: &IrExpr, locals: &BTreeMap<IrIndex, &IrType>, meter: &mut Meter) -> Result<()> {
+fn check_expr(
+    result: &IrType,
+    expr: &IrExpr,
+    locals: &BTreeMap<IrIndex, &IrType>,
+    meter: &mut Meter,
+) -> Result<()> {
     // Returning a borrow from locals does not borrow the mutable meter.
     let get = |index: IrIndex| locals.get(&index).copied();
     let source = |index: IrIndex, meter: &Meter| {
@@ -329,7 +394,7 @@ fn check_expr(result: &IrType, expr: &IrExpr, locals: &BTreeMap<IrIndex, &IrType
             meter.object("ap result", result)
         }
         IrExpr::Ctor { info, .. } => {
-            if info.size != 0 || info.usize != 0 || info.ssize != 0 {
+            if meter.constructor_layout(info)? {
                 meter.object("reference constructor result", result)?;
             }
             Ok(())

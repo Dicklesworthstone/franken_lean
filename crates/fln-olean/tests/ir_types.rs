@@ -105,6 +105,230 @@ fn reference_constructors_require_objects_but_fieldless_forms_keep_the_pin_rule(
     check(IrType::Object, IrType::Tagged, IrExpr::Ctor { info: info(0), args: vec![] }).unwrap();
 }
 
+fn constructor(info: IrCtorInfo) -> Result<(), Error> {
+    check(
+        IrType::Object,
+        IrType::Object,
+        IrExpr::Ctor { info, args: vec![] },
+    )
+}
+
+fn constructor_refused(info: IrCtorInfo, field: &'static str, observed: u128, allowed: u128) {
+    let error = constructor(info).expect_err("invalid constructor metadata must be refused");
+    assert!(
+        !error.is_resource(),
+        "a layout violation is not budget exhaustion"
+    );
+    assert_eq!(
+        error,
+        Error::ConstructorLayout {
+            declaration: name("Main"),
+            binding: 1,
+            constructor: name("C.mk"),
+            field,
+            observed,
+            allowed,
+        }
+    );
+}
+
+#[test]
+fn constructor_limits_match_the_generated_pin_contract_and_lp64_artifacts() {
+    use fln_rt::abi::{MAX_CTOR_FIELDS, MAX_CTOR_SCALARS_SIZE, TAG_MAX_CTOR_TAG};
+    // Independent expectations from lean.h:92,106-107 and the generated
+    // size_t field of the codec header. Host pointer width is not the input.
+    assert_eq!(
+        (TAG_MAX_CTOR_TAG, MAX_CTOR_FIELDS, MAX_CTOR_SCALARS_SIZE),
+        (243, 256, 1024)
+    );
+    let word = fln_olean::format::OLEAN_HEADER_FIELDS
+        .iter()
+        .find(|field| field.name == "base_addr" && field.c_type == "size_t")
+        .unwrap();
+    assert_eq!(word.size, std::mem::size_of::<u64>());
+
+    // Checker.lean uses `>` at both bounds, not the allocator's strict `<`.
+    // This intentionally does not claim that 256 pointers can be allocated.
+    constructor(IrCtorInfo {
+        cidx: 243,
+        size: 256,
+        usize: 1,
+        ssize: 1016,
+        ..info(0)
+    })
+    .unwrap();
+    constructor(info(0)).unwrap();
+}
+
+#[test]
+fn constructor_tag_cap_covers_each_reference_shape_but_not_fieldless_tags() {
+    for shape in [
+        info(1),
+        IrCtorInfo {
+            usize: 1,
+            ..info(0)
+        },
+        IrCtorInfo {
+            ssize: 1,
+            ..info(0)
+        },
+    ] {
+        constructor(IrCtorInfo {
+            cidx: 243,
+            ..shape.clone()
+        })
+        .unwrap();
+        constructor_refused(IrCtorInfo { cidx: 244, ..shape }, "tag", 244, 243);
+    }
+    check(
+        IrType::Object,
+        IrType::Tagged,
+        IrExpr::Ctor {
+            info: IrCtorInfo {
+                cidx: u64::MAX,
+                ..info(0)
+            },
+            args: vec![],
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn constructor_object_fields_have_a_distinct_metadata_bound() {
+    for fields in [257, u64::MAX] {
+        constructor_refused(info(fields), "object fields", fields.into(), 256);
+    }
+}
+
+#[test]
+fn constructor_scalar_bytes_include_usize_words_and_do_not_wrap() {
+    for (words, bytes) in [(0, 1024), (128, 0), (127, 8), (1, 1016)] {
+        constructor(IrCtorInfo {
+            usize: words,
+            ssize: bytes,
+            ..info(0)
+        })
+        .unwrap();
+    }
+    for (words, bytes, total) in [
+        (0, 1025, 1025),
+        (129, 0, 1032),
+        (127, 9, 1025),
+        (1, 1017, 1025),
+        // A u64 multiplication would wrap to zero; the sum case would too.
+        (1u64 << 61, 0, 1u128 << 64),
+        (u64::MAX, 8, 1u128 << 67),
+        (u64::MAX, u64::MAX, u128::from(u64::MAX) * 9),
+    ] {
+        constructor_refused(
+            IrCtorInfo {
+                usize: words,
+                ssize: bytes,
+                ..info(0)
+            },
+            "scalar bytes",
+            total,
+            1024,
+        );
+    }
+}
+
+#[test]
+fn constructor_layout_checks_share_the_work_budget_and_leave_inputs_unchanged() {
+    let modules = [sample(
+        IrType::Object,
+        IrType::Object,
+        IrExpr::Ctor {
+            info: info(1),
+            args: vec![IrArg::Var(0)],
+        },
+    )];
+    let before = modules.clone();
+    let measured =
+        validate_ir_types(&modules, &BTreeMap::new(), IrValidationLimits::default()).unwrap();
+    let exact = IrValidationLimits {
+        max_work: measured.work,
+        ..IrValidationLimits::default()
+    };
+    validate_ir_types(&modules, &BTreeMap::new(), exact).unwrap();
+    for remaining in 1..=4 {
+        let error = validate_ir_types(
+            &modules,
+            &BTreeMap::new(),
+            IrValidationLimits {
+                max_work: measured.work - remaining,
+                ..exact
+            },
+        )
+        .unwrap_err();
+        assert!(error.is_resource());
+    }
+    assert_eq!(modules, before);
+}
+
+#[test]
+fn real_profile_closure_checks_constructor_metadata_inside_join_points() {
+    use fln_olean::ir::{IrDecodeLimits, decode_ir};
+    use fln_olean::region::{OleanView, WalkBudget};
+    let view = OleanView::parse(include_bytes!("../fixtures/ir/Lean.Util.Profile.ir")).unwrap();
+    let blocks = view
+        .extension_payloads(WalkBudget::default(), 1 << 30)
+        .unwrap();
+    let decoded = decode_ir(&blocks, IrDecodeLimits::default()).unwrap();
+    let target = name("Lean.profileitIOUnsafe._redArg._lam_0");
+    let declaration = decoded
+        .decls
+        .iter()
+        .find(|decl| decl.name() == &target)
+        .unwrap()
+        .clone();
+    let mut modules = [module(vec![declaration])];
+    let checked =
+        validate_ir_types(&modules, &BTreeMap::new(), IrValidationLimits::default()).unwrap();
+    assert_eq!(checked.structural.dynamic_calls, 1);
+    assert!(checked.structural.bodies > 1);
+
+    // The unchanged pin fixture has Except.ok / Except.error allocations deep
+    // in join-point values. Mutate those metadata fields, not its container.
+    let IrDecl::Function { body, .. } = &mut modules[0].decls[0] else {
+        unreachable!()
+    };
+    let mut pending = vec![body];
+    let mut mutations = 0;
+    while let Some(body) = pending.pop() {
+        for stmt in &mut body.stmts {
+            match stmt {
+                IrStmt::VDecl {
+                    expr: IrExpr::Ctor { info, .. },
+                    ..
+                } => {
+                    assert_eq!(info.size, 1);
+                    info.size = 257;
+                    mutations += 1;
+                }
+                IrStmt::JDecl { value, .. } => pending.push(value),
+                _ => {}
+            }
+        }
+        if let IrTerminal::Case { alts, .. } = body.terminal.as_mut() {
+            for alt in alts {
+                let (IrAlt::Ctor { body, .. } | IrAlt::Default { body }) = alt;
+                pending.push(body);
+            }
+        }
+    }
+    assert_eq!(
+        mutations, 2,
+        "the unchanged fixture must exercise both constructor branches"
+    );
+    assert!(
+        matches!(validate_ir_types(&modules, &BTreeMap::new(), IrValidationLimits::default()),
+        Err(Error::ConstructorLayout { declaration, field: "object fields", observed: 257, allowed: 256, .. })
+        if declaration == target)
+    );
+}
+
 #[test]
 fn object_projection_and_tagged_projection_follow_different_rules() {
     check(IrType::Object, IrType::TObject, IrExpr::Proj { i: 0, x: 0 }).unwrap();
