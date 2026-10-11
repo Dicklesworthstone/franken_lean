@@ -197,7 +197,8 @@ impl Context {
         }
         // The outer request runs the pin's `preprocessOutParam`, even for
         // known outputs. Prerequisites go directly to `tryResolve` instead:
-        // their already known outputs must constrain candidate selection.
+        // all their output values, repeated variables and dependent structure
+        // must constrain candidate selection, even when still unknown.
         let (mut prepared_levels, mut key_levels) = if let Some(parameters) = imported {
             self.instance_explicit_output_levels(
                 &base.level_params,
@@ -212,10 +213,8 @@ impl Context {
                 prepared_levels.iter_mut().zip(&mut key_levels).zip(levels)
             {
                 self.tick()?;
-                if !original.has_mvar() {
-                    *prepared = original.clone();
-                    *key = original.clone();
-                }
+                *prepared = original.clone();
+                *key = original.clone();
             }
         }
         let levels = prepared_levels;
@@ -241,8 +240,7 @@ impl Context {
                 self.synthesize_instance_input(&argument, registry)?;
                 argument = self.instantiate(&argument)?;
             }
-            let erase_output = mode == ParameterMode::Output
-                && (erase_known_outputs || argument.has_expr_mvar() || argument.has_level_mvar());
+            let erase_output = mode == ParameterMode::Output && erase_known_outputs;
             let selected = match mode {
                 ParameterMode::Input => {
                     if argument.has_expr_mvar() || argument.has_level_mvar() {

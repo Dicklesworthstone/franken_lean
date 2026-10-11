@@ -48,7 +48,7 @@ fn repeated_polymorphic_prerequisites_infer_their_own_universes() {
     let base = checked(&engine(), &polymorphic_tree(9));
     checked(
         &base,
-        "def result : Answer := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+        "set_option synthInstance.maxSize 1024 in\ndef result : Answer := inferInstance\ntheorem correct : result.value = 7 := by rfl",
     );
 }
 

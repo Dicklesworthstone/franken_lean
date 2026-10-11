@@ -9,12 +9,14 @@ pub(super) mod audit;
 mod parameters;
 mod reconcile;
 mod table;
+mod tabled;
 
 #[cfg(test)]
 mod index_tests;
 
 const MAX_SEARCH_DEPTH: usize = 128;
 const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
+const DEFAULT_MAX_RESULT_SIZE: u64 = 128;
 /// The pin's `maxSynthPendingDepth` default (vendored Meta/Basic.lean). As in
 /// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
 pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
@@ -134,10 +136,12 @@ enum Candidate {
     Local(FVarId),
     Global(Name),
 }
+#[derive(Clone)]
 struct Expansion {
     value: Expr,
     subgoals: Vec<MVarId>,
 }
+#[derive(Clone)]
 struct Frame {
     goal: MVarId,
     target: Expr,
@@ -151,6 +155,10 @@ struct Frame {
     // Successful prerequisites remain resumable until the enclosing candidate
     // completes. Arena indices keep this history flat, not recursively cloned.
     children: Vec<usize>,
+    // Number of prerequisite instances consumed by this candidate. Restoring
+    // a historical child also restores the enclosing candidate's prior size.
+    size: u64,
+    parent_size: u64,
     resumable: bool,
     // A table hit returns the first answer but retains a lazy continuation.
     // On backtracking rebuild its choices, skip that answer once, then resume
@@ -165,6 +173,13 @@ pub(super) fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabE
 }
 
 impl Context {
+    fn instance_max_result_size(&self) -> u64 {
+        self.txn.options.get_nat(
+            &Name::from_components(["synthInstance", "maxSize"]),
+            DEFAULT_MAX_RESULT_SIZE,
+        )
+    }
+
     /// The current environment's instance registry, read once per change of
     /// what it reads ([`crate::instances::RegistryCache`]).
     pub(super) fn instance_registry(
@@ -593,6 +608,8 @@ impl Context {
             cursor: 0,
             chosen: None,
             children: Vec::new(),
+            size: 0,
+            parent_size: 0,
         }))
     }
 
@@ -634,10 +651,16 @@ impl Context {
             };
             let body = body.clone();
             let arg = if *binder_info == BinderInfo::InstImplicit {
-                let arg = self.instance_hole(binder_type.clone())?;
+                // These are search-internal binders, not source-owned goals.
+                // The pin's getSubgoals creates ordinary assignable variables
+                // for every binder, including dictionaries. Keeping them
+                // opaque forces output preprocessing in prerequisites, losing
+                // repeated-variable constraints before candidate selection.
+                let arg = self.hole(binder_type.clone())?;
                 let ExprNode::MVar { id } = arg.node() else {
                     unreachable!("fresh instance hole")
                 };
+                self.instance_goals.push(id.clone());
                 subgoals.push(id.clone());
                 positions.push(position);
                 arg
@@ -720,10 +743,12 @@ impl Context {
             };
             if let Some(child) = frame.children.pop() {
                 let child = history[child].take().expect("live instance choice");
+                frame.size = child.parent_size;
                 frames.push(child);
                 continue;
             }
             frame.chosen = None;
+            frame.size = 0;
             let spent = self.txn.budget.heartbeats_consumed;
             *self = frame.base.clone();
             self.txn.budget.heartbeats_consumed = spent;
@@ -781,6 +806,27 @@ impl Context {
         registry: &InstanceRegistry,
         default: Option<&Name>,
     ) -> Result<SearchResult, NatDefinitionElabError> {
+        if default.is_none() {
+            let base = self.clone();
+            if let Some(result) = self.search_instances_tabled(root.clone(), registry)? {
+                return Ok(result);
+            }
+            // Open answers and scope fragments not represented by the shared
+            // table keep the bounded search below. No speculative assignment
+            // or uncharged work survives a change of search strategy.
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = base;
+            self.txn.budget.heartbeats_consumed = spent;
+        }
+        self.search_instance_depth_first(root, registry, default)
+    }
+
+    fn search_instance_depth_first(
+        &mut self,
+        root: MVarId,
+        registry: &InstanceRegistry,
+        default: Option<&Name>,
+    ) -> Result<SearchResult, NatDefinitionElabError> {
         let ambient = self
             .txn
             .mvars
@@ -823,6 +869,7 @@ impl Context {
                     // blocked preparation, but retain every charged heartbeat.
                 }
                 if let Some(mut child) = ready {
+                    child.parent_size = frames[index].size;
                     let mut cycle = false;
                     for ancestor in &frames {
                         if table::same_goal(self, ancestor, &child)? {
@@ -838,8 +885,10 @@ impl Context {
                         return Err(failure(SourceInferenceError::ResourceLimit));
                     }
                     match table.lookup(self, &child, &frames)? {
-                        Some(table::Answer::Solved(value)) => {
+                        Some(table::Answer::Solved(value, size)) => {
                             self.assign_instance_answer(&child, value)?;
+                            frames[index].size = frames[index].size.saturating_add(size);
+                            child.size = size.saturating_sub(1);
                             if child.resumable {
                                 child.replay_first = true;
                                 child.returned = true;
@@ -861,6 +910,10 @@ impl Context {
                     self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
+                if frames[index].size >= self.instance_max_result_size() {
+                    self.retry_instance_choice(&mut frames, &mut history)?;
+                    continue;
+                }
                 let mut value = self.instantiate(&expansion.value)?;
                 let actual = self.instantiate(&frames[index].target)?;
                 if value.has_expr_mvar()
@@ -871,8 +924,9 @@ impl Context {
                     self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
-                // Selection never sees existing output values. Reconcile only
-                // after a complete candidate, in this goal's own local scope.
+                // Only the outer selection hides existing output values;
+                // prerequisites preserve their original output constraints.
+                // Reconcile a complete answer in this goal's own local scope.
                 // A mismatch ends this goal; trying a lower-priority instance
                 // here would silently turn outParam into semiOutParam.
                 self.txn.lctx = frames[index].base.txn.lctx.clone();
@@ -933,6 +987,9 @@ impl Context {
                 }
                 frames[index].returned = true;
                 let complete = frames.pop().expect("completed instance frame");
+                if let Some(parent) = frames.last_mut() {
+                    parent.size = parent.size.saturating_add(complete.size.saturating_add(1));
+                }
                 if complete.resumable
                     && let Some(parent) = frames.last_mut()
                 {

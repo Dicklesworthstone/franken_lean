@@ -345,6 +345,8 @@ mod tests {
             cursor: 0,
             chosen: None,
             children: Vec::new(),
+            size: 0,
+            parent_size: 0,
             resumable: true,
             replay_first: false,
             returned: false,

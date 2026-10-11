@@ -145,6 +145,14 @@ pub const ROWS: &[Row] = &[
         "Lean/Meta/SynthInstance.lean:19",
         AtLeastDefault,
     ),
+    // Both instance search strategies count every consumed dictionary,
+    // including repeated table answers (SynthInstance.addAnswer/resume).
+    row(
+        "synthInstance.maxSize",
+        Nat(128),
+        "Lean/Meta/SynthInstance.lean:24",
+        Honored,
+    ),
     row(
         "maxRecDepth",
         Nat(512),
@@ -651,6 +659,14 @@ mod tests {
             .map(|row| row.name)
             .collect();
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
-        assert_eq!(honored, ["autoLift", "maxHeartbeats", "autoImplicit"]);
+        assert_eq!(
+            honored,
+            [
+                "autoLift",
+                "maxHeartbeats",
+                "synthInstance.maxSize",
+                "autoImplicit"
+            ]
+        );
     }
 }
