@@ -4,8 +4,8 @@
 //! Every program's verdict was taken from the pinned `lean` (v4.32.0) on 2026-10-09 first.
 #![forbid(unsafe_code)]
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, KVMap,
-    SourceCheckError, SourceCheckLimits, VmExit,
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckError,
+    SourceCheckLimits, VmExit,
 };
 
 fn check(source: &str) -> Result<usize, SourceCheckError> {
@@ -111,17 +111,12 @@ fn scoped_notation_lives_in_its_namespace() {
     );
 }
 
-/// A template that binds names (`fun y => …`) is accepted at the pin; its scoping is not
-/// prechecked here, so it is refused as not implemented rather than admitted unchecked.
+/// The pin-accepted binding template now goes through lexical pre-resolution,
+/// hygienic expansion and the same theorem admission path as nonbinding notation.
 #[test]
-fn a_template_that_binds_names_is_a_typed_refusal() {
-    let error = refused(
+fn a_template_that_binds_names_is_checked_and_admitted() {
+    accepted(
         "notation \"⟪\" x \"⟫\" => (fun y => Nat.add y y) x\ntheorem w : ⟪(2 : Nat)⟫ = 4 := rfl\n",
-    );
-    assert!(
-        matches!(&error, SourceCheckError::Command { error, .. }
-            if matches!(**error, EngineExecutionError::NotImplemented { .. })),
-        "{error:?}"
     );
 }
 

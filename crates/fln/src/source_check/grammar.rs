@@ -15,9 +15,10 @@
 //!
 //! The pin also checks a notation's right-hand side when it is declared (the quotation
 //! precheck): a free identifier must name something. Here every free identifier must name a
-//! global constant in the current scope. Literal lambda binders are tracked lexically: a
-//! group's domain sees earlier binders, and its names scope over the following groups and
-//! body. Binding constructs whose scope is not analysed remain typed refusals.
+//! global constant in the current scope. Literal lambda and Pi binders are tracked lexically: a
+//! domain sees preceding binders, including earlier names in the same group. Shared
+//! annotations are expanded into singleton groups before pre-resolution. Binding constructs
+//! whose scope is not analysed remain typed refusals.
 //!
 //! A quotation's identifiers are pre-resolved where it is written (`Syntax.ident`'s
 //! `preresolved`), and a use takes those constants before any of its own scope: a notation
