@@ -234,3 +234,111 @@ fn declined_holes_are_asked_once_per_assignment_generation_in_occurrence_order()
     assert_eq!(synthesis.asked, vec![second, first]);
     unchanged(&txn, &before);
 }
+
+#[test]
+fn assignable_function_holes_can_synthesize_after_ordinary_patterns_stall() {
+    for kind in [MetavarKind::Natural, MetavarKind::Synthetic] {
+        let mut txn = transaction();
+        let instance = MVarId(name("functionInstance"));
+        txn.mvars.declare(
+            instance.clone(),
+            instance.0.clone(),
+            Expr::forall_e(name("x"), nat(), nat(), BinderInfo::Default),
+            txn.lctx.clone(),
+            kind,
+            0,
+            None,
+        );
+        let equations = [(
+            Expr::app(Expr::mvar(instance.clone()), numeral(0)),
+            numeral(7),
+        )];
+        let before = txn.clone();
+        let mut control = txn.clone();
+        assert!(matches!(
+            control.unify_many_with(&equations, budget(), &|| false),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged(&control, &before);
+
+        let answer = Expr::lam(name("x"), nat(), numeral(7), BinderInfo::Default);
+        let expected = answer.clone();
+        let mut synthesis = owner(move |_: &ElabTxn, _: &MVarId| PendingAnswer {
+            result: Ok(Some((answer.clone(), name("Pending")))),
+            spent: 0,
+        });
+        let report = txn
+            .unify_many_with_pending(&equations, budget(), &|| false, &mut synthesis)
+            .unwrap();
+        assert_eq!(synthesis.asked, vec![instance.clone()]);
+        assert_eq!(report.expression_assignments, vec![instance.clone()]);
+        assert_eq!(txn.mvars.get_assigned_expr(&instance), Some(&expected));
+        assert!(report.kernel_checks > 0);
+    }
+}
+
+#[test]
+fn synthesis_of_assignable_holes_cannot_discard_the_original_constraint() {
+    let mut txn = transaction();
+    let instance = MVarId(name("functionInstance"));
+    txn.mvars.declare(
+        instance.clone(),
+        instance.0.clone(),
+        Expr::forall_e(name("x"), nat(), nat(), BinderInfo::Default),
+        txn.lctx.clone(),
+        MetavarKind::Natural,
+        0,
+        None,
+    );
+    let equations = [(
+        Expr::app(Expr::mvar(instance.clone()), numeral(0)),
+        numeral(7),
+    )];
+    let before = txn.clone();
+    // This is a well-typed function, but it does not solve the equation. Its
+    // owner's completed answer is not authority to publish the assignment.
+    let mut synthesis = owner(|_: &ElabTxn, _: &MVarId| PendingAnswer {
+        result: Ok(Some((
+            Expr::lam(name("x"), nat(), numeral(8), BinderInfo::Default),
+            name("Pending"),
+        ))),
+        spent: 17,
+    });
+    assert!(matches!(
+        txn.unify_many_with_pending(&equations, budget(), &|| false, &mut synthesis),
+        Err(UnificationError::Deferred(_))
+    ));
+    assert_eq!(synthesis.asked, vec![instance]);
+    assert!(txn.budget.heartbeats_consumed >= before.budget.heartbeats_consumed + 17);
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn an_unknown_argument_of_a_neutral_function_is_not_a_synthesis_blocker() {
+    let mut txn = transaction();
+    let function = FVarId(name("neutral"));
+    txn.lctx.add_param(
+        function.clone(),
+        function.0.clone(),
+        Expr::forall_e(name("x"), nat(), nat(), BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    let argument = hole(&mut txn, "argument", MetavarKind::Natural);
+    let equations = [(
+        Expr::app(Expr::fvar(function), Expr::mvar(argument)),
+        numeral(7),
+    )];
+    let before = txn.clone();
+    let mut synthesis = owner(|_: &ElabTxn, _: &MVarId| PendingAnswer {
+        result: Ok(Some((numeral(0), name("Pending")))),
+        spent: 0,
+    });
+    assert!(matches!(
+        txn.unify_many_with_pending(&equations, budget(), &|| false, &mut synthesis),
+        Err(UnificationError::Deferred(_))
+    ));
+    // Choosing an argument does not unblock an uninterpreted local function.
+    // In particular, scanning every natural hole would change search order.
+    assert!(synthesis.asked.is_empty());
+    unchanged(&txn, &before);
+}

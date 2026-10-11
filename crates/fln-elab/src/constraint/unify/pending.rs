@@ -4,9 +4,9 @@
 //! `synthPending` (vendored `Lean/Meta/ExprDefEq.lean`, `unstuckMVar`, and
 //! `Lean/Meta/SynthInstance.lean`, `synthPendingImp`): once unification has
 //! fixed the class inputs, the instance is synthesized and unification goes on
-//! with the assignments it already made. This solver keeps instance holes
-//! opaque and owns no instance search, so at a fixed point blocked on such a
-//! hole it asks the hole's owner instead. The answer is not trusted: it takes
+//! with the assignments it already made. This solver owns no instance search:
+//! at a fixed point it asks the owner of an opaque source instance hole or an
+//! ordinary candidate dictionary that blocks reduction. The answer takes
 //! the same scope check, worklist typing equation and final K1 validation as a
 //! pattern solution, and the batch stays all-or-nothing. A declined goal is
 //! asked again only after a new assignment could have changed its inputs.
@@ -26,7 +26,7 @@ pub struct PendingAnswer {
 
 /// The owner of instance holes, consulted as the pin consults `synthPending`.
 pub trait PendingSynthesis {
-    /// Synthesize the opaque hole `goal` against `state`, the batch's working
+    /// Synthesize the instance hole `goal` against `state`, the batch's working
     /// transaction; its new assignments are validated only when the batch ends.
     /// `spent` heartbeats of the caller's budget are already used by this batch.
     fn synthesize(&mut self, state: &ElabTxn, goal: &MVarId, spent: u64) -> PendingAnswer;
@@ -58,9 +58,9 @@ impl<'a> PendingState<'a> {
 }
 
 impl Engine<'_> {
-    /// One `synthPending` step at a fixed point: ask for the first unassigned
-    /// opaque hole, in deterministic order of occurrence in the postponed
-    /// equations, that the owner can solve now. Returns whether one was assigned.
+    /// One `synthPending` step at a fixed point: ask for the first owned opaque
+    /// hole or ordinary reduction blocker that the owner can solve now, in
+    /// deterministic equation order. Returns whether one was assigned.
     pub(super) fn synthesize_pending(
         &mut self,
         postponed: &VecDeque<Equation>,
@@ -76,10 +76,15 @@ impl Engine<'_> {
         }
         let mut goals = Vec::new();
         let mut seen = HashSet::new();
-        for (left, right, _) in postponed {
+        for (left, right, locals) in postponed {
             for side in [left, right] {
                 let side = self.instantiate(side)?;
                 self.opaque_holes(&side, &mut seen, &mut goals)?;
+                if let Some(goal) = self.assignable_blocker(&side, locals)?
+                    && seen.insert(goal.clone())
+                {
+                    goals.push(goal);
+                }
             }
         }
         for goal in goals {
@@ -142,6 +147,73 @@ impl Engine<'_> {
             stack.extend(children(current).into_iter().rev().flatten());
         }
         Ok(())
+    }
+
+    /// Follow the reduction blocker, not every ordinary hole in an expression.
+    /// The pin's `getStuckMVar?` follows flexible heads and class projection
+    /// receivers. Candidate dictionaries are ordinary metavariables, so the
+    /// opaque-hole scan alone cannot resume their stuck parent projections.
+    /// The owner still decides whether a discovered hole is an instance goal.
+    fn assignable_blocker(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<MVarId>, UnificationError> {
+        let mut current = expr.clone();
+        loop {
+            self.meter.node()?;
+            if !current.has_expr_mvar() {
+                return Ok(None);
+            }
+            current = self.whnf(&current, locals)?;
+            let mut head = current.clone();
+            let mut arguments = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.meter.node()?;
+                arguments.push(a.clone());
+                head = f.clone();
+            }
+            match head.node() {
+                ExprNode::MVar { id } => {
+                    let assignable = self.work.mvars.get_decl(id).is_some_and(|declaration| {
+                        declaration.kind != MetavarKind::SyntheticOpaque
+                            && declaration.delayed.is_none()
+                            && !self.work.mvars.is_assigned(id)
+                    });
+                    return Ok(assignable.then(|| id.clone()));
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    current = expr.clone();
+                }
+                ExprNode::Const { name, levels } => {
+                    let Some(ConstantInfo::Defn(definition)) = self.work.env.find(name) else {
+                        return Ok(None);
+                    };
+                    if definition.base.level_params.len() != levels.len() {
+                        return Ok(None);
+                    }
+                    let Some(projection) = crate::records::projection::class_projection(
+                        &self.work.env,
+                        definition,
+                        || self.meter.node(),
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if arguments.len() <= projection.parameters
+                        || !self
+                            .projection_registry
+                            .read(&self.work.env)
+                            .map_err(UnificationError::InstanceRegistry)?
+                            .is_class(&projection.structure)
+                    {
+                        return Ok(None);
+                    }
+                    current = arguments[arguments.len() - projection.parameters - 1].clone();
+                }
+                _ => return Ok(None),
+            }
+        }
     }
 
     /// Synthesis work comes out of the same transaction budget as the batch.

@@ -595,3 +595,78 @@ example : Shape (Option Sq) := Sq.instShapeOption
         "{result:?}"
     );
 }
+
+/// The pin's tests/elab/509.lean, with its notation expanded. Matching
+/// foo.has_note2 requires solving the candidate's function-valued dictionary
+/// before a stuck parent-class projection can reduce.
+const INHERITED_FUNCTION_INSTANCES: &str = r#"
+class has_note (M : Type) where
+  note : M
+class has_note2 (M : Type) extends has_note M
+variable {ι : Type} (β : ι → Type)
+structure foo [∀ i, has_note (β i)] : Type where
+  to_fun : ∀ i, β i
+instance foo.has_note [∀ i, has_note (β i)] : has_note (foo (fun i => β i)) where
+  note := { to_fun := fun _ => has_note.note }
+instance foo.has_note2 [∀ i, has_note2 (β i)] : has_note2 (foo (fun i => β i)) where
+  note := has_note.note
+variable (α : Type) (M : Type)
+structure bar [has_note M] where
+  to_fun : α → M
+instance bar.has_note [has_note M] : has_note (bar α M) where
+  note := { to_fun := fun _ => has_note.note }
+instance bar.has_note2 [has_note2 M] : has_note2 (bar α M) where
+  note := has_note.note
+"#;
+
+#[test]
+fn higher_order_instance_projection_constraints_synthesize_the_candidate_dictionary() {
+    let base = checked(&engine(), INHERITED_FUNCTION_INSTANCES);
+    // The explicit candidate already works. The search must find that same
+    // checked dictionary instead of abandoning its unresolved projection.
+    let base = checked(
+        &base,
+        r#"def explicit {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := foo.has_note2 _"#,
+    );
+    let result = checked(
+        &base,
+        r#"def inferred {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance
+theorem same {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  inferred β M = explicit β M := by rfl"#,
+    );
+    let Some(ConstantInfo::Defn(definition)) = result.environment().find(&n("inferred")) else {
+        panic!("instance synthesis must publish the checked definition");
+    };
+    assert!(has_constant(&definition.value, &n("foo.has_note2")));
+    assert!(has_constant(&definition.value, &n("bar.has_note2")));
+}
+
+#[test]
+fn higher_order_instance_projection_failures_preserve_the_environment_and_recover() {
+    let base = checked(&engine(), INHERITED_FUNCTION_INSTANCES);
+    let before = base.logical_root(&KVMap::new());
+    // A parent dictionary cannot supply the stronger child class. A solved
+    // candidate from an earlier command must not escape a later refusal.
+    let source = r#"def provisional {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance
+def rejected {ι : Type} (β : ι → Type) (M : Type) [has_note M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance"#;
+    let error = base
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .expect_err("a missing child instance must remain a real synthesis failure");
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
+    assert!(
+        matches!(error, fln::SourceCheckError::Command { command: 1, .. }),
+        "the valid earlier command must complete before the missing-instance refusal: {error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+    assert!(!base.environment().contains(&n("provisional")));
+    assert!(!base.environment().contains(&n("rejected")));
+    checked(
+        &base,
+        r#"def recovered {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance"#,
+    );
+}
