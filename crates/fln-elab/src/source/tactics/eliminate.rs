@@ -508,7 +508,9 @@ impl Context {
                 .cloned()
                 .ok_or_else(|| error(TacticError::EliminationLocal))?
         } else if recursive
-            || parts.generated && matches!(major.value.node(), ExprNode::FVar { .. })
+            || parts.generated
+                && !parts.is_conditional()
+                && matches!(major.value.node(), ExprNode::FVar { .. })
         {
             if recursive {
                 self.recursive_match(&major.value);

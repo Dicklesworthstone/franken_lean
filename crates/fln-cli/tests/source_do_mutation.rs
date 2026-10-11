@@ -1,13 +1,13 @@
 //! `let mut` and reassignment over the pin's own Init (`List`'s `ForIn`, `Id`): straight-line
 //! reassignment, `x ← e`, loop state across iterations (one, two and three variables), `break` and
 //! `continue` after a reassignment, nested loops, a `mut` local to the loop body, and branches that
-//! reassign inside and outside a loop. Every program was run through the pinned `lean` v4.32.0 with
+//! reassign inside and outside a loop, on `Bool` and `Prop` conditions and with `unless`. Every program was run through the pinned `lean` v4.32.0 with
 //! the same header first (2026-10-11), with the same verdict. Values are checked with `decide`;
 //! each refused theorem is the value a lost reassignment would give.
 //!
-//! Not here, because this engine still refuses them where the pin accepts: a branch on a `Bool`
-//! condition (or a `match`) after a `let` whose numeral has not been defaulted yet. That is not
-//! about mutation: `let x := 1; if b then pure () else pure (); return x` is refused too.
+//! Not here, because this engine still refuses it where the pin accepts: a `match` after a `let`
+//! whose numeral has not been defaulted yet. That is not about mutation: the match reverts the
+//! `let`, whose type is still a hole, and the branch's expected monad loses its `Id`.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -82,6 +82,18 @@ fn mutable_variables_have_the_pins_values() {
         (
             "two",
             "def stats (xs : List Nat) : Nat × Nat := Id.run do\n  let mut s := 0\n  let mut c := 0\n  for x in xs do\n    s := s + x\n    c := c + 1\n  return (s, c)\ntheorem t : stats [4, 5] = (9, 2) := by decide\n",
+        ),
+        (
+            "if",
+            "def g (b : Bool) : Nat := Id.run do\n  let mut x := 1\n  if b then\n    x := 10\n  return x + 1\ntheorem t1 : g true = 11 := by decide\ntheorem t2 : g false = 2 := by decide\n",
+        ),
+        (
+            "ifelse2",
+            "def h (b : Bool) : Nat × Nat := Id.run do\n  let mut x := 1\n  let mut y := 2\n  if b then\n    x := 10\n  else\n    y := 20\n    x := 5\n  return (x, y)\ntheorem t1 : h true = (10, 2) := by decide\ntheorem t2 : h false = (5, 20) := by decide\n",
+        ),
+        (
+            "unless",
+            "def m14 (b : Bool) : Nat := Id.run do\n  let mut x := 1\n  unless b do\n    x := 2\n  return x\ntheorem t1 : m14 true = 1 := by decide\ntheorem t2 : m14 false = 2 := by decide\n",
         ),
         (
             "break",

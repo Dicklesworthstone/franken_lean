@@ -424,13 +424,31 @@ impl Context {
         mut major: Typed,
         expected: Option<Expr>,
     ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
-        if let Some(conditional) = parts.conditional {
-            let type_ = self.whnf(&major.type_)?;
-            if type_ == Expr::const_(Name::from_components(["Bool"]), vec![]) {
-                if conditional.binding.is_some() {
-                    return Err(error(MatchError::ExpectedCondition));
-                }
-            } else if type_ == Expr::sort(Level::zero()) {
+        if let Some(binding) = parts.conditional.as_ref().map(|c| c.binding.is_some()) {
+            let mut type_ = self.whnf(&major.type_)?;
+            let boolean = Expr::const_(Name::from_components(["Bool"]), vec![]);
+            // A conditional never refines its condition, as the pin's `ite`/`dite` never do: the
+            // case split below is on a copy of the condition (`start_refined_match`), so a branch
+            // that needs `b` replaced (`if b then Or.inl rfl else Or.inr rfl` against
+            // `b = true ∨ b = false`) is refused, as at the pin. `if h : b` is the pin's
+            // `dite (b = true)`, its evidence `h : b = true`: the decided proposition below.
+            if type_ == boolean && binding {
+                major = Typed {
+                    value: [
+                        boolean.clone(),
+                        major.value,
+                        Expr::const_(Name::from_components(["Bool", "true"]), vec![]),
+                    ]
+                    .into_iter()
+                    .fold(
+                        Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                        Expr::app,
+                    ),
+                    type_: Expr::sort(Level::zero()),
+                };
+                type_ = Expr::sort(Level::zero());
+            }
+            if type_ == Expr::sort(Level::zero()) {
                 // Keep the condition in the checked dictionary's type and both
                 // branches in the ordinary Decidable recursor. No source branch
                 // is selected by evaluating a proposition or a host Boolean.
@@ -458,7 +476,7 @@ impl Context {
                     type_,
                 };
                 self.resolve_instances(false)?;
-            } else {
+            } else if type_ != boolean {
                 return Err(error(MatchError::ExpectedCondition));
             }
         }
