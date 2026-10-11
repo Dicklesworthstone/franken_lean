@@ -15,6 +15,13 @@ pub(super) enum Prefix {
     /// `return e` outside `do` (`Term.termReturn`, `"return" (ppSpace term)?`): the keyword; its
     /// body, possibly empty, is the rest of the enclosing group.
     Return(usize),
+    /// `"set_option " identWithPartialTrailingDot optionValue " in " termParser`
+    /// (`Lean/Parser/Command.lean`): the checked header and the rest of the group
+    /// as its body. The option value is syntax, not an elaborated expression.
+    SetOption {
+        keyword: usize,
+        value: Box<Syntax>,
+    },
     /// A bounded range after an application's last argument (`f a lo...<hi`): the application's
     /// head and earlier arguments. The range (`syntax:max`) takes only that argument on its left
     /// and the rest of the group on its right, so the body is the range, `f a (lo...<hi)`.
@@ -218,6 +225,38 @@ fn primed_proof(mut proof: Syntax) -> Syntax {
 }
 
 impl Prefix {
+    pub(super) fn set_option(
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        keyword: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let name = keyword + 1;
+        if name >= end || !matches!(&tokens[name].kind, TokenKind::Ident(_)) {
+            return Err(refuse(view, tokens, name));
+        }
+        let value_at = name + 1;
+        if value_at >= end {
+            return Err(refuse(view, tokens, value_at));
+        }
+        let value = crate::command_scope::trees::option_value(leaves, tokens, value_at)?
+            .ok_or_else(|| refuse(view, tokens, value_at))?;
+        let in_at = value_at + 1;
+        if in_at >= end || !word(tokens, in_at, "in") {
+            return Err(refuse(view, tokens, in_at));
+        }
+        *cursor = in_at + 1;
+        if *cursor >= end {
+            return Err(refuse(view, tokens, *cursor));
+        }
+        Ok(Self::SetOption {
+            keyword,
+            value: Box::new(value),
+        })
+    }
+
     pub(super) fn assertion(
         view: &SourceView,
         tokens: &[LexedToken],
@@ -297,6 +336,7 @@ impl Prefix {
             | Prefix::Assertion(_)
             | Prefix::Nested(_)
             | Prefix::Return(_)
+            | Prefix::SetOption { .. }
             | Prefix::RangeArgument(_)
             | Prefix::StarRange(..) => None,
         }
@@ -306,18 +346,22 @@ impl Prefix {
             Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
-            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => {
-                true
-            }
+            Self::Nested(_)
+            | Self::Return(_)
+            | Self::SetOption { .. }
+            | Self::RangeArgument(_)
+            | Self::StarRange(..) => true,
         }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
-            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => {
-                false
-            }
+            Self::Nested(_)
+            | Self::Return(_)
+            | Self::SetOption { .. }
+            | Self::RangeArgument(_)
+            | Self::StarRange(..) => false,
             Self::Assertion(p) => match p.phase {
                 Phase::Annotation if !p.form.declares() => {
                     word(tokens, at, "from") || word(tokens, at, "by")
@@ -349,7 +393,11 @@ impl Prefix {
                     .map(|(p, next)| (Self::Binders(Box::new(p)), next));
             }
             Self::Assertion(p) => p,
-            Self::Nested(_) | Self::Return(_) | Self::RangeArgument(_) | Self::StarRange(..) => {
+            Self::Nested(_)
+            | Self::Return(_)
+            | Self::SetOption { .. }
+            | Self::RangeArgument(_)
+            | Self::StarRange(..) => {
                 return Err(refuse(view, tokens, at));
             }
         };
@@ -419,6 +467,20 @@ impl Prefix {
                 let syntax = Syntax::node(
                     parser_kind(&["Term", "termReturn"]),
                     vec![leaves.leaf(keyword)?, null_node(vec![body])],
+                );
+                return Ok((syntax, keyword));
+            }
+            Self::SetOption { keyword, value } => {
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "set_option"]),
+                    vec![
+                        leaves.leaf(keyword)?,
+                        leaves.leaf(keyword + 1)?,
+                        null_node(Vec::new()),
+                        *value,
+                        leaves.leaf(keyword + 3)?,
+                        body,
+                    ],
                 );
                 return Ok((syntax, keyword));
             }

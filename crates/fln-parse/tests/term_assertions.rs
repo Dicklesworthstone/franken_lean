@@ -1,5 +1,165 @@
 #![forbid(unsafe_code)]
 use fln_parse::parse_definition;
+use fln_syntax::tree::Syntax;
+
+fn option_terms(root: &Syntax) -> Vec<&[Syntax]> {
+    let mut pending = vec![root];
+    let mut found = Vec::new();
+    while let Some(node) = pending.pop() {
+        if let Syntax::Node { kind, args, .. } = node {
+            if kind.to_display_string() == "Lean.Parser.Term.set_option" {
+                found.push(args.as_slice());
+            }
+            pending.extend(args.iter().rev());
+        }
+    }
+    found
+}
+
+/// The six children follow Lean/Parser/Command.lean's Term.set_option:
+/// keyword, identWithPartialTrailingDot's two slots, optionValue, in, term.
+/// Parsing an option does not decide whether the elaborator implements it.
+#[test]
+fn scoped_option_terms_preserve_the_header_and_full_body() {
+    for (value, value_kind, body, body_kind) in [
+        ("true", None, "1 + 2", "term_+_"),
+        ("false", None, "f x", "Lean.Parser.Term.app"),
+        ("0x10", Some("num"), "fun x => x", "Lean.Parser.Term.fun"),
+        (
+            r#""text λ""#,
+            Some("str"),
+            "by exact 7",
+            "Lean.Parser.Term.byTactic",
+        ),
+    ] {
+        let source = format!("def chosen := set_option option.name {value} in {body}");
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        let terms = option_terms(parsed.syntax());
+        let [args] = terms.as_slice() else {
+            panic!("expected one scoped option in {source}");
+        };
+        let [
+            keyword,
+            name,
+            partial,
+            actual_value,
+            in_keyword,
+            actual_body,
+        ] = *args
+        else {
+            panic!("scoped option must have exactly the pin's six children");
+        };
+        assert!(matches!(keyword, Syntax::Atom { val, .. } if val == "set_option"));
+        assert!(
+            matches!(name, Syntax::Ident { val, .. } if val.to_display_string() == "option.name")
+        );
+        assert!(matches!(partial, Syntax::Node { kind, args, .. }
+            if kind.to_display_string() == "null" && args.is_empty()));
+        match value_kind {
+            None => assert!(matches!(actual_value, Syntax::Atom { val, .. } if val == value)),
+            Some(expected) => assert!(matches!(actual_value, Syntax::Node { kind, args, .. }
+                if kind.to_display_string() == expected
+                    && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == value))),
+        }
+        assert!(matches!(in_keyword, Syntax::Atom { val, .. } if val == "in"));
+        assert_eq!(
+            actual_body.kind().unwrap().to_display_string(),
+            body_kind,
+            "{source}"
+        );
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+    }
+}
+
+#[test]
+fn scoped_options_end_at_the_enclosing_term_and_retain_original_positions() {
+    let source = "def chosen :=\r\n  let x := (set_option /- setting -/ autoLift false in f a) b;\r\n  (set_option autoLift true in x) + 1\r\n";
+    let parsed = parse_definition(source.as_bytes()).unwrap();
+    let terms = option_terms(parsed.syntax());
+    assert_eq!(terms.len(), 2);
+    assert!(matches!(&terms[0][5], Syntax::Node { kind, args, .. }
+        if kind.to_display_string() == "Lean.Parser.Term.app"
+            && matches!(args.as_slice(), [Syntax::Ident { val, .. }, Syntax::Node { args, .. }]
+                if val.to_display_string() == "f"
+                    && matches!(args.as_slice(), [Syntax::Ident { val, .. }] if val.to_display_string() == "a"))));
+    assert!(matches!(&terms[1][5], Syntax::Ident { val, .. } if val.to_display_string() == "x"));
+    let normalized = source.replace("\r\n", "\n");
+    for args in terms {
+        for child in [&args[0], &args[1], &args[3], &args[4]] {
+            let fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } = child.info() else {
+                panic!("an option header leaf must retain original positions");
+            };
+            let text = &normalized[pos.0..end_pos.0];
+            match child {
+                Syntax::Atom { val, .. } => assert_eq!(text, val),
+                Syntax::Ident { val, .. } => assert_eq!(text, val.to_display_string()),
+                _ => panic!("this header uses boolean values"),
+            }
+        }
+    }
+    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    assert_eq!(
+        parsed.reconstruct_normalized().unwrap(),
+        normalized.as_bytes()
+    );
+}
+
+#[test]
+fn incomplete_scoped_options_never_consume_a_missing_operand_or_delimiter() {
+    for body in [
+        "set_option",
+        "set_option 7 true in 1",
+        "set_option autoLift",
+        "set_option autoLift in 1",
+        "set_option autoLift true 1",
+        "set_option autoLift true in",
+        "set_option autoLift true in (",
+        "set_option autoLift unknown in 1",
+        "set_option autoLift «true» in 1",
+        "set_option autoLift «false» in 1",
+        "set_option autoLift -1 in 1",
+        "set_option autoLift 1.5 in 1",
+        "set_option autoLift true «in» 1",
+    ] {
+        let source = format!("def chosen := {body}");
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+    let source = "def chosen :=\r\n  set_option autoLift true nope 7";
+    assert_eq!(
+        parse_definition(source.as_bytes())
+            .unwrap_err()
+            .primary_offset(),
+        Some(fln_syntax::source::BytePos(source.find("nope").unwrap()))
+    );
+}
+
+#[test]
+fn nested_scoped_options_stay_on_the_heap_and_do_not_steal_escaped_names() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let source = format!(
+                "def chosen := {}7",
+                "set_option autoLift true in ".repeat(600)
+            );
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(option_terms(parsed.syntax()).len(), 600);
+            assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let source = "def chosen := «set_option» x".as_bytes();
+    let parsed = parse_definition(source).unwrap();
+    assert!(option_terms(parsed.syntax()).is_empty());
+    assert_eq!(parsed.reconstruct_normalized().unwrap(), source);
+    assert!(
+        fln_parse::parse_nat_definition(b"def chosen : Nat := set_option autoLift true in 7")
+            .is_err()
+    );
+}
+
 #[test]
 fn original_assertion_tokens_comments_and_crlf_round_trip() {
     for source in [

@@ -393,13 +393,12 @@ pub(crate) fn option_value(
     at: usize,
 ) -> Result<Option<Syntax>, NatDefinitionParseError> {
     Ok(Some(match &tokens[at].kind {
-        TokenKind::Ident(name)
-            if *name == Name::from_components(["true"])
-                || *name == Name::from_components(["false"]) =>
-        {
+        _ if term_locals::word(tokens, at, "true") || term_locals::word(tokens, at, "false") => {
+            // nonReservedSymbolFnAux compares the raw identifier spelling, not
+            // its resolved name: an escaped identifier is not a boolean token.
             Syntax::Atom {
                 info: leaves.leaf(at)?.info(),
-                val: if *name == Name::from_components(["true"]) {
+                val: if term_locals::word(tokens, at, "true") {
                     "true"
                 } else {
                     "false"

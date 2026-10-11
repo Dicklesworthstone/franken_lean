@@ -3595,6 +3595,19 @@ fn bounded_term_token(
             ))));
         }
         _ if grammar == DefinitionGrammar::Scalar
+            && term_locals::word(tokens, index, "set_option") =>
+        {
+            let prefix = term_locals::Prefix::set_option(
+                leaves,
+                view,
+                tokens,
+                index,
+                &mut cursor,
+                range.end,
+            )?;
+            frames.push(term_binders::frame(prefix));
+        }
+        _ if grammar == DefinitionGrammar::Scalar
             && (term_locals::word(tokens, index, "let")
                 || term_locals::word(tokens, index, "have")
                 || term_locals::word(tokens, index, "letI")
