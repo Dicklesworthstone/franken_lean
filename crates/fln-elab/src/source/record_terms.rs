@@ -359,18 +359,23 @@ impl Context {
                 binder_info,
                 ..
             } = receiver.type_.node()
-                && (*binder_info == BinderInfo::Implicit
-                    || *binder_info == BinderInfo::InstImplicit
-                    || has_arguments && *binder_info == BinderInfo::StrictImplicit)
             {
-                let argument = if *binder_info == BinderInfo::InstImplicit {
-                    self.instance_hole(binder_type.clone())?
+                let argument = if *binder_info == BinderInfo::Implicit
+                    || has_arguments && *binder_info == BinderInfo::StrictImplicit
+                {
+                    Some(self.hole(binder_type.clone())?)
+                } else if *binder_info == BinderInfo::InstImplicit {
+                    Some(self.instance_hole(binder_type.clone())?)
                 } else {
-                    self.hole(binder_type.clone())?
+                    // The pin's receiver `consumeImplicits` also applies
+                    // leading `optParam` defaults before namespace lookup.
+                    optional::default_value(binder_type).cloned()
                 };
-                receiver.type_ = self.substitute(body, &argument)?;
-                receiver.value = Expr::app(receiver.value, argument);
-                continue;
+                if let Some(argument) = argument {
+                    receiver.type_ = self.substitute(body, &argument)?;
+                    receiver.value = Expr::app(receiver.value, argument);
+                    continue;
+                }
             }
             let mut head = &receiver.type_;
             let mut arguments = Vec::new();

@@ -274,7 +274,10 @@ impl Context {
 
     /// `inferProjType` consumes only outer type annotations, not the field's
     /// own definitions or annotations nested inside a function type.
-    fn projection_domain(&mut self, mut domain: Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(super) fn projection_domain(
+        &mut self,
+        mut domain: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         use fln_core::name::LeafView;
 
         loop {

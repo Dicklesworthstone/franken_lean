@@ -698,8 +698,10 @@ fn a_bracket_after_a_tight_operator_is_a_list_not_a_binder() {
 }
 
 /// A binder default in a dependent arrow or a `∀` (`(h : i = i := by rfl) → Nat`) parses as the
-/// pin's `binderTactic`/`binderDefault`; the binder's type is then `optParam`/`autoParam`, which the
-/// checker does not build, so it refuses each file, all of which the pin accepts.
+/// pin's `binderTactic`/`binderDefault`; the binder's type needs `optParam`/`autoParam`, neither
+/// supplied by this test's seed. Defaults must not be dropped to admit these files. The value
+/// default is exercised positively with an actual `optParam` in `source_optional_parameters`;
+/// tactic defaults additionally need the separate quoted-syntax machinery.
 #[test]
 fn binder_defaults_in_arrows_and_foralls_are_refused_not_dropped() {
     let (engine, limits) = engine();

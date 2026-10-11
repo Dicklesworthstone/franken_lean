@@ -39,6 +39,7 @@ pub mod inspect;
 mod matching;
 mod numeric;
 mod operators;
+mod optional;
 mod overload;
 mod pattern_typing;
 mod patterns;
@@ -1194,6 +1195,16 @@ impl Context {
                 }
             };
             if !insert {
+                // Field lookup consumes leading value defaults even when
+                // its receiver was written with `@` (pin `consumeImplicits`).
+                if matches!(insertion, ImplicitInsertion::FieldReceiver)
+                    && let Some(argument) = optional::default_value(binder_type)
+                {
+                    let argument = argument.clone();
+                    term.type_ = self.substitute(body, &argument)?;
+                    term.value = Expr::app(term.value, argument);
+                    continue;
+                }
                 // A completed term keeps its named type. Unfolding a
                 // function-backed monad here would store an anonymous Pi
                 // in inferred action aliases, losing the constructor that
@@ -1237,6 +1248,17 @@ impl Context {
     }
 
     fn finish_application(
+        &mut self,
+        term: Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        if self.has_optional_parameter(&term.type_)? {
+            return self.finish_optional_application(term, expected);
+        }
+        self.finish_application_implicits(term, expected)
+    }
+
+    fn finish_application_implicits(
         &mut self,
         term: Typed,
         expected: Option<&Expr>,
@@ -2363,6 +2385,12 @@ impl Context {
                                     }
                                     self.resolve_instances(false)?;
                                     term
+                                } else if matches!(syntax, Syntax::Ident { .. })
+                                    || syntax.kind()
+                                        == Some(&parser_kind(&["Term", "explicitUniv"]))
+                                    || syntax.kind() == Some(&parser_kind(&["Term", "dotIdent"]))
+                                {
+                                    self.finish_optional_term(term, expected.as_ref())?
                                 } else {
                                     self.finish_term(term, expected.as_ref())?
                                 }
@@ -2381,7 +2409,11 @@ impl Context {
                                     if arguments.is_empty() =>
                                 {
                                     values.push(if finish {
-                                        self.finish_term(term, expected.as_ref())?
+                                        if explicit {
+                                            self.finish_explicit_term(term, expected.as_ref())?
+                                        } else {
+                                            self.finish_optional_term(term, expected.as_ref())?
+                                        }
                                     } else {
                                         term
                                     });
@@ -2908,7 +2940,7 @@ impl Context {
                                 else {
                                     return Err(failure(SourceInferenceError::ExpectedFunction));
                                 };
-                                let domain = binder_type.clone();
+                                let domain = self.projection_domain(binder_type.clone())?;
                                 let codomain = body.clone();
                                 // Propagate a known result before checking the last
                                 // explicit argument when the codomain does not depend
@@ -3797,6 +3829,8 @@ impl Context {
     ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
         let mut parameters = Vec::new();
         for syntax in expect_null_args(syntax, "declaration binders")? {
+            let expanded = self.expand_optional_binder_node(syntax.clone(), false)?;
+            let syntax = &expanded;
             let Syntax::Node { kind, .. } = syntax else {
                 return Err(failure(SourceInferenceError::Scope));
             };
@@ -3861,7 +3895,22 @@ impl Context {
                 }
                 _ => return Err(failure(SourceInferenceError::ExpectedType)),
             };
-            for name in names {
+            // Local function binders may already have been expanded by the
+            // enclosing term worklist. Observe the annotation, not whether
+            // this invocation happened to rewrite the original syntax.
+            let defaulted = optional::default_value(&domain).is_some();
+            for (position, name) in names.iter().enumerate() {
+                // `toBinderViews` expands each defaulted name separately.
+                // A later name sees the preceding local, including when that
+                // local shadows a name used by the original default syntax.
+                let domain = if defaulted && position != 0 {
+                    let [_, type_syntax] = type_parts else {
+                        unreachable!("expanded default has a type annotation");
+                    };
+                    self.type_term(type_syntax)?
+                } else {
+                    domain.clone()
+                };
                 let name = match name {
                     Syntax::Ident { val, .. } => val.clone(),
                     // `_` binds a name no source identifier spells, as an unnamed instance
