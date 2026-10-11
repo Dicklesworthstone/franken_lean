@@ -108,10 +108,6 @@ pub enum SourceInferenceError {
     },
     UnresolvedUniverses,
     InstanceSynthesisRequired,
-    /// An operator tree needs a coercion at a leaf. The pin inserts the
-    /// `expandCoe`-unfolded coercion; the native coercion search does not
-    /// produce that term, so this is refused rather than approximated.
-    OperatorCoercion,
     /// The pin's eliminator elaboration (`elabAsElim`) could not finish; the
     /// text is the pin's own message after "failed to elaborate eliminator, ".
     Eliminator(&'static str),
@@ -329,10 +325,6 @@ impl std::fmt::Display for SourceInferenceError {
             Self::InstanceSynthesisRequired => write!(
                 f,
                 "native instance search could not resolve all instance arguments"
-            ),
-            Self::OperatorCoercion => write!(
-                f,
-                "operator elaboration needs a coercion to the tree's maximal type, and expanded coercion insertion is not implemented"
             ),
             Self::Eliminator(reason) => write!(f, "failed to elaborate eliminator, {reason}"),
             Self::UnsupportedRecursor(name) => write!(

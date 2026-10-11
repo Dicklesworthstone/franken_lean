@@ -656,13 +656,21 @@ fn operands_without_an_instance_are_refused_where_the_pin_refuses_them() {
 /// fun (n : Nat) (i : Int) => @LT.lt.{0} Int Int.instLTInt i (@Nat.cast.{0} Int instNatCastInt n)
 /// ```
 ///
-/// The pin's `mkCoe` returns the coercion after `expandCoe` has unfolded the
-/// `@[coe_decl]` chain down to `Nat.cast`. That expansion is not implemented,
-/// so both must be refused with the typed `OperatorCoercion` refusal; neither
-/// may elaborate to the unexpanded `CoeT.coe` term the native search returns.
-const COERCION_FIXTURES: &[&str] = &[
-    "def g01 (n : Nat) (i : Int) : Int := n + i",
-    "def g02 (n : Nat) (i : Int) : Prop := i < n",
+/// The pin's `mkCoe` expands the `@[coe_decl]` chain down to `Nat.cast`.
+/// Preserving that untagged named conversion is observable in the stored
+/// declaration: neither an unexpanded `CoeT.coe` nor an over-unfolded
+/// `Int.ofNat` is the pin's term.
+const COERCION_FIXTURES: &[(&str, &str, &str)] = &[
+    (
+        "def g01 (n : Nat) (i : Int) : Int := n + i",
+        "(n : Nat) → (i : Int) → Int",
+        "fun (n : Nat) (i : Int) => @HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd) (@Nat.cast.{0} Int instNatCastInt n) i",
+    ),
+    (
+        "def g02 (n : Nat) (i : Int) : Prop := i < n",
+        "(n : Nat) → (i : Int) → Prop",
+        "fun (n : Nat) (i : Int) => @LT.lt.{0} Int Int.instLTInt i (@Nat.cast.{0} Int instNatCastInt n)",
+    ),
 ];
 
 /// `Init.Data.Int.Basic` and its import closure, dependency first.
@@ -685,27 +693,130 @@ const INT_CLOSURE: &[&str] = &[
 ];
 
 #[test]
-fn a_coercion_the_pin_inserts_is_refused_typed_rather_than_left_unexpanded() {
+fn mixed_nat_int_operators_elaborate_to_the_pins_expanded_coercions() {
     let Some(lib) = pinned_lib() else {
         eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
         return;
     };
     on_a_big_stack(move || {
         let base = import_modules(&lib, INT_CLOSURE, "Init.Data.Int.Basic");
-        for declaration in COERCION_FIXTURES {
-            // Matched by variant name so this file also builds against a
-            // tree without the variant (the mutant run in the bead record).
-            let refused = match check(&base, declaration) {
-                Err(error @ SourceCheckError::Command { .. }) => {
-                    format!("{error:?}").contains("Elaborate(Inference(OperatorCoercion))")
-                }
-                _ => false,
+        for (declaration, type_text, value_text) in COERCION_FIXTURES {
+            let checked = match check(&base, declaration) {
+                Ok(Outcome::Complete(checked)) => checked,
+                other => panic!("{declaration} must elaborate: {other:?}"),
             };
-            assert!(
-                refused,
-                "{declaration} must be refused with OperatorCoercion: {:?}",
-                check(&base, declaration).map(|_| ())
+            let name = Name::from_components([declaration_name(declaration)]);
+            let Some(ConstantInfo::Defn(info)) = checked.engine.environment().find(&name) else {
+                panic!("expected checked definition {name:?}");
+            };
+            assert_eq!(info.base.type_, PinTerm::parse(type_text), "{declaration}");
+            assert_eq!(
+                info.value,
+                PinTerm::parse(value_text),
+                "{declaration}\nours: {}",
+                render(&info.value, &mut Vec::new())
             );
         }
+    });
+}
+
+/// These source programs use the existing checked coercion library; they do
+/// not extend the seed. The explicit forms keep the conversion definition
+/// opaque to coercion expansion, as `Lean.Meta.expandCoe` requires for a
+/// function without `@[coe_decl]`.
+#[test]
+fn coerced_operator_leaves_preserve_named_conversions_and_checked_results() {
+    on_a_big_stack(|| {
+        let base =
+            Engine::with_coercion_seed(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)))
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let before = base.logical_root(&KVMap::new());
+        let source = r#"
+structure Box where
+  value : Nat
+def toNat (w : Box) : Nat := w.value
+instance boxToNat : Coe Box Nat := Coe.mk toNat
+def coercedLeft (w : Box) (n : Nat) : Nat := w + n
+def explicitLeft (w : Box) (n : Nat) : Nat := toNat w + n
+def coercedRight (w : Box) (n : Nat) : Nat := n + w
+def explicitRight (w : Box) (n : Nat) : Nat := n + toNat w
+def coercedBoth (w : Box) (z : Box) : Nat := w + z
+def explicitBoth (w : Box) (z : Box) : Nat := toNat w + toNat z
+def coercedNested (w : Box) (n : Nat) : Nat := (w + n) * (w + 1)
+def explicitNested (w : Box) (n : Nat) : Nat := (toNat w + n) * (toNat w + 1)
+def coercedRelation (w : Box) (n : Nat) : Prop := w = n
+def explicitRelation (w : Box) (n : Nat) : Prop := toNat w = n
+def coercedPower (w : Box) (n : Nat) : Nat := w ^ n
+def explicitPower (w : Box) (n : Nat) : Nat := toNat w ^ n
+theorem left_value : coercedLeft (Box.mk 3) 4 = 7 := by rfl
+theorem right_value : coercedRight (Box.mk 3) 4 = 7 := by rfl
+theorem both_value : coercedBoth (Box.mk 3) (Box.mk 4) = 7 := by rfl
+theorem nested_value : coercedNested (Box.mk 3) 4 = 28 := by rfl
+theorem relation_value : coercedRelation (Box.mk 3) 3 := by rfl
+theorem power_value : coercedPower (Box.mk 3) 2 = 9 := by rfl
+"#;
+        let checked = match check(&base, source) {
+            Ok(Outcome::Complete(checked)) => checked,
+            other => panic!("coerced operator programs must be admitted: {other:?}"),
+        };
+        assert_eq!(checked.theorems, 6);
+        for suffix in ["Left", "Right", "Both", "Nested", "Relation", "Power"] {
+            let definition = |prefix: &str| {
+                let text = format!("{prefix}{suffix}");
+                let name = Name::from_components([text.as_str()]);
+                let Some(ConstantInfo::Defn(info)) = checked.engine.environment().find(&name)
+                else {
+                    panic!("expected checked definition {name:?}");
+                };
+                info
+            };
+            let actual = definition("coerced");
+            let explicit = definition("explicit");
+            assert_eq!(actual.base.type_, explicit.base.type_, "{suffix} type");
+            assert_eq!(
+                actual.value, explicit.value,
+                "{suffix}: expansion must preserve the named conversion"
+            );
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+
+        let admitted = checked.engine;
+        let before_failure = admitted.logical_root(&KVMap::new());
+        let missing = r#"
+def beforeFailure (w : Box) (n : Nat) : Nat := w + n
+def missingOperator (w : Box) : Nat := w + true
+"#;
+        match check(&admitted, missing) {
+            Err(error) => assert_eq!(
+                refusal(&error),
+                Some(Refusal::InstanceSynthesis),
+                "a coercion to Nat cannot manufacture HAdd Box Bool Nat: {error:?}"
+            ),
+            other => panic!("the missing heterogeneous instance must be refused: {other:?}"),
+        }
+        assert!(
+            check(
+                &admitted,
+                "theorem falseResult : coercedLeft (Box.mk 3) 4 = 8 := by rfl"
+            )
+            .is_err(),
+            "coercion insertion cannot bypass proof checking"
+        );
+        assert_eq!(admitted.logical_root(&KVMap::new()), before_failure);
+        assert!(
+            !admitted
+                .environment()
+                .contains(&Name::from_components(["beforeFailure"]))
+        );
+        let recovery = check(
+            &admitted,
+            "theorem recovery : coercedLeft (Box.mk 3) 4 = 7 := by rfl",
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        assert_eq!(recovery.theorems, 1);
     });
 }

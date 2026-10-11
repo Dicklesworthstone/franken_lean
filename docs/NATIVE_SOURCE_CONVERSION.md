@@ -51,3 +51,38 @@ cargo test --locked -p fln --test source_delta_inference
 cargo test --locked -p fln-cli --test source_delta_inference
 cargo test --locked -p fln --test source_instances --test source_backtracking
 ```
+
+## Mixed-type operators
+
+Operator leaves now use the existing checked coercion path to reach the type
+chosen by operator elaboration. For example, an imported `Int` environment
+supports both mixed addition and comparison:
+
+```lean
+import Init.Data.Int.Basic
+
+def mixedAdd (n : Nat) (i : Int) : Int := n + i
+def mixedLess (n : Nat) (i : Int) : Prop := i < n
+```
+
+The inserted conversion expands the builtin coercion projections and retains
+the named `Nat.cast` application present in the pinned Lean terms. The same
+path supports checked user-defined coercions on either operand, nested operator
+trees, and operands whose target type is fixed by an expected result type.
+Untagged conversion definitions remain explicit in the stored expression.
+
+Coercion insertion shares ordinary expected-type inference's assignment
+rollback and work accounting. It cannot create a missing operator instance or
+bypass either checking seat. Failed files still publish no declarations.
+
+`source_operator_elaboration` compares exact types and bodies against the
+existing pinned Lean captures, including mixed `Nat`/`Int` operators. It also
+checks user-defined conversions against their explicit forms, successful and
+false proof results, failed-file atomicity, and recovery. The pin-dependent
+checks require the official v4.32.0 artifacts:
+
+```sh
+FLN_REFERENCE_LIB=/path/to/lean-4.32.0-linux/lib/lean \
+FLN_REQUIRE_REFERENCE=1 \
+cargo test --locked -p fln --test source_operator_elaboration --test source_coercions
+```

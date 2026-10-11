@@ -20,11 +20,10 @@
 //! - `elabBinRelCore` for `binrel%` and `binrel_no_prop%`, including
 //!   `toBoolIfNecessary` and the `Prop`-to-`Bool` maximal type.
 //!
-//! What is refused with a type rather than approximated: inserting a
-//! coercion at a leaf ([`SourceInferenceError::OperatorCoercion`]). The pin's
-//! `mkCoe` returns the coercion after `expandCoe` has unfolded every
-//! `@[coe_decl]` head; the native coercion search here returns the unexpanded
-//! `CoeT.coe` application, which is a different term.
+//! A leaf needing `mkCoe` uses the ordinary transactional coercion path. Its
+//! builtin `expandCoe` traversal unfolds the registered coercion projections
+//! while retaining untagged conversion functions such as `Nat.cast`, so the
+//! stored operator term contains the same explicit conversion as the pin.
 //!
 //! A notation whose pin function is absent from the environment (the bounded
 //! source seed has no `LT`/`LE`, and the raw Nat fixture has no classes at all)
@@ -881,19 +880,16 @@ impl Context {
         }
     }
 
-    /// `mkCoe maxType e` at a leaf. Without any coercion the pin reports a
-    /// type mismatch; this is the ordinary typing constraint, which also
-    /// postpones a check that is not yet decidable.
+    /// `mkCoe maxType e` at a leaf. Use the same checked, expanded coercion as
+    /// an ordinary expected-type boundary. Failed alternatives roll back
+    /// assignments while retaining their work, and a not-yet-decidable typing
+    /// obligation is postponed by that shared path.
     fn operator_coercion(
         &mut self,
         value: Typed,
         max: &Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
-        if self.has_coercion(&value.type_, max)? {
-            return Err(failure(SourceInferenceError::OperatorCoercion));
-        }
-        self.constrain_type(&value.type_, max)?;
-        Ok(value)
+        self.coerce_expected(value, max)
     }
 
     /// `Op.hasHomogeneousInstance`: `Cls max max max` for `f = Cls.op`.
