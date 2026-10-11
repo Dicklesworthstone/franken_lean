@@ -7122,6 +7122,7 @@ impl Engine {
             outputs: Vec::new(),
             checks: Vec::new(),
             guards: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -7172,6 +7173,9 @@ impl Engine {
             }
         })?;
         let mut guards: Vec<SourceGuard> = Vec::new();
+        // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
+        // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
+        let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
         let mut evaluation_indices = Vec::new();
         evaluation_indices
             .try_reserve_exact(command_count)
@@ -7342,11 +7346,14 @@ impl Engine {
                         }
                         // The pin passes such a guard by capturing the command's errors,
                         // warnings or traces, whose text this engine does not reproduce. Running
-                        // the command here would turn the pin's pass into a rejection.
+                        // the command here would turn the pin's pass into a rejection. The one
+                        // warning it does reproduce, "declaration uses `sorry`", is judged.
                         if expected.lines().any(|line| {
-                            ["error:", "warning:", "trace:"]
-                                .iter()
-                                .any(|severity| line.trim_start().starts_with(severity))
+                            let line = line.trim_start();
+                            line != "warning: declaration uses `sorry`"
+                                && ["error:", "warning:", "trace:"]
+                                    .iter()
+                                    .any(|severity| line.starts_with(severity))
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error, warning or trace message",
@@ -7432,6 +7439,10 @@ impl Engine {
             } else {
                 scopes.current.clone()
             };
+            let warn_sorry = scope
+                .options
+                .get_bool(&Name::from_components(["warn", "sorry"]), true);
+            warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
             let scoped = scope != fln_elab::source::scope::SourceScope::default();
             if scope.exports_declaration()
                 && let Some(public) = public.as_deref_mut()
@@ -7739,6 +7750,16 @@ impl Engine {
                 }
                 _ => false,
             };
+            // A definition that uses `sorry` is admitted with its warning and never run: the pin
+            // compiles it and fails only when it is evaluated.
+            let uses_sorry = !is_evaluation
+                && source_execution::uses_sorry(&declaration, limits.ingress.max_nodes).map_err(
+                    |error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    },
+                )?;
             // A theorem, an opaque constant and an axiom have no body to execute here; they
             // are admitted, as a template or a proof definition is.
             if matches!(
@@ -7746,6 +7767,7 @@ impl Engine {
                 Declaration::Thm(_) | Declaration::Opaque(_) | Declaration::Axiom(_)
             ) || is_template
                 || is_proof_definition
+                || uses_sorry
             {
                 let admission = match engine
                     .admit_declarations(&[declaration], options, limits.admission())
@@ -7845,6 +7867,50 @@ impl Engine {
         if let Some(public) = public {
             public.retain_scope(scopes.public_scope());
         }
+        // The pin's `warnIfUsesSorry` runs on every declaration a command adds, an `example`'s
+        // included; a definition with `sorry` is admitted above, never executed.
+        let mut sorry_commands = BTreeSet::new();
+        let declarations = source_admissions
+            .iter()
+            .flat_map(|row| {
+                row.admission
+                    .admissions
+                    .iter()
+                    .map(move |admitted| (row.command_index, &admitted.declaration))
+            })
+            .chain(outputs.iter().filter_map(|output| {
+                match output {
+                    SourceCommandOutput::Example {
+                        command_index,
+                        check_index,
+                    } => checks
+                        .get(*check_index)
+                        .map(|check| (*command_index, &check.declaration)),
+                    _ => None,
+                }
+            }));
+        for (command, declaration) in declarations {
+            if !sorry_commands.contains(&command)
+                && source_execution::uses_sorry(declaration, limits.ingress.max_nodes)?
+            {
+                sorry_commands.insert(command);
+            }
+        }
+        let warnings = sorry_commands
+            .into_iter()
+            .filter_map(|command| {
+                let &(offset, source, warn) = warning_sites.get(&command)?;
+                warn.then(|| SourceWarning {
+                    command_index: command,
+                    at: fln_parse::BytePos(
+                        offset.0
+                            + fln_parse::command_scope::declaration_warning_offset(source)
+                                .unwrap_or(0),
+                    ),
+                    message: "declaration uses `sorry`".to_owned(),
+                })
+            })
+            .collect();
         Ok(Outcome::Complete(SourceCommandBatchExecution {
             scope: scopes.current,
             batch: DefinitionBatchExecution {
@@ -7862,6 +7928,7 @@ impl Engine {
             outputs,
             checks,
             guards,
+            warnings,
         }))
     }
 
@@ -11315,6 +11382,40 @@ pub struct SourceCommandBatchExecution {
     pub checks: Vec<SourceCheck>,
     /// Commands run under `#guard_msgs`, in command order, at most one per command.
     pub guards: Vec<SourceGuard>,
+    /// Warnings the pin would log, in command order, at most one per command.
+    pub warnings: Vec<SourceWarning>,
+}
+
+/// A warning a source command produced. The only one today is the pin's "declaration uses
+/// `sorry`" (`warnIfUsesSorry`, `Lean/AddDecl.lean`): a command whose admitted declarations
+/// mention `sorryAx`, while `warn.sorry` is true. `at` is the file offset the pin positions it
+/// at (`fln_parse::command_scope::declaration_warning_offset`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceWarning {
+    pub command_index: usize,
+    pub at: fln_parse::BytePos,
+    pub message: String,
+}
+
+/// Whether a constant's type or value mentions `sorryAx`, the pin's `hasSorry`
+/// (`Lean/Util/Sorry.lean`). A reference walk that cannot finish answers `true`, so a report
+/// built on it never hides a `sorry` it could not rule out.
+pub fn constant_uses_sorry(info: &ConstantInfo) -> bool {
+    let sorry = Name::from_components(["sorryAx"]);
+    let value = match info {
+        ConstantInfo::Defn(value) => Some(&value.value),
+        ConstantInfo::Thm(value) => Some(&value.value),
+        ConstantInfo::Opaque(value) => Some(&value.value),
+        _ => None,
+    };
+    let mut spent = 0;
+    std::iter::once(&info.constant_val().type_)
+        .chain(value)
+        .any(|expr| {
+            let mut references = BTreeSet::new();
+            collect_constant_references(expr, &mut references, &mut spent, usize::MAX)
+                .map_or(true, |()| references.contains(&sorry))
+        })
 }
 
 /// `#guard_msgs` around one source command (bead `fln-guard-msgs-lls1`). The command ran as

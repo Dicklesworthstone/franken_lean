@@ -11831,7 +11831,7 @@ fn render_lean_source_module_commands(
             }
         }
     }
-    render_lean_source_commands(&completed.entry)
+    render_lean_source_commands(&completed.entry, WarningSink::Unreachable)
 }
 
 /// One message as the pin's `GuardMsgs.messageToString` renders it without positions: the
@@ -11861,7 +11861,64 @@ fn io_guard_refusal(command_index: usize) -> MultiplexerOutput {
     )
 }
 
-fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> MultiplexerOutput {
+/// Where a rendering sends a command's warning that no `#guard_msgs` collects. A guarded
+/// command's warning is always judged with its other messages.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WarningSink<'a> {
+    /// The entry file's: printed as the pin prints it, `FILE:LINE:COL: warning: MESSAGE`, with
+    /// `file` as the command line named it (`<stdin>` for standard input).
+    Print { file: &'a str, source: &'a [u8] },
+    /// An imported module's, or a rendering that only judges guards: the pin compiled the
+    /// module on its own and prints nothing of it here.
+    Discard,
+    /// A world without `Lean.Name` and `sorryAx`, where no warning can arise; one that does is
+    /// an internal fault, never dropped.
+    Unreachable,
+}
+
+/// Send one warning to its guard's messages or to `sink`.
+fn emit_lean_warning(
+    warning: &fln::SourceWarning,
+    sink: WarningSink<'_>,
+    guarded: &mut std::collections::BTreeMap<usize, (Vec<String>, bool)>,
+    stdout: &mut String,
+) -> Result<(), MultiplexerOutput> {
+    if let Some((messages, _)) = guarded.get_mut(&warning.command_index) {
+        messages.push(guard_message("warning", &warning.message));
+        return Ok(());
+    }
+    match sink {
+        WarningSink::Print { file, source } => {
+            let Some(position) = source_position_at(source, warning.at.0) else {
+                return Err(source_failure(
+                    "internal-fault",
+                    "a source warning's offset is not a character position of its file",
+                    false,
+                    SourcePresentation::Lean,
+                    4,
+                ));
+            };
+            stdout.push_str(&format!(
+                "{file}:{}:{}: warning: {}\n",
+                position.line, position.column, warning.message
+            ));
+            Ok(())
+        }
+        WarningSink::Discard => Ok(()),
+        WarningSink::Unreachable => Err(source_failure(
+            "internal-fault",
+            "a source warning arose where no warning can",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )),
+    }
+}
+
+fn render_lean_source_commands(
+    completed: &fln::SourceCommandBatchExecution,
+    sink: WarningSink<'_>,
+) -> MultiplexerOutput {
     if completed.execution_command_indices.len() != completed.batch.executions.len() {
         return source_failure(
             "internal-fault",
@@ -11910,12 +11967,20 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
         .iter()
         .map(|guard| (guard.command_index, (Vec::new(), false)))
         .collect();
+    // Warnings interleave with the outputs in command order, as the pin logs them.
+    let mut warnings = completed.warnings.iter().peekable();
     for output in &completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
             | fln::SourceCommandOutput::Check { command_index, .. }
             | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
+        while let Some(warning) = warnings.next_if(|warning| warning.command_index <= command_index)
+        {
+            if let Err(failure) = emit_lean_warning(warning, sink, &mut guarded, &mut stdout) {
+                return failure;
+            }
+        }
         if command_index >= completed.command_count
             || previous_output_command.is_some_and(|previous| previous >= command_index)
         {
@@ -12080,6 +12145,11 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 }
                 stdout.push_str(&line);
             }
+        }
+    }
+    for warning in warnings {
+        if let Err(failure) = emit_lean_warning(warning, sink, &mut guarded, &mut stdout) {
+            return failure;
         }
     }
     // The pin's `elabGuardMsgs`, default spec: the checked messages joined by `---\n` and
@@ -12444,7 +12514,9 @@ where
             }
         };
         return match completed {
-            fln::Outcome::Complete(completed) => render_lean_source_commands(&completed),
+            fln::Outcome::Complete(completed) => {
+                render_lean_source_commands(&completed, WarningSink::Unreachable)
+            }
             fln::Outcome::Inconclusive(inconclusive) => source_failure(
                 "inconclusive",
                 &format!("{inconclusive:?}"),
@@ -18303,7 +18375,7 @@ mod tests {
             usage,
         };
 
-        let output = render_lean_source_commands(&completed);
+        let output = render_lean_source_commands(&completed, super::WarningSink::Unreachable);
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.starts_with("lean: program-panic: "));

@@ -229,7 +229,8 @@ pub const ROWS: &[Row] = &[
         "Lean/Linter/ConstructorAsVariable.lean:25",
         Silent,
     ),
-    row("warn.sorry", Bool(true), "Lean/AddDecl.lean:69", Silent),
+    // Read by the source executor: a declaration that uses `sorry` warns while it is true.
+    row("warn.sorry", Bool(true), "Lean/AddDecl.lean:69", Honored),
     row(
         "warn.classDefReducibility",
         Bool(true),
@@ -659,13 +660,16 @@ mod tests {
             .map(|row| row.name)
             .collect();
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
+        // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
+        // `execute_source_command_stream`); `sorry_is_admitted_with_the_pins_warnings` sets it false.
         assert_eq!(
             honored,
             [
                 "autoLift",
                 "maxHeartbeats",
                 "synthInstance.maxSize",
-                "autoImplicit"
+                "autoImplicit",
+                "warn.sorry"
             ]
         );
     }

@@ -386,6 +386,20 @@ const AXIOMS: &[Accepted] = &[
 ];
 
 /// An axiom has no value: the pin ends the command after its signature and refuses `:=`.
+/// The term `sorry` (`Lean/Parser/Term.lean:164`). Trees captured from the pin with
+/// `scripts/extract/dump_command_syntax.lean` on 2026-10-11, under `prelude` and
+/// `import Init.Prelude`.
+const SORRIES: &[Accepted] = &[
+    Accepted {
+        source: "theorem t : Eq 1 2 := sorry",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `t []) (Command.declSig [] (Term.typeSpec ":" (Term.app `Eq [(num "1") (num "2")]))) (Command.declValSimple ":=" (Term.sorry "sorry") (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def f (n : Nat) : Nat := sorry",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.sorry "sorry") (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 const AXIOM_REFUSALS: &[Refused] = &[Refused {
     source: "axiom X4 : Nat := 0",
     message: "1:15: error: unexpected token ':='; expected command",
@@ -4327,6 +4341,42 @@ fn axioms_produce_the_pins_trees() {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }
+}
+
+#[test]
+fn sorry_produces_the_pins_trees() {
+    for row in SORRIES {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+/// Where the pin positions a declaration's warning (measured at v4.32.0 on 2026-10-11 with
+/// `sorry` bodies): the declared name, or the keyword when there is no name or the command
+/// declares a structure.
+#[test]
+fn a_declarations_warning_sits_where_the_pin_puts_it() {
+    use fln_parse::command_scope::declaration_warning_offset;
+    for (source, at) in [
+        ("theorem t : Eq 1 2 := sorry", "t : Eq"),
+        ("def f (n : Nat) : Nat := sorry", "f (n"),
+        (
+            "/-- doc -/\nprotected def Foo.bar : Nat := sorry",
+            "Foo.bar",
+        ),
+        ("instance named : C := sorry", "named"),
+        ("@[instance] def g : C := sorry", "g : C"),
+        ("example : Eq 1 2 := sorry", "example"),
+        ("instance : C := sorry", "instance"),
+        ("structure S where\n  x : Nat := sorry", "structure"),
+    ] {
+        assert_eq!(
+            declaration_warning_offset(source.as_bytes()),
+            source.find(at),
+            "{source}"
+        );
+    }
+    assert_eq!(declaration_warning_offset(b"#eval 1"), None);
 }
 
 #[test]

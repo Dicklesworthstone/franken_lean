@@ -1109,7 +1109,7 @@ fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) ->
             Some(TokenKind::Literal(
                 LiteralKind::Str | LiteralKind::Char | LiteralKind::Scientific | LiteralKind::Name
             ))
-        ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_" | "∅"))))
+        ) || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_" | "∅" | "sorry"))))
 }
 
 fn bounded_term_leaf(
@@ -1158,6 +1158,9 @@ fn bounded_term_leaf(
                 )),
                 "Prop" => Ok(Syntax::node(parser_kind(&["Term", "prop"]), vec![leaf])),
                 "_" => Ok(Syntax::node(parser_kind(&["Term", "hole"]), vec![leaf])),
+                // `@[builtin_term_parser] def «sorry» := leading_parser "sorry"`
+                // (`Lean/Parser/Term.lean`).
+                "sorry" => Ok(Syntax::node(parser_kind(&["Term", "sorry"]), vec![leaf])),
                 // `notation "∅" => EmptyCollection.emptyCollection` (`Init/Core.lean:581`).
                 "∅" => Ok(Syntax::node(Name::from_components(["term∅"]), vec![leaf])),
                 _ => Err(NatDefinitionParseError::OutsideSeedGrammar {

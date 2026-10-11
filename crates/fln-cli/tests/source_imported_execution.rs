@@ -778,6 +778,68 @@ fn pinned_prelude_imports_can_publish_replayable_bytecode_and_a_verified_sidecar
     assert!(replayed.stdout.contains("\"verified\":true"));
 }
 
+/// `sorry` elaborates to the pin's `sorryAx (Lean.Name → T) false tag` and every declaration
+/// that uses it is admitted with the pin's warning, positioned at the declared name, or at the
+/// keyword for an `example`, an anonymous instance and a structure; `warn.sorry false` silences
+/// it. The expected bytes are the pinned v4.32.0's on this file (measured 2026-10-11), and the
+/// pinned binary beside the library is compared again when present. `check-source` prints no
+/// warnings, so it counts the declarations instead.
+#[test]
+fn sorry_is_admitted_with_the_pins_warnings() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-sorry");
+    let entry = workspace.write(
+        "Main.lean",
+        "prelude\nimport Init.Prelude\nexample : Eq 1 2 := sorry\nclass C where\n  x : Nat\n\
+         instance : C := sorry\n/-- doc -/\nprotected def Foo.bar : Nat := sorry\n\
+         set_option warn.sorry false in\ntheorem quiet : Eq 1 2 := sorry\n\
+         instance named : C := sorry\ntheorem two : Eq 2 2 := Eq.refl 2\n\
+         structure S where\n  x : Nat := sorry\n",
+    );
+    let file = entry.display();
+    let expected: String = ["3:0", "6:0", "8:14", "11:9", "13:0"]
+        .iter()
+        .map(|at| format!("{file}:{at}: warning: declaration uses `sorry`\n"))
+        .collect();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stderr.as_str()), (0, ""), "{ours:?}");
+    assert_eq!(ours.stdout, expected);
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    match pinned {
+        Some(pinned) => {
+            let theirs = Command::new(pinned)
+                .arg(&entry)
+                .env("LEAN_PATH", &lib)
+                .output()
+                .expect("run the pinned lean");
+            assert!(theirs.status.success(), "{theirs:?}");
+            assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+        }
+        None => eprintln!("SKIP: no pinned lean beside the library; stdout was not compared"),
+    }
+    // `instC`, `Foo.bar`, `quiet` (silenced, still a use), `named` and `S.x`'s default.
+    let checked = workspace.invoke("check-source", &entry, Some(&lib), &[]);
+    assert_eq!(checked.code, 0, "{checked:?}");
+    assert!(
+        checked
+            .stdout
+            .contains("\"theorems\":2,\"axioms\":0,\"sorryDeclarations\":5,"),
+        "{checked:?}"
+    );
+    // Each `sorry` is its own term: two of them are not definitionally equal, at the pin too.
+    let distinct = workspace.write(
+        "Distinct.lean",
+        "prelude\nimport Init.Prelude\nexample : Eq (sorry : Nat) sorry := Eq.refl _\n",
+    );
+    let refused = lean_door(&workspace, &distinct, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
 /// The drop-in `lean` on one file, with the search path and the record store
 /// both inside the workspace so a run neither reads nor leaves anything else.
 fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {

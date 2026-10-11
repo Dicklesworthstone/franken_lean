@@ -671,6 +671,87 @@ impl Context {
         })
     }
 
+    /// `sorry` at `type_`, as the pin elaborates it (`elabSorry`, `Lean/Elab/BuiltinNotation.lean`;
+    /// `mkLabeledSorry type (synthetic := false) (unique := true)`, `Lean/Meta/Sorry.lean`):
+    /// `sorryAx (Lean.Name → type_) false tag`. The tag makes every `sorry` a different term, so
+    /// two of them are never definitionally equal. The pin's tag is the module, the source range
+    /// and a fresh macro scope; this one is the source byte range plus a counter, so the term is
+    /// the pin's up to that label. Without `Lean.Name` and `sorryAx` the pin aborts the command;
+    /// here it is refused, naming the missing constant.
+    fn labeled_sorry(
+        &mut self,
+        syntax: &Syntax,
+        type_: Expr,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let name = |components: &[&str]| Name::from_components(components.iter().copied());
+        for required in [
+            name(&["sorryAx"]),
+            name(&["Lean", "Name"]),
+            name(&["Lean", "Name", "anonymous"]),
+            name(&["Lean", "Name", "str"]),
+            name(&["Lean", "Name", "num"]),
+            name(&["Bool", "false"]),
+        ] {
+            if !self.txn.env.contains(&required) {
+                return Err(failure(SourceInferenceError::UnknownConstant(required)));
+            }
+        }
+        let name_type = Expr::const_(name(&["Lean", "Name"]), Vec::new());
+        let labeled = Expr::forall_e(
+            Name::str(Name::anonymous(), "tag"),
+            name_type,
+            type_.clone(),
+            BinderInfo::Default,
+        );
+        let sort = match self.known_type(&labeled)? {
+            Some(sort) => self.whnf(&sort)?,
+            None => return Err(failure(SourceInferenceError::ExpectedType)),
+        };
+        let ExprNode::Sort { level } = sort.node() else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
+        let nat = |value: u64| Expr::lit(Literal::Nat(fln_core::expr::NatLit::from_u64(value)));
+        let info = match syntax {
+            Syntax::Node { args, .. } => args
+                .first()
+                .map_or(fln_syntax::source::SourceInfo::None, Syntax::info),
+            _ => syntax.info(),
+        };
+        let counter = self.next;
+        self.fresh_name()?;
+        let mut tag = Expr::app(
+            Expr::app(
+                Expr::const_(name(&["Lean", "Name", "str"]), Vec::new()),
+                Expr::const_(name(&["Lean", "Name", "anonymous"]), Vec::new()),
+            ),
+            Expr::lit(Literal::Str("_sorry".to_owned())),
+        );
+        let positions = [
+            info.pos(false).map(|pos| pos.0 as u64),
+            info.end_pos(false).map(|pos| pos.0 as u64),
+        ];
+        for component in positions.into_iter().flatten().chain([counter]) {
+            tag = Expr::app(
+                Expr::app(
+                    Expr::const_(name(&["Lean", "Name", "num"]), Vec::new()),
+                    tag,
+                ),
+                nat(component),
+            );
+        }
+        let value = Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(name(&["sorryAx"]), vec![level.clone()]),
+                    labeled,
+                ),
+                Expr::const_(name(&["Bool", "false"]), Vec::new()),
+            ),
+            tag,
+        );
+        Ok(Typed { value, type_ })
+    }
+
     fn atom(
         &mut self,
         syntax: &Syntax,
@@ -733,6 +814,20 @@ impl Context {
                     value: self.hole(type_.clone())?,
                     type_,
                 });
+            }
+            if kind == &parser_kind(&["Term", "sorry"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(keyword, "sorry", "sorry")?;
+                let type_ = match expected {
+                    Some(type_) => type_.clone(),
+                    None => {
+                        let level = self.level()?;
+                        self.hole(Expr::sort(level))?
+                    }
+                };
+                return self.labeled_sorry(syntax, type_);
             }
             let level = if kind == &parser_kind(&["Term", "type"]) {
                 Some(self.source_sort(args, true)?)

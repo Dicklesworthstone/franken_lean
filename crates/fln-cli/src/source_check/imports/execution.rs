@@ -304,11 +304,20 @@ fn run_loaded(
                 ), presentation)),
                 Err(output) => return Some(output),
             };
+            // The pin names the file as the command line did, and standard input `<stdin>`.
+            let display = match origin {
+                EntryOrigin::StandardInput => "<stdin>".to_owned(),
+                EntryOrigin::File => paths[0].display().to_string(),
+            };
             Some(match presentation {
                 Presentation::Lean => match lean_output(
                     &completed,
                     &names[0],
                     headers[0].prelude && !loaded.reaches(&Name::from_components(["Init"])),
+                    crate::WarningSink::Print {
+                        file: &display,
+                        source: &sources[0],
+                    },
                 ) {
                     Ok(output) => match main_arguments.as_ref() {
                         Some(arguments) => main_output(
@@ -458,7 +467,7 @@ fn prepare_publication<'a>(
     validate_exits(program)?;
     for module in &program.modules {
         if !module.commands.guards.is_empty() {
-            let judged = render_lean_source_commands(&module.commands);
+            let judged = render_lean_source_commands(&module.commands, crate::WarningSink::Discard);
             if judged.exit_code != 0 {
                 let (class, authority) = match judged.exit_code {
                     3 => ("resource", false),
@@ -705,7 +714,7 @@ fn validate_lean_module(
 ) -> Result<(), MultiplexerOutput> {
     validate_module_exits(module, commands).map_err(|error| failure(error, Presentation::Lean))?;
     if !commands.guards.is_empty() {
-        let mut presented = render_lean_source_commands(commands);
+        let mut presented = render_lean_source_commands(commands, crate::WarningSink::Discard);
         if presented.exit_code != 0 {
             presented.stdout.clear();
             return Err(presented);
@@ -726,6 +735,7 @@ fn lean_output(
     program: &SourceProgramExecution,
     entry: &Name,
     without_init: bool,
+    sink: crate::WarningSink<'_>,
 ) -> Result<MultiplexerOutput, Failure> {
     validate_exits(program)?;
     let (module, dependencies) = program
@@ -740,7 +750,8 @@ fn lean_output(
         if dependency.commands.guards.is_empty() {
             continue;
         }
-        let mut presented = render_lean_source_commands(&dependency.commands);
+        let mut presented =
+            render_lean_source_commands(&dependency.commands, crate::WarningSink::Discard);
         if presented.exit_code != 0 {
             presented.stdout.clear();
             return Ok(presented);
@@ -768,7 +779,7 @@ fn lean_output(
             CAPABILITY_NOT_IMPLEMENTED_EXIT,
         ));
     }
-    Ok(render_lean_source_commands(&module.commands))
+    Ok(render_lean_source_commands(&module.commands, sink))
 }
 
 /// Invoke main only after the complete source front end, including dependency
@@ -1205,7 +1216,8 @@ mod tests {
                         .into_complete()
                         .unwrap();
                     assert_eq!(dependency.guards.len(), 1);
-                    let judged = render_lean_source_commands(&dependency);
+                    let judged =
+                        render_lean_source_commands(&dependency, crate::WarningSink::Discard);
                     if expected == 2 {
                         assert_eq!(judged.exit_code, 0, "{}", judged.stderr);
                         assert_eq!(judged.stdout, "11\n");
@@ -1238,13 +1250,17 @@ mod tests {
                             },
                         ],
                     };
-                    let frontend =
-                        match lean_output(&program, &Name::from_components(["Main"]), false) {
-                            Ok(frontend) => frontend,
-                            Err(error) => {
-                                panic!("retained source commands must finish: {}", error.detail)
-                            }
-                        };
+                    let frontend = match lean_output(
+                        &program,
+                        &Name::from_components(["Main"]),
+                        false,
+                        crate::WarningSink::Unreachable,
+                    ) {
+                        Ok(frontend) => frontend,
+                        Err(error) => {
+                            panic!("retained source commands must finish: {}", error.detail)
+                        }
+                    };
                     assert_eq!(frontend.exit_code, if expected == 2 { 0 } else { 1 });
                     assert_eq!(frontend.stdout, if expected == 2 { "42\n" } else { "" });
                     let result = main_output(&program, &[], limits, frontend);
@@ -1297,7 +1313,7 @@ mod tests {
                 assert!(render(&program, &entry, 0, None, true, None).is_ok());
                 // The `lean` presentation prints the entry's own output only: one
                 // `42`, though the dependency evaluated the same term.
-                match lean_output(&program, &entry, false) {
+                match lean_output(&program, &entry, false, crate::WarningSink::Unreachable) {
                     Ok(presented) => assert_eq!(
                         (presented.exit_code, presented.stdout.as_str()),
                         (0, "42\n")
@@ -1305,7 +1321,7 @@ mod tests {
                     Err(error) => panic!("a complete program must present: {}", error.detail),
                 }
                 // A `prelude` entry whose world lacks `Init` never prints an `#eval`.
-                match lean_output(&program, &entry, true) {
+                match lean_output(&program, &entry, true, crate::WarningSink::Unreachable) {
                     Err(error) => assert_eq!((error.class, error.exit), ("capability", 5)),
                     Ok(_) => panic!("an #eval without Init's instances must not print"),
                 }
@@ -1320,7 +1336,7 @@ mod tests {
                     message: "dependency initialization failed".to_owned(),
                     usage: returned.usage,
                 };
-                match lean_output(&program, &entry, false) {
+                match lean_output(&program, &entry, false, crate::WarningSink::Unreachable) {
                     Err(error) => assert_eq!((error.class, error.exit), ("program-panic", 1)),
                     Ok(_) => panic!("the lean presentation must not hide a dependency panic"),
                 }

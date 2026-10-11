@@ -317,8 +317,19 @@ pub(super) fn run(
                     matches!(info, fln::ConstantInfo::Axiom(_)) && !engine.environment().contains(name)
                 })
                 .count();
+            // The sources' declarations that use `sorry` (`sorryAx`): the pin admits each with
+            // the warning "declaration uses `sorry`"; this report, which prints no warnings,
+            // counts them.
+            let sorries = result
+                .engine
+                .environment()
+                .constants()
+                .filter(|(name, info)| {
+                    !engine.environment().contains(name) && fln::constant_uses_sorry(info)
+                })
+                .count();
             let stdout = if json {
-                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"axioms\":{axioms},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
+                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"axioms\":{axioms},\"sorryDeclarations\":{sorries},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
                     result.files, result.commands, result.theorems, loaded.total_bytes,
                     json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()), olean_json)
             } else {
@@ -330,7 +341,12 @@ pub(super) fn run(
                 } else {
                     format!(", {axioms} axioms asserted without proof")
                 };
-                format!("Checked {} source commands ({} theorems{axioms}) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
+                let sorries = if sorries == 0 {
+                    String::new()
+                } else {
+                    format!(", {sorries} declarations use `sorry`")
+                };
+                format!("Checked {} source commands ({} theorems{axioms}{sorries}) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };
             // The process ends with this answer. Tearing down an imported closure
             // (65,404 declarations for `Init`) node by node took seconds; the

@@ -99,6 +99,59 @@ pub(crate) fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionPar
         })
         .collect())
 }
+
+/// The original byte offset at which the pin positions a declaration command's warnings, such as
+/// "declaration uses `sorry`": the declared name for `def`, `theorem`, `abbrev`, `opaque`,
+/// `axiom` and a named `instance`, and the keyword for `example`, an anonymous `instance`,
+/// `structure`, `class` and `inductive` (measured at the pinned v4.32.0: `protected def Foo.bar`
+/// after a doc comment and an attribute warns at the name; `structure S` with a `sorry` field
+/// default warns at `structure`). `None` when no declaration keyword is found.
+pub fn declaration_warning_offset(source: &[u8]) -> Option<usize> {
+    let original = SourceText::from_utf8(source).ok()?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view).ok()?;
+    let symbol = |index: usize| match tokens.get(index).map(|token| &token.kind) {
+        Some(TokenKind::Symbol(symbol)) => Some(symbol.as_str()),
+        _ => None,
+    };
+    // A keyword inside an attribute list (`@[instance] def f`) names an attribute, not the
+    // declaration.
+    let mut depth = 0usize;
+    let keyword = (0..tokens.len()).find(|&index| {
+        match symbol(index) {
+            Some("@[") => depth += 1,
+            Some("[") if depth > 0 => depth += 1,
+            Some("]") if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+            && matches!(
+                symbol(index),
+                Some(
+                    "def"
+                        | "theorem"
+                        | "abbrev"
+                        | "opaque"
+                        | "axiom"
+                        | "instance"
+                        | "example"
+                        | "structure"
+                        | "class"
+                        | "inductive"
+                )
+            )
+    })?;
+    let at = |index: usize| view.to_original(tokens[index].extent.start()).0;
+    let named = matches!(
+        symbol(keyword),
+        Some("def" | "theorem" | "abbrev" | "opaque" | "axiom" | "instance")
+    ) && matches!(
+        tokens.get(keyword + 1).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    );
+    Some(if named { at(keyword + 1) } else { at(keyword) })
+}
+
 /// [`tokens`] for [`partition`], which goes past a refusal of one token: a symbol the table
 /// does not have (a notation this table lacks, such as a scoped one) or a character literal with
 /// no closing quote (`x#'lt` without the scoped `#'`). The pin's frontend reports such an error on
