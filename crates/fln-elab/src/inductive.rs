@@ -3,6 +3,7 @@
 //! Both checking engines must validate the block. This generator handles
 //! dependent constructor fields and strictly positive uniform recursive fields; it never
 //! infers positivity from a flag or publishes a candidate into an environment.
+pub mod auxiliaries;
 mod mutual;
 pub use mutual::mutual_inductive_declaration;
 pub(crate) use mutual::mutual_inductive_with_promoted_parameters;
