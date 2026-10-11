@@ -1191,7 +1191,9 @@ mod tests {
             "end A B",
             "section A B",
             "open",
-            "open A (x)",
+            "open A ()",
+            "open A (x",
+            "open A (1)",
             "open A in",
             "open scoped",
             "open scoped A in",
@@ -1204,6 +1206,15 @@ mod tests {
             assert!(parse(source.as_bytes()).is_err(), "{source}");
         }
         assert_eq!(parse(b"def value := 3").unwrap(), None);
+        // The pin's `openOnly` (measured: `open A ()`, `open A (x` and `open A (1)` are its parse
+        // errors; `open A (x)` is not).
+        assert_eq!(
+            parse(b"open A (x)").unwrap(),
+            Some(ScopeCommand::OpenExplicit {
+                namespace: Name::str(Name::anonymous(), "A"),
+                names: vec![Name::str(Name::anonymous(), "x")],
+            })
+        );
     }
     /// `attribute`, `variable`, `omit` and `include` take the next command after a top-level
     /// `in` too (`Command.in`), as in `Init/GrindInstances/Ring/SInt.lean`; an `in` inside
