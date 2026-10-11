@@ -11,9 +11,13 @@
 //!   callback starts from the tuple. Every exit (`continue`, `break`, the end of the body) yields
 //!   the variables' values at that point. The loop's result binds them again.
 //!
+//! - A branch statement whose every reassigning branch ends in `break` or `continue` needs no join:
+//!   the jump yields the values it reads, so it stays a plain `do` element.
+//!
 //! Refused where the pin accepts, a refusal and never a different meaning:
-//! - a reassigning branch statement that also contains `return`, `break` or `continue` (its join
-//!   would also have to forward the exit), or that is a `try`;
+//! - a reassigning branch statement that also contains `return`, or `break` or `continue` with a
+//!   reassigning branch that falls through (its join would also have to forward the exit), or
+//!   that is a `try`;
 //! - a reassigning loop whose body returns;
 //! - a pattern reassignment (`(a, b) := e`).
 //!
@@ -118,6 +122,71 @@ fn facts(element: &Syntax) -> Facts {
         }
     }
     facts
+}
+
+/// The last element of a `doSeqIndent` or `doSeqBracketed`.
+fn last_element(sequence: &Syntax) -> Option<&Syntax> {
+    let Syntax::Node { args, .. } = sequence else {
+        return None;
+    };
+    let items = if is(sequence, "doSeqBracketed") {
+        args.get(1)
+    } else {
+        args.first()
+    };
+    let Some(Syntax::Node { args: items, .. }) = items else {
+        return None;
+    };
+    match items.last() {
+        Some(Syntax::Node { args, .. }) => args.first(),
+        _ => None,
+    }
+}
+
+/// The branch sequences of a branch statement: an `if`'s then, else-if and else sequences, a
+/// `match`'s alternatives, and the sequence of a nested `do` or of an `unless` body.
+fn branch_sequences(element: &Syntax) -> Vec<&Syntax> {
+    fn last(syntax: &Syntax) -> Option<&Syntax> {
+        match syntax {
+            Syntax::Node { args, .. } => args.last(),
+            _ => None,
+        }
+    }
+    let Syntax::Node { args, .. } = element else {
+        return Vec::new();
+    };
+    let mut sequences = Vec::new();
+    if is(element, "doIf") {
+        sequences.extend(args.get(3));
+        if let Some(Syntax::Node { args: clauses, .. }) = args.get(4) {
+            sequences.extend(clauses.iter().filter_map(last));
+        }
+        sequences.extend(args.get(5).and_then(last));
+    } else if is(element, "doMatch") {
+        if let Some(Syntax::Node {
+            args: alternatives, ..
+        }) = args.last()
+            && let Some(Syntax::Node { args: rows, .. }) = alternatives.first()
+        {
+            sequences.extend(rows.iter().filter_map(last));
+        }
+    } else {
+        sequences.extend(args.last());
+    }
+    sequences
+}
+
+/// Whether every branch of `element` that reassigns one of `state` ends in `break` or `continue`,
+/// so that control never leaves the statement with one of them reassigned.
+fn jumps_out_with(element: &Syntax, state: &[Name]) -> bool {
+    branch_sequences(element).into_iter().all(|sequence| {
+        !facts(sequence)
+            .reassigned
+            .iter()
+            .any(|name| state.contains(name))
+            || last_element(sequence)
+                .is_some_and(|last| is(last, "doBreak") || is(last, "doContinue"))
+    })
 }
 
 /// Whether a binder (a name or a pattern) mentions a `mut` variable.
@@ -500,8 +569,17 @@ impl Context {
                 out.push(self.mutable_branches(element, muts, None, looped)?);
                 return Ok(());
             }
-            if facts.returns || facts.jumps || facts.handles {
+            if facts.returns || facts.handles {
                 return Err(refused());
+            }
+            if facts.jumps {
+                // Every branch that reassigns ends in `break` or `continue`, which yields the
+                // values it reads: no reassignment falls through, so the statement needs no join.
+                if !jumps_out_with(&element, &state) {
+                    return Err(refused());
+                }
+                out.push(self.mutable_branches(element, muts, None, looped)?);
+                return Ok(());
             }
             let branches = if looped {
                 term(

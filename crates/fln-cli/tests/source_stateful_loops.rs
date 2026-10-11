@@ -1,7 +1,8 @@
 //! Stateful `for` loops and staged callbacks, compiled and run by the installed drop-in `lean`
 //! (`#eval`). `List`'s `ForIn` instance passes `forIn'` the two-binder `fun a _ => f a`, where
 //! `forIn'` calls back with three arguments, so the callback's closure type differs from the
-//! parameter's flat one until the lambda is eta-expanded at the call. Every program here was run
+//! parameter's flat one until the lambda is eta-expanded at the call. Branches that reassign and
+//! then `break` or `continue` leave the loop with the values they read. Every program here was run
 //! through the pinned `lean` v4.32.0 with the same header first (2026-10-11), printing the value
 //! asserted here, and is compared with the pinned binary's output again when it is present.
 #![forbid(unsafe_code)]
@@ -61,6 +62,120 @@ const PROGRAMS: &[(&str, &str, &str)] = &[
         "def app3 (f : Nat → Nat → Nat → Nat) : Nat := f 1 2 3\n\
          #eval app3 (fun a b => let y := a * 10 + b; fun c => y + c)\n",
         "15",
+    ),
+    (
+        "break_after_reassignment",
+        "def firstBig (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut r := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x > 3 then\n\
+         \x20     r := x\n\
+         \x20     break\n\
+         \x20 return r\n\
+         #eval firstBig [1, 5, 7]\n",
+        "5",
+    ),
+    (
+        "continue_after_reassignment",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x == 2 then\n\
+         \x20     s := s + 100\n\
+         \x20     continue\n\
+         \x20   s := s + x\n\
+         \x20 return s\n\
+         #eval m [1, 2, 3]\n",
+        "104",
+    ),
+    (
+        "both_branches_jump",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x > 2 then\n\
+         \x20     s := s + 1000\n\
+         \x20     break\n\
+         \x20   else\n\
+         \x20     s := s + x\n\
+         \x20     continue\n\
+         \x20 return s\n\
+         #eval m [1, 2, 3, 4]\n",
+        "1003",
+    ),
+    (
+        "match_alternatives_jump",
+        "def m (xs : List (Option Nat)) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for o in xs do\n\
+         \x20   match o with\n\
+         \x20   | some n =>\n\
+         \x20     s := s + n\n\
+         \x20     continue\n\
+         \x20   | none =>\n\
+         \x20     s := s + 1000\n\
+         \x20     break\n\
+         \x20 return s\n\
+         #eval m [some 1, some 2, none, some 5]\n",
+        "1003",
+    ),
+    (
+        "unless_continue",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   unless x % 2 == 0 do\n\
+         \x20     s := s + 100\n\
+         \x20     continue\n\
+         \x20   s := s + x\n\
+         \x20 return s\n\
+         #eval m [1, 2, 3, 4]\n",
+        "206",
+    ),
+    (
+        "inner_loop_break",
+        "def m (xs ys : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   for y in ys do\n\
+         \x20     if y > x then\n\
+         \x20       s := s + 10\n\
+         \x20       break\n\
+         \x20     s := s + y\n\
+         \x20 return s\n\
+         #eval m [1, 2] [1, 2, 3]\n",
+        "24",
+    ),
+    (
+        "body_local_mut_and_break",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   let mut t := x\n\
+         \x20   if t > 2 then\n\
+         \x20     t := t * 2\n\
+         \x20     s := s + t\n\
+         \x20     break\n\
+         \x20   s := s + t\n\
+         \x20 return s\n\
+         #eval m [1, 2, 3, 4]\n",
+        "9",
+    ),
+    (
+        "else_if_jumps",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x == 1 then\n\
+         \x20     s := s + 10\n\
+         \x20     continue\n\
+         \x20   else if x == 2 then\n\
+         \x20     s := s + 20\n\
+         \x20     break\n\
+         \x20   s := s + x\n\
+         \x20 return s\n\
+         #eval m [3, 1, 2, 5]\n",
+        "33",
     ),
 ];
 

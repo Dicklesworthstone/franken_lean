@@ -3,7 +3,8 @@
 //! pinned `lean` v4.32.0), here without imports so they also run where the pin is absent:
 //! straight-line reassignment, a branch that reassigns, loop state across iterations, `break` and
 //! `continue` after a reassignment, branches that reassign inside a loop, a bound branch inside a
-//! loop, and effects that read the current value.
+//! loop, branches that reassign and then `break` or `continue`, and effects that read the current
+//! value.
 #![forbid(unsafe_code)]
 use super::*;
 
@@ -80,6 +81,32 @@ def bound : State Nat := do
     let y ← if x = 1 then Pure.pure (f := State) 5 else Pure.pure (f := State) 2
     c := c + y
   return c
+def leaveWith : State Nat := do
+  let mut s := 0
+  for x in items do
+    if x = 1 then
+      s := s + 100
+      break
+    s := s + x
+  return s
+def skipWith : State Nat := do
+  let mut s := 0
+  for x in items do
+    if x = 1 then
+      s := s + 100
+      continue
+    s := s + x
+  return s
+def bothJump : State Nat := do
+  let mut s := 0
+  for x in items do
+    if x = 2 then
+      s := s + 1000
+      break
+    else
+      s := s + x
+      continue
+  return s
 "#;
 
 #[test]
@@ -101,6 +128,9 @@ theorem countedValue : (counted 0).value = 10 := by rfl
 theorem chosenValue : (chosen 0).value = 11 := by rfl
 theorem steppedValue : (stepped 0).value = 12 := by rfl
 theorem boundValue : (bound 0).value = 7 := by rfl
+theorem leaveValue : (leaveWith 0).value = 100 := by rfl
+theorem skipValue : (skipWith 0).value = 102 := by rfl
+theorem bothValue : (bothJump 0).value = 1001 := by rfl
 "
         ),
     );
@@ -123,6 +153,9 @@ fn stale_values_are_refused() {
         "theorem w : (chosen 0).value = 0 := by rfl",
         "theorem w : (stepped 0).value = 2 := by rfl",
         "theorem w : (bound 0).value = 0 := by rfl",
+        "theorem w : (leaveWith 0).value = 0 := by rfl",
+        "theorem w : (skipWith 0).value = 2 := by rfl",
+        "theorem w : (bothJump 0).value = 1 := by rfl",
     ] {
         let source = format!("{PROGRAMS}{theorem}\n");
         assert!(
@@ -133,13 +166,15 @@ fn stale_values_are_refused() {
     }
 }
 
-/// The pin's own refusals: a variable not declared `mut` cannot be reassigned, a `mut` variable
-/// cannot be shadowed (by `let` or a loop binder), and a reassignment keeps the variable's type.
+/// The pin's own refusals: a variable not declared `mut` cannot be reassigned (also in a branch
+/// that leaves its loop), a `mut` variable cannot be shadowed (by `let` or a loop binder), and a
+/// reassignment keeps the variable's type.
 #[test]
 fn reassigning_an_immutable_and_shadowing_a_mutable_are_refused() {
     let base = state_engine();
     for source in [
         "def bad : Id Nat := do\n  let x := 1\n  x := 2\n  return x\n",
+        "def bad : State Nat := do\n  let s := 0\n  for x in items do\n    if x = 1 then\n      s := s + 100\n      break\n  return s\n",
         "def bad : Id Nat := do\n  let mut x := 1\n  let x := 2\n  return x\n",
         "def bad : State Nat := do\n  let mut x := 0\n  for x in items do\n    mark x\n  return x\n",
         "def bad : Id Nat := do\n  let mut x := 1\n  x := true\n  return x\n",
