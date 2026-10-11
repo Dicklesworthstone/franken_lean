@@ -428,8 +428,12 @@ therefore stops later source effects as well as entry output.
 Import admission is serial by default to limit peak memory while loading full
 `Init`. `-j N`, `-jN`, `--threads N`, and
 `--threads=N` select parallel import workers; zero also selects serial
-admission. These options accept the pin's unsigned 32-bit counts and stop being
-compiler options at `--run`, so a following `--threads=8` is a script argument.
+admission. Work that is not admission (re-proving a reused admission record
+under the `reuse-verified` posture, reading each module's extension data) uses
+up to the available parallelism, at most 8 threads, or `N` when that is
+larger. These options accept the pin's unsigned
+32-bit counts and stop being compiler options at `--run`, so a following
+`--threads=8` is a script argument.
 The personality also answers `-g`/`--githash` from the exact pinned Reference
 commit and reports `[]` for `--features`, truthfully reflecting the absence of
 an LLVM backend. `-q`/`--quiet` is accepted on source operations; there are no

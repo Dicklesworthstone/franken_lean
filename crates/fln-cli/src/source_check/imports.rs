@@ -151,6 +151,15 @@ impl Loaded {
                         threads: jobs,
                         worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
                     },
+                    // Work that is no council (re-proving a record, capturing each
+                    // module's extension payloads) is not held to the council's
+                    // worker count: the `lean` door keeps one council worker for a
+                    // cold Init, and a warm one decodes, measures and captures Init's
+                    // 601 modules in parallel.
+                    read_jobs: fln::OleanFrontierJobs {
+                        threads: jobs.max(crate::default_import_jobs()),
+                        worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
+                    },
                     ..fln::source_check::modules::imported::SourceOleanImportLimits::new(limits)
                 },
                 resolved.request(),

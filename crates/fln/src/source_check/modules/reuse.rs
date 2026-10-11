@@ -1247,8 +1247,12 @@ impl Engine {
                 "import-reuse/modules",
             )));
         }
-        let ordered =
-            self.decode_olean_module_set(modules, limits.check, CheckerReading::Skip, limits.jobs)?;
+        let ordered = self.decode_olean_module_set(
+            modules,
+            limits.check,
+            CheckerReading::Skip,
+            limits.read_jobs,
+        )?;
         let count = ordered.len();
         let inputs: BTreeMap<_, _> = modules.iter().map(|module| (module.name, module)).collect();
         let positions: BTreeMap<_, _> = ordered
@@ -1727,7 +1731,7 @@ impl Engine {
             deltas.push(delta);
             pending.push((module.name.clone(), decoded, declarations));
         }
-        let roots = module_roots(base, &deltas, options, limits.jobs);
+        let roots = module_roots(base, &deltas, options, limits.read_jobs);
         let mut previous = base;
         let mut checked_modules = Vec::with_capacity(pending.len());
         for ((name, decoded, declarations), root) in pending.into_iter().zip(roots) {
@@ -1825,7 +1829,7 @@ impl Engine {
             modules,
             options,
             limits.check,
-            limits.jobs,
+            limits.read_jobs,
             record,
             cancellation,
         ) {

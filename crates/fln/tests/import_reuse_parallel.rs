@@ -45,11 +45,19 @@ fn source_limits() -> SourceModuleCheckLimits {
 }
 
 fn limits(threads: usize) -> SourceOleanImportLimits {
+    split_limits(threads, threads)
+}
+
+/// `council` council workers, and `reproof` threads re-proving a record: the `lean`
+/// door runs one council worker but re-proves a warm record in parallel.
+fn split_limits(council: usize, reproof: usize) -> SourceOleanImportLimits {
+    let jobs = |threads| OleanFrontierJobs {
+        threads: NonZeroUsize::new(threads).unwrap(),
+        worker_stack_bytes: STACK,
+    };
     SourceOleanImportLimits {
-        jobs: OleanFrontierJobs {
-            threads: NonZeroUsize::new(threads).unwrap(),
-            worker_stack_bytes: STACK,
-        },
+        jobs: jobs(council),
+        read_jobs: jobs(reproof),
         ..SourceOleanImportLimits::new(OleanCheckLimits::new(
             1 << 20,
             Budget::for_stack_bytes(STACK),
@@ -201,7 +209,7 @@ fn same_source_contexts(left: &SourceOleanImport, right: &SourceOleanImport) {
 }
 
 #[test]
-fn cold_mixed_and_warm_public_imports_match_at_one_and_eight_workers() {
+fn cold_mixed_and_warm_public_imports_match_at_one_and_eight_workers_and_split_reproof() {
     on_import_stack(|| {
         let artifacts = diamond();
         let all = inputs(&artifacts);
@@ -221,7 +229,7 @@ fn cold_mixed_and_warm_public_imports_match_at_one_and_eight_workers() {
             .unwrap()
             .into_complete()
             .unwrap();
-        for threads in [1, 8] {
+        for (council, reproof) in [(1, 1), (8, 8), (1, 8)] {
             for warm_base in [false, true] {
                 let store = Memory::default();
                 if warm_base {
@@ -235,7 +243,7 @@ fn cold_mixed_and_warm_public_imports_match_at_one_and_eight_workers() {
                             &base,
                             &[n("Base")],
                             &options,
-                            limits(threads),
+                            split_limits(council, reproof),
                             reuse(checker, &store),
                             None,
                         )
@@ -249,7 +257,7 @@ fn cold_mixed_and_warm_public_imports_match_at_one_and_eight_workers() {
                             &all,
                             &roots,
                             &options,
-                            limits(threads),
+                            split_limits(council, reproof),
                             reuse(checker, &store),
                             None,
                         )

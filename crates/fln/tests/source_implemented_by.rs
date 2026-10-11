@@ -30,11 +30,13 @@ fn execution() -> EngineExecutionLimits {
     EngineExecutionLimits::new(admission().kernel)
 }
 fn limits(threads: usize) -> SourceOleanImportLimits {
+    let jobs = OleanFrontierJobs {
+        threads: NonZeroUsize::new(threads).unwrap(),
+        worker_stack_bytes: STACK,
+    };
     SourceOleanImportLimits {
-        jobs: OleanFrontierJobs {
-            threads: NonZeroUsize::new(threads).unwrap(),
-            worker_stack_bytes: STACK,
-        },
+        jobs,
+        read_jobs: jobs,
         ..SourceOleanImportLimits::new(OleanCheckLimits::new(32 << 20, admission().kernel))
     }
 }

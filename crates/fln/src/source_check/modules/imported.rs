@@ -27,6 +27,12 @@ pub struct SourceOleanImportLimits {
     /// same at every count ([`Engine::check_olean_modules_scheduled`]); only its
     /// wall time depends on it.
     pub jobs: OleanFrontierJobs,
+    /// How many threads run the import's work that is not a council: decoding
+    /// the closure and measuring its declarations when a `reuse-verified` record
+    /// is re-proved, and capturing each module's extension payloads. Each piece
+    /// reads only bytes the caller supplied, and the import is the same at every
+    /// count, so a caller may allow more here than council workers.
+    pub read_jobs: OleanFrontierJobs,
 }
 impl SourceOleanImportLimits {
     /// Capture may use as many bytes as the caller allows the artifacts
@@ -43,6 +49,7 @@ impl SourceOleanImportLimits {
             max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
             jobs: OleanFrontierJobs::SERIAL,
+            read_jobs: OleanFrontierJobs::SERIAL,
         }
     }
 }
@@ -308,8 +315,8 @@ impl Engine {
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
         // Each module's capture reads only its own parts, so the walks run
-        // `limits.jobs` at once; the cumulative byte allowance is charged below in
-        // replay order, exactly as when one walk followed another.
+        // `limits.read_jobs` at once; the cumulative byte allowance is charged below
+        // in replay order, exactly as when one walk followed another.
         cancelled!("source-olean/capture");
         let mut captures = capture_modules(&checked, &order, &inputs, &limits).into_iter();
         for &index in &order {
@@ -681,8 +688,8 @@ impl Engine {
     }
 }
 
-/// Every module's extension payloads, in replay `order`, `limits.jobs` modules at
-/// once. Each walk may use the whole capture allowance; the caller charges the
+/// Every module's extension payloads, in replay `order`, `limits.read_jobs` modules
+/// at once. Each walk may use the whole capture allowance; the caller charges the
 /// cumulative allowance in order, so a closure over it is still refused.
 fn capture_modules(
     checked: &CheckedOleanSet,
@@ -718,7 +725,7 @@ fn capture_modules(
                 error,
             })
     };
-    let threads = limits.jobs.threads.get().min(order.len());
+    let threads = limits.read_jobs.threads.get().min(order.len());
     if threads <= 1 {
         return order.iter().map(|&index| capture(index)).collect();
     }
@@ -1175,11 +1182,13 @@ pub(super) mod tests {
     }
 
     pub(in crate::source_check::modules) fn limits(threads: usize) -> SourceOleanImportLimits {
+        let jobs = OleanFrontierJobs {
+            threads: NonZeroUsize::new(threads).expect("a positive thread count"),
+            worker_stack_bytes: STACK,
+        };
         SourceOleanImportLimits {
-            jobs: OleanFrontierJobs {
-                threads: NonZeroUsize::new(threads).expect("a positive thread count"),
-                worker_stack_bytes: STACK,
-            },
+            jobs,
+            read_jobs: jobs,
             ..SourceOleanImportLimits::new(OleanCheckLimits::new(
                 1 << 30,
                 Budget::for_stack_bytes(STACK),
