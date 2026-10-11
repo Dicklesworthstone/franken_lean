@@ -829,6 +829,9 @@ impl Context {
                     "emptyCollection",
                 ]));
             }
+            if kind == &parser_kind(&["Term", "quotedName"]) {
+                return self.quoted_name(args);
+            }
             if kind == &parser_kind(&["Term", "syntheticHole"]) {
                 let [question, label] = args.as_slice() else {
                     return Err(failure(SourceInferenceError::Scope));
@@ -997,6 +1000,68 @@ impl Context {
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
         self.whnf_with_transparency(expr, UnificationTransparency::Default, true)
+    }
+
+    /// `` `a.b `` (`Term.quotedName`): the pin's `elabQuotedName` is `toExpr` of the literal's name
+    /// (`Name.toExprAux`, vendored Lean/ToExpr.lean). That is `Lean.Name.mkStrN "a" "b"` for one to
+    /// eight components, otherwise `Lean.Name.str` from `Lean.Name.anonymous`. A name literal's
+    /// components are all strings (`String.toName`). `«…»` escapes a component. A double backtick
+    /// (`doubleQuotedName`, which resolves a constant) is refused here.
+    fn quoted_name(&mut self, args: &[Syntax]) -> Result<Typed, NatDefinitionElabError> {
+        let [literal] = args else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let parts = expect_node(
+            literal,
+            &Name::str(Name::anonymous(), "name"),
+            1,
+            "name literal",
+        )?;
+        let Syntax::Atom { val, .. } = &parts[0] else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let Some(body) = val.strip_prefix('`').filter(|body| !body.starts_with('`')) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut components = Vec::new();
+        let mut current = String::new();
+        let mut escaped = false;
+        for character in body.chars() {
+            match character {
+                '«' if !escaped => escaped = true,
+                '»' if escaped => escaped = false,
+                '.' if !escaped => components.push(std::mem::take(&mut current)),
+                _ => current.push(character),
+            }
+        }
+        components.push(current);
+        if escaped || components.iter().any(String::is_empty) {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let name = |label: &str| Name::from_components(["Lean", "Name", label]);
+        let value = if components.len() <= 8 {
+            let mut value = self
+                .constant(&name(&format!("mkStr{}", components.len())))?
+                .value;
+            for component in components {
+                value = Expr::app(value, Expr::lit(Literal::Str(component)));
+            }
+            value
+        } else {
+            let mut value = self.constant(&name("anonymous"))?.value;
+            let str_ = self.constant(&name("str"))?.value;
+            for component in components {
+                value = Expr::app(
+                    Expr::app(str_.clone(), value),
+                    Expr::lit(Literal::Str(component)),
+                );
+            }
+            value
+        };
+        Ok(Typed {
+            value,
+            type_: Expr::const_(Name::from_components(["Lean", "Name"]), Vec::new()),
+        })
     }
 
     fn whnf_with_transparency(
