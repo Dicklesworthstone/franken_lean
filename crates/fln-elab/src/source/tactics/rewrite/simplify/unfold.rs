@@ -29,6 +29,11 @@ impl Context {
             SimpRule::Local(_) => Ok(UnfoldResult::NotDefinition),
             SimpRule::Global(rule) => {
                 self.tick()?;
+                // A definition-valued equality proof is still evidence, not
+                // a request to unfold either it or its attribute origin.
+                if rule.proof.is_some() {
+                    return Ok(UnfoldResult::NotDefinition);
+                }
                 match self.txn.env.find(&rule.declaration) {
                     Some(ConstantInfo::Defn(definition))
                         if definition.safety == DefinitionSafety::Safe && !rule.reverse =>

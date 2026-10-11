@@ -203,7 +203,9 @@ impl Context {
     fn selected_simp_term(&mut self, rule: &SimpRule<'_>) -> Result<Typed, NatDefinitionElabError> {
         match rule {
             SimpRule::Explicit(rule) => self.simp_rule_term(rule.syntax),
-            SimpRule::Global(rule) => self.constant(&rule.declaration),
+            SimpRule::Global(rule) => {
+                self.constant(rule.proof.as_ref().unwrap_or(&rule.declaration))
+            }
             SimpRule::Local(id) => {
                 self.tick()?;
                 let local = self

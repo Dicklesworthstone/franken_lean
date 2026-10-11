@@ -14,6 +14,8 @@ use fln_env::{
     extensions::{CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance},
 };
 use std::collections::BTreeMap;
+mod imports;
+pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
 
 /// A `prio` tree's value: a decimal numeral, `default`/`low`/`mid`/`high` (1000, 100, 500 and
 /// 10000, vendored `src/Init/Notation.lean`), or either in parentheses. Priority arithmetic and
@@ -51,7 +53,7 @@ fn priority_value(
         "priority numeral",
     )?;
     let [Syntax::Atom { val, .. }] = numeral else {
-        return Err(refuse("priority numeral"));
+        return Err(refuse("decimal priority"));
     };
     if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
         return Err(refuse("decimal priority"));
@@ -164,6 +166,8 @@ const MAGIC: &[u8] = b"FLNSIMP\x01";
 // the shared tagged structural codec in a separately versioned payload, so a
 // private numeric component can never be mistaken for a source string "0".
 const STRUCTURAL_MAGIC: &[u8] = b"FLNSIMP\x02";
+// Auxiliary proofs add a new row form; existing v1/v2 rows keep their bytes.
+const PROOF_MAGIC: &[u8] = b"FLNSIMP\x03";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 16384;
 
@@ -194,7 +198,10 @@ impl std::error::Error for SimpSetError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpEntry {
+    /// Attribute origin: erasure and explicit replacement act on this identity.
     pub declaration: Name,
+    /// Already oriented proof, distinct from the origin and never an unfolding.
+    pub proof: Option<Name>,
     pub priority: u32,
     pub reverse: bool,
     pub order: usize,
@@ -403,15 +410,17 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
     if extension.len() > MAX_ROWS {
         return Err(SimpSetError::Limit);
     }
-    let mut active = BTreeMap::new();
+    let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
     for (order, row) in extension.entries().enumerate() {
         if row.payload.len() > MAX_BYTES {
             return Err(SimpSetError::Limit);
         }
         let mut bytes: &[u8] = &row.payload;
-        let structural = match take(&mut bytes, MAGIC.len())? {
+        let header = take(&mut bytes, MAGIC.len())?;
+        let proof_row = header == PROOF_MAGIC;
+        let structural = match header {
             header if header == MAGIC => false,
-            header if header == STRUCTURAL_MAGIC => true,
+            header if header == STRUCTURAL_MAGIC || proof_row => true,
             _ => return Err(SimpSetError::Malformed),
         };
         let operation = take(&mut bytes, 1)?[0];
@@ -419,6 +428,14 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
             crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?
         } else {
             read_name(&mut bytes)?
+        };
+        let proof = if proof_row {
+            if operation != 2 {
+                return Err(SimpSetError::Malformed);
+            }
+            Some(crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?)
+        } else {
+            None
         };
         let priority = number(&mut bytes)?;
         let reverse = match take(&mut bytes, 1)?[0] {
@@ -434,12 +451,16 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
                 validate(env, &declaration, reverse)?;
                 active.insert(
                     declaration.clone(),
-                    SimpEntry {
-                        declaration,
-                        priority,
-                        reverse,
-                        order,
-                    },
+                    BTreeMap::from([(
+                        None,
+                        SimpEntry {
+                            declaration,
+                            proof: None,
+                            priority,
+                            reverse,
+                            order,
+                        },
+                    )]),
                 );
             }
             1 if priority == 0 && !reverse => {
@@ -448,10 +469,34 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
                 }
                 active.remove(&declaration);
             }
+            2 if proof_row && !reverse => {
+                let proof = proof.ok_or(SimpSetError::Malformed)?;
+                if !env.contains(&declaration) {
+                    return Err(SimpSetError::UnknownDeclaration(declaration));
+                }
+                imports::validate_proof(env, &proof)?;
+                // A persisted theorem group replaces a prior ordinary source
+                // selection, but its auxiliary lemmas coexist with each other.
+                let group = active.entry(declaration.clone()).or_default();
+                group.remove(&None);
+                group.insert(
+                    Some(proof.clone()),
+                    SimpEntry {
+                        declaration,
+                        proof: Some(proof),
+                        priority,
+                        reverse,
+                        order,
+                    },
+                );
+            }
             _ => return Err(SimpSetError::Malformed),
         }
     }
-    let mut rows: Vec<SimpEntry> = active.into_values().collect();
+    let mut rows: Vec<SimpEntry> = active
+        .into_values()
+        .flat_map(BTreeMap::into_values)
+        .collect();
     rows.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
@@ -474,19 +519,18 @@ pub fn update(
     }
     if let Some((priority, reverse)) = rule {
         validate(env, declaration, reverse)?;
-        if current.is_some_and(|r| r.priority == priority && r.reverse == reverse) {
+        if current
+            .is_some_and(|r| r.proof.is_none() && r.priority == priority && r.reverse == reverse)
+        {
             return Ok(env.clone());
         }
     } else if current.is_none() {
         return Ok(env.clone());
     }
-    let expected = descriptor();
-    if env
-        .extension(&expected.name)
-        .is_some_and(|ext| ext.len() >= MAX_ROWS)
-    {
-        return Err(SimpSetError::Limit);
-    }
+    append(env, source_payload(declaration, rule)?)
+}
+
+fn source_payload(declaration: &Name, rule: Option<(u32, bool)>) -> Result<Vec<u8>, SimpSetError> {
     let mut payload = if let Ok(parts) = super::components(declaration) {
         if parts.is_empty() {
             return Err(SimpSetError::Malformed);
@@ -521,6 +565,22 @@ pub fn update(
     let (priority, reverse) = rule.unwrap_or((0, false));
     payload.extend(priority.to_le_bytes());
     payload.push(u8::from(reverse));
+    Ok(payload)
+}
+
+fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, SimpSetError> {
+    let expected = descriptor();
+    if payload.len() > MAX_BYTES {
+        return Err(SimpSetError::Limit);
+    }
+    if let Some(state) = env.extension(&expected.name) {
+        if state.descriptor != expected {
+            return Err(SimpSetError::Malformed);
+        }
+        if state.len() >= MAX_ROWS {
+            return Err(SimpSetError::Limit);
+        }
+    }
     let env = if env.extension(&expected.name).is_none() {
         env.register_extension(expected.clone())
             .map_err(|_| SimpSetError::Malformed)?
