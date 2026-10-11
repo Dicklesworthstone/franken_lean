@@ -158,7 +158,11 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         ScopeCommand::Namespace(_) => "namespace",
         ScopeCommand::Section(_) | ScopeCommand::SectionWithModifiers { .. } => "section",
         ScopeCommand::End(_) => "end",
-        ScopeCommand::Open(_) | ScopeCommand::OpenScoped(_) | ScopeCommand::OpenIn { .. } => "open",
+        ScopeCommand::Open(_)
+        | ScopeCommand::OpenScoped(_)
+        | ScopeCommand::OpenIn { .. }
+        | ScopeCommand::OpenExplicit { .. } => "open",
+        ScopeCommand::Export { .. } => "export",
         ScopeCommand::Universe(_) => "universe",
         ScopeCommand::Variable(_) => "variable",
         ScopeCommand::Include(_) | ScopeCommand::Omit(_) => "include-omit",

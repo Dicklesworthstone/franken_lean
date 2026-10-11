@@ -648,10 +648,10 @@ fn export(
     };
     let symbol = |index: usize, text: &str| matches!(tokens.get(index).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
     let Some(TokenKind::Ident(namespace)) = tokens.get(1).map(|t| &t.kind) else {
-        return Err(bad(1).into());
+        return Err(bad(1));
     };
     if !symbol(2, "(") {
-        return Err(bad(2).into());
+        return Err(bad(2));
     }
     let mut names = Vec::new();
     let mut at = 3;
@@ -660,7 +660,7 @@ fn export(
         at += 1;
     }
     if names.is_empty() || !symbol(at, ")") || at + 1 != tokens.len() {
-        return Err(bad(at).into());
+        return Err(bad(at));
     }
     Ok(ScopeCommand::Export {
         namespace: namespace.clone(),
