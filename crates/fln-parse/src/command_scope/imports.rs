@@ -1,7 +1,7 @@
 //! Header-only source import parsing over Vellum's real token stream.
 //! No source is synthesized and the returned body offset names original bytes.
 use super::*;
-use fln_syntax::token::{TokenTable, lex_token};
+use fln_syntax::token::{TokenError, TokenTable, lex_token};
 use fln_syntax::trivia::scan_trivia;
 
 /// One explicit import directive. Modifier positions name the original source
@@ -197,6 +197,7 @@ fn parse_header(source: &[u8]) -> Result<ParsedHeader, DefinitionParseError> {
     } else {
         0
     });
+    let header_start = start;
     let mut next = next_header_token(&view, table, start)?;
     let mut tokens = Vec::new();
     let module = optional_keyword(&view, table, &mut next, &mut tokens, "module")?;
@@ -224,9 +225,10 @@ fn parse_header(source: &[u8]) -> Result<ParsedHeader, DefinitionParseError> {
             Some(TokenKind::Ident(name)) => name.clone(),
             _ => {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: next.as_ref().map_or(BytePos(source.len()), |token| {
-                        view.to_original(token.extent.start())
-                    }),
+                    at: view.to_original(next.as_ref().map_or_else(
+                        || boundary(&view, &tokens, header_start),
+                        |token| token.extent.start(),
+                    )),
                     expected: NatDefinitionExpectation::ImportedModule,
                 });
             }
@@ -267,10 +269,10 @@ fn parse_header(source: &[u8]) -> Result<ParsedHeader, DefinitionParseError> {
     let body_position = if module.is_none() && prelude.is_none() && imports.is_empty() {
         start
     } else {
-        next.as_ref()
-            .map_or(BytePos(view.normalized().len_bytes()), |token| {
-                token.extent.start()
-            })
+        next.as_ref().map_or_else(
+            || boundary(&view, &tokens, header_start),
+            |token| token.extent.start(),
+        )
     };
     Ok(ParsedHeader {
         header: SourceHeader {
@@ -333,19 +335,84 @@ fn next_header_token(
     if at.0 >= text.len_bytes() {
         return Ok(None);
     }
-    lex_token(text, table, at)
-        .map(Some)
-        .map_err(|error| NatDefinitionParseError::Lexical {
+    match lex_token(text, table, at) {
+        Ok(token) => Ok(Some(token)),
+        // Bytes that start no builtin token (`#guard_msgs`, `#reduce`: notation an import
+        // declares) begin the body. The pin's `many import` stops there without consuming
+        // them, and the body is lexed with the imported table; [`boundary`] places it.
+        Err(TokenError::NotAToken { .. }) => Ok(None),
+        Err(error) => Err(NatDefinitionParseError::Lexical {
             diagnostics: vec![ParseDiagnostic {
                 message: error.message(),
                 at: view.to_original(error.at()),
             }],
-        })
+        }),
+    }
+}
+
+/// Where the body begins when no further header token was lexed: past the trivia after
+/// the last header token (or `start`), which is either a byte no builtin token starts or
+/// the end of the file. View coordinates.
+fn boundary(view: &SourceView, tokens: &[LexedToken], start: BytePos) -> BytePos {
+    let text = view.normalized();
+    let from = tokens.last().map_or(start, |token| token.extent.end());
+    // `next_header_token` already scanned this trivia without error.
+    scan_trivia(text, from).unwrap_or(BytePos(text.len_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header is lexed with builtin tokens only, so a body that opens with notation an
+    /// import declares (`#guard_msgs`, `#reduce`) starts where those bytes do, as the pin's
+    /// `many import` stops there; a header token's own argument still refuses them.
+    /// Measured at the pin 2026-10-11: `#guard_msgs in` and `#reduce 1 + 1` as a file's
+    /// first command both exit 0.
+    #[test]
+    fn a_body_that_opens_with_imported_notation_starts_where_its_bytes_do() {
+        for source in ["#guard_msgs in\ndef x : Nat := 1\n", "  #reduce 1 + 1\n"] {
+            let header = parse_source_header(source.as_bytes()).unwrap();
+            assert!(header.imports.is_empty() && !header.prelude, "{source:?}");
+            assert_eq!(header.body_start, BytePos(0), "{source:?}");
+        }
+        for (source, body) in [
+            ("prelude\n#reduce 1\n", "#reduce"),
+            (
+                "import Foo\n\n-- note\n#guard_msgs in\ndef x := 1\n",
+                "#guard_msgs",
+            ),
+            ("import Foo\n/-- doc -/ #guard_msgs in\n", "/--"),
+        ] {
+            let header = parse_source_header(source.as_bytes()).unwrap();
+            assert_eq!(
+                header.body_start.0,
+                source.find(body).unwrap(),
+                "{source:?}"
+            );
+        }
+        let header = parse_source_header(b"import Foo\n").unwrap();
+        assert_eq!(header.imports, [Name::from_components(["Foo"])]);
+        assert_eq!(header.body_start.0, "import Foo\n".len());
+        // `import` still needs a module name: the same bytes there are refused, at them.
+        let refused = parse_source_header(b"import #x\n").unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(7),
+                    expected: NatDefinitionExpectation::ImportedModule,
+                }
+            ),
+            "{refused:?}"
+        );
+        // Only bytes that start no token end the header; a malformed token still refuses.
+        let refused = parse_source_header("«unterminated\n".as_bytes()).unwrap_err();
+        assert!(
+            matches!(refused, NatDefinitionParseError::Lexical { .. }),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn unfinished_bodies_do_not_prevent_header_discovery_or_become_valid_files() {
