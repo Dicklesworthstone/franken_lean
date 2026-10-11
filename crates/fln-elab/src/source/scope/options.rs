@@ -151,19 +151,21 @@ pub const ROWS: &[Row] = &[
         "Lean/Util/RecDepth.lean:15",
         AtLeastDefault,
     ),
-    // This engine has no auto-bound implicits: `false` makes the pin do what it does, and
-    // `true` is the pin's default.
+    // Read by a definition header (`auto_bound_name` in source.rs).
     row(
         "autoImplicit",
         Bool(true),
         "Lean/Elab/AutoBound.lean:17",
-        Inert("this engine never auto-binds an unknown identifier"),
+        Honored,
     ),
     row(
         "relaxedAutoImplicit",
         Bool(true),
         "Lean/Elab/AutoBound.lean:22",
-        Inert("it refines auto-bound implicits, which this engine never makes"),
+        Inert(
+            "this engine auto-binds only strict names (one character and a suffix) either way; \
+             `false` is exactly that, and under `true` it binds a subset of the pin's names",
+        ),
     ),
     row(
         "Elab.async",
@@ -557,7 +559,7 @@ mod tests {
         ));
         assert_eq!(
             admitted("autoImplicit", DataValue::OfBool(false)),
-            Ok(Effect::NoChange)
+            Ok(Effect::Honored)
         );
         assert!(matches!(
             admitted("trace.Meta.synthInstance", DataValue::OfBool(true)),
@@ -648,6 +650,7 @@ mod tests {
             .filter(|row| matches!(row.policy, Honored | HonoredAtLeast { .. }))
             .map(|row| row.name)
             .collect();
-        assert_eq!(honored, ["autoLift", "maxHeartbeats"]);
+        // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
+        assert_eq!(honored, ["autoLift", "maxHeartbeats", "autoImplicit"]);
     }
 }

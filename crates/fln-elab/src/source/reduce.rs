@@ -9,7 +9,7 @@ mod projection_tests;
 mod quotient;
 
 use super::*;
-use fln_env::constants::{ConstantInfo, RecursorVal};
+use fln_env::constants::{ConstantInfo, DefinitionVal, RecursorVal};
 
 enum Continuation {
     Quotient {
@@ -32,6 +32,16 @@ enum Continuation {
         recursor: RecursorVal,
         arguments: Vec<Expr>,
     },
+}
+
+/// [`Context::smart_unfolding`]'s verdict on one delta step.
+enum SmartUnfolding {
+    /// Not a source structural definition: ordinary delta.
+    Plain,
+    /// A match did not reach an alternative, or the application is partial: nothing unfolds.
+    Folded,
+    /// The alternative reached, standing for the application to the first `consumed` arguments.
+    Alternative { value: Expr, consumed: usize },
 }
 
 fn recursor_prefix(recursor: &RecursorVal) -> Result<usize, NatDefinitionElabError> {
@@ -193,6 +203,22 @@ impl Context {
                             if definition.base.level_params.len() != levels.len() {
                                 return Err(failure(SourceInferenceError::Scope));
                             }
+                            match self.smart_unfolding(
+                                &definition,
+                                levels,
+                                &arguments,
+                                transparency,
+                                zeta_delta,
+                            )? {
+                                SmartUnfolding::Plain => {}
+                                SmartUnfolding::Folded => break,
+                                SmartUnfolding::Alternative { value, consumed } => {
+                                    changed = true;
+                                    arguments.truncate(arguments.len() - consumed);
+                                    head = value;
+                                    continue;
+                                }
+                            }
                             changed = true;
                             head = self.instantiate_params(
                                 &definition.value,
@@ -335,6 +361,141 @@ impl Context {
                 Ok(original)
             };
         }
+    }
+
+    /// The pin's smart unfolding (vendored Lean/Meta/WHNF.lean:871-930) of a source structural
+    /// definition applied to `arguments`, this reduction's reversed spine. The pin unfolds such a
+    /// definition only through its `_sunfold` companion
+    /// (Lean/Elab/PreDefinition/Structural/SmartUnfolding.lean): the original body, recursive
+    /// calls still naming the definition, whose matches must reach an alternative, or nothing
+    /// unfolds at all. So `Tower 1` is `Tower 0 → Tower 0` there, never the compiled recursor's
+    /// `Nat.rec … 0 → Nat.rec … 0`, whose domain even instance transparency reduces to `Nat`
+    /// (a numeral at it would find `instOfNatNat`); and `Tower n` stays `Tower n`. A source
+    /// structural definition carries that body as its original-body obligation
+    /// (`recursion::structural_obligation_name`). A `match` compiles to recursor applications,
+    /// so each fully applied recursor met at the head before an alternative is one of them.
+    fn smart_unfolding(
+        &mut self,
+        definition: &DefinitionVal,
+        levels: &[Level],
+        arguments: &[Expr],
+        transparency: UnificationTransparency,
+        zeta_delta: bool,
+    ) -> Result<SmartUnfolding, NatDefinitionElabError> {
+        let mut body = &definition.value;
+        let mut lambdas = 0usize;
+        while let ExprNode::Lam { body: inner, .. } = body.node() {
+            self.tick()?;
+            lambdas += 1;
+            body = inner;
+        }
+        let ExprNode::LetE {
+            decl_name, value, ..
+        } = body.node()
+        else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let Some(header) = super::recursion::structural_obligation_parameters(decl_name) else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let ExprNode::Lam { body: checked, .. } = value.node() else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let ExprNode::LetE {
+            value: original, ..
+        } = checked.node()
+        else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let Some(outer) = lambdas.checked_sub(header) else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        // The pin unfolds neither a bare `f` nor an application missing the argument its match
+        // inspects; an application short of any parameter stays folded here.
+        if arguments.len() < lambdas {
+            return Ok(SmartUnfolding::Folded);
+        }
+        let supplied: Vec<Expr> = arguments.iter().rev().take(lambdas).cloned().collect();
+        // `self` is the definition at the parameters bound outside its header (section
+        // variables): the reference its recursive calls were elaborated against.
+        let mut reference = Expr::const_(definition.base.name.clone(), levels.to_vec());
+        for argument in &supplied[..outer] {
+            self.tick()?;
+            reference = Expr::app(reference, argument.clone());
+        }
+        let original = self.instantiate_params(original, &definition.base.level_params, levels)?;
+        let mut substitution = supplied;
+        substitution.push(reference);
+        let mut current = original
+            .subst_loose(0, &substitution)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        loop {
+            self.tick()?;
+            let mut head = current.clone();
+            let mut spine = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.tick()?;
+                spine.push(a.clone());
+                head = f.clone();
+            }
+            current = match head.node() {
+                ExprNode::MData { expr, .. } => self.rebuild_application(expr.clone(), spine)?,
+                ExprNode::LetE { value, body, .. } => {
+                    let body = self.substitute(body, value)?;
+                    self.rebuild_application(body, spine)?
+                }
+                ExprNode::Lam { body, .. } if !spine.is_empty() => {
+                    let argument = spine.pop().expect("nonempty application spine");
+                    let body = self.substitute(body, &argument)?;
+                    self.rebuild_application(body, spine)?
+                }
+                ExprNode::Const { name, .. } => {
+                    let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(name).cloned() else {
+                        break;
+                    };
+                    let major = recursor_major(&recursor)?;
+                    if recursor.is_unsafe || major >= spine.len() {
+                        break;
+                    }
+                    let position = spine.len() - major - 1;
+                    // The pin reads an offset major as `Nat.succ a` (`cleanupNatOffsetMajor`), so
+                    // `Tower (n + 1)` exposes `Tower n`, never the seed `Nat.add`'s recursion.
+                    let mut major_head = match super::pattern_typing::offset_major(&spine[position])
+                    {
+                        Some(major) => major,
+                        None => {
+                            self.reduce_source_head(&spine[position], transparency, zeta_delta)?
+                        }
+                    };
+                    let mut major_arguments = Vec::new();
+                    while let ExprNode::App { f, a } = major_head.node() {
+                        self.tick()?;
+                        major_arguments.push(a.clone());
+                        major_head = f.clone();
+                    }
+                    let reduced = match self.source_iota(
+                        &head,
+                        &recursor,
+                        &spine,
+                        &major_head,
+                        &major_arguments,
+                    )? {
+                        Some(reduced) => Some(reduced),
+                        None => self.source_k_iota(&head, &recursor, &spine)?,
+                    };
+                    let Some(reduced) = reduced else {
+                        return Ok(SmartUnfolding::Folded);
+                    };
+                    spine.truncate(position);
+                    self.rebuild_application(reduced, spine)?
+                }
+                _ => break,
+            };
+        }
+        Ok(SmartUnfolding::Alternative {
+            value: current,
+            consumed: lambdas,
+        })
     }
 
     /// An admitted nullary K recursor can reduce an unknown proof only when

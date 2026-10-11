@@ -12,7 +12,7 @@ structure Package where
   value : carrier
 
 def wrapped : Package := Package.mk Nat 23
-theorem wrapped_ok : Package.value wrapped = 23 := by rfl
+theorem wrapped_ok : Package.value wrapped = (23 : Nat) := by rfl
 
 class Choice (A : Type) where
   value : A
@@ -27,6 +27,9 @@ theorem chosen_ok : chosen 4 5 = 11 := by rfl
 
 Run `fln check-source --json examples/native_records.lean` with an installed build.
 The command checks the file; it does not compile or execute its declarations.
+The numeral in `wrapped_ok` carries its type: at `wrapped.carrier` instance search
+does not unfold the definition `wrapped`, so a bare `23` there needs
+`OfNat wrapped.carrier 23`, which Lean refuses and so does the checker.
 
 Header parameters use the existing dependent/implicit/instance binder elaborator.
 Named field types can refer to those parameters and earlier fields. Method
@@ -78,7 +81,7 @@ structure Package where
 
 def wrapped : Package := { value := 23, carrier := Nat }
 def unpack (p : Package) : p.carrier := p.value
-theorem wrapped_ok : (wrapped).value = 23 := by rfl
+theorem wrapped_ok : (wrapped).value = (23 : Nat) := by rfl
 ```
 
 Values are elaborated in constructor-field order, even when written in a different

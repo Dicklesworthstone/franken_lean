@@ -490,6 +490,33 @@ fn multiplexer_goals_verb_inspects_proof_goals() {
     assert!(json_stdout.contains("\"goals\""), "{json_stdout}");
 }
 
+/// `intro` on `Tower (n + 1)` names the domain the pin names: smart unfolding reaches the
+/// alternative `Tower k → Tower k`, and the match reads the offset `n + 1` as `Nat.succ n`
+/// (`cleanupNatOffsetMajor`). The pin's goal there is `n : Nat`, `x : Tower n`, `⊢ Tower n`
+/// (`trace_state`, 2026-10-10); neither the recursor nor the seed `Nat.add` may show.
+#[test]
+fn goals_after_intro_on_a_recursive_type_name_the_folded_domain() {
+    let (_dir, file_path) = temp_file(
+        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef t (n : Nat) : Tower (n + 1) := by\n  intro x\n  exact x\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["goals", "--line", "4", "--col", "2"])
+        .arg(&file_path)
+        .output()
+        .expect("run fln goals");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("x : (Tower n)\n"), "{stdout}");
+    assert!(stdout.contains("⊢ (Tower n)"), "{stdout}");
+    for internal in ["Nat.rec", "PProd", "Nat.add"] {
+        assert!(!stdout.contains(internal), "{stdout}");
+    }
+}
+
 #[test]
 fn leanc_personality_respects_cli_transcripts() {
     // leanc --version

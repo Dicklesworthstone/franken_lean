@@ -86,6 +86,29 @@ pub(super) struct StructuralHint<'a> {
     measure: &'a Syntax,
 }
 
+/// The binder of a structural definition's original-body obligation (`recursion/obligation.rs`):
+/// `_fln_structural.<h>`, where `h` counts the parameters bound directly above it (the header
+/// and the written leading lambdas). The obligation is the body the pin's `_sunfold` companion
+/// holds, recursive calls still naming the definition, and source reduction unfolds through it
+/// as the pin does (`reduce.rs`, `smart_unfolding`). Source text cannot spell a numeric name
+/// component, so no written `let` carries this name.
+pub(super) fn structural_obligation_name(parameters: usize) -> Name {
+    Name::num(
+        Name::from_components(["_fln_structural"]),
+        parameters as u64,
+    )
+}
+
+/// The `h` of [`structural_obligation_name`], or `None` for any other binder name.
+pub(super) fn structural_obligation_parameters(name: &Name) -> Option<usize> {
+    let fln_core::name::LeafView::Num(parameters) = name.leaf_view() else {
+        return None;
+    };
+    (!name.component_overflowed() && name.parent() == Name::from_components(["_fln_structural"]))
+        .then(|| usize::try_from(parameters).ok())
+        .flatten()
+}
+
 /// Read the supported structural clause, never silently discard a well-founded
 /// measure or a `decreasing_by` proof. Shape checks match `elabTerminationHints`
 /// in the pinned `Lean/Elab/PreDefinition/TerminationHint.lean`.
@@ -586,7 +609,7 @@ impl Context {
                                 self.original_recursive_body_obligation(syntax, expected.clone())?;
                             let mut value = self.term(syntax, expected.clone())?;
                             value.value = Expr::let_e(
-                                Name::anonymous(),
+                                structural_obligation_name(parameters.len()),
                                 obligation.type_,
                                 obligation.value,
                                 value.value,
@@ -614,7 +637,7 @@ impl Context {
                                 false,
                             );
                             value.value = Expr::let_e(
-                                Name::anonymous(),
+                                structural_obligation_name(parameters.len()),
                                 build.obligation.type_,
                                 build.obligation.value,
                                 value.value,

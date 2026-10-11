@@ -277,6 +277,60 @@ fn offset_term(expr: &Expr) -> Option<(Option<Expr>, u64)> {
     nat_view(expr, 0).filter(|(base, offset)| base.is_none() || *offset > 0)
 }
 
+/// A recursor major as the pin's `reduceRec` reads it after `cleanupNatOffsetMajor` (vendored
+/// Lean/Meta/WHNF.lean:216-244): a closed term is its literal, and `a + k` with `k > 0` is
+/// `Nat.succ a`, or `Nat.succ (a + (k-1))` built as `mkNatAdd` builds it. `None` for anything
+/// else, which the caller reduces as before.
+pub(super) fn offset_major(expr: &Expr) -> Option<Expr> {
+    let nat = || Expr::const_(Name::from_components(["Nat"]), vec![]);
+    let numeral = |value: u64| {
+        let literal = nat_literal(value);
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(
+                        Name::from_components(["OfNat", "ofNat"]),
+                        vec![Level::zero()],
+                    ),
+                    nat(),
+                ),
+                literal.clone(),
+            ),
+            Expr::app(
+                Expr::const_(Name::from_components(["instOfNatNat"]), vec![]),
+                literal,
+            ),
+        )
+    };
+    let succ = |term: Expr| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            term,
+        )
+    };
+    match offset_term(expr)? {
+        (None, value) => Some(nat_literal(value)),
+        (Some(base), 1) => Some(succ(base)),
+        (Some(base), offset) => {
+            let add = Expr::const_(
+                Name::from_components(["HAdd", "hAdd"]),
+                vec![Level::zero(), Level::zero(), Level::zero()],
+            );
+            let instance = Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["instHAdd"]), vec![Level::zero()]),
+                    nat(),
+                ),
+                Expr::const_(Name::from_components(["instAddNat"]), vec![]),
+            );
+            let sum = [nat(), nat(), nat(), instance, base, numeral(offset - 1)]
+                .into_iter()
+                .fold(add, Expr::app);
+            Some(succ(sum))
+        }
+    }
+}
+
 fn without_zero(expr: Expr) -> Expr {
     match nat_view(&expr, 0) {
         Some((Some(base), 0)) => base,

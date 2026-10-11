@@ -1018,9 +1018,13 @@ fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors(
     let prefix = file(
         "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k",
     );
-    let good = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    let good = file(
+        "def identity : Tower 1 := fun x => x\ntheorem ok : identity (9 : Nat) = (9 : Nat) := by rfl",
+    );
     let bad = file("def ambiguous (n : Nat) : Tower n := fun x => x");
-    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+    // `identity`'s domain is `Tower 0`, as at the pin, which has no `OfNat (Tower 0) 9` (2026-10-10).
+    let bare = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&bare, false), (&good, true)] {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["check-source", "--json"])
             .arg(&prefix)

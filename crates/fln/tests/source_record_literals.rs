@@ -791,12 +791,23 @@ fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionarie
     // Parenthesized locals are now real source terms. Their dictionaries may
     // determine the annotation, but must leave scope before later annotations
     // or the body. Do not retain the old parser-refusal expectation as a gate.
+    // A bare `8` at `let d : Factory := …; Factory.carrier` has no `OfNat` instance at
+    // the pin ("failed to synthesize", 5:26), the typed numeral checks (2026-10-11). The pin
+    // also refuses `def recursiveType (x : (let rec ty …; ty 2)) : Nat := x` ("Type
+    // mismatch": a `let rec` is opaque until its definition is complete), which this
+    // checker still accepts in a type position: fln-fln-let-rec-opacity-and-lifting-thb4.
     check(
         &base,
         "def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\n\
-         theorem computes : nested 8 = 8 := by rfl\n\
-         def recursiveType (x : (let rec ty (n : Nat) : Type := match n with | .zero => Nat | .succ k => ty k; ty 2)) : Nat := x\n\
-         theorem recursive_computes : recursiveType 9 = 9 := by rfl",
+         theorem computes : nested (8 : Nat) = 8 := by rfl",
+    );
+    assert!(
+        base.check_source_files(
+            &["def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\ntheorem computes : nested 8 = 8 := by rfl".as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_err()
     );
     for source in [
         "def bad (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Factory.carrier := x",

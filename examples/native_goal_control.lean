@@ -36,7 +36,7 @@ def packed : Package := by
   · exact Nat
   · exact 23
 
-theorem packed_ok : packed.value = 23 := by rfl
+theorem packed_ok : packed.value = (23 : Nat) := by rfl
 
 theorem transported (n m : Nat) (h : n = m) (P : Nat -> Prop) (p : P n) : Both (P m) (P n) := by
   constructor

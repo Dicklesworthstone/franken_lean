@@ -22,6 +22,31 @@ fn check(source: &str) {
         .into_complete()
         .unwrap();
 }
+/// The pin's `preprocessPropToDecide` (Lean/Elab/Tactic/Decide.lean:24-32) zeta-reduces the goal and
+/// then refuses one that still mentions a local, whatever dictionary is in scope.
+fn reject_decide_with_free_variables(source: &str) {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let error = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("accepted: {source}"));
+    let rendered = format!("{error:?} {error}");
+    assert!(
+        rendered.contains("DecideFreeVariables"),
+        "{source}\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Expected type must not contain free variables"),
+        "{source}\n{rendered}"
+    );
+}
 fn reject(source: &str) {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
@@ -263,7 +288,7 @@ fn local_decision_values_and_nested_proof_scopes_are_preserved() {
         r#"
         theorem available (p : Prop) (hp : p) : p := by
           let witness : Decidable p := Decidable.isTrue hp
-          decide
+          exact of_decide_eq_true rfl
         theorem nested : Not False := by
           have loc : Not False := by decide
           first | (have hidden : False := by decide; exact hidden) | exact loc
@@ -276,6 +301,10 @@ fn local_decision_values_and_nested_proof_scopes_are_preserved() {
           · decide
         "#,
     );
+    // `decide` itself refuses the goal `p` at the pin, local dictionary or not (2026-10-10).
+    reject_decide_with_free_variables(
+        "theorem available (p : Prop) (hp : p) : p := by\n  let witness : Decidable p := Decidable.isTrue hp\n  decide\n",
+    );
 }
 
 #[test]
@@ -286,7 +315,7 @@ fn dictionary_dependencies_close_hygienically_without_capturing_sibling_holes() 
           let witness : Decidable (P a) := Decidable.isTrue proof
           have saved : P a := by
             let proof := 23
-            decide
+            exact of_decide_eq_true rfl
           exact saved
         structure Later where
           proof : True
@@ -297,7 +326,7 @@ fn dictionary_dependencies_close_hygienically_without_capturing_sibling_holes() 
           · decide
           · exact Nat
           · exact 23
-        theorem built : build.value = 23 := by rfl
+        theorem built : build.value = (23 : Nat) := by rfl
         "#,
     );
 }
@@ -327,7 +356,7 @@ fn decision_tactics_compose_with_proposition_conditionals_and_scoped_holes() {
         theorem conditional (p : Prop) [Decidable p] (hp : p) : p := by
           refine if branch : p then ?_ else ?_
           · let witness : Decidable p := Decidable.isTrue branch
-            decide
+            exact of_decide_eq_true rfl
           · exact hp
         inductive Holds : Prop where | proof
         instance conditionalDictionary : Decidable Holds :=
@@ -338,6 +367,9 @@ fn decision_tactics_compose_with_proposition_conditionals_and_scoped_holes() {
           · exact if True then evidence else hp
           · exact hp
         "#,
+    );
+    reject_decide_with_free_variables(
+        "theorem conditional (p : Prop) [Decidable p] (hp : p) : p := by\n  refine if branch : p then ?_ else ?_\n  · let witness : Decidable p := Decidable.isTrue branch\n    decide\n  · exact hp\n",
     );
 }
 

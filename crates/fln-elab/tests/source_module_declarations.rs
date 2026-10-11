@@ -74,11 +74,12 @@ fn hidden_public_bodies_and_public_mutual_groups_remain_explicit_refusals() {
     let mut public = module();
     public.public_declarations = true;
     public.expose_definitions = true;
+    // `@[no_expose] public instance` is read now; the pin accepts it on a class instance
+    // (`@[no_expose] public instance dictionary : C := ⟨1⟩` in a `module`, 2026-10-11).
     for source in [
         "@[no_expose] def hidden (a : Type) (x : a) : a := x",
         "@[expose] public theorem proof (p : Prop) (h : p) : p := h",
         "@[no_expose] public theorem proof (p : Prop) (h : p) : p := h",
-        "@[no_expose] public instance dictionary : Type := Type",
         "mutual inductive A where | mk inductive B where | mk end",
         "mutual inductive A where | mk public inductive B where | mk end",
     ] {

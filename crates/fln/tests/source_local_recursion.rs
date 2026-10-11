@@ -23,6 +23,28 @@ fn checked(base: &Engine, source: &str) -> Engine {
     .engine
 }
 
+/// The pin elaborates the rest of a definition with its `let rec` as a local without a value
+/// (`elabLetRec`, Lean/Elab/LetRec.lean:140-147): `rfl : bar = 5` inside `foo` is a type mismatch
+/// there (3:22). Once `foo` is complete the value is visible, so `foo = 6` by `rfl` holds for the
+/// `where` form, which is the same `let rec` (2026-10-11).
+#[test]
+fn a_let_rec_is_opaque_inside_its_definition_and_transparent_after_it() {
+    let base = engine();
+    let inside = "def foo : Nat :=\n  let rec bar : Nat := 5\n  have h : bar = 5 := rfl\n  bar\n";
+    let Err(error) = base.check_source_files(
+        &[inside.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ) else {
+        panic!("unfolded a let rec inside its own definition");
+    };
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    checked(
+        &base,
+        "def foo : Nat := bar + 1\nwhere bar : Nat := 5\ntheorem t : foo = 6 := rfl\n",
+    );
+}
+
 #[test]
 fn local_recursors_capture_outer_values_and_compute_without_global_helpers() {
     let base = engine();

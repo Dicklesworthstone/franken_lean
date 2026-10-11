@@ -167,7 +167,7 @@ end
 def s : Shadow Nat := { x := 7 }
 theorem works : s.keep 42 = 42 := by rfl
 def d : Dependent := { A := Nat, x := 42 }
-theorem dependentWorks : d.copy = 42 := by rfl"#,
+theorem dependentWorks : d.copy = (42 : Nat) := by rfl"#,
     );
     assert_eq!(params(&e, "Shadow"), vec![(n("A"), BinderInfo::Default)]);
     assert!(params(&e, "Dependent").is_empty());

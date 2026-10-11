@@ -4,7 +4,7 @@ structure Package where
 
 def wrapped : Package := Package.mk Nat 23
 
-theorem wrapped_ok : Package.value wrapped = 23 := by rfl
+theorem wrapped_ok : Package.value wrapped = (23 : Nat) := by rfl
 
 class Choice (A : Type) where
   value : A

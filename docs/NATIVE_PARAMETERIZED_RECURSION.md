@@ -7,15 +7,15 @@ independent implementation uses checker-owned wire arenas and does not call the
 primary inductive generator or kernel.
 
 ```lean
-inductive Seq (A : Type) where
+inductive Sequence (A : Type) where
   | nil
-  | cons (head : A) (tail : Seq A)
+  | cons (head : A) (tail : Sequence A)
 
-def append {A : Type} (xs : Seq A) (ys : Seq A) : Seq A := match xs with
+def append {A : Type} (xs : Sequence A) (ys : Sequence A) : Sequence A := match xs with
   | .nil => ys
-  | .cons x tail => Seq.cons x (append tail ys)
+  | .cons x tail => Sequence.cons x (append tail ys)
 
-theorem append_right_nil {A : Type} (xs : Seq A) : append xs Seq.nil = xs := by
+theorem append_right_nil {A : Type} (xs : Sequence A) : append xs Sequence.nil = xs := by
   induction xs with
   | nil => rfl
   | cons x tail ih => simp only [append, ih]

@@ -66,6 +66,12 @@ pub enum SourceInferenceError {
     Deriving(deriving::DerivingError),
     EvaluationPrinting(evaluation::PrintingError),
     UnknownConstant(Name),
+    /// An auto-bound implicit's type mentions a binder written after it (the pin's
+    /// `addAutoBoundImplicits`, Lean/Elab/Term/TermElabM.lean:2044-2058).
+    AutoBoundDependsOnExplicit {
+        auto: Name,
+        explicit: Name,
+    },
     /// More than one interpretation of an overloaded identifier elaborates against
     /// the expected type (the pin's `elabAppAux`), listed in the order it tries them.
     AmbiguousTerm {
@@ -259,6 +265,12 @@ impl std::fmt::Display for SourceInferenceError {
             Self::UnknownMemberConstant(name) => {
                 write!(f, "Unknown constant `{}`", name.to_display_string())
             }
+            Self::AutoBoundDependsOnExplicit { auto, explicit } => write!(
+                f,
+                "invalid auto implicit argument `{}`, it depends on explicitly provided argument `{}`",
+                auto.to_display_string(),
+                explicit.to_display_string()
+            ),
             // The pin's wording (`elabAppAux`), with each interpretation named as it
             // names it: a root declaration as `_root_.x`.
             Self::AmbiguousTerm {
@@ -3130,12 +3142,18 @@ impl Context {
                                 }
                             }
                             values.push(value);
+                            // The pin elaborates the rest of the enclosing definition with a
+                            // `let rec` (and so a `where` declaration) as a local without a value:
+                            // it becomes the auxiliary `f.g` only once `f` is complete
+                            // (`elabLetRec`, Lean/Elab/LetRec.lean:140-147: `withAuxLocalDecls`,
+                            // then `registerLetRecsToLift`). Inside `f` it cannot unfold, as a
+                            // `have` cannot; the admitted term still binds the value.
                             tasks.push(Task::LetValue(
                                 build.binding.name,
                                 None,
                                 build.binding.body,
                                 build.expected,
-                                build.binding.opaque,
+                                build.binding.opaque || build.binding.recursive,
                                 false,
                             ));
                         }
@@ -4078,6 +4096,35 @@ fn definition_scoped(
     definition_in_context(syntax, &mut context)
 }
 
+/// Whether the pin would auto-bind `name` in a header: `autoImplicit` is on (its default) and
+/// `name` is atomic, without macro scopes, and a strict name, one character followed only by
+/// digits, subscripts, `_` or `'` (`checkValidAutoBoundImplicitName`,
+/// Lean/Elab/AutoBound.lean:31-63; `isSubScriptAlnum`, Init/Meta/Defs.lean:111-118). The pin's
+/// default `relaxedAutoImplicit` also binds any other atomic name; this engine does not, because
+/// its seed lacks names Init has (`IO`, `Int`, `Unit`), and binding those would make a variable
+/// of a constant. Such a name stays an unknown identifier: a refusal where the pin may accept.
+fn auto_bound_name(name: &Name, options: &KVMap) -> bool {
+    if !options.get_bool(&Name::from_components(["autoImplicit"]), true)
+        || name.has_macro_scopes()
+        || !name.parent().is_anonymous()
+    {
+        return false;
+    }
+    let LeafView::Str(spelled) = name.leaf_view() else {
+        return false;
+    };
+    let subscript = |c: char| {
+        let c = u32::from(c);
+        (0x2080..=0x2089).contains(&c)
+            || (0x2090..=0x209c).contains(&c)
+            || (0x1d62..=0x1d6a).contains(&c)
+            || c == 0x2c7c
+    };
+    let mut chars = spelled.chars();
+    chars.next().is_some()
+        && chars.all(|c| c.is_ascii_digit() || subscript(c) || c == '_' || c == '\'')
+}
+
 fn definition_in_context(
     syntax: &Syntax,
     context: &mut Context,
@@ -4253,21 +4300,85 @@ fn definition_in_context_named(
         2,
         "declaration signature",
     )?;
-    let mut parameters = context.bind_parameters(&signature[0])?;
-    let mut expected = if is_theorem || is_instance || is_opaque || is_axiom {
-        let parts = expect_node(
-            &signature[1],
-            &parser_kind(&["Term", "typeSpec"]),
-            2,
-            "theorem type",
-        )?;
-        expect_atom(&parts[0], ":", "theorem type colon")?;
-        Some(context.type_term(&parts[1])?)
-    } else {
-        optional_type_syntax(&signature[1])?
-            .map(|syntax| context.type_term(syntax))
-            .transpose()?
+    // The pin's `withAutoBoundImplicit` (Lean/Elab/Term/TermElabM.lean:1932-1955): an unknown
+    // atomic name in the header restores the header's state, becomes an implicit local of a
+    // fresh type, and the header is elaborated again. Never the definition's own name
+    // (MutualDef.lean:213). See `auto_bound_name` for which names.
+    let own_name = match name.leaf_view() {
+        LeafView::Str(spelled) => Some(spelled.to_owned()),
+        _ => None,
     };
+    let mut header_state = context.clone();
+    let mut autos = Vec::new();
+    let (mut parameters, mut expected) = loop {
+        let attempt: Result<_, NatDefinitionElabError> = (|| {
+            let parameters = context.bind_parameters(&signature[0])?;
+            let expected = if is_theorem || is_instance || is_opaque || is_axiom {
+                let parts = expect_node(
+                    &signature[1],
+                    &parser_kind(&["Term", "typeSpec"]),
+                    2,
+                    "theorem type",
+                )?;
+                expect_atom(&parts[0], ":", "theorem type colon")?;
+                Some(context.type_term(&parts[1])?)
+            } else {
+                optional_type_syntax(&signature[1])?
+                    .map(|syntax| context.type_term(syntax))
+                    .transpose()?
+            };
+            Ok((parameters, expected))
+        })();
+        match attempt {
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
+                found,
+            ))) if !matches!(found.leaf_view(), LeafView::Str(spelled) if own_name.as_deref() == Some(spelled))
+                && auto_bound_name(&found, &context.txn.options) =>
+            {
+                let spent = context.txn.budget.heartbeats_consumed;
+                *context = header_state;
+                context.txn.budget.heartbeats_consumed = spent;
+                context.tick()?;
+                let sort = context.type_expected()?;
+                let type_ = context.hole(sort)?;
+                let id = FVarId(context.fresh_name()?);
+                context
+                    .txn
+                    .lctx
+                    .add_param(id.clone(), found, type_, BinderInfo::Implicit);
+                autos.push(
+                    context
+                        .txn
+                        .lctx
+                        .find(&id)
+                        .expect("auto-bound local")
+                        .clone(),
+                );
+                header_state = context.clone();
+            }
+            other => break other?,
+        }
+    };
+    for auto in &autos {
+        let type_ = context.instantiate(&auto.type_)?;
+        let mut explicit = None;
+        for parameter in &parameters {
+            let abstracted = type_
+                .abstract_fvar(&parameter.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            if abstracted.has_loose_bvar(0) {
+                explicit = Some(parameter);
+                break;
+            }
+        }
+        if let Some(explicit) = explicit {
+            return Err(failure(SourceInferenceError::AutoBoundDependsOnExplicit {
+                auto: auto.user_name.clone(),
+                explicit: explicit.user_name.clone(),
+            }));
+        }
+    }
+    parameters.splice(0..0, autos);
     context.infer_level_params = false;
     // Later binders may determine earlier class inputs, but the body may not
     // rescue a stuck header instance. An explicit result also closes ordinary

@@ -4,9 +4,9 @@ Native source declarations can use constructor equations directly rather than
 writing a lambda followed by a match:
 
 ```lean
-def append {A : Type} : Seq A -> Seq A -> Seq A
+def append {A : Type} : Sequence A -> Sequence A -> Sequence A
   | .nil, ys => ys
-  | .cons x xs, ys => Seq.cons x (append xs ys)
+  | .cons x xs, ys => Sequence.cons x (append xs ys)
 ```
 
 The result annotation supplies the function telescope. Header parameters remain

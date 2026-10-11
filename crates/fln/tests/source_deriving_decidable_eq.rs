@@ -106,7 +106,7 @@ fn proof_fields_and_dependent_remaining_telescopes_are_transported() {
           count : Nat
           proof : count = count
         deriving DecidableEq
-        theorem proofs (p q : 7 = 7) : Checked.mk 7 p = Checked.mk 7 q := by decide
+        theorem proofs (p q : 7 = 7) : Checked.mk 7 p = Checked.mk 7 q := of_decide_eq_true rfl
         theorem unequal : Not (Checked.mk 7 (Eq.refl 7) = Checked.mk 8 (Eq.refl 8)) := by decide
         structure Sized (n : Nat) where
           value : Nat

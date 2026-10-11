@@ -80,8 +80,14 @@ def Tower (n : Nat) : Type := match n with
 
 def identity : Tower 1 := fun x => x
 def higherIdentity : Tower 2 := fun f => f
-theorem higher_ok : higherIdentity identity 12 = 12 := by rfl
+theorem higher_ok : higherIdentity identity (12 : Nat) = (12 : Nat) := by rfl
 ```
+
+A recursive definition unfolds as Lean unfolds it, through its original body
+(the pin's `_sunfold` smart unfolding): `Tower 1` is `Tower 0 -> Tower 0`, and
+`Tower n` for an unknown `n` does not unfold at all. So `identity`'s domain is
+`Tower 0`, where a bare `12` needs `OfNat (Tower 0) 12`, which Lean refuses
+because instance resolution does not unfold `Tower`; the checker refuses it too.
 
 Projection and recursor continuations use a heap worklist. Stuck discriminants
 stay stuck; the reducer does not guess a constructor or widen definition/local

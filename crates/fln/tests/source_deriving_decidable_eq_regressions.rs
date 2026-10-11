@@ -116,7 +116,7 @@ theorem same_chain : first = first := by decide
 theorem changed_tail : Not (first = second) := by decide
 theorem different_ctor : Not (first = Wire.Chain.nil) := by decide
 theorem nil_same : decide ((Wire.Chain.nil : Wire.Chain Nat) = Wire.Chain.nil) = true := by rfl
-theorem arbitrary_proofs (p q : 7 = 7) : Wire.Chain.cons 7 Wire.Chain.nil p = Wire.Chain.cons 7 Wire.Chain.nil q := by decide
+theorem arbitrary_proofs : Wire.Chain.cons 7 Wire.Chain.nil (rfl : 7 = 7) = Wire.Chain.cons 7 Wire.Chain.nil (Eq.refl 7) := by decide
 "#;
     let result = checked(&engine(), source);
     let program = b"#eval if first = second then 0 else if first = first then 42 else 1";
@@ -206,7 +206,7 @@ inductive HiddenProof where
 deriving DecidableEq
 theorem same : @HiddenField.mk 7 = @HiddenField.mk 7 := by decide
 theorem unequal : Not (@HiddenField.mk 7 = @HiddenField.mk 8) := by decide
-theorem proofs (p q : 7 = 7) : @HiddenProof.mk 7 p = @HiddenProof.mk 7 q := by decide
+theorem proofs (p q : 7 = 7) : @HiddenProof.mk 7 p = @HiddenProof.mk 7 q := of_decide_eq_true rfl
 theorem different_payload : Not (@HiddenProof.mk 7 rfl = @HiddenProof.mk 8 rfl) := by decide
 "#,
     );

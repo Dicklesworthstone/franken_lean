@@ -32,6 +32,9 @@ pub enum TacticError {
     /// pin's `checkTypeIsProp`).
     InvalidSimpTheorem,
     DecisionNotTrue,
+    /// `decide` on a goal that still mentions a local after its let-bound locals are unfolded
+    /// (the pin's `preprocessPropToDecide`; `decide +revert` is not read).
+    DecideFreeVariables,
     NoGoals,
     UnsolvedGoals {
         count: usize,
@@ -91,6 +94,10 @@ impl std::fmt::Display for TacticError {
                 write!(f, "Invalid simp theorem: Expected a proposition")
             }
             Self::DecisionNotTrue => write!(f, "decision did not reduce to a proof of the goal"),
+            // The pin's words.
+            Self::DecideFreeVariables => {
+                write!(f, "Expected type must not contain free variables")
+            }
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
             Self::SyntheticHoleOutsideRefine => write!(f, "synthetic proof holes require refine"),
