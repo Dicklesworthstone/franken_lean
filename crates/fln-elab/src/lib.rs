@@ -841,6 +841,28 @@ fn elaborate_atom(
         Syntax::Ident { val: name, .. } => {
             elaborate_nat_reference(name, locals, allow_string, environment)?
         }
+        // `nat_lit n` (`rawNatLit`): the pin's `elabRawNatLit` is `mkRawNatLit n`, a raw literal of
+        // type `Nat`, with no `OfNat` instance.
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["rawNatLit"]) && args.len() == 2 =>
+        {
+            let Syntax::Node { kind, args, .. } = &args[1] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            };
+            let [Syntax::Atom { val: spelling, .. }] = args.as_slice() else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            };
+            if kind != &Name::str(Name::anonymous(), "num") {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            }
+            Expr::lit(decode_natural(spelling)?)
+        }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "supported scalar literal or constant identifier",
