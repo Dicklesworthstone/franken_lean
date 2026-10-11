@@ -37,6 +37,29 @@ pub struct SourceProgramExecution {
     pub modules: Vec<SourceModuleExecution>,
 }
 
+/// A source failure or a caller's refusal of a completed module. Validation
+/// errors retain the caller's type and stop before any later module executes.
+#[derive(Debug)]
+pub enum SourceProgramExecutionError<E> {
+    Source(SourceModuleCheckError),
+    Validation { module: Name, error: E },
+}
+
+impl<E> From<SourceModuleCheckError> for SourceProgramExecutionError<E> {
+    fn from(error: SourceModuleCheckError) -> Self {
+        Self::Source(error)
+    }
+}
+
+impl SourceProgramExecutionError<std::convert::Infallible> {
+    fn into_source_error(self) -> SourceModuleCheckError {
+        match self {
+            Self::Source(error) => error,
+            Self::Validation { error, .. } => match error {},
+        }
+    }
+}
+
 fn source_error(module: &Name, error: EngineExecutionError) -> SourceModuleCheckError {
     let (command, offset, error) = match error {
         EngineExecutionError::BatchCommand { index, at, error } => {
@@ -225,7 +248,9 @@ impl imported::SourceOleanImport {
             cancellation,
             false,
             presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
         )
+        .map_err(SourceProgramExecutionError::into_source_error)
     }
 
     /// Compile and run ordinary Lean source modules, including the implicit
@@ -275,11 +300,41 @@ impl imported::SourceOleanImport {
             cancellation,
             true,
             presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+        )
+        .map_err(SourceProgramExecutionError::into_source_error)
+    }
+
+    /// Execute ordinary Lean modules, validating each completed command stream
+    /// before exporting its declarations or executing another module. The
+    /// validator sees the module's retained command evidence, including guards
+    /// and checked printer results. A refusal returns its exact error and no
+    /// partial program; the remaining source modules do not execute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_validation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
+        self.execute_source_modules_with_implicit_init(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            true,
+            presentation,
+            validate,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_source_modules_with_implicit_init(
+    fn execute_source_modules_with_implicit_init<E>(
         &self,
         modules: &[SourceModuleInput<'_>],
         entry: &Name,
@@ -288,7 +343,8 @@ impl imported::SourceOleanImport {
         cancellation: Option<&dyn CancellationProbe>,
         implicit_init: bool,
         presentation: EvaluationPresentation,
-    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                 "source-program/before-plan",
@@ -412,6 +468,12 @@ impl imported::SourceOleanImport {
                     "source-program/after-module",
                 )));
             }
+            validate(module.name, &completed).map_err(|error| {
+                SourceProgramExecutionError::Validation {
+                    module: module.name.clone(),
+                    error,
+                }
+            })?;
             let public_export = public.map(visibility::PublicWorld::finish).transpose()?;
             if index != plan.entry {
                 exports.insert(
