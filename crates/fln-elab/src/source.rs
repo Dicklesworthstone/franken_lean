@@ -541,6 +541,10 @@ struct Context {
     // before the recursion context exists, as a direct `T.size l` already is.
     defining: Option<Name>,
     recursion: Option<recursion::Recursion>,
+    well_founded: Option<recursion::WellFounded>,
+    // Set only after a top-level well-founded lowering succeeds. The source
+    // declaration result carries this status to post-admission metadata.
+    well_founded_definition: bool,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -612,6 +616,8 @@ impl Context {
             refinements: Vec::new(),
             defining: None,
             recursion: None,
+            well_founded: None,
+            well_founded_definition: false,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_application_errors: Vec::new(),
@@ -930,6 +936,16 @@ impl Context {
             if let Some(recursion) = &self.recursion
                 && &recursion.name == name
             {
+                return Ok(recursion.reference.clone());
+            }
+            if let Some(recursion) = &self.well_founded
+                && &recursion.name == name
+            {
+                if recursion.proving {
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::RecursionInDecreasingProof,
+                    )));
+                }
                 return Ok(recursion.reference.clone());
             }
             let mut resolved = name.clone();
@@ -1402,6 +1418,7 @@ impl Context {
         }
         self.resolve_instances(false)?;
         term.value = self.lower_matrix_call(&term.value)?;
+        term.value = self.lower_well_founded_call(&term.value)?;
         Ok(term)
     }
 
@@ -1457,15 +1474,27 @@ impl Context {
         // failed elaboration leaves its worklist before the closing frame.
         // Speculative retries restore their own complete Context checkpoints.
         let options = self.txn.options.clone();
-        let result = self.term_prepared_scoped(syntax, expected);
+        let result = self.term_prepared_scoped(syntax, expected, None);
         self.txn.options = options;
         result
     }
 
-    fn term_prepared_scoped(
+    fn run_decreasing_proof<'a>(
         &mut self,
-        syntax: &Syntax,
+        syntax: &'a Syntax,
+        proof: tactics::ProofState<'a>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let options = self.txn.options.clone();
+        let result = self.term_prepared_scoped(syntax, None, Some(proof));
+        self.txn.options = options;
+        result
+    }
+
+    fn term_prepared_scoped<'a>(
+        &mut self,
+        syntax: &'a Syntax,
         expected: Option<Expr>,
+        initial_proof: Option<tactics::ProofState<'a>>,
     ) -> Result<Typed, NatDefinitionElabError> {
         use application::postponed;
         /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
@@ -1588,7 +1617,10 @@ impl Context {
             ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, Option<usize>),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
-        let mut tasks = vec![Task::Visit(syntax, expected, true)];
+        let mut tasks = vec![match initial_proof {
+            Some(proof) => Task::Proof(proof),
+            None => Task::Visit(syntax, expected, true),
+        }];
         let mut values: Vec<Typed> = Vec::new();
         enum Attempt<'a> {
             Proof(tactics::backtrack::Checkpoint<'a>, postponed::Queue<'a>),
@@ -4311,15 +4343,40 @@ pub(super) fn definition(
     definition_scoped(syntax, environment, kernel, &SourceScope::default())
 }
 
+/// An untrusted source candidate and the effects selected by its successful
+/// elaboration. Effects are installed only after ordinary declaration admission;
+/// neither this value nor its flags grant publication authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElaboratedDeclaration {
+    pub declaration: Declaration,
+    /// The definition actually used well-founded lowering. A source spelling or
+    /// a body mentioning `WellFounded.Nat.fix` does not set this effect.
+    pub irreducible: bool,
+}
+
 fn definition_scoped(
     syntax: &Syntax,
     environment: &Environment,
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    definition_scoped_with_effects(syntax, environment, kernel, scope)
+        .map(|elaborated| elaborated.declaration)
+}
+
+fn definition_scoped_with_effects(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope);
-    definition_in_context(syntax, &mut context)
+    let declaration = definition_in_context(syntax, &mut context)?;
+    Ok(ElaboratedDeclaration {
+        declaration,
+        irreducible: context.well_founded_definition,
+    })
 }
 
 /// Whether the pin would auto-bind `name` in a header: `autoImplicit` is on (its default) and
@@ -4760,7 +4817,10 @@ fn definition_in_context_named(
             expect_atom(&parts[0], ":=", "definition assignment")?;
             (&parts[1], &parts[2], &parts[3])
         };
-    let termination = recursion::structural_hint(termination)?;
+    let termination = recursion::termination_hint(
+        termination,
+        !is_theorem && !is_instance && !is_abbrev && !is_opaque,
+    )?;
     // `where` declarations scope over the body as `let rec` declarations, the pin's
     // `expandWhereDecls`; each is its own group here, so a later one may call an
     // earlier one.

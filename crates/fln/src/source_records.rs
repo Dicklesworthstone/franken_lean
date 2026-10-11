@@ -4,6 +4,11 @@ use super::*;
 use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
+mod elaboration;
+
+pub(crate) use elaboration::{
+    apply_admission_effects, apply_batch_effects, apply_execution_effects,
+};
 
 /// A candidate publication held off to the side until both module worlds and
 /// their extension journals are ready. Only the public module driver consumes it.
@@ -291,6 +296,7 @@ impl Engine {
                 match public.admit_scoped_candidate(
                     parsed.syntax(),
                     candidate,
+                    false,
                     options,
                     limits,
                     public_scope,
@@ -360,6 +366,7 @@ impl Engine {
             match public.admit_scoped_candidate(
                 parsed.syntax(),
                 interface,
+                false,
                 options,
                 limits,
                 public_scope,
@@ -416,6 +423,7 @@ impl Engine {
         &self,
         syntax: &fln_syntax::tree::Syntax,
         declaration: Declaration,
+        irreducible: bool,
         options: &KVMap,
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
@@ -443,6 +451,7 @@ impl Engine {
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut batch) => {
+                apply_batch_effects(&mut batch, irreducible, options)?;
                 if let Some((name, priority)) = registration {
                     // Definitions, proof theorems and exported interfaces all
                     // retain the exact admitted generated instance name.
@@ -612,20 +621,22 @@ impl Engine {
         }
         if !fln_elab::source::is_record(syntax) {
             if scope != &fln_elab::source::scope::SourceScope::default() {
-                let declaration =
-                    match elaboration_outcome(fln_elab::source::scope::elaborate_definition(
+                let elaborated = match elaboration_outcome(
+                    fln_elab::source::scope::elaborate_definition_with_effects(
                         parsed.syntax(),
                         self.environment(),
                         limits.kernel,
                         scope,
-                    ))? {
-                        Outcome::Complete(declaration) => declaration,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    };
+                    ),
+                )? {
+                    Outcome::Complete(declaration) => declaration,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
                 return self.admit_scoped_candidate(
                     parsed.syntax(),
-                    declaration,
+                    elaborated.declaration,
+                    elaborated.irreducible,
                     options,
                     limits,
                     scope,

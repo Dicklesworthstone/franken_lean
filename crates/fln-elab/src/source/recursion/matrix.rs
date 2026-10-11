@@ -9,10 +9,14 @@ use super::*;
 
 impl Context {
     pub(in crate::source) fn is_matrix_hypothesis(&self, local: &LocalDecl) -> bool {
-        self.recursion
-            .iter()
-            .chain(&self.enclosing_recursions)
-            .any(|recursion| recursion.matrix_hidden.contains(&local.user_name))
+        self.well_founded
+            .as_ref()
+            .is_some_and(|state| state.hides(local))
+            || self
+                .recursion
+                .iter()
+                .chain(&self.enclosing_recursions)
+                .any(|recursion| recursion.matrix_hidden.contains(&local.user_name))
     }
 
     pub(in crate::source) fn register_matrix_hypotheses(

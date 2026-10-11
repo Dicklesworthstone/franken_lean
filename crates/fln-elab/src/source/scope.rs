@@ -443,6 +443,10 @@ impl Context {
                     .recursion
                     .as_ref()
                     .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
+                || self
+                    .well_founded
+                    .as_ref()
+                    .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
                 || (self.defining.as_ref() == Some(candidate) && !held_back_recursion(candidate))
         };
         // Locals first: the pin's `resolveLocalName` runs before `resolveGlobalName`
@@ -550,6 +554,8 @@ impl Context {
 
 /// Candidates only. The caller must use the same kernel/council publication as
 /// an unscoped declaration; scope resolution cannot mint a checked declaration.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects`] instead.
 pub fn elaborate_definition(
     syntax: &Syntax,
     env: &Environment,
@@ -557,6 +563,17 @@ pub fn elaborate_definition(
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     super::definition_scoped(syntax, env, kernel, scope)
+}
+
+/// Elaborate the candidate and its explicit source effects in one transaction.
+/// The caller must check the declaration before installing any returned effect.
+pub fn elaborate_definition_with_effects(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<super::ElaboratedDeclaration, NatDefinitionElabError> {
+    super::definition_scoped_with_effects(syntax, env, kernel, scope)
 }
 
 /// An `#eval` candidate (a generated definition) with names resolved in `scope`. As for

@@ -456,11 +456,26 @@ impl Context {
                     base,
                 });
             }
+            if let Some(recursion) = &self.well_founded
+                && recursion.name == method
+            {
+                if recursion.proving {
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::RecursionInDecreasingProof,
+                    )));
+                }
+                return Ok(FieldResolution::Method {
+                    function: recursion.reference.clone(),
+                    receiver,
+                    base,
+                });
+            }
             // Before the recursion context exists, a reference to the declaration being
             // defined is reported as the unknown constant it still is, exactly as a direct
             // `T.size l` is: `definition_body` retries such a failure with the structural
             // recursion context, where the branch above resolves it.
             if self.recursion.is_none()
+                && self.well_founded.is_none()
                 && self.defining.as_ref() == Some(&method)
                 && !self.txn.env.contains(&method)
             {

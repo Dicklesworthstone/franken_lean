@@ -6777,8 +6777,8 @@ impl Engine {
             .and_then(fln_parse::ParsedDefinition::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
-        let declaration = match source_records::elaboration_outcome(
-            fln_elab::elaborate_definition_in_scope_with_budget(
+        let elaborated = match source_records::elaboration_outcome(
+            fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
@@ -6808,10 +6808,15 @@ impl Engine {
                 ))
             })?;
         let result = self
-            .admit_declaration(declaration, options, limits)
+            .admit_declaration(elaborated.declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut admitted) => {
+                source_records::apply_admission_effects(
+                    &mut admitted,
+                    elaborated.irreducible,
+                    options,
+                )?;
                 if let Some((name, priority)) = registration {
                     // A proof instance is admitted as a theorem. Both it and
                     // a data definition register the actual completed name,
@@ -7697,10 +7702,21 @@ impl Engine {
                     limits,
                     presentation,
                 )
+                .map(|outcome| {
+                    outcome.map_complete(|(declaration, presentation)| {
+                        (
+                            fln_elab::source::ElaboratedDeclaration {
+                                declaration,
+                                irreducible: false,
+                            },
+                            presentation,
+                        )
+                    })
+                })
             } else {
                 source_records::elaboration_outcome(match parsed.kind() {
                     fln_parse::SourceCommandKind::Definition if scoped => {
-                        fln_elab::elaborate_definition_in_scope_with_budget(
+                        fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                             parsed.syntax(),
                             engine.environment(),
                             limits.kernel,
@@ -7708,7 +7724,7 @@ impl Engine {
                         )
                     }
                     fln_parse::SourceCommandKind::Definition => {
-                        fln_elab::elaborate_definition_in_with_budget(
+                        fln_elab::elaborate_definition_with_effects_in_with_budget(
                             parsed.syntax(),
                             engine.environment(),
                             limits.kernel,
@@ -7729,11 +7745,15 @@ impl Engine {
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
-            let (declaration, evaluation_presentation) = match declaration {
+            let (elaborated, evaluation_presentation) = match declaration {
                 Outcome::Complete(declaration) => declaration,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
+            let fln_elab::source::ElaboratedDeclaration {
+                declaration,
+                irreducible,
+            } = elaborated;
             if matches!(
                 evaluation_presentation,
                 Some(
@@ -7806,7 +7826,7 @@ impl Engine {
                 || is_proof_definition
                 || uses_sorry
             {
-                let admission = match engine
+                let mut admission = match engine
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -7817,6 +7837,13 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                source_records::apply_batch_effects(&mut admission, irreducible, options).map_err(
+                    |error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    },
+                )?;
                 for row in &admission.admissions {
                     scopes.admitted(&row.declaration);
                 }
@@ -7860,6 +7887,16 @@ impl Engine {
                     });
                 }
             };
+            source_records::apply_execution_effects(
+                &mut execution,
+                irreducible,
+                scoped_options.as_ref().unwrap_or(options),
+            )
+            .map_err(|error| EngineExecutionError::BatchCommand {
+                index: command_index,
+                error: Box::new(error),
+                at: Some(original_offset),
+            })?;
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
@@ -8384,8 +8421,8 @@ impl Engine {
                 ),
             ));
         }
-        let declaration = match source_records::elaboration_outcome(
-            fln_elab::elaborate_definition_in_scope_with_budget(
+        let elaborated = match source_records::elaboration_outcome(
+            fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
@@ -8396,7 +8433,20 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        self.execute_definition(declaration, options, limits)
+        Ok(
+            match self.execute_definition(elaborated.declaration, options, limits)? {
+                Outcome::Complete(mut execution) => {
+                    source_records::apply_execution_effects(
+                        &mut execution,
+                        elaborated.irreducible,
+                        options,
+                    )?;
+                    Outcome::Complete(execution)
+                }
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     /// Execute the bounded Nat definitions in a nonempty sequence of source

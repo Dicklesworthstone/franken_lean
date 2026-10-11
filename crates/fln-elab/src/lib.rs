@@ -420,6 +420,8 @@ pub fn elaborate_definition_in(
 /// Elaborate with native expected-type propagation and implicit inference.
 /// Every speculative assignment uses the caller's calibrated kernel budget.
 /// The returned declaration is still an untrusted candidate, not admission.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects_in_with_budget`] instead.
 pub fn elaborate_definition_in_with_budget(
     syntax: &Syntax,
     environment: &Environment,
@@ -430,6 +432,22 @@ pub fn elaborate_definition_in_with_budget(
     // elaboration error as a kernel rejection.
     source::definition(syntax, environment, budget)
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// Elaborate an untrusted declaration together with effects selected by the
+/// successful elaboration. Both checkers must admit the candidate before the
+/// caller installs its effects in the checked successor.
+pub fn elaborate_definition_with_effects_in_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+) -> Result<source::ElaboratedDeclaration, NatDefinitionElabError> {
+    elaborate_definition_with_effects_in_scope_with_budget(
+        syntax,
+        environment,
+        budget,
+        &source::scope::SourceScope::default(),
+    )
 }
 
 /// The pin words an unknown name `Unknown constant` when a proper prefix of it is a
@@ -511,6 +529,8 @@ pub fn elaborate_evaluation_in_scope_with_budget(
 
 /// [`elaborate_definition_in_with_budget`] with names declared and resolved in a
 /// source scope.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects_in_scope_with_budget`] instead.
 pub fn elaborate_definition_in_scope_with_budget(
     syntax: &Syntax,
     environment: &Environment,
@@ -518,6 +538,17 @@ pub fn elaborate_definition_in_scope_with_budget(
     scope: &source::scope::SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     source::scope::elaborate_definition(syntax, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// The metadata-bearing source declaration seam with names resolved in `scope`.
+pub fn elaborate_definition_with_effects_in_scope_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<source::ElaboratedDeclaration, NatDefinitionElabError> {
+    source::scope::elaborate_definition_with_effects(syntax, environment, budget, scope)
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 

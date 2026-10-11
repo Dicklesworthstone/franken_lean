@@ -14,8 +14,10 @@ mod context;
 mod lambdas;
 mod matrix;
 mod obligation;
+mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
+pub(super) use well_founded::State as WellFounded;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -32,6 +34,10 @@ pub enum RecursionError {
     },
     ChangedIndex,
     PartialApplication,
+    WellFoundedMeasureRequired,
+    WellFoundedArgumentRequired,
+    DecreasingProofRequired,
+    RecursionInDecreasingProof,
     StructuralMeasureNotParameter,
     StructuralParameterNotInductive,
     TerminationBinderCount {
@@ -62,7 +68,19 @@ impl std::fmt::Display for RecursionError {
             Self::GeneralizeParameter { .. } => "recursive parameter requires generalization",
             Self::ChangedIndex => "recursive call indices do not match its structural child's type",
             Self::PartialApplication => {
-                "recursive function escapes without its structural argument"
+                "recursive function escapes without its decreasing argument"
+            }
+            Self::WellFoundedMeasureRequired => {
+                "well-founded recursion requires an explicit Nat-valued termination_by measure"
+            }
+            Self::WellFoundedArgumentRequired => {
+                "well-founded recursion requires one varying final argument and a fixed prefix"
+            }
+            Self::DecreasingProofRequired => {
+                "well-founded recursion requires an explicit decreasing_by proof"
+            }
+            Self::RecursionInDecreasingProof => {
+                "a decreasing_by proof cannot call the recursive function"
             }
             Self::StructuralMeasureNotParameter => {
                 "the termination measure of a structurally recursive function must be one of its parameters"
@@ -84,6 +102,27 @@ fn error(reason: RecursionError) -> NatDefinitionElabError {
 pub(super) struct StructuralHint<'a> {
     aliases: Vec<Option<Name>>,
     measure: &'a Syntax,
+}
+
+pub(super) enum TerminationHint<'a> {
+    Structural(StructuralHint<'a>),
+    WellFounded {
+        hint: well_founded::Hint<'a>,
+        allowed: bool,
+    },
+}
+
+pub(super) fn termination_hint(
+    syntax: &Syntax,
+    well_founded_allowed: bool,
+) -> Result<Option<TerminationHint<'_>>, NatDefinitionElabError> {
+    if let Some(hint) = well_founded::hint(syntax)? {
+        return Ok(Some(TerminationHint::WellFounded {
+            hint,
+            allowed: well_founded_allowed,
+        }));
+    }
+    structural_hint(syntax).map(|hint| hint.map(TerminationHint::Structural))
 }
 
 /// The binder of a structural definition's original-body obligation (`recursion/obligation.rs`):
@@ -503,7 +542,7 @@ impl Context {
         parameters: &[LocalDecl],
         syntax: &Syntax,
         expected: Option<Expr>,
-        hint: Option<&StructuralHint<'_>>,
+        hint: Option<&TerminationHint<'_>>,
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
         self.defining = Some(name.clone());
@@ -550,11 +589,33 @@ impl Context {
         let result = (|| {
             let (body, expected, lambdas) =
                 self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
-            let selected = hint
-                .map(|hint| self.structural_hint_parameter(hint, &parameters, header_parameters))
-                .transpose()?;
-            let body =
-                self.structural_definition_body(name, &parameters, body, expected, selected)?;
+            let body = match hint {
+                Some(TerminationHint::WellFounded {
+                    hint,
+                    allowed: true,
+                }) => self.well_founded_body(
+                    name,
+                    &parameters,
+                    body,
+                    expected,
+                    hint,
+                    header_parameters,
+                )?,
+                Some(TerminationHint::WellFounded { allowed: false, .. }) => {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "well-founded recursion in a safe def declaration",
+                    });
+                }
+                _ => {
+                    let selected = match hint {
+                        Some(TerminationHint::Structural(hint)) => Some(
+                            self.structural_hint_parameter(hint, &parameters, header_parameters)?,
+                        ),
+                        _ => None,
+                    };
+                    self.structural_definition_body(name, &parameters, body, expected, selected)?
+                }
+            };
             self.close_recursive_lambdas(&lambdas, body)
         })();
         if result.is_err() {

@@ -330,6 +330,29 @@ impl Context {
         })
     }
 
+    /// A single user script handles all recursive-call obligations, in source
+    /// order, just as the pin's `solveDecreasingGoals` does. Reusing the normal
+    /// proof driver preserves tactic controls, alternatives, and resource rules.
+    pub(super) fn start_decreasing_proof<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+        goals: Vec<ProofGoal>,
+    ) -> Result<ProofState<'a>, NatDefinitionElabError> {
+        let first = goals
+            .first()
+            .ok_or_else(|| error(TacticError::ExpectedGoal))?;
+        Ok(ProofState {
+            extent: self.observation_extent(syntax)?.map(Box::new),
+            saved: self.txn.lctx.clone(),
+            target: first.target.clone(),
+            root: Expr::mvar(first.id.clone()),
+            instructions: self.proof_instructions(syntax)?,
+            cursor: 0,
+            work: goals.into_iter().rev().map(Work::Goal).collect(),
+            controls: Vec::new(),
+        })
+    }
+
     fn proof_instructions<'a>(
         &mut self,
         syntax: &'a Syntax,
