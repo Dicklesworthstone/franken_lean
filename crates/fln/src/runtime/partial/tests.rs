@@ -113,6 +113,92 @@ fn partial_linkage_requires_both_checked_halves_and_exact_telescope() {
     }
 }
 
+/// The pin compiles an opaque from its value unless a companion, extern or init
+/// attribute selects otherwise (`toDecl`). Here the value runs only for an opaque
+/// the engine admitted from a handed declaration, never over a companion, an
+/// unsafe opaque, or an extern row the native catalogs did not take.
+#[test]
+fn an_opaque_value_runs_only_when_its_engine_admitted_it() {
+    let (logical, executable) = pair("hidden");
+    let label = logical.base.name.clone();
+    let lone = Environment::new()
+        .add_decl(ConstantInfo::Opaque(logical.clone()))
+        .unwrap();
+    let admitted = BTreeSet::from([label.clone()]);
+    let elsewhere = BTreeSet::from([name("elsewhere")]);
+    let selected = |environment: &Environment, names: Option<&BTreeSet<Name>>, requested: &Name| {
+        let preparation = Preparation::new(environment, IngressLimits::default());
+        match names {
+            Some(names) => preparation.with_executable_opaques(names),
+            None => preparation,
+        }
+        .executable_definition(requested)
+    };
+    // An environment of unknown provenance, or another engine's admissions.
+    assert_eq!(selected(&lone, None, &label).unwrap(), None);
+    assert_eq!(selected(&lone, Some(&elsewhere), &label).unwrap(), None);
+    assert_eq!(
+        selected(&lone, Some(&admitted), &label).unwrap(),
+        Some(DefinitionVal {
+            base: logical.base.clone(),
+            value: logical.value.clone(),
+            hints: ReducibilityHints::Opaque,
+            safety: DefinitionSafety::Safe,
+            all: vec![label.clone()],
+        })
+    );
+    // `getDeclInfo?` tries the unsafe-rec companion first.
+    let paired = world(logical.clone(), executable.clone());
+    assert_eq!(
+        selected(&paired, Some(&admitted), &label).unwrap(),
+        Some(executable)
+    );
+    let mut unsafe_logical = logical.clone();
+    unsafe_logical.is_unsafe = true;
+    let unsafe_world = Environment::new()
+        .add_decl(ConstantInfo::Opaque(unsafe_logical))
+        .unwrap();
+    assert_eq!(
+        selected(&unsafe_world, Some(&admitted), &label).unwrap(),
+        None
+    );
+    // A supported extern row the native catalogs did not bind is not replaced
+    // by the value, and an unsupported one is refused outright.
+    let mut mix = logical;
+    mix.base.name = name("mixHash");
+    mix.all = vec![mix.base.name.clone()];
+    let mix_admitted = BTreeSet::from([mix.base.name.clone()]);
+    let mix_world = Environment::new()
+        .add_decl(ConstantInfo::Opaque(mix.clone()))
+        .unwrap();
+    assert!(
+        selected(&mix_world, Some(&mix_admitted), &mix.base.name)
+            .unwrap()
+            .is_some()
+    );
+    for (symbol, supported) in [("lean_uint64_mix_hash", true), ("unavailable_mix", false)] {
+        let externed = fln_elab::externs::register(
+            &mix_world,
+            &mix.base.name,
+            vec![fln_elab::externs::ExternEntry::Standard {
+                backend: name("all"),
+                symbol: symbol.to_owned(),
+            }],
+        )
+        .unwrap();
+        let result = selected(&externed, Some(&mix_admitted), &mix.base.name);
+        if supported {
+            assert_eq!(result.unwrap(), None, "{symbol}");
+        } else {
+            assert!(
+                format!("{:?}", result.unwrap_err())
+                    .contains("native extern attribute does not match the supported ABI"),
+                "{symbol}"
+            );
+        }
+    }
+}
+
 #[test]
 fn mutual_partial_linkage_validates_every_member_before_selecting_code() {
     let (mut first, mut first_impl) = pair("first");

@@ -4003,6 +4003,7 @@ impl EngineBuilder {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4018,6 +4019,8 @@ impl EngineBuilder {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            // An environment of unknown provenance runs no opaque value.
+            executable_opaques: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4040,6 +4043,7 @@ impl EngineBuilder {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4252,6 +4256,12 @@ pub struct Engine {
     imported_environment: Option<Environment>,
     /// Direct import edges retained from each checked module's decoded header.
     imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
+    /// Opaques this engine's lineage admitted through [`Engine::admit_declaration`]
+    /// from a declaration it was handed (source text, a replayed source record, an
+    /// embedder), never one read from an `.olean`. Only these may run their value:
+    /// an artifact's opaque can carry an `init` attribute the importer does not
+    /// read, and the pin then runs the initializer rather than the value.
+    executable_opaques: std::sync::Arc<BTreeSet<Name>>,
     epoch: ModuleEpoch,
     mode: Mode,
     reproducibility: ReproducibilityProfile,
@@ -4460,6 +4470,7 @@ impl Engine {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
             epoch: Self::pinned_epoch(),
             mode: Mode::DEFAULT,
             reproducibility: ReproducibilityProfile::Standard,
@@ -4483,6 +4494,7 @@ impl Engine {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -5889,6 +5901,7 @@ impl Engine {
             imported_modules: std::sync::Arc::new(imported),
             imported_environment,
             imported_module_dependencies: std::sync::Arc::new(dependencies),
+            executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -6494,7 +6507,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
-        let admitted = match self.admit_declaration_unrooted(
+        let mut admitted = match self.admit_declaration_unrooted(
             declaration,
             options,
             limits,
@@ -6504,6 +6517,13 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        // No artifact metadata exists for a handed declaration, so its value is
+        // what the pin's compiler runs (`toDecl`, `value? (allowOpaque := true)`).
+        if let Declaration::Opaque(value) = &admitted.declaration {
+            let mut names = (*self.executable_opaques).clone();
+            names.insert(value.base.name.clone());
+            admitted.engine.executable_opaques = std::sync::Arc::new(names);
+        }
         // `self` is immutable, so its root is the same before or after the council.
         let base_logical_root = self.logical_root(options);
         let result_logical_root = admitted.engine.environment.logical_root(options);
@@ -6630,6 +6650,7 @@ impl Engine {
                 imported_module_dependencies: std::sync::Arc::clone(
                     &self.imported_module_dependencies,
                 ),
+                executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
                 epoch: self.epoch.clone(),
                 mode: self.mode,
                 reproducibility: self.reproducibility,
@@ -8932,7 +8953,8 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress);
+        let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress)
+            .with_executable_opaques(&self.executable_opaques);
         let evaluated = match entry {
             source_evaluation::Entry::Value => None,
             source_evaluation::Entry::Evaluation => preparation
@@ -12227,6 +12249,10 @@ pub(crate) fn assert_engines_identical(left: &Engine, right: &Engine, what: &str
     assert_eq!(
         left.imported_module_dependencies, right.imported_module_dependencies,
         "{what}: import edges"
+    );
+    assert_eq!(
+        left.executable_opaques, right.executable_opaques,
+        "{what}: executable opaques"
     );
     assert_eq!(left.epoch, right.epoch, "{what}: epoch");
     assert_eq!(left.mode, right.mode, "{what}: mode");

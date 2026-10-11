@@ -46,6 +46,9 @@ pub(super) struct Preparation<'a> {
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
+    /// Opaques whose values may run; see `Engine::executable_opaques`. None
+    /// unless the caller names its engine's set.
+    executable_opaques: Option<&'a BTreeSet<Name>>,
     native_intrinsics: native_intrinsics::Store,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
@@ -133,6 +136,7 @@ impl<'a> Preparation<'a> {
             visited: 0,
             externs: None,
             implementations: None,
+            executable_opaques: None,
             native_intrinsics: native_intrinsics::Store::default(),
             lambdas: Vec::new(),
             cases: Vec::new(),
@@ -168,6 +172,13 @@ impl<'a> Preparation<'a> {
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
+    }
+
+    /// Permit the named opaques' values to run, as the pin's compiler does for
+    /// an opaque with no extern or init attribute.
+    pub(super) fn with_executable_opaques(mut self, names: &'a BTreeSet<Name>) -> Self {
+        self.executable_opaques = Some(names);
+        self
     }
 
     fn tick(&mut self) -> Result<(), IngressError> {

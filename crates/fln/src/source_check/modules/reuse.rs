@@ -1772,6 +1772,7 @@ impl Engine {
             imported_modules: std::sync::Arc::new(imported),
             imported_environment: Some(environment),
             imported_module_dependencies: std::sync::Arc::new(dependencies),
+            executable_opaques: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2062,6 +2063,7 @@ impl Engine {
             // The base is empty, so the imports alone produced this environment.
             imported_environment: Some(environment),
             imported_module_dependencies: std::sync::Arc::new(dependencies),
+            executable_opaques: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,

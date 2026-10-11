@@ -1824,3 +1824,38 @@ fn an_opaque_constant_is_checked_and_never_unfolds() {
         assert!(refused(source), "{source}");
     }
 }
+
+/// The pin's compiler runs an opaque's value when no companion, extern or init
+/// attribute selects another implementation (`Compiler/LCNF/ToDecl.lean`, `toDecl`).
+/// On the pinned v4.32.0 these evaluations print 5, 0 (`default`), 6 and 7 (measured
+/// 2026-10-11, `scratchpad/r13/op7.lean`). The logic still never sees the value: the
+/// test above keeps `secret = 5 := rfl` refused.
+#[test]
+fn a_source_opaque_executes_its_value_as_the_pin_compiles_it() {
+    let (engine, limits) = engine();
+    let program = "opaque s : Nat := 5\nopaque t : Nat\ndef u : Nat := s + 1\nstructure P where\n  x : Nat\ninstance : Inhabited P := ⟨⟨7⟩⟩\nopaque p : P\n#eval s\n#eval t\n#eval u\n#eval p.x\n";
+    let batch = engine
+        .execute_source_definitions(
+            &[program.as_bytes()],
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits.kernel),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"))
+        .into_complete()
+        .unwrap();
+    let values: Vec<_> = batch
+        .executions
+        .iter()
+        .map(|execution| {
+            let fln::VmExit::Returned(value) = &execution.exit else {
+                panic!("returned value: {:?}", execution.exit)
+            };
+            fln_vm::interpreter::nat_decimal(&value.value)
+        })
+        .collect();
+    // The batch also runs the closed definition `u` where it is declared.
+    assert_eq!(
+        values.iter().map(Option::as_deref).collect::<Vec<_>>(),
+        [Some("6"), Some("5"), Some("0"), Some("6"), Some("7")]
+    );
+}

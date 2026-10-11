@@ -136,6 +136,92 @@ fn without_import_report(text: &str) -> String {
     format!("{before}{after}")
 }
 
+/// The pin compiles an opaque from its value unless a companion, extern or init
+/// attribute selects another implementation (`Compiler/LCNF/ToDecl.lean`, `toDecl`).
+/// With `import Init` and `Left.lean` built by the pin, `opaque own : Nat := 5`,
+/// `opaque left : Nat := 20` and the value-less `opaque bare : Nat` evaluate to 5, 20
+/// and 0 there (measured 2026-10-11). The value runs here only for an opaque admitted
+/// from source, in its own file or a sibling source module. The same declaration
+/// read from an `.olean` is refused rather than run: an artifact's opaque may carry
+/// an `init` attribute the importer does not read, where the pin runs the initializer.
+#[test]
+fn a_source_opaque_runs_its_value_and_the_same_opaque_read_from_an_olean_is_refused() {
+    let Some(lib) = pinned_lib() else { return };
+    let ws = Workspace::new("opaque-values");
+    ws.write(
+        "Left.lean",
+        "prelude\nimport Init.Prelude\nopaque left : Nat := 20\nopaque bare : Nat\n",
+    );
+    let main = ws.write(
+        "Main.lean",
+        "prelude\nimport Left\nopaque own : Nat := 5\n#eval own\n#eval left\n#eval bare\n",
+    );
+    let ran = ws.run(&main, Some(&lib), &[]);
+    let text = ran.complete();
+    for (command, value) in [(1, 5), (2, 20), (3, 0)] {
+        assert!(
+            text.contains(&format!(
+                "\"command\":{command},\"event\":\"evaluation\",\"kind\":\"nat\",\"value\":{value},"
+            )),
+            "{text}"
+        );
+    }
+
+    let name = |text: &str| fln::Name::from_components(text.split('.'));
+    let left = fln::ConstantInfo::Opaque(fln::OpaqueVal {
+        base: fln::ConstantVal {
+            name: name("left"),
+            level_params: vec![],
+            type_: fln::Expr::const_(name("Nat"), vec![]),
+        },
+        value: fln::Expr::lit(fln::Literal::Nat(fln::NatLit::from_u64(20))),
+        is_unsafe: false,
+        all: vec![name("left")],
+    });
+    let bytes = fln::encode_olean_module(
+        fln::OleanModuleWriteInput {
+            is_module: false,
+            imports: &[fln::OleanModuleImport {
+                module: name("Init.Prelude"),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            }],
+            constants: &[left],
+            extra_const_names: &[],
+        },
+        fln::OleanWriteHeader {
+            version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+            flags: 1,
+            lean_version: fln::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+            githash: fln::OLEAN_PIN_COMMIT,
+            base_addr: 2 * fln::OLEAN_REGION_ALIGN as u64,
+        },
+        fln::OleanWriteBudget::default(),
+    )
+    .unwrap()
+    .bytes;
+    let artifact = Workspace::new("opaque-artifact");
+    let objects = artifact.0.join("objects");
+    std::fs::create_dir(&objects).unwrap();
+    std::fs::write(objects.join("Left.olean"), bytes).unwrap();
+    let search = PathBuf::from(std::env::join_paths([objects, lib]).unwrap());
+    let main = artifact.write(
+        "Main.lean",
+        "prelude\nimport Left\n#eval (3 : Nat)\n#eval left\n",
+    );
+    let refused = artifact.run(&main, Some(&search), &[]);
+    let stderr = refused.refused("execution", 1);
+    // The import was admitted and the first evaluation compiled; only the
+    // artifact's opaque value is not taken as its implementation.
+    assert!(stderr.contains("command 1, byte"), "{refused:?}");
+    assert!(
+        stderr.contains("core Expr constant `left`")
+            && stderr.contains("is not in the runtime catalogs"),
+        "{refused:?}"
+    );
+}
+
 #[test]
 fn caller_execution_ceilings_apply_after_real_import_admission() {
     let Some(lib) = pinned_lib() else { return };

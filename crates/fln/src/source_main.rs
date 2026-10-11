@@ -359,7 +359,8 @@ impl Engine {
         // The compiler's existing resolver validates every recursive sibling
         // and explicit replacement. A forged suffix must not select a body,
         // and an unsupported opaque/unsafe main must not run its logical value.
-        let mut preparation = crate::runtime::Preparation::new(self.environment(), limits.ingress);
+        let mut preparation = crate::runtime::Preparation::new(self.environment(), limits.ingress)
+            .with_executable_opaques(&self.executable_opaques);
         if preparation
             .executable_definition(&requested)
             .map_err(MainExecutionError::Preparation)?

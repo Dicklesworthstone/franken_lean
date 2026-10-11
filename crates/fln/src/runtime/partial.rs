@@ -41,17 +41,19 @@ impl Preparation<'_> {
     ) -> Result<Option<DefinitionVal>, IngressError> {
         self.tick()?;
         let environment = self.environment;
-        let (logical, fallback) = match environment.find(requested) {
+        let (logical, fallback, opaque) = match environment.find(requested) {
             Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
-                (requested.clone(), Some(definition))
+                (requested.clone(), Some(definition), None)
             }
             Some(ConstantInfo::Defn(definition))
                 if definition.safety == DefinitionSafety::Partial
                     && matches!(requested.leaf_view(), LeafView::Str("_unsafe_rec")) =>
             {
-                (requested.parent(), None)
+                (requested.parent(), None, None)
             }
-            Some(ConstantInfo::Opaque(opaque)) if !opaque.is_unsafe => (requested.clone(), None),
+            Some(ConstantInfo::Opaque(opaque)) if !opaque.is_unsafe => {
+                (requested.clone(), None, Some(opaque))
+            }
             Some(_) => return Ok(None),
             None => return Ok(self.specialized_definition(requested)),
         };
@@ -60,7 +62,11 @@ impl Preparation<'_> {
             // An ordinary safe definition needs no executable companion. Once
             // one is present, failed linkage must not silently run its logical
             // body instead of the implementation the pin would select.
-            return Ok(fallback.cloned());
+            return match (fallback, opaque) {
+                (Some(definition), _) => Ok(Some(definition.clone())),
+                (None, Some(opaque)) => self.opaque_value(opaque),
+                (None, None) => Ok(None),
+            };
         };
         let ConstantInfo::Defn(implementation) = candidate else {
             return Ok(None);
@@ -110,6 +116,43 @@ impl Preparation<'_> {
             }
         }
         Ok(Some(implementation.clone()))
+    }
+
+    /// The pin compiles an opaque with no companion, extern or init attribute
+    /// from its value (`Compiler/LCNF/ToDecl.lean`, `toDecl`). That runs here
+    /// only for an opaque the engine admitted from a handed declaration: an
+    /// artifact's opaque may carry an init attribute the importer drops. An
+    /// extern row is an explicit contract that the native catalogs, consulted
+    /// before any body, did not satisfy, so it never falls back to the value.
+    fn opaque_value(&mut self, opaque: &OpaqueVal) -> Result<Option<DefinitionVal>, IngressError> {
+        let name = &opaque.base.name;
+        if !self
+            .executable_opaques
+            .is_some_and(|names| names.contains(name))
+        {
+            return Ok(None);
+        }
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(name).is_some())
+        {
+            return Ok(None);
+        }
+        Ok(Some(DefinitionVal {
+            base: opaque.base.clone(),
+            value: opaque.value.clone(),
+            hints: ReducibilityHints::Opaque,
+            safety: DefinitionSafety::Safe,
+            all: opaque.all.clone(),
+        }))
     }
 
     pub(super) fn has_recursive_companion(&mut self, name: &Name) -> Result<bool, IngressError> {
