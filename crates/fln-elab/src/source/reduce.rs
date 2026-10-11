@@ -4,6 +4,7 @@
 //! admitted recursor rules. Stuck majors are rebuilt once and unwound, never
 //! resubmitted in an unproductive loop. Neither reduction nor transparency can
 //! publish a declaration or eliminate an original source typing obligation.
+mod imported_smart;
 #[cfg(test)]
 mod projection_tests;
 mod quotient;
@@ -114,7 +115,12 @@ impl Context {
                     }
                     ExprNode::Const { name, levels } => match self.txn.env.find(name).cloned() {
                         Some(ConstantInfo::Defn(definition)) => {
-                            if definition.safety != DefinitionSafety::Safe || !match transparency {
+                            // `whnfCore` unfolds applied auxiliary recursors even
+                            // when ordinary delta is disabled. Their admitted
+                            // journal, not a casesOn/brecOn suffix, selects them.
+                            let auxiliary =
+                                !arguments.is_empty() && self.is_auxiliary_recursor(name)?;
+                            if definition.safety != DefinitionSafety::Safe || !auxiliary && !match transparency {
                                 UnificationTransparency::None => false,
                                 UnificationTransparency::Abbreviations => {
                                     crate::reducibility::table(&self.txn.env)
@@ -361,6 +367,56 @@ impl Context {
                 Ok(original)
             };
         }
+    }
+
+    /// One explicitly selected simp unfolding. Keep a structural definition's
+    /// head intact until enough arguments expose a checked smart alternative;
+    /// unfolding its bare constant first loses the recursive call identities.
+    pub(in crate::source) fn unfold_selected_definition(
+        &mut self,
+        term: &Expr,
+        definition: &DefinitionVal,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut head = term.clone();
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f.clone();
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(term.clone());
+        };
+        if name != &definition.base.name || definition.safety != DefinitionSafety::Safe {
+            return Ok(term.clone());
+        }
+        if definition.base.level_params.len() != levels.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let unfolding = self.smart_unfolding(
+            definition,
+            levels,
+            &arguments,
+            UnificationTransparency::None,
+            false,
+        )?;
+        let unfolding = match unfolding {
+            SmartUnfolding::Plain => {
+                self.imported_smart_unfolding(definition, levels, &arguments)?
+            }
+            result => result,
+        };
+        let value = match unfolding {
+            SmartUnfolding::Folded => return Ok(term.clone()),
+            SmartUnfolding::Plain => {
+                self.instantiate_params(&definition.value, &definition.base.level_params, levels)?
+            }
+            SmartUnfolding::Alternative { value, consumed } => {
+                arguments.truncate(arguments.len() - consumed);
+                value
+            }
+        };
+        self.rebuild_application(value, arguments)
     }
 
     /// The pin's smart unfolding (vendored Lean/Meta/WHNF.lean:871-930) of a source structural

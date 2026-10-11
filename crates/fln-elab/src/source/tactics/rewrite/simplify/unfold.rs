@@ -198,20 +198,17 @@ impl Context {
                     idx,
                     expr,
                 } => Expr::proj(struct_name.clone(), *idx, child(expr)),
-                ExprNode::Const { name, levels } => match selection {
-                    Selection::Global(definition) if name == &definition.base.name => self
-                        .instantiate_params(
-                            &definition.value,
-                            &definition.base.level_params,
-                            levels,
-                        )?,
-                    _ => term.clone(),
-                },
                 ExprNode::FVar { id } => match selection {
                     Selection::Local(selected, value) if selected == id => value.clone(),
                     _ => term.clone(),
                 },
                 _ => term.clone(),
+            };
+            let rebuilt = match selection {
+                Selection::Global(definition) => {
+                    self.unfold_selected_definition(&rebuilt, definition)?
+                }
+                Selection::Local(..) => rebuilt,
             };
             let normalized = self.simp_beta_zeta(&rebuilt)?;
             done.insert(key, normalized);
