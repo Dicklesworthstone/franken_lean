@@ -158,6 +158,74 @@ fn generic_paths_and_authoritative_imported_out_parameters_determine_the_schedul
     );
 }
 
+/// The pin's `checkOutParam` (`Lean/Class.lean`), run by `addClass` on every new class.
+#[test]
+fn a_regular_parameter_may_not_depend_on_an_out_parameter() {
+    let out = |domain| app("outParam", domain);
+    let base = axiom(
+        &Environment::new(),
+        "Inhabited",
+        pi("a", ty(), ty(), BinderInfo::Default),
+    );
+    // F (β : outParam Type) (b : β) : Type is refused, and registers nothing.
+    let refused = axiom(
+        &base,
+        "F",
+        pi(
+            "β",
+            out(ty()),
+            pi("b", b(0), ty(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+    );
+    assert_eq!(
+        register_class(&refused, &n("F")),
+        Err(InstanceRegistryError::OutParamDependency {
+            class: n("F"),
+            parameter: 2,
+        })
+    );
+    assert!(!InstanceRegistry::read(&refused).unwrap().is_class(&n("F")));
+    // G (β : outParam Type) (b : outParam β), D (β : outParam Type) [Inhabited β] (the
+    // instance-implicit exception, pin issue #1852), and E (x : outParam Type) (α : Type), whose
+    // α does not mention x, are classes.
+    for (name, type_) in [
+        (
+            "G",
+            pi(
+                "β",
+                out(ty()),
+                pi("b", out(b(0)), ty(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+        (
+            "D",
+            pi(
+                "β",
+                out(ty()),
+                pi("i", app("Inhabited", b(0)), ty(), BinderInfo::InstImplicit),
+                BinderInfo::Default,
+            ),
+        ),
+        (
+            "E",
+            pi(
+                "x",
+                out(ty()),
+                pi("α", ty(), ty(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+    ] {
+        let env = class(&base, name, type_);
+        assert!(
+            InstanceRegistry::read(&env).unwrap().is_class(&n(name)),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn implicit_class_detection_uses_the_original_function_telescope() {
     let env = class(&Environment::new(), "C", ty());

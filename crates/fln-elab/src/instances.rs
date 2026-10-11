@@ -33,6 +33,12 @@ pub enum InstanceRegistryError {
     Limit,
     UnknownDeclaration(Name),
     InvalidClass(Name),
+    /// The pin's `checkOutParam` (`Lean/Class.lean`): parameter `parameter` (1-based) is neither
+    /// an `outParam` nor instance-implicit, yet its type mentions an earlier `outParam`.
+    OutParamDependency {
+        class: Name,
+        parameter: u32,
+    },
     UnknownClass(Name),
     InvalidInstance(Name),
     DuplicateInstance(Name),
@@ -50,6 +56,12 @@ impl std::fmt::Display for InstanceRegistryError {
                 f,
                 "{} is not a supported class declaration",
                 n.to_display_string()
+            ),
+            Self::OutParamDependency { class, parameter } => write!(
+                f,
+                "invalid class {}, parameter #{parameter} depends on `outParam`, but it is not an \
+                 `outParam`",
+                class.to_display_string()
             ),
             Self::UnknownClass(n) => {
                 write!(f, "{} is not registered as a class", n.to_display_string())
@@ -497,6 +509,8 @@ pub fn register_class(
     if registry.is_class(class) {
         return Ok(env.clone());
     }
+    // The pin's `addClass` runs `checkOutParam` on every new class.
+    export::check_out_params(env, class)?;
     append(env, class_payload(class)?)
 }
 

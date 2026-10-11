@@ -71,17 +71,25 @@ pub fn parameters(
     parameters_with_budget(env, class, &mut remaining)
 }
 
-fn parameters_with_budget(
-    env: &Environment,
-    class: &Name,
-    work_left: &mut usize,
-) -> Result<imported::ClassParameters, InstanceRegistryError> {
-    validate_class(env, class)?;
+/// The pin's `checkOutParam`, as `addClass` runs it on a new class: refused when a parameter
+/// that is neither an `outParam` nor instance-implicit mentions an earlier `outParam`.
+pub fn check_out_params(env: &Environment, class: &Name) -> Result<(), InstanceRegistryError> {
     let info = env.find(class).ok_or(InstanceRegistryError::Malformed)?;
+    let mut remaining = MAX_ENTRY_BYTES;
+    out_params(class, &info.constant_val().type_, &mut remaining).map(|_| ())
+}
+
+/// The class telescope's `outParam` positions, the domains of the other parameters, and the
+/// type after the telescope. `checkOutParam` walks syntactic binders only, without reducing.
+fn out_params<'a>(
+    class: &Name,
+    type_: &'a Expr,
+    work_left: &mut usize,
+) -> Result<(Vec<u32>, Vec<&'a Expr>, &'a Expr), InstanceRegistryError> {
     let mut out = Vec::new();
     let mut domains = Vec::new();
     let mut index = 0u32;
-    let mut ty = &info.constant_val().type_;
+    let mut ty = type_;
     loop {
         tick(work_left)?;
         match ty.node() {
@@ -105,7 +113,10 @@ fn parameters_with_budget(
                     tick(work_left)?;
                     if contains_loose(binder_type, index - previous - 1, work_left)? {
                         if !annotated && *binder_info != BinderInfo::InstImplicit {
-                            return Err(InstanceRegistryError::InvalidClass(class.clone()));
+                            return Err(InstanceRegistryError::OutParamDependency {
+                                class: class.clone(),
+                                parameter: index.saturating_add(1),
+                            });
                         }
                         output = true;
                     }
@@ -118,9 +129,21 @@ fn parameters_with_budget(
                 index += 1;
                 ty = body;
             }
-            ExprNode::Sort { .. } => break,
-            _ => return Err(InstanceRegistryError::InvalidClass(class.clone())),
+            _ => return Ok((out, domains, ty)),
         }
+    }
+}
+
+fn parameters_with_budget(
+    env: &Environment,
+    class: &Name,
+    work_left: &mut usize,
+) -> Result<imported::ClassParameters, InstanceRegistryError> {
+    validate_class(env, class)?;
+    let info = env.find(class).ok_or(InstanceRegistryError::Malformed)?;
+    let (out, mut domains, result) = out_params(class, &info.constant_val().type_, work_left)?;
+    if !matches!(result.node(), ExprNode::Sort { .. }) {
+        return Err(InstanceRegistryError::InvalidClass(class.clone()));
     }
     let mut inputs = HashSet::new();
     let mut seen = HashSet::new();
