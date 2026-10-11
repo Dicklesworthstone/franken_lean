@@ -16,17 +16,6 @@ impl Preparation<'_> {
                 observed: args.len(),
             });
         }
-        let mut computed = false;
-        for argument in args {
-            self.tick()?;
-            computed |= matches!(
-                argument.node(),
-                ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
-            );
-        }
-        if !computed {
-            return Ok(None);
-        }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
@@ -47,6 +36,22 @@ impl Preparation<'_> {
                 .iter()
                 .any(|level| level.has_mvar() || level.has_param())
         {
+            return Ok(None);
+        }
+        // An ineligible callee cannot consume a staged callback. Check that
+        // once before scanning a potentially long application spine.
+        let mut computed = false;
+        for argument in args {
+            self.tick()?;
+            if matches!(
+                argument.node(),
+                ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
+            ) {
+                computed = true;
+                break;
+            }
+        }
+        if !computed {
             return Ok(None);
         }
         definition.base.type_ = self.universe_instance(
