@@ -597,6 +597,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain one checked module's internal auxiliary-recursor tags. This
+    /// journal does not affect the kept class or instance state.
+    pub fn register_aux_recursors(
+        mut self,
+        declarations: &[Name],
+    ) -> Result<Self, crate::aux_recursors::AuxRecursorError> {
+        self.env = crate::aux_recursors::register_module(&self.env, declarations)?;
+        Ok(self)
+    }
+
     /// Record one imported reducibility status in the environment being
     /// activated ([`crate::reducibility::register`]). The reducibility journal is
     /// not one this activation keeps or reads, so the kept class and instance

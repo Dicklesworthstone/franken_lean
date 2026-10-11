@@ -294,7 +294,8 @@ fn source_command_report_retains_every_checked_declaration_transition() {
         .unwrap()
         .into_complete()
         .unwrap();
-    assert_eq!(result.admissions.len(), 3);
+    // The block, two projections, and the two checked recursor auxiliaries.
+    assert_eq!(result.admissions.len(), 5);
     assert!(matches!(
         result.admissions[0].declaration,
         Declaration::Inductive(_)

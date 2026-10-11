@@ -59,6 +59,9 @@ pub struct SourceMetadataReport {
     /// `protected` declarations (the pin's `protectedExt`), activated so that an
     /// atomic identifier does not resolve to one.
     pub protected: usize,
+    /// Internal auxiliary-recursion tags (the pin's `auxRecExt`), activated
+    /// only for this module's own admitted definitions.
+    pub aux_recursors: usize,
     /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
     /// `instances` transparency instance selection runs at.
     pub reducibility: usize,
@@ -291,6 +294,7 @@ impl Engine {
             metadata::REDUCIBILITY_EXTENSION,
             metadata::EXTERN_EXTENSION,
             metadata::IMPLEMENTED_BY_EXTENSION,
+            metadata::AUX_RECURSOR_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -322,6 +326,7 @@ impl Engine {
                 scoped_instances: 0,
                 aliases: 0,
                 protected: 0,
+                aux_recursors: 0,
                 reducibility: 0,
                 externs: 0,
                 implemented_by: 0,
@@ -354,6 +359,7 @@ impl Engine {
                         5 => report.reducibility = block.entries.len(),
                         6 => report.externs = block.entries.len(),
                         7 => report.implemented_by = block.entries.len(),
+                        8 => report.aux_recursors = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -382,6 +388,7 @@ impl Engine {
         let mut defaults = decoded.defaults.into_iter();
         let mut aliases = decoded.aliases.into_iter();
         let mut protected = decoded.protected.into_iter();
+        let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
@@ -528,6 +535,28 @@ impl Engine {
                     reason,
                 }
             })?;
+            if report.aux_recursors != 0 {
+                cancelled!("source-olean/auxiliary-recursor");
+                let tagged: Vec<Name> = aux_recursors.by_ref().take(report.aux_recursors).collect();
+                if tagged.len() != report.aux_recursors {
+                    return Err(SourceOleanImportError::Internal(
+                        "auxiliary-recursor count changed during decode",
+                    ));
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.aux_recursors,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for declaration in &tagged {
+                    cancelled!("source-olean/auxiliary-recursor-owner");
+                    owners.validate(activation.environment(), &report.module, declaration)?;
+                }
+                activation = activation
+                    .register_aux_recursors(&tagged)
+                    .map_err(|error| auxiliary_error(&report.module, error))?;
+            }
             for _ in 0..report.reducibility {
                 cancelled!("source-olean/reducibility");
                 let row = reducibility.next().ok_or(SourceOleanImportError::Internal(
@@ -617,11 +646,14 @@ impl Engine {
         // Validate the complete graph once. A later registration can introduce
         // a cycle through an earlier module; no partial activation escapes it.
         implemented_by::validate_journal(&engine.environment)?;
+        fln_elab::aux_recursors::AuxRecursors::read(&engine.environment)
+            .map_err(|error| auxiliary_error(&roots.first().cloned().unwrap_or_default(), error))?;
         if classes.next().is_some()
             || instances.next().is_some()
             || defaults.next().is_some()
             || aliases.next().is_some()
             || protected.next().is_some()
+            || aux_recursors.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
@@ -743,6 +775,10 @@ trait Registrar: Sized {
         self,
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError>;
+    fn register_aux_recursors(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError>;
     fn register_reducibility(
         self,
         declaration: &Name,
@@ -801,6 +837,12 @@ impl Registrar for instances::imported::ImportActivation {
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
         self.register_protected(declarations)
+    }
+    fn register_aux_recursors(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
+        self.register_aux_recursors(declarations)
     }
     fn register_reducibility(
         self,
@@ -956,6 +998,32 @@ fn extern_error(
     SourceOleanImportError::Metadata {
         module: module.clone(),
         declaration: declaration.clone(),
+        reason,
+    }
+}
+
+fn auxiliary_error(
+    module: &Name,
+    error: fln_elab::aux_recursors::AuxRecursorError,
+) -> SourceOleanImportError {
+    use fln_elab::aux_recursors::AuxRecursorError;
+    let (declaration, reason) = match error {
+        AuxRecursorError::Limit => {
+            return SourceOleanImportError::Limit("auxiliary-recursor journal");
+        }
+        AuxRecursorError::UnknownDeclaration(name) => {
+            (name, "an auxiliary tag names no admitted declaration")
+        }
+        AuxRecursorError::NotDefinition(name) => (name, "an auxiliary tag names a non-definition"),
+        AuxRecursorError::Duplicate(name) => (
+            name,
+            "a definition is tagged as an auxiliary recursor twice",
+        ),
+        AuxRecursorError::Malformed => (module.clone(), "malformed auxiliary-recursor journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
         reason,
     }
 }
@@ -1268,6 +1336,12 @@ pub(super) mod tests {
             declarations: &[Name],
         ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
             fln_elab::protected_names::register_module(&self.0, declarations).map(Sequential)
+        }
+        fn register_aux_recursors(
+            self,
+            declarations: &[Name],
+        ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
+            fln_elab::aux_recursors::register_module(&self.0, declarations).map(Sequential)
         }
         fn register_reducibility(
             self,

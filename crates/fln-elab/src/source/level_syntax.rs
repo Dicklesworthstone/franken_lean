@@ -304,6 +304,7 @@ impl Context {
             .find(name)
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
+        self.note_resolved_recursor(name, &info)?;
         let base = info.constant_val();
         let count = levels.len().div_ceil(2);
         if count > base.level_params.len() {

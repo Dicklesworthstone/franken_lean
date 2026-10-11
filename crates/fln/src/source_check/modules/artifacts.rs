@@ -300,6 +300,31 @@ impl PendingArtifact {
                 metadata.protected.push(tagged.clone());
             }
         }
+        // Auxiliary tags belong to the module that generated the definition;
+        // dependencies' tags stay in their own artifacts, including diamonds.
+        let auxiliaries = |env: &Environment| {
+            fln_elab::aux_recursors::AuxRecursors::read(env).map_err(|_| {
+                SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::aux_recursors::journal_name(),
+                    reason: "invalid auxiliary-recursor journal",
+                }
+            })
+        };
+        let inherited = auxiliaries(base)?;
+        for tagged in auxiliaries(checked)?.iter() {
+            meter.work(1)?;
+            if !inherited.contains(tagged) {
+                if base.contains(tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::aux_recursors::journal_name(),
+                        reason: "a module cannot tag an imported auxiliary recursor",
+                    });
+                }
+                metadata.aux_recursors.push(tagged.clone());
+            }
+        }
         Ok(Self {
             name: name.clone(),
             imports,

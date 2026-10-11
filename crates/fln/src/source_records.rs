@@ -3,6 +3,8 @@
 use super::*;
 use fln_kernel::verdict::Verdict;
 
+mod auxiliaries;
+
 /// A candidate publication held off to the side until both module worlds and
 /// their extension journals are ready. Only the public module driver consumes it.
 pub(crate) struct PublicSourceAdmission {
@@ -401,8 +403,10 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        self.admit_declarations(&[candidate], options, limits)
-            .map_err(EngineExecutionError::from)
+        let result = self
+            .admit_declarations(&[candidate], options, limits)
+            .map_err(EngineExecutionError::from)?;
+        self.finish_source_inductive_auxiliaries(result, options, limits)
     }
 
     /// Admit a scoped candidate before applying its declaration attributes. This
@@ -603,6 +607,7 @@ impl Engine {
             let result = self
                 .admit_declarations(&[candidate], options, limits)
                 .map_err(EngineExecutionError::from)?;
+            let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
             return self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope);
         }
         if !fln_elab::source::is_record(syntax) {
@@ -708,6 +713,9 @@ impl Engine {
                     .map_err(EngineExecutionError::from)?;
             }
         }
+        // Complete the declaration stream before adding any record journals,
+        // so adjacent council receipts retain their exact predecessor roots.
+        let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
         let result = match result {
             Outcome::Complete(mut batch) => {
                 // Projection hints and reducibility status are different facts.

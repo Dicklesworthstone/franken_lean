@@ -22,6 +22,9 @@ pub struct SourceMetadata {
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
     /// reading this module answers `isProtected` correctly.
     pub protected: Vec<Name>,
+    /// This module's own internally generated auxiliary recursors, written as
+    /// the pin's `auxRecExt` tag array in `Name.quickLt` order.
+    pub aux_recursors: Vec<Name>,
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
@@ -91,7 +94,18 @@ impl Encoder {
             blocks.push(self.instance_block(&metadata.instances)?);
         }
         if !metadata.protected.is_empty() {
-            blocks.push(self.protected_block(&metadata.protected)?);
+            blocks.push(self.tagged_names_block(
+                layout::PROTECTED_EXTENSION,
+                &metadata.protected,
+                "anonymous or duplicate protected declaration",
+            )?);
+        }
+        if !metadata.aux_recursors.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::AUX_RECURSOR_EXTENSION,
+                &metadata.aux_recursors,
+                "anonymous or duplicate auxiliary recursor",
+            )?);
         }
         if !metadata.reducibility.is_empty() {
             blocks.push(self.reducibility_block(&metadata.reducibility)?);
@@ -125,29 +139,30 @@ impl Encoder {
         self.ctor(0, vec![name, entries], &[])
     }
 
-    /// `protectedExt`'s entries: each a `Name`, in `Name.quickLt` order, as
-    /// `mkTagDeclarationExtension`'s `toArrayFn` writes them.
-    fn protected_block(&mut self, protected: &[Name]) -> WResult<Obj> {
-        self.source_array_bound(protected.len())?;
-        let mut sorted: Vec<&Name> = protected.iter().collect();
+    /// `TagDeclarationExtension` entries: each a `Name`, in `Name.quickLt`
+    /// order, as `mkTagDeclarationExtension`'s `toArrayFn` writes them.
+    fn tagged_names_block(
+        &mut self,
+        extension: &str,
+        tagged: &[Name],
+        invalid: &'static str,
+    ) -> WResult<Obj> {
+        self.source_array_bound(tagged.len())?;
+        let mut sorted: Vec<&Name> = tagged.iter().collect();
         sorted.sort_by(|left, right| left.quick_cmp(right));
         if sorted.iter().any(|name| name.is_anonymous())
             || sorted
                 .windows(2)
                 .any(|pair| pair[0].quick_cmp(pair[1]) == std::cmp::Ordering::Equal)
         {
-            return Err(WriteError::Contract {
-                what: "anonymous or duplicate protected declaration",
-            });
+            return Err(WriteError::Contract { what: invalid });
         }
         let mut entries = Vec::with_capacity(sorted.len());
         for name in sorted {
             entries.push(self.name(name)?);
         }
         let entries = self.array(entries)?;
-        let name = self.name(&Name::from_components(
-            layout::PROTECTED_EXTENSION.split('.'),
-        ))?;
+        let name = self.name(&Name::from_components(extension.split('.')))?;
         self.ctor(0, vec![name, entries], &[])
     }
 }

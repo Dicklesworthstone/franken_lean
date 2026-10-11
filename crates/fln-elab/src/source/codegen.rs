@@ -35,10 +35,12 @@ use std::collections::{BTreeSet, HashSet};
 const CSIMP_TABLE: &str = include_str!("../seed/csimp_recursors.tsv");
 const CSIMP_SCHEMA: &str = "schema fln-seed-csimp-recursors/1";
 
-/// Recursors the pin's `visitApp` lowers itself (ToLCNF.lean:824-831). Its `Eq.recOn`
-/// and `Eq.ndrec` cases are definitions here, never recursor constants.
-const SPECIAL_RECURSORS: [[&str; 2]; 6] = [
+/// Recursors the pin's `visitApp` lowers itself (ToLCNF.lean:824-831).
+/// Eq.recOn is a tagged definition. Other generated recOn wrappers have no
+/// compiled signature, even when their underlying recursor has a csimp rule.
+const SPECIAL_RECURSORS: [[&str; 2]; 7] = [
     ["Eq", "rec"],
+    ["Eq", "recOn"],
     ["HEq", "rec"],
     ["And", "rec"],
     ["Iff", "rec"],
@@ -105,6 +107,23 @@ fn type_former_motive(motive: &Expr) -> bool {
 }
 
 impl Context {
+    /// Track both ordinary constants and constants with explicit universe arguments.
+    /// Elaboration's own eliminations construct their recursor constants directly.
+    pub(super) fn note_resolved_recursor(
+        &mut self,
+        name: &Name,
+        info: &ConstantInfo,
+    ) -> Result<(), NatDefinitionElabError> {
+        if matches!(info, ConstantInfo::Rec(_))
+            || (matches!(info, ConstantInfo::Defn(_))
+                && matches!(name.leaf_view(), LeafView::Str("recOn"))
+                && self.is_auxiliary_recursor(name)?)
+        {
+            self.note_source_recursor(name);
+        }
+        Ok(())
+    }
+
     /// Record a recursor the source names, for [`Self::check_compiled_recursors`].
     pub(super) fn note_source_recursor(&mut self, name: &Name) {
         if !self.source_recursors.contains(name) {
@@ -149,6 +168,11 @@ impl Context {
                     args.reverse();
                     if let ExprNode::Const { name, levels } = head.node() {
                         if named.contains(name) && self.compiled_application(name, levels, &args) {
+                            if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
+                                return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
+                                    name.clone(),
+                                )));
+                            }
                             return Err(failure(SourceInferenceError::UnsupportedRecursor(
                                 name.clone(),
                             )));
@@ -176,8 +200,19 @@ impl Context {
     /// Whether an application of the recursor `name` at `levels` to `args` produces data
     /// the pin compiles: neither a proof nor a type.
     fn compiled_application(&self, name: &Name, levels: &[Level], args: &[Expr]) -> bool {
-        let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(name) else {
-            return false;
+        let recursor = match self.txn.env.find(name) {
+            Some(ConstantInfo::Rec(recursor)) => recursor,
+            // Only explicitly tagged recOn definitions enter source_recursors.
+            // Reordering its major/minor premises leaves the motive positions
+            // and elimination universe identical to the original recursor.
+            Some(ConstantInfo::Defn(_)) => {
+                let recursor_name = Name::str(name.parent(), "rec");
+                let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(&recursor_name) else {
+                    return true;
+                };
+                recursor
+            }
+            _ => return false,
         };
         let family = name.parent();
         let Some(ConstantInfo::Induct(inductive)) = self.txn.env.find(&family) else {

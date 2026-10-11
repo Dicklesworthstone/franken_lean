@@ -1,5 +1,5 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! protected-declaration, extern and implemented_by attribute journals.
+//! protected-declaration, auxiliary-recursor, extern and implemented_by journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -16,7 +16,7 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
+    ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
     IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION,
     SIMP_EXTENSION,
 };
@@ -116,6 +116,9 @@ pub struct SourceExtensions {
     /// `protected` declarations (the pin's `protectedExt`): each entry names one
     /// declaration its own module tagged. A name tagged twice is refused.
     pub protected: Vec<Name>,
+    /// Generated auxiliary recursors (the pin's `auxRecExt`), recorded only by
+    /// their owning module. A suffix alone never supplies this metadata.
+    pub aux_recursors: Vec<Name>,
     /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
     pub reducibility: Vec<ReducibilityEntry>,
     /// Explicit extern bindings. Consumers must validate their declarations and
@@ -420,6 +423,7 @@ pub fn decode(
         name(format::REDUCIBILITY_EXTENSION),
         name(format::EXTERN_EXTENSION),
         name(format::IMPLEMENTED_BY_EXTENSION),
+        name(format::AUX_RECURSOR_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -432,6 +436,7 @@ pub fn decode(
     };
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();
+    let mut aux_recursors = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
             return Err(shape("duplicate extension block"));
@@ -482,7 +487,14 @@ pub fn decode(
                         implementation: pair.declaration,
                     });
                 }
-                _ => unreachable!("nine selected extension families"),
+                9 => {
+                    let declaration = reader.name(&obj)?;
+                    if !aux_recursors.insert(declaration.clone()) {
+                        return Err(shape("auxiliary recursor tagged twice"));
+                    }
+                    out.aux_recursors.push(declaration);
+                }
+                _ => unreachable!("ten selected extension families"),
             }
         }
     }

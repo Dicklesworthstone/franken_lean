@@ -147,6 +147,9 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
             )
             | SourceInferenceError::ProtectedJournal(
                 fln_elab::protected_names::ProtectedError::Malformed,
+            )
+            | SourceInferenceError::AuxiliaryJournal(
+                fln_elab::aux_recursors::AuxRecursorError::Malformed,
             ) => ("internal-fault", false, 4),
             SourceInferenceError::ResourceLimit
             | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
@@ -155,6 +158,12 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
             )
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
             | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)
+            | SourceInferenceError::Auxiliary(
+                fln_elab::inductive::auxiliaries::AuxiliaryError::ResourceLimit,
+            )
+            | SourceInferenceError::AuxiliaryJournal(
+                fln_elab::aux_recursors::AuxRecursorError::Limit,
+            )
             | SourceInferenceError::InstanceRegistry(
                 fln_elab::instances::InstanceRegistryError::Limit,
             ) => ("resource", false, 3),

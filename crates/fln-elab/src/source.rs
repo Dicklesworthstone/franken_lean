@@ -64,6 +64,7 @@ pub enum SourceInferenceError {
     Recursion(recursion::RecursionError),
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
+    Auxiliary(crate::inductive::auxiliaries::AuxiliaryError),
     Deriving(deriving::DerivingError),
     EvaluationPrinting(evaluation::PrintingError),
     UnknownConstant(Name),
@@ -121,12 +122,15 @@ pub enum SourceInferenceError {
     /// A compiled declaration applies a recursor the pin's code generator does not
     /// support (`codegen.rs`, bead `franken_lean-z8j.1.6.6`).
     UnsupportedRecursor(Name),
+    /// A generated recOn has no compiled LCNF signature at the pin.
+    AuxiliaryNotCompiled(Name),
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     Option(scope::options::OptionRefusal),
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
     ProtectedJournal(crate::protected_names::ProtectedError),
+    AuxiliaryJournal(crate::aux_recursors::AuxRecursorError),
     ResourceLimit,
     /// Private inspection stopped at a source boundary; never an admitted declaration.
     ObservationComplete,
@@ -256,6 +260,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
+            Self::Auxiliary(error) => write!(f, "{error}"),
             Self::Deriving(error) => write!(f, "{error}"),
             Self::EvaluationPrinting(error) => write!(f, "{error}"),
             Self::Option(error) => write!(f, "{error}"),
@@ -347,6 +352,11 @@ impl std::fmt::Display for SourceInferenceError {
                 "code generator does not support recursor `{}` yet, consider using 'match ... with' and/or structural recursion",
                 name.to_display_string()
             ),
+            Self::AuxiliaryNotCompiled(name) => write!(
+                f,
+                "Failed to find LCNF signature for {}",
+                name.to_display_string()
+            ),
             Self::InvalidInstanceBinder => write!(
                 f,
                 "instance binder must end in a registered class with inferable parameters"
@@ -354,6 +364,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
             Self::ProtectedJournal(error) => write!(f, "{error}"),
+            Self::AuxiliaryJournal(error) => write!(f, "{error}"),
             Self::ObservationComplete => {
                 write!(f, "source observation completed without admission")
             }
@@ -519,6 +530,9 @@ struct Context {
     // Imported `protected` declarations, re-read on the same terms: an atomic
     // identifier never reaches one through a namespace or an alias.
     protected_cache: crate::protected_names::ProtectedCache,
+    // Only explicitly generated/imported auxiliary declarations receive the
+    // pin's eliminator elaboration; a declaration's suffix is insufficient.
+    auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -593,6 +607,7 @@ impl Context {
             registry_cache: crate::instances::RegistryCache::default(),
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
+            auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,
@@ -664,11 +679,7 @@ impl Context {
             .find(name)
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
-        // Elaboration's own eliminations build their recursor constants directly; one
-        // resolved here is the source's.
-        if matches!(info, fln_env::constants::ConstantInfo::Rec(_)) {
-            self.note_source_recursor(name);
-        }
+        self.note_resolved_recursor(name, &info)?;
         let base = info.constant_val();
         let mut levels = Vec::new();
         for _ in &base.level_params {
@@ -4287,6 +4298,7 @@ impl Context {
         self.registry_cache = crate::instances::RegistryCache::default();
         self.alias_cache = crate::aliases::AliasCache::default();
         self.protected_cache = crate::protected_names::ProtectedCache::default();
+        self.auxiliary_cache = crate::aux_recursors::AuxRecursorCache::default();
         Ok(())
     }
 }

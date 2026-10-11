@@ -291,5 +291,6 @@ fn admission_root_includes_the_default_registration_and_helpers() {
         Some(&helper)
     );
     assert!(result.engine.environment().contains(&helper));
-    assert_eq!(result.admissions.len(), 3);
+    // The block, projection, default helper, recOn, and casesOn.
+    assert_eq!(result.admissions.len(), 5);
 }

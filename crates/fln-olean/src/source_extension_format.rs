@@ -15,6 +15,7 @@
 //! src/Lean/ReducibilityAttrs.lean: sha256 8d11c2c5d9217eb7034426217b2075526ca4e55f1fdb73d8475d5034f3a6b1a2
 //! src/Lean/Compiler/ExternAttr.lean: sha256 b7fc317ef4457ee6383d2c85a264361b1960d0ce1109c8d2fe5901144d323345
 //! src/Lean/Compiler/ImplementedByAttr.lean: sha256 fec5d936a52cdbac96173249c9ad2028c2be3a049d380fdc0c84da5b4116640f
+//! src/Lean/AuxRecursor.lean: sha256 c004ddcbd0d6475550e701e30b8035e146132f8f7c8d3d5c8486c1f465a6ff9f
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -76,6 +77,7 @@ pub const PROD_SND: usize = 1;
 pub const PROD_POINTERS: usize = 2;
 pub const PROD_SCALAR_BYTES: usize = 0;
 pub const PROTECTED_EXTENSION: &str = "Lean.protectedExt";
+pub const AUX_RECURSOR_EXTENSION: &str = "Lean.auxRecExt";
 pub const KEY_STAR: u8 = 0;
 pub const KEY_OTHER: u8 = 1;
 pub const KEY_LIT: u8 = 2;

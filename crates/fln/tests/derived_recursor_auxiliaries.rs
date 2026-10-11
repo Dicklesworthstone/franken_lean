@@ -3,8 +3,12 @@
 #![forbid(unsafe_code)]
 
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln_core::expr::{BinderInfo, Expr, FVarId};
+use fln_core::level::Level;
 use fln_core::name::{LeafView, Name};
 use fln_elab::inductive::auxiliaries::{AuxiliaryError, cases_on_declaration, rec_on_declaration};
+use fln_elab::inductive::{ConstructorSpec, InductiveSpec, inductive_declaration};
+use fln_elab::lctx::LocalDecl;
 use fln_elab::records::RecordBudget;
 use fln_env::constants::{ConstantInfo, DefinitionVal, InductiveVal, RecursorVal};
 use fln_olean::decl::{ChainLimits, DeclDecoder, decode_chain_constants_from_parts};
@@ -218,6 +222,16 @@ fn install_auxiliaries(mut engine: Engine, names: &[&str]) -> Engine {
             cases_on_declaration(ind, &rec, &families, generation_budget()).unwrap(),
         ];
         for candidate in candidates {
+            if let Some(existing) = engine.environment().find(&candidate.base.name) {
+                let ConstantInfo::Defn(existing) = existing else {
+                    panic!("a published auxiliary must be a definition");
+                };
+                assert_eq!(
+                    existing, &candidate,
+                    "ordinary source publication preserves the raw generator candidate"
+                );
+                continue;
+            }
             engine = engine
                 .admit_declaration(
                     fln::Declaration::Defn(candidate),
@@ -239,10 +253,51 @@ fn generated_case_analysis_and_recursion_compute_through_both_seats() {
         .unwrap()
         .into_complete()
         .unwrap();
-    let engine = checked(
-        &engine,
-        "inductive Chain where | nil | cons (head : Nat) (tail : Chain)",
-    );
+    // Deliberately enter through primitive candidate admission here. Ordinary
+    // source now publishes auxiliary definitions itself; this still exercises
+    // explicit independent admission of the raw generator's two candidates.
+    let field = |s: &str, type_: Expr, index| LocalDecl {
+        id: FVarId(name(s)),
+        user_name: name(s),
+        type_,
+        value: None,
+        binder_info: BinderInfo::Default,
+        index,
+    };
+    let declaration = inductive_declaration(
+        &InductiveSpec {
+            name: name("Chain"),
+            level_params: Vec::new(),
+            parameters: Vec::new(),
+            indices: Vec::new(),
+            constructors: vec![
+                ConstructorSpec {
+                    name: name("nil"),
+                    fields: Vec::new(),
+                    result_indices: Vec::new(),
+                },
+                ConstructorSpec {
+                    name: name("cons"),
+                    fields: vec![
+                        field("head", Expr::const_(name("Nat"), Vec::new()), 0),
+                        field("tail", Expr::const_(name("Chain"), Vec::new()), 1),
+                    ],
+                    result_indices: Vec::new(),
+                },
+            ],
+            result_level: Level::one(),
+        },
+        generation_budget(),
+    )
+    .unwrap();
+    let engine = engine
+        .admit_declaration(declaration, &KVMap::new(), admission_limits())
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    assert!(!engine.environment().contains(&name("Chain.casesOn")));
+    assert!(!engine.environment().contains(&name("Chain.recOn")));
     let original = engine.logical_root(&KVMap::new());
     let generated = install_auxiliaries(engine.clone(), &["Chain"]);
     assert_eq!(
