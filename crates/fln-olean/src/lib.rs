@@ -40,6 +40,7 @@ pub mod decl;
 pub mod extension_write;
 pub mod format;
 pub mod ilean;
+pub mod initializers;
 pub mod ir;
 pub mod ir_files;
 mod ir_format;
