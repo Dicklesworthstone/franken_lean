@@ -9,8 +9,9 @@
 //!   the import activates the tags, and an atomic identifier never resolves to a
 //!   protected declaration through a namespace or `open` (bead `fln-eq4k`).
 //!
-//! Every program's expected verdict is the pinned Reference's own, each run alone
-//! after `prelude` and `import Init.Core`:
+//! The import and overload verdicts below are checked against the pinned
+//! Reference, each run alone after `prelude` and `import Init.Core`. Additional
+//! conservative controls exercise cases native synthesis cannot yet settle:
 //!
 //! ```text
 //! ulimit -v 40000000
@@ -22,8 +23,8 @@
 
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
-    OleanModuleInput, Outcome, SourceCheckLimits,
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, Environment, KVMap, Name,
+    OleanCheckLimits, OleanModuleInput, Outcome, SourceCheckLimits,
 };
 use std::path::{Path, PathBuf};
 
@@ -438,6 +439,18 @@ fn imported_overloads_are_ambiguous_unless_the_type_chooses_as_at_the_pin() {
             let limits =
                 SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
             let root = engine.logical_root(&KVMap::new());
+            // Rigid/noncanonical coercion failures still provide no new
+            // overload evidence. Do not blanket-filter ExpectedFunction.
+            let undetermined = "def foo (n : Nat) : Nat := n\nnamespace P\ndef foo : Nat := 1\nend P\nopen P\ndef bar : Nat := foo 0";
+            let refused = engine
+                .check_source_files(&[undetermined.as_bytes()], &KVMap::new(), limits)
+                .expect_err("an unsupported candidate must remain undetermined");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("can be neither established nor ruled out"),
+                "{undetermined}: {refused:?}"
+            );
             for source in OVERLOAD_AMBIGUOUS {
                 let refused = engine
                     .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
@@ -488,6 +501,175 @@ fn imported_overloads_are_ambiguous_unless_the_type_chooses_as_at_the_pin() {
                     other.to_display_string()
                 );
             }
+            // Init exports polymorphic `read` and `get`. Their implicit
+            // telescopes end in an unknown monadic carrier when used as these
+            // ordinary functions; Init provides no CoeFun instances for the
+            // pin's terminal coercion attempt. The root interpretation must
+            // remain available without restoring root-name precedence.
+            for (name, imported) in [("read", "MonadReader.read"), ("get", "MonadState.get")] {
+                let source =
+                    format!("def {name} (n : Nat) : Nat := n + 2\ndef bar : Nat := {name} 40");
+                let checked = engine
+                    .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
+                    .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                    .into_complete()
+                    .expect("complete imported overload check");
+                let Some(fln_env::constants::ConstantInfo::Defn(bar)) = checked
+                    .engine
+                    .environment()
+                    .find(&Name::from_components(["bar"]))
+                else {
+                    panic!("bar is an admitted definition");
+                };
+                assert!(mentions(&bar.value, &Name::from_components([name])));
+                assert!(!mentions(
+                    &bar.value,
+                    &Name::from_components(imported.split('.'))
+                ));
+            }
+            // Exercise the two complete source programs that exposed this
+            // Init regression, including structural recursion and the Item
+            // dictionary inferred for the user's `get`.
+            let executed = engine
+                .execute_source_commands_with_checks(
+                    include_bytes!("../../../examples/native_indexed_function_children.lean"),
+                    &KVMap::new(),
+                    EngineExecutionLimits::new(limits.admission.kernel),
+                )
+                .expect("Init must check and execute the indexed regression program")
+                .into_complete()
+                .expect("indexed regression execution completes");
+            assert_eq!(executed.batch.source_evaluation_indices.len(), 1);
+            let index = executed.batch.source_evaluation_indices[0];
+            let fln::VmExit::Returned(returned) = &executed.batch.executions[index].exit else {
+                panic!("the indexed regression must return a Nat");
+            };
+            assert_eq!(
+                fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
+                Some("42")
+            );
+            let checked = engine.check_source_files(
+                &[include_bytes!("../../../examples/native_term_binders.lean")],
+                &KVMap::new(),
+                limits,
+            );
+            assert!(
+                matches!(checked, Ok(Outcome::Complete(_))),
+                "Init must elaborate the term-binder regression program: {checked:?}"
+            );
+            // A genuinely unavailable initial callee still waits for its
+            // containing argument. Imported CoeFun metadata must not turn
+            // this suspension into an overload or tactic failure.
+            let delayed = "def use {A : Type} (run : A -> Nat) (value : A) : Nat := run value
+              def bar : Nat := use (fun f => f 20) (fun n => n + 22)
+              theorem computes : bar = 42 := by rfl";
+            let checked = engine.check_source_files(&[delayed.as_bytes()], &KVMap::new(), limits);
+            assert!(matches!(checked, Ok(Outcome::Complete(_))), "{checked:?}");
+            // A nested overload trial has its own empty argument queue. Its
+            // caller can nevertheless have synthetic work waiting to run, so
+            // the absence of CoeFun providers is not yet terminal evidence.
+            let consume = "def consume {A : Type} (value : A -> Nat) (answer : Nat) : Nat := answer
+              def read (n : Nat) : Nat := n + 2\n";
+            let pending = format!("{consume}def bar : Nat := consume (fun f => f 20) (read 40)");
+            let error = engine
+                .check_source_files(&[pending.as_bytes()], &KVMap::new(), limits)
+                .expect_err("an enclosing pending argument vetoes terminal overload evidence");
+            assert!(
+                error
+                    .to_string()
+                    .contains("can be neither established nor ruled out"),
+                "{pending}: {error:?}"
+            );
+            let resolved = format!(
+                "{consume}def bar : Nat := consume (fun (f : Nat -> Nat) => f 20) (read 40)
+                 theorem computes : bar = 42 := by rfl"
+            );
+            let checked = engine.check_source_files(&[resolved.as_bytes()], &KVMap::new(), limits);
+            assert!(
+                matches!(checked, Ok(Outcome::Complete(_))),
+                "the same overload without pending work must complete: {checked:?}"
+            );
+            // Q.make's implicit dictionary determines A only after its earlier
+            // callback suspended. Resuming that callback can then reveal that
+            // B is a function. Empty CoeFun search must not silently select the
+            // root interpretation before the awakened callback is processed.
+            let awakened = "class Pick (key : Type) (A : outParam Type) where
+                value : A
+              instance pick : Pick Nat (Nat -> Nat) := { value := fun n => n + 41 }
+              def make (run : (Nat -> Nat) -> Nat -> Nat) (n : Nat) : Nat :=
+                run (fun x => x) n
+              namespace Q
+              def make {A B : Type} (run : A -> B) [i : Pick Nat A] : B :=
+                run (@Pick.value Nat A i)
+              end Q
+              open Q
+              def bar : Nat := make (fun f => let x := f 0; fun n : Nat => x + n) 1";
+            let error = engine
+                .check_source_files(&[awakened.as_bytes()], &KVMap::new(), limits)
+                .expect_err("a ready callback can still expose the alternate function type");
+            assert!(
+                error
+                    .to_string()
+                    .contains("can be neither established nor ruled out"),
+                "{awakened}: {error:?}"
+            );
+            // A provider can match without determining the unknown carrier.
+            // Its presence must veto empty-search evidence, even where this
+            // elaborator cannot yet complete the resulting inference. Include
+            // scoped and ordinary-local dictionaries, not only globals.
+            for providers in [
+                "instance anyCallable (A : Type) : CoeFun A (fun _ => Nat -> Nat) :=
+                   { coe := fun _ n => n }\n",
+                "namespace Scoped
+                 def anyCallable (A : Type) : CoeFun A (fun _ => Nat -> Nat) :=
+                   { coe := fun _ n => n }
+                 attribute [scoped instance] anyCallable
+                 end Scoped
+                 open scoped Scoped\n",
+            ] {
+                let source = format!(
+                    "{providers}def read (n : Nat) : Nat := n + 2\ndef bar : Nat := read 40"
+                );
+                let error = engine
+                    .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
+                    .expect_err(
+                        "a CoeFun provider makes the alternate interpretation undetermined",
+                    );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("can be neither established nor ruled out"),
+                    "{source}: {error:?}"
+                );
+            }
+            for binder in [
+                "[CoeFun Nat (fun _ => Nat -> Nat)]",
+                "(dictionary : CoeFun Nat (fun _ => Nat -> Nat))",
+            ] {
+                let source =
+                    format!("def read (n : Nat) : Nat := n + 2\ndef bar {binder} : Nat := read 40");
+                let error = engine
+                    .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
+                    .expect_err("a possible local provider vetoes empty-search evidence");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("can be neither established nor ruled out"),
+                    "{source}: {error:?}"
+                );
+            }
+            // Rigid/noncanonical coercion failures still provide no new
+            // overload evidence. Do not blanket-filter ExpectedFunction.
+            let undetermined = "def foo (n : Nat) : Nat := n\nnamespace P\ndef foo : Nat := 1\nend P\nopen P\ndef bar : Nat := foo 0";
+            let refused = engine
+                .check_source_files(&[undetermined.as_bytes()], &KVMap::new(), limits)
+                .expect_err("an unsupported candidate must remain undetermined");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("can be neither established nor ruled out"),
+                "{undetermined}: {refused:?}"
+            );
             assert_eq!(engine.logical_root(&KVMap::new()), root);
         })
         .expect("spawn the checking thread")

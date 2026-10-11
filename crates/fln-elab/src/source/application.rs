@@ -19,6 +19,7 @@ pub(super) enum ApplicationValue<'a> {
 
 pub(super) struct NamedApplication<'a> {
     function: Typed,
+    initial: bool,
     positional: VecDeque<ApplicationValue<'a>>,
     named: Vec<Named<'a>>,
     explicit: bool,
@@ -31,6 +32,18 @@ pub(super) struct NamedApplication<'a> {
 impl NamedApplication<'_> {
     pub(super) fn function_type(&self) -> &Expr {
         &self.function.type_
+    }
+
+    pub(super) fn initial(&self) -> bool {
+        self.initial
+    }
+
+    pub(super) fn start(&mut self) {
+        self.initial = false;
+    }
+
+    pub(super) fn has_arguments(&self) -> bool {
+        !self.positional.is_empty() || !self.named.is_empty()
     }
 }
 
@@ -93,6 +106,7 @@ impl Context {
         }
         Ok(NamedApplication {
             function,
+            initial: true,
             positional,
             named,
             explicit,

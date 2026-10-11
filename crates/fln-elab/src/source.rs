@@ -102,6 +102,11 @@ pub enum SourceInferenceError {
     InvalidFieldReceiver(Name),
     LevelSyntax(LevelSyntaxError),
     ExpectedFunction,
+    /// Argument processing exhausted a known function telescope, and the
+    /// pin's imported `CoeFun` has no active global, scoped or local provider.
+    /// Unlike an initially unknown callee, this is the pin's terminal
+    /// `synthesizePendingAndNormalizeFunType` refusal, not a postponement.
+    FunctionCoercionAbsent,
     ExpectedType,
     RecordTerm(record_terms::RecordTermError),
     Record(crate::records::RecordError),
@@ -326,7 +331,9 @@ impl std::fmt::Display for SourceInferenceError {
                 "field notation requires a usable parameter with type head `{}`",
                 name.to_display_string()
             ),
-            Self::ExpectedFunction => write!(f, "source application requires a function type"),
+            Self::ExpectedFunction | Self::FunctionCoercionAbsent => {
+                write!(f, "source application requires a function type")
+            }
             Self::Tactic(error) => write!(f, "{error}"),
             Self::Record(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
@@ -556,6 +563,10 @@ struct Context {
     // pin's synthetic metavariable errors. Tactic/recursion rollback restores
     // them; a selected declaration can never discard them or admit its holes.
     postponed_application_errors: Vec<NatDefinitionElabError>,
+    // Argument queues borrow syntax from their term worklist. Nested overload
+    // trials cannot own those queues, but must know that pending synthetic work
+    // may still reveal a function type before establishing terminal failure.
+    pending_source_arguments: bool,
     // Recursors the source names directly, which a compiled declaration may not apply
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
@@ -621,6 +632,7 @@ impl Context {
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_application_errors: Vec::new(),
+            pending_source_arguments: false,
             source_recursors: Vec::new(),
         }
     }
@@ -1474,8 +1486,10 @@ impl Context {
         // failed elaboration leaves its worklist before the closing frame.
         // Speculative retries restore their own complete Context checkpoints.
         let options = self.txn.options.clone();
+        let pending_source_arguments = self.pending_source_arguments;
         let result = self.term_prepared_scoped(syntax, expected, None);
         self.txn.options = options;
+        self.pending_source_arguments = pending_source_arguments;
         result
     }
 
@@ -1485,8 +1499,10 @@ impl Context {
         proof: tactics::ProofState<'a>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let options = self.txn.options.clone();
+        let pending_source_arguments = self.pending_source_arguments;
         let result = self.term_prepared_scoped(syntax, None, Some(proof));
         self.txn.options = options;
+        self.pending_source_arguments = pending_source_arguments;
         result
     }
 
@@ -1562,6 +1578,7 @@ impl Context {
             ForCollection(Option<Expr>),
             Argument(Typed, Expr, Arguments<'a>, Option<Expr>, bool),
             Apply(Typed, Arguments<'a>, Option<Expr>, bool),
+            ApplyNext(Typed, Arguments<'a>, Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
             Operator(operators::OperatorTree<'a>, Option<Expr>),
             Arrow(Option<Expr>),
@@ -1628,12 +1645,16 @@ impl Context {
             Argument(Box<postponed::Checkpoint<'a>>),
         }
         let mut attempts: Vec<Attempt<'_>> = Vec::new();
+        let inherited_pending_arguments = self.pending_source_arguments;
         let mut pending = postponed::Queue::default();
         loop {
             let mut blocked_application = None;
             let mut containing_argument = None;
+            let mut blocked_initial_application = None;
             let result = (|| {
                 loop {
+                    self.pending_source_arguments =
+                        inherited_pending_arguments || !pending.is_empty();
                     let closes_scope = matches!(
                         tasks.last(),
                         Some(
@@ -3026,6 +3047,25 @@ impl Context {
                             values.push(self.finish_term(collection, expected.as_ref())?);
                         }
                         Task::NamedNext(mut state) => {
+                            if state.initial() {
+                                if state.has_arguments()
+                                    && self
+                                        .application_type_unavailable(state.function_type())?
+                                        .is_some()
+                                {
+                                    self.resolve_instances(false)?;
+                                    if let Some(blocker) =
+                                        self.application_type_unavailable(state.function_type())?
+                                    {
+                                        blocked_application = Some(blocker);
+                                        blocked_initial_application = Some(Task::NamedNext(state));
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    }
+                                }
+                                state.start();
+                            }
                             let next = self.next_named_argument(&mut state);
                             if matches!(
                                 &next,
@@ -3034,6 +3074,11 @@ impl Context {
                                         | SourceInferenceError::InvalidNamedArgument(_)
                                 ))
                             ) {
+                                if self.function_coercion_is_absent(state.function_type())? {
+                                    return Err(failure(
+                                        SourceInferenceError::FunctionCoercionAbsent,
+                                    ));
+                                }
                                 blocked_application =
                                     self.application_type_unavailable(state.function_type())?;
                                 if blocked_application.is_some() {
@@ -3080,6 +3125,31 @@ impl Context {
                             tasks.push(Task::NamedNext(state));
                         }
                         Task::Apply(function, arguments, expected, explicit) => {
+                            if !arguments.is_empty()
+                                && self
+                                    .application_type_unavailable(&function.type_)?
+                                    .is_some()
+                            {
+                                // Known telescopes reach ordinary synthesis in
+                                // coerce_function. Only an unavailable initial
+                                // callee needs an earlier round here.
+                                self.resolve_instances(false)?;
+                                if let Some(blocker) =
+                                    self.application_type_unavailable(&function.type_)?
+                                {
+                                    // `elabAppArgs` postpones before consuming
+                                    // arguments. Keep this continuation in its
+                                    // lexical context; defaults can resume it
+                                    // when no containing argument owns the type.
+                                    blocked_application = Some(blocker);
+                                    blocked_initial_application =
+                                        Some(Task::Apply(function, arguments, expected, explicit));
+                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                }
+                            }
+                            tasks.push(Task::ApplyNext(function, arguments, expected, explicit));
+                        }
+                        Task::ApplyNext(function, arguments, expected, explicit) => {
                             if let Some((first, rest)) = arguments.split_first() {
                                 let function = if explicit {
                                     function
@@ -3097,6 +3167,11 @@ impl Context {
                                         SourceInferenceError::ExpectedFunction
                                     ))
                                 ) {
+                                    if self.function_coercion_is_absent(&callee_type)? {
+                                        return Err(failure(
+                                            SourceInferenceError::FunctionCoercionAbsent,
+                                        ));
+                                    }
                                     blocked_application =
                                         self.application_type_unavailable(&callee_type)?;
                                 }
@@ -3134,7 +3209,7 @@ impl Context {
                         Task::Argument(function, codomain, rest, expected, explicit) => {
                             let argument = values.pop().expect("argument task follows its visit");
                             let type_ = self.substitute(&codomain, &argument.value)?;
-                            tasks.push(Task::Apply(
+                            tasks.push(Task::ApplyNext(
                                 Typed {
                                     value: Expr::app(function.value, argument.value),
                                     type_,
@@ -3554,6 +3629,16 @@ impl Context {
                             }
                         }
                         if containing_argument.is_none() {
+                            if let Some(application) = blocked_initial_application
+                                && self.resolve_next_default_instance()?
+                            {
+                                // The pin retries postponed initial applications
+                                // between default-instance rounds. Do not close
+                                // their locals, drop pending argument work, or
+                                // refund the unsuccessful attempt's budget.
+                                tasks.push(application);
+                                continue;
+                            }
                             return Err(problem);
                         }
                     }

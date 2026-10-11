@@ -474,6 +474,72 @@ impl Context {
         }
     }
 
+    /// The pin's application loop distinguishes an unavailable *initial*
+    /// function type (`elabAppArgs.tryPostponeIfMVar`) from a telescope that
+    /// runs out during argument processing. The latter first synthesizes
+    /// pending instances, then calls `coerceToFunction?` and fails if it cannot
+    /// produce a function (`App.synthesizePendingAndNormalizeFunType`).
+    ///
+    /// Unknown inputs alone are NOT failure evidence: a generic CoeFun provider
+    /// can match without assigning them. Only an empty provider population is
+    /// decisive here. Read active scoped registrations too; a possible local
+    /// instance or an unknown local type vetoes the proof. A seed class, a rigid
+    /// carrier and every nonempty/unsupported coercion search give no evidence.
+    /// Pending arguments (including a caller's queue), eliminators or equations
+    /// also veto it: the pin synthesizes those before trying CoeFun, and they
+    /// may still reveal a function without any coercion.
+    /// Call only after ordinary synthesis/coercion failed, and never for the
+    /// initial application postponement.
+    pub(in crate::source) fn function_coercion_is_absent(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.pending_source_arguments
+            || !self.postponed_eliminators.is_empty()
+            || !self.equations.is_empty()
+            || self.application_type_unavailable(type_)?.is_none()
+        {
+            return Ok(false);
+        }
+        let class = Name::from_components(["CoeFun"]);
+        let registry =
+            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+                .map_err(registry_error)?;
+        if !self.txn.env.contains(&class)
+            || registry.imported_class_parameters(&class).is_none()
+            || !registry.candidates(&class).is_empty()
+        {
+            return Ok(false);
+        }
+        for local in self.txn.lctx.decls().to_vec() {
+            self.tick()?;
+            if local.binder_info == BinderInfo::InstImplicit {
+                return Ok(false);
+            }
+            let type_ = self.whnf_with_transparency(
+                &local.type_,
+                UnificationTransparency::Abbreviations,
+                false,
+            )?;
+            if type_.has_expr_mvar() || type_.has_level_mvar() {
+                return Ok(false);
+            }
+            // Ordinary function parameters are not local instances. Every
+            // other local must have a known head outside the CoeFun class.
+            if matches!(
+                type_.node(),
+                ExprNode::ForallE { .. } | ExprNode::Sort { .. }
+            ) {
+                continue;
+            }
+            match operators::spine(&type_).0.node() {
+                ExprNode::Const { name, .. } if name != &class => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     pub(in crate::source) fn coerce_expected(
         &mut self,
         term: Typed,

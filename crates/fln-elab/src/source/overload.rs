@@ -30,6 +30,11 @@
 //! `coercions::rigid_type_mismatch`, bead fln-azxg) or a completed `NotDefEq`
 //! conversion refusal reaches that evidence sooner. Both rule an interpretation
 //! out only when the coercion classes are the pin's.
+//! A distinct terminal function-application refusal is also shared: after a
+//! known telescope runs out, no active global, scoped or possible local CoeFun
+//! provider exists in the imported class registry. Unknown inputs alone are
+//! insufficient evidence; any provider vetoes this empty-search proof. An initially
+//! unknown callee remains postponed/undetermined, as does generic ExpectedFunction.
 //!
 //! Every other non-success leaves the interpretation undetermined, and the identifier
 //! is refused rather than resolved by guessing:
@@ -119,6 +124,14 @@ impl Context {
         let term = match self.term_prepared(syntax, expected.cloned()) {
             Ok(term) => term,
             Err(error) => {
+                if matches!(
+                    &error,
+                    NatDefinitionElabError::Inference(SourceInferenceError::FunctionCoercionAbsent)
+                ) {
+                    return Ok(Some(Err(
+                        "function type is unavailable after argument inference".to_owned(),
+                    )));
+                }
                 let mismatch = matches!(
                     &error,
                     NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. })

@@ -34,6 +34,10 @@ pub(in crate::source) struct Queue<'a> {
 }
 
 impl<'a> Queue<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.arguments.is_empty()
+    }
+
     pub fn has_current_scope(&self, context: &mut Context) -> Result<bool, NatDefinitionElabError> {
         for argument in &self.arguments {
             context.tick()?;

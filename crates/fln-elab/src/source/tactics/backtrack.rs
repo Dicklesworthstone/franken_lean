@@ -130,6 +130,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
         NatDefinitionElabError::Inference(
             SourceInferenceError::UnknownConstant(_)
             | SourceInferenceError::ExpectedFunction
+            | SourceInferenceError::FunctionCoercionAbsent
             | SourceInferenceError::ExpectedType
             | SourceInferenceError::Match(_)
             | SourceInferenceError::Recursion(_)
