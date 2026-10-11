@@ -360,6 +360,8 @@ pub(crate) fn tactic(
             "decreasing_tactic",
             // `syntax (name := guardTarget) "guard_target " equal term : tactic` (`Init/Guard.lean:75`).
             "guard_target",
+            // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`).
+            "admit",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word])),
@@ -370,6 +372,7 @@ pub(crate) fn tactic(
         TokenKind::Symbol(symbol) if symbol == "show" => Some("show"),
         // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`).
         TokenKind::Symbol(symbol) if symbol == "sorry" => Some("sorry"),
+        TokenKind::Symbol(symbol) if symbol == "admit" => Some("admit"),
         _ => None,
     };
     let Some(keyword) = keyword else {
@@ -633,6 +636,7 @@ fn local_tactic(
         | "infer_instance"
         | "exfalso"
         | "sorry"
+        | "admit"
         | "done"
         | "subst_eqs"
         | "get_elem_tactic"
@@ -740,6 +744,7 @@ fn local_tactic(
         "infer_instance" => "tacticInfer_instance",
         "exfalso" => "tacticExfalso",
         "sorry" => "tacticSorry",
+        "admit" => "tacticAdmit",
         "norm_cast" => "tacticNorm_cast__",
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",

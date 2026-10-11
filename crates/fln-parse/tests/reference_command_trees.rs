@@ -403,6 +403,11 @@ const SORRIES: &[Accepted] = &[
         source: "theorem u : Eq 2 2 := by sorry",
         tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `u []) (Command.declSig [] (Term.typeSpec ":" (Term.app `Eq [(num "2") (num "2")]))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticSorry "sorry")]))) (Termination.suffix [] []) [])))"#,
     },
+    // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`), captured the same way.
+    Accepted {
+        source: "theorem u : Eq 2 2 := by admit",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `u []) (Command.declSig [] (Term.typeSpec ":" (Term.app `Eq [(num "2") (num "2")]))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticAdmit "admit")]))) (Termination.suffix [] []) [])))"#,
+    },
 ];
 
 const AXIOM_REFUSALS: &[Refused] = &[Refused {

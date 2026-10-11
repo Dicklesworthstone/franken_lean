@@ -1072,16 +1072,28 @@ impl Context {
                 expect_atom(keyword, "symm", "symmetry tactic")?;
                 expect_empty_null(location, "goal-only symmetry location")?;
                 self.symmetrize_proof_goal(proof, goal)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticSorry"]) {
-                // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`).
-                // A world whose imports do not reach `Init.Tactics` lacks the macro, and the
-                // pin reads `sorry` there as an unexpected token.
+            } else if kind == &parser_kind(&["Tactic", "tacticSorry"])
+                || kind == &parser_kind(&["Tactic", "tacticAdmit"])
+            {
+                // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`),
+                // and `macro "admit" : tactic => `(tactic| sorry)` beside it. A world whose
+                // imports do not reach `Init.Tactics` lacks the macro, and the pin reads the
+                // word there as an unexpected token.
+                let admit = kind == &parser_kind(&["Tactic", "tacticAdmit"]);
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                expect_atom(keyword, "sorry", "sorry tactic")?;
-                let macro_syntax =
-                    Name::from_components(["Lean", "Parser", "Tactic", "tacticSorry"]);
+                expect_atom(
+                    keyword,
+                    if admit { "admit" } else { "sorry" },
+                    "sorry tactic",
+                )?;
+                let macro_syntax = Name::from_components([
+                    "Lean",
+                    "Parser",
+                    "Tactic",
+                    if admit { "tacticAdmit" } else { "tacticSorry" },
+                ]);
                 if !self.txn.env.contains(&macro_syntax) {
                     return Err(failure(SourceInferenceError::UnknownConstant(macro_syntax)));
                 }

@@ -893,6 +893,51 @@ fn the_sorry_tactic_exists_where_init_tactics_is_imported() {
     );
 }
 
+/// `admit` is `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`): it warns as
+/// the tactic `sorry` does where the imports reach it (the pin's bytes, compared with the pinned
+/// binary when present), and is refused where they stop at `Init.Prelude`.
+#[test]
+fn the_admit_tactic_is_the_sorry_tactic() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-admit-tactic");
+    let body = "theorem u : Eq 2 2 := by admit\ntheorem v : Eq 2 3 := by\n  admit\n";
+    let entry = workspace.write(
+        "Tactics.lean",
+        format!("prelude\nimport Init.Tactics\n{body}"),
+    );
+    let file = entry.display();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stderr.as_str()), (0, ""), "{ours:?}");
+    assert_eq!(
+        ours.stdout,
+        format!(
+            "{file}:3:8: warning: declaration uses `sorry`\n\
+             {file}:4:8: warning: declaration uses `sorry`\n"
+        )
+    );
+    if let Some(pinned) = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file())
+    {
+        let theirs = Command::new(pinned)
+            .arg(&entry)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .expect("run the pinned lean");
+        assert!(theirs.status.success(), "{theirs:?}");
+        assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+    }
+    let unreached = workspace.write(
+        "Prelude.lean",
+        format!("prelude\nimport Init.Prelude\n{body}"),
+    );
+    let refused = lean_door(&workspace, &unreached, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
 /// `#guard_msgs` is syntax `Init/Notation.lean` declares. A `prelude` file whose imports reach
 /// it judges its guard (the pin passes this one and prints nothing); one whose imports stop at
 /// `Init.Prelude` is refused, as the pin refuses it ("expected token", exit 1). Before the
