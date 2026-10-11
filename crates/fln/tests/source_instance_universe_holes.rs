@@ -43,6 +43,8 @@ fn instance_answers_keep_the_goals_universe_holes() {
         "def e [BEq α] (a b : α) : Bool := a == b\ntheorem t : e 1 1 = true := rfl\n",
         "def s {α : Sort u} [Inhabited α] : α := default\n",
         "variable {α} [Inhabited α]\ndef v : α := default\n",
+        // A universe hole in an input (`@Eq.{?u} α a b`) does not block `Decidable`.
+        "def dd [DecidableEq α] (a b : α) : Bool := decide (a = b)\ntheorem t : dd 1 2 = false := rfl\n",
     ] {
         check(source).unwrap_or_else(|error| panic!("{source}: {error}"));
     }

@@ -242,8 +242,11 @@ impl Context {
             }
             let erase_output = mode == ParameterMode::Output && erase_known_outputs;
             let selected = match mode {
+                // An unknown input blocks the goal. A universe hole does not: the pin searches
+                // under `withNewMCtxDepth (allowLevelAssignments := true)`, so `Inhabited PUnit.{?u}`
+                // is answered by `instInhabitedPUnit.{?u}`.
                 ParameterMode::Input => {
-                    if argument.has_expr_mvar() || argument.has_level_mvar() {
+                    if argument.has_expr_mvar() {
                         return Ok(None);
                     }
                     argument.clone()
