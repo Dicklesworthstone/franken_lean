@@ -10448,6 +10448,7 @@ fn executable_dependencies(
             .or_else(|| preparation.st_intrinsic_binding(&name))
             .or_else(|| preparation.io_intrinsic_binding(&name))
             .or_else(|| preparation.fs_intrinsic_binding(&name))
+            .or_else(|| preparation.float_intrinsic_binding(&name))
             .or_else(|| preparation.stdout_intrinsic_binding(&name))
             .or_else(|| preparation.string_push_intrinsic_binding(&name))
             .or_else(|| preparation.string_bootstrap_intrinsic_binding(&name))

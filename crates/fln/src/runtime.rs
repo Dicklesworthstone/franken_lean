@@ -77,6 +77,7 @@ pub(super) struct Preparation<'a> {
     st: st::Store,
     io: io::Store,
     fs: fs::Store,
+    floats: floats::Store,
     stdout: stdout::Store,
     string_bootstrap: string_bootstrap::Store,
     string_bytes: string_bytes::Store,
@@ -166,6 +167,7 @@ impl<'a> Preparation<'a> {
             st: st::Store::default(),
             io: io::Store::default(),
             fs: fs::Store::default(),
+            floats: floats::Store::default(),
             stdout: stdout::Store::default(),
             string_bootstrap: string_bootstrap::Store::default(),
             string_bytes: string_bytes::Store::default(),
@@ -525,6 +527,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(value) = self.imported_float_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(action) = self.stdout_call(&head, &args)? {
                             tasks.push(Task::Visit(action));
                             continue;
@@ -865,6 +871,10 @@ impl<'a> Preparation<'a> {
                             }
                             if let Some(action) = self.fs_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
+                                continue;
+                            }
+                            if let Some(value) = self.imported_float_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
                                 continue;
                             }
                             if let Some(action) = self.stdout_call(&expr, &[])? {
