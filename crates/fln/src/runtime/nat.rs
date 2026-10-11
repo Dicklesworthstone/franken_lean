@@ -227,17 +227,24 @@ impl Preparation<'_> {
             .checked_add(1)
             .ok_or_else(|| unsupported("Nat recursor identity"))?;
         let marker = FVarId(Name::num(name("_fln_runtime_nat_ih"), id));
+        // The successor's binder is one value, as the pin binds it: substituting
+        // its expression would compute the predecessor again at every use.
+        let predecessor_marker = FVarId(Name::num(name("_fln_runtime_nat_pred"), id));
         let major = variable(extra)?;
         let predecessor = self.nat_predecessor(major.clone())?;
-        let hypothesis = Expr::app(variable(extra + 1)?, predecessor.clone());
-        step = self.minor_apply(step, predecessor)?;
+        let hypothesis = Expr::app(variable(extra + 1)?, Expr::fvar(predecessor_marker.clone()));
+        step = self.minor_apply(step, Expr::fvar(predecessor_marker.clone()))?;
         step = self.minor_apply(step, Expr::fvar(marker.clone()))?;
         for index in (0..extra).rev() {
             let argument = variable(index)?;
             zero = self.minor_apply(zero, argument.clone())?;
             step = self.minor_apply(step, argument)?;
         }
-        if step.has_fvar() {
+        let body = step
+            .lift_loose(0, 1)
+            .and_then(|body| body.abstract_fvar(&marker, 0))
+            .map_err(|_| unsupported("Nat hypothesis scope"))?;
+        if body.has_loose_bvar(0) {
             // Share the recursive result when it is used more than once. An
             // unused IH was eliminated by beta reduction above, so ordinary
             // matching on a huge Nat still needs only one predecessor step.
@@ -251,11 +258,22 @@ impl Preparation<'_> {
                     BinderInfo::Default,
                 );
             }
-            let body = step
-                .lift_loose(0, 1)
-                .and_then(|body| body.abstract_fvar(&marker, 0))
-                .map_err(|_| unsupported("Nat hypothesis scope"))?;
             step = Expr::let_e(marker.0, hypothesis_type, hypothesis, body, false);
+        }
+        // Bound outside the hypothesis, whose recursive call reads it. An unused
+        // binder, with an unused hypothesis, computes no predecessor at all.
+        let body = step
+            .lift_loose(0, 1)
+            .and_then(|body| body.abstract_fvar(&predecessor_marker, 0))
+            .map_err(|_| unsupported("Nat predecessor scope"))?;
+        if body.has_loose_bvar(0) {
+            step = Expr::let_e(
+                predecessor_marker.0,
+                Expr::const_(name("Nat"), vec![]),
+                predecessor,
+                body,
+                false,
+            );
         }
         // Pattern discrimination belongs to the recursor's checked Nat
         // representation. Calling public Nat.beq here would let a recursive
