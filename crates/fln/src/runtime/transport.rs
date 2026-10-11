@@ -14,32 +14,12 @@ impl Preparation<'_> {
         if self.equality_family_checked {
             return Ok(());
         }
-        let Declaration::Inductive(block) = fln_elab::seed::eq_seed_declaration() else {
-            return Err(unsupported("equality seed"));
-        };
-        for expected in &block.types {
-            self.tick()?;
-            if !matches!(self.environment.find(&expected.base.name),
-                Some(ConstantInfo::Induct(actual)) if actual == expected)
-            {
-                return Err(unsupported("noncanonical equality family"));
-            }
-        }
-        for expected in &block.ctors {
-            self.tick()?;
-            if !matches!(self.environment.find(&expected.base.name),
-                Some(ConstantInfo::Ctor(actual)) if actual == expected)
-            {
-                return Err(unsupported("noncanonical equality constructor"));
-            }
-        }
-        for expected in &block.recursors {
-            self.tick()?;
-            if !matches!(self.environment.find(&expected.base.name),
-                Some(ConstantInfo::Rec(actual)) if actual == expected)
-            {
-                return Err(unsupported("noncanonical equality recursor"));
-            }
+        if !crate::source_intrinsics::equality_family_matches(
+            self.environment,
+            &mut self.visited,
+            self.limits,
+        )? {
+            return Err(unsupported("noncanonical equality family"));
         }
         self.equality_family_checked = true;
         Ok(())

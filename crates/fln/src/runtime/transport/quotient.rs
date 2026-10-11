@@ -7,17 +7,17 @@ use super::*;
 
 impl Preparation<'_> {
     fn check_quotient_family(&mut self) -> Result<(), IngressError> {
-        let Declaration::Quotient(expected) = fln_elab::seed::quotient_seed_declaration() else {
-            return Err(unsupported("quotient seed"));
-        };
-        for expected in expected {
-            self.tick()?;
-            if !matches!(self.environment.find(&expected.base.name),
-                Some(ConstantInfo::Quot(actual)) if actual == &expected)
-            {
-                return Err(unsupported("noncanonical quotient family"));
-            }
+        if self.quotient_family_checked {
+            return Ok(());
         }
+        if !crate::source_intrinsics::quotient_family_matches(
+            self.environment,
+            &mut self.visited,
+            self.limits,
+        )? {
+            return Err(unsupported("noncanonical quotient family"));
+        }
+        self.quotient_family_checked = true;
         Ok(())
     }
 

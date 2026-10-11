@@ -262,6 +262,14 @@ fn admitted_pin_matches_every_primitive_model_dependency() {
                 .into_complete()
                 .unwrap();
             let environment = imported.engine.environment();
+            assert!(
+                equality_family_matches(environment, &mut 0, IngressLimits::default()).unwrap(),
+                "the admitted pinned Eq family must authorize runtime transport"
+            );
+            assert!(
+                quotient_family_matches(environment, &mut 0, IngressLimits::default()).unwrap(),
+                "the admitted pinned quotient quartet must authorize runtime erasure"
+            );
             for operation in [
                 "Nat.pred",
                 "Nat.beq",
