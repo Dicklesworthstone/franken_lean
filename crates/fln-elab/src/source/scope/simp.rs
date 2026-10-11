@@ -112,6 +112,135 @@ fn compiler_hint(
     Ok(Some(requires_definition))
 }
 
+/// A reducibility attribute: `reducible`, `irreducible`, `semireducible`, `implicit_reducible` or its
+/// alias `instance_reducible` (vendored Lean/ReducibilityAttrs.lean). The pin refuses arguments
+/// (`ensureNoArgs`) and the `scoped` kind. `local` would need a section-scoped status, which this
+/// engine has no journal for, so it is refused too.
+fn reducibility_attribute(
+    attribute: &fln_syntax::tree::Syntax,
+) -> Result<Option<crate::reducibility::Reducibility>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    use crate::reducibility::Reducibility;
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    let Syntax::Node { kind, args, .. } = &instance[1] else {
+        return Ok(None);
+    };
+    if kind != &parser_kind(&["Attr", "simple"]) {
+        return Ok(None);
+    }
+    let [Syntax::Ident { val, .. }, argument] = args.as_slice() else {
+        return Ok(None);
+    };
+    let status = match val.to_display_string().as_str() {
+        "reducible" => Reducibility::Reducible,
+        "irreducible" => Reducibility::Irreducible,
+        "semireducible" => Reducibility::Semireducible,
+        "implicit_reducible" | "instance_reducible" => Reducibility::ImplicitReducible,
+        _ => return Ok(None),
+    };
+    expect_empty_null(argument, "reducibility attribute without arguments")?;
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global reducibility attribute")?;
+    Ok(Some(status))
+}
+
+/// The reducibility status a declaration's attributes give it, validated in order as the pin's
+/// `validate` does for a global attribute on a declaration of this file:
+/// - only a definition takes one ("is not a definition");
+/// - `reducible` and `implicit_reducible` need the status `semireducible`;
+/// - `irreducible` needs `semireducible` or `implicit_reducible`;
+/// - `semireducible` is refused ("declarations are `[semireducible]` by default").
+///
+/// `def` starts `semireducible` and `abbrev` `reducible`. An `instance` (`implicit_reducible`) is
+/// refused here, as is any other declaration: the pin's `isDefinition` admits a data instance, but
+/// its name is the instance command's, read elsewhere. Like `registration`, this only describes
+/// metadata, installed on the successor of ordinary declaration admission.
+pub fn reducibility(
+    syntax: &fln_syntax::tree::Syntax,
+) -> Result<Option<(Name, crate::reducibility::Reducibility)>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    use crate::reducibility::Reducibility;
+    let refuse = |expected| NatDefinitionElabError::UnexpectedSyntax { expected };
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    let mut requested = Vec::new();
+    for attribute in super::visibility::attributes(&modifiers[1])? {
+        if let Some(status) = reducibility_attribute(attribute)? {
+            requested.push(status);
+        }
+    }
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    let mut status = if declaration[1].kind() == Some(&parser_kind(&["Command", "definition"])) {
+        Reducibility::Semireducible
+    } else if declaration[1].kind() == Some(&parser_kind(&["Command", "abbrev"])) {
+        Reducibility::Reducible
+    } else {
+        return Err(refuse("a reducibility attribute on a `def` or an `abbrev`"));
+    };
+    for next in requested {
+        let allowed = match next {
+            Reducibility::Reducible | Reducibility::ImplicitReducible => {
+                status == Reducibility::Semireducible
+            }
+            Reducibility::Irreducible => matches!(
+                status,
+                Reducibility::Semireducible | Reducibility::ImplicitReducible
+            ),
+            Reducibility::Semireducible => false,
+        };
+        if !allowed {
+            return Err(refuse(
+                "a reducibility attribute the declaration's status admits",
+            ));
+        }
+        status = next;
+    }
+    let id = expect_node(
+        &expect_node(
+            &declaration[1],
+            declaration[1].kind().ok_or_else(|| refuse("declaration"))?,
+            if declaration[1].kind() == Some(&parser_kind(&["Command", "definition"])) {
+                5
+            } else {
+                4
+            },
+            "definition",
+        )?[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    let Syntax::Ident { val, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    if val.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    }
+    Ok(Some((val.clone(), status)))
+}
+
 /// Decode a canonical inline request. This only describes metadata: it must be
 /// installed on the successor of ordinary declaration admission, never before.
 pub fn registration(
@@ -138,6 +267,10 @@ pub fn registration(
         }
         if let Some(requires_definition) = compiler_hint(attribute)? {
             inlining |= requires_definition;
+            continue;
+        }
+        // Read by `reducibility`.
+        if reducibility_attribute(attribute)?.is_some() {
             continue;
         }
         if simp.replace(attribute).is_some() {

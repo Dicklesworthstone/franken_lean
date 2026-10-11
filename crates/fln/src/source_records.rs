@@ -447,6 +447,9 @@ impl Engine {
         let simp = fln_elab::source::scope::simp::registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let reducibility = fln_elab::source::scope::simp::reducibility(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let protected = fln_elab::source::protected_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
@@ -535,6 +538,17 @@ impl Engine {
                             ),
                         ))
                     })?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if let Some((name, status)) = reducibility {
+                    let name = scope.declaration_name(&name).map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                    batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if let Some(name) = protected {
@@ -1033,6 +1047,24 @@ pub(crate) fn tag_protected(
                 ),
             ))
         })
+}
+
+/// Record a `@[reducible]`-style attribute's status for an admitted declaration of this module
+/// (`scope::simp::reducibility` validated it), as the pin's `setReducibilityStatus`.
+pub(crate) fn set_reducibility(
+    engine: &Engine,
+    name: &Name,
+    status: fln_elab::reducibility::Reducibility,
+) -> Result<Environment, EngineExecutionError> {
+    fln_elab::reducibility::register(engine.environment(), name, status).map_err(|error| {
+        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::Unification(Box::new(
+                    fln_elab::constraint::unify::UnificationError::Reducibility(error),
+                )),
+            ),
+        ))
+    })
 }
 
 #[cfg(test)]

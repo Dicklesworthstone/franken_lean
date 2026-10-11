@@ -6815,6 +6815,9 @@ impl Engine {
         let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let reducibility = fln_elab::source::scope::simp::reducibility(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let protected = fln_elab::source::protected_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
@@ -6903,6 +6906,20 @@ impl Engine {
                             ),
                         ))
                     })?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if let Some((name, status)) = reducibility {
+                    let name = fln_elab::source::scope::SourceScope::default()
+                        .declaration_name(&name)
+                        .map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::NameScope(error),
+                                ),
+                            ))
+                        })?;
+                    admitted.engine.environment =
+                        source_records::set_reducibility(&admitted.engine, &name, status)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some(name) = protected {
@@ -7612,18 +7629,28 @@ impl Engine {
                 })?;
             // An inline `@[simp]` is registered (or, on an example, refused) only by the
             // admission path `check_source_files` uses; the paths below would drop it.
-            let has_inline_simp = matches!(
-                parsed.kind(),
-                SourceCommandKind::Definition | SourceCommandKind::Example
-            ) && fln_elab::source::scope::simp::registration(parsed.syntax())
-                .map_err(DefinitionFrontendError::Elaborate)
-                .map_err(EngineExecutionError::Frontend)
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(error),
-                    at: Some(original_offset),
-                })?
-                .is_some();
+            let has_inline_simp =
+                matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Definition | SourceCommandKind::Example
+                ) && (fln_elab::source::scope::simp::registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some()
+                    || fln_elab::source::scope::simp::reducibility(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_some());
             if matches!(
                 parsed.kind(),
                 SourceCommandKind::Check | SourceCommandKind::Example
@@ -8475,6 +8502,10 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .is_some()
+            || fln_elab::source::scope::simp::reducibility(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_some()
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(
