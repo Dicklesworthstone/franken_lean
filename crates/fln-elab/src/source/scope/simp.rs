@@ -61,6 +61,57 @@ fn priority_value(
     val.parse::<u32>().map_err(|_| refuse("u32 priority"))
 }
 
+/// A code generator hint, which changes neither a verdict nor a value: `inline`, `noinline`,
+/// `always_inline` and `inline_if_reduce` (the pin's `inlineAttrs`, Lean/Compiler/InlineAttrs.lean),
+/// `Some(true)`, and `specialize` without arguments (Lean/Compiler/Specialize.lean), `Some(false)`.
+/// The `bool` says whether the pin's `checkIsDefinition` applies: the inlining kinds take only a
+/// definition or an opaque constant. These are enum and parametric attributes, so the pin refuses
+/// them `local` or `scoped`, and refuses an inlining kind with arguments. `macro_inline` evaluates
+/// arguments lazily, and `specialize f` names parameters the pin checks, so both stay refused.
+fn compiler_hint(
+    attribute: &fln_syntax::tree::Syntax,
+) -> Result<Option<bool>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    let requires_definition = match &instance[1] {
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "simple"]) => {
+            let [Syntax::Ident { val, .. }, argument] = args.as_slice() else {
+                return Ok(None);
+            };
+            if !["inline", "noinline", "always_inline", "inline_if_reduce"]
+                .iter()
+                .any(|hint| val == &Name::from_components([*hint]))
+            {
+                return Ok(None);
+            }
+            expect_empty_null(argument, "inlining attribute without arguments")?;
+            true
+        }
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "specialize"]) => {
+            let [keyword, arguments] = args.as_slice() else {
+                return Ok(None);
+            };
+            expect_atom(keyword, "specialize", "specialize attribute keyword")?;
+            expect_empty_null(arguments, "specialize attribute without arguments")?;
+            false
+        }
+        _ => return Ok(None),
+    };
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global compiler hint")?;
+    Ok(Some(requires_definition))
+}
+
 /// Decode a canonical inline request. This only describes metadata: it must be
 /// installed on the successor of ordinary declaration admission, never before.
 pub fn registration(
@@ -80,8 +131,13 @@ pub fn registration(
         "declaration modifiers",
     )?;
     let mut simp = None;
+    let mut inlining = false;
     for attribute in super::visibility::attributes(&modifiers[1])? {
         if super::visibility::exposure_attribute(attribute)?.is_some() {
+            continue;
+        }
+        if let Some(requires_definition) = compiler_hint(attribute)? {
+            inlining |= requires_definition;
             continue;
         }
         if simp.replace(attribute).is_some() {
@@ -89,6 +145,17 @@ pub fn registration(
                 expected: "one simp attribute beside exposure attributes",
             });
         }
+    }
+    // The pin's `checkIsDefinition`: a definition (`def`, `abbrev`, `instance`) or an opaque
+    // constant; a theorem or an axiom is refused, "Declaration `d` is not a definition".
+    if inlining
+        && !["definition", "abbrev", "instance", "opaque"]
+            .iter()
+            .any(|kind| declaration[1].kind() == Some(&parser_kind(&["Command", kind])))
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "an inlining attribute on a definition or an opaque constant",
+        });
     }
     let Some(attribute) = simp else {
         return Ok(None);
