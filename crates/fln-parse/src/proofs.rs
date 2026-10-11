@@ -358,6 +358,8 @@ pub(crate) fn tactic(
             "decreasing_trivial",
             "decreasing_trivial_pre_omega",
             "decreasing_tactic",
+            // `syntax (name := guardTarget) "guard_target " equal term : tactic` (`Init/Guard.lean:75`).
+            "guard_target",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word])),
@@ -399,6 +401,7 @@ pub(crate) fn tactic(
         "by_cases" => by_cases(leaves, view, tokens, range, atom),
         "suffices" => suffices(leaves, view, tokens, range, atom),
         "change" => change(leaves, view, tokens, range, atom),
+        "guard_target" => guard_target(leaves, view, tokens, range, atom),
         // `"specialize " term` (`Init/Tactics.lean`) has `exact`'s shape.
         "exact" | "apply" | "refine" | "specialize" | "show" => {
             term_tactic(leaves, view, tokens, range, keyword, atom)
@@ -866,6 +869,50 @@ fn term_tactic(
     Ok(Syntax::node(
         parser_kind(&["Tactic", keyword]),
         vec![atom, term],
+    ))
+}
+
+/// `"guard_target " equal term` (`Init/Guard.lean:75`), where `equal` is `equalR <|> equalD <|>
+/// equalS <|> equalA` (`" = "`, `" =~ "`, `" =ₛ "`, `" =ₐ "`, `:38-46`).
+#[inline(never)]
+fn guard_target(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let relation = range.start + 1;
+    let kind = match tokens.get(relation).map(|token| &token.kind) {
+        Some(TokenKind::Symbol(symbol)) if relation < range.end => match symbol.as_str() {
+            "=" => "equalR",
+            "=~" => "equalD",
+            "=ₛ" => "equalS",
+            "=ₐ" => "equalA",
+            _ => return Err(refusal(view, tokens, relation)),
+        },
+        _ => return Err(refusal(view, tokens, relation.min(range.end))),
+    };
+    if range.end <= relation + 1 {
+        return Err(refusal(view, tokens, range.end));
+    }
+    let equal = Syntax::node(
+        parser_kind(&["equal"]),
+        vec![Syntax::node(
+            parser_kind(&[kind]),
+            vec![leaves.leaf(relation)?],
+        )],
+    );
+    let term = bounded_term(
+        leaves,
+        view,
+        tokens,
+        relation + 1..range.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "guardTarget"]),
+        vec![atom, equal, term],
     ))
 }
 

@@ -16,6 +16,7 @@ mod control;
 mod decision;
 pub(in crate::source) mod eliminate;
 mod equality;
+mod guard;
 mod index_equations;
 mod omega;
 mod refine;
@@ -27,6 +28,9 @@ pub(in crate::source) use refine::RefinementFrame;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticError {
     ExplicitFailure,
+    /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
+    /// expected to be …").
+    GuardTargetMismatch,
     ExpectedGoal,
     ExpectedProposition,
     /// A non-identifier simp argument whose type does not conclude in a proposition (the
@@ -92,6 +96,10 @@ impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
+            Self::GuardTargetMismatch => write!(
+                f,
+                "guard_target: the main goal is not what it was expected to be"
+            ),
             Self::ExpectedGoal => write!(f, "by proof requires an expected type"),
             Self::ExpectedProposition => write!(f, "decision requires a proposition"),
             Self::InvalidSimpTheorem => {
@@ -693,6 +701,16 @@ impl Context {
                 proof.work.push(Work::Goal(goal));
                 return Ok(ProofAction::Attempt(spec));
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {
+                let [keyword, relation, expected] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "guard_target", "guard_target keyword")?;
+                let relation = guard::relation(relation)?;
+                if !self.guard_target_matches(&goal, relation, expected)? {
+                    return Err(error(TacticError::GuardTargetMismatch));
+                }
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "fail"]) {
                 return Err(error(TacticError::ExplicitFailure));

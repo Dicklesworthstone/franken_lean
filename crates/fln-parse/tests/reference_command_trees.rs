@@ -4011,6 +4011,27 @@ const DOTTED_IDENTIFIERS: &[Accepted] = &[
     },
 ];
 
+/// `guard_target` with each relation (`syntax (name := guardTarget) "guard_target " equal term :
+/// tactic`, `Init/Guard.lean:75`; `equal` at `:38-46`). Captured 2026-10-11.
+const GUARD_TARGETS: &[Accepted] = &[
+    Accepted {
+        source: "theorem a (p : Prop) (h : p) : p := by\n  guard_target = p\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `a []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `p] [] ")")] (Term.typeSpec ":" `p)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.guardTarget "guard_target" (equal (equalR "=")) `p) [] (Tactic.exact "exact" `h)]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem b (p : Prop) (h : p) : p := by\n  guard_target =~ p\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `b []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `p] [] ")")] (Term.typeSpec ":" `p)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.guardTarget "guard_target" (equal (equalD "=~")) `p) [] (Tactic.exact "exact" `h)]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem c (p : Prop) (h : p) : p := by\n  guard_target =ₛ p\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `c []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `p] [] ")")] (Term.typeSpec ":" `p)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.guardTarget "guard_target" (equal (equalS "=ₛ")) `p) [] (Tactic.exact "exact" `h)]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem d (p : Prop) (h : p) : p := by\n  guard_target =ₐ p\n  exact h",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `d []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `p] [] ")")] (Term.typeSpec ":" `p)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.guardTarget "guard_target" (equal (equalA "=ₐ")) `p) [] (Tactic.exact "exact" `h)]))) (Termination.suffix [] []) [])))"#,
+    },
+];
+
 /// `#guard e` (`syntax (name := guardCmd) "#guard " term : command`, `Init/Guard.lean:127`), read
 /// by the source-command entry point that `#eval` and `#check` use: a `Bool` comparison, a decidable
 /// proposition and Boolean operators. Captured 2026-10-11 from one file the pin elaborated without
@@ -5691,6 +5712,14 @@ fn dotted_identifiers_produce_the_pins_trees() {
 #[test]
 fn relations_and_existentials_produce_the_pins_trees() {
     for row in RELATIONS_AND_EXISTENTIALS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn guard_targets_produce_the_pins_trees() {
+    for row in GUARD_TARGETS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }
