@@ -283,7 +283,9 @@ fn exposure_tags_combine_with_simp_without_dropping_other_attribute_effects() {
     for source in [
         "@[local expose] public def identity (a : Type) (x : a) : a := x",
         "@[expose 10] public def identity (a : Type) (x : a) : a := x",
-        "@[expose, inline] public def identity (a : Type) (x : a) : a := x",
+        // `inline` is a code generator hint with no effect to drop (accepted since the compiler
+        // hints landed); `macro_inline` changes evaluation and is not implemented.
+        "@[expose, macro_inline] public def identity (a : Type) (x : a) : a := x",
     ] {
         let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
         assert!(
