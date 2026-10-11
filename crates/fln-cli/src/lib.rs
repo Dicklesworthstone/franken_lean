@@ -205,7 +205,10 @@ const USAGE: &str = concat!(
     "    Explicit external imports use the same bounded loader and import posture\n",
     "    as check-source. Each source module runs in its own import context;\n",
     "    fln.source-program/1 reports raw results per module. These programs\n",
-    "    currently refuse --emit-*; `prelude` starts without an ambient seed.\n",
+    "    can publish the entry's final self-contained --emit-flbc and an\n",
+    "    --emit-sidecar binding all sources and imported artifact parts.\n",
+    "    Imported .olean snapshots remain unsupported; `prelude` starts\n",
+    "    without an ambient seed.\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
     "    Execution limits count VM instructions and simultaneous frames per\n",
     "    evaluation (per artifact for flbc run), including imported source code.\n",
@@ -14025,7 +14028,26 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             &paths,
             max_bytes,
             json,
-            emit_flbc.is_some() || emit_sidecar.is_some() || emit_olean_snapshot.is_some(),
+            match (&emit_flbc, &emit_sidecar, &emit_olean_snapshot) {
+                (Some(path), sidecar, None) => SourcePublication::Flbc {
+                    path: path.clone(),
+                    sidecar: sidecar.as_ref().map(|path| SourceSidecarPublication {
+                        path: path.clone(),
+                        toolchain_image: None,
+                    }),
+                },
+                (None, None, Some(path)) => SourcePublication::OleanSnapshot { path: path.clone() },
+                (None, None, None) => SourcePublication::None,
+                _ => {
+                    return source_failure(
+                        "internal-fault",
+                        "mutually exclusive source publication options reached execution together",
+                        false,
+                        SourcePresentation::Fln { json },
+                        4,
+                    );
+                }
+            },
             jobs.unwrap_or_else(default_import_jobs),
             import_posture,
             vm_limits,

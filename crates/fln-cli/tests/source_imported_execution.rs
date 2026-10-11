@@ -38,7 +38,8 @@ impl Workspace {
 
     fn invoke(&self, verb: &str, entry: &Path, lib: Option<&Path>, extra: &[&str]) -> Run {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-            .args([verb, "--json"])
+            .args(verb.split_ascii_whitespace())
+            .arg("--json")
             .args(extra)
             .arg(entry)
             .env("LEAN_PATH", lib.unwrap_or(&self.0))
@@ -419,20 +420,270 @@ fn imports_limits_original_offsets_and_publication_refusals_are_atomic() {
         "Main.lean",
         "prelude\ninductive Token where\n  | mk\n#check Token\n",
     );
-    for (option, name) in [
-        ("--emit-flbc", "result.flbc"),
-        ("--emit-olean-snapshot", "result.olean"),
+    for (option, name, class, code, detail) in [
+        (
+            "--emit-flbc",
+            "result.flbc",
+            "execution",
+            1,
+            "entry module has no executed",
+        ),
+        (
+            "--emit-olean-snapshot",
+            "result.olean",
+            "capability",
+            5,
+            "snapshot publication",
+        ),
     ] {
         let path = ws.0.join(name);
         let emitted = ws.run(&main, None, &[option, path.to_str().unwrap()]);
-        assert!(
-            emitted
-                .refused("capability", 5)
-                .contains("artifact publication")
-        );
+        assert!(emitted.refused(class, code).contains(detail));
         assert!(!path.exists(), "a refused program must not publish {name}");
     }
     ws.run(&main, None, &[]).complete();
+}
+
+/// Build an actual standalone .olean with the installed producer, then import
+/// its checked declarations through the ordinary module admission path. No
+/// Reference installation or synthetic import receipt is needed for this case.
+fn compiled_export_library(workspace: &Workspace) -> PathBuf {
+    let source = workspace.write("Producer.lean", "def double (n : Nat) : Nat := Nat.add n n\ndef importedAnswer (n : Nat) : Nat := Nat.add (double n) 2\ndef finalValue : Nat := 0\n");
+    let library = workspace.0.join("External.olean");
+    workspace
+        .run(
+            &source,
+            None,
+            &["--emit-olean-snapshot", library.to_str().unwrap()],
+        )
+        .complete();
+    library
+}
+
+#[test]
+fn imported_flbc_and_sidecar_survive_without_sources_or_import_artifacts() {
+    let workspace = Workspace::new("imported-artifact-closure");
+    let library = compiled_export_library(&workspace);
+    workspace.write(
+        "Left.lean",
+        "prelude\nimport External\ndef left (n : Nat) : Nat := importedAnswer n\n",
+    );
+    let right_source = "prelude\nimport External\ndef right : Nat := 3\n";
+    workspace.write("Right.lean", right_source);
+    let source = "prelude\nimport Left\nimport Right\n#eval Nat.add (left 20) right\n";
+    let entry = workspace.write("Main.lean", source);
+    let produce = |label: &str| {
+        let product = workspace.0.join(format!("{label}.flbc"));
+        let sidecar = workspace.0.join(format!("{label}.sidecar"));
+        let run = workspace.run(
+            &entry,
+            None,
+            &[
+                "--emit-flbc",
+                product.to_str().unwrap(),
+                "--emit-sidecar",
+                sidecar.to_str().unwrap(),
+                "--jobs=1",
+            ],
+        );
+        let output = run.complete();
+        assert!(output.contains("\"value\":45"), "{run:?}");
+        assert!(
+            output.contains("\"emittedFlbc\":{") && output.contains("\"emittedSidecar\":{"),
+            "{run:?}"
+        );
+        assert!(
+            output.contains("\"module\":\"Main\",\"command\":0"),
+            "{run:?}"
+        );
+        assert!(output.contains("\"profile\":\"standard\""), "{run:?}");
+        (product, sidecar)
+    };
+    let (product, sidecar) = produce("first");
+    let first_product = std::fs::read(&product).unwrap();
+    let first_sidecar = std::fs::read(&sidecar).unwrap();
+    let (repeat_product, repeat_sidecar) = produce("repeat");
+    assert_eq!(std::fs::read(repeat_product).unwrap(), first_product);
+    assert_eq!(std::fs::read(repeat_sidecar).unwrap(), first_sidecar);
+
+    // An unchanged answer is not an unchanged source closure. A sibling's
+    // comment leaves the compiled code alone but changes the input binding.
+    workspace.write(
+        "Right.lean",
+        format!("{right_source}-- retained sibling input\n"),
+    );
+    let (changed_product, changed_sidecar) = produce("changed-source");
+    assert_eq!(std::fs::read(changed_product).unwrap(), first_product);
+    let changed =
+        fln::decode_flbc_product_sidecar(&std::fs::read(changed_sidecar).unwrap()).unwrap();
+    let original = fln::decode_flbc_product_sidecar(&first_sidecar).unwrap();
+    assert_ne!(changed.closure_root(), original.closure_root());
+    assert_eq!(changed.product_root(), original.product_root());
+
+    // The consumer gets no usable source or imported artifact. Every called
+    // imported definition has to be retained inside the validated bytecode.
+    workspace.write("Main.lean", "deliberately malformed source");
+    workspace.write("Left.lean", "deliberately malformed source");
+    workspace.write("Right.lean", "deliberately malformed source");
+    std::fs::write(&library, b"deliberately malformed imported artifact").unwrap();
+    let consume = workspace.invoke(
+        "flbc run",
+        &product,
+        None,
+        &["--sidecar", sidecar.to_str().unwrap()],
+    );
+    let output = consume.complete();
+    assert!(
+        output.contains("\"returnValue\":45") && output.contains("\"verified\":true"),
+        "{consume:?}"
+    );
+    let unbound = workspace.invoke("flbc run", &product, None, &[]);
+    assert!(unbound.complete().contains("\"returnValue\":45"));
+
+    let mut corrupt = first_product.clone();
+    corrupt[0] ^= 1;
+    let corrupted = workspace.write("corrupted.flbc", corrupt);
+    let refused = workspace.invoke(
+        "flbc run",
+        &corrupted,
+        None,
+        &["--sidecar", sidecar.to_str().unwrap()],
+    );
+    assert!(refused.refused("sidecar", 1).contains("product"));
+    assert!(
+        workspace
+            .invoke(
+                "flbc run",
+                &product,
+                None,
+                &["--sidecar", sidecar.to_str().unwrap()]
+            )
+            .complete()
+            .contains("\"returnValue\":45")
+    );
+}
+
+#[test]
+fn imported_artifact_publication_keeps_failed_sources_and_existing_outputs_atomic() {
+    let workspace = Workspace::new("imported-artifact-refusals");
+    compiled_export_library(&workspace);
+    let source = "prelude\nimport External\n#eval importedAnswer 20\n";
+    let entry = workspace.write("Main.lean", source);
+    let product = workspace.0.join("result.flbc");
+    let sidecar = workspace.0.join("result.sidecar");
+    let emit = [
+        "--emit-flbc",
+        product.to_str().unwrap(),
+        "--emit-sidecar",
+        sidecar.to_str().unwrap(),
+    ];
+    workspace.write("Main.lean", format!("{source}def broken : Nat := absent\n"));
+    let late = workspace.run(&entry, None, &emit);
+    assert_ne!(late.code, 0, "{late:?}");
+    assert!(late.stdout.is_empty(), "{late:?}");
+    assert!(!product.exists() && !sidecar.exists());
+
+    workspace.write("Main.lean", source);
+    let mut limits = emit.to_vec();
+    limits.push("--fln-max-steps=0");
+    workspace
+        .run(&entry, None, &limits)
+        .refused("inconclusive", 3);
+    assert!(!product.exists() && !sidecar.exists());
+
+    workspace.write(
+        "Main.lean",
+        "prelude\nimport External\n/-- info: 999 -/\n#guard_msgs in\n#eval (42 : Nat)\n",
+    );
+    workspace.run(&entry, None, &emit).refused("guard-msgs", 1);
+    assert!(!product.exists() && !sidecar.exists());
+
+    workspace.write(
+        "Dependency.lean",
+        "prelude\nimport External\n#eval (7 : Nat)\n",
+    );
+    workspace.write("Main.lean", "prelude\nimport Dependency\n#check Nat\n");
+    assert!(
+        workspace
+            .run(&entry, None, &emit)
+            .refused("execution", 1)
+            .contains("entry module has no executed")
+    );
+    assert!(
+        !product.exists() && !sidecar.exists(),
+        "a dependency's execution is not the entry product"
+    );
+
+    workspace.write("Main.lean", source);
+    workspace.write("result.flbc", b"existing product");
+    workspace.run(&entry, None, &emit).refused("output", 1);
+    assert_eq!(std::fs::read(&product).unwrap(), b"existing product");
+    assert!(
+        !sidecar.exists(),
+        "known product collision must not publish a sidecar"
+    );
+    let fresh_product = workspace.0.join("fresh.flbc");
+    workspace.write("result.sidecar", b"existing sidecar");
+    workspace
+        .run(
+            &entry,
+            None,
+            &[
+                "--emit-flbc",
+                fresh_product.to_str().unwrap(),
+                "--emit-sidecar",
+                sidecar.to_str().unwrap(),
+            ],
+        )
+        .refused("output", 1);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"existing sidecar");
+    assert!(!fresh_product.exists());
+    let fresh_sidecar = workspace.0.join("fresh.sidecar");
+    workspace
+        .run(
+            &entry,
+            None,
+            &[
+                "--emit-flbc",
+                fresh_product.to_str().unwrap(),
+                "--emit-sidecar",
+                fresh_sidecar.to_str().unwrap(),
+            ],
+        )
+        .complete();
+    assert!(fresh_product.is_file() && fresh_sidecar.is_file());
+}
+
+#[test]
+fn pinned_prelude_imports_can_publish_replayable_bytecode_and_a_verified_sidecar() {
+    let Some(library) = pinned_lib() else { return };
+    let workspace = Workspace::new("pinned-import-artifact");
+    let entry = workspace.write(
+        "Main.lean",
+        "prelude\nimport Init.Prelude\ndef answer : Nat := id 42\n#eval answer\n",
+    );
+    let product = workspace.0.join("pinned.flbc");
+    let sidecar = workspace.0.join("pinned.sidecar");
+    let emitted = workspace.run(
+        &entry,
+        Some(&library),
+        &[
+            "--emit-flbc",
+            product.to_str().unwrap(),
+            "--emit-sidecar",
+            sidecar.to_str().unwrap(),
+            "--jobs=1",
+        ],
+    );
+    assert!(emitted.complete().contains("\"value\":42"));
+    let replayed = workspace.invoke(
+        "flbc run",
+        &product,
+        None,
+        &["--sidecar", sidecar.to_str().unwrap()],
+    );
+    assert!(replayed.complete().contains("\"returnValue\":42"));
+    assert!(replayed.stdout.contains("\"verified\":true"));
 }
 
 /// The drop-in `lean` on one file, with the search path and the record store

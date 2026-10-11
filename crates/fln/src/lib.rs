@@ -617,6 +617,7 @@ pub fn decode_flbc_product_sidecar(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceRunSidecarBuildError {
     EmptyExecutionBatch,
+    SourceProgramInputs { reason: &'static str },
     UnsupportedTarget { target: String },
     Closure(ProductSidecarBuildRefusal),
 }
@@ -626,6 +627,9 @@ impl std::fmt::Display for SourceRunSidecarBuildError {
         match self {
             Self::EmptyExecutionBatch => {
                 f.write_str("cannot bind a sidecar to an empty execution batch")
+            }
+            Self::SourceProgramInputs { reason } => {
+                write!(f, "cannot bind the source program inputs: {reason}")
             }
             Self::UnsupportedTarget { target } => {
                 write!(
@@ -11576,6 +11580,126 @@ pub fn build_source_run_flbc_sidecar(
         .map_err(SourceRunSidecarBuildError::Closure)
 }
 
+/// Bind an explicit import program's final entry execution to every source
+/// module and admitted artifact part that produced it. Module executions keep
+/// their own roots: sibling import worlds are never flattened into a fictitious
+/// batch. Imported metadata and private declarations are bound by the original
+/// artifact bytes as well as the checked logical roots. This is the same
+/// standard product binding as [`build_source_run_flbc_sidecar`], not a
+/// certificate of source reproducibility or permission to execute the Reference.
+/// The caller must supply the complete artifact inventory used for admission;
+/// the public execution report cannot reconstruct omitted import bytes. The
+/// CLI supplies its resolver's entire retained closure, including companions.
+pub fn build_source_program_flbc_sidecar(
+    sources: &[SourceModuleInput<'_>],
+    imports: &[OleanModuleInput<'_>],
+    options: &KVMap,
+    toolchain_image: &[u8],
+    completed: &source_check::modules::execution::SourceProgramExecution,
+) -> Result<FlbcProductSidecarV1, SourceRunSidecarBuildError> {
+    let entry = completed
+        .modules
+        .last()
+        .ok_or(SourceRunSidecarBuildError::EmptyExecutionBatch)?;
+    let final_execution = entry
+        .commands
+        .batch
+        .executions
+        .last()
+        .ok_or(SourceRunSidecarBuildError::EmptyExecutionBatch)?;
+    let mismatch = |reason| SourceRunSidecarBuildError::SourceProgramInputs { reason };
+    let mut by_name = BTreeMap::new();
+    for source in sources {
+        if by_name.insert(source.name, source.source).is_some() {
+            return Err(mismatch("duplicate source module"));
+        }
+    }
+    if by_name.len() != completed.modules.len() {
+        return Err(mismatch(
+            "source modules do not cover the completed program",
+        ));
+    }
+    let mut ordered_sources = Vec::new();
+    for module in &completed.modules {
+        let source = by_name
+            .remove(&module.module)
+            .ok_or_else(|| mismatch("completed module has no unique source input"))?;
+        if module.commands.batch.engine.mode() != entry.commands.batch.engine.mode() {
+            return Err(mismatch("module modes disagree"));
+        }
+        ordered_sources.push((module, source));
+    }
+    let mut ordered_imports = BTreeMap::new();
+    for import in imports {
+        if ordered_imports.insert(import.name, import).is_some() {
+            return Err(mismatch("duplicate imported artifact module"));
+        }
+    }
+    let source_bytes = material_bytes("fln.source-program.sources/1", |writer| {
+        writer.u64(ordered_sources.len() as u64);
+        for (module, source) in &ordered_sources {
+            writer.bytes(&module.module.to_canonical_bytes());
+            writer.bytes(source);
+        }
+    });
+    let semantic_bytes = material_bytes("fln.source-program.semantic-inputs/1", |writer| {
+        writer.u64(ordered_sources.len() as u64);
+        for (module, _) in &ordered_sources {
+            writer.bytes(&module.module.to_canonical_bytes());
+            writer.bytes(&semantic_input_material(&module.commands.batch));
+            writer.u64(module.commands.checks.len() as u64);
+            for check in &module.commands.checks {
+                writer.bytes(&check.environment_root.0.0);
+            }
+        }
+        writer.u64(ordered_imports.len() as u64);
+        for (name, import) in &ordered_imports {
+            writer.bytes(&name.to_canonical_bytes());
+            for part in [
+                Some(import.artifact),
+                import.server_artifact,
+                import.private_artifact,
+            ] {
+                writer.u8(u8::from(part.is_some()));
+                if let Some(bytes) = part {
+                    writer.u64(bytes.len() as u64);
+                    // Hash in place: a large Init closure must not be copied
+                    // merely to build its bounded standard-profile sidecar.
+                    writer.bytes(
+                        &fln_hash::domain::hash(
+                            fln_hash::domain::Domain::ArtifactClosureComponent,
+                            bytes,
+                        )
+                        .0,
+                    );
+                }
+            }
+        }
+    });
+    let coordinates = current_source_run_coordinates(entry.commands.batch.engine.mode())?;
+    let mut material = source_run_material(&[], options, toolchain_image, &entry.commands.batch);
+    for (component, bytes) in &mut material {
+        match component {
+            ClosureComponent::Sources => {
+                *bytes = std::borrow::Cow::Borrowed(source_bytes.as_slice());
+            }
+            ClosureComponent::SemanticInputs => {
+                *bytes = std::borrow::Cow::Borrowed(semantic_bytes.as_slice());
+            }
+            _ => {}
+        }
+    }
+    let entries: Vec<_> = material
+        .iter()
+        .map(|(component, bytes)| ClosureMaterialV1 {
+            component: *component,
+            bytes: bytes.as_ref(),
+        })
+        .collect();
+    FlbcProductSidecarV1::build_standard(coordinates, &entries, &final_execution.flbc_artifact)
+        .map_err(SourceRunSidecarBuildError::Closure)
+}
+
 /// Validate a sidecar against exact FLBC bytes and every current source-run component
 /// the consumer can independently rederive. Source bytes and elaborated logical roots
 /// are intentionally not reconstructed from executable output; v1 is a standard
@@ -11593,6 +11717,7 @@ pub fn verify_source_run_flbc_sidecar(
             SourceRunSidecarVerificationError::UnsupportedTarget { target }
         }
         SourceRunSidecarBuildError::EmptyExecutionBatch
+        | SourceRunSidecarBuildError::SourceProgramInputs { .. }
         | SourceRunSidecarBuildError::Closure(_) => {
             unreachable!("coordinate derivation cannot inspect an execution closure")
         }
@@ -16405,6 +16530,156 @@ mod tests {
         ));
         super::verify_source_run_flbc_sidecar(&bytes, &product, b"exact toolchain image")
             .expect("both negative controls recover on exact inputs");
+    }
+
+    #[test]
+    fn source_program_sidecar_binds_siblings_order_and_each_imported_artifact_part() {
+        use super::source_check::modules::execution::{
+            SourceModuleExecution, SourceProgramExecution,
+        };
+
+        let engine = seeded_engine();
+        let options = KVMap::new();
+        let names = ["Left", "Right", "Main"].map(|name| Name::from_components([name]));
+        let bytes: [&[u8]; 3] = [b"def left := 11", b"def right := 22", b"#eval (42 : Nat)"];
+        let mut program = SourceProgramExecution {
+            modules: names
+                .iter()
+                .zip(bytes)
+                .map(|(name, source)| SourceModuleExecution {
+                    module: name.clone(),
+                    commands: engine
+                        .execute_source_commands_with_checks(source, &options, test_limits())
+                        .unwrap()
+                        .into_complete()
+                        .unwrap(),
+                })
+                .collect(),
+        };
+        let sources: Vec<_> = names
+            .iter()
+            .zip(bytes)
+            .map(|(name, source)| super::SourceModuleInput { name, source })
+            .collect();
+        // The sidecar hashes artifact inputs; it does not admit them. These
+        // distinct byte strings exercise that binding, while the installed
+        // CLI tests below this API use genuinely admitted .olean imports.
+        let external_names = ["External", "Other"].map(|name| Name::from_components([name]));
+        let parts = [
+            b"exported".to_vec(),
+            b"server".to_vec(),
+            b"private".to_vec(),
+        ];
+        let imports = [
+            OleanModuleInput {
+                name: &external_names[0],
+                artifact: &parts[0],
+                server_artifact: Some(&parts[1]),
+                private_artifact: Some(&parts[2]),
+            },
+            OleanModuleInput {
+                name: &external_names[1],
+                artifact: b"other",
+                server_artifact: None,
+                private_artifact: None,
+            },
+        ];
+        let build = |sources: &[super::SourceModuleInput<'_>],
+                     imports: &[OleanModuleInput<'_>],
+                     program: &SourceProgramExecution| {
+            super::build_source_program_flbc_sidecar(
+                sources,
+                imports,
+                &options,
+                b"exact toolchain image",
+                program,
+            )
+            .unwrap()
+        };
+        let original = build(&sources, &imports, &program);
+        let product = &program
+            .modules
+            .last()
+            .unwrap()
+            .commands
+            .batch
+            .executions
+            .last()
+            .unwrap()
+            .flbc_artifact;
+        super::verify_source_run_flbc_sidecar(
+            &super::encode_flbc_product_sidecar(&original),
+            product,
+            b"exact toolchain image",
+        )
+        .unwrap();
+
+        let mut source_permutation = sources.clone();
+        source_permutation.reverse();
+        let mut import_permutation = imports;
+        import_permutation.reverse();
+        assert_eq!(
+            build(&source_permutation, &import_permutation, &program),
+            original,
+            "caller discovery order is not source execution order"
+        );
+
+        for part in 0..3 {
+            let mut changed = parts.clone();
+            changed[part][0] ^= 1;
+            let mut modified = imports;
+            modified[0] = OleanModuleInput {
+                name: &external_names[0],
+                artifact: &changed[0],
+                server_artifact: Some(&changed[1]),
+                private_artifact: Some(&changed[2]),
+            };
+            let rebound = build(&sources, &modified, &program);
+            assert_ne!(
+                rebound.component_root(super::ClosureComponent::SemanticInputs),
+                original.component_root(super::ClosureComponent::SemanticInputs),
+                "artifact part {part} must be bound"
+            );
+            assert_eq!(
+                rebound.product_root(),
+                original.product_root(),
+                "binding an input never recompiles or changes the product"
+            );
+        }
+        let mut without_private = imports;
+        without_private[0].private_artifact = None;
+        assert_ne!(
+            build(&sources, &without_private, &program).closure_root(),
+            original.closure_root()
+        );
+
+        let mut changed_source = sources.clone();
+        changed_source[0].source = b"def left := 11 -- retained sibling comment";
+        let rebound = build(&changed_source, &imports, &program);
+        assert_ne!(
+            rebound.component_root(super::ClosureComponent::Sources),
+            original.component_root(super::ClosureComponent::Sources)
+        );
+        assert_eq!(rebound.product_root(), original.product_root());
+
+        program.modules.swap(0, 1);
+        assert_ne!(
+            build(&sources, &imports, &program).closure_root(),
+            original.closure_root(),
+            "completed sibling order is retained rather than flattened"
+        );
+        program.modules.swap(0, 1);
+        assert_eq!(build(&sources, &imports, &program), original);
+        assert!(matches!(
+            super::build_source_program_flbc_sidecar(
+                &sources[..2],
+                &imports,
+                &options,
+                b"exact toolchain image",
+                &program
+            ),
+            Err(super::SourceRunSidecarBuildError::SourceProgramInputs { .. })
+        ));
     }
 
     #[test]

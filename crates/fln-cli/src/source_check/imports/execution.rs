@@ -1,6 +1,7 @@
 //! `fln run` and the drop-in `lean` over explicit source and `.olean` imports.
 //! `fln run` presents FlN's raw result surface; `lean` presents the entry file's
-//! command output through that door's own printer. Neither publishes an artifact.
+//! command output through that door's own printer. FlN can retain the entry's
+//! exact final executed bytecode and a sidecar binding the complete import program.
 use super::*;
 use fln::source_check::modules::execution::{
     SourceProgramExecution, SourceProgramLimits, preflight_lean_source_program,
@@ -119,7 +120,7 @@ pub(in crate::source_check) fn run(
     paths: &[PathBuf],
     max_bytes: usize,
     presentation: Presentation,
-    emit_artifact: bool,
+    publication: SourcePublication,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     vm_limits: fln::VmExecutionLimits,
@@ -215,13 +216,8 @@ pub(in crate::source_check) fn run(
             if !explicit_world {
                 return None;
             }
-            if emit_artifact {
-                return Some(failure(Failure::new(
-                    "capability",
-                    "artifact publication (--emit-flbc, --emit-sidecar, --emit-olean-snapshot) is not implemented for explicit import source programs",
-                    false,
-                    CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                ), presentation));
+            if let Err(error) = preflight_publication(&publication) {
+                return Some(failure(error, presentation));
             }
             let inputs: Vec<_> = names.iter().zip(sources).map(|(name, source)| {
                 SourceModuleInput { name, source }
@@ -299,8 +295,17 @@ pub(in crate::source_check) fn run(
                     Err(error) => failure(error, presentation),
                 },
                 Presentation::Fln { json } => {
-                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json) {
-                        Ok(stdout) => MultiplexerOutput::success(stdout),
+                    let prepared = match prepare_publication(&publication, &completed, &inputs, &loaded) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Some(failure(error, presentation)),
+                    };
+                    // Validate and bound the complete report before linking
+                    // either artifact. No recompile or second execution occurs.
+                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json, prepared.as_ref()) {
+                        Ok(stdout) => match prepared.as_ref().map(|prepared| prepared.publish(fln::publish_file_atomic_new)).transpose() {
+                            Ok(_) => MultiplexerOutput::success(stdout),
+                            Err(error) => failure(error, presentation),
+                        },
                         Err(error) => failure(error, presentation),
                     }
                 }
@@ -319,6 +324,279 @@ pub(in crate::source_check) fn run(
                 presentation,
             )),
         },
+    }
+}
+
+fn preflight_publication(publication: &SourcePublication) -> Result<(), Failure> {
+    let (product, sidecar) = match publication {
+        SourcePublication::None => return Ok(()),
+        SourcePublication::OleanSnapshot { .. } => {
+            return Err(Failure::new(
+                "capability",
+                "standalone .olean snapshot publication is not implemented for explicit import source programs; imported module metadata and private artifact parts require their own export contract",
+                false,
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            ));
+        }
+        SourcePublication::Flbc { path, sidecar } => (path.as_path(), sidecar.as_ref()),
+    };
+    if sidecar.is_some_and(|sidecar| output_paths_alias(product, &sidecar.path)) {
+        return Err(Failure::new(
+            "output",
+            "the FLBC product and its sidecar must name different paths",
+            true,
+            1,
+        ));
+    }
+    for path in std::iter::once(product).chain(sidecar.map(|sidecar| sidecar.path.as_path())) {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(Failure::new(
+                    "output",
+                    &format!(
+                        "output path {} already exists; no artifact was published",
+                        path.display()
+                    ),
+                    true,
+                    1,
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let (class, authority, exit) = publication_failure_disposition(&error);
+                return Err(Failure::new(
+                    class,
+                    &format!("could not inspect output {}: {error}", path.display()),
+                    authority,
+                    exit,
+                ));
+            }
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match std::fs::metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Failure::new(
+                    "output",
+                    &format!("output parent {} is not a directory", parent.display()),
+                    true,
+                    1,
+                ));
+            }
+            Err(error) => {
+                let (class, authority, exit) = publication_failure_disposition(&error);
+                return Err(Failure::new(
+                    class,
+                    &format!(
+                        "could not inspect output parent {}: {error}",
+                        parent.display()
+                    ),
+                    authority,
+                    exit,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct PreparedSidecar<'a> {
+    path: &'a Path,
+    bytes: Vec<u8>,
+    mode: fln::Mode,
+    closure_root: fln::ContentRoot,
+    product_root: fln::ContentRoot,
+}
+
+struct PreparedPublication<'a> {
+    module: &'a Name,
+    command: usize,
+    product_path: &'a Path,
+    product: &'a [u8],
+    sidecar: Option<PreparedSidecar<'a>>,
+}
+
+fn prepare_publication<'a>(
+    publication: &'a SourcePublication,
+    program: &'a SourceProgramExecution,
+    sources: &[SourceModuleInput<'_>],
+    loaded: &Loaded,
+) -> Result<Option<PreparedPublication<'a>>, Failure> {
+    let SourcePublication::Flbc { path, sidecar } = publication else {
+        return Ok(None);
+    };
+    validate_exits(program)?;
+    for module in &program.modules {
+        if !module.commands.guards.is_empty() {
+            let judged = render_lean_source_commands(&module.commands);
+            if judged.exit_code != 0 {
+                let (class, authority) = match judged.exit_code {
+                    3 => ("resource", false),
+                    4 => ("internal-fault", false),
+                    5 => ("capability", false),
+                    _ => ("guard-msgs", true),
+                };
+                return Err(Failure::new(
+                    class,
+                    &format!(
+                        "module `{}`: {}",
+                        module.module.to_display_string(),
+                        judged.stderr.trim_end()
+                    ),
+                    authority,
+                    judged.exit_code,
+                ));
+            }
+        }
+    }
+    let entry = program
+        .modules
+        .last()
+        .ok_or_else(|| internal("source program has no entry for FLBC publication"))?;
+    let final_execution = entry.commands.batch.executions.last().ok_or_else(|| {
+        Failure::new(
+            "execution",
+            "entry module has no executed definition or #eval command to publish as FLBC",
+            true,
+            1,
+        )
+    })?;
+    let command = entry
+        .commands
+        .execution_command_indices
+        .last()
+        .copied()
+        .ok_or_else(|| internal("entry's final execution has no source command index"))?;
+    let sidecar = if let Some(request) = sidecar {
+        let current_image;
+        let image = match request.toolchain_image.as_deref() {
+            Some(image) => image,
+            None => {
+                current_image =
+                    read_current_toolchain_image().map_err(|error| internal(&error.to_string()))?;
+                &current_image
+            }
+        };
+        let imports: Vec<_> = loaded
+            .oleans
+            .iter()
+            .map(|import| {
+                let [exported, server, private] = &import.parts;
+                fln::OleanModuleInput {
+                    name: &import.name,
+                    artifact: exported,
+                    server_artifact: (!server.is_empty()).then_some(server.as_slice()),
+                    private_artifact: (!private.is_empty()).then_some(private.as_slice()),
+                }
+            })
+            .collect();
+        let sidecar = fln::build_source_program_flbc_sidecar(
+            sources,
+            &imports,
+            &fln::KVMap::new(),
+            image,
+            program,
+        )
+        .map_err(|error| Failure::new("sidecar", &error.to_string(), false, 1))?;
+        Some(PreparedSidecar {
+            path: &request.path,
+            bytes: fln::encode_flbc_product_sidecar(&sidecar),
+            mode: sidecar.mode(),
+            closure_root: sidecar.closure_root(),
+            product_root: sidecar.product_root(),
+        })
+    } else {
+        None
+    };
+    Ok(Some(PreparedPublication {
+        module: &entry.module,
+        command,
+        product_path: path,
+        // These bytes were already canonically decoded and validated before
+        // Golem executed them. They contain the complete reachable functions
+        // and intrinsics, including compiled imported definitions.
+        product: &final_execution.flbc_artifact,
+        sidecar,
+    }))
+}
+
+impl PreparedPublication<'_> {
+    fn publish<P, E>(&self, mut publish: P) -> Result<(), Failure>
+    where
+        P: FnMut(&[u8], &Path) -> Result<(), E>,
+        E: SourcePublicationFailure,
+    {
+        // As on the import-free path, each artifact is atomically created,
+        // never overwritten. A failed product link may leave its complete
+        // sidecar; it never exposes a partial bytecode file.
+        if let Some(sidecar) = &self.sidecar {
+            publish(&sidecar.bytes, sidecar.path).map_err(|error| {
+                let (class, authority, exit) = publication_failure_disposition(&error);
+                Failure::new(class, &format!("could not complete durable FLBC sidecar publication to {}: {error}; {}; the FLBC product was not published", sidecar.path.display(), publication_state(&error)), authority, exit)
+            })?;
+        }
+        publish(self.product, self.product_path).map_err(|error| {
+            let (class, authority, exit) = publication_failure_disposition(&error);
+            let retained = self.sidecar.as_ref().map_or_else(String::new, |sidecar| format!("; the complete sidecar is retained at {}", sidecar.path.display()));
+            Failure::new(class, &format!("could not complete durable FLBC artifact publication to {}: {error}; {}{retained}", self.product_path.display(), publication_state(&error)), authority, exit)
+        })
+    }
+
+    fn report(&self, output: &mut String, json: bool) -> Result<(), Failure> {
+        if json {
+            append(
+                output,
+                &format!(
+                    ",\"emittedFlbc\":{{\"path\":{},\"bytes\":{},\"module\":{},\"command\":{}}},\"emittedSidecar\":",
+                    json_string(&self.product_path.to_string_lossy()),
+                    self.product.len(),
+                    json_string(&self.module.to_display_string()),
+                    self.command
+                ),
+            )?;
+            if let Some(sidecar) = &self.sidecar {
+                append(
+                    output,
+                    &format!(
+                        "{{\"path\":{},\"bytes\":{},\"mode\":{},\"profile\":\"standard\",\"closureRoot\":{},\"productRoot\":{}}}",
+                        json_string(&sidecar.path.to_string_lossy()),
+                        sidecar.bytes.len(),
+                        json_string(mode_name(sidecar.mode)),
+                        json_string(&root_hex(sidecar.closure_root)),
+                        json_string(&root_hex(sidecar.product_root))
+                    ),
+                )?;
+            } else {
+                append(output, "null")?;
+            }
+        } else {
+            append(
+                output,
+                &format!(
+                    "Emitted FLBC: {} bytes to {} (module `{}`, command {}).\n",
+                    self.product.len(),
+                    self.product_path.display(),
+                    self.module.to_display_string(),
+                    self.command
+                ),
+            )?;
+            if let Some(sidecar) = &self.sidecar {
+                append(
+                    output,
+                    &format!(
+                        "Emitted sidecar: {} bytes to {}.\nClosure root: {}\nProduct root: {}\n",
+                        sidecar.bytes.len(),
+                        sidecar.path.display(),
+                        root_hex(sidecar.closure_root),
+                        root_hex(sidecar.product_root)
+                    ),
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -471,6 +749,7 @@ fn render(
     source_bytes: usize,
     base: Option<&OleanBase>,
     json: bool,
+    publication: Option<&PreparedPublication<'_>>,
 ) -> Result<String, Failure> {
     validate_exits(program)?;
     if program
@@ -552,7 +831,13 @@ fn render(
         }
     }
     if json {
-        append(&mut output, "]}\n")?;
+        append(&mut output, "]")?;
+    }
+    if let Some(publication) = publication {
+        publication.report(&mut output, json)?;
+    }
+    if json {
+        append(&mut output, "}\n")?;
     }
     Ok(output)
 }
@@ -705,6 +990,84 @@ fn render_commands(
 mod tests {
     use super::*;
     use fln::source_check::modules::execution::SourceModuleExecution;
+
+    #[test]
+    fn imported_publication_reports_resource_failure_and_retained_sidecar_truthfully() {
+        let module = Name::from_components(["Main"]);
+        let prepared = PreparedPublication {
+            module: &module,
+            command: 0,
+            product_path: Path::new("program.flbc"),
+            product: b"complete product",
+            sidecar: Some(PreparedSidecar {
+                path: Path::new("program.sidecar"),
+                bytes: b"complete sidecar".to_vec(),
+                mode: fln::Mode::Sound,
+                closure_root: fln::ContentRoot::new([0; 32]),
+                product_root: fln::ContentRoot::new([0; 32]),
+            }),
+        };
+        for failed_call in 0..2 {
+            for target_created in [false, true] {
+                let mut calls = Vec::new();
+                let failed = prepared
+                    .publish(|bytes, path| {
+                        let call = calls.len();
+                        calls.push((path.to_path_buf(), bytes.to_vec()));
+                        if call != failed_call {
+                            return Ok(());
+                        }
+                        Err(fln::AtomicCreateError::<std::convert::Infallible>::Io {
+                            step: if target_created {
+                                fln::AtomicCreateStep::SyncDirectoryAfterLink
+                            } else {
+                                fln::AtomicCreateStep::WriteChunk {
+                                    offset: 0,
+                                    chunk_len: 1,
+                                    total_len: bytes.len() as u64,
+                                }
+                            },
+                            target_created,
+                            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                        })
+                    })
+                    .unwrap_err();
+                assert_eq!(
+                    (failed.class, failed.authority, failed.exit),
+                    ("resource", false, 3)
+                );
+                assert_eq!(calls.len(), failed_call + 1);
+                assert_eq!(
+                    calls[0],
+                    (
+                        PathBuf::from("program.sidecar"),
+                        b"complete sidecar".to_vec()
+                    )
+                );
+                if failed_call == 0 {
+                    assert!(failed.detail.contains("the FLBC product was not published"));
+                } else {
+                    assert_eq!(
+                        calls[1],
+                        (PathBuf::from("program.flbc"), b"complete product".to_vec())
+                    );
+                    assert!(
+                        failed
+                            .detail
+                            .contains("the complete sidecar is retained at program.sidecar")
+                    );
+                }
+                assert!(failed.detail.contains(if target_created {
+                    "the complete target already exists"
+                } else {
+                    "the target was not created"
+                }));
+                let report = failure(failed, Presentation::Fln { json: true });
+                assert!(report.stdout.is_empty());
+                assert!(report.stderr.contains("\"authority\":false"));
+            }
+        }
+    }
 
     #[test]
     fn presentation_selection_preserves_the_classic_scalar_boundary() {
@@ -911,7 +1274,7 @@ mod tests {
                 }
                 let mut program = SourceProgramExecution { modules };
                 let entry = Name::from_components(["Main"]);
-                assert!(render(&program, &entry, 0, None, true).is_ok());
+                assert!(render(&program, &entry, 0, None, true, None).is_ok());
                 // The `lean` presentation prints the entry's own output only: one
                 // `42`, though the dependency evaluated the same term.
                 match lean_output(&program, &entry, false) {
@@ -942,7 +1305,7 @@ mod tests {
                     Ok(_) => panic!("the lean presentation must not hide a dependency panic"),
                 }
                 for json in [false, true] {
-                    let error = match render(&program, &entry, 0, None, json) {
+                    let error = match render(&program, &entry, 0, None, json, None) {
                         Err(error) => error,
                         Ok(_) => panic!("a successful entry must not hide a dependency panic"),
                     };
