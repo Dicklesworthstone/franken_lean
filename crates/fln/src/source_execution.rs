@@ -91,10 +91,12 @@ fn parts<'a>(
 /// Whether `declaration` mentions `sorryAx` anywhere, the pin's `Declaration.hasSorry`
 /// (`Lean/Util/Sorry.lean`), which decides its "declaration uses `sorry`" warning
 /// (`warnIfUsesSorry`, `Lean/AddDecl.lean`).
-pub(super) fn uses_sorry(
-    declaration: &Declaration,
-    limit: usize,
-) -> Result<bool, EngineExecutionError> {
+///
+/// Unbudgeted, as the pin's is: the walk visits each distinct node of a declaration the
+/// kernel already admitted once. It must not spend the command's ingress budget, or a
+/// small one would stop here rather than at the preparation it bounds.
+pub(super) fn uses_sorry(declaration: &Declaration) -> Result<bool, EngineExecutionError> {
+    let limit = usize::MAX;
     let sorry = Name::from_components(["sorryAx"]);
     let mut found = false;
     let mut spent = 0;

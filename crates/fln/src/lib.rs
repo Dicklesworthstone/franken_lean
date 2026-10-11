@@ -7780,13 +7780,13 @@ impl Engine {
             // A definition that uses `sorry` is admitted with its warning and never run: the pin
             // compiles it and fails only when it is evaluated.
             let uses_sorry = !is_evaluation
-                && source_execution::uses_sorry(&declaration, limits.ingress.max_nodes).map_err(
-                    |error| EngineExecutionError::BatchCommand {
+                && source_execution::uses_sorry(&declaration).map_err(|error| {
+                    EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
                         at: Some(original_offset),
-                    },
-                )?;
+                    }
+                })?;
             // A theorem, an opaque constant and an axiom have no body to execute here; they
             // are admitted, as a template or a proof definition is.
             if matches!(
@@ -7917,9 +7917,7 @@ impl Engine {
                 }
             }));
         for (command, declaration) in declarations {
-            if !sorry_commands.contains(&command)
-                && source_execution::uses_sorry(declaration, limits.ingress.max_nodes)?
-            {
+            if !sorry_commands.contains(&command) && source_execution::uses_sorry(declaration)? {
                 sorry_commands.insert(command);
             }
         }
