@@ -1,0 +1,879 @@
+//! `let mut` and reassignment (`x := e`, `x ← e`), as the pin's `do` elaborator
+//! (`Lean/Elab/BuiltinDo/Let.lean`, `For.lean`, `Lean/Elab/Do/Basic.lean`), rewritten into the
+//! immutable `do` the rest of this module expands. One pass per `do` block, before expansion:
+//! - `let mut x := e` is `let x := e`. A reassignment `x := e` is `let x : T := e` and `x ← e` is
+//!   `let x : T ← e`, where `T` is the type of the `x` it replaces (`pushTypeIntoReassignment`).
+//! - A branch statement (`if`, `match`, `unless`, a nested `do`) that reassigns variables declared
+//!   before it, and is followed by statements that read them, binds them again from its result.
+//!   Each branch ends with `pure (x, y, …)`, the right-nested `Prod` of `mkProdMkN`, which stands
+//!   for the pin's join-point parameters.
+//! - A `for` loop that reassigns them carries them as its `ForIn` state (`elabDoFor`). The
+//!   callback starts from the tuple. Every exit (`continue`, `break`, the end of the body) yields
+//!   the variables' values at that point. The loop's result binds them again.
+//!
+//! Refused where the pin accepts, a refusal and never a different meaning:
+//! - a reassigning branch statement that also contains `return`, `break` or `continue` (its join
+//!   would also have to forward the exit), or that is a `try`;
+//! - a reassigning loop whose body returns;
+//! - a pattern reassignment (`(a, b) := e`).
+//!
+//! Refused as the pin refuses them:
+//! - reassigning a name not declared `mut` in this `do` block ("cannot be mutated");
+//! - declaring a name that shadows a `mut` variable (`checkMutVarsForShadowing`).
+use super::*;
+
+fn is(syntax: &Syntax, kind: &str) -> bool {
+    syntax.kind() == Some(&parser_kind(&["Term", kind]))
+}
+
+/// A term-level `do` (and the pin's term forms that expand into one) is its own block: its
+/// variables, and those it may mutate, are its own (`elabDo` starts a fresh context).
+fn is_block(syntax: &Syntax) -> bool {
+    ["do", "termFor", "termTry", "termUnless", "termReturn"]
+        .iter()
+        .any(|kind| is(syntax, kind))
+}
+
+/// Inner blocks are rewritten first, so any mutation below a block is its own.
+fn contains_mutation(block: &Syntax) -> bool {
+    let mut pending = vec![block];
+    while let Some(syntax) = pending.pop() {
+        if is_mutation(syntax) {
+            return true;
+        }
+        if let Syntax::Node { args, .. } = syntax {
+            pending.extend(args);
+        }
+    }
+    false
+}
+
+fn non_empty(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { args, .. } if !args.is_empty())
+}
+
+/// `let mut …` or a reassignment: the elements this pass rewrites.
+pub(in crate::source) fn is_mutation(syntax: &Syntax) -> bool {
+    ((is(syntax, "doLet") || is(syntax, "doLetArrow"))
+        && matches!(syntax, Syntax::Node { args, .. } if args.get(1).is_some_and(non_empty)))
+        || is(syntax, "doReassign")
+        || is(syntax, "doReassignArrow")
+}
+
+/// The variable a reassignment names; `None` for a pattern reassignment.
+fn reassigned_name(element: &Syntax) -> Option<Name> {
+    let Syntax::Node { args, .. } = element else {
+        return None;
+    };
+    let declaration = args.first()?;
+    let Syntax::Node { args, .. } = declaration else {
+        return None;
+    };
+    let name = if is(declaration, "letIdDeclNoBinders") {
+        let Syntax::Node { args, .. } = args.first()? else {
+            return None;
+        };
+        args.first()?
+    } else if is(declaration, "doIdDecl") {
+        args.first()?
+    } else {
+        return None;
+    };
+    match name {
+        Syntax::Ident { val, .. } => Some(val.clone()),
+        _ => None,
+    }
+}
+
+/// What the do elements of one element do, not counting nested `do` blocks: the names it
+/// reassigns, whether it returns, and whether it leaves an enclosing loop (`break`/`continue`
+/// outside its own loops). `try` is reported too: its handlers are not rewritten here.
+#[derive(Default)]
+struct Facts {
+    reassigned: Vec<Name>,
+    returns: bool,
+    jumps: bool,
+    handles: bool,
+}
+
+fn facts(element: &Syntax) -> Facts {
+    let mut facts = Facts::default();
+    let mut pending = vec![(element, false)];
+    while let Some((syntax, looped)) = pending.pop() {
+        if is_block(syntax) {
+            continue;
+        }
+        if (is(syntax, "doReassign") || is(syntax, "doReassignArrow"))
+            && let Some(name) = reassigned_name(syntax)
+            && !facts.reassigned.contains(&name)
+        {
+            facts.reassigned.push(name);
+        }
+        facts.returns |= is(syntax, "doReturn");
+        facts.jumps |= !looped && (is(syntax, "doBreak") || is(syntax, "doContinue"));
+        facts.handles |= is(syntax, "doTry") || is(syntax, "nativeDoTry");
+        if let Syntax::Node { args, .. } = syntax {
+            let looped = looped || is(syntax, "doFor") || is(syntax, "nativeDoMutFor");
+            pending.extend(args.iter().map(|argument| (argument, looped)));
+        }
+    }
+    facts
+}
+
+/// Whether a binder (a name or a pattern) mentions a `mut` variable.
+fn shadows(binder: &Syntax, muts: &[Name]) -> bool {
+    let mut pending = vec![binder];
+    while let Some(syntax) = pending.pop() {
+        match syntax {
+            Syntax::Ident { val, .. } if muts.contains(val) => return true,
+            Syntax::Node { args, .. } => pending.extend(args),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn term(kind: &str, args: Vec<Syntax>) -> Syntax {
+    Syntax::node(parser_kind(&["Term", kind]), args)
+}
+
+fn named(name: &Name) -> Syntax {
+    ident(name.clone())
+}
+
+fn root(components: &[&str]) -> Syntax {
+    ident(Name::from_components(
+        std::iter::once("_root_").chain(components.iter().copied()),
+    ))
+}
+
+fn application(function: Syntax, arguments: Vec<Syntax>) -> Syntax {
+    term("app", vec![function, null(arguments)])
+}
+
+/// `(x, y, z)` as `mkProdMkN` builds it: `Prod.mk x (Prod.mk y z)`; one variable is itself.
+pub(super) fn state_tuple(state: &[Syntax]) -> Syntax {
+    let mut components = state.iter().rev();
+    let mut tuple = components.next().cloned().expect("a nonempty state");
+    for component in components {
+        tuple = application(root(&["Prod", "mk"]), vec![component.clone(), tuple]);
+    }
+    tuple
+}
+
+/// Whether `syntax` is a `state_tuple` of plain names.
+pub(super) fn is_state_tuple(syntax: &Syntax) -> bool {
+    let mut syntax = syntax;
+    loop {
+        if matches!(syntax, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+        {
+            return true;
+        }
+        let Syntax::Node { args, .. } = syntax else {
+            return false;
+        };
+        if !is(syntax, "app")
+            || !matches!(&args[..], [Syntax::Ident { val, .. }, _]
+                if val == &Name::from_components(["_root_", "Prod", "mk"]))
+        {
+            return false;
+        }
+        let Syntax::Node { args: pair, .. } = &args[1] else {
+            return false;
+        };
+        let [first, rest] = &pair[..] else {
+            return false;
+        };
+        if !matches!(first, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+        {
+            return false;
+        }
+        syntax = rest;
+    }
+}
+
+/// The `index`-th of `count` components of a `state_tuple` value.
+fn component(tuple: &Syntax, index: usize, count: usize) -> Syntax {
+    let mut value = tuple.clone();
+    for _ in 0..index {
+        value = application(root(&["Prod", "snd"]), vec![value]);
+    }
+    if index + 1 < count {
+        value = application(root(&["Prod", "fst"]), vec![value]);
+    }
+    value
+}
+
+/// The type of the local `name` in scope where this node is elaborated.
+fn type_of(name: &Name) -> Syntax {
+    null(vec![term(
+        "typeSpec",
+        vec![atom(":"), term("nativeDoTypeOf", vec![named(name)])],
+    )])
+}
+
+fn let_config() -> Syntax {
+    term("letConfig", vec![null(vec![])])
+}
+
+/// `let name annotation := value`.
+fn let_element(name: &Name, annotation: Syntax, value: Syntax) -> Syntax {
+    term(
+        "doLet",
+        vec![
+            atom("let"),
+            null(vec![]),
+            let_config(),
+            term(
+                "letDecl",
+                vec![term(
+                    "letIdDecl",
+                    vec![
+                        term("letId", vec![named(name)]),
+                        null(vec![]),
+                        annotation,
+                        atom(":="),
+                        value,
+                    ],
+                )],
+            ),
+        ],
+    )
+}
+
+/// `let name annotation ← value`, `value` a do element.
+fn bind_element(name: Syntax, annotation: Syntax, value: Syntax) -> Syntax {
+    term(
+        "doLetArrow",
+        vec![
+            atom("let"),
+            null(vec![]),
+            let_config(),
+            term("doIdDecl", vec![name, annotation, atom("←"), value]),
+        ],
+    )
+}
+
+fn sequence_of(elements: Vec<Syntax>, bracketed: bool) -> Syntax {
+    let items = null(
+        elements
+            .into_iter()
+            .map(|element| term("doSeqItem", vec![element, null(vec![])]))
+            .collect(),
+    );
+    if bracketed {
+        term("doSeqBracketed", vec![atom("{"), items, atom("}")])
+    } else {
+        term("doSeqIndent", vec![items])
+    }
+}
+
+/// The pin's error for this pass's own refusals: the names in scope do not admit the program.
+fn refused() -> NatDefinitionElabError {
+    invalid()
+}
+
+impl Context {
+    /// Rewrite every `do` block of `syntax` that declares or reassigns a `mut` variable, inner
+    /// blocks first. The result contains no mutation: an element this pass does not rewrite is
+    /// refused when it contains one.
+    pub(in crate::source) fn eliminate_do_mutation(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(&'a Syntax, usize),
+        }
+        let mut tasks = vec![Task::Visit(syntax)];
+        let mut built: Vec<Syntax> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(node @ Syntax::Node { args, .. }) => {
+                    tasks.push(Task::Build(node, built.len()));
+                    tasks.extend(args.iter().rev().map(Task::Visit));
+                }
+                Task::Visit(leaf) => built.push(leaf.clone()),
+                Task::Build(Syntax::Node { info, kind, .. }, start) => {
+                    let node = Syntax::Node {
+                        info: *info,
+                        kind: kind.clone(),
+                        args: built.split_off(start),
+                    };
+                    built.push(if is(&node, "do") && contains_mutation(&node) {
+                        self.mutable_block(node)?
+                    } else {
+                        node
+                    });
+                }
+                Task::Build(..) => unreachable!("only nodes are built"),
+            }
+        }
+        let result = built.pop().ok_or_else(invalid)?;
+        // Mutation outside any `do` block (or in an element kept as written) is refused.
+        let mut pending = vec![&result];
+        while let Some(syntax) = pending.pop() {
+            self.tick()?;
+            if is_mutation(syntax) {
+                return Err(refused());
+            }
+            if let Syntax::Node { args, .. } = syntax {
+                pending.extend(args);
+            }
+        }
+        Ok(result)
+    }
+
+    fn mutable_block(&mut self, block: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+        let mut parts = node(block, "do", 2)?;
+        let sequence = parts.pop().expect("do sequence");
+        parts.push(self.mutable_sequence(sequence, &[], None, false, false)?);
+        Ok(term("do", parts))
+    }
+
+    /// One sequence with the `mut` variables `muts` in scope. `tail`: the variables its end yields
+    /// as the result of a rewritten branch. `continues`: whether statements after this sequence
+    /// read the variables it reassigns (a loop body's next iteration does). `looped`: the sequence
+    /// is (inside) the body of a loop that carries state, where a bound branch statement becomes
+    /// a term (`stateful_term`).
+    fn mutable_sequence(
+        &mut self,
+        sequence: Syntax,
+        muts: &[Name],
+        tail: Option<&[Name]>,
+        continues: bool,
+        looped: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let bracketed = is(&sequence, "doSeqBracketed");
+        let statements = sequence_items(sequence)?;
+        let count = statements.len();
+        let mut muts = muts.to_vec();
+        let mut elements = Vec::with_capacity(count);
+        for (index, statement) in statements.into_iter().enumerate() {
+            self.tick()?;
+            let element = sequence_element(statement)?;
+            let continues = index + 1 < count || tail.is_some() || continues;
+            self.mutable_element(element, &mut muts, continues, looped, &mut elements)?;
+        }
+        if let Some(state) = tail {
+            let state: Vec<Syntax> = state.iter().map(named).collect();
+            elements.push(term("doExpr", vec![call(false, vec![state_tuple(&state)])]));
+        }
+        Ok(sequence_of(elements, bracketed))
+    }
+
+    fn mutable_element(
+        &mut self,
+        element: Syntax,
+        muts: &mut Vec<Name>,
+        continues: bool,
+        looped: bool,
+        out: &mut Vec<Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if is(&element, "doLet") || is(&element, "doHave") {
+            let have = is(&element, "doHave");
+            let mut parts = node(
+                element,
+                if have { "doHave" } else { "doLet" },
+                if have { 3 } else { 4 },
+            )?;
+            let declaration = parts.last().expect("let declaration");
+            // `letDecl`'s binder: `letIdDecl`'s `letId`, or `letPatDecl`'s pattern.
+            let binder = match declaration {
+                Syntax::Node { args, .. } => match args.first() {
+                    Some(Syntax::Node { args, .. }) => args.first(),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .ok_or_else(invalid)?;
+            if shadows(binder, muts) {
+                return Err(refused());
+            }
+            let declared = if !have && non_empty(&parts[1]) {
+                // `let mut` binds one name (the parser reads no mutable pattern).
+                let declared = match binder {
+                    Syntax::Node { args, .. } if is(binder, "letId") => match args.first() {
+                        Some(Syntax::Ident { val, .. }) => val.clone(),
+                        _ => return Err(refused()),
+                    },
+                    _ => return Err(refused()),
+                };
+                parts[1] = null(vec![]);
+                Some(declared)
+            } else {
+                None
+            };
+            out.push(term(if have { "doHave" } else { "doLet" }, parts));
+            muts.extend(declared);
+            return Ok(());
+        }
+        if is(&element, "doLetArrow") {
+            let mut parts = node(element, "doLetArrow", 4)?;
+            let mutable = non_empty(&parts[1]);
+            let declaration = parts.pop().expect("bind declaration");
+            let mut declaration_parts = match &declaration {
+                Syntax::Node { args, .. } => args.clone(),
+                _ => return Err(invalid()),
+            };
+            let kind = declaration.kind().cloned().ok_or_else(invalid)?;
+            let binder = declaration_parts.first().ok_or_else(invalid)?;
+            if shadows(binder, muts) {
+                return Err(refused());
+            }
+            let declared = if mutable {
+                match binder {
+                    Syntax::Ident { val, .. } if kind == parser_kind(&["Term", "doIdDecl"]) => {
+                        Some(val.clone())
+                    }
+                    _ => return Err(refused()),
+                }
+            } else {
+                None
+            };
+            // The bound action (index 3 of `doIdDecl` and `doPatDecl`) may be a branch statement.
+            let value = std::mem::replace(
+                declaration_parts.get_mut(3).ok_or_else(invalid)?,
+                Syntax::Missing,
+            );
+            declaration_parts[3] = self.mutable_action(value, muts, looped)?;
+            parts[1] = null(vec![]);
+            parts.push(Syntax::node(kind, declaration_parts));
+            out.push(term("doLetArrow", parts));
+            muts.extend(declared);
+            return Ok(());
+        }
+        if is(&element, "doReassign") {
+            let name = reassigned_name(&element).ok_or_else(refused)?;
+            if !muts.contains(&name) {
+                return Err(refused());
+            }
+            let mut parts = node(element, "doReassign", 1)?;
+            let mut declaration =
+                node(parts.pop().expect("reassignment"), "letIdDeclNoBinders", 5)?;
+            expect_empty_null(&declaration[1], "reassignment parameters")?;
+            expect_empty_null(&declaration[2], "reassignment type")?;
+            expect_atom(&declaration[3], ":=", "reassignment")?;
+            let value = declaration.pop().expect("reassigned value");
+            out.push(let_element(&name, type_of(&name), value));
+            return Ok(());
+        }
+        if is(&element, "doReassignArrow") {
+            let name = reassigned_name(&element).ok_or_else(refused)?;
+            if !muts.contains(&name) {
+                return Err(refused());
+            }
+            let mut parts = node(element, "doReassignArrow", 1)?;
+            let mut declaration = node(parts.pop().expect("reassignment"), "doIdDecl", 4)?;
+            expect_empty_null(&declaration[1], "reassignment type")?;
+            let value = declaration.pop().expect("reassigned action");
+            let value = self.mutable_action(value, muts, looped)?;
+            let arrow = declaration.pop().expect("reassignment arrow");
+            out.push(term(
+                "doLetArrow",
+                vec![
+                    atom("let"),
+                    null(vec![]),
+                    let_config(),
+                    term("doIdDecl", vec![named(&name), type_of(&name), arrow, value]),
+                ],
+            ));
+            return Ok(());
+        }
+        if is(&element, "doFor") {
+            return self.mutable_loop(element, muts, looped, out);
+        }
+        if is(&element, "doIf")
+            || is(&element, "doMatch")
+            || is(&element, "doUnless")
+            || is(&element, "doNested")
+        {
+            let facts = facts(&element);
+            let state: Vec<Name> = muts
+                .iter()
+                .filter(|name| facts.reassigned.contains(name))
+                .cloned()
+                .collect();
+            if state.is_empty() || !continues {
+                // Reassignments nothing reads afterwards stay inside their branches.
+                out.push(self.mutable_branches(element, muts, None, looped)?);
+                return Ok(());
+            }
+            if facts.returns || facts.jumps || facts.handles {
+                return Err(refused());
+            }
+            let branches = if looped {
+                term(
+                    "doExpr",
+                    vec![self.stateful_term(element, muts, Some(&state))?],
+                )
+            } else {
+                self.mutable_branches(element, muts, Some(&state), false)?
+            };
+            self.bind_state(&state, branches, out)?;
+            return Ok(());
+        }
+        // Everything else is kept as written. It may not reassign this block's variables, nor bind
+        // a name that shadows one (the pin's check covers every do binder).
+        let facts = facts(&element);
+        if muts.iter().any(|name| facts.reassigned.contains(name)) {
+            return Err(refused());
+        }
+        if !muts.is_empty()
+            && (facts.handles
+                || is(&element, "doLetElse")
+                || is(&element, "doLetRec")
+                || fallback::is_binding(&element))
+            && shadows(&element, muts)
+        {
+            return Err(refused());
+        }
+        out.push(element);
+        Ok(())
+    }
+
+    /// A bound action (`let x ← a`, `x ← a`): a branch statement in it may declare its own `mut`
+    /// variables, but may not reassign the enclosing ones.
+    fn mutable_action(
+        &mut self,
+        value: Syntax,
+        muts: &[Name],
+        looped: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if !(is(&value, "doIf")
+            || is(&value, "doMatch")
+            || is(&value, "doUnless")
+            || is(&value, "doNested"))
+        {
+            return Ok(value);
+        }
+        let facts = facts(&value);
+        if muts.iter().any(|name| facts.reassigned.contains(name)) {
+            return Err(refused());
+        }
+        if looped {
+            if facts.returns || facts.jumps || facts.handles {
+                return Err(refused());
+            }
+            return Ok(term("doExpr", vec![self.stateful_term(value, muts, None)?]));
+        }
+        self.mutable_branches(value, muts, None, false)
+    }
+
+    /// `let x : T ← branches` for one variable; `let s ← branches; let x := s.1; …` for several.
+    fn bind_state(
+        &mut self,
+        state: &[Name],
+        action: Syntax,
+        out: &mut Vec<Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if let [name] = state {
+            out.push(bind_element(named(name), type_of(name), action));
+            return Ok(());
+        }
+        let result = self.do_control_name()?;
+        out.push(bind_element(result.clone(), null(vec![]), action));
+        for (index, name) in state.iter().enumerate() {
+            self.tick()?;
+            out.push(let_element(
+                name,
+                null(vec![]),
+                component(&result, index, state.len()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Each branch sequence of a branch statement, ending in `pure tail` when given.
+    fn mutable_branches(
+        &mut self,
+        element: Syntax,
+        muts: &[Name],
+        tail: Option<&[Name]>,
+        looped: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if is(&element, "doUnless") {
+            // `unless c do s` is `if c then pure () else s` (`unless::expand`).
+            return self.mutable_branches(unless::expand(element)?, muts, tail, looped);
+        }
+        if is(&element, "doNested") {
+            let mut parts = node(element, "doNested", 2)?;
+            let sequence = parts.pop().expect("nested sequence");
+            parts.push(self.mutable_sequence(sequence, muts, tail, false, looped)?);
+            return Ok(term("doNested", parts));
+        }
+        if is(&element, "doMatch") {
+            let mut parts = node(element, "doMatch", 7)?;
+            let mut alternatives = node(parts.pop().expect("match alternatives"), "matchAlts", 1)?;
+            let rows = children(alternatives.pop().expect("match rows"))?;
+            let mut rebuilt = Vec::with_capacity(rows.len());
+            for row in rows {
+                self.tick()?;
+                let mut row = node(row, "matchAlt", 4)?;
+                if shadows(&row[1], muts) {
+                    return Err(refused());
+                }
+                let sequence = row.pop().expect("match alternative sequence");
+                row.push(self.mutable_sequence(sequence, muts, tail, false, looped)?);
+                rebuilt.push(term("matchAlt", row));
+            }
+            parts.push(term("matchAlts", vec![null(rebuilt)]));
+            return Ok(term("doMatch", parts));
+        }
+        let mut parts = node(element, "doIf", 6)?;
+        if condition_binder(&parts[1]).is_some_and(|binder| shadows(binder, muts)) {
+            return Err(refused());
+        }
+        let otherwise = parts.pop().expect("else clause");
+        let clauses = children(parts.pop().expect("else-if clauses"))?;
+        let sequence = parts.pop().expect("then sequence");
+        parts.push(self.mutable_sequence(sequence, muts, tail, false, looped)?);
+        let mut rebuilt = Vec::with_capacity(clauses.len());
+        for clause in clauses {
+            self.tick()?;
+            let mut clause = take(clause, Name::from_components(["group"]), Some(4))?;
+            if condition_binder(&clause[1]).is_some_and(|binder| shadows(binder, muts)) {
+                return Err(refused());
+            }
+            let sequence = clause.pop().expect("else-if sequence");
+            clause.push(self.mutable_sequence(sequence, muts, tail, false, looped)?);
+            rebuilt.push(Syntax::node(Name::from_components(["group"]), clause));
+        }
+        parts.push(null(rebuilt));
+        let mut otherwise = children(otherwise)?;
+        let otherwise = match (otherwise.pop(), tail) {
+            (Some(sequence), _) => {
+                let keyword = otherwise.pop().ok_or_else(invalid)?;
+                vec![
+                    keyword,
+                    self.mutable_sequence(sequence, muts, tail, false, looped)?,
+                ]
+            }
+            // An absent `else` yields the variables unchanged.
+            (None, Some(state)) => {
+                let state: Vec<Syntax> = state.iter().map(named).collect();
+                vec![
+                    atom("else"),
+                    sequence_of(
+                        vec![term("doExpr", vec![call(false, vec![state_tuple(&state)])])],
+                        false,
+                    ),
+                ]
+            }
+            (None, None) => vec![],
+        };
+        parts.push(null(otherwise));
+        Ok(term("doIf", parts))
+    }
+
+    /// A jump-free branch statement as a term whose branches are `do` blocks: `if c then do s else
+    /// do t`, `match d with | p => do s`, or `do s`. A loop that carries state expands its body
+    /// without the nested-sequence joins that a bound `do` element needs; a term needs none.
+    fn stateful_term(
+        &mut self,
+        element: Syntax,
+        muts: &[Name],
+        tail: Option<&[Name]>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let block = |sequence: Syntax| term("do", vec![atom("do"), sequence]);
+        let element = if is(&element, "doIf") {
+            nest_else_ifs(element)?
+        } else {
+            element
+        };
+        let element = self.mutable_branches(element, muts, tail, false)?;
+        if is(&element, "doNested") {
+            let mut parts = node(element, "doNested", 2)?;
+            return Ok(block(parts.pop().expect("nested sequence")));
+        }
+        if is(&element, "doMatch") {
+            let mut parts = node(element, "doMatch", 7)?;
+            // The do-only dependent switch; the rest is the term `match`'s shape.
+            expect_empty_null(&parts[1], "plain do match option")?;
+            parts.remove(1);
+            for discriminant in children(parts[3].clone())?.iter().step_by(2) {
+                let Syntax::Node { args, .. } = discriminant else {
+                    return Err(invalid());
+                };
+                if args.iter().any(|field| is(field, "nestedAction")) {
+                    return Err(refused());
+                }
+            }
+            let mut alternatives = node(parts.pop().expect("match alternatives"), "matchAlts", 1)?;
+            let rows = children(alternatives.pop().expect("match rows"))?;
+            let mut rebuilt = Vec::with_capacity(rows.len());
+            for row in rows {
+                self.tick()?;
+                let mut row = node(row, "matchAlt", 4)?;
+                let sequence = row.pop().expect("match alternative sequence");
+                row.push(block(sequence));
+                rebuilt.push(term("matchAlt", row));
+            }
+            parts.push(term("matchAlts", vec![null(rebuilt)]));
+            return Ok(term("match", parts));
+        }
+        // `doIf`, its else-if clauses already nested into its `else`.
+        let mut parts = node(element, "doIf", 6)?;
+        let mut otherwise = children(parts.pop().expect("else clause"))?;
+        expect_empty_null(
+            &parts.pop().expect("else-if clauses"),
+            "nested else-if clauses",
+        )?;
+        let yes = block(parts.pop().expect("then sequence"));
+        let then = parts.pop().expect("then keyword");
+        let mut condition =
+            node(parts.pop().expect("condition"), "doIfProp", 2).map_err(|_| refused())?;
+        let proposition = condition.pop().expect("condition proposition");
+        let binder = condition.pop().expect("condition binder");
+        let keyword = parts.pop().expect("if keyword");
+        let no = match otherwise.pop() {
+            Some(sequence) => block(sequence),
+            None => block(sequence_of(
+                vec![term(
+                    "doExpr",
+                    vec![call(false, vec![root(&["PUnit", "unit"])])],
+                )],
+                false,
+            )),
+        };
+        Ok(term(
+            "ifThenElse",
+            vec![keyword, binder, proposition, then, yes, atom("else"), no],
+        ))
+    }
+
+    /// A `for` loop. One that reassigns variables declared before it carries them as its state
+    /// (`nativeDoMutFor`, expanded by `expand_state_for_loop`), then binds them again.
+    fn mutable_loop(
+        &mut self,
+        element: Syntax,
+        muts: &[Name],
+        looped: bool,
+        out: &mut Vec<Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut parts = node(element, "doFor", 4)?;
+        if loop_binders(&parts[1])
+            .into_iter()
+            .any(|binder| shadows(binder, muts))
+        {
+            return Err(refused());
+        }
+        let body = parts.pop().expect("loop body");
+        let facts = facts(&body);
+        let state: Vec<Name> = muts
+            .iter()
+            .filter(|name| facts.reassigned.contains(name))
+            .cloned()
+            .collect();
+        if state.is_empty() {
+            parts.push(self.mutable_sequence(body, muts, None, false, looped)?);
+            out.push(term("doFor", parts));
+            return Ok(());
+        }
+        if facts.returns {
+            return Err(refused());
+        }
+        parts.push(self.mutable_sequence(body, muts, None, true, true)?);
+        let result = match state.as_slice() {
+            [name] => named(name),
+            _ => self.do_control_name()?,
+        };
+        parts.push(null(state.iter().map(named).collect()));
+        parts.push(result.clone());
+        out.push(term("nativeDoMutFor", parts));
+        if state.len() > 1 {
+            for (index, name) in state.iter().enumerate() {
+                self.tick()?;
+                out.push(let_element(
+                    name,
+                    null(vec![]),
+                    component(&result, index, state.len()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `nativeDoMutFor`: the loop with its state, as `let s ← forIn xs s (fun x s => body)`.
+    pub(super) fn expand_state_for_loop(
+        &mut self,
+        syntax: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let mut parts = node(syntax, "nativeDoMutFor", 6)?;
+        let result = parts.pop().expect("loop result");
+        let state = children(parts.pop().expect("loop state"))?;
+        if state.is_empty() {
+            return Err(invalid());
+        }
+        let (header, sequence) = self.split_for_loop(term("doFor", parts))?;
+        let tuple = state_tuple(&state);
+        let parameter = match state.as_slice() {
+            [name] => name.clone(),
+            _ => self.do_control_name()?,
+        };
+        let yield_step = application(root(&["ForInStep", "yield"]), vec![tuple.clone()]);
+        let mut body = self.expand_do_sequence(sequence, Some(call(false, vec![yield_step])))?;
+        if state.len() > 1 {
+            for (index, name) in state.iter().enumerate().rev() {
+                self.tick()?;
+                body = Syntax::node(
+                    parser_kind(&["Term", "let"]),
+                    vec![
+                        atom("let"),
+                        let_config(),
+                        term(
+                            "letDecl",
+                            vec![term(
+                                "letIdDecl",
+                                vec![
+                                    term("letId", vec![name.clone()]),
+                                    null(vec![]),
+                                    null(vec![]),
+                                    atom(":="),
+                                    component(&parameter, index, state.len()),
+                                ],
+                            )],
+                        ),
+                        atom(";"),
+                        body,
+                    ],
+                );
+            }
+        }
+        let action = self.finish_for_loop(header, parameter, tuple, body)?;
+        Ok(bind_element(
+            result,
+            null(vec![]),
+            term("doExpr", vec![action]),
+        ))
+    }
+}
+
+/// The binder of a `doIf` condition: `h` of `if h : c`, `p` of `if let p := e`.
+fn condition_binder(condition: &Syntax) -> Option<&Syntax> {
+    let Syntax::Node { args, .. } = condition else {
+        return None;
+    };
+    if is(condition, "doIfProp") {
+        args.first()
+    } else if is(condition, "doIfLet") {
+        args.get(1)
+    } else {
+        None
+    }
+}
+
+/// The binders of a `for`'s declarations: the membership witness and the element.
+fn loop_binders(declarations: &Syntax) -> Vec<&Syntax> {
+    let Syntax::Node { args, .. } = declarations else {
+        return Vec::new();
+    };
+    args.iter()
+        .filter_map(|declaration| match declaration {
+            Syntax::Node { args, .. } => Some(args.iter().take(2)),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}

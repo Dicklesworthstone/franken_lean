@@ -1192,12 +1192,14 @@ impl Context {
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
         let mut scan = vec![syntax];
         let mut needed = false;
+        let mut mutation = false;
         let mut local_roots = HashSet::new();
         while let Some(node) = scan.pop() {
             self.tick()?;
             if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) {
                 continue;
             }
+            mutation |= do_notation::is_mutation(node);
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || collections::is_notation(node)
@@ -1221,6 +1223,13 @@ impl Context {
                 }
                 scan.extend(args);
             }
+        }
+        if mutation {
+            // `let mut` and reassignment become immutable `do` first; the result has none left.
+            let rewritten = self.eliminate_do_mutation(syntax)?;
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&rewritten)?.into_owned(),
+            ));
         }
         if !needed {
             return Ok(Cow::Borrowed(syntax));

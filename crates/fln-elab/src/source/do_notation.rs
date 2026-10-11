@@ -13,6 +13,8 @@ mod for_loop;
 mod if_let;
 mod loop_returns;
 mod matching;
+mod mutation;
+pub(super) use mutation::is_mutation;
 mod nested;
 pub(super) use nested::bind_join_domain;
 mod pattern_binding;
@@ -374,6 +376,12 @@ impl Context {
             }
             self.tick()?;
             return unless::expand(syntax);
+        }
+        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoMutFor"])) {
+            if pattern {
+                return Err(invalid());
+            }
+            return self.expand_state_for_loop(syntax);
         }
         if syntax.kind() == Some(&parser_kind(&["Term", "doFor"])) {
             if pattern {

@@ -1946,6 +1946,29 @@ impl Context {
                                     tasks.push(Task::Visit(collection, None, true));
                                     continue;
                                 }
+                                // A reassignment's type: the type of the variable it replaces
+                                // (`do_notation::mutation`).
+                                if kind == &parser_kind(&["Term", "nativeDoTypeOf"]) {
+                                    let [Syntax::Ident { val, .. }] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let local = self
+                                        .txn
+                                        .lctx
+                                        .find_by_user_name(val)
+                                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                                    let value = self.instantiate(&local.type_.clone())?;
+                                    let type_ = self.known_type(&value)?.ok_or_else(|| {
+                                        failure(SourceInferenceError::ExpectedType)
+                                    })?;
+                                    let term = Typed { value, type_ };
+                                    values.push(if finish {
+                                        self.finish_term(term, expected.as_ref())?
+                                    } else {
+                                        term
+                                    });
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "nativeDoJoin"]) {
                                     let (name, suffix, body) = do_notation::join_parts(args)?;
                                     tasks.push(Task::DoJoinValue(name, body, expected.clone()));
