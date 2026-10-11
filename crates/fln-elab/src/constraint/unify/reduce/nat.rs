@@ -203,7 +203,15 @@ impl Engine<'_> {
             else {
                 return Ok(None);
             };
-            if binder_type != &nat_type {
+            // Init's operations borrow their operands (`Nat.mul : (@& Nat) → (@& Nat) → Nat`,
+            // vendored Init/Prelude.lean): `@&` is a `borrowed` annotation, an mdata around `Nat`
+            // in the declaration's type. The pin's `reduceBinNatOp` keys on the name alone.
+            let mut domain = binder_type;
+            while let ExprNode::MData { expr, .. } = domain.node() {
+                self.meter.node()?;
+                domain = expr;
+            }
+            if domain != &nat_type {
                 return Ok(None);
             }
             type_ = body;
