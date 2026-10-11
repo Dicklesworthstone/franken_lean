@@ -224,6 +224,7 @@ impl Context {
         } else if kind == &parser_kind(&["Tactic", "tacticRepeat_"]) {
             Mode::Repeat
         } else if kind == &parser_kind(&["Tactic", "failIfSuccess"]) {
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "failIfSuccess"])?;
             Mode::FailIfSuccess
         } else {
             return Ok(None);

@@ -75,6 +75,12 @@ impl Context {
             .known_type(&target)?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         let elaborated = self.term(expected, Some(target_type))?;
+        // `Tactic.elabTerm` synthesizes without postponing, default instances included, before
+        // `isEq` compares: `guard_target = 1 = 1` meets the goal's `@OfNat.ofNat Nat 1 _`.
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        self.resolve_instances_with_defaults()?;
+        self.flush(false)?;
         let value = self.instantiate(&elaborated.value)?;
         match relation {
             Relation::Syntactic => self.expr_eqv(consume_mdata(&value), consume_mdata(&target)),

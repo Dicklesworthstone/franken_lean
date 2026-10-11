@@ -452,6 +452,27 @@ impl Context {
         Ok(instructions)
     }
 
+    /// A tactic is syntax its declaring module adds, as a `ParserDescr` constant named after its
+    /// kind (`Lean.Parser.Tactic.guardTarget`, from `Init/Guard.lean`). In a world built from
+    /// Init's `.olean`s, which declare `Lean.ParserDescr`, a world whose imports do not reach that
+    /// module lacks the constant, and the pin reads the tactic as unknown ("unknown tactic"). The
+    /// seed declares no syntax and stands for the implicit Init, which declares every such tactic.
+    pub(super) fn require_declared_tactic(
+        &self,
+        syntax_constant: &[&str],
+    ) -> Result<(), NatDefinitionElabError> {
+        let name = Name::from_components(syntax_constant.iter().copied());
+        if self
+            .txn
+            .env
+            .contains(&Name::from_components(["Lean", "ParserDescr"]))
+            && !self.txn.env.contains(&name)
+        {
+            return Err(failure(SourceInferenceError::UnknownConstant(name)));
+        }
+        Ok(())
+    }
+
     /// Try equality transactionally; a failed candidate retains no assignment.
     /// Inconclusive/resource/internal outcomes never mean "try another proof".
     pub(in crate::source) fn proof_types_match(
@@ -736,6 +757,7 @@ impl Context {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "guard_target", "guard_target keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardTarget"])?;
                 let relation = guard::relation(relation)?;
                 if !self.guard_target_matches(&goal, relation, expected)? {
                     return Err(error(TacticError::GuardTargetMismatch));

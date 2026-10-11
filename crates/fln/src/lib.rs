@@ -7720,6 +7720,33 @@ impl Engine {
             }
 
             let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
+            // `#guard` is syntax `Init/Guard.lean` declares (`Lean.Parser.Command.guardCmd`). A
+            // world built from `.olean`s that does not reach it reads the command as an unknown
+            // token, as the pin does ("expected token"); the seed stands for the implicit `Init`,
+            // which declares it. The same rule as `#guard_msgs`'s, above.
+            let guard_command = Name::from_components(["Lean", "Parser", "Command", "guardCmd"]);
+            if is_evaluation
+                && parsed.syntax().kind() == Some(&guard_command)
+                && !engine.imported_modules.is_empty()
+                && !engine.environment().contains(&guard_command)
+            {
+                let keyword = command_source
+                    .windows(b"#guard".len())
+                    .position(|window| window == b"#guard")
+                    .unwrap_or(0);
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Parse(
+                            fln_parse::NatDefinitionParseError::OutsideSeedGrammar {
+                                at: fln_parse::BytePos(original_offset.0 + keyword),
+                                expected: fln_parse::NatDefinitionExpectation::DefinitionKeyword,
+                            },
+                        ),
+                    )),
+                    at: Some(original_offset),
+                });
+            }
             let declaration = if is_evaluation {
                 let name = fresh_generated_command_name(engine.environment(), command_index)
                     .map_err(|error| EngineExecutionError::BatchCommand {
