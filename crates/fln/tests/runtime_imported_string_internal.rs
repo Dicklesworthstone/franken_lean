@@ -122,6 +122,76 @@ fn query(label: &str) -> Declaration {
     })
 }
 
+fn assert_callback_refused(engine: &Engine, limits: EngineExecutionLimits) {
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        "#eval let count := String.Internal.length; count \"λé\"",
+        "#eval let unused := String.Internal.length; 42",
+    ] {
+        let failure = engine
+            .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+            .expect_err("an unauthenticated opaque cannot become a callback");
+        let fln::EngineExecutionError::BatchCommand { error, .. } = failure else {
+            panic!("callback refusal must name its source command: {failure:?}");
+        };
+        assert!(
+            matches!(*error, fln::EngineExecutionError::Ingress(_)),
+            "{error:?}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+}
+
+fn assert_partial_arguments_remain_strict(engine: &Engine, limits: EngineExecutionLimits) {
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let source = |cost| {
+        format!(
+            "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n\
+             #eval let unused := String.Internal.append (let paid := spend {cost}; \"prefix\"); 42"
+        )
+    };
+    let run = |cost, limits| {
+        engine.execute_source_commands_with_checks(source(cost).as_bytes(), &options, limits)
+    };
+    let mut steps = Vec::new();
+    for cost in [0, 30] {
+        let completed = run(cost, limits).unwrap().into_complete().unwrap();
+        let execution = completed.batch.executions.last().unwrap();
+        assert_eq!(
+            fln::closed_vm_value(&execution.exit).unwrap(),
+            Some(ClosedVmValue::Scalar(42))
+        );
+        let fln::VmExit::Returned(returned) = &execution.exit else {
+            panic!("the strict argument program must return");
+        };
+        steps.push(returned.usage.steps);
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        assert_eq!(
+            fln::closed_vm_value(&replay).unwrap(),
+            Some(ClosedVmValue::Scalar(42))
+        );
+    }
+    assert!(
+        steps[1] > steps[0] + 30,
+        "constructing an unused native closure must evaluate its supplied argument: {steps:?}"
+    );
+    let mut bounded = limits;
+    bounded.vm.max_steps = steps[0];
+    assert!(matches!(
+        run(30, bounded).unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
+    assert_eq!(engine.logical_root(&options), root);
+    assert!(matches!(run(0, limits).unwrap(), fln::Outcome::Complete(_)));
+    assert_eq!(engine.logical_root(&options), root);
+}
+
 #[test]
 fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contracts() {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
@@ -190,6 +260,12 @@ import Init.Data.String.Bootstrap
 #eval String.Internal.foldl String.push "" "Aλ😀é\x00"
 #eval if String.Internal.isEmpty "" then 42 else 0
 #eval let isEmpty := String.Internal.isEmpty; if isEmpty "\x00" then 0 else 42
+#eval let append := String.Internal.append "left"; append "right"
+#eval let append := String.Internal.append; append "λ" "😀"
+#eval let append := String.Internal.append "λ"; String.Internal.append (append "é") (append "😀")
+#eval let count := String.Internal.length; count "λ😀"
+#eval let consume (f : String -> String) : String := f "λ"; consume (String.Internal.append "pre")
+#eval let measure (f : String -> Nat) : Nat := f "é😀a"; measure String.Internal.length
 "#;
         let entry = name("Main");
         let modules = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
@@ -207,6 +283,12 @@ import Init.Data.String.Bootstrap
             Some(ClosedVmValue::String("prea!λ!".to_owned())),
             Some(ClosedVmValue::String("Aλ😀é\0".to_owned())),
             Some(ClosedVmValue::Scalar(42)), Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::String("leftright".to_owned())),
+            Some(ClosedVmValue::String("λ😀".to_owned())),
+            Some(ClosedVmValue::String("λéλ😀".to_owned())),
+            Some(ClosedVmValue::Scalar(2)),
+            Some(ClosedVmValue::String("preλ".to_owned())),
+            Some(ClosedVmValue::Scalar(3)),
         ]);
         assert_eq!("é😀a".len(), 7, "the native length result counts codepoints, not bytes");
         // Replay the actual bytes emitted after both imported-module and
@@ -232,12 +314,9 @@ import Init.Data.String.Bootstrap
         let mut tight = limits;
         tight.execution.ingress.max_nodes = 1;
         assert!(imported.execute_source_modules(&modules, &entry, &options, tight, None).is_err());
-        // Existing intrinsic adapters require saturated calls. Preserve that
-        // explicit refusal instead of silently changing a strict call to a closure.
-        let partial = b"prelude\nimport Init.Data.String.Bootstrap\n#eval let append := String.Internal.append \"left\"; append \"right\"\n";
-        let failure = imported.execute_source_modules(&[SourceModuleInput { name: &entry, source: partial }], &entry, &options, limits, None).expect_err("unsaturated intrinsic calls retain their bounded refusal");
-        let fln::source_check::modules::SourceModuleCheckError::Source { error: fln::source_check::SourceCheckError::Command { error, .. }, .. } = failure else { panic!("unexpected refusal {failure:?}") };
-        assert!(matches!(*error, fln::EngineExecutionError::Ingress(fln::IngressError::IntrinsicTermArity { expected: 2, actual: 1, .. })));
+        let invalid = b"prelude\nimport Init.Data.String.Bootstrap\n#eval let append := String.Internal.append \"left\"; append 42\n";
+        assert!(imported.execute_source_modules(&[SourceModuleInput { name: &entry, source: invalid }], &entry, &options, limits, None).is_err(), "an ill-typed callback application cannot enter native execution");
+        assert_partial_arguments_remain_strict(&imported.engine, limits.execution);
         let retry = run();
         assert_eq!(executions.iter().map(|execution| &execution.flbc_artifact).collect::<Vec<_>>(), retry.modules[0].commands.batch.executions.iter().map(|execution| &execution.flbc_artifact).collect::<Vec<_>>());
         assert_eq!(imported.engine.logical_root(&options), original_root);
@@ -257,6 +336,7 @@ import Init.Data.String.Bootstrap
             let root = engine.logical_root(&options);
             let failure = engine.execute_definition(query("counterfeitResult"), &options, limits.execution).expect_err("an altered opaque or dictionary must not acquire native authority");
             assert!(matches!(failure, fln::EngineExecutionError::Ingress(_)), "{failure:?}");
+            assert_callback_refused(&engine, limits.execution);
             assert_eq!(engine.logical_root(&options), root);
         }
         let ordinary = replace_checked(&imported.engine, "String.Internal.length", |info| {
@@ -280,6 +360,7 @@ import Init.Data.String.Bootstrap
         let root = no_attribute.logical_root(&options);
         let failure = no_attribute.execute_definition(query("noAttributeResult"), &options, limits.execution).expect_err("identical opaque constants without extern metadata grant no native binding");
         assert!(matches!(failure, fln::EngineExecutionError::Ingress(_)), "{failure:?}");
+        assert_callback_refused(&no_attribute, limits.execution);
         assert_eq!(no_attribute.logical_root(&options), root);
         use fln_elab::externs::ExternEntry;
         let canonical = ExternEntry::Standard { backend: name("all"), symbol: "lean_string_length".to_owned() };
@@ -294,6 +375,7 @@ import Init.Data.String.Bootstrap
             let root = changed.logical_root(&options);
             let failure = changed.execute_definition(query("changedAttributeResult"), &options, limits.execution).expect_err("the exact supported extern entry is required");
             assert!(matches!(failure, fln::EngineExecutionError::Ingress(fln::IngressError::UnsupportedNode { .. })), "{failure:?}");
+            assert_callback_refused(&changed, limits.execution);
             assert_eq!(changed.logical_root(&options), root);
         }
         let result = imported.engine.execute_definition(query("cleanResult"), &options, limits.execution).unwrap().into_complete().unwrap();

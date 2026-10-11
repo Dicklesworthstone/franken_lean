@@ -814,7 +814,8 @@ impl Preparation<'_> {
         Ok(Some(application(head, args[consumed..].iter().cloned())))
     }
     /// Only admitted executable entries can become callable values. A familiar
-    /// axiom name is insufficient: intrinsics require the exact seed contract.
+    /// axiom name is insufficient: intrinsics require the complete admitted
+    /// native contract and any selected extern metadata.
     /// Ground constructors use the same telescope that produced their layout.
     pub(super) fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
         self.original_callable_type(head)?
@@ -860,7 +861,12 @@ impl Preparation<'_> {
         if let Some(type_) = self.specializations.constructor_types.get(name) {
             return Ok(Some(type_.clone()));
         }
-        if source_intrinsic_binding(self.environment, name).is_some() {
+        // Imported safe opaques have no executable logical body. Their native
+        // contract must authorize the same callable telescope used for a
+        // saturated invocation, including its selected extern. The ordinary
+        // partial-call path then captures supplied values in strict lets and
+        // emits a saturated native call inside a checked closure.
+        if self.native_intrinsic_binding(name)?.is_some() {
             return Ok(self
                 .environment
                 .find(name)
