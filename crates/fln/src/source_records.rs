@@ -450,6 +450,9 @@ impl Engine {
         let reducibility = fln_elab::source::scope::simp::reducibility(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let noncomputable = fln_elab::source::noncomputable_registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let protected = fln_elab::source::protected_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
@@ -549,6 +552,17 @@ impl Engine {
                         ))
                     })?;
                     batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if let Some(name) = noncomputable {
+                    let name = scope.declaration_name(&name).map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                    batch.engine.environment = tag_noncomputable(&batch.engine, &name)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if let Some(name) = protected {
@@ -1047,6 +1061,21 @@ pub(crate) fn tag_protected(
                 ),
             ))
         })
+}
+
+/// Tag an admitted `noncomputable def` (`scope`'s `noncomputable_registration`), as the pin's
+/// `addNoncomputable`: the runtime catalog never binds it.
+pub(crate) fn tag_noncomputable(
+    engine: &Engine,
+    name: &Name,
+) -> Result<Environment, EngineExecutionError> {
+    fln_elab::noncomputable::register(engine.environment(), name).map_err(|_| {
+        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a noncomputable tag on an admitted declaration",
+            },
+        ))
+    })
 }
 
 /// Record a `@[reducible]`-style attribute's status for an admitted declaration of this module

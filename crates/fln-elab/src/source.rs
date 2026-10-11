@@ -4711,9 +4711,14 @@ fn definition_in_context_named(
                 scope::visibility::modifier(modifier)?;
             }
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
+            // Validated, with the declaration kind, by `noncomputable_registration` below.
+            NONCOMPUTABLE_SLOT => {
+                noncomputable_slot(modifier)?;
+            }
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
     }
+    noncomputable_registration(syntax)?;
     if is_protected && generated_name.is_some() {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "a named protected declaration",
@@ -5408,6 +5413,7 @@ pub fn instance_registration_is_local(syntax: &Syntax) -> Result<bool, NatDefini
 /// `declModifiers`' `protected` slot: docComment, attributes, visibility, then
 /// `protected` (vendored `src/Lean/Parser/Command.lean`, `declModifiers`).
 const PROTECTED_SLOT: usize = 3;
+pub(super) const NONCOMPUTABLE_SLOT: usize = 4;
 
 /// `declModifiers`' doc comment slot: empty, or the pin's `docComment` node. A docstring adds
 /// no declaration and no meaning the kernel sees; the reference-manual links the pin validates
@@ -5449,6 +5455,83 @@ fn protected_slot(slot: &Syntax) -> Result<bool, NatDefinitionElabError> {
         _ => Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "one protected modifier",
         }),
+    }
+}
+
+/// Whether a `noncomputable` slot is set: empty, or exactly one
+/// `Lean.Parser.Command.noncomputable` node holding the keyword.
+pub(super) fn noncomputable_slot(slot: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    match expect_null_args(slot, "noncomputable modifier")? {
+        [] => Ok(false),
+        [modifier] => {
+            let parts = expect_node(
+                modifier,
+                &parser_kind(&["Command", "noncomputable"]),
+                1,
+                "noncomputable modifier",
+            )?;
+            expect_atom(&parts[0], "noncomputable", "noncomputable keyword")?;
+            Ok(true)
+        }
+        _ => Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one noncomputable modifier",
+        }),
+    }
+}
+
+/// The name a `noncomputable def` or `abbrev` declares, if the command is one: checked but
+/// never compiled, and code that must run may not depend on it (the pin's `noncomputableExt`,
+/// vendored `src/Lean/Compiler/NoncomputableAttr.lean`). A `noncomputable example` declares
+/// nothing. A `noncomputable theorem` is the pin's error "'theorem' subsumes 'noncomputable'",
+/// and a `noncomputable` instance or opaque constant is refused here. The caller tags the
+/// name only once the council has admitted the declaration.
+pub fn noncomputable_registration(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    if !noncomputable_slot(&modifiers[NONCOMPUTABLE_SLOT])? {
+        return Ok(None);
+    }
+    let kind = |name: &str| declaration[1].kind() == Some(&parser_kind(&["Command", name]));
+    if kind("example") {
+        return Ok(None);
+    }
+    if kind("theorem") {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a computable theorem ('theorem' subsumes 'noncomputable')",
+        });
+    }
+    if !kind("definition") && !kind("abbrev") {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a noncomputable `def`, `abbrev` or `example`",
+        });
+    }
+    let Syntax::Node { args, .. } = &declaration[1] else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "named declaration",
+        });
+    };
+    let id = expect_node(
+        args.get(1)
+            .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "declaration id",
+            })?,
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    match &id[0] {
+        Syntax::Ident { val, .. } if !val.is_anonymous() => Ok(Some(val.clone())),
+        _ => Err(NatDefinitionElabError::AnonymousDeclarationName),
     }
 }
 

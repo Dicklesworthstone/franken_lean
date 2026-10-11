@@ -679,7 +679,12 @@ pub fn elaborate_example(
     // Attribute execution is a separate effect. Refuse unsupported modifiers
     // instead of silently losing an attribute failure when the scratch closes.
     super::doc_comment_slot(&modifiers[0])?;
-    for modifier in &modifiers[1..] {
+    for (index, modifier) in modifiers.iter().enumerate().skip(1) {
+        // `noncomputable example`: the pin's examples are never compiled anyway.
+        if index == super::NONCOMPUTABLE_SLOT {
+            super::noncomputable_slot(modifier)?;
+            continue;
+        }
         expect_empty_null(modifier, "unmodified example")?;
     }
     let example = expect_node(

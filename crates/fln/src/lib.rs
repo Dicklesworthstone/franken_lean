@@ -6818,6 +6818,9 @@ impl Engine {
         let reducibility = fln_elab::source::scope::simp::reducibility(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let noncomputable = fln_elab::source::noncomputable_registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let protected = fln_elab::source::protected_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
@@ -6920,6 +6923,20 @@ impl Engine {
                         })?;
                     admitted.engine.environment =
                         source_records::set_reducibility(&admitted.engine, &name, status)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if let Some(name) = noncomputable {
+                    let name = fln_elab::source::scope::SourceScope::default()
+                        .declaration_name(&name)
+                        .map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::NameScope(error),
+                                ),
+                            ))
+                        })?;
+                    admitted.engine.environment =
+                        source_records::tag_noncomputable(&admitted.engine, &name)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some(name) = protected {
@@ -7712,10 +7729,22 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_some();
+            // A `noncomputable def` is checked, never compiled (the pin's `noncomputableExt`).
+            let is_noncomputable = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                && fln_elab::source::noncomputable_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some();
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
                 || is_instance
                 || has_inline_simp
+                || is_noncomputable
             {
                 let admission = match grammar
                     .enter(|| {
@@ -10513,6 +10542,13 @@ fn executable_dependencies(
     let mut resolved = BTreeSet::new();
     let mut visited_nodes = 0usize;
     collect_executable_constants(source, &mut pending, &mut visited_nodes, limits)?;
+    // A noncomputable declaration has no runtime binding, so code that depends on it is refused
+    // as a constant outside the runtime catalogs (the pin: "failed to compile definition ...
+    // because it depends on 'a', which is 'noncomputable'").
+    let noncomputable =
+        fln_elab::noncomputable::read(environment).map_err(|_| IngressError::UnsupportedNode {
+            kind: "malformed noncomputable journal",
+        })?;
 
     let maximum_functions = limits.fir.max_functions.saturating_sub(1);
     let mut scalar_constructors = Vec::new();
@@ -10539,7 +10575,7 @@ fn executable_dependencies(
         let Some(name) = pending.pop_first() else {
             break;
         };
-        if !resolved.insert(name.clone()) {
+        if !resolved.insert(name.clone()) || noncomputable.contains(&name) {
             continue;
         }
         if let Some(binding) = source_scalar_constructor_binding(environment, &name) {

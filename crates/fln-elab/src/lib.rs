@@ -37,6 +37,7 @@ pub mod lctx;
 pub mod messages;
 pub mod mvar;
 pub mod perturbation;
+pub mod noncomputable;
 pub mod protected_names;
 pub mod records;
 pub mod reducibility;
