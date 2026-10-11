@@ -3977,6 +3977,11 @@ fn finish_intrinsic_result(
         });
     }
     let value = result.into_object();
+    // Only a scalar result has a representation to check; classifying the
+    // row by its text is skipped for every other ownership.
+    if expected != ResultOwnership::Scalar {
+        return Ok(value);
+    }
     let scalar_kind_matches = if let Some(intrinsic) = floats::Intrinsic::for_row(row) {
         intrinsic.result_kind_matches(&value)
     } else if floats::boxed_integer_result(row) {
@@ -3984,7 +3989,7 @@ fn finish_intrinsic_result(
     } else {
         value.is_scalar()
     };
-    if expected == ResultOwnership::Scalar && !scalar_kind_matches {
+    if !scalar_kind_matches {
         return Err(VmRefusal::IntrinsicResultKind {
             row: row.to_string(),
             expected: if floats::Intrinsic::for_row(row).is_some()
@@ -4095,6 +4100,48 @@ fn transfer_arguments(
     fault_code: &'static str,
     boundary: &'static str,
 ) -> Result<Vec<Obj>, Stop> {
+    let consumes = |index: usize| ownership.get(index).is_some_and(|d| d.consumes());
+    // Order is observable only when a register consumed by one operand is
+    // read borrowed by a later one: the retained copy must be taken first.
+    let consumed_then_borrowed = registers.iter().enumerate().any(|(later, register_id)| {
+        later < ownership.len()
+            && !consumes(later)
+            && registers[..later]
+                .iter()
+                .enumerate()
+                .any(|(earlier, other)| other == register_id && consumes(earlier))
+    });
+    if !consumed_then_borrowed {
+        // Report a missing register exactly as the two-phase path does:
+        // every borrowed operand first, then every consumed one.
+        for pass_consumes in [false, true] {
+            for (register_id, disposition) in
+                registers.iter().copied().zip(ownership.iter().copied())
+            {
+                if disposition.consumes() == pass_consumes {
+                    register(frame, register_id)?;
+                }
+            }
+        }
+        let mut values = Vec::new();
+        values.try_reserve_exact(registers.len()).map_err(|_| {
+            Stop::InternalFault(InternalFault::new(
+                fault_code,
+                format!(
+                    "could not reserve {} transferred {boundary} arguments",
+                    registers.len()
+                ),
+            ))
+        })?;
+        for (register_id, disposition) in registers.iter().copied().zip(ownership.iter().copied()) {
+            values.push(if disposition.consumes() {
+                take_register(frame, register_id)?
+            } else {
+                clone_register(frame, register_id)?
+            });
+        }
+        return Ok(values);
+    }
     let mut borrowed = Vec::new();
     borrowed.try_reserve_exact(registers.len()).map_err(|_| {
         Stop::InternalFault(InternalFault::new(
@@ -4186,7 +4233,82 @@ fn set_register(frame: &mut Frame, register: Register, value: Obj) -> Result<(),
     Ok(())
 }
 
+/// The scalar branch of the pin's `Nat` primitives: `lean_nat_add` and its
+/// siblings (`lean.h:1423` onwards) test `lean_is_scalar` on every operand
+/// before reaching GMP.
+///
+/// Answers only when every operand is a tagged scalar and the bignum arm
+/// below would pass each magnitude check and return a tagged scalar too, so
+/// it changes how fast a row answers, never what it answers or refuses.
+/// `None` leaves the call to that arm, which also owns every arity and
+/// operand-type refusal.
+fn scalar_nat_result(
+    implementation: IntrinsicImplementation,
+    args: &[Obj],
+) -> Option<IntrinsicResult> {
+    // An operand below this has at most `usize::BITS - 2` significant bits,
+    // so the bignum arm's bound for a sum is at most `usize::BITS - 1` bits:
+    // zero magnitude bytes (`nat_magnitude_bytes`) and a tagged scalar.
+    const SUM_OPERAND_LIMIT: usize = 1 << (usize::BITS - 2);
+    let bits = |value: usize| usize::BITS - value.leading_zeros();
+    let truth = |holds: bool| Some(IntrinsicResult::scalar(Obj::mk_nat(usize::from(holds))));
+    match (implementation, args) {
+        (IntrinsicImplementation::NatPred, [value]) if value.is_scalar() => Some(
+            IntrinsicResult::owned(Obj::mk_nat(value.unbox().saturating_sub(1))),
+        ),
+        (_, [left, right]) if left.is_scalar() && right.is_scalar() => {
+            let (left, right) = (left.unbox(), right.unbox());
+            let value = match implementation {
+                IntrinsicImplementation::NatAdd
+                    if left < SUM_OPERAND_LIMIT && right < SUM_OPERAND_LIMIT =>
+                {
+                    left + right
+                }
+                // A scalar minuend has at most `usize::BITS - 1` bits, the
+                // bignum arm's whole check here.
+                IntrinsicImplementation::NatSub => left.saturating_sub(right),
+                // The bignum arm's bound for a product is the sum of the bit
+                // lengths; below `usize::BITS` it is a tagged scalar.
+                IntrinsicImplementation::NatMul
+                    if left == 0 || right == 0 || bits(left) + bits(right) < usize::BITS =>
+                {
+                    left * right
+                }
+                // Lean's laws: `x / 0 = 0` and `x % 0 = x`.
+                IntrinsicImplementation::NatDiv | IntrinsicImplementation::NatDivExact => {
+                    left.checked_div(right).unwrap_or(0)
+                }
+                IntrinsicImplementation::NatMod | IntrinsicImplementation::NatModCore => {
+                    left.checked_rem(right).unwrap_or(left)
+                }
+                IntrinsicImplementation::NatBeq | IntrinsicImplementation::NatDecEq => {
+                    return truth(left == right);
+                }
+                IntrinsicImplementation::NatBle | IntrinsicImplementation::NatDecLe => {
+                    return truth(left <= right);
+                }
+                IntrinsicImplementation::NatDecLt => return truth(left < right),
+                _ => return None,
+            };
+            Some(IntrinsicResult::owned(Obj::mk_nat(value)))
+        }
+        _ => None,
+    }
+}
+
 fn invoke_intrinsic(
+    implementation: IntrinsicImplementation,
+    row: &str,
+    args: &[Obj],
+    max_nat_magnitude_bytes: u64,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    if let Some(result) = scalar_nat_result(implementation, args) {
+        return Ok(result);
+    }
+    dispatch_intrinsic(implementation, row, args, max_nat_magnitude_bytes)
+}
+
+fn dispatch_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
     args: &[Obj],
@@ -8005,6 +8127,172 @@ pub fn value_kind(value: &Obj) -> ValueKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scalar `Nat` branch answers exactly as the bignum arm it bypasses,
+    /// at every operand boundary and magnitude ceiling, and steps aside
+    /// wherever the bignum arm could refuse or box.
+    #[test]
+    fn the_scalar_nat_branch_agrees_with_the_bignum_arm() -> Result<(), String> {
+        // `LEAN_MAX_SMALL_NAT` is `SIZE_MAX >> 1` (`lean.h:1380`).
+        let max = usize::MAX >> 1;
+        let quarter = 1usize << (usize::BITS - 2);
+        let operands = [
+            0,
+            1,
+            2,
+            3,
+            255,
+            1 << 31,
+            (1 << 32) + 7,
+            quarter - 1,
+            quarter,
+            quarter + 1,
+            max / 2,
+            max - 1,
+            max,
+        ];
+        let rows = [
+            (IntrinsicImplementation::NatAdd, "extern:Nat.add"),
+            (IntrinsicImplementation::NatSub, "extern:Nat.sub"),
+            (IntrinsicImplementation::NatMul, "extern:Nat.mul"),
+            (IntrinsicImplementation::NatDiv, "extern:Nat.div"),
+            (IntrinsicImplementation::NatDivExact, "extern:Nat.divExact"),
+            (IntrinsicImplementation::NatMod, "extern:Nat.mod"),
+            (IntrinsicImplementation::NatModCore, "extern:Nat.modCore"),
+            (IntrinsicImplementation::NatBeq, "extern:Nat.beq"),
+            (IntrinsicImplementation::NatBle, "extern:Nat.ble"),
+            (IntrinsicImplementation::NatDecEq, "extern:Nat.decEq"),
+            (IntrinsicImplementation::NatDecLe, "extern:Nat.decLe"),
+            (IntrinsicImplementation::NatDecLt, "extern:Nat.decLt"),
+        ];
+        let ceilings = [0, 7, 8, 16, u64::MAX];
+        let (mut answered, mut declined) = (0usize, 0usize);
+        let mut agree = |implementation, row: &str, values: &[usize]| -> Result<(), String> {
+            let args: Vec<Obj> = values.iter().map(|&value| Obj::mk_nat(value)).collect();
+            let Some(fast) = scalar_nat_result(implementation, &args) else {
+                declined += 1;
+                return Ok(());
+            };
+            answered += 1;
+            for ceiling in ceilings {
+                let slow =
+                    dispatch_intrinsic(implementation, row, &args, ceiling).map_err(|_| {
+                        format!("{row} {values:?} at {ceiling}: the bignum arm refused")
+                    })?;
+                assert_eq!(slow.ownership(), fast.ownership(), "{row} {values:?}");
+                let slow = slow.into_object();
+                assert!(
+                    slow.is_scalar() && fast.value.is_scalar(),
+                    "{row} {values:?}"
+                );
+                assert_eq!(
+                    slow.unbox(),
+                    fast.value.unbox(),
+                    "{row} {values:?} at {ceiling}"
+                );
+            }
+            Ok(())
+        };
+        for (implementation, row) in rows {
+            for left in operands {
+                for right in operands {
+                    agree(implementation, row, &[left, right])?;
+                }
+            }
+        }
+        for value in operands {
+            agree(
+                IntrinsicImplementation::NatPred,
+                "extern:Nat.pred",
+                &[value],
+            )?;
+        }
+        // The branch fires for every predicate pair and steps aside where a
+        // sum or product could leave the scalar range.
+        assert!(
+            answered > rows.len() * operands.len(),
+            "answered {answered}"
+        );
+        assert!(declined > 0, "declined {declined}");
+        assert!(
+            scalar_nat_result(
+                IntrinsicImplementation::NatAdd,
+                &[Obj::mk_nat(quarter), Obj::mk_nat(0)]
+            )
+            .is_none()
+        );
+        assert!(
+            scalar_nat_result(
+                IntrinsicImplementation::NatMul,
+                &[Obj::mk_nat(1 << 32), Obj::mk_nat(1 << 31)]
+            )
+            .is_none()
+        );
+        // A boxed operand and a wrong arity both stay with the bignum arm,
+        // which owns their answers and refusals.
+        let boxed = Obj::mk_mpz(&[0, 1], false);
+        assert!(
+            scalar_nat_result(IntrinsicImplementation::NatAdd, &[boxed, Obj::mk_nat(1)]).is_none()
+        );
+        assert!(scalar_nat_result(IntrinsicImplementation::NatAdd, &[Obj::mk_nat(1)]).is_none());
+        assert!(
+            scalar_nat_result(
+                IntrinsicImplementation::NatPred,
+                &[Obj::mk_nat(1), Obj::mk_nat(1)]
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    /// One register read borrowed and consumed in either order transfers the
+    /// same handles; a register consumed twice is the validator's fault, named
+    /// as the moved register.
+    #[test]
+    fn argument_transfer_is_order_independent_for_aliased_registers() -> Result<(), String> {
+        use ArgumentOwnership::{Borrowed, Owned};
+        let frame_with = |value: Obj| Frame {
+            function: FunctionId::new(0),
+            pc: 0,
+            registers: vec![Some(value), Some(Obj::mk_nat(9))],
+            return_to: None,
+            pending_tail_return: None,
+        };
+        let r0 = Register::new(0);
+        let r1 = Register::new(1);
+        for ownership in [[Owned, Borrowed], [Borrowed, Owned]] {
+            let string = Obj::mk_string("aliased");
+            let mut frame = frame_with(string.clone_ref());
+            let values = transfer_arguments(&mut frame, &[r0, r0], &ownership, "T", "test")
+                .map_err(|_| format!("{ownership:?}: an aliased transfer was refused"))?;
+            assert_eq!(values.len(), 2);
+            for value in &values {
+                assert_eq!(
+                    string_value(value, "test", 0).ok().as_deref(),
+                    Some("aliased")
+                );
+            }
+            assert!(frame.registers[0].is_none(), "{ownership:?} consumed r0");
+            assert!(frame.registers[1].is_some());
+        }
+        let mut frame = frame_with(Obj::mk_nat(1));
+        let mixed = transfer_arguments(
+            &mut frame,
+            &[r1, r0, r1],
+            &[Borrowed, Owned, Owned],
+            "T",
+            "t",
+        );
+        let mixed = mixed.map_err(|_| "a borrowed read before a move was refused".to_string())?;
+        assert_eq!(mixed.iter().map(Obj::unbox).collect::<Vec<_>>(), [9, 1, 9]);
+        let mut frame = frame_with(Obj::mk_nat(1));
+        let twice = transfer_arguments(&mut frame, &[r0, r0], &[Owned, Owned], "T", "t");
+        assert!(matches!(
+            twice,
+            Err(Stop::InternalFault(ref fault)) if fault.detail.text().contains("moved missing register 0")
+        ));
+        Ok(())
+    }
 
     #[test]
     fn intrinsic_result_adapter_refuses_class_and_scalar_kind_drift() {
