@@ -26,6 +26,10 @@ pub struct SourceScope {
     /// own `expose`/`no_expose` attributes override this on its effective clone.
     pub expose_definitions: bool,
     pub opened: Vec<Name>,
+    /// `open X (a b)`'s `OpenDecl.explicit a X.a`, each with `opened.len()` when it was added,
+    /// so resolution reads simple and explicit open declarations in one order, as the pin's
+    /// single `openDecls` list.
+    pub explicit_opens: Vec<(usize, Name, Name)>,
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
     pub instance_scopes: crate::instances::scoped::ActiveScopes,
@@ -280,9 +284,11 @@ impl SourceScope {
     /// list after `eraseDups`, so the root declaration first, then the opened
     /// namespaces, most recently opened first.
     ///
-    /// Not modelled: `open X (y)`, `open X hiding y` and `open X renaming`, whose
-    /// explicit names the pin resolves without the protection test, and the
-    /// projection fallback (`loop p (s::projs)`), which field notation handles.
+    /// An explicit open (`open X (y)`, `OpenDecl.explicit y X.y`) answers `y` with `X.y`, and
+    /// `y.z` with `X.y.z` when that exists, without the protection test.
+    ///
+    /// Not modelled: `open X hiding y` and `open X renaming`, and the projection fallback
+    /// (`loop p (s::projs)`), which field notation handles.
     pub fn resolve_with_aliases(
         &self,
         name: &Name,
@@ -350,9 +356,35 @@ impl SourceScope {
         if let Some(target) = resolve(name, &mut exists) {
             found.push(target);
         }
-        for opened in self.opened.iter().rev() {
+        // The open declarations in the order they were made: each explicit open recorded with
+        // the number of simple opens before it.
+        let mut decls: Vec<Result<&Name, (&Name, &Name)>> = Vec::new();
+        for position in 0..=self.opened.len() {
+            for (at, opened_id, resolved) in &self.explicit_opens {
+                if *at == position {
+                    decls.push(Err((opened_id, resolved)));
+                }
+            }
+            if let Some(opened) = self.opened.get(position) {
+                decls.push(Ok(opened));
+            }
+        }
+        for decl in decls.into_iter().rev() {
             let mut here = Vec::new();
-            qualified(opened, &mut here, &mut exists);
+            match decl {
+                Ok(opened) => qualified(opened, &mut here, &mut exists),
+                // `resolveOpenDecls`'s `OpenDecl.explicit openedId resolvedId`.
+                Err((opened_id, resolved)) => {
+                    if opened_id == name {
+                        here.push(resolved.clone());
+                    } else if let Some(rest) = strip_name_prefix(name, opened_id) {
+                        let candidate = resolved.append_core(&rest);
+                        if exists(&candidate) {
+                            here.push(candidate);
+                        }
+                    }
+                }
+            }
             here.append(&mut found);
             found = here;
         }
@@ -365,6 +397,18 @@ impl SourceScope {
         pooled.append(&mut found);
         settle(name, pooled)
     }
+}
+
+/// `name` with the strict prefix `prefix` removed (`Name.replacePrefix`'s test `isPrefixOf`).
+fn strip_name_prefix(name: &Name, prefix: &Name) -> Option<Name> {
+    let parts = components(name).ok()?;
+    let head = components(prefix).ok()?;
+    if head.is_empty() || parts.len() <= head.len() || parts[..head.len()] != head[..] {
+        return None;
+    }
+    Some(Name::from_components(
+        parts[head.len()..].iter().map(String::as_str),
+    ))
 }
 
 impl Context {
@@ -735,6 +779,7 @@ mod tests {
             public_declarations: false,
             expose_definitions: false,
             opened: vec![n("O")],
+            explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
@@ -925,6 +970,7 @@ mod tests {
             expose_definitions: false,
             namespace: n(namespace),
             opened: opened.iter().map(|o| n(o)).collect(),
+            explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
@@ -998,6 +1044,7 @@ mod tests {
             expose_definitions: false,
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
+            explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),

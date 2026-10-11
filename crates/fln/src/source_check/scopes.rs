@@ -102,6 +102,17 @@ impl Scopes {
             ScopeCommand::Open(names) => {
                 return self.transition_open(names, false, env, public_env);
             }
+            ScopeCommand::OpenExplicit { namespace, names } => {
+                let resolved = self
+                    .explicit_opens(env, &namespace, &names)
+                    .map_err(TransitionError::Scope)?;
+                let position = self.current.opened.len();
+                for (opened_id, declaration) in resolved {
+                    self.current
+                        .explicit_opens
+                        .push((position, opened_id, declaration));
+                }
+            }
             ScopeCommand::OpenScoped(names) => {
                 return self.transition_open(names, true, env, public_env);
             }
@@ -175,6 +186,40 @@ impl Scopes {
     /// is a self export, and each name must denote exactly one declaration `ns ++ name` among
     /// those namespaces (`resolveNameUsingNamespaces`). The result pairs each alias,
     /// `currentNamespace ++ name`, with its declaration.
+    /// `open Ns (a b …)`: each name with the one declaration `ns ++ name` it denotes among the
+    /// namespaces `Ns` resolves to (`resolveNameUsingNamespacesCore`).
+    fn explicit_opens(
+        &self,
+        env: &Environment,
+        namespace: &Name,
+        names: &[Name],
+    ) -> Result<Vec<(Name, Name)>, String> {
+        let namespaces = self.resolve_open_in(&self.current, namespace)?;
+        if namespaces.is_empty() {
+            return Err(format!(
+                "unknown namespace `{}`",
+                namespace.to_display_string()
+            ));
+        }
+        let mut opens = Vec::with_capacity(names.len());
+        for name in names {
+            let candidates: Vec<Name> = namespaces
+                .iter()
+                .map(|ns| ns.append_core(name))
+                .filter(|candidate| env.contains(candidate))
+                .collect();
+            let [declaration] = candidates.as_slice() else {
+                return Err(if candidates.is_empty() {
+                    format!("unknown declaration `{}`", name.to_display_string())
+                } else {
+                    format!("ambiguous identifier `{}`", name.to_display_string())
+                });
+            };
+            opens.push((name.clone(), declaration.clone()));
+        }
+        Ok(opens)
+    }
+
     pub fn export_aliases(
         &self,
         env: &Environment,
@@ -432,6 +477,9 @@ impl Scopes {
             }
             ScopeCommand::Export { .. } => {
                 return Err("export requires an environment transition".into());
+            }
+            ScopeCommand::OpenExplicit { .. } => {
+                return Err("explicit opening requires an environment transition".into());
             }
             ScopeCommand::Reducibility(_) => {
                 return Err("reducibility attributes require an environment transition".into());

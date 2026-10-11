@@ -71,6 +71,12 @@ pub enum ScopeCommand {
         namespace: Name,
         names: Vec<Name>,
     },
+    /// `open Ns (a b …)` (`openOnly`): the pin's `elabOpenDecl` resolves each name in the
+    /// namespaces `Ns` resolves to and adds `OpenDecl.explicit a Ns.a`.
+    OpenExplicit {
+        namespace: Name,
+        names: Vec<Name>,
+    },
     Trivia,
 }
 
@@ -529,6 +535,17 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     }
     if keyword == "export" {
         return export(&view, &tokens, source.len()).map(Some);
+    }
+    // `open Ns (a b …)`: the same shape as `export`'s.
+    if keyword == "open"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(")
+    {
+        return export(&view, &tokens, source.len()).map(|command| match command {
+            ScopeCommand::Export { namespace, names } => {
+                Some(ScopeCommand::OpenExplicit { namespace, names })
+            }
+            other => Some(other),
+        });
     }
     if !control(keyword) {
         return Ok(None);

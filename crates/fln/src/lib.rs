@@ -7440,6 +7440,7 @@ impl Engine {
                     | ScopeCommand::SectionWithModifiers { .. }
                     | ScopeCommand::End(_)
                     | ScopeCommand::Open(_)
+                    | ScopeCommand::OpenExplicit { .. }
                     | ScopeCommand::OpenScoped(_)
                     | ScopeCommand::SetOption { .. }
                     | ScopeCommand::Universe(_)
