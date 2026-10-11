@@ -366,6 +366,8 @@ pub(crate) fn tactic(
         TokenKind::Symbol(symbol) if symbol == "exists" => Some("exists"),
         // `syntax (name := «show») "show " term : tactic` (`Init/Tactics.lean`).
         TokenKind::Symbol(symbol) if symbol == "show" => Some("show"),
+        // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`).
+        TokenKind::Symbol(symbol) if symbol == "sorry" => Some("sorry"),
         _ => None,
     };
     let Some(keyword) = keyword else {
@@ -627,6 +629,7 @@ fn local_tactic(
         | "ac_rfl"
         | "infer_instance"
         | "exfalso"
+        | "sorry"
         | "done"
         | "subst_eqs"
         | "get_elem_tactic"
@@ -733,6 +736,7 @@ fn local_tactic(
         // `tacticNorm_cast__` (`Init/Tactics.lean`).
         "infer_instance" => "tacticInfer_instance",
         "exfalso" => "tacticExfalso",
+        "sorry" => "tacticSorry",
         "norm_cast" => "tacticNorm_cast__",
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",

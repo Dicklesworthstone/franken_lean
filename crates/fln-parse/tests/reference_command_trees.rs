@@ -398,6 +398,11 @@ const SORRIES: &[Accepted] = &[
         source: "def f (n : Nat) : Nat := sorry",
         tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `f []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.sorry "sorry") (Termination.suffix [] []) []) []))"#,
     },
+    // The tactic (`Init/Tactics.lean:459`), captured under `prelude` and `import Init.Tactics`.
+    Accepted {
+        source: "theorem u : Eq 2 2 := by sorry",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `u []) (Command.declSig [] (Term.typeSpec ":" (Term.app `Eq [(num "2") (num "2")]))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticSorry "sorry")]))) (Termination.suffix [] []) [])))"#,
+    },
 ];
 
 const AXIOM_REFUSALS: &[Refused] = &[Refused {

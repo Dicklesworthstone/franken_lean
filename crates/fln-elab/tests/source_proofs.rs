@@ -147,9 +147,20 @@ fn incorrect_proofs_are_refuted_and_nonprop_theorems_reach_k1() {
 }
 #[test]
 fn unsupported_tactics_and_nested_by_are_not_reinterpreted() {
+    // A tactic this engine does not have (Mathlib's) is refused at parse.
     assert!(matches!(
-        check_definition_source(b"theorem bad (P : Prop) : P := by sorry", &env(), budget()),
+        check_definition_source(
+            b"theorem bad (P : Prop) : P := by nlinarith",
+            &env(),
+            budget()
+        ),
         Err(DefinitionFrontendError::Parse(_))
+    ));
+    // `sorry` is a macro `Init/Tactics.lean` declares; this environment declares neither it nor
+    // `sorryAx`, so it is refused, never admitted.
+    assert!(!matches!(
+        check_definition_source(b"theorem bad (P : Prop) : P := by sorry", &env(), budget()),
+        Ok(result) if matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. }))
     ));
     // A nested proof runs its own tactics: it closes a goal it proves and nothing else.
     accepted("theorem good (P : Prop) (p : P) : P := by exact (by assumption)");

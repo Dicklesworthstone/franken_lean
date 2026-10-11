@@ -964,6 +964,21 @@ impl Context {
                 expect_atom(keyword, "symm", "symmetry tactic")?;
                 expect_empty_null(location, "goal-only symmetry location")?;
                 self.symmetrize_proof_goal(proof, goal)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticSorry"]) {
+                // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`).
+                // A world whose imports do not reach `Init.Tactics` lacks the macro, and the
+                // pin reads `sorry` there as an unexpected token.
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "sorry", "sorry tactic")?;
+                let macro_syntax =
+                    Name::from_components(["Lean", "Parser", "Tactic", "tacticSorry"]);
+                if !self.txn.env.contains(&macro_syntax) {
+                    return Err(failure(SourceInferenceError::UnknownConstant(macro_syntax)));
+                }
+                let sorry = self.labeled_sorry(instruction, goal.target.clone())?;
+                self.close_proof_goal(goal, sorry.value)?;
             } else if kind == &parser_kind(&["Tactic", "tacticRfl"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
