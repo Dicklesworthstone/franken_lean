@@ -251,20 +251,21 @@ pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
 }
 
 impl Context {
-    /// The universe holes of `exprs`, instantiated. Shared subterms are walked once per occurrence;
-    /// a subterm without a universe hole is skipped whole.
+    /// The universe holes of `exprs`, instantiated. A shared subterm is walked once, and a subterm
+    /// without a universe hole is skipped whole.
     fn level_holes(
         &mut self,
         exprs: &[Expr],
     ) -> Result<std::collections::HashSet<LMVarId>, NatDefinitionElabError> {
         let mut holes = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
         let mut pending = Vec::with_capacity(exprs.len());
         for expr in exprs {
             pending.push(self.instantiate(expr)?);
         }
         while let Some(expr) = pending.pop() {
             self.tick()?;
-            if !expr.has_level_mvar() {
+            if !expr.has_level_mvar() || !seen.insert(expr.allocation_identity()) {
                 continue;
             }
             let mut levels: Vec<Level> = Vec::new();
