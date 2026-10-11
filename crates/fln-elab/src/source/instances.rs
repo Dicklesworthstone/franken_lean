@@ -524,7 +524,12 @@ impl Context {
                 let Some(class) = result_head(&target?) else {
                     continue;
                 };
-                for row in &defaults {
+                // The pin's `defaultInstanceExtension` prepends each entry, imported ones folded in
+                // import order (vendored Lean/Meta/Instances.lean, `addDefaultInstanceEntry`), and
+                // `synthesizeUsingDefaultInstance` tries that list from its head: the last default
+                // added is tried first. Rows here are appended in the same order, so they are read
+                // back to front (`2 ^ 10` takes `instPowNat` before `Pow α α`).
+                for row in defaults.iter().rev() {
                     self.tick()?;
                     if row.candidate.priority != priority || row.class != class {
                         continue;

@@ -88,6 +88,15 @@ fn default_instances_leave_their_arguments_to_later_synthesis() {
             "def m := match 3 with\n  | 0 => 1\n  | _ => 2\ntheorem t : m = 2 := rfl\n",
         ),
         ("condition", "def i := if 1 = 1 then 2 else 3\n"),
+        // `Pow` has two defaults; the pin tries the last added first, `instPowNat` before
+        // `Pow α α`, so the exponent is a `Nat`.
+        ("power", "theorem t : 2 ^ 10 = 1024 := rfl\n"),
+        ("power_mod", "theorem t : (2 ^ 64 + 1) % 7 = 3 := rfl\n"),
+        ("power_def", "def p := 2 ^ 5\ntheorem t : p = 32 := rfl\n"),
+        (
+            "power_var",
+            "def f (n : Nat) := 2 ^ n\ntheorem t : f 3 = 8 := rfl\n",
+        ),
     ] {
         let (code, stdout, stderr) = check(&lib, &root, name, program);
         assert_eq!(code, 0, "{name}: {program}\n{stdout}\n{stderr}");
@@ -123,6 +132,16 @@ fn default_instance_refusals_match_the_pin() {
         (
             "bool",
             "def b : Bool := 1 + 1\n",
+            "failed to synthesize instance of type class",
+        ),
+        (
+            "power_wrong",
+            "theorem t : 2 ^ 10 = 1023 := rfl\n",
+            "Not a definitional equality",
+        ),
+        (
+            "power_string",
+            "def s : String := 2 ^ 3\n",
             "failed to synthesize instance of type class",
         ),
     ] {
