@@ -9,6 +9,9 @@ pub(in crate::source) enum Mode {
     First,
     Try,
     Repeat,
+    /// `fail_if_success t` (`evalFailIfSuccess`, Lean/Elab/Tactic/BuiltinTactic.lean:273-277):
+    /// succeeds, with the state unchanged, exactly when `t` fails.
+    FailIfSuccess,
 }
 pub(in crate::source) struct Spec<'a> {
     pub mode: Mode,
@@ -85,7 +88,14 @@ impl<'a> Checkpoint<'a> {
         self.next < self.spec.branches.len()
     }
     pub fn optional(&self) -> bool {
-        matches!(self.spec.mode, Mode::Try | Mode::Repeat)
+        matches!(
+            self.spec.mode,
+            Mode::Try | Mode::Repeat | Mode::FailIfSuccess
+        )
+    }
+    /// Whether the body succeeding is this attempt's failure (`fail_if_success`).
+    pub fn inverted(&self) -> bool {
+        self.spec.mode == Mode::FailIfSuccess
     }
     pub fn finish(&self, context: &mut Context, proof: &mut ProofState<'a>) {
         context.attempt_depth = self.context.attempt_depth;
@@ -209,6 +219,8 @@ impl Context {
             Mode::Try
         } else if kind == &parser_kind(&["Tactic", "tacticRepeat_"]) {
             Mode::Repeat
+        } else if kind == &parser_kind(&["Tactic", "failIfSuccess"]) {
+            Mode::FailIfSuccess
         } else {
             return Ok(None);
         };
@@ -221,6 +233,7 @@ impl Context {
                 Mode::First => "first",
                 Mode::Try => "try",
                 Mode::Repeat => "repeat",
+                Mode::FailIfSuccess => "fail_if_success",
             },
             "alternative keyword",
         )?;

@@ -28,6 +28,8 @@ pub(in crate::source) use refine::RefinementFrame;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticError {
     ExplicitFailure,
+    /// The tactic given to `fail_if_success` succeeded (`evalFailIfSuccess`).
+    FailIfSuccessSucceeded,
     /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
     /// expected to be …").
     GuardTargetMismatch,
@@ -96,6 +98,10 @@ impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
+            Self::FailIfSuccessSucceeded => write!(
+                f,
+                "the tactic provided to `fail_if_success` succeeded but was expected to fail"
+            ),
             Self::GuardTargetMismatch => write!(
                 f,
                 "guard_target: the main goal is not what it was expected to be"

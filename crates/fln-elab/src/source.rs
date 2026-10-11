@@ -2786,6 +2786,16 @@ impl Context {
                                 {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
+                                if checkpoint.inverted() {
+                                    // `fail_if_success t` and `t` succeeded: undo it and fail, to
+                                    // the enclosing attempt (whose own checkpoint restores it).
+                                    tasks.truncate(checkpoint.tasks);
+                                    values.truncate(checkpoint.values);
+                                    checkpoint.restore(self);
+                                    return Err(failure(SourceInferenceError::Tactic(
+                                        tactics::TacticError::FailIfSuccessSucceeded,
+                                    )));
+                                }
                                 checkpoint.finish(self, &mut proof);
                                 if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
                                     proof = next.begin(self, attempts.len())?;
