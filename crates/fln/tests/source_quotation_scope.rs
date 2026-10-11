@@ -197,3 +197,112 @@ fn grouped_and_shared_domains_rebind_each_copy_without_changing_the_program() {
         5,
     );
 }
+
+#[test]
+fn user_macros_can_bind_local_values_without_capturing_their_arguments() {
+    accepted(
+        "macro \"plusOne \" n:term:max : term => `(let value : Nat := $n; Nat.add value 1)\n\
+         theorem capture (value : Nat) : plusOne value = Nat.add value 1 := rfl\n\
+         theorem result : plusOne (41 : Nat) = 42 := rfl\n",
+        2,
+    );
+}
+
+#[test]
+fn user_macro_local_functions_close_over_inputs_and_keep_parameter_scope() {
+    accepted(
+        "namespace A\ndef n : Nat := 9\n\
+         macro \"twice \" input:term:max : term => `(let f (n : Nat) : Nat := Nat.add n $input; f $input)\n\
+         macro \"outside \" : term => `(let f (n : Nat) : Nat := n; n)\nend A\n\
+         def n : Nat := 99\n\
+         theorem doubled (n : Nat) : twice n = Nat.add n n := rfl\n\
+         theorem outside_parameter : outside = 9 := rfl\n",
+        2,
+    );
+}
+
+#[test]
+fn user_macros_can_introduce_proof_bindings_without_capturing_proof_arguments() {
+    accepted(
+        "macro \"keepProof \" p:term:max : term => `(have h : True := True.intro; $p)\n\
+         theorem preserved (P : Prop) (h : P) : P := keepProof h\n",
+        1,
+    );
+    assert!(
+        check(
+            "macro \"keepProof \" p:term:max : term => `(have h : True := True.intro; $p)\n\
+             theorem bad : False := keepProof True.intro\n"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn macro_local_initializers_keep_the_declaration_site_global() {
+    accepted(
+        "namespace A\ndef x : Nat := 7\n\
+         macro \"shadowValue\" : term => `(let x : Nat := x; x)\nend A\n\
+         def x : Nat := 99\ntheorem shadow : shadowValue = 7 := rfl\n",
+        1,
+    );
+}
+
+#[test]
+fn a_local_binding_macro_runs_on_golem_after_module_import() {
+    let base = engine();
+    let library_name = Name::from_components(["Library"]);
+    let main_name = Name::from_components(["Main"]);
+    let library =
+        "macro \"plusOne \" n:term:max : term => `(let value : Nat := $n; Nat.add value 1)\n";
+    let main = "import Library\ndef answer : Nat := plusOne (41 : Nat)\ntheorem verified : answer = 42 := rfl\n";
+    let modules = [
+        SourceModuleInput {
+            name: &library_name,
+            source: library.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &main_name,
+            source: main.as_bytes(),
+        },
+    ];
+    let checked = base
+        .check_source_modules(
+            &modules,
+            &main_name,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.checked.theorems, 1);
+    let result = checked
+        .checked
+        .engine
+        .execute_source_commands_with_checks(
+            b"#eval plusOne (41 : Nat)\n",
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &result.batch.executions.last().unwrap().exit else {
+        panic!("the compiled local binding must return its value");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+}
+
+#[test]
+fn unused_macros_defer_unknown_names_but_checked_notations_still_refuse_lets() {
+    let prefix = "macro \"unknownLocal\" : term => `(let x : Nat := missing; x)\n";
+    accepted(&format!("{prefix}theorem okay : True := True.intro\n"), 1);
+    assert!(check(&format!("{prefix}def bad : Nat := unknownLocal\n")).is_err());
+    assert!(matches!(
+        check("notation \"letNotation\" => let x : Nat := 1; x\n"),
+        Err(SourceCheckError::Command { command: 0, .. })
+    ));
+}

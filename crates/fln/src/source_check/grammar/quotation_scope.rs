@@ -251,6 +251,71 @@ fn dependent_arrow<'a>(
     Ok(())
 }
 
+/// A nonrecursive local declaration has two distinct scopes: its parameters
+/// bind only its type and value, while its name binds only the continuation.
+/// Ordinary macros are not eagerly quotation-prechecked at the pin. Checked
+/// notations still refuse these forms: the pin has no `quot_precheck` hook for
+/// them, so analysing their scope here must not silently widen that contract.
+fn local_definition<'a>(
+    syntax: &'a Syntax,
+    leaf: &str,
+    rule: &NotationRule,
+    tasks: &mut Vec<Task<'a>>,
+    scope_depth: usize,
+) -> Result<(), EngineExecutionError> {
+    if rule.prechecked {
+        return Err(unsupported_binder());
+    }
+    let [keyword, config, wrapper, separator, body] = term_args(syntax, leaf)? else {
+        return Err(unsupported_binder());
+    };
+    let [settings] = term_args(config, "letConfig")? else {
+        return Err(unsupported_binder());
+    };
+    let [declaration] = term_args(wrapper, "letDecl")? else {
+        return Err(unsupported_binder());
+    };
+    let [id, parameters, annotation, assignment, value] = term_args(declaration, "letIdDecl")?
+    else {
+        // Patterns, equation clauses and recursive declarations have different
+        // binding rules and remain explicit refusals, not unchecked subtrees.
+        return Err(unsupported_binder());
+    };
+    let [name] = term_args(id, "letId")? else {
+        return Err(unsupported_binder());
+    };
+    if !atom(keyword, &[leaf])
+        || !null_args(settings)?.is_empty()
+        || !atom(assignment, &[":="])
+        || !(atom(separator, &[";"]) || null_args(separator).is_ok_and(<[Syntax]>::is_empty))
+    {
+        return Err(unsupported_binder());
+    }
+    null_args(parameters)?;
+    shared_type(annotation)?;
+    let mut names = Vec::new();
+    binder_name(name, rule, &mut names)?;
+
+    // LIFO execution: parameters -> annotation -> initializer -> restore the
+    // enclosing scope -> introduce the local name -> continuation -> restore.
+    tasks.push(Task::Restore(scope_depth));
+    tasks.push(build(syntax)?);
+    tasks.push(Task::Visit(body));
+    tasks.push(Task::Copy(separator));
+    tasks.push(Task::Bind(names));
+    tasks.push(Task::Restore(scope_depth));
+    tasks.push(build(wrapper)?);
+    tasks.push(build(declaration)?);
+    tasks.push(Task::Visit(value));
+    tasks.push(Task::Copy(assignment));
+    tasks.push(Task::Visit(annotation));
+    tasks.push(Task::Binders(parameters));
+    tasks.push(Task::Copy(id));
+    tasks.push(Task::Copy(config));
+    tasks.push(Task::Copy(keyword));
+    Ok(())
+}
+
 fn binder<'a>(
     syntax: &'a Syntax,
     selected: Option<&'a Syntax>,
@@ -448,6 +513,13 @@ pub(super) fn preresolve(
                 }
                 if term_kind(kind, "depArrow") {
                     dependent_arrow(node, &mut tasks, locals.len())?;
+                    continue;
+                }
+                if let Some(leaf) = ["let", "have", "letI", "haveI"]
+                    .into_iter()
+                    .find(|leaf| term_kind(kind, leaf))
+                {
+                    local_definition(node, leaf, rule, &mut tasks, locals.len())?;
                     continue;
                 }
                 if BINDING.iter().any(|leaf| term_kind(kind, leaf))
@@ -722,6 +794,76 @@ mod tests {
             preresolve(&rule, &global),
             Err(EngineExecutionError::NotImplemented { .. })
         ));
+    }
+
+    #[test]
+    fn macro_local_initializers_are_nonrecursive_and_bodies_are_scoped() {
+        for keyword in ["let", "have", "letI", "haveI"] {
+            let mut rule = rule(&format!(
+                "notation \"localFn\" => {keyword} x : Nat := x; x"
+            ));
+            rule.prechecked = false;
+            assert_eq!(
+                names(&preresolve(&rule, &global).unwrap()),
+                ["x", "_root_.Declared.Nat", "_root_.Declared.x", "x"]
+            );
+        }
+    }
+
+    #[test]
+    fn macro_local_function_parameters_do_not_escape_into_the_continuation() {
+        let mut rule = rule("notation \"localFn\" => let f (x : Nat) : Nat := x; x");
+        rule.prechecked = false;
+        assert_eq!(
+            names(&preresolve(&rule, &global).unwrap()),
+            [
+                "f",
+                "x",
+                "_root_.Declared.Nat",
+                "_root_.Declared.Nat",
+                "x",
+                "_root_.Declared.x",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_macro_local_bindings_restore_the_enclosing_lambda() {
+        let mut rule = rule("notation \"localFn\" => fun x => (let x := x; x) x");
+        rule.prechecked = false;
+        assert_eq!(
+            preresolve(&rule, &|_| panic!("all names are lexical")).unwrap(),
+            rule.rhs
+        );
+    }
+
+    #[test]
+    fn macro_local_binding_does_not_hide_free_names_from_pre_resolution() {
+        let mut rule = rule("notation \"localFn\" => let x := missing; x");
+        rule.prechecked = false;
+        assert_eq!(
+            preresolve(&rule, &|_| Resolution::Nothing).unwrap(),
+            rule.rhs
+        );
+        assert!(matches!(
+            preresolve(&rule, &|_| Resolution::Undetermined),
+            Err(EngineExecutionError::NotImplemented { .. })
+        ));
+    }
+
+    #[test]
+    fn local_macro_patterns_and_recursive_binding_rules_remain_explicit_refusals() {
+        for source in [
+            "notation \"localFn\" => let (x, y) := pair; x",
+            "notation \"localFn\" => let rec f (x : Nat) : Nat := f x; f",
+        ] {
+            let mut rule = rule(source);
+            rule.prechecked = false;
+            assert!(matches!(
+                preresolve(&rule, &global),
+                Err(EngineExecutionError::NotImplemented { .. })
+            ));
+        }
     }
 
     #[test]
