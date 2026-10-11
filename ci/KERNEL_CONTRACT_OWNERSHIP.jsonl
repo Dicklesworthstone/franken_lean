@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":608,"projection_hash":"807127362a636500927a83cd018c65fe9bbf0baa37bbd415d292f7aa671b004c"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":612,"projection_hash":"f56f51b70905be905a140135fe42c28a8533456af537303f63379ff85d5e05a5"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -137,7 +137,11 @@
 {"id":"fln-ffam"}
 {"id":"fln-ffce"}
 {"id":"fln-fixture-retention-unbounded-evit"}
+{"id":"fln-fln-definition-auxiliary-names-lv0n"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
+{"id":"fln-fln-let-rec-opacity-and-lifting-thb4"}
+{"id":"fln-fln-main-red-three-unowned-h823"}
+{"id":"fln-fln-outparam-false-accept-zad2"}
 {"id":"fln-freeze-gate-blind-spot-bi3q"}
 {"id":"fln-front-door-residuals-0f6x"}
 {"id":"fln-frontier-oom-abort-w9dx"}
