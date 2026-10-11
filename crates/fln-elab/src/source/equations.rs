@@ -1,8 +1,8 @@
 //! Equation-style declarations use the existing typed pattern-matrix compiler.
 //!
-//! Open the declared function telescope before choosing any branch. Hidden
-//! binders retain their binder information; pattern columns consume explicit
-//! binders only. Original alternative syntax is retained, and generated names
+//! Open the declared function telescope before choosing any branch. Every
+//! binder of the declared type is a pattern column, implicit and instance ones
+//! included, and keeps its binder information. Original alternative syntax is retained, and generated names
 //! are not source identifier spellings. The resulting root match participates
 //! in the ordinary structural-recursion and declaration-admission paths.
 use super::*;
@@ -73,10 +73,10 @@ impl Context {
     ) -> Result<(Syntax, Expr), NatDefinitionElabError> {
         let arity = self.equation_arity(alternatives)?;
         let start = parameters.len();
-        let mut explicit = 0;
+        let mut opened = 0;
         let mut result_type = declared_type.clone();
         let mut discriminants = Vec::new();
-        while explicit < arity {
+        while opened < arity {
             self.tick()?;
             let ty = self.whnf(&result_type)?;
             let ExprNode::ForallE {
@@ -105,16 +105,14 @@ impl Context {
                     .clone(),
             );
             result_type = self.substitute(body, &Expr::fvar(id))?;
-            if *binder_info == BinderInfo::Default {
-                if explicit != 0 {
-                    discriminants.push(atom(","));
-                }
-                discriminants.push(Syntax::node(
-                    parser_kind(&["Term", "matchDiscr"]),
-                    vec![null(vec![]), ident(name)],
-                ));
-                explicit += 1;
+            if opened != 0 {
+                discriminants.push(atom(","));
             }
+            discriminants.push(Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), ident(name)],
+            ));
+            opened += 1;
         }
         // Count retained syntax against the same request budget before copying.
         let mut pending = vec![alternatives];
@@ -124,11 +122,12 @@ impl Context {
                 pending.extend(args);
             }
         }
-        // The pin elaborates the equations as a match on the explicit parameters
-        // (`expandMatchAltsIntoMatch`), so their patterns are typed as a match's are.
+        // The pin's `expandMatchAltsWhereDecls` (vendored Lean/Elab/Binders.lean:628) wraps the
+        // equations' match in one `@fun x =>` per pattern column: `@fun` binds the type's
+        // implicit and instance binders too, so `def h : {n : Nat} → Fin n → Nat | _, ⟨k, _⟩ => k`
+        // has two columns and `| m => m` against `{n : Nat} → Nat → Nat` is a type mismatch.
         let columns: Vec<(Expr, Expr)> = parameters[start..]
             .iter()
-            .filter(|decl| decl.binder_info == BinderInfo::Default)
             .map(|decl| (Expr::fvar(decl.id.clone()), decl.type_.clone()))
             .collect();
         let rows = expect_node(
