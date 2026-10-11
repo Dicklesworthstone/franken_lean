@@ -12,6 +12,10 @@ pub(super) enum Error {
     },
     OutputAllocation,
     InvalidIoPresentation,
+    /// `#guard e` evaluated to `false` (the pin: "Expression … did not evaluate to `true`").
+    GuardFalse,
+    /// `#guard e`'s checked `Bool` did not come back as the scalar 0 or 1.
+    InvalidGuardResult,
     InvalidUnit,
     InvalidException,
     Raised {
@@ -36,6 +40,8 @@ impl fmt::Display for Error {
             Self::InvalidIoPresentation => {
                 f.write_str("selected IO presentation did not retain a checked IO result")
             }
+            Self::GuardFalse => f.write_str("#guard: the expression did not evaluate to `true`"),
+            Self::InvalidGuardResult => f.write_str("#guard result is not the Bool scalar 0 or 1"),
             Self::InvalidUnit => f.write_str("IO unit result has an invalid representation"),
             Self::InvalidException => {
                 f.write_str("IO exception disagrees with its admitted constructor layout")
@@ -59,6 +65,7 @@ impl Error {
             Self::Format(error) => error.disposition(),
             Self::OutputLimit { .. } | Self::OutputAllocation => ("resource", false, 3),
             Self::Raised { .. } => ("io-exception", true, 1),
+            Self::GuardFalse => ("execution", true, 1),
             Self::Value(SourceValueProjectionError::Shaped(
                 fln::ClosedShapedValueError::TooLarge { .. },
             )) => ("resource", false, 3),
@@ -282,6 +289,7 @@ pub(super) fn has_checked_presentation(execution: &fln::DefinitionExecution) -> 
             fln::EvaluationResultPresentation::Format { .. }
                 | fln::EvaluationResultPresentation::IoFormat { .. }
                 | fln::EvaluationResultPresentation::IoUnit
+                | fln::EvaluationResultPresentation::Guard
         )
     )
 }
@@ -333,6 +341,14 @@ pub(super) fn formatted(
             io_formatted(execution, Some(width)).map(Some)
         }
         Some(fln::EvaluationResultPresentation::IoUnit) => io_formatted(execution, None).map(Some),
+        Some(fln::EvaluationResultPresentation::Guard) => {
+            match fln::closed_vm_value(&execution.exit) {
+                Ok(Some(fln::ClosedVmValue::Scalar(1))) => Ok(Some(PresentedEvaluation::IoUnit)),
+                Ok(Some(fln::ClosedVmValue::Scalar(0))) => Err(Error::GuardFalse),
+                Ok(_) => Err(Error::InvalidGuardResult),
+                Err(error) => Err(Error::Value(SourceValueProjectionError::Runtime(error))),
+            }
+        }
     }
 }
 

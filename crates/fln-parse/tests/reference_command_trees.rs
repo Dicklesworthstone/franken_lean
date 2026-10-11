@@ -4011,6 +4011,25 @@ const DOTTED_IDENTIFIERS: &[Accepted] = &[
     },
 ];
 
+/// `#guard e` (`syntax (name := guardCmd) "#guard " term : command`, `Init/Guard.lean:127`), read
+/// by the source-command entry point that `#eval` and `#check` use: a `Bool` comparison, a decidable
+/// proposition and Boolean operators. Captured 2026-10-11 from one file the pin elaborated without
+/// an error.
+const GUARDS: &[Accepted] = &[
+    Accepted {
+        source: "#guard 1 + 1 == 2",
+        tree: r##"(Command.guardCmd "#guard" («term_==_» («term_+_» (num "1") "+" (num "1")) "==" (num "2")))"##,
+    },
+    Accepted {
+        source: "#guard (2 : Nat) < 3",
+        tree: r##"(Command.guardCmd "#guard" («term_<_» (Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (num "2") ":" [`Nat] ")") "<" (num "3")))"##,
+    },
+    Accepted {
+        source: "#guard true && !false",
+        tree: r##"(Command.guardCmd "#guard" («term_&&_» `true "&&" (term!_ "!" `false)))"##,
+    },
+];
+
 /// `·`: `Term.cdot`, `unicodeSymbol "·" "." >> hygieneInfo` (`Lean/Parser/Term.lean:174`), spelled
 /// `·` and `.`, alone and several, as an argument, under an ascription, nested, in a method
 /// argument on a list literal, and unscoped (the parser takes it; the elaborator refuses it).
@@ -5673,6 +5692,17 @@ fn dotted_identifiers_produce_the_pins_trees() {
 fn relations_and_existentials_produce_the_pins_trees() {
     for row in RELATIONS_AND_EXISTENTIALS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn guards_produce_the_pins_trees() {
+    for row in GUARDS {
+        let parsed = fln_parse::parse_source_command(row.source.as_bytes())
+            .unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        let mut ours = String::new();
+        render(parsed.syntax(), &mut ours);
         assert_eq!(ours, row.tree, "{}", row.source);
     }
 }

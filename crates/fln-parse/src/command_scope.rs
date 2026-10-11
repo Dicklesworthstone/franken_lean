@@ -468,6 +468,7 @@ fn declaration(s: &str) -> bool {
             | "inductive"
             | "#check"
             | "#eval"
+            | "#guard"
     )
 }
 

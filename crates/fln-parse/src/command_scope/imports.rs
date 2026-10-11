@@ -439,6 +439,23 @@ mod tests {
     }
 
     #[test]
+    fn a_body_token_the_header_table_lacks_ends_the_header() {
+        // `#guard` is `Init.Guard`'s token, not a builtin or header token. The pin's header stops
+        // at it and the body begins there; the body's own parser, with the imports, decides it.
+        for (source, body) in [
+            ("prelude\nimport Init.Guard\n#guard 1 == 1\n", "#guard"),
+            ("import Init.Guard\n#guard 1 == 1\n", "#guard"),
+            ("prelude\n#guard 1 == 1\n", "#guard"),
+            ("#guard 1 == 1\n", "#guard"),
+        ] {
+            let header = parse_source_header(source.as_bytes()).unwrap();
+            assert_eq!(header.body_start.0, source.find(body).unwrap(), "{source}");
+        }
+        let header = parse_source_header(b"prelude\nimport Init.Guard\n#guard 1 == 1\n").unwrap();
+        assert_eq!(header.imports, [Name::from_components(["Init", "Guard"])]);
+    }
+
+    #[test]
     fn streaming_headers_preserve_repeated_imports_bom_crlf_and_header_errors() {
         let source = "\u{feff}/- heading -/\r\nprelude\r\nimport A.B\r\nimport «C.D»\r\nimport A.B\r\ndef pending := \"unfinished";
         let header = parse_source_header(source.as_bytes()).unwrap();

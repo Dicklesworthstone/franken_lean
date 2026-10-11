@@ -81,7 +81,7 @@ impl Context {
     /// names the same function `decide`, so the seed spelling is used only where
     /// the pin's constant is absent; it goes when the seed is retired
     /// (franken_lean-z8j.1.8).
-    pub(super) fn decide_constant(&self) -> Expr {
+    pub(in crate::source) fn decide_constant(&self) -> Expr {
         let pinned = Name::from_components(["Decidable", "decide"]);
         if self.txn.env.contains(&pinned) {
             Expr::const_(pinned, vec![])
@@ -243,7 +243,7 @@ impl Context {
         }
     }
 
-    pub(super) fn decision_dictionary(
+    pub(in crate::source) fn decision_dictionary(
         &mut self,
         proposition: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {

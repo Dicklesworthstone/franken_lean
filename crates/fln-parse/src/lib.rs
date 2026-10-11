@@ -4793,11 +4793,15 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     query_term: None,
                 })
             }
-            TokenKind::Symbol(symbol) if symbol == "#eval" || symbol == "#check" => {
-                let (kind, command_kind) = if symbol == "#eval" {
-                    (SourceCommandKind::Evaluation, "eval")
-                } else {
-                    (SourceCommandKind::Check, "check")
+            TokenKind::Symbol(symbol)
+                if symbol == "#eval" || symbol == "#check" || symbol == "#guard" =>
+            {
+                // `#guard e` (`syntax (name := guardCmd) "#guard " term : command`,
+                // `Init/Guard.lean:127`) is an evaluation whose result must be `true`.
+                let (kind, command_kind) = match symbol.as_str() {
+                    "#eval" => (SourceCommandKind::Evaluation, "eval"),
+                    "#guard" => (SourceCommandKind::Evaluation, "guardCmd"),
+                    _ => (SourceCommandKind::Check, "check"),
                 };
                 let tokens = run
                     .events
@@ -5935,6 +5939,7 @@ pub fn partition_definition_commands(
                 || symbol == "example"
                 || symbol == "instance"
                 || symbol == "#eval"
+                || symbol == "#guard"
                 || symbol == "#check" =>
             {
                 Some(view.to_original(extent.start()).0)

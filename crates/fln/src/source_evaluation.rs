@@ -27,6 +27,9 @@ pub enum EvaluationResultPresentation {
     /// The checked action's payload is definitionally Unit. Success is silent;
     /// the ordinary typed IO projection must still validate it or its exception.
     IoUnit,
+    /// `#guard e`: the checked result is a `Bool`. `true` is silent; `false` refuses the command
+    /// (`evalGuardCmd`, Lean/Elab/Tactic/Guard.lean).
+    Guard,
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +188,12 @@ pub(super) fn elaborate(
     // Classification also retains a canonical monad for Functor.map rather
     // than letting an exposed world arrow infer a Reader instance. It validates
     // the original aliases before mapping can change their type spelling.
+    if syntax.kind() == Some(&fln_parse_kind_guard()) {
+        return Ok(Outcome::Complete((
+            prepared.into_raw(),
+            Some(EvaluationResultPresentation::Guard),
+        )));
+    }
     let mut preparation = runtime::Preparation::new(engine.environment(), limits.ingress);
     if let Some(action) = preparation
         .evaluation_presentation_type(prepared.type_())
@@ -219,4 +228,9 @@ pub(super) fn elaborate(
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         },
     )
+}
+
+/// `Lean.Parser.Command.guardCmd`, the node `#guard e` parses to.
+fn fln_parse_kind_guard() -> Name {
+    Name::from_components(["Lean", "Parser", "Command", "guardCmd"])
 }

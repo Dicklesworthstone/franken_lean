@@ -47,6 +47,38 @@ fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
 
+/// `#guard e` (`syntax (name := guardCmd) "#guard " term : command`, Init/Guard.lean:127). The pin's
+/// `evalGuardCmd` (Lean/Elab/Tactic/Guard.lean) elaborates `e` ensuring type `Bool`, where a
+/// decidable proposition `p` becomes `Decidable.decide p` by coercion. It then evaluates the
+/// result and fails unless it is `true`; the caller does that with the declaration built here.
+fn guard_term(syntax: &Syntax, context: &mut Context) -> Result<Typed, NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Command", "guardCmd"]),
+        2,
+        "Lean.Parser.Command.guardCmd",
+    )?;
+    expect_atom(&parts[0], "#guard", "guard keyword")?;
+    let bool_type = Expr::const_(name("Bool"), vec![]);
+    let term = context.term(&parts[1], Some(bool_type.clone()))?;
+    let type_ = context.whnf(&term.type_)?;
+    let term = if type_ == bool_type {
+        term
+    } else if matches!(type_.node(), ExprNode::Sort { level } if level.is_zero()) {
+        // `decPropToBool` (Init/Coe.lean): the proposition is decided.
+        let dictionary = context.decision_dictionary(&term.value)?;
+        Typed {
+            value: Expr::app(Expr::app(context.decide_constant(), term.value), dictionary),
+            type_: bool_type,
+        }
+    } else {
+        return Err(failure(SourceInferenceError::ExpectedType));
+    };
+    let term = context.finish(term)?;
+    context.check_compiled_recursors(&term.value)?;
+    Ok(term)
+}
+
 /// One closed, fully resolved but unadmitted `#eval` candidate. Its original
 /// context stays private so selecting a printer cannot refund elaboration work
 /// or lose obligations. The caller may inspect its type to preserve IO handling,
@@ -73,8 +105,12 @@ impl PreparedEvaluation {
         scope: &SourceScope,
     ) -> Result<Self, NatDefinitionElabError> {
         let mut context = Context::scoped(environment, budget, scope);
-        let (term, _) = query_term(syntax, &generated_name, &mut context, true)
-            .map_err(|error| with_pin_unknown_name_wording(error, environment))?;
+        let term = if syntax.kind() == Some(&parser_kind(&["Command", "guardCmd"])) {
+            guard_term(syntax, &mut context)
+        } else {
+            query_term(syntax, &generated_name, &mut context, true).map(|(term, _)| term)
+        }
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))?;
         Ok(Self {
             name: generated_name,
             context,

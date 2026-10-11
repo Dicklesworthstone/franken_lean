@@ -7947,6 +7947,7 @@ impl Engine {
                 Some(
                     EvaluationResultPresentation::Format { .. }
                         | EvaluationResultPresentation::IoFormat { .. }
+                        | EvaluationResultPresentation::Guard
                 )
             ) {
                 engine = execution.engine.clone();
