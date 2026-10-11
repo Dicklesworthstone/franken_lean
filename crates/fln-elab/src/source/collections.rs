@@ -45,14 +45,122 @@ fn cons(head: Syntax, tail: Syntax) -> Syntax {
     application(constructor("cons"), vec![head, tail])
 }
 
+/// The index notations of `Init/GetElem.lean`.
+const INDEX_KINDS: [&str; 4] = ["term__[_]", "term__[_]'_", "term__[_]_?", "term__[_]_!"];
+
 pub(super) fn is_notation(syntax: &Syntax) -> bool {
     syntax.kind().is_some_and(|kind| {
-        kind == &Name::from_components(["term[_]"])
+        INDEX_KINDS
+            .iter()
+            .any(|index| kind == &Name::from_components([*index]))
+            || kind == &Name::from_components(["term[_]"])
             || kind == &Name::from_components(["term#[_,]"])
             || kind == &Name::from_components(["term{_:_//_}"])
             || kind == &Name::from_components(["term_::_"])
             || kind == &parser_kind(&["Term", "tuple"])
     })
+}
+
+fn root_ident(components: &[&str]) -> Syntax {
+    Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default(),
+        val: Name::from_components(std::iter::once("_root_").chain(components.iter().copied())),
+        preresolved: Vec::new(),
+    }
+}
+
+/// `by first | done | assumption`: the alternatives of the pin's `get_elem_tactic`
+/// (`Init/Tactics.lean`) this frontend runs as the pin does. The pin then tries
+/// `get_elem_tactic_extensible` (`omega`, `simp +arith; done`, `trivial`, ...); here the
+/// `first` fails instead, and the index is refused.
+fn get_elem_tactic() -> Syntax {
+    let sequence = |tactic: Syntax| {
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticSeq"]),
+            vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                vec![null(vec![tactic])],
+            )],
+        )
+    };
+    let alternative = |name: &str| {
+        Syntax::node(
+            Name::from_components(["group"]),
+            vec![
+                atom("|"),
+                sequence(Syntax::node(
+                    parser_kind(&["Tactic", name]),
+                    vec![atom(name)],
+                )),
+            ],
+        )
+    };
+    Syntax::node(
+        parser_kind(&["Term", "byTactic"]),
+        vec![
+            atom("by"),
+            sequence(Syntax::node(
+                parser_kind(&["Tactic", "first"]),
+                vec![
+                    atom("first"),
+                    null(vec![alternative("done"), alternative("assumption")]),
+                ],
+            )),
+        ],
+    )
+}
+
+/// The index notations' macros (`Init/GetElem.lean`), each to its exported method resolved where
+/// it is defined:
+/// - `x[i]` is `getElem x i (by get_elem_tactic)`;
+/// - `x[i]'h` is `getElem x i h`;
+/// - `x[i]?` is `getElem? x i`;
+/// - `x[i]!` is `getElem! x i`.
+/// None is a pattern.
+fn expand_index(
+    kind: &Name,
+    args: Vec<Syntax>,
+    pattern: bool,
+) -> Result<Syntax, NatDefinitionElabError> {
+    if pattern {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    if kind == &Name::from_components(["term__[_]"]) {
+        let Ok([x, open, i, close]) = <[Syntax; 4]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "index opener")?;
+        expect_atom(&close, "]", "index closer")?;
+        return Ok(application(
+            root_ident(&["GetElem", "getElem"]),
+            vec![x, i, get_elem_tactic()],
+        ));
+    }
+    if kind == &Name::from_components(["term__[_]'_"]) {
+        let Ok([x, open, i, close, proof]) = <[Syntax; 5]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "index opener")?;
+        expect_atom(&close, "]'", "index closer")?;
+        return Ok(application(
+            root_ident(&["GetElem", "getElem"]),
+            vec![x, i, proof],
+        ));
+    }
+    let Ok([x, _, open, i, close, _, mark]) = <[Syntax; 7]>::try_from(args) else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    expect_atom(&open, "[", "index opener")?;
+    expect_atom(&close, "]", "index closer")?;
+    let method = if kind == &Name::from_components(["term__[_]_?"]) {
+        expect_atom(&mark, "?", "optional index mark")?;
+        "getElem?"
+    } else {
+        expect_atom(&mark, "!", "checked index mark")?;
+        "getElem!"
+    };
+    Ok(application(root_ident(&["GetElem?", method]), vec![x, i]))
 }
 
 /// `{x // p}` is `Subtype (fun (x : _) => p)` and `{x : T // p}` is `Subtype (fun (x : T) =>
@@ -166,6 +274,12 @@ impl Context {
         };
         if kind == &Name::from_components(["term{_:_//_}"]) {
             return expand_subtype(std::mem::take(args), pattern);
+        }
+        if INDEX_KINDS
+            .iter()
+            .any(|index| kind == &Name::from_components([*index]))
+        {
+            return expand_index(kind, std::mem::take(args), pattern);
         }
         if args.len() != 3 {
             return Err(failure(SourceInferenceError::Scope));
