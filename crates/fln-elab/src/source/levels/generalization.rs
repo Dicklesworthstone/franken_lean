@@ -19,6 +19,13 @@ impl Context {
         for term in terms {
             holes.extend(self.txn.mvars.collect_mvars(term));
         }
+        // A let-rec's value is deliberately not available while its enclosing
+        // declaration elaborates. These are registered, already elaborated
+        // obligations, not inference holes; declaration completion assigns
+        // them before the final closed-term check and kernel admission.
+        for pending in &self.deferred_local_functions {
+            holes.remove(&pending.id);
+        }
         if holes.is_empty() {
             Ok(())
         } else {

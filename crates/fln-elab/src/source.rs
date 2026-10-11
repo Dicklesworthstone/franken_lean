@@ -478,6 +478,10 @@ struct Context {
     // Opaque assertions remain parameter assumptions until their continuations
     // have been checked. Visibility comes from lctx, including after rollback.
     opaque_locals: std::collections::HashSet<FVarId>,
+    // Unlike ordinary `have` values, local recursive definitions remain
+    // opaque after leaving their lexical scope, until their enclosing
+    // declaration has completed all source constraints.
+    deferred_local_functions: Vec<local_functions::Deferred>,
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
@@ -523,6 +527,10 @@ struct Context {
     // before the recursion context exists, as a direct `T.size l` already is.
     defining: Option<Name>,
     recursion: Option<recursion::Recursion>,
+    // A local recursive helper suspends its parent's structural compiler.
+    // Complete parent calls still lower against that parent's hypotheses
+    // before the helper closes over them as an opaque value.
+    enclosing_recursions: Vec<recursion::Recursion>,
     // Eliminator applications waiting for their expected type (`elabAsElim`'s
     // postponement), resumed after default instances run.
     postponed_eliminators: Vec<eliminator::PostponedEliminator>,
@@ -565,6 +573,7 @@ impl Context {
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
+            deferred_local_functions: Vec::new(),
             txn,
             kernel,
             next: 0,
@@ -588,6 +597,7 @@ impl Context {
             refinements: Vec::new(),
             defining: None,
             recursion: None,
+            enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_application_errors: Vec::new(),
             source_recursors: Vec::new(),
@@ -3287,6 +3297,11 @@ impl Context {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
                             }
+                            let value = if build.binding.recursive {
+                                self.defer_local_function(value)?
+                            } else {
+                                value
+                            };
                             values.push(value);
                             // The pin elaborates the rest of the enclosing definition with a
                             // `let rec` (and so a `where` declaration) as a local without a value:
@@ -4225,35 +4240,38 @@ impl Context {
         section_parameters: &[LocalDecl],
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        let mut roots: Vec<_> = section_parameters
-            .iter()
-            .chain(parameters)
-            .map(|local| local.type_.clone())
-            .collect();
-        roots.push(expected.clone());
-        self.generalize_declaration_universes(&roots)?;
-        let mut type_ = self.instantiate(expected)?;
-        for local in section_parameters.iter().chain(parameters).rev() {
-            self.tick()?;
-            type_ = Expr::forall_e(
-                local.user_name.clone(),
-                self.instantiate(&local.type_)?,
-                type_
-                    .abstract_fvar(&local.id, 0)
-                    .map_err(|_| failure(SourceInferenceError::Scope))?,
-                local.binder_info,
-            );
-        }
-        self.require_resolved(std::slice::from_ref(&type_))?;
-        if type_.has_fvar() || type_.has_loose_bvars() {
-            return Err(failure(SourceInferenceError::Scope));
-        }
-        let level_params = self.declaration_levels(std::slice::from_ref(&type_))?;
-        self.public_theorem_signature = Some(ConstantVal {
-            name: name.clone(),
-            level_params,
-            type_,
-        });
+        let signature = self.with_closed_local_function_header(|context| {
+            let mut roots: Vec<_> = section_parameters
+                .iter()
+                .chain(parameters)
+                .map(|local| local.type_.clone())
+                .collect();
+            roots.push(expected.clone());
+            context.generalize_declaration_universes(&roots)?;
+            let mut type_ = context.instantiate(expected)?;
+            for local in section_parameters.iter().chain(parameters).rev() {
+                context.tick()?;
+                type_ = Expr::forall_e(
+                    local.user_name.clone(),
+                    context.instantiate(&local.type_)?,
+                    type_
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+            context.require_resolved(std::slice::from_ref(&type_))?;
+            if type_.has_fvar() || type_.has_loose_bvars() {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            let level_params = context.declaration_levels(std::slice::from_ref(&type_))?;
+            Ok(ConstantVal {
+                name: name.clone(),
+                level_params,
+                type_,
+            })
+        })?;
+        self.public_theorem_signature = Some(signature);
         self.enter_private_proof()
     }
 
@@ -4776,6 +4794,7 @@ fn definition_in_context_named(
     context.resolve_instances(true)?;
     context.resume_postponed_eliminators(true)?;
     context.flush(true)?;
+    context.complete_local_functions()?;
     let section_parameters = if let Some(selected) = theorem_section_parameters {
         selected
     } else {
@@ -5064,6 +5083,7 @@ fn query_term(
             term = context.insert_implicits(term, ImplicitInsertion::InstanceQuery)?;
         }
     }
+    context.complete_local_functions()?;
     // `#check` generalizes universe metavariables the term leaves open to fresh
     // parameters `u_1`, `u_2`, … (the pin's `levelMVarToParam`), so `#check @List.map`
     // has a type; `#eval` needs a closed, concrete term and keeps the refusal.

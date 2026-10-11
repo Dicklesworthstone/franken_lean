@@ -794,8 +794,8 @@ fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionarie
     // A bare `8` at `let d : Factory := …; Factory.carrier` has no `OfNat` instance at
     // the pin ("failed to synthesize", 5:26), the typed numeral checks (2026-10-11). The pin
     // also refuses `def recursiveType (x : (let rec ty …; ty 2)) : Nat := x` ("Type
-    // mismatch": a `let rec` is opaque until its definition is complete), which this
-    // checker still accepts in a type position: fln-fln-let-rec-opacity-and-lifting-thb4.
+    // mismatch": a `let rec` stays opaque until its definition is complete).
+    // `source_local_recursion` exercises that distinct delayed-closure boundary.
     check(
         &base,
         "def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\n\

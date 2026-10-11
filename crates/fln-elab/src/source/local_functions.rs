@@ -4,6 +4,17 @@
 use super::*;
 use std::collections::HashSet;
 
+/// A local recursive value is checked before its continuation, but remains
+/// opaque until the enclosing declaration has finished elaborating. Captures
+/// are explicit arguments to its metavariable, so closing an enclosing let or
+/// lambda cannot leave hidden free variables in the deferred value.
+#[derive(Clone)]
+pub(super) struct Deferred {
+    pub id: MVarId,
+    value: Typed,
+    captures: Vec<LocalDecl>,
+}
+
 #[derive(Clone)]
 pub(super) struct Binding<'a> {
     pub name: Name,
@@ -152,6 +163,118 @@ pub(super) fn retryable(problem: &NatDefinitionElabError) -> bool {
 }
 
 impl Context {
+    pub(super) fn defer_local_function(
+        &mut self,
+        value: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let locals = self.txn.lctx.decls().to_vec();
+        let mut reads = self.elimination_reads(&value.value)?;
+        reads.extend(self.elimination_reads(&value.type_)?);
+        let mut captures = Vec::new();
+        for local in locals.iter().rev() {
+            self.tick()?;
+            if reads.contains(&local.id) {
+                reads.extend(self.elimination_reads(&local.type_)?);
+                if let Some(value) = &local.value {
+                    reads.extend(self.elimination_reads(value)?);
+                }
+                captures.push(local.clone());
+            }
+        }
+        captures.reverse();
+        let mut type_ = self.instantiate(&value.type_)?;
+        for local in captures.iter().rev() {
+            self.tick()?;
+            type_ = Expr::forall_e(
+                local.user_name.clone(),
+                self.instantiate(&local.type_)?,
+                type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
+        let name = self.fresh_name()?;
+        let id = MVarId(name.clone());
+        self.txn.mvars.declare(
+            id.clone(),
+            name,
+            type_,
+            LocalContext::new(),
+            MetavarKind::SyntheticOpaque,
+            0,
+            None,
+        );
+        let mut reference = Expr::mvar(id.clone());
+        for local in &captures {
+            self.tick()?;
+            reference = Expr::app(reference, Expr::fvar(local.id.clone()));
+        }
+        let type_ = value.type_.clone();
+        self.deferred_local_functions.push(Deferred {
+            id,
+            value,
+            captures,
+        });
+        Ok(Typed {
+            value: reference,
+            type_,
+        })
+    }
+
+    /// The pin assigns let-rec metavariables while forming the enclosing
+    /// declaration's closure (`MutualClosure.mkLetRecClosures`), after its
+    /// header and body constraints have already been checked. Assignment here
+    /// grants no admission authority: the resulting closed declaration still
+    /// passes the ordinary kernel and independent checker.
+    pub(super) fn complete_local_functions(&mut self) -> Result<(), NatDefinitionElabError> {
+        if self.deferred_local_functions.is_empty() {
+            return Ok(());
+        }
+        self.resolve_instances(true)?;
+        self.flush(true)?;
+        let deferred = std::mem::take(&mut self.deferred_local_functions);
+        for pending in deferred {
+            self.tick()?;
+            let mut value = self.instantiate(&pending.value.value)?;
+            for local in pending.captures.iter().rev() {
+                self.tick()?;
+                value = Expr::lam(
+                    local.user_name.clone(),
+                    self.instantiate(&local.type_)?,
+                    value
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+            self.txn
+                .mvars
+                .assign(pending.id, value, AssignmentJustification::UserGiven)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+        }
+        Ok(())
+    }
+
+    /// Freeze a public signature using only closures elaborated in its public
+    /// predecessor. Its proof still sees the original opaque metavariables.
+    /// Universe assignments and spent work remain shared across this boundary;
+    /// only the temporary disclosure of local function values is restored.
+    pub(super) fn with_closed_local_function_header<T>(
+        &mut self,
+        freeze: impl FnOnce(&mut Context) -> Result<T, NatDefinitionElabError>,
+    ) -> Result<T, NatDefinitionElabError> {
+        if self.deferred_local_functions.is_empty() {
+            return freeze(self);
+        }
+        let mvars = self.txn.mvars.clone();
+        let deferred = self.deferred_local_functions.clone();
+        let result = self.complete_local_functions().and_then(|()| freeze(self));
+        self.txn.mvars = mvars;
+        self.deferred_local_functions = deferred;
+        result
+    }
+
     pub(super) fn start_local_function<'a>(
         &mut self,
         binding: Binding<'a>,
@@ -196,6 +319,7 @@ impl Context {
         }
         let saved = self.txn.lctx.clone();
         let outer = self.recursion.clone();
+        let enclosing = self.enclosing_recursions.len();
         self.start_local_function_value(build, None)?;
         let marker = build
             .marker
@@ -231,6 +355,7 @@ impl Context {
             tactics::eliminate::add_local(&mut self.txn.lctx, parameter);
         }
         self.recursion = outer;
+        self.enclosing_recursions.truncate(enclosing);
         build.marker = None;
         build.outer_recursion = None;
         build.value_syntax = body;
@@ -250,6 +375,9 @@ impl Context {
         // The function is not in scope in its signature. Only now can its
         // complete type and private recursive marker be introduced.
         build.outer_recursion = self.recursion.take();
+        if let Some(outer) = &build.outer_recursion {
+            self.enclosing_recursions.push(outer.clone());
+        }
         let expected = build
             .result_type
             .as_ref()
@@ -416,6 +544,9 @@ impl Context {
         self.txn.lctx = build.saved.clone();
         if build.binding.recursive {
             self.recursion = build.outer_recursion.clone();
+            if build.outer_recursion.is_some() {
+                self.enclosing_recursions.pop();
+            }
         }
         // An explicit result remains in the let-bound function's full type.
         // K1 therefore checks it even when the enclosing body never calls f.

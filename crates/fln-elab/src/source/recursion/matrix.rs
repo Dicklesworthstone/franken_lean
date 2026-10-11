@@ -10,8 +10,9 @@ use super::*;
 impl Context {
     pub(in crate::source) fn is_matrix_hypothesis(&self, local: &LocalDecl) -> bool {
         self.recursion
-            .as_ref()
-            .is_some_and(|recursion| recursion.matrix_hidden.contains(&local.user_name))
+            .iter()
+            .chain(&self.enclosing_recursions)
+            .any(|recursion| recursion.matrix_hidden.contains(&local.user_name))
     }
 
     pub(in crate::source) fn register_matrix_hypotheses(
@@ -60,14 +61,9 @@ impl Context {
         &mut self,
         value: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
-        let Some(recursion) = self.recursion.as_ref().filter(|r| !r.pending) else {
-            return Ok(value.clone());
-        };
-        if recursion.matrix_hypotheses.is_empty() || !value.has_fvar() {
+        if !value.has_fvar() || (self.recursion.is_none() && self.enclosing_recursions.is_empty()) {
             return Ok(value.clone());
         }
-        let marker = recursion.marker.clone();
-        let decreasing = recursion.decreasing;
         let mut head = value;
         let mut arguments = Vec::new();
         while let ExprNode::App { f, a } = head.node() {
@@ -75,17 +71,25 @@ impl Context {
             arguments.push(a.clone());
             head = f;
         }
-        if !matches!(head.node(), ExprNode::FVar { id } if id == &marker)
-            || arguments.len() <= decreasing
-        {
+        let ExprNode::FVar { id } = head.node() else {
             return Ok(value.clone());
-        }
-        let pairs = self
+        };
+        let Some(recursion) = self
             .recursion
-            .as_ref()
-            .expect("recursive matrix")
-            .matrix_hypotheses
-            .clone();
+            .iter()
+            .chain(self.enclosing_recursions.iter().rev())
+            .find(|recursion| &recursion.marker == id)
+            .filter(|recursion| {
+                !recursion.pending
+                    && !recursion.matrix_hypotheses.is_empty()
+                    && arguments.len() > recursion.decreasing
+            })
+            .cloned()
+        else {
+            return Ok(value.clone());
+        };
+        let marker = recursion.marker.clone();
+        let pairs = recursion.matrix_hypotheses.clone();
         let mut hypotheses = Vec::new();
         for (child, hypothesis) in pairs {
             self.tick()?;
@@ -110,6 +114,12 @@ impl Context {
             let argument = self.instantiate(&argument)?;
             application = Expr::app(application, self.recursive_alias_value(&argument)?);
         }
-        self.lower_recursive_calls(&application, &hypotheses)
+        // The enclosing recursion remains the owner of a call made in a local
+        // helper. In particular, requests to generalize its earlier arguments
+        // must reach its checkpoint, not the helper's structural candidate.
+        let active = self.recursion.replace(recursion);
+        let result = self.lower_recursive_calls(&application, &hypotheses);
+        self.recursion = active;
+        result
     }
 }
