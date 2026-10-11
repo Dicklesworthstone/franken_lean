@@ -368,6 +368,30 @@ const ABBREVIATIONS: &[Accepted] = &[
     },
 ];
 
+/// `axiom`: `"axiom " declId declSig`, a required signature and no value slot at all.
+/// Captured as above on 2026-10-10.
+const AXIOMS: &[Accepted] = &[
+    Accepted {
+        source: "axiom X1 : Nat",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.axiom "axiom" (Command.declId `X1 []) (Command.declSig [] (Term.typeSpec ":" `Nat))))"#,
+    },
+    Accepted {
+        source: "axiom X2 {α : Type} (a : α) (p : α → Prop) : α",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.axiom "axiom" (Command.declId `X2 []) (Command.declSig [(Term.implicitBinder "{" [`α] [":" (Term.type "Type" [])] "}") (Term.explicitBinder "(" [`a] [":" `α] [] ")") (Term.explicitBinder "(" [`p] [":" (Term.arrow `α "→" (Term.prop "Prop"))] [] ")")] (Term.typeSpec ":" `α))))"#,
+    },
+    Accepted {
+        source: "private axiom X3 : 1 = 1",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [(Command.private "private")] [] [] [] []) (Command.axiom "axiom" (Command.declId `X3 []) (Command.declSig [] (Term.typeSpec ":" («term_=_» (num "1") "=" (num "1"))))))"#,
+    },
+];
+
+/// An axiom has no value: the pin ends the command after its signature and refuses `:=`.
+const AXIOM_REFUSALS: &[Refused] = &[Refused {
+    source: "axiom X4 : Nat := 0",
+    message: "1:15: error: unexpected token ':='; expected command",
+    at: 15,
+}];
+
 /// A typed `have` inside a match alternative, whose `:` belongs to the `have`, and `intros`.
 const LOCALS_IN_ALTERNATIVES: &[Accepted] = &[
     Accepted {
@@ -4295,6 +4319,19 @@ fn abbreviations_produce_the_pins_trees() {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }
+}
+
+#[test]
+fn axioms_produce_the_pins_trees() {
+    for row in AXIOMS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn an_axiom_with_a_value_is_refused_at_the_pins_token() {
+    refusals_agree(AXIOM_REFUSALS);
 }
 
 #[test]

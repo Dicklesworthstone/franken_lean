@@ -4123,7 +4123,25 @@ fn definition_in_context_named(
     let is_instance = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","instance"]));
     let is_theorem = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","theorem"]));
     let is_abbrev = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","abbrev"]));
+    // `opaque` is an opaque constant whose signature is a `declSig` and whose value is
+    // optional (vendored `Lean/Elab/Declaration.lean`, `elabOpaque` via `mkDefViewOfOpaque`).
+    let is_opaque = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","opaque"]));
+    // `axiom` is `"axiom " declId declSig` (vendored `Lean/Elab/Declaration.lean`,
+    // `elabAxiom`): a theorem's header and no value.
+    let is_axiom = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","axiom"]));
+    if is_opaque {
+        let parts = expect_node(
+            &declaration[1],
+            &parser_kind(&["Command", "opaque"]),
+            4,
+            "opaque",
+        )?;
+        if expect_null_args(&parts[3], "opaque value")?.is_empty() {
+            return opaque_without_value(declaration, parts, context, generated_name);
+        }
+    }
     let instance_parts;
+    let opaque_parts;
     let definition = if is_instance {
         let parts = instance_command::parts(&declaration[1])?;
         instance_parts = [
@@ -4149,11 +4167,34 @@ fn definition_in_context_named(
             parts.value.clone(),
         ];
         &instance_parts[..]
+    } else if is_opaque {
+        let parts = expect_node(
+            &declaration[1],
+            &parser_kind(&["Command", "opaque"]),
+            4,
+            "opaque",
+        )?;
+        expect_atom(&parts[0], "opaque", "opaque keyword")?;
+        let [value] = expect_null_args(&parts[3], "opaque value")? else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "one opaque value",
+            });
+        };
+        opaque_parts = [
+            parts[0].clone(),
+            parts[1].clone(),
+            parts[2].clone(),
+            value.clone(),
+        ];
+        &opaque_parts[..]
     } else {
         // An abbreviation has the definition's optional signature and value,
-        // but no deriving slot (Lean.Parser.Command.abbrev at the pin).
+        // but no deriving slot (Lean.Parser.Command.abbrev at the pin); an axiom
+        // has a theorem's `declId declSig` and no value at all.
         let (kind, keyword, arity) = if is_theorem {
             ("theorem", "theorem", 4)
+        } else if is_axiom {
+            ("axiom", "axiom", 3)
         } else if is_abbrev {
             ("abbrev", "abbrev", 4)
         } else {
@@ -4203,7 +4244,7 @@ fn definition_in_context_named(
         &definition[2],
         &parser_kind(&[
             "Command",
-            if is_theorem || is_instance {
+            if is_theorem || is_instance || is_opaque || is_axiom {
                 "declSig"
             } else {
                 "optDeclSig"
@@ -4213,7 +4254,7 @@ fn definition_in_context_named(
         "declaration signature",
     )?;
     let mut parameters = context.bind_parameters(&signature[0])?;
-    let mut expected = if is_theorem || is_instance {
+    let mut expected = if is_theorem || is_instance || is_opaque || is_axiom {
         let parts = expect_node(
             &signature[1],
             &parser_kind(&["Term", "typeSpec"]),
@@ -4277,6 +4318,10 @@ fn definition_in_context_named(
         return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
+    if is_axiom {
+        let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        return axiom_from_header(context, name, parameters, expected);
+    }
     let theorem_section_parameters = if is_theorem {
         let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
         roots.extend(expected.iter().cloned());
@@ -4365,7 +4410,7 @@ fn definition_in_context_named(
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
-    if !is_theorem && !is_instance && !is_abbrev {
+    if !is_theorem && !is_instance && !is_abbrev && !is_opaque {
         expect_empty_null(&definition[4], "absent definition clauses")?;
     }
     let header_parameters = parameters.len();
@@ -4480,6 +4525,13 @@ fn definition_in_context_named(
             value: term.value,
             all: vec![name.clone()],
         }))
+    } else if is_opaque {
+        Ok(Declaration::Opaque(fln_env::constants::OpaqueVal {
+            base,
+            value: term.value,
+            is_unsafe: false,
+            all: vec![name.clone()],
+        }))
     } else {
         Ok(Declaration::Defn(DefinitionVal {
             base,
@@ -4493,6 +4545,109 @@ fn definition_in_context_named(
             all: vec![name.clone()],
         }))
     }
+}
+
+/// An axiom from its elaborated header (`elabAxiom`): the type, closed over its binders and
+/// the section variables it uses (`mkForallFVars vars type (usedOnly := true)`), with its
+/// universe parameters.
+fn axiom_from_header(
+    context: &mut Context,
+    name: &Name,
+    mut parameters: Vec<LocalDecl>,
+    expected: Expr,
+) -> Result<Declaration, NatDefinitionElabError> {
+    context.resolve_instances(true)?;
+    context.resume_postponed_eliminators(true)?;
+    context.flush(true)?;
+    let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
+    roots.push(expected.clone());
+    let section = context.section_parameters(&roots, true)?;
+    parameters.splice(0..0, section);
+    let mut universe_roots: Vec<_> = parameters
+        .iter()
+        .map(|parameter| parameter.type_.clone())
+        .collect();
+    universe_roots.push(expected.clone());
+    context.generalize_declaration_universes(&universe_roots)?;
+    let mut type_ = context.instantiate(&expected)?;
+    for local in parameters.into_iter().rev() {
+        let LocalDecl {
+            id,
+            user_name,
+            type_: domain,
+            binder_info,
+            ..
+        } = local;
+        let domain = context.instantiate(&domain)?;
+        type_ = type_
+            .abstract_fvar(&id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        type_ = Expr::forall_e(user_name, domain, type_, binder_info);
+    }
+    let type_ = context.instantiate(&type_)?;
+    context.require_resolved(std::slice::from_ref(&type_))?;
+    if type_.has_fvar() || type_.has_loose_bvars() {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let level_params = context.declaration_levels(std::slice::from_ref(&type_))?;
+    Ok(Declaration::Axiom(fln_env::constants::AxiomVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params,
+            type_,
+        },
+        is_unsafe: false,
+    }))
+}
+
+/// `opaque c : T` with no value takes the pin's `default_or_ofNonempty%` (vendored
+/// `Lean/Elab/BuiltinNotation.lean`): `default` through an `Inhabited` instance, elaborated as
+/// the written value would be. Its other half, `Classical.ofNonempty` through a `Nonempty`
+/// instance, is noncomputable, and the pin's compiler refuses it for an `opaque` that is not
+/// `noncomputable`, `@[extern]` or `@[implemented_by]` ("failed to compile definition … depends
+/// on 'Classical.ofNonempty'", measured 2026-10-11). None of those is modelled here, so a type
+/// without an `Inhabited` instance is refused, as the pin refuses it.
+fn opaque_without_value(
+    declaration: &[Syntax],
+    parts: &[Syntax],
+    context: &mut Context,
+    generated_name: Option<Name>,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let value = |term: Syntax| {
+        let null = || Syntax::node(Name::from_components(["null"]), Vec::new());
+        let declaration_value = Syntax::node(
+            parser_kind(&["Command", "declValSimple"]),
+            vec![
+                Syntax::atom(fln_syntax::source::SourceInfo::None, ":="),
+                term,
+                Syntax::node(
+                    parser_kind(&["Termination", "suffix"]),
+                    vec![null(), null()],
+                ),
+                null(),
+            ],
+        );
+        let opaque = Syntax::node(
+            parser_kind(&["Command", "opaque"]),
+            vec![
+                parts[0].clone(),
+                parts[1].clone(),
+                parts[2].clone(),
+                Syntax::node(Name::from_components(["null"]), vec![declaration_value]),
+            ],
+        );
+        Syntax::node(
+            parser_kind(&["Command", "declaration"]),
+            vec![declaration[0].clone(), opaque],
+        )
+    };
+    let identifier = |components: &[&str]| Syntax::Ident {
+        info: fln_syntax::source::SourceInfo::None,
+        raw_val: fln_syntax::source::ByteSpan::default(),
+        val: Name::from_components(components.iter().copied()),
+        preresolved: Vec::new(),
+    };
+    definition_in_context_named(&value(identifier(&["default"])), context, generated_name)
 }
 
 pub(super) fn query(

@@ -2874,3 +2874,38 @@ fn an_unknown_constant_is_refused_by_its_name() {
         );
     }
 }
+
+/// The pin admits a file's own `axiom` silently; this report counts them, because every
+/// theorem that uses one trusts it. Axioms of the base (none in the seed) are not counted, and
+/// a file without any keeps the plain wording.
+#[test]
+fn a_files_own_axioms_are_counted_in_the_report() {
+    let axioms = file(
+        "axiom unproven : False\naxiom pick {α : Type} (a : α) : α\ntheorem bad : 0 = 1 := False.elim unproven\n",
+    );
+    let plain = file("theorem t : True := True.intro\n");
+    for (path, json, expected) in [
+        (&axioms, true, "\"theorems\":1,\"axioms\":2,"),
+        (&plain, true, "\"theorems\":1,\"axioms\":0,"),
+        (
+            &axioms,
+            false,
+            "Checked 3 source commands (1 theorems, 2 axioms asserted without proof) in 1 files;",
+        ),
+        (
+            &plain,
+            false,
+            "Checked 1 source commands (1 theorems) in 1 files;",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.arg("check-source");
+        if json {
+            command.arg("--json");
+        }
+        let output = command.arg(path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(expected), "{stdout}");
+    }
+}

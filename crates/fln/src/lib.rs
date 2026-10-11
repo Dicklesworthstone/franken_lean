@@ -7718,7 +7718,14 @@ impl Engine {
                 }
                 _ => false,
             };
-            if matches!(declaration, Declaration::Thm(_)) || is_template || is_proof_definition {
+            // A theorem, an opaque constant and an axiom have no body to execute here; they
+            // are admitted, as a template or a proof definition is.
+            if matches!(
+                declaration,
+                Declaration::Thm(_) | Declaration::Opaque(_) | Declaration::Axiom(_)
+            ) || is_template
+                || is_proof_definition
+            {
                 let admission = match engine
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {

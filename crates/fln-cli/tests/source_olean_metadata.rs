@@ -208,7 +208,7 @@ fn cli_replays_dictionary_order_and_reports_uninterpreted_metadata() {
         assert!(report.contains("\"executed\":false"), "{report}");
         assert!(
             report.contains(
-                "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":3,\"declarations\":6}"
+                "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":3,\"modules\":3,\"declarations\":6}"
             ),
             "{report}"
         );

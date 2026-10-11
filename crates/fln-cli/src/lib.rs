@@ -18393,10 +18393,17 @@ mod tests {
     /// One real checked environment, emitted through the product door, as an
     /// import-free non-module snapshot: the same artifact class the bounded
     /// check-olean and trust surfaces consume.
+    /// A source axiom, a theorem that uses it, and a definition whose closure is
+    /// axiom-free: `Nat` addition is a checked definition in this seed, not an
+    /// axiom. The pin accepts the file and prints `42`.
     fn checked_snapshot_fixture(root: &std::path::Path) -> PathBuf {
         let source = root.join("answer_source.lean");
-        std::fs::write(&source, "def answer : Nat := 40 + 2\n#eval answer\n")
-            .expect("write trust-surface source fixture");
+        std::fs::write(
+            &source,
+            "axiom answerAx : 40 + 2 = 42\ntheorem answer_eq : 40 + 2 = 42 := answerAx\n\
+             def answer : Nat := 40 + 2\n#eval answer\n",
+        )
+        .expect("write trust-surface source fixture");
         let snapshot = root.join("answer_snapshot.olean");
         let output = run([
             OsString::from("run"),
@@ -18460,14 +18467,16 @@ mod tests {
         assert!(robot.stdout.contains("\"schema\":\"fln.audit-tcb/1\""));
         assert!(robot.stdout.contains("\"modules\":1"));
         assert!(
-            robot.stdout.contains("\"name\":\"Nat.add\""),
-            "the remaining primitive addition axiom must appear in the inventory: {}",
+            robot.stdout.contains("\"name\":\"answerAx\""),
+            "the source's own axiom must appear in the inventory: {}",
             robot.stdout
         );
-        assert!(
-            !robot.stdout.contains("\"name\":\"Nat\""),
-            "the checked Nat inductive must not be inventoried as an axiom"
-        );
+        for checked in ["Nat", "Nat.add", "answer_eq", "answer"] {
+            assert!(
+                !robot.stdout.contains(&format!("\"name\":\"{checked}\"")),
+                "the checked `{checked}` must not be inventoried as an axiom"
+            );
+        }
         assert!(!robot.stdout.contains("\"unsafe\":true"));
 
         let human = run([
@@ -18477,8 +18486,10 @@ mod tests {
         ]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stdout.contains("trust surface inventory: complete"));
-        assert!(human.stdout.contains("axiom Nat.add"));
-        assert!(!human.stdout.lines().any(|line| line.trim() == "axiom Nat"));
+        let listed = |axiom: &str| human.stdout.lines().any(|line| line.trim() == axiom);
+        assert!(listed("axiom answerAx"));
+        assert!(!listed("axiom Nat"));
+        assert!(!listed("axiom Nat.add"));
         assert!(human.stdout.contains("scope: decoded declarations only"));
 
         let missing_flag = run([
@@ -18496,28 +18507,39 @@ mod tests {
         let robot = run([
             OsString::from("why-trusts"),
             OsString::from("--json"),
-            OsString::from("answer"),
+            OsString::from("answer_eq"),
             snapshot.clone().into_os_string(),
         ]);
         assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
         assert!(robot.stdout.contains("\"schema\":\"fln.why-trusts/1\""));
-        assert!(robot.stdout.contains("\"target\":\"answer\""));
-        assert!(robot.stdout.contains("\"kind\":\"definition\""));
+        assert!(robot.stdout.contains("\"target\":\"answer_eq\""));
+        assert!(robot.stdout.contains("\"kind\":\"theorem\""));
         assert!(
-            robot.stdout.contains("\"axioms\":[\"Nat.add\"]"),
-            "the trust closure must reach addition without inventing a Nat axiom: {}",
+            robot.stdout.contains("\"axioms\":[\"answerAx\"]"),
+            "the trust closure must reach the source axiom and invent no Nat axiom: {}",
             robot.stdout
         );
         assert!(robot.stdout.contains("\"truncated\":false"));
 
+        // Addition is checked, so a definition built from it trusts nothing.
+        let free = run([
+            OsString::from("why-trusts"),
+            OsString::from("--json"),
+            OsString::from("answer"),
+            snapshot.clone().into_os_string(),
+        ]);
+        assert_eq!(free.exit_code, 0, "{}", free.stderr);
+        assert!(free.stdout.contains("\"kind\":\"definition\""));
+        assert!(free.stdout.contains("\"axioms\":[]"), "{}", free.stdout);
+
         let human = run([
             OsString::from("why-trusts"),
-            OsString::from("answer"),
+            OsString::from("answer_eq"),
             snapshot.into_os_string(),
         ]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
-        assert!(human.stdout.contains("why-trusts: answer"));
-        assert!(human.stdout.contains("axioms: Nat.add\n"));
+        assert!(human.stdout.contains("why-trusts: answer_eq"));
+        assert!(human.stdout.contains("axioms: answerAx\n"));
         assert!(human.stdout.contains(
             "recursor rules, instance selections, and rewrite provenance are not traversed"
         ));

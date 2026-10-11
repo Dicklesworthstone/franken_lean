@@ -280,15 +280,30 @@ pub(super) fn run(
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let olean_json = olean_base.as_ref().map_or_else(String::new, |base| base.json());
+            // The sources' own `axiom`s: admitted without proof, so every theorem that uses
+            // one trusts it. The pin admits them silently; the report names how many.
+            let axioms = result
+                .engine
+                .environment()
+                .constants()
+                .filter(|(name, info)| {
+                    matches!(info, fln::ConstantInfo::Axiom(_)) && !engine.environment().contains(name)
+                })
+                .count();
             let stdout = if json {
-                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
+                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"axioms\":{axioms},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
                     result.files, result.commands, result.theorems, loaded.total_bytes,
                     json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()), olean_json)
             } else {
                 let base = olean_base.as_ref().map_or(String::new(), |base| {
                     format!(" against {} imported .olean modules ({} declarations, {})", base.modules, base.declarations, posture_sentence(&base.report))
                 });
-                format!("Checked {} source commands ({} theorems) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
+                let axioms = if axioms == 0 {
+                    String::new()
+                } else {
+                    format!(", {axioms} axioms asserted without proof")
+                };
+                format!("Checked {} source commands ({} theorems{axioms}) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };
             // The process ends with this answer. Tearing down an imported closure
             // (65,404 declarations for `Init`) node by node took seconds; the
