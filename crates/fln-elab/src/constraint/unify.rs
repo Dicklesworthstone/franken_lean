@@ -12,6 +12,7 @@
 //! its metavariables, universes and constraint queue, atomically on success.
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
+mod application_congruence;
 mod application_head;
 mod assignment_types;
 mod assignment_universes;
@@ -510,6 +511,7 @@ struct Engine<'a> {
     nat_literals_valid: Option<bool>,
     projection_registry: crate::instances::RegistryCache,
     pending: pending::PendingState<'a>,
+    congruence_depth: u8,
 }
 
 impl Engine<'_> {
@@ -984,6 +986,9 @@ impl Engine<'_> {
         }
         if let Some((left, right)) = self.nat_offset_equation(&left, &right, locals)? {
             pending.push_front((left, right, locals.clone()));
+            return Ok(());
+        }
+        if self.try_definition_congruence(&left, &right, locals)? {
             return Ok(());
         }
         if let Some((left, right)) = self.lazy_delta(&left, &right)? {
@@ -1600,6 +1605,7 @@ impl ElabTxn {
             nat_literals_valid: None,
             projection_registry: crate::instances::RegistryCache::default(),
             pending: pending::PendingState::new(pending, remaining),
+            congruence_depth: 0,
         };
         let result = engine.solve(equations, typings, delayed);
         // Synthesis spends the same heartbeats as the batch that asked for it,

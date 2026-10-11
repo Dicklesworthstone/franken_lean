@@ -491,8 +491,9 @@ impl Engine<'_> {
     /// already run. Unfold one permitted side, preferring reducible definitions
     /// and then greater definitional height for ground terms. Each resulting
     /// equation returns to the metered worklist; we never force both complete
-    /// normal forms before comparing them. The pin's further projection,
-    /// matcher and argument-congruence heuristics are not claimed here.
+    /// normal forms before comparing them. Metavariable argument congruence
+    /// has already had its reversible trial before this rung. The pin's further
+    /// projection and matcher heuristics are not claimed here.
     pub(super) fn lazy_delta(
         &mut self,
         left: &Expr,
