@@ -64,7 +64,10 @@ impl<'a> Checkpoint<'a> {
             .rposition(|work| {
                 matches!(
                     work,
-                    Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_)
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
                 )
             })
             .map_or(0, |position| position + 1);
@@ -117,6 +120,10 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
             | SourceInferenceError::InstanceSynthesisRequired
             | SourceInferenceError::UnresolvedHoles { .. }
             | SourceInferenceError::UnresolvedUniverses
+            // The known row's wrong literal type is an ordinary `throwError`
+            // in Lean.Elab.SetOption. Missing policy rows and unsupported
+            // effects do not establish a pin failure, so remain uncaught.
+            | SourceInferenceError::Option(scope::options::OptionRefusal::WrongType { .. })
             // The pin's `throwTypeMismatchError` is an ordinary elaboration error: `first`
             // catches it and tries its next alternative.
             | SourceInferenceError::TypeMismatch { .. },
@@ -233,7 +240,7 @@ impl Context {
         for position in (0..proof.work.len()).rev() {
             self.tick()?;
             match proof.work[position] {
-                Work::EndScript(..) | Work::EndControl(_) => return Ok(None),
+                Work::EndScript(..) | Work::EndControl(_) | Work::EndOptions(_) => return Ok(None),
                 Work::EndAttempt(index) => {
                     proof.work.remove(position);
                     proof.work.push(Work::Goal(goal.clone()));

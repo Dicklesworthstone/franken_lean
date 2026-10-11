@@ -185,12 +185,19 @@ pub(super) struct ProofGoal {
 enum Work<'a> {
     EndAttempt(usize),
     EndControl(usize),
+    EndOptions(Box<OptionScope<'a>>),
     Rewrite(ProofGoal, std::collections::VecDeque<RewriteRule<'a>>, bool),
     Goal(ProofGoal),
     Close(ProofGoal, Expr),
     Script(ProofGoal, Vec<&'a Syntax>),
     Term(ProofGoal, &'a Syntax),
     EndScript(Vec<&'a Syntax>, usize),
+}
+#[derive(Clone)]
+struct OptionScope<'a> {
+    options: KVMap,
+    instructions: Vec<&'a Syntax>,
+    cursor: usize,
 }
 #[derive(Clone)]
 pub(super) struct ProofState<'a> {
@@ -485,7 +492,12 @@ impl Context {
             self.tick()?;
             if matches!(
                 proof.work.last(),
-                None | Some(Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_))
+                None | Some(
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
+                )
             ) {
                 self.skip_empty_goal_controls(proof)?;
                 if let Some(&instruction) = proof.instructions.get(proof.cursor) {
@@ -503,6 +515,12 @@ impl Context {
                     }
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "fail"])) {
                         return Err(error(TacticError::ExplicitFailure));
+                    }
+                    if let Syntax::Node { kind, args, .. } = instruction
+                        && kind == &parser_kind(&["Tactic", "set_option"])
+                    {
+                        self.start_tactic_options(proof, args)?;
+                        continue;
                     }
                 }
             }
@@ -529,6 +547,10 @@ impl Context {
                 }
                 Work::EndControl(index) => {
                     self.finish_goal_control(proof, index, Vec::new())?;
+                    continue;
+                }
+                Work::EndOptions(scope) => {
+                    self.finish_tactic_options(proof, *scope)?;
                     continue;
                 }
                 Work::Term(mut goal, syntax) => {
@@ -587,7 +609,10 @@ impl Context {
                 for pending in proof.work.iter().rev() {
                     self.tick()?;
                     match pending {
-                        Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_) => break,
+                        Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_) => break,
                         Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
                             visible.push((other.target.clone(), other.lctx.clone()));
                         }
@@ -603,9 +628,21 @@ impl Context {
                 if self.suspend_goal_control(proof, &goal)? {
                     continue;
                 }
+                if self.suspend_tactic_options(proof, &goal)? {
+                    continue;
+                }
                 let count = 1 + proof.work.iter().filter(|row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id))).count();
                 return Err(error(TacticError::UnsolvedGoals { count }));
             };
+            if let Syntax::Node { kind, args, .. } = instruction
+                && kind == &parser_kind(&["Tactic", "set_option"])
+            {
+                // Finish the preceding tactic's queued branches and close
+                // actions before changing options for this instruction.
+                proof.work.push(Work::Goal(goal));
+                self.start_tactic_options(proof, args)?;
+                continue;
+            }
             proof.cursor += 1;
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));

@@ -353,12 +353,154 @@ pub fn admit(name: &Name, value: &DataValue) -> Result<Effect, OptionRefusal> {
     }
 }
 
+impl crate::source::Context {
+    /// The pinned term and tactic `set_option` nodes have the same six fields
+    /// (`Parser/Command.lean`). Values are syntax data, never elaborated terms:
+    /// resolving an identifier or synthesizing OfNat here would change them.
+    pub(in crate::source) fn enter_source_options<'a>(
+        &mut self,
+        args: &'a [fln_syntax::tree::Syntax],
+    ) -> Result<
+        (&'a fln_syntax::tree::Syntax, fln_core::options::KVMap),
+        crate::NatDefinitionElabError,
+    > {
+        use crate::source::{SourceInferenceError, failure};
+        use crate::{NatDefinitionElabError, expect_atom, expect_empty_null};
+        use fln_core::expr::Literal;
+        use fln_syntax::tree::Syntax;
+
+        let malformed = || NatDefinitionElabError::UnexpectedSyntax {
+            expected: "set_option name value in body",
+        };
+        let [
+            keyword,
+            Syntax::Ident { val: name, .. },
+            trailing,
+            value,
+            separator,
+            body,
+        ] = args
+        else {
+            return Err(malformed());
+        };
+        expect_atom(keyword, "set_option", "scoped option keyword")?;
+        expect_empty_null(trailing, "complete option name")?;
+        expect_atom(separator, "in", "scoped option separator")?;
+        let value = match value {
+            Syntax::Atom { val, .. } if val == "true" || val == "false" => {
+                DataValue::OfBool(val == "true")
+            }
+            Syntax::Node { kind, args, .. } if kind == &Name::from_components(["num"]) => {
+                let [Syntax::Atom { val, .. }] = args.as_slice() else {
+                    return Err(malformed());
+                };
+                let Literal::Nat(value) = crate::decode_natural(val)? else {
+                    unreachable!("natural decoder");
+                };
+                DataValue::OfNat(value.to_u64().ok_or_else(malformed)?)
+            }
+            Syntax::Node { kind, args, .. } if kind == &Name::from_components(["str"]) => {
+                let [Syntax::Atom { val, .. }] = args.as_slice() else {
+                    return Err(malformed());
+                };
+                let Literal::Str(value) = crate::decode_string(val)? else {
+                    unreachable!("string decoder");
+                };
+                DataValue::OfString(value)
+            }
+            _ => return Err(malformed()),
+        };
+        let effect =
+            admit(name, &value).map_err(|error| failure(SourceInferenceError::Option(error)))?;
+        let saved = self.txn.options.clone();
+        if effect == Effect::Honored {
+            self.txn.options.insert(name.clone(), value);
+        }
+        Ok((body, saved))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NatDefinitionElabError;
+    use crate::source::{Context, SourceInferenceError, parser_kind};
+    use fln_core::expr::Expr;
+    use fln_core::level::Level;
+    use fln_env::environment::Environment;
+    use fln_kernel::verdict::Budget;
+    use fln_syntax::tree::Syntax;
 
     fn n(s: &str) -> Name {
         Name::from_components(s.split('.'))
+    }
+
+    #[test]
+    fn failed_option_scopes_restore_the_map_without_refunding_exhausted_work() {
+        for (body, kind, exhausted) in [
+            (
+                "set_option autoLift false in set_option autoLift true in missing",
+                "set_option",
+                false,
+            ),
+            (
+                "by first | set_option autoLift false in repeat skip | skip",
+                "byTactic",
+                true,
+            ),
+        ] {
+            let source = format!("theorem t : Prop := {body}");
+            let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+            let mut pending = vec![parsed.syntax()];
+            let syntax = loop {
+                let syntax = pending.pop().expect("scoped term");
+                if syntax.kind() == Some(&parser_kind(&["Term", kind])) {
+                    break syntax;
+                }
+                if let Syntax::Node { args, .. } = syntax {
+                    pending.extend(args.iter().rev());
+                }
+            };
+            let mut context =
+                Context::new(&Environment::new(), Budget::for_stack_bytes(128 * 1024));
+            context
+                .txn
+                .options
+                .insert(n("autoLift"), DataValue::OfBool(true));
+            context
+                .txn
+                .options
+                .insert(n("maxHeartbeats"), DataValue::OfNat(400_000));
+            context.txn.budget.max_heartbeats = 400;
+            let options = context.txn.options.clone();
+            let result = context.term(syntax, Some(Expr::sort(Level::zero())));
+            assert_eq!(context.txn.options, options, "{body}");
+            if exhausted {
+                assert!(
+                    matches!(
+                        result,
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::ResourceLimit
+                        ))
+                    ),
+                    "{body}: {:?}",
+                    result.as_ref().err()
+                );
+                assert!(context.txn.budget.heartbeats_consumed > 400);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::UnknownConstant(_)
+                        ))
+                    ),
+                    "{body}: {:?}",
+                    result.as_ref().err()
+                );
+                assert!(context.txn.budget.heartbeats_consumed > 0);
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub(in crate::source) struct Argument<'a> {
     waiting: Expr,
     blocker: MVarId,
     lctx: LocalContext,
+    options: KVMap,
     hole: Expr,
 }
 
@@ -99,6 +100,7 @@ impl<'a> Queue<'a> {
 pub(in crate::source) struct Checkpoint<'a> {
     context: Box<Context>,
     queue: Queue<'a>,
+    options: KVMap,
     pub syntax: &'a Syntax,
     pub expected: Expr,
     pub hole: Option<Expr>,
@@ -122,6 +124,7 @@ impl<'a> Checkpoint<'a> {
         Ok(Some(Self {
             context: Box::new(context.clone()),
             queue: queue.clone(),
+            options: context.txn.options.clone(),
             syntax,
             expected,
             hole: None,
@@ -140,12 +143,23 @@ impl<'a> Checkpoint<'a> {
         Self {
             context: Box::new(context.clone()),
             queue: queue.clone(),
+            options: argument.options,
             syntax: argument.syntax,
             expected: argument.expected,
             hole: Some(argument.hole),
             tasks,
             values,
         }
+    }
+
+    /// A delayed argument keeps the options at its source occurrence. The
+    /// surrounding worklist may now be inside a different `set_option` region.
+    pub fn enter_options(&self, context: &mut Context) {
+        context.txn.options = self.options.clone();
+    }
+
+    pub fn finish_options(&self, context: &mut Context) {
+        context.txn.options = self.context.txn.options.clone();
     }
 
     pub fn restore(&self, context: &mut Context, queue: &mut Queue<'a>) {
@@ -225,6 +239,7 @@ impl<'a> Checkpoint<'a> {
             waiting: expected.clone(),
             blocker: blocker.clone(),
             lctx: context.txn.lctx.clone(),
+            options: self.options.clone(),
             hole: hole.clone(),
         });
         Ok(Some(Typed {

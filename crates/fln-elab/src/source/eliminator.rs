@@ -51,6 +51,7 @@ pub(super) struct PostponedEliminator {
     arguments: Vec<Syntax>,
     info: ElimInfo,
     lctx: LocalContext,
+    options: KVMap,
 }
 
 fn eliminator(reason: &'static str) -> NatDefinitionElabError {
@@ -292,6 +293,7 @@ impl Context {
                     arguments: arguments.to_vec(),
                     info,
                     lctx: self.txn.lctx.clone(),
+                    options: self.txn.options.clone(),
                 });
                 Ok(Typed {
                     value: hole,
@@ -323,6 +325,7 @@ impl Context {
                     continue;
                 }
                 let saved = std::mem::replace(&mut self.txn.lctx, record.lctx.clone());
+                let options = std::mem::replace(&mut self.txn.options, record.options);
                 let result = self.elaborate_eliminator(
                     record.function.clone(),
                     &record.arguments,
@@ -330,6 +333,7 @@ impl Context {
                     expected,
                 );
                 self.txn.lctx = saved;
+                self.txn.options = options;
                 let term = result?;
                 self.constrain(&record.hole, &term.value)?;
                 progressed = true;

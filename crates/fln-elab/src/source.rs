@@ -116,6 +116,7 @@ pub enum SourceInferenceError {
     UnsupportedRecursor(Name),
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
+    Option(scope::options::OptionRefusal),
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
     ProtectedJournal(crate::protected_names::ProtectedError),
@@ -250,6 +251,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Inductive(error) => write!(f, "{error}"),
             Self::Deriving(error) => write!(f, "{error}"),
             Self::EvaluationPrinting(error) => write!(f, "{error}"),
+            Self::Option(error) => write!(f, "{error}"),
             // The pin's two wordings for `lean.unknownIdentifier`, verbatim.
             Self::UnknownConstant(name) => {
                 write!(f, "Unknown identifier `{}`", name.to_display_string())
@@ -1301,6 +1303,20 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // Scoped term and tactic options are dynamically restored even when a
+        // failed elaboration leaves its worklist before the closing frame.
+        // Speculative retries restore their own complete Context checkpoints.
+        let options = self.txn.options.clone();
+        let result = self.term_prepared_scoped(syntax, expected);
+        self.txn.options = options;
+        result
+    }
+
+    fn term_prepared_scoped(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         use application::postponed;
         /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
         /// `⟨a, b, …⟩` interleaved with their `,` separators, which are skipped.
@@ -1332,6 +1348,7 @@ impl Context {
             }
         }
         enum Task<'a> {
+            RestoreOptions(KVMap),
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoBindJoinStart(Name, &'a Syntax, &'a Syntax, Expr, bool),
             DoBindJoinBody(LocalContext, FVarId, Name, &'a Syntax, Expr),
@@ -1495,6 +1512,7 @@ impl Context {
                         );
                         let syntax = checkpoint.syntax;
                         let expected = checkpoint.expected.clone();
+                        checkpoint.enter_options(self);
                         let index = attempts.len();
                         attempts.push(Attempt::Argument(Box::new(checkpoint)));
                         tasks.push(Task::ArgumentComplete(index));
@@ -1522,6 +1540,7 @@ impl Context {
                         pending.close_scope(self)?;
                     }
                     match task {
+                        Task::RestoreOptions(options) => self.txn.options = options,
                         Task::CheckArgument(syntax, expected, infer_exception_action) => {
                             if let Some(checkpoint) = postponed::Checkpoint::argument(
                                 self,
@@ -1562,6 +1581,7 @@ impl Context {
                                 let value = values.pop().expect("resumed argument visit");
                                 self.constrain(hole, &value.value)?;
                             }
+                            checkpoint.finish_options(self);
                             attempts.pop();
                         }
                         Task::DoAction(arguments, expected) => {
@@ -1630,6 +1650,12 @@ impl Context {
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "set_option"]) {
+                                    let (body, options) = self.enter_source_options(args)?;
+                                    tasks.push(Task::RestoreOptions(options));
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "recursiveContextCapture"]) {
                                     let [body] = args.as_slice() else {
                                         return Err(failure(SourceInferenceError::Scope));

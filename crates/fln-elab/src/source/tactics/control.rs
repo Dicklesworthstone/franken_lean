@@ -49,6 +49,80 @@ pub(super) struct Frame<'a> {
     after: Option<Vec<&'a Syntax>>,
 }
 impl Context {
+    /// Options wrap the whole visible goal frontier, not just its main goal.
+    /// In particular an enclosed all_goals still sees the caller's siblings,
+    /// and an unfinished body returns its goals to the outer sequence.
+    pub(super) fn start_tactic_options<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        args: &'a [Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let (syntax, options) = self.enter_source_options(args)?;
+        let body = self.proof_instructions(syntax)?;
+        let boundary = proof
+            .work
+            .iter()
+            .rposition(|work| {
+                matches!(
+                    work,
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
+                )
+            })
+            .map_or(0, |position| position + 1);
+        let scope = OptionScope {
+            options,
+            instructions: std::mem::replace(&mut proof.instructions, body),
+            cursor: proof.cursor + 1,
+        };
+        proof.cursor = 0;
+        proof
+            .work
+            .insert(boundary, Work::EndOptions(Box::new(scope)));
+        Ok(())
+    }
+
+    pub(super) fn finish_tactic_options<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        scope: OptionScope<'a>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if proof.cursor != proof.instructions.len() {
+            return Err(error(TacticError::NoGoals));
+        }
+        self.txn.options = scope.options;
+        proof.instructions = scope.instructions;
+        proof.cursor = scope.cursor;
+        Ok(())
+    }
+
+    pub(super) fn suspend_tactic_options(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: &ProofGoal,
+    ) -> Result<bool, NatDefinitionElabError> {
+        for position in (0..proof.work.len()).rev() {
+            self.tick()?;
+            match &proof.work[position] {
+                Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_) => {
+                    return Ok(false);
+                }
+                Work::EndOptions(_) => {
+                    let Work::EndOptions(scope) = proof.work.remove(position) else {
+                        unreachable!("option boundary");
+                    };
+                    self.finish_tactic_options(proof, *scope)?;
+                    proof.work.push(Work::Goal(goal.clone()));
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn start_goal_control<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -131,7 +205,9 @@ impl Context {
         for work in proof.work.iter().rev() {
             self.tick()?;
             match work {
-                Work::EndScript(..) | Work::EndAttempt(_) => return Ok(false),
+                Work::EndScript(..) | Work::EndAttempt(_) | Work::EndOptions(_) => {
+                    return Ok(false);
+                }
                 Work::EndControl(index) => {
                     boundary = Some(*index);
                     break;

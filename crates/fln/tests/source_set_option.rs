@@ -42,6 +42,22 @@ fn run(base: &Engine, source: &str) -> Result<fln::SourceFileCheck, String> {
         .map_err(|outcome| format!("{outcome:?}"))
 }
 
+fn lift_definition(body: &str) -> String {
+    format!(
+        "def lifted {{M N : Type -> Type}} [Pure N] [Bind N] [MonadLiftT M N] \
+         {{A : Type}} (action : M A) : N A := {body}\n"
+    )
+}
+
+fn elaboration_refusal(base: &Engine, source: &str) -> String {
+    let root = base.logical_root(&KVMap::new());
+    let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
+    let error = result.expect_err("the scoped option must refuse this source");
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    error.to_string()
+}
+
 #[test]
 fn an_honored_option_changes_elaboration_and_ends_with_its_scope() {
     let base = run(&seed(), CLASSES).unwrap().engine;
@@ -59,6 +75,250 @@ fn an_honored_option_changes_elaboration_and_ends_with_its_scope() {
     let restored =
         format!("section\nset_option autoLift false\nset_option autoLift true\n{LIFTED}end\n");
     run(&base, &restored).unwrap();
+}
+
+#[test]
+fn term_options_control_actual_lifting_and_restore_the_surrounding_expression() {
+    let base = run(&seed(), CLASSES).unwrap().engine;
+    let enabled = lift_definition("set_option autoLift true in do\n  let x ← action\n  return x");
+    run(&base, &format!("set_option autoLift false\n{enabled}")).unwrap();
+    let disabled = lift_definition("set_option autoLift false in do\n  let x ← action\n  return x");
+    elaboration_refusal(&base, &disabled);
+
+    let nested = lift_definition(
+        "set_option autoLift false in\n  set_option autoLift true in do\n    let x ← action\n    return x",
+    );
+    run(&base, &nested).unwrap();
+
+    // A successful override must end before a later expression in this very
+    // definition, not merely before the next command is elaborated.
+    let later = lift_definition(
+        "let enabled : N A := (set_option autoLift true in do { let x ← action; return x }); do { let x ← action; return x }",
+    );
+    elaboration_refusal(&base, &format!("set_option autoLift false\n{later}"));
+    run(&base, LIFTED).unwrap();
+}
+
+#[test]
+fn tactic_options_control_lifting_and_restore_after_failed_alternatives() {
+    let base = run(&seed(), CLASSES).unwrap().engine;
+    let enabled = lift_definition(
+        "by\n  set_option autoLift true in\n    exact do\n      let x ← action\n      return x",
+    );
+    run(&base, &format!("set_option autoLift false\n{enabled}")).unwrap();
+    let disabled = lift_definition(
+        "by\n  set_option autoLift false in\n    exact do\n      let x ← action\n      return x",
+    );
+    elaboration_refusal(&base, &disabled);
+
+    let retried = lift_definition(
+        "by\n  first\n  | set_option autoLift false in\n      exact do\n        let x ← action\n        return x\n  | exact do\n      let x ← action\n      return x",
+    );
+    run(&base, &retried).unwrap();
+    let nested = lift_definition(
+        "by\n  set_option autoLift false in\n    set_option autoLift true in\n      exact do\n        let x ← action\n        return x",
+    );
+    run(&base, &nested).unwrap();
+
+    // A wrong value type for a known option is an ordinary elaboration
+    // failure, so the surrounding tactic alternative may recover from it.
+    for source in [
+        "theorem recovered : 1 = 1 := by\n  first\n  | set_option autoLift 1 in rfl\n  | rfl",
+        "theorem recovered : 1 = 1 := by\n  rfl\n  first\n  | set_option autoLift 1 in skip\n  | skip",
+        "theorem recovered : 1 = 1 := by\n  rfl\n  try set_option autoLift 1 in skip\n  skip",
+    ] {
+        run(&base, source).unwrap_or_else(|error| panic!("{source}\n{error}"));
+    }
+    // Refusals for options outside this implementation's admitted policy
+    // stay visible even when a later tactic alternative would succeed.
+    for (option, name) in [("foo.bar true", "`foo.bar`"), ("pp.all true", "`pp.all`")] {
+        let source = format!(
+            "theorem refused : 1 = 1 := by\n  first\n  | set_option {option} in rfl\n  | rfl"
+        );
+        let error = elaboration_refusal(&base, &source);
+        assert!(error.contains(name), "{source}\n{error}");
+    }
+}
+
+#[test]
+fn postponed_callbacks_keep_the_options_at_their_creation_site() {
+    let base = run(
+        &seed(),
+        &format!("{CLASSES}\ndef applyLater {{A B : Type}} (f : A -> B) (x : A) : B := f x"),
+    )
+    .unwrap()
+    .engine;
+    // The partial application leaves f's type unknown until its final
+    // argument, outside the option wrapper, has been checked. Its callback
+    // must resume under the options where it was first elaborated.
+    let enabled = "(set_option autoLift true in applyLater (fun f => do { let x ← f action; return x })) (fun (x : M A) => x)";
+    run(
+        &base,
+        &format!("set_option autoLift false\n{}", lift_definition(enabled)),
+    )
+    .unwrap();
+    let disabled = lift_definition(
+        "(set_option autoLift false in applyLater (fun f => do { let x ← f action; return x })) (fun (x : M A) => x)",
+    );
+    elaboration_refusal(&base, &disabled);
+
+    // Resuming a saved callback must also restore the caller's options when
+    // it finishes, before another expression is elaborated.
+    let later = lift_definition(&format!(
+        "let enabled : N A := {enabled}; do {{ let x ← action; return x }}"
+    ));
+    elaboration_refusal(&base, &format!("set_option autoLift false\n{later}"));
+}
+
+#[test]
+fn postponed_eliminators_keep_options_until_their_motive_is_known() {
+    let base = run(&seed(), CLASSES).unwrap().engine;
+    let recursor =
+        "Nat.rec (let lifted : N A := (do { let x ← action; return x }); 0) (fun _ ih => ih) 0";
+    let theorem = |body: &str| {
+        format!(
+            "theorem liftedResult {{M N : Type -> Type}} [Pure N] [Bind N] [MonadLiftT M N] \
+             {{A : Type}} (action : M A) : ({body}) = (0 : Nat) := by rfl"
+        )
+    };
+    // The checked let in the minor premise requires an actual monad lift.
+    // Establish that this delayed recursor succeeds precisely when lifting
+    // is enabled, before testing opposite options in a smaller scope.
+    run(&base, &theorem(recursor)).unwrap();
+    elaboration_refusal(
+        &base,
+        &format!("set_option autoLift false\n{}", theorem(recursor)),
+    );
+    // The left side of equality has no expected type. The recursor waits for
+    // the right side to determine its motive, after its option region closes.
+    run(
+        &base,
+        &format!(
+            "set_option autoLift false\n{}",
+            theorem(&format!("set_option autoLift true in {recursor}"))
+        ),
+    )
+    .unwrap();
+    elaboration_refusal(
+        &base,
+        &theorem(&format!("set_option autoLift false in {recursor}")),
+    );
+}
+
+#[test]
+fn tactic_options_apply_to_all_goals_and_restore_before_the_next_tactic() {
+    let base = run(
+        &seed(),
+        &format!("{CLASSES}\ninductive Pair (A : Type) where | mk (left : A) (right : A)"),
+    )
+    .unwrap()
+    .engine;
+    let header = "set_option autoLift false\ndef liftedPair {M N : Type -> Type} [Pure N] [Bind N] [MonadLiftT M N] {A : Type} (action : M A) : Pair (N A) := by\n  constructor\n";
+    let all = format!(
+        "{header}  set_option autoLift true in\n    all_goals\n      exact do\n        let x ← action\n        return x"
+    );
+    run(&base, &all).unwrap();
+
+    // The option wrapper may solve one goal while leaving its sibling to the
+    // surrounding tactic sequence. That sibling sees the original false.
+    let leaked = format!(
+        "{header}  set_option autoLift true in\n    exact do\n      let x ← action\n      return x\n  exact do\n    let x ← action\n    return x"
+    );
+    elaboration_refusal(&base, &leaked);
+    let explicit = format!(
+        "{header}  set_option autoLift true in\n    exact do\n      let x ← action\n      return x\n  exact liftM action"
+    );
+    run(&base, &explicit).unwrap();
+}
+
+#[test]
+fn queued_case_bodies_run_before_the_following_option() {
+    let base = run(&seed(), CLASSES).unwrap().engine;
+    let declaration = |body: &str| {
+        format!(
+            "def branches {{M N : Type -> Type}} [Pure N] [Bind N] [MonadLiftT M N] \
+             {{A : Type}} (flag : Bool) (action : M A) : N A := by\n{body}"
+        )
+    };
+    for branches in [
+        "  cases flag with\n  | false => exact do { let x ← action; return x }\n  | true => exact do { let x ← action; return x }\n",
+        "  exact match flag with\n    | false => do { let x ← action; return x }\n    | true => do { let x ← action; return x }\n",
+    ] {
+        let accepted = declaration(&format!("{branches}  set_option autoLift false in skip"));
+        run(&base, &accepted).unwrap_or_else(|error| panic!("{accepted}\n{error}"));
+        let refused = declaration(&format!("{branches}  set_option autoLift true in skip"));
+        elaboration_refusal(&base, &format!("set_option autoLift false\n{refused}"));
+    }
+}
+
+#[test]
+fn scoped_options_at_the_start_of_case_scripts_stay_in_their_branch() {
+    let base = run(&seed(), CLASSES).unwrap().engine;
+    let declaration = |true_branch: &str| {
+        let body = format!(
+            "  cases flag with\n  | false => set_option autoLift true in exact do {{ let x ← action; return x }}\n  | true => {true_branch}"
+        );
+        format!(
+            "set_option autoLift false\n\
+             def branches {{M N : Type -> Type}} [Pure N] [Bind N] [MonadLiftT M N] \
+             {{A : Type}} (flag : Bool) (action : M A) : N A := by\n{body}"
+        )
+    };
+    run(
+        &base,
+        &declaration("set_option autoLift true in exact do { let x ← action; return x }"),
+    )
+    .unwrap();
+    elaboration_refusal(&base, &declaration("exact do { let x ← action; return x }"));
+}
+
+#[test]
+fn option_wrappers_return_unsolved_goals_and_allow_goal_free_bodies() {
+    let base = seed();
+    for source in [
+        "theorem identity (P : Prop) : P -> P := by\n  set_option autoLift false in\n    intro p\n  exact p",
+        "theorem identity (P : Prop) : P -> P := by\n  set_option autoLift false in skip\n  intro p\n  exact p",
+        "theorem completeProof : 1 = 1 := by\n  rfl\n  set_option autoLift false in skip",
+        "theorem completeProof : 1 = 1 := by\n  rfl\n  set_option autoLift false in all_goals rfl",
+        "theorem completeProof : 1 = 1 := by\n  rfl\n  set_option autoLift false in\n    set_option autoLift true in skip",
+        "theorem completeProof : 1 = 1 := by\n  rfl\n  set_option autoLift false in all_goals set_option foo.bar true in rfl",
+    ] {
+        run(&base, source).unwrap_or_else(|error| panic!("{source}\n{error}"));
+    }
+    elaboration_refusal(
+        &base,
+        "theorem unfinished (P : Prop) : P := by\n  set_option autoLift false in skip",
+    );
+    elaboration_refusal(
+        &base,
+        "theorem falseProof : 1 = 2 := by\n  set_option autoLift false in rfl",
+    );
+    elaboration_refusal(
+        &base,
+        "theorem completeProof : 1 = 1 := by\n  rfl\n  set_option autoLift false in rfl",
+    );
+}
+
+#[test]
+fn term_and_tactic_option_refusals_are_named_and_atomic_even_after_goals_close() {
+    let base = seed();
+    for (option, named) in [
+        ("foo.bar true", "`foo.bar`"),
+        ("maxHeartbeats true", "`maxHeartbeats`"),
+        ("autoLift 1", "`autoLift`"),
+        ("pp.all true", "`pp.all`"),
+        ("maxHeartbeats 1000", "`maxHeartbeats`"),
+    ] {
+        for source in [
+            format!("def value : Nat := set_option {option} in 1"),
+            format!("theorem same : 1 = 1 := by\n  set_option {option} in rfl"),
+            format!("theorem same : 1 = 1 := by\n  rfl\n  set_option {option} in skip"),
+        ] {
+            let error = elaboration_refusal(&base, &source);
+            assert!(error.contains(named), "{source}\n{error}");
+        }
+    }
+    run(&base, "theorem recovered : 1 = 1 := by rfl").unwrap();
 }
 
 #[test]
