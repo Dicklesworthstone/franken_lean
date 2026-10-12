@@ -8,6 +8,7 @@
 mod k;
 mod nat;
 mod quotient;
+mod string;
 
 use super::*;
 use fln_env::constants::RecursorVal;
@@ -38,6 +39,7 @@ enum Continuation {
         structure: Name,
         index: u64,
         arguments: Vec<Expr>,
+        expanded_literal: bool,
     },
     ClassProjection {
         head: Expr,
@@ -50,6 +52,7 @@ enum Continuation {
         arguments: Vec<Expr>,
         prefix: usize,
         major: usize,
+        expanded_literal: bool,
     },
 }
 
@@ -114,6 +117,7 @@ impl Engine<'_> {
                             structure: struct_name.clone(),
                             index: *idx,
                             arguments: std::mem::take(&mut args),
+                            expanded_literal: false,
                         });
                         head = expr.clone();
                     }
@@ -285,6 +289,7 @@ impl Engine<'_> {
                                     arguments: std::mem::take(&mut args),
                                     prefix,
                                     major,
+                                    expanded_literal: false,
                                 });
                                 head = value;
                             }
@@ -353,7 +358,21 @@ impl Engine<'_> {
                         structure,
                         index,
                         arguments: outer,
+                        expanded_literal,
                     } => {
+                        if !expanded_literal
+                            && args.is_empty()
+                            && let Some(expanded) = self.string_literal_constructor(&head)?
+                        {
+                            continuations.push(Continuation::Projection {
+                                structure,
+                                index,
+                                arguments: outer,
+                                expanded_literal: true,
+                            });
+                            head = expanded;
+                            continue 'reduce;
+                        }
                         if let Some(field) = crate::records::constructor_field(
                             &self.work.env,
                             &structure,
@@ -395,7 +414,23 @@ impl Engine<'_> {
                         arguments: mut outer,
                         prefix,
                         major,
+                        expanded_literal,
                     } => {
+                        if !expanded_literal
+                            && args.is_empty()
+                            && let Some(expanded) = self.string_literal_constructor(&head)?
+                        {
+                            continuations.push(Continuation::Recursor {
+                                head: rec_head,
+                                recursor,
+                                arguments: outer,
+                                prefix,
+                                major,
+                                expanded_literal: true,
+                            });
+                            head = expanded;
+                            continue 'reduce;
+                        }
                         let reduced =
                             self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?;
                         let reduced = match reduced {

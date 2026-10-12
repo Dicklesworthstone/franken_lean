@@ -284,3 +284,366 @@ theorem character_proof (s : Char) : True :=
         assert_eq!(checked.theorems, 2);
     });
 }
+
+#[test]
+fn computed_text_matches_are_definitional_proofs() {
+    on_stack(|| {
+        let source = r#"
+def text : String -> Nat | "x" => 1 | _ => 2
+example : text "x" = 1 := by rfl
+example : text "y" = 2 := by rfl
+"#;
+        imported()
+            .engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                fln::SourceCheckLimits::new(fln::EngineAdmissionLimits::new(
+                    Budget::for_stack_bytes(STACK),
+                )),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+    });
+}
+
+struct TextRecursorProblem {
+    txn: fln_elab::txn::ElabTxn,
+    call: fln::Expr,
+    answer: fln::Expr,
+    id: fln_core::expr::MVarId,
+    budget: fln_elab::constraint::unify::UnificationBudget,
+}
+
+fn recursor_problem(text: &str, function_valued: bool) -> TextRecursorProblem {
+    use fln_core::expr::{BinderInfo, Expr, Literal, MVarId, NatLit};
+    use fln_core::level::Level;
+    use fln_elab::constraint::unify::{UnificationBudget, UnificationTransparency};
+    use fln_elab::mvar::MetavarKind;
+    use fln_elab::txn::ElabTxn;
+    let constant = |text: &str| Expr::const_(name(text), vec![]);
+    let lam = |label: &str, domain, body| Expr::lam(name(label), domain, body, BinderInfo::Default);
+    let nat = constant("Nat");
+    let mut txn = ElabTxn::new(imported().engine.environment().clone(), KVMap::new(), 77);
+    let id = MVarId(name("minorResult"));
+    txn.mvars.declare(
+        id.clone(),
+        id.0.clone(),
+        nat.clone(),
+        txn.lctx.clone(),
+        MetavarKind::Natural,
+        0,
+        None,
+    );
+    let (result_type, result) = if function_valued {
+        (
+            Expr::forall_e(name("n"), nat.clone(), nat.clone(), BinderInfo::Default),
+            lam("n", nat, Expr::mvar(id.clone())),
+        )
+    } else {
+        (nat, Expr::mvar(id.clone()))
+    };
+    let motive = lam("s", constant("String"), result_type);
+    let minor = lam(
+        "bytes",
+        constant("ByteArray"),
+        lam(
+            "valid",
+            Expr::app(constant("ByteArray.IsValidUTF8"), Expr::bvar(0).unwrap()),
+            result,
+        ),
+    );
+    let mut call = Expr::const_(name("String.rec"), vec![Level::one()]);
+    for arg in [motive, minor, Expr::lit(Literal::Str(text.into()))] {
+        call = Expr::app(call, arg);
+    }
+    if function_valued {
+        call = Expr::app(call, Expr::lit(Literal::Nat(NatLit::from_u64(41))));
+    }
+    let answer = Expr::lit(Literal::Nat(NatLit::from_u64(37)));
+    let mut budget = UnificationBudget::new(Budget::for_stack_bytes(STACK));
+    budget.transparency = UnificationTransparency::Default;
+    TextRecursorProblem {
+        txn,
+        call,
+        answer,
+        id,
+        budget,
+    }
+}
+
+#[test]
+fn string_recursor_reduction_solves_an_unknown_minor_result() {
+    on_stack(|| {
+        for (text, function_valued) in ["", "x", "λ🦀"]
+            .into_iter()
+            .flat_map(|text| [false, true].map(|f| (text, f)))
+        {
+            let TextRecursorProblem {
+                mut txn,
+                call,
+                answer,
+                id,
+                budget,
+            } = recursor_problem(text, function_valued);
+            let report = txn
+                .unify(&call, &answer, budget)
+                .unwrap_or_else(|error| panic!("{text:?}: {error:?}"));
+            assert_eq!(report.expression_assignments, vec![id.clone()]);
+            assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&answer));
+            assert_eq!(txn.env, *imported().engine.environment());
+        }
+    });
+}
+
+#[test]
+fn string_projections_solve_an_unknown_utf8_payload() {
+    on_stack(|| {
+        use fln_core::expr::{Expr, Literal, MVarId, NatLit};
+        use fln_core::level::Level;
+        use fln_elab::constraint::unify::{UnificationBudget, UnificationTransparency};
+        use fln_elab::mvar::MetavarKind;
+        use fln_elab::txn::ElabTxn;
+        let byte = Expr::const_(name("UInt8"), vec![]);
+        let list_type = Expr::app(
+            Expr::const_(name("List"), vec![Level::zero()]),
+            byte.clone(),
+        );
+        for text in ["", "hello", "λ🦀", "\0é中🦀"] {
+            let mut txn = ElabTxn::new(imported().engine.environment().clone(), KVMap::new(), 78);
+            txn.budget.max_heartbeats = 2_000_000;
+            let id = MVarId(name("bytePayload"));
+            txn.mvars.declare(
+                id.clone(),
+                id.0.clone(),
+                list_type.clone(),
+                txn.lctx.clone(),
+                MetavarKind::Natural,
+                0,
+                None,
+            );
+            let receiver = Expr::proj(name("String"), 0, Expr::lit(Literal::Str(text.into())));
+            let array = Expr::proj(name("ByteArray"), 0, receiver);
+            let expected = Expr::app(
+                Expr::app(
+                    Expr::const_(name("Array.mk"), vec![Level::zero()]),
+                    byte.clone(),
+                ),
+                Expr::mvar(id.clone()),
+            );
+            let mut budget = UnificationBudget::new(Budget::for_stack_bytes(STACK));
+            budget.transparency = UnificationTransparency::Default;
+            // This test reduces the pin's logical UTF-8 model, not the native
+            // String adapter. Its dependent payload conversion is expensive;
+            // keep the production defaults unchanged and supply an explicit
+            // caller budget for these structural comparison cells.
+            budget.max_steps = 1_000_000;
+            budget.max_visited_nodes = 5_000_000;
+            let report = txn
+                .unify(&array, &expected, budget)
+                .unwrap_or_else(|error| panic!("{text:?}: {error:?}"));
+            assert_eq!(report.expression_assignments, vec![id.clone()]);
+            let actual = txn.mvars.get_assigned_expr(&id).unwrap().clone();
+            let cons = Expr::app(
+                Expr::const_(name("List.cons"), vec![Level::zero()]),
+                byte.clone(),
+            );
+            let mut bytes = Expr::app(
+                Expr::const_(name("List.nil"), vec![Level::zero()]),
+                byte.clone(),
+            );
+            for value in text.bytes().rev() {
+                let value = Expr::app(
+                    Expr::const_(name("UInt8.ofNat"), vec![]),
+                    Expr::lit(Literal::Nat(NatLit::from_u64(u64::from(value)))),
+                );
+                bytes = Expr::app(Expr::app(cons.clone(), value), bytes);
+            }
+            let apply =
+                |function: Expr, args: Vec<Expr>| args.into_iter().fold(function, Expr::app);
+            let type_ = apply(
+                Expr::const_(name("Eq"), vec![Level::one()]),
+                vec![list_type.clone(), actual.clone(), bytes],
+            );
+            let proof = apply(
+                Expr::const_(name("Eq.refl"), vec![Level::one()]),
+                vec![list_type.clone(), actual],
+            );
+            let theorem = fln_kernel::Declaration::Thm(fln_env::constants::TheoremVal {
+                base: fln_env::constants::ConstantVal {
+                    name: name("payloadVerification"),
+                    level_params: vec![],
+                    type_,
+                },
+                value: proof,
+                all: vec![name("payloadVerification")],
+            });
+            assert!(
+                matches!(
+                    fln_kernel::check(&txn.env, &theorem, Budget::for_stack_bytes(STACK)),
+                    fln_core::outcome::Outcome::Complete(
+                        fln_kernel::verdict::Verdict::Accepted { .. }
+                    )
+                ),
+                "{text:?}"
+            );
+            assert_eq!(txn.env, *imported().engine.environment());
+        }
+    });
+}
+
+fn unchanged_transaction(actual: &fln_elab::txn::ElabTxn, before: &fln_elab::txn::ElabTxn) {
+    assert_eq!(actual.env, before.env);
+    assert_eq!(actual.mvars, before.mvars);
+    assert_eq!(actual.universes, before.universes);
+    assert_eq!(actual.constraints, before.constraints);
+    assert_eq!(actual.lctx, before.lctx);
+    assert_eq!(actual.options, before.options);
+    assert_eq!(actual.seed, before.seed);
+}
+
+#[test]
+fn string_inference_stops_without_publishing_speculative_assignments() {
+    on_stack(|| {
+        use fln_core::expr::{Expr, Literal, NatLit};
+        use fln_elab::constraint::unify::{UnificationError, UnificationTransparency};
+        let mut problem = recursor_problem("x", false);
+        let before = problem.txn.clone();
+        problem.budget.transparency = UnificationTransparency::None;
+        assert!(matches!(
+            problem
+                .txn
+                .unify(&problem.call, &problem.answer, problem.budget),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged_transaction(&problem.txn, &before);
+
+        let mut problem = recursor_problem("x", false);
+        let before = problem.txn.clone();
+        problem.budget.max_steps = 1;
+        assert!(matches!(
+            problem
+                .txn
+                .unify(&problem.call, &problem.answer, problem.budget),
+            Err(UnificationError::StepLimit { limit: 1 })
+        ));
+        unchanged_transaction(&problem.txn, &before);
+
+        let mut problem = recursor_problem("x", false);
+        problem.txn.budget.max_heartbeats = 1;
+        let before = problem.txn.clone();
+        assert!(matches!(
+            problem
+                .txn
+                .unify(&problem.call, &problem.answer, problem.budget),
+            Err(UnificationError::HeartbeatLimit)
+        ));
+        unchanged_transaction(&problem.txn, &before);
+
+        let mut problem = recursor_problem(&"λ".repeat(2_000), false);
+        let before = problem.txn.clone();
+        problem.budget.max_visited_nodes = 200;
+        assert!(matches!(
+            problem
+                .txn
+                .unify(&problem.call, &problem.answer, problem.budget),
+            Err(UnificationError::NodeLimit { .. })
+        ));
+        unchanged_transaction(&problem.txn, &before);
+
+        let mut problem = recursor_problem(&"x".repeat(2_000), false);
+        let before = problem.txn.clone();
+        let calls = std::cell::Cell::new(0);
+        assert!(matches!(
+            problem
+                .txn
+                .unify_many_with(&[(problem.call, problem.answer)], problem.budget, &|| {
+                    calls.set(calls.get() + 1);
+                    calls.get() > 100
+                }),
+            Err(UnificationError::Cancelled)
+        ));
+        unchanged_transaction(&problem.txn, &before);
+
+        let mut problem = recursor_problem("x", true);
+        let before = problem.txn.clone();
+        let numeral = |n| Expr::lit(Literal::Nat(NatLit::from_u64(n)));
+        assert!(
+            problem
+                .txn
+                .unify_many_with(
+                    &[(problem.call, problem.answer), (numeral(1), numeral(2))],
+                    problem.budget,
+                    &|| false
+                )
+                .is_err()
+        );
+        unchanged_transaction(&problem.txn, &before);
+        assert!(problem.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+    });
+}
+
+#[test]
+fn incomplete_or_literal_returning_string_models_do_not_loop_or_infer() {
+    on_stack(|| {
+        use fln_core::expr::{Expr, ExprNode, Literal};
+        use fln_elab::constraint::unify::UnificationError;
+        use fln_env::constants::ConstantInfo;
+        // Hostile comparison data, never installed in an executable engine or
+        // passed off as a newly admitted environment. A successful prefix of a
+        // literal expansion must not confer authority on an absent definition.
+        for target in [
+            "Char.ofNat",
+            "String.ofList",
+            "String.ofList.literal-return",
+        ] {
+            let mut problem = recursor_problem("", false);
+            let original = problem.txn.env.clone();
+            let selected = name(if target.ends_with("literal-return") {
+                "String.ofList"
+            } else {
+                target
+            });
+            let mut env = fln::Environment::new();
+            for (label, _) in original.constants() {
+                if label != &selected {
+                    env = env.with_entry(original.entry(label).unwrap()).unwrap();
+                }
+            }
+            if target.ends_with("literal-return") {
+                let Some(ConstantInfo::Defn(mut value)) = original.find(&selected).cloned() else {
+                    panic!("known definition");
+                };
+                let ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    binder_info,
+                    ..
+                } = value.value.node()
+                else {
+                    panic!("String.ofList lambda");
+                };
+                value.value = Expr::lam(
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    Expr::lit(Literal::Str(String::new())),
+                    *binder_info,
+                );
+                env = env.add_decl(ConstantInfo::Defn(value)).unwrap();
+            }
+            problem.txn.env = env;
+            let before = problem.txn.clone();
+            assert!(
+                matches!(
+                    problem
+                        .txn
+                        .unify(&problem.call, &problem.answer, problem.budget),
+                    Err(UnificationError::Deferred(_))
+                ),
+                "{target}"
+            );
+            unchanged_transaction(&problem.txn, &before);
+        }
+    });
+}
