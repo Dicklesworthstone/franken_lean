@@ -165,3 +165,71 @@ jobs:
           path: ${{ runner.temp }}/assignment-transfer
           retention-days: 7
           if-no-files-found: error
+
+  scientific-conversions:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify dynamic scientific conversions on the pinned toolchains'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'd20991e829e998586a0fa27d4712a37a0033ce53'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'd20991e829e998586a0fa27d4712a37a0033ce53'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/OfScientific; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Compare all dynamic conversion bit expectations with the live pin
+        shell: python
+        run: |
+          import os, pathlib, re, subprocess
+          test = pathlib.Path('crates/fln/tests/source_imported_floats.rs').read_text()
+          helper = test.split('fn assert_dynamic_conversions(', 1)[1]
+          source = re.search(r'let source = r#"(.*?)"#;', helper, re.S).group(1)
+          source, count = re.subn(r'^#eval (.+)$', r'#eval ((\1).toBits).toNat', source, flags=re.M)
+          assert count == 17, count
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dynamic-conversion-oracle.lean'
+          fixture.write_text('import Init.Data.OfScientific\n' + source)
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          result = subprocess.run([str(lean), str(fixture)], text=True, capture_output=True)
+          print(result.stdout, end='')
+          print(result.stderr, end='')
+          assert result.returncode == 0, result.returncode
+          expected = ['4611911198408756429', '1074161254', '4906019910204099648', '4608285800708723180', '1067408425', '4611911198408756429', '0', '1', '1', '9218868437227405312', '2139095040', '4895412794951729152', '1593835521', '4631107791820423168', '1109917696', '13854479828675198976', '1123680256']
+          assert result.stdout.splitlines() == expected, (result.stdout.splitlines(), expected)
+      - name: Check complete Float models and selected native helper authority
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --lib source_intrinsics::float::tests -- --nocapture --test-threads=1
+      - name: Execute and replay actual imported scientific bodies
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_imported_floats actual_imported_scientific_floats_execute_and_replay_the_regression -- --exact --nocapture --test-threads=1
+      - name: Check formatting of the candidate source
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          rustfmt --check --edition 2024 crates/fln/src/source_intrinsics/float.rs crates/fln/tests/source_imported_floats.rs
+          git diff --check
