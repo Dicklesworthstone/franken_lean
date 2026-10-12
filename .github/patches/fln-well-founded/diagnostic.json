@@ -1,0 +1,79 @@
+[
+  {
+    "path": "crates/fln-elab/src/source.rs",
+    "expectedBlob": "2503ec2964834b3783ad699479209953276585d4",
+    "edits": [
+      {
+        "needle": "    fn tick(&mut self) -> Result<(), NatDefinitionElabError> {\n        self.txn\n            .budget\n            .check_heartbeat()\n            .map_err(|_| failure(SourceInferenceError::ResourceLimit))\n    }",
+        "replacement": "    #[track_caller]\n    fn tick(&mut self) -> Result<(), NatDefinitionElabError> {\n        let caller = std::panic::Location::caller();\n        self.txn.budget.check_heartbeat().map_err(|_| {\n            eprintln!(\n                \"WF_RESOURCE_TRACE caller={caller} consumed={} maximum={} defining={:?} well_founded={} proving={} attempt_depth={}\",\n                self.txn.budget.heartbeats_consumed,\n                self.txn.budget.max_heartbeats,\n                self.defining,\n                self.well_founded.is_some(),\n                self.well_founded.as_ref().is_some_and(|state| state.proving),\n                self.attempt_depth,\n            );\n            failure(SourceInferenceError::ResourceLimit)\n        })\n    }",
+        "count": 1
+      },
+      {
+        "needle": "fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {\n    NatDefinitionElabError::Inference(reason)\n}",
+        "replacement": "#[track_caller]\nfn failure(reason: SourceInferenceError) -> NatDefinitionElabError {\n    if matches!(&reason, SourceInferenceError::ResourceLimit) {\n        eprintln!(\"WF_RESOURCE_ORIGIN {}\", std::panic::Location::caller());\n        eprintln!(\"WF_RESOURCE_BACKTRACE {}\", std::backtrace::Backtrace::force_capture());\n    }\n    NatDefinitionElabError::Inference(reason)\n}",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/fln-elab/src/source/recursion/well_founded.rs",
+    "expectedBlob": "c0c7607c7fd52dc1c5716a27126c13307b7bd9c2",
+    "edits": [
+      {
+        "needle": "    fn well_founded_selected_body(\n",
+        "replacement": "    fn trace_well_founded_nested(&self, name: &Name, phase: &str) {\n        if name == &Name::from_components([\"nestedLexAutomatic\"]) {\n            eprintln!(\n                \"WF_NESTED phase={phase} heartbeats={}\",\n                self.txn.budget.heartbeats_consumed,\n            );\n        }\n    }\n\n    fn well_founded_selected_body(\n",
+        "count": 1
+      },
+      {
+        "needle": "        let measure = self.well_founded_measure(hint, parameters, header_parameters)?;\n        let measure = self.select_well_founded_relation(measure, parameters)?;\n",
+        "replacement": "        self.trace_well_founded_nested(name, \"measure.begin\");\n        let measure = self.well_founded_measure(hint, parameters, header_parameters)?;\n        self.trace_well_founded_nested(name, \"measure.done\");\n        let measure = self.select_well_founded_relation(measure, parameters)?;\n        self.trace_well_founded_nested(name, \"relation.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "        let domain = self.well_founded_domain(&varying_parameters)?;\n        let motive = self.well_founded_motive(&varying_parameters, &domain, &expected)?;\n",
+        "replacement": "        self.trace_well_founded_nested(name, \"attempt.domain.begin\");\n        let domain = self.well_founded_domain(&varying_parameters)?;\n        self.trace_well_founded_nested(name, \"attempt.domain.done\");\n        let motive = self.well_founded_motive(&varying_parameters, &domain, &expected)?;\n        self.trace_well_founded_nested(name, \"attempt.motive.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "        let fix = self.well_founded_fix(domain, motive, measure_fn.value, measure)?;\n",
+        "replacement": "        self.trace_well_founded_nested(name, \"attempt.fix.begin\");\n        let fix = self.well_founded_fix(domain, motive, measure_fn.value, measure)?;\n        self.trace_well_founded_nested(name, \"attempt.fix.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "        let result = (|| {\n            let term = self.term(syntax, Some(expected.clone()))?;\n            self.resolve_instances_with_defaults()?;\n            self.resume_postponed_eliminators(true)?;\n",
+        "replacement": "        let result = (|| {\n            self.trace_well_founded_nested(name, \"body.term.begin\");\n            let term = self.term(syntax, Some(expected.clone()))?;\n            self.trace_well_founded_nested(name, \"body.term.done\");\n            self.resolve_instances_with_defaults()?;\n            self.trace_well_founded_nested(name, \"body.instances.done\");\n            self.resume_postponed_eliminators(true)?;\n",
+        "count": 1
+      },
+      {
+        "needle": "            let actual_varying = self.well_founded_varying_parameters(parameters, &obligations)?;\n",
+        "replacement": "            self.trace_well_founded_nested(name, \"body.obligations.done\");\n            let actual_varying = self.well_founded_varying_parameters(parameters, &obligations)?;\n            self.trace_well_founded_nested(name, \"body.varying.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "                let goals = self.prepare_decreasing_goals(&obligations)?;\n",
+        "replacement": "                self.trace_well_founded_nested(name, \"goals.prepare.begin\");\n                let goals = self.prepare_decreasing_goals(&obligations)?;\n                self.trace_well_founded_nested(name, \"goals.prepare.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "                    let goals = self.normalize_decreasing_goals(goals)?;\n",
+        "replacement": "                    self.trace_well_founded_nested(name, \"goals.normalize.begin\");\n                    let goals = self.normalize_decreasing_goals(goals)?;\n                    self.trace_well_founded_nested(name, \"goals.normalize.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "                        for goal in goals {\n                            self.tick()?;\n                            let state = self.start_decreasing_proof(&prepared, vec![goal])?;\n                            self.run_decreasing_proof(&prepared, state)?;\n",
+        "replacement": "                        for goal in goals {\n                            self.trace_well_founded_nested(name, \"proof.begin\");\n                            self.tick()?;\n                            let state = self.start_decreasing_proof(&prepared, vec![goal])?;\n                            self.trace_well_founded_nested(name, \"proof.prepared\");\n                            self.run_decreasing_proof(&prepared, state)?;\n                            self.trace_well_founded_nested(name, \"proof.done\");\n",
+        "count": 1
+      },
+      {
+        "needle": "            let mut value = self.instantiate(&value)?;\n            self.require_resolved_terms(std::slice::from_ref(&value))?;\n",
+        "replacement": "            self.trace_well_founded_nested(name, \"proofs.transport.done\");\n            let mut value = self.instantiate(&value)?;\n            self.require_resolved_terms(std::slice::from_ref(&value))?;\n",
+        "count": 1
+      },
+      {
+        "needle": "        self.well_founded = None;\n        self.txn.lctx = saved;\n        if matches!(&result, Ok(Attempt::Complete(_))) {\n",
+        "replacement": "        self.trace_well_founded_nested(name, \"attempt.finished\");\n        self.well_founded = None;\n        self.txn.lctx = saved;\n        if matches!(&result, Ok(Attempt::Complete(_))) {\n",
+        "count": 1
+      }
+    ]
+  }
+]

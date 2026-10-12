@@ -119,6 +119,21 @@ def main():
         target.chmod(0o644)
         original[path] = data
 
+    diagnostic = ENV.get("FLN_WF_RESOURCE_DIAGNOSTIC") == "1"
+    if diagnostic:
+        # This temporary overlay diagnoses an unchanged limit. It is never a
+        # production candidate and cannot emit a successful validation result.
+        edits = json.loads((PAYLOAD / "diagnostic.json").read_text())
+        for item in edits:
+            target = worktree / item["path"]
+            data = target.read_bytes()
+            assert blob(data) == item["expectedBlob"], item["path"]
+            source = data.decode("utf-8")
+            for edit in item["edits"]:
+                assert source.count(edit["needle"]) == edit["count"], edit["needle"]
+                source = source.replace(edit["needle"], edit["replacement"])
+            target.write_text(source)
+
     # Freeze the exact formatted bytes BEFORE testing. Do not visit other modules.
     fmt = ["rustfmt", "--edition", "2024", "--config", "skip_children=true"]
     run("format-candidate", fmt + paths, worktree)
@@ -130,12 +145,21 @@ def main():
         assert index_entry(path, worktree) == ("100644", blob(frozen[path])), path
     run("diff-check", ["git", "diff", "--cached", "--check"], worktree)
 
+    command = [
+        "cargo", "test", "--offline", "--locked", "-p", "fln",
+        "--test", "source_well_founded",
+    ]
+    if diagnostic:
+        command += ["native_automatic_well_founded_termination", "--", "--exact"]
+    else:
+        command += ["--"]
+    command += ["--nocapture", "--test-threads=1"]
     output = run(
-        "native-well-founded",
-        ["cargo", "test", "--offline", "--locked", "-p", "fln",
-         "--test", "source_well_founded", "--", "--nocapture", "--test-threads=1"],
-        worktree, {"CARGO_PROFILE_TEST_OPT_LEVEL": "2"},
+        "native-well-founded", command, worktree,
+        {"CARGO_PROFILE_TEST_OPT_LEVEL": "2"},
     )
+    if diagnostic:
+        raise SystemExit("Diagnostic-only run cannot authorize source publication")
     assert re.search(
         r"test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
         output,
