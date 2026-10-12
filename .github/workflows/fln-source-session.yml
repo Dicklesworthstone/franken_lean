@@ -9,39 +9,61 @@ permissions:
   contents: read
 
 jobs:
-  checkout:
+  source-probes:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Read current functional blockers
+      - name: Read functional blockers and relevant implementation locations
         shell: python
         run: |
-          import json
+          import json, re
           from pathlib import Path
           rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
           selected = [r for r in rows if r.get('status') in ('open', 'in_progress', 'blocked') and r.get('priority', 9) <= 1]
-          for row in sorted(selected, key=lambda r: (r.get('priority', 9), r['id'])):
-              print(json.dumps({k: row.get(k) for k in ('id', 'title', 'status', 'priority', 'description', 'acceptance_criteria')}, ensure_ascii=False))
-      - name: Prepare exact source and Rust snapshot
+          for r in sorted(selected, key=lambda r: (r.get('priority', 9), r['id'])):
+              print(r['id'], r.get('status'), r.get('priority'), r.get('title', '')[:180])
+          focus = [r for r in rows if r.get('status') != 'closed' and re.search(r'rcases|rintro|obtain|motive|pattern.*tactic|eliminat', r.get('title', ''), re.I)]
+          for r in focus[:12]:
+              print('FOCUS', json.dumps({k: r.get(k) for k in ('id', 'title', 'description', 'acceptance_criteria')}, ensure_ascii=False)[:2500])
+          for directory in ('crates/fln-parse/src/proofs', 'crates/fln-elab/src/source/tactics'):
+              for path in sorted(Path(directory).rglob('*.rs')):
+                  text = path.read_text()
+                  for i, line in enumerate(text.splitlines(), 1):
+                      if re.search(r'rcases|rintro|obtain|matchMotive', line):
+                          print('CODE', str(path), i, line[:180])
+      - name: Run focused native source capability probes
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/source-session"
-          git rev-parse HEAD > "$RUNNER_TEMP/source-session/BASE_SHA"
-          git archive HEAD | gzip -1 > "$RUNNER_TEMP/source-session/source.tar.gz"
-          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
-          rustc +nightly-2026-08-31 -Vv > "$RUNNER_TEMP/source-session/RUST_VERSION"
-          toolchain=$(rustup run nightly-2026-08-31 rustc --print sysroot)
-          tar -C "$toolchain" -czf "$RUNNER_TEMP/source-session/rust.tar.gz" bin lib libexec
-          cd "$RUNNER_TEMP/source-session"
-          sha256sum source.tar.gz rust.tar.gz > SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-source-session
-          path: ${{ runner.temp }}/source-session
-          retention-days: 2
-          compression-level: 0
+          rustup show active-toolchain
+          test ! -e crates/fln/examples/source_session_probe.rs
+          cat > crates/fln/examples/source_session_probe.rs <<'RS'
+          use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+          fn main() {
+              let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+              let e = Engine::with_source_seed(limits).unwrap().into_complete().unwrap();
+              for (id, source) in [
+                  ("rcases_pair", "theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h with ⟨hp, hq⟩; exact hq"),
+                  ("rintro_pair", "theorem f (p q : Prop) : p ∧ q → q := by rintro ⟨hp, hq⟩; exact hq"),
+                  ("obtain_pair", "theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ := h; exact hq"),
+                  ("match_motive", "def f (b : Bool) : Nat := match (motive := fun _ => Nat) b with | true => 1 | false => 2"),
+                  ("exists_tactic", "theorem f : ∃ n : Nat, n = 3 := by exists 3"),
+                  ("refine_pair", "theorem f (p q : Prop) (hp : p) (hq : q) : p ∧ q := by refine ⟨?_, ?_⟩; exact hp; exact hq"),
+                  ("cases_pair", "theorem f (p q : Prop) (h : p ∧ q) : q := by cases h with | intro hp hq => exact hq"),
+              ] {
+                  match e.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+                      Ok(value) => println!("PROBE {id}: complete={}", value.into_complete().is_some()),
+                      Err(error) => println!("PROBE {id}: {error:?}"),
+                  }
+              }
+          }
+          RS
+          cargo run --locked -p fln --example source_session_probe > "$RUNNER_TEMP/probes.log" 2>&1 || { tail -100 "$RUNNER_TEMP/probes.log"; exit 1; }
+          grep '^PROBE ' "$RUNNER_TEMP/probes.log"
