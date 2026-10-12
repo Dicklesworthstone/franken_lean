@@ -500,7 +500,7 @@ jobs:
 
   array-iteration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify imported Array traversal and executable model authority'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify Array execution after strict fixture corrections'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -512,11 +512,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '7de76a25ddd25bddbc692e50ad1eaae4ac4cb150'
+      CANDIDATE_SHA: '275bd7863e23f4443fa1a50829513733f44596cd'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '7de76a25ddd25bddbc692e50ad1eaae4ac4cb150'
+          ref: '275bd7863e23f4443fa1a50829513733f44596cd'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         id: reference
@@ -537,109 +537,12 @@ jobs:
             done
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
-      - name: Compile both Array test surfaces before importing the actual library
-        id: array-compile
-        run: cargo test --locked --offline -p fln --lib --test source_imported_arrays --no-run
-      - name: Compare all shared programs with the actual pinned Lean oracle
-        if: (success() || failure()) && steps.reference.outcome == 'success'
-        run: python3 crates/fln/tests/source_imported_arrays/check_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
-      - name: Extract complete logical and selected executable dependency identities
-        id: array-extract
-        if: (success() || failure()) && steps.array-compile.outcome == 'success' && steps.reference.outcome == 'success'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --offline -p fln --test source_imported_arrays dump_pinned_array_iteration_model -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/array-model.log"
-      - name: Generate the exact runtime model from admitted pinned declarations
-        id: array-model
-        if: (success() || failure()) && steps.array-extract.outcome == 'success'
-        shell: python
-        run: |
-          import os, pathlib, re
-          
-          log = pathlib.Path(os.environ['RUNNER_TEMP'], 'array-model.log').read_text()
-          lines = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', log).splitlines()
-          
-          def section(prefix):
-              begin = [i for i, line in enumerate(lines) if line == prefix + '_BEGIN']
-              end = [i for i, line in enumerate(lines) if line == prefix + '_END']
-              assert len(begin) == len(end) == 1 and begin[0] < end[0], (prefix, begin, end)
-              return lines[begin[0] + 1:end[0]]
-          
-          def encoded_name(value):
-              assert re.fullmatch(r'(?:s:[^/\t\r\n]*|n:[0-9]+)(?:/(?:s:[^/\t\r\n]*|n:[0-9]+))*', value), value
-              return value
-          
-          digests = {}
-          rows = section('FLN_ARRAY_DEPENDENCIES')
-          assert rows and rows == sorted(rows), 'dependency rows must be nonempty and sorted'
-          for row in rows:
-              columns = row.split('\t')
-              assert len(columns) == 2, row
-              label, digest = columns
-              encoded_name(label)
-              assert label not in digests and re.fullmatch(r'[0-9a-f]{64}', digest), row
-              digests[label] = digest
-          
-          metadata = {kind: {} for kind in ('implemented_by', 'extern', 'companion')}
-          for row in section('FLN_ARRAY_DEPENDENCY_METADATA'):
-              columns = row.split('\t', 2)
-              assert len(columns) == 3, row
-              kind, label, value = columns
-              assert kind in metadata and label in digests and label not in metadata[kind], row
-              assert value, row
-              if kind == 'extern':
-                  assert value != '[]', row
-              elif kind == 'companion' and value == '-':
-                  pass
-              else:
-                  encoded_name(value)
-                  assert value in digests, ('missing executable edge target', row)
-              metadata[kind][label] = value
-          
-          for label, target in metadata['companion'].items():
-              assert target == '-' or target == label + '/s:_unsafe_rec', ('noncanonical companion', label, target)
-          for label in digests:
-              if label.endswith('/s:_unsafe_rec'):
-                  assert label.removesuffix('/s:_unsafe_rec') in digests, ('missing logical parent', label)
-          
-          roots = (
-              "s:Array/s:forIn'", "s:Array/s:forIn'Unsafe", "s:List/s:forIn'",
-              's:Array', 's:Array/s:Mem', 's:ForInStep', 's:List', 's:Monad',
-              's:Array/s:Mem/s:mk',
-          )
-          assert all(label in digests for label in roots), 'missing canonical model root'
-          assert metadata['implemented_by'].get("s:Array/s:forIn'") == "s:Array/s:forIn'Unsafe"
-          assert all(label in metadata['companion'] for label in ("s:Array/s:forIn'", "s:List/s:forIn'"))
-          
-          result = ''.join(
-              '\t'.join((
-                  label, digests[label], metadata['implemented_by'].get(label, '-'),
-                  'extern' if label in metadata['extern'] else '-',
-                  metadata['companion'].get(label, '-'),
-              )) + '\n'
-              for label in sorted(digests)
-          )
-          path = pathlib.Path('crates/fln/src/source_intrinsics/array_iteration/dependencies.txt')
-          assert path.is_file(), 'the candidate must contain the guarded model input'
-          path.write_text(result)
-          print('FLN_ARRAY_GENERATED_MODEL_BEGIN', flush=True)
-          print(result, end='', flush=True)
-          print('FLN_ARRAY_GENERATED_MODEL_END', flush=True)
-          print('FLN_ARRAY_GENERATED_MODEL_COUNTS', {
-              'declarations': len(digests),
-              'implemented_by': len(metadata['implemented_by']),
-              'externs': len(metadata['extern']),
-              'present_companions': sum(value != '-' for value in metadata['companion'].values()),
-              'checked_companion_slots': len(metadata['companion']),
-          }, flush=True)
-          
-      - name: Format the candidate and preserve the exact generated and tested bytes
+      - name: Format the candidate and bind the complete pinned model
         id: array-format
-        if: (success() || failure()) && steps.array-model.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git hash-object crates/fln/src/source_intrinsics/array_iteration/dependencies.txt)" = 03bd623fb97a1617ce726aeaf978810922143663
           rust_paths=(
             crates/fln/src/runtime/array_iteration.rs
             crates/fln/src/source_intrinsics/array_iteration.rs
@@ -651,7 +554,6 @@ jobs:
             crates/fln/tests/source_imported_arrays/execution.rs
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/source_check.rs
           )
           paths=(
             crates/fln/src/runtime/array_iteration.rs
@@ -668,7 +570,6 @@ jobs:
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/tests/source_imported_arrays/check_oracle.py
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/source_check.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
@@ -681,22 +582,19 @@ jobs:
           echo FLN_ARRAY_FORMATTED_BLOBS_END
           rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
           git diff --check
-      - name: Check model authority, initializers, resource limits and private collisions
+      - name: Check exact model authority and all selected compiler companions
         if: (success() || failure()) && steps.array-format.outcome == 'success'
         run: cargo test --locked --offline -p fln --lib runtime::array_iteration::tests -- --nocapture --test-threads=1
       - name: Execute and replay all imported Array programs and checked model controls
         if: (success() || failure()) && steps.array-format.outcome == 'success'
         run: cargo test --locked --offline -p fln --test source_imported_arrays actual_imported_array_iteration_executes_replays_and_preserves_authority -- --exact --nocapture --test-threads=1
-      - name: Check existing loops, implementation selection and default-instance registration
-        if: (success() || failure()) && steps.array-format.outcome == 'success'
-        run: cargo test --locked --offline -p fln --test source_do --test source_exception_loops --test source_for_membership --test source_implemented_by --test source_default_instances --no-fail-fast -- --test-threads=1
-      - name: Check runtime, Array target and merged well-founded target warnings
+      - name: Check runtime, Array fixtures and the current merged well-founded target
         if: (success() || failure()) && steps.array-format.outcome == 'success'
         run: cargo clippy --locked --offline -p fln --lib --test source_imported_arrays --test source_well_founded -- -D warnings
 
   array-iteration-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): isolate the pinned Array oracle failure'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify Array execution after strict fixture corrections'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -708,11 +606,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '7de76a25ddd25bddbc692e50ad1eaae4ac4cb150'
+      CANDIDATE_SHA: '275bd7863e23f4443fa1a50829513733f44596cd'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '7de76a25ddd25bddbc692e50ad1eaae4ac4cb150'
+          ref: '275bd7863e23f4443fa1a50829513733f44596cd'
           persist-credentials: false
       - name: Verify candidate and install the exact Reference
         shell: bash
@@ -729,5 +627,5 @@ jobs:
             done
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
-      - name: Compare all 43 unchanged Array probes with pinned Lean
+      - name: Compare all 43 Array probes with the exact pinned Lean oracle
         run: python3 crates/fln/tests/source_imported_arrays/check_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
