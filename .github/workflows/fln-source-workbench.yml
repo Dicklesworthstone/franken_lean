@@ -755,7 +755,7 @@ jobs:
 
   mutable-loop-returns:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): check mutable loop returns against all pinned effect traces'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate typed state continuations and native mutable returns'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -767,11 +767,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '5c9f17b4dad88775434bc16f913a222b950392f5'
+      CANDIDATE_SHA: '435c5fd99d18d06b7415c04abaccbd75e9fa1df4'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '5c9f17b4dad88775434bc16f913a222b950392f5'
+          ref: '435c5fd99d18d06b7415c04abaccbd75e9fa1df4'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -832,6 +832,9 @@ jobs:
           rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
           git diff --check
 
+      - name: Check bounded do-notation transformations with explicit state types
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib source::do_notation -- --test-threads=1
       - name: Require all 29 exact pinned mutable-return values and effect traces
         if: (success() || failure()) && steps.mutable-format.outcome == 'success'
         run: python3 crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
