@@ -36,6 +36,7 @@ for attempt in range(3):
     run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *[f for f in FILES if f.endswith('.rs')]], work)
     run(['git', 'diff', '--check'], work)
     counts = [0, 0]
+    mismatches = []
     for fixture in ['crates/fln/tests/fixtures/rcases.tsv', FILES[-1]]:
         for line in (work / fixture).read_text().splitlines():
             if not line.strip() or line.startswith('#'): continue
@@ -44,11 +45,25 @@ for attempt in range(3):
             subject.write_text('import Init.RCases\n' + source.replace('\\n', '\n') + '\n')
             result = subprocess.run([os.environ['FLN_REFERENCE_LEAN'], str(subject)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
             if (result.returncode == 0) != (verdict == 'accept'):
-                raise RuntimeError(f'pin {name} {verdict}: {result.returncode}\n{result.stdout}')
+                mismatches.append(name)
+                print('PIN_MISMATCH', name, verdict, result.returncode, result.stdout, flush=True)
             counts[verdict != 'accept'] += 1
+    if mismatches:
+        for i, source in enumerate([
+            'theorem f (p : Prop) (hp : p) : p := by obtain h : p; trace_state',
+            'theorem f (p : Prop) (hp : p) : p := by obtain h : p; exact hp; trace_state',
+            'theorem f (p : Prop) (hp : p) : p := by\n  obtain h : p\n  · exact hp\n  trace_state\n  exact h',
+            'theorem f (p : Prop) (hp : p) : p := by\n  obtain h : p\n  · exact hp\n  exact hp',
+            'theorem f (p : Prop) (hp : p) : p := by obtain : p; exact hp; trace_state',
+            'theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ : p ∧ q; exact h; trace_state',
+        ]):
+            subject = Path(os.environ['RUNNER_TEMP']) / f'obtain-scope-{i}.lean'
+            subject.write_text('import Init.RCases\n' + source + '\n')
+            result = subprocess.run([os.environ['FLN_REFERENCE_LEAN'], str(subject)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+            print('SCOPE_PROBE', i, repr(source), result.returncode, result.stdout, flush=True)
+        raise RuntimeError(f'Reference acceptance mismatch; no production activation: {mismatches}')
     if counts != [36, 23]: raise RuntimeError(f'unexpected oracle counts: {counts}')
     print('PIN_RINTRO_OBTAIN', counts, flush=True)
-    # Fail early on native behavior before paying for the real import closure.
     run(seed, work)
     run(['cargo', 'clippy', '--locked', '-p', 'fln-elab', '--lib', '--', '-D', 'warnings'], work)
     run(['cargo', 'clippy', '--locked', '-p', 'fln', '--test', 'source_rintro_obtain', '--no-deps', '--', '-D', 'warnings'], work)
