@@ -414,3 +414,5 @@ fn generated_entry_collision_refuses_without_publishing_a_stage() {
     assert_eq!(engine.logical_root(&KVMap::new()), root);
     returned(&engine, b"#eval 42", &["42"]);
 }
+
+mod callback_stages;

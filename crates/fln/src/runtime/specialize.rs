@@ -35,7 +35,7 @@ pub(super) struct Store {
     pub(super) receiver_queries: super::projections::query::Store,
     factory_values: HashMap<Expr, Expr>,
     pub(super) executable_projections: HashMap<(Name, u64, Expr), Expr>,
-    instances: HashMap<arguments::InstanceKey, Name>,
+    pub(super) instances: HashMap<arguments::InstanceKey, Name>,
     types: HashMap<Expr, Expr>,
     constructor_types: HashMap<Name, Expr>,
 }

@@ -7,6 +7,8 @@
 use super::*;
 use std::collections::HashMap;
 
+mod callbacks;
+
 #[derive(Clone)]
 struct Parameter {
     name: Name,
@@ -30,6 +32,7 @@ pub(in crate::runtime) struct Store {
     entries: Vec<Entry>,
     origins: HashMap<Name, usize>,
     names: HashMap<Name, usize>,
+    callbacks: HashMap<(Name, Vec<ValueType>), usize>,
 }
 
 impl Preparation<'_> {
@@ -257,22 +260,34 @@ impl Preparation<'_> {
         let Some(entry) = self.partial_stage(name)? else {
             return Ok(None);
         };
+        let entry = self.partial_callback_stage(name, entry, args)?;
+        self.apply_partial_stage(&entry, args)
+    }
+
+    /// One strict binding per supplied prefix operand, followed by the prefix
+    /// result and then any surplus operands. Callback-specialized recursive
+    /// entries use this same staging operation as the ordinary Partial path.
+    fn apply_partial_stage(
+        &mut self,
+        entry: &Entry,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
         let prefix = entry.parameters.len();
         let supplied = args.len().min(prefix);
-        let mut value = Expr::const_(entry.name, Vec::new());
+        let mut value = Expr::const_(entry.name.clone(), Vec::new());
         for index in (0..prefix).rev() {
             self.tick()?;
             value = Expr::app(value, variable(index)?);
         }
         value = if args.len() > prefix {
             let Some(applied) =
-                self.apply_producer(value, entry.suffix, &args[prefix..], prefix)?
+                self.apply_producer(value, entry.suffix.clone(), &args[prefix..], prefix)?
             else {
                 return Ok(None);
             };
             applied
         } else {
-            self.typed_callable_result(value, entry.suffix, entry.result)?
+            self.typed_callable_result(value, entry.suffix.clone(), entry.result)?
         };
         if supplied < prefix {
             for parameter in entry.parameters[supplied..].iter().rev() {
