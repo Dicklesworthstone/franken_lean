@@ -252,7 +252,7 @@ jobs:
 
   automatic-termination:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify normalized automatic termination proofs on current main'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify checked projection cleanup with source defaults on current main'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -264,11 +264,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '5e4fc17d7aa43fdc6c15b318712e2889bc07a4af'
+      CANDIDATE_SHA: '8b26452baa1a0533227527b7aa1063b6b9328b24'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '5e4fc17d7aa43fdc6c15b318712e2889bc07a4af'
+          ref: '8b26452baa1a0533227527b7aa1063b6b9328b24'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -288,6 +288,48 @@ jobs:
             done
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format integrated default source and preserve the tested merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-elab/src/instances/defaults.rs
+            crates/fln-elab/src/instances/defaults/export.rs
+            crates/fln-elab/src/instances/defaults/export/tests.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/instance_command.rs
+            crates/fln-elab/src/source/instances.rs
+            crates/fln-elab/src/source/scope/simp.rs
+            crates/fln-elab/src/source/scope/visibility.rs
+            crates/fln-olean/src/write/source.rs
+            crates/fln-olean/src/write/source/defaults.rs
+            crates/fln-olean/src/write/source/namespaces.rs
+            crates/fln-parse/src/command_scope/instances.rs
+            crates/fln/src/lib.rs
+            crates/fln/src/source_check.rs
+            crates/fln/src/source_check/instance_attributes.rs
+            crates/fln/src/source_check/modules/artifacts.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/persisted.rs
+            crates/fln/src/source_check/modules/replay.rs
+            crates/fln/src/source_check/modules/visibility.rs
+            crates/fln/src/source_records.rs
+            crates/fln/tests/source_default_instances.rs
+            crates/fln/tests/source_default_simp.rs
+            crates/fln/tests/source_module_artifacts/classes.rs
+            crates/fln/tests/source_module_artifacts/defaults.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_INTEGRATED_DEFAULT_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_INTEGRATED_DEFAULT_RUSTFMT_DIFF_END
+          echo FLN_INTEGRATED_DEFAULT_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_INTEGRATED_DEFAULT_FORMATTED_BLOBS_END
+          git diff --check
       - name: Format only the four candidate files and preserve the tested bytes
         shell: bash
         run: |
