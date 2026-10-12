@@ -458,8 +458,12 @@ impl Context {
             if !terminal {
                 return Err(invalid());
             }
-            if block.loop_scope.is_some() {
-                block.result = Some(self.expand_loop_return(element)?);
+            if let Some(scope) = &block.loop_scope {
+                block.result = Some(if scope.targets.return_state.is_empty() {
+                    self.expand_loop_return(element)?
+                } else {
+                    self.expand_scoped_loop_return(element, false, &scope.targets)?
+                });
                 work.push(Task::Block(block));
                 return Ok(());
             }

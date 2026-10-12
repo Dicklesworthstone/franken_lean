@@ -377,6 +377,15 @@ impl Context {
             self.tick()?;
             return unless::expand(syntax);
         }
+        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoReturningMutFor"])) {
+            if pattern {
+                return Err(invalid());
+            }
+            return Ok(Syntax::node(
+                parser_kind(&["Term", "nativeDoReturningFor"]),
+                vec![syntax],
+            ));
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoMutFor"])) {
             if pattern {
                 return Err(invalid());
@@ -473,14 +482,10 @@ impl Context {
                 if !terminal {
                     return Err(invalid());
                 }
-                let return_type = scope
-                    .targets
-                    .and_then(|targets| targets.return_type.as_ref())
-                    .ok_or_else(invalid)?;
-                return self.expand_loop_return_with_signal(
+                return self.expand_scoped_loop_return(
                     element,
                     scope.signal,
-                    Some(return_type),
+                    scope.targets.ok_or_else(invalid)?,
                 );
             }
             // A branch may return only when there is no enclosing source

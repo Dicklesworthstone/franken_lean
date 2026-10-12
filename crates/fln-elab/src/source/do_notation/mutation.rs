@@ -10,6 +10,8 @@
 //! - A `for` loop that reassigns them carries them as its `ForIn` state (`elabDoFor`). The
 //!   callback starts from the tuple. Every exit (`continue`, `break`, the end of the body) yields
 //!   the variables' values at that point. The loop's result binds them again.
+//!   A returning loop also carries Option R; its checked state continuation receives the final
+//!   values before either resuming the suffix or forwarding a nonlocal return.
 //!
 //! - A branch statement whose every reassigning branch ends in `break` or `continue` needs no join:
 //!   the jump yields the values it reads, so it stays a plain `do` element.
@@ -23,7 +25,6 @@
 //!   that falls through (its join would also have to forward the exit). Inside one, the same when
 //!   a branch binds a name the statements after it read (`| some n => …` before `s := s + n` with
 //!   an outer `n`): their copy in that branch would capture it;
-//! - a reassigning loop whose body returns;
 //! - a pattern reassignment (`(a, b) := e`).
 //!
 //! Refused as the pin refuses them:
@@ -489,7 +490,7 @@ pub(super) fn is_state_tuple(syntax: &Syntax) -> bool {
 }
 
 /// The `index`-th of `count` components of a `state_tuple` value.
-fn component(tuple: &Syntax, index: usize, count: usize) -> Syntax {
+pub(super) fn component(tuple: &Syntax, index: usize, count: usize) -> Syntax {
     let mut value = tuple.clone();
     for _ in 0..index {
         value = application(root(&["Prod", "snd"]), vec![value]);
@@ -1093,7 +1094,12 @@ impl Context {
             return Ok(());
         }
         if facts.returns {
-            return Err(refused());
+            parts.push(self.mutable_sequence(body, muts, None, true, true)?);
+            parts.push(null(state.iter().map(named).collect()));
+            // Retain this sequence for the enclosing return worklist. Its
+            // state must parameterize the suffix, not a thunk over old values.
+            out.push(term("nativeDoReturningMutFor", parts));
+            return Ok(());
         }
         parts.push(self.mutable_sequence(body, muts, None, true, true)?);
         let result = match state.as_slice() {

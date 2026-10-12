@@ -55,7 +55,9 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoLoopResultType"])) {
+        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoLoopResultType"]))
+            || syntax.kind() == Some(&parser_kind(&["Term", "nativeDoStateLoopResultType"]))
+        {
             return self
                 .do_loop_result_argument(function, name, syntax)
                 .map(Some);

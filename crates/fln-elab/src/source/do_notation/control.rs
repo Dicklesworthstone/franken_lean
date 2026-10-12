@@ -7,6 +7,9 @@ pub(super) struct LoopTargets {
     // Returning loops retain the outer checked join's result type. A return
     // inside a handler may have no normal path from which to infer this type.
     pub(super) return_type: Option<Syntax>,
+    // Only names of the current mutable values, in the checked carrier order.
+    // Return packets read these at the exit site, after all prior assignments.
+    pub(super) return_state: Vec<Syntax>,
 }
 impl LoopTargets {
     /// `expand_for_loop` supplies exactly `pure (ForInStep.yield accumulator)`.
@@ -36,6 +39,7 @@ impl LoopTargets {
         Ok(Self {
             accumulator: accumulator.clone(),
             return_type: None,
+            return_state: Vec::new(),
         })
     }
     fn value(&self, stop: bool) -> Syntax {
@@ -124,6 +128,7 @@ mod tests {
         LoopTargets {
             accumulator: ident(Name::num(Name::anonymous(), 99)),
             return_type: None,
+            return_state: Vec::new(),
         }
         .exit(false)
     }
