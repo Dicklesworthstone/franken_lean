@@ -18,10 +18,14 @@
 //! - In a loop body, a reassigning branch statement whose other branches jump is closed over the
 //!   statements after it: they, and then `continue`, end each branch that falls through, which is
 //!   what falling off the body's end means (`close_over_rest`). Every reassigning branch then jumps.
+//! - Outside a loop, a reassigning branch statement that returns in one branch and falls through
+//!   in another is closed over the statements after it the same way (without `continue`), when the
+//!   end of its sequence is the end of the block; the statement is then the last, with no join.
 //!
 //! Refused where the pin accepts, a refusal and never a different meaning:
 //! - a reassigning branch statement that contains `return` and has a reassigning branch that
-//!   falls through, or that is a `try`;
+//!   falls through, where it cannot be closed over the rest (in a loop body, in a branch whose
+//!   values a join reads, or when a branch binds a name the rest reads), or that is a `try`;
 //! - outside a loop body, one that also contains `break` or `continue` with a reassigning branch
 //!   that falls through (its join would also have to forward the exit). Inside one, the same when
 //!   a branch binds a name the statements after it read (`| some n => …` before `s := s + n` with
@@ -201,13 +205,23 @@ fn jumps_out_with(element: &Syntax, state: &[Name]) -> bool {
 /// another (`if c then s := s + 1 else break`, then statements that read `s`), with `rest`, the
 /// statements after it, and then `continue` appended to each branch that falls through. Falling
 /// off the end of the body is `continue`, so this is the same loop body, and now every branch that
-/// reassigns ends in a jump, which needs no join (`jumps_out_with`). `None` when the statement is
-/// not of that kind, or when a branch binds a name that `rest` reads: the copy in that branch would
-/// capture it.
+/// reassigns ends in a jump, which needs no join (`jumps_out_with`).
+///
+/// Outside a loop (`looped` false), the same for a statement that returns in one branch and falls
+/// through in another (`if c then i := i + 1; if i == n then return i`, then statements that read
+/// `i`), in a sequence whose end ends the block: `rest` alone ends each branch that falls through.
+/// `(if c then a else b); rest` is `if c then (a; rest) else (b; rest)`, so this is the same
+/// block, and the statement is now its last, which needs no join. The pin's join point forwards
+/// the return instead (`Lean/Elab/Do/Basic.lean`); the copies are this engine's, bounded by the
+/// elaboration budget.
+///
+/// `None` when the statement is not of that kind, or when a branch binds a name that `rest` reads:
+/// the copy in that branch would capture it.
 fn close_over_rest(
     element: &Syntax,
     muts: &[Name],
     rest: &[Syntax],
+    looped: bool,
 ) -> Result<Option<Syntax>, NatDefinitionElabError> {
     if !["doIf", "doMatch", "doUnless", "doNested"]
         .iter()
@@ -221,11 +235,22 @@ fn close_over_rest(
         .filter(|name| facts.reassigned.contains(name))
         .cloned()
         .collect();
-    if state.is_empty() || !facts.jumps || facts.returns || facts.handles {
+    if state.is_empty() || facts.handles {
         return Ok(None);
     }
-    if jumps_out_with(element, &state) {
+    let kind = if looped {
+        // A `return` leaves the loop as `break` does (`loop_returns`): it is a jump too.
+        facts.jumps || facts.returns
+    } else {
+        facts.returns && !facts.jumps && !rest.is_empty()
+    };
+    if !kind || jumps_out_with(element, &state) {
         return Ok(None);
+    }
+    // What ends a branch that falls through: `rest`, then, in a loop body, `continue`.
+    let mut tail = rest.to_vec();
+    if looped {
+        tail.push(term("doSeqItem", vec![continue_element(), null(vec![])]));
     }
     let mut read = Vec::new();
     for statement in rest {
@@ -236,26 +261,25 @@ fn close_over_rest(
     } else {
         element.clone()
     };
-    let close = |sequence: Syntax,
-                 bound: Vec<Name>|
-     -> Result<Option<Syntax>, NatDefinitionElabError> {
-        if last_element(&sequence).is_some_and(|last| is(last, "doBreak") || is(last, "doContinue"))
-        {
-            return Ok(Some(sequence));
-        }
-        let Some(mut bound) = sequence_binders(&sequence, bound) else {
-            return Ok(None);
+    let close =
+        |sequence: Syntax, bound: Vec<Name>| -> Result<Option<Syntax>, NatDefinitionElabError> {
+            if last_element(&sequence).is_some_and(|last| {
+                is(last, "doBreak") || is(last, "doContinue") || is(last, "doReturn")
+            }) {
+                return Ok(Some(sequence));
+            }
+            let Some(mut bound) = sequence_binders(&sequence, bound) else {
+                return Ok(None);
+            };
+            bound.retain(|name| !muts.contains(name));
+            if bound.iter().any(|name| read.contains(name)) {
+                return Ok(None);
+            }
+            let bracketed = is(&sequence, "doSeqBracketed");
+            let mut items = sequence_items(sequence)?;
+            items.extend(tail.iter().cloned());
+            Ok(Some(items_sequence(items, bracketed)))
         };
-        bound.retain(|name| !muts.contains(name));
-        if bound.iter().any(|name| read.contains(name)) {
-            return Ok(None);
-        }
-        let bracketed = is(&sequence, "doSeqBracketed");
-        let mut items = sequence_items(sequence)?;
-        items.extend(rest.iter().cloned());
-        items.push(term("doSeqItem", vec![continue_element(), null(vec![])]));
-        Ok(Some(items_sequence(items, bracketed)))
-    };
     if is(&element, "doNested") {
         let mut parts = node(element, "doNested", 2)?;
         let sequence = parts.pop().expect("nested sequence");
@@ -321,11 +345,7 @@ fn close_over_rest(
             vec![keyword, sequence]
         }
         // An absent `else` falls through to `rest`.
-        None => {
-            let mut items = rest.to_vec();
-            items.push(term("doSeqItem", vec![continue_element(), null(vec![])]));
-            vec![atom("else"), items_sequence(items, false)]
-        }
+        None => vec![atom("else"), items_sequence(tail.clone(), false)],
     };
     parts.push(null(otherwise));
     Ok(Some(term("doIf", parts)))
@@ -654,6 +674,9 @@ impl Context {
         let mut elements = Vec::with_capacity(count);
         // The body of a loop that carries state: falling off its end is `continue`.
         let loop_body = looped && continues && tail.is_none();
+        // Outside a loop, a sequence whose end is the end of its block: nothing after it reads
+        // this block's variables, and no join waits for their values.
+        let ends_block = !looped && !continues && tail.is_none();
         let mut statements = statements.into_iter();
         let mut index = 0;
         while let Some(statement) = statements.next() {
@@ -661,10 +684,18 @@ impl Context {
             let element = sequence_element(statement)?;
             let continues = index + 1 < count || tail.is_some() || continues;
             if loop_body
-                && let Some(closed) = close_over_rest(&element, &muts, statements.as_slice())?
+                && let Some(closed) = close_over_rest(&element, &muts, statements.as_slice(), true)?
             {
                 // The statements after it now end each branch that falls through.
                 self.mutable_element(closed, &mut muts, continues, looped, &mut elements)?;
+                break;
+            }
+            if ends_block
+                && let Some(closed) =
+                    close_over_rest(&element, &muts, statements.as_slice(), false)?
+            {
+                // The statements after it now end each branch that falls through; nothing follows.
+                self.mutable_element(closed, &mut muts, false, looped, &mut elements)?;
                 break;
             }
             self.mutable_element(element, &mut muts, continues, looped, &mut elements)?;
