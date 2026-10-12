@@ -751,30 +751,29 @@ fn mutable_do_variables_are_refused_not_dropped() {
 }
 
 /// Alternatives sharing a right-hand side (`| 0 | 1 => 0`) parse as the pin's `matchAlt` with two
-/// pattern groups. The checker reads one group per alternative, so it refuses the file, which the
-/// pin accepts; it never keeps the first group alone, which would let `sa1 1 = 1` through.
+/// pattern groups, which the pin's `expandMatchAlt` splits into one alternative per group. Every
+/// group reaches the shared right-hand side, so `sa1 1 = 1` stays refused: the first group alone
+/// would have let it through.
 #[test]
-fn shared_match_alternatives_are_refused_not_truncated() {
-    let (engine, limits) = engine();
+fn shared_match_alternatives_cover_every_group() {
     let sa1 = "def sa1 : Nat → Nat\n  | 0 | 1 => 0\n  | _ => 1\n";
-    for source in [
-        format!("{sa1}theorem sa1_one : sa1 1 = 0 := rfl\n"),
-        format!("{sa1}theorem sa1_wrong : sa1 1 = 1 := rfl\n"),
-        "def sa2 (o : Option Nat) : Nat :=\n  match o with | none | some 0 => 0 | some _ => 1\n"
-            .to_owned(),
-    ] {
-        assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
+    check(&format!(
+        "{sa1}theorem sa1_zero : sa1 0 = 0 := rfl\ntheorem sa1_one : sa1 1 = 0 := rfl\n\
+         theorem sa1_two : sa1 2 = 1 := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source = format!("{sa1}theorem sa1_wrong : sa1 1 = 1 := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
             ),
-            "{source}"
-        );
-    }
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
 }
 
 /// `h : P := by tac` is the pin's `binderTactic` (an `autoParam` field): an omitted field is filled
