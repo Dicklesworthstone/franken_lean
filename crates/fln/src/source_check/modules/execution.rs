@@ -406,14 +406,12 @@ impl imported::SourceOleanImport {
             let module = modules[index];
             // Empty forwarding modules still import a grammar world. Enforce
             // its phase boundary before bypassing the command stream.
-            if plan.headers[index].module_system {
-                grammar::SourceGrammar::for_environment(
-                    engine.environment(),
-                    Some(module.name),
-                    true,
-                )
-                .map_err(|error| source_error(module.name, error))?;
-            }
+            let grammar = grammar::SourceGrammar::for_engine(
+                &engine,
+                Some(module.name),
+                plan.headers[index].module_system,
+            )
+            .map_err(|error| source_error(module.name, error))?;
             let public_imports = if plan.headers[index].module_system {
                 match visibility::imports(
                     &self.contexts.complete,
@@ -436,7 +434,8 @@ impl imported::SourceOleanImport {
             let mut public = public_imports.map(|engine| {
                 visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
             });
-            let body = commands(module.name, module.source, &plan.headers[index])?;
+            let body =
+                grammar.enter(|| commands(module.name, module.source, &plan.headers[index]))?;
             let completed = if body.is_empty() {
                 let mut completed = engine.empty_source_command_execution(options);
                 completed.scope.private_module = plan.headers[index]

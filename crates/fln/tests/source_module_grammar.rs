@@ -78,6 +78,110 @@ fn session_checked(
 const BRACKETS: &str = "notation \"⟪\" x \"⟫\" => Nat.add x x\n";
 
 #[test]
+fn direct_engine_entry_points_preserve_imported_interpolation_grammar() {
+    let base = engine();
+    let imported = checked(
+        &base,
+        &[
+            ("Main", "import Lib"),
+            (
+                "Lib",
+                r#"macro "fixed!" _s:interpolatedStr(term) : term => `(42)"#,
+            ),
+        ],
+    )
+    .checked
+    .engine;
+    let options = KVMap::new();
+    let before = imported.logical_root(&options);
+    let execution_limits = EngineExecutionLimits::new(limits().source.admission.kernel);
+    let source = br#"def answer : Nat := fixed!"\{"
+#eval answer"#;
+    let commands = imported
+        .execute_source_commands_with_presentation(
+            source,
+            &options,
+            execution_limits,
+            fln::EvaluationPresentation::Raw,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(commands.batch.source_evaluation_indices.len(), 1);
+    assert_eq!(
+        fln::closed_vm_value(&commands.batch.executions.last().unwrap().exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+
+    let definitions = imported
+        .execute_source_definitions(
+            &[br#"def answer : Nat := fixed!"\{""#, b"#eval answer"],
+            &options,
+            execution_limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        fln::closed_vm_value(&definitions.executions.last().unwrap().exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+
+    for source in [
+        br#"#check fixed!"\{""#.as_slice(),
+        br#"def answer : Nat := fixed!"\{"
+#check answer"#,
+    ] {
+        let terminal = imported
+            .check_terminal_source_command(source, &options, execution_limits)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            terminal.check.checked_type,
+            fln::Expr::const_(name("Nat"), Vec::new())
+        );
+    }
+
+    for invalid in [br#"def bad := "\{""#.as_slice(), br#"def bad := "\q""#] {
+        assert!(
+            imported
+                .execute_source_commands_with_presentation(
+                    invalid,
+                    &options,
+                    execution_limits,
+                    fln::EvaluationPresentation::Raw,
+                )
+                .is_err()
+        );
+        assert!(
+            imported
+                .execute_source_definitions(&[invalid], &options, execution_limits)
+                .is_err()
+        );
+        let mut terminal = invalid.to_vec();
+        terminal.extend_from_slice(b"\n#check Nat");
+        assert!(
+            imported
+                .check_terminal_source_command(&terminal, &options, execution_limits)
+                .is_err()
+        );
+    }
+    assert_eq!(imported.logical_root(&options), before);
+    assert!(!imported.environment().contains(&name("answer")));
+    assert!(
+        base.execute_source_commands_with_presentation(
+            source,
+            &options,
+            execution_limits,
+            fln::EvaluationPresentation::Raw,
+        )
+        .is_err(),
+        "the macro must come from the checked source module"
+    );
+}
+
+#[test]
 fn syntax_only_libraries_export_notation_term_macros_and_tactic_macros() {
     let base = engine();
     let before = base.logical_root(&KVMap::new());

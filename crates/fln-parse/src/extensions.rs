@@ -63,9 +63,9 @@ use fln_core::name::{LeafView, Name};
 use fln_core::options::DataValue;
 use fln_syntax::literal::{LiteralKind, decode_string};
 use fln_syntax::run::{Event, LexRun, lex_run_from};
-use fln_syntax::source::{BytePos, ByteSpan, SourceText};
+use fln_syntax::source::{BytePos, ByteSpan, SourceInfo, SourceText};
 use fln_syntax::token::{LexedToken, TokenKind, TokenTable};
-use fln_syntax::tree::Syntax;
+use fln_syntax::tree::{Preresolved, Syntax};
 use fln_syntax::view::SourceView;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1124,6 +1124,9 @@ pub struct FileGrammar {
     generation: usize,
     /// What the file's notations expand to, by node kind.
     rules: Arc<BTreeMap<Name, Arc<NotationRule>>>,
+    /// Imported string interpolation whose native expansion is implemented below. The syntax
+    /// still comes from the census and is available only through its declaring module.
+    interpolation_kinds: Arc<BTreeSet<Name>>,
     /// Expansions made so far, shared with every grammar built from this file: each takes the
     /// next macro scope.
     expansions: Rc<Cell<u64>>,
@@ -1186,6 +1189,17 @@ impl FileGrammar {
             })
             .map(|(name, (ident_behavior, _))| (name.clone(), *ident_behavior))
             .collect();
+        let interpolation_kinds = imported
+            .iter()
+            .filter(|decl| {
+                decl.module == Name::from_components(["Init", "Data", "ToString", "Macro"])
+                    && decl.decl == Name::from_components(["termS!_"])
+            })
+            .filter_map(|decl| match &decl.descr {
+                Descr::Node { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .collect();
         Ok(FileGrammar {
             module,
             base_tokens: tokens.tokens_for(prelude, imports)?,
@@ -1206,6 +1220,7 @@ impl FileGrammar {
             declared_tokens: BTreeSet::new(),
             generation: 0,
             rules: Arc::new(BTreeMap::new()),
+            interpolation_kinds: Arc::new(interpolation_kinds),
             expansions: Rc::new(Cell::new(0)),
             imports_entered: true,
             scopes: vec![FileScope {
@@ -1219,14 +1234,33 @@ impl FileGrammar {
     }
 
     /// This state with only the file's own declarations entered, over the import closure's
-    /// token table: the imports' notations and syntax (scoped ones too) are not, so the parser
-    /// reads their uses as it does without a grammar. For a path whose elaborator expands the
-    /// file's notations but has no expansion for an imported one: entering Init's `«term{}»`
-    /// would make `{}` the pin's `choice`, which that elaborator cannot resolve.
+    /// token table, together with imported syntax having a native expansion. Other imported
+    /// notations and syntax (scoped ones too) remain absent. Entering Init's `«term{}»` without
+    /// its expansion would make `{}` the pin's `choice`, which this elaborator cannot resolve.
     pub fn own_syntax_only(mut self) -> FileGrammar {
         self.imports_entered = false;
         self.cache.borrow_mut().clear();
         self
+    }
+
+    /// Keep native expansions of artifact syntax only when their declaring module was
+    /// actually admitted. Production source paths may begin with the wider Init token table
+    /// for preflight parsing; those tokens alone do not authorize an imported macro.
+    /// Native source declarations and their recorded templates are unaffected.
+    pub fn retain_imported_expansions(&mut self, admitted: impl Fn(&Name) -> bool) {
+        self.interpolation_kinds = Arc::new(
+            self.imported
+                .iter()
+                .filter(|decl| admitted(&decl.module))
+                .filter_map(|decl| match &decl.descr {
+                    Descr::Node { kind, .. } if self.interpolation_kinds.contains(kind) => {
+                        Some(kind.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
+        self.cache.borrow_mut().clear();
     }
 
     fn top(&self) -> &FileScope {
@@ -1374,7 +1408,11 @@ impl FileGrammar {
         let mut decls = if self.imports_entered {
             self.imported.clone()
         } else {
-            Vec::new()
+            self.imported
+                .iter()
+                .filter(|decl| self.interpolation_kinds.contains(&decl.decl))
+                .cloned()
+                .collect()
         };
         decls.extend(self.native_imported.iter().cloned());
         let own =
@@ -1663,6 +1701,70 @@ impl FileGrammar {
         let [_, _, attr_kind, _, opt_kind, alternatives] = args else {
             return;
         };
+        // A source override changes an imported macro's meaning even when this expander
+        // cannot translate the new rule. Stop using its native expansion, including when
+        // the command contains several alternatives. Anonymous source batches do not export
+        // a grammar journal, so the export refusal below cannot protect their executions.
+        // An explicit kind also permits an identifier pattern, with no quotation root.
+        // Resolve it as `checkSyntaxNodeKindAtNamespaces`: the nearest registered syntax
+        // kind wins, without open aliases or special handling for `_root_`.
+        let explicit_kind = null_args(opt_kind).and_then(|args| match args {
+            [_, _, _, kind, _] => ident_name(kind),
+            _ => None,
+        });
+        let explicit_kind = explicit_kind.and_then(|name| {
+            let mut namespace = self.top().namespace.clone();
+            loop {
+                let candidate = namespace.append_core(&name);
+                let registered = self
+                    .imported
+                    .iter()
+                    .chain(&self.native_imported)
+                    .chain(&self.declared)
+                    .chain(self.scoped.values().flatten())
+                    .chain(self.native_scoped.values().flatten())
+                    .any(|decl| matches!(&decl.descr, Descr::Node { kind, .. } if *kind == candidate));
+                if registered {
+                    break Some(candidate);
+                }
+                if namespace.is_anonymous() {
+                    break None;
+                }
+                namespace = namespace.parent();
+            }
+        });
+        let mut overridden = explicit_kind
+            .as_ref()
+            .is_some_and(|kind| Arc::make_mut(&mut self.interpolation_kinds).remove(kind));
+        if let Some(alternatives) = node_args(alternatives)
+            .and_then(<[Syntax]>::first)
+            .and_then(null_args)
+        {
+            for alternative in alternatives {
+                let Some([_, groups, _, _]) = node_args(alternative) else {
+                    continue;
+                };
+                let Some(groups) = null_args(groups) else {
+                    continue;
+                };
+                for group in groups {
+                    let Some(patterns) = null_args(group) else {
+                        continue;
+                    };
+                    for pattern in patterns {
+                        if let Some((kind, ..)) = quotation_root(pattern) {
+                            overridden |=
+                                Arc::make_mut(&mut self.interpolation_kinds).remove(&kind);
+                        }
+                    }
+                }
+            }
+        }
+        if overridden {
+            self.generation += 1;
+            self.native_export_refusal =
+                Some("source module export of macro_rules for imported syntax");
+        }
         if attr_kind_of(attr_kind) != Ok(AttrKind::Global) {
             // The current single-rule expander has no independent scoped rule
             // stack. Do not export a local/scoped override as a global macro.
@@ -1738,6 +1840,7 @@ impl FileGrammar {
     fn expander(&self) -> Expander {
         Expander {
             rules: Arc::clone(&self.rules),
+            interpolation_kinds: Arc::clone(&self.interpolation_kinds),
             expansions: Rc::clone(&self.expansions),
             context: self.module.clone().unwrap_or_else(Name::anonymous),
         }
@@ -2207,6 +2310,7 @@ impl FileGrammar {
 #[derive(Debug, Clone)]
 pub struct Expander {
     rules: Arc<BTreeMap<Name, Arc<NotationRule>>>,
+    interpolation_kinds: Arc<BTreeSet<Name>>,
     expansions: Rc<Cell<u64>>,
     context: Name,
 }
@@ -2218,7 +2322,7 @@ impl Expander {
     /// declaration referred to rather than to a binder at the use. Notation inside an expansion
     /// is expanded too, to a bounded depth.
     pub fn expand(&self, syntax: &Syntax) -> Result<Syntax, &'static str> {
-        if self.rules.is_empty() {
+        if self.rules.is_empty() && self.interpolation_kinds.is_empty() {
             return Ok(syntax.clone());
         }
         self.expand_at(syntax, 0)
@@ -2249,6 +2353,10 @@ impl Expander {
                             let expansion = self.instantiate(&rule, &args)?;
                             self.expand_at(&expansion, depth + 1)?
                         }
+                        None if self.interpolation_kinds.contains(kind) => {
+                            let expansion = self.expand_interpolation(&args)?;
+                            self.expand_at(&expansion, depth + 1)?
+                        }
                         None => Syntax::Node {
                             info,
                             kind: kind.clone(),
@@ -2260,6 +2368,89 @@ impl Expander {
             }
         }
         built.pop().ok_or("an empty expansion")
+    }
+
+    /// Native `Init.Data.ToString.Macro` expansion, following
+    /// `Lean.TSyntax.expandInterpolatedStr{Chunks}` in `Init/Meta/Defs.lean`.
+    /// Literal chunks and holes both call the imported `ToString.toString`; `++` then uses
+    /// ordinary operator elaboration and instance synthesis. No value is rendered here.
+    fn expand_interpolation(&self, args: &[Syntax]) -> Result<Syntax, &'static str> {
+        let [
+            Syntax::Atom { val: head, .. },
+            Syntax::Node {
+                kind, args: chunks, ..
+            },
+        ] = args
+        else {
+            return Err("a string interpolation's syntax shape");
+        };
+        if head != "s!" || *kind != Name::from_components(["interpolatedStrKind"]) {
+            return Err("a string interpolation's syntax kind");
+        }
+        let scope = self
+            .expansions
+            .get()
+            .checked_add(1)
+            .ok_or("macro scope limit")?;
+        self.expansions.set(scope);
+        let global = |path: &[&str]| -> Result<Syntax, &'static str> {
+            let declaration = Name::from_components(path.iter().copied());
+            let absolute = Name::from_components(["_root_"]).append_core(&declaration);
+            Ok(Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::empty_at(BytePos(0)),
+                val: fln_syntax::hygiene::add_macro_scope(&self.context, &absolute, scope)
+                    .map_err(|_| "an interpolation name that cannot take a macro scope")?,
+                preresolved: vec![Preresolved::Decl {
+                    name: declaration,
+                    fields: Vec::new(),
+                }],
+            })
+        };
+        let convert = |value: Syntax| -> Result<Syntax, &'static str> {
+            Ok(Syntax::node(
+                crate::parser_kind(&["Term", "app"]),
+                vec![global(&["ToString", "toString"])?, null_node(vec![value])],
+            ))
+        };
+        let mut result = None;
+        for chunk in chunks {
+            let value = if chunk.kind() == Some(&Name::from_components(["interpolatedStrLitKind"]))
+            {
+                let literal = interpolation_literal(chunk)?;
+                if literal.0.is_empty() {
+                    continue;
+                }
+                literal.1
+            } else {
+                chunk.clone()
+            };
+            let value = convert(value)?;
+            result = Some(match result {
+                None => value,
+                Some(previous) => Syntax::node(
+                    Name::from_components(["term_++_"]),
+                    vec![previous, Syntax::atom(SourceInfo::None, "++"), value],
+                ),
+            });
+        }
+        let result = match result {
+            Some(result) => result,
+            None => convert(Syntax::node(
+                Name::from_components(["str"]),
+                vec![Syntax::atom(SourceInfo::None, "\"\"")],
+            ))?,
+        };
+        Ok(Syntax::node(
+            crate::parser_kind(&["Term", "typeAscription"]),
+            vec![
+                crate::hygienic_lparen(Syntax::atom(SourceInfo::None, "(")),
+                result,
+                Syntax::atom(SourceInfo::None, ":"),
+                null_node(vec![global(&["String"])?]),
+                Syntax::atom(SourceInfo::None, ")"),
+            ],
+        ))
     }
 
     /// One use of `rule`: its template with `args` (the node's children) in place of the
@@ -2339,6 +2530,54 @@ pub struct NotationRule {
 
 /// Expansions nest no deeper: a notation whose template reaches itself is refused.
 const MAX_EXPANSION_DEPTH: usize = 32;
+
+/// Convert one interpolation chunk (`"before{`, `}between{`, or `}after"`) to an
+/// ordinary string literal. `decodeInterpStrLit` additionally accepts `\{`; all other
+/// escapes and string gaps retain the ordinary literal decoder's semantics.
+fn interpolation_literal(chunk: &Syntax) -> Result<(String, Syntax), &'static str> {
+    let Syntax::Node { args, .. } = chunk else {
+        return Err("an interpolation literal node");
+    };
+    let [Syntax::Atom { info, val }] = args.as_slice() else {
+        return Err("an interpolation literal atom");
+    };
+    if !val.starts_with(['"', '}']) || !val.ends_with(['"', '{']) || val.len() < 2 {
+        return Err("an interpolation literal's delimiters");
+    }
+    let mut spelling = String::from("\"");
+    let mut chars = val[1..val.len() - 1].chars();
+    while let Some(c) = chars.next() {
+        if matches!(c, '{' | '"') {
+            return Err("an unescaped interpolation delimiter inside a literal chunk");
+        }
+        if c != '\\' {
+            spelling.push(c);
+            continue;
+        }
+        let escaped = chars.next().ok_or("an unfinished interpolation escape")?;
+        if escaped != '{' {
+            spelling.push('\\');
+        }
+        spelling.push(escaped);
+    }
+    spelling.push('"');
+    let value = decode_string(&spelling).ok_or("an invalid interpolation escape")?;
+    let info = match (info.pos(false), info.end_pos(false)) {
+        (Some(pos), Some(end_pos)) => SourceInfo::Synthetic {
+            pos,
+            end_pos,
+            canonical: false,
+        },
+        _ => SourceInfo::None,
+    };
+    Ok((
+        value,
+        Syntax::node(
+            Name::from_components(["str"]),
+            vec![Syntax::atom(info, spelling)],
+        ),
+    ))
+}
 
 /// `expandMixfix`'s operand names, hygienic in its quotation: they can meet no user name.
 fn mixfix_variable(base: &str) -> Name {
@@ -3115,7 +3354,11 @@ pub fn expand_active(syntax: &Syntax) -> Result<Option<Syntax>, &'static str> {
         return Ok(None);
     };
     match &grammar.expander {
-        Some(expander) if !expander.rules.is_empty() => expander.expand(syntax).map(Some),
+        Some(expander)
+            if !expander.rules.is_empty() || !expander.interpolation_kinds.is_empty() =>
+        {
+            expander.expand(syntax).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -3737,10 +3980,14 @@ impl Run<'_> {
             return None;
         }
         let literal = |index: usize| -> Option<Syntax> {
-            Some(Syntax::node(
+            let literal = Syntax::node(
                 Name::from_components(["interpolatedStrLitKind"]),
                 vec![self.leaves.leaf(index).ok()?],
-            ))
+            );
+            // If interpolation lexing failed, the original lexer can have left one ordinary
+            // string containing an unclosed hole. It is not a valid interpolation chunk.
+            interpolation_literal(&literal).ok()?;
+            Some(literal)
         };
         let mut items = vec![literal(at)?];
         let mut next = at;

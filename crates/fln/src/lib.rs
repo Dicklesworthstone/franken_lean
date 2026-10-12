@@ -7106,7 +7106,9 @@ impl Engine {
         limits: EngineExecutionLimits,
         presentation: EvaluationPresentation,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
-        let partitioned = fln_parse::partition_source_module(source)
+        let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
+        let partitioned = grammar
+            .enter(|| fln_parse::partition_source_module(source))
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         if !partitioned.imports.is_empty() {
@@ -7235,8 +7237,8 @@ impl Engine {
         scopes.current.private_module = private_module.cloned();
         // The syntax a file declares extends the grammar of its commands after it
         // (`source_check::grammar`). The stream was partitioned before any of it was declared.
-        let mut grammar = source_check::grammar::SourceGrammar::for_environment(
-            engine.environment(),
+        let mut grammar = source_check::grammar::SourceGrammar::for_engine(
+            &engine,
             source_module,
             private_module.is_some(),
         )?;
@@ -7286,8 +7288,8 @@ impl Engine {
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
                 scopes.current.private_module = private_module.cloned();
-                grammar = source_check::grammar::SourceGrammar::for_environment(
-                    engine.environment(),
+                grammar = source_check::grammar::SourceGrammar::for_engine(
+                    &engine,
                     source_module,
                     private_module.is_some(),
                 )?;
@@ -8031,7 +8033,9 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<TerminalSourceCheck>, EngineExecutionError> {
-        let mut commands = fln_parse::partition_definition_commands(source)
+        let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
+        let mut commands = grammar
+            .enter(|| fln_parse::partition_definition_commands(source))
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         let terminal_index =
@@ -8047,7 +8051,8 @@ impl Engine {
                 .ok_or(EngineExecutionError::UnexpectedPublication {
                     detail: "source command partition lost its terminal command",
                 })?;
-        let terminal = fln_parse::parse_source_command(terminal_source)
+        let terminal = grammar
+            .enter(|| fln_parse::parse_source_command(terminal_source))
             .map_err(|error| error.with_original_offset(terminal_offset))
             .map_err(DefinitionFrontendError::Parse)
             .map_err(|error| EngineExecutionError::BatchCommand {
@@ -8059,7 +8064,8 @@ impl Engine {
             return Err(EngineExecutionError::TerminalCheckRequired);
         }
         for (index, (original_offset, command_source)) in commands.iter().enumerate() {
-            let parsed = fln_parse::parse_source_command(command_source)
+            let parsed = grammar
+                .enter(|| fln_parse::parse_source_command(command_source))
                 .map_err(|error| error.with_original_offset(*original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -8087,8 +8093,14 @@ impl Engine {
         let query_engine = definition_prefix
             .as_ref()
             .map_or(self, |completed| &completed.engine);
-        let checked = query_engine
-            .check_source_command(terminal_source, options, limits.admission())
+        let checked = grammar
+            .enter(|| {
+                let terminal = terminal
+                    .expanded()
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(EngineExecutionError::Frontend)?;
+                query_engine.check_parsed_source_command(terminal, options, limits.admission(), 0)
+            })
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: terminal_index,
                 error: Box::new(error),
@@ -8532,16 +8544,17 @@ impl Engine {
                 requested: sources.len(),
             }
         })?;
+        let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
         for source in sources {
-            let partitioned = fln_parse::partition_source_module(source).map_err(|error| {
-                EngineExecutionError::BatchCommand {
+            let partitioned = grammar
+                .enter(|| fln_parse::partition_source_module(source))
+                .map_err(|error| EngineExecutionError::BatchCommand {
                     index: commands.len(),
                     error: Box::new(EngineExecutionError::Frontend(
                         DefinitionFrontendError::Parse(error),
                     )),
                     at: None,
-                }
-            })?;
+                })?;
             if !partitioned.imports.is_empty() {
                 return Err(EngineExecutionError::ImportsRequireResolver {
                     imports: partitioned.imports,

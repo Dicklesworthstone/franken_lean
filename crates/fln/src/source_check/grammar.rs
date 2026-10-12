@@ -34,11 +34,13 @@
 //! only where it is used). A `macro` this does not translate (a `do` block, a sequence of
 //! tactics, a splice) registers its syntax without a rule, `elab` is not read, and a second rule
 //! for one kind removes the first (the pin tries the newest first): in each case the uses reach
-//! the elaborator unexpanded and are refused there. Artifact imports' own syntax (Init's notations, as the grammar census lists them)
-//! is not entered: their expansions are not in the census, so their uses would reach the
-//! elaborator unexpanded too, and terms the hand grammar reads, such as `{}`, would become the
-//! pin's `choice` between a notation and a structure instance.
+//! the elaborator unexpanded and are refused there. Artifact syntax is entered only where its
+//! native expansion is implemented and its module has been admitted. The other census
+//! registrations remain absent: their expansions are not in the census, so their uses would
+//! reach the elaborator unexpanded, and terms the hand grammar reads, such as `{}`, would become
+//! the pin's `choice` between a notation and a structure instance.
 
+use crate::Engine;
 use crate::EngineExecutionError;
 use crate::Environment;
 use fln_core::name::Name;
@@ -139,6 +141,20 @@ impl SourceGrammar {
             return Err(Self::module_phase_refusal());
         }
         journal::load(environment, &mut grammar.file)?;
+        Ok(grammar)
+    }
+
+    /// The production grammar can expand artifact syntax only after admitting its module.
+    /// A similarly named constant in a source or seed environment is not an import.
+    pub(crate) fn for_engine(
+        engine: &Engine,
+        module: Option<&Name>,
+        module_system: bool,
+    ) -> Result<Self, EngineExecutionError> {
+        let mut grammar = Self::for_environment(engine.environment(), module, module_system)?;
+        grammar
+            .file
+            .retain_imported_expansions(|module| engine.imported_modules.contains(module));
         Ok(grammar)
     }
 

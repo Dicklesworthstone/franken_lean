@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod io_printing;
 #[path = "source_imported_execution/main_run.rs"]
 mod main_run;
+#[path = "source_imported_execution/string_interpolation.rs"]
+mod string_interpolation;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -140,12 +142,13 @@ fn without_import_report(text: &str) -> String {
 /// attribute selects another implementation (`Compiler/LCNF/ToDecl.lean`, `toDecl`).
 /// With `import Init` and `Left.lean` built by the pin, `opaque own : Nat := 5`,
 /// `opaque left : Nat := 20` and the value-less `opaque bare : Nat` evaluate to 5, 20
-/// and 0 there (measured 2026-10-11). The value runs here only for an opaque admitted
-/// from source, in its own file or a sibling source module. The same declaration
-/// read from an `.olean` is refused rather than run: an artifact's opaque may carry
-/// an `init` attribute the importer does not read, where the pin runs the initializer.
+/// and 0 there (measured 2026-10-11). Source opaques and fully admitted imported
+/// opaques run their stored values when complete initializer journals rule out
+/// initialization. This legacy artifact carries its complete empty journals in
+/// one file; initialized globals and incomplete module-system artifacts remain
+/// refused by the importer/runtime controls in `source_implemented_by`.
 #[test]
-fn a_source_opaque_runs_its_value_and_the_same_opaque_read_from_an_olean_is_refused() {
+fn source_and_fully_admitted_imported_opaques_execute_their_stored_values() {
     let Some(lib) = pinned_lib() else { return };
     let ws = Workspace::new("opaque-values");
     ws.write(
@@ -210,16 +213,16 @@ fn a_source_opaque_runs_its_value_and_the_same_opaque_read_from_an_olean_is_refu
         "Main.lean",
         "prelude\nimport Left\n#eval (3 : Nat)\n#eval left\n",
     );
-    let refused = artifact.run(&main, Some(&search), &[]);
-    let stderr = refused.refused("execution", 1);
-    // The import was admitted and the first evaluation compiled; only the
-    // artifact's opaque value is not taken as its implementation.
-    assert!(stderr.contains("command 1, byte"), "{refused:?}");
-    assert!(
-        stderr.contains("core Expr constant `left`")
-            && stderr.contains("is not in the runtime catalogs"),
-        "{refused:?}"
-    );
+    let ran = artifact.run(&main, Some(&search), &[]);
+    let text = ran.complete();
+    for (command, value) in [(0, 3), (1, 20)] {
+        assert!(
+            text.contains(&format!(
+                "\"command\":{command},\"event\":\"evaluation\",\"kind\":\"nat\",\"value\":{value},"
+            )),
+            "{text}"
+        );
+    }
 }
 
 #[test]

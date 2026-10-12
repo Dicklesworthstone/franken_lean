@@ -413,6 +413,256 @@ fn interpolated_strings_are_chunks_around_terms() {
 }
 
 #[test]
+fn imported_interpolation_expands_on_the_production_grammar_with_hygienic_class_calls() {
+    let grammar = FileGrammar::new(false, &[], Some(name("Test.Interpolation")))
+        .expect("Init")
+        .own_syntax_only();
+    let source = "def f (x : Nat) : String := s!\"a{x}b{x + 1}\"";
+    let parsed = with_grammar(&grammar.grammar(), || {
+        parse_source_command(source.as_bytes())?.expanded()
+    })
+    .expect("the imported interpolation parses and expands");
+    let found = kinds(parsed.syntax());
+    assert!(!found.contains(&name("termS!_")));
+    assert!(!found.contains(&name("interpolatedStrLitKind")));
+    assert_eq!(found.iter().filter(|k| **k == name("term_++_")).count(), 3);
+    let mut terms = vec![parsed.syntax()];
+    let mut conversions = 0;
+    let mut string_types = 0;
+    while let Some(term) = terms.pop() {
+        match term {
+            Syntax::Node { args, .. } => terms.extend(args),
+            Syntax::Ident {
+                val, preresolved, ..
+            } => {
+                for entry in preresolved {
+                    if let fln_syntax::tree::Preresolved::Decl {
+                        name: declaration,
+                        fields,
+                    } = entry
+                    {
+                        if *declaration == name("ToString.toString") {
+                            conversions += 1;
+                            assert_ne!(val, declaration, "the call carries a macro scope");
+                            assert_eq!(
+                                val.erase_macro_scopes(),
+                                name("_root_.ToString.toString"),
+                                "the declaration is fixed even inside a shadowing namespace"
+                            );
+                            assert!(fields.is_empty());
+                        }
+                        if *declaration == name("String") {
+                            string_types += 1;
+                            assert_ne!(val, declaration);
+                            assert_eq!(val.erase_macro_scopes(), name("_root_.String"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(conversions, 4, "literals and holes both use ToString");
+    assert_eq!(
+        string_types, 1,
+        "the expansion has the pin's String ascription"
+    );
+}
+
+#[test]
+fn interpolation_empty_chunks_escapes_and_nested_holes_keep_the_pins_expansion() {
+    let grammar = FileGrammar::new(false, &[], Some(name("Test.Interpolation")))
+        .expect("Init")
+        .own_syntax_only();
+    for (source, literals, appends) in [
+        (r#"def f := s!"""#, vec![""], 0),
+        (r#"def f (x : Nat) := s!"{x}""#, vec![], 0),
+        (
+            r#"def f (x : Nat) := s!"\{\\{x}\u2665""#,
+            vec!["{\\", "♥"],
+            2,
+        ),
+        (
+            r#"def f (x : Nat) := s!"a{s!"b{x}"}c""#,
+            vec!["a", "b", "c"],
+            3,
+        ),
+    ] {
+        let parsed = with_grammar(&grammar.grammar(), || {
+            parse_source_command(source.as_bytes())?.expanded()
+        })
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let found = kinds(parsed.syntax());
+        assert!(!found.contains(&name("termS!_")), "{source}");
+        assert_eq!(
+            found.iter().filter(|k| **k == name("term_++_")).count(),
+            appends,
+            "{source}"
+        );
+        let mut terms = vec![parsed.syntax()];
+        let mut found_literals = Vec::new();
+        while let Some(term) = terms.pop() {
+            if let Syntax::Node { kind, args, .. } = term {
+                if *kind == name("str") {
+                    let [Syntax::Atom { val, .. }] = args.as_slice() else {
+                        panic!("a string literal")
+                    };
+                    found_literals.push(fln_syntax::literal::decode_string(val).unwrap());
+                } else {
+                    terms.extend(args.iter().rev());
+                }
+            }
+        }
+        assert_eq!(found_literals, literals, "{source}");
+    }
+}
+
+#[test]
+fn interpolation_command_partition_uses_the_active_grammar_and_keeps_plain_escape_refusals() {
+    let grammar = FileGrammar::new(false, &[], Some(name("Test.Interpolation")))
+        .expect("Init")
+        .own_syntax_only();
+    let source = r#"def before := 1
+#eval s!"\{\\{(7 : Nat)}\u2665"
+#eval s!"outer {s!"inner {true}"}"
+def after := 2
+"#;
+    assert!(command_scope::partition(source.as_bytes()).is_err());
+    with_grammar(&grammar.grammar(), || {
+        let commands = command_scope::partition(source.as_bytes())
+            .expect("the active interpolation grammar also owns command boundaries");
+        assert_eq!(commands.len(), 4);
+        for (at, command) in commands {
+            assert_eq!(command, &source.as_bytes()[at.0..at.0 + command.len()]);
+            parse_source_command(command)
+                .and_then(|parsed| parsed.expanded())
+                .expect("each preserved command parses and expands");
+        }
+        for invalid in [r#"def bad := "\{""#, r#"def bad := "\q""#] {
+            let mixed = format!("{source}{invalid}\n");
+            assert!(command_scope::partition(mixed.as_bytes()).is_err());
+        }
+    });
+}
+
+#[test]
+fn interpolation_requires_its_import_and_refuses_malformed_holes_or_escapes() {
+    let absent = FileGrammar::new(
+        true,
+        &[name("Init.Prelude")],
+        Some(name("Test.Interpolation")),
+    )
+    .expect("Prelude")
+    .own_syntax_only();
+    assert!(!absent.grammar().table().contains("s!"));
+    // Without its declaration `s!` is an identifier, not this macro. Name resolution will
+    // refuse the unknown function; parsing alone does not establish an accepted program.
+    if let Ok(parsed) = with_grammar(&absent.grammar(), || {
+        parse_source_command(br#"def f := s!"value""#)?.expanded()
+    }) {
+        assert!(!kinds(parsed.syntax()).contains(&name("termS!_")));
+        assert!(!kinds(parsed.syntax()).contains(&name("interpolatedStrKind")));
+    }
+    let present = FileGrammar::new(
+        true,
+        &[name("Init.Data.ToString.Macro")],
+        Some(name("Test.Interpolation")),
+    )
+    .expect("the macro module")
+    .own_syntax_only();
+    assert!(
+        with_grammar(&present.grammar(), || {
+            parse_source_command(br#"def f := s!"value""#)?.expanded()
+        })
+        .is_ok()
+    );
+    for source in [
+        r#"def f := s!"{}""#,
+        r#"def f := s!"{1""#,
+        r#"def f := s!"\q""#,
+    ] {
+        assert!(
+            with_grammar(&present.grammar(), || {
+                parse_source_command(source.as_bytes())?.expanded()
+            })
+            .is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_interpolation_overrides_never_fall_back_to_the_native_macro() {
+    for command in [
+        r#"macro_rules | `(s!"value") => `("replacement")"#,
+        r#"macro_rules | `(s!"value") => `("first") | `(s!"other") => `("second")"#,
+        r#"macro_rules (kind := «termS!_») | _stx => `("replacement")"#,
+    ] {
+        let mut grammar = FileGrammar::new(false, &[], Some(name("Test.Interpolation")))
+            .expect("Init")
+            .own_syntax_only();
+        let usage = with_grammar(&grammar.grammar(), || {
+            parse_source_command(br#"def f := s!"value""#)
+        })
+        .expect("the original interpolation is available");
+        let declaration = with_grammar(&grammar.grammar(), || {
+            parse_source_command(command.as_bytes())
+        })
+        .unwrap_or_else(|error| panic!("{command}: {error:?}"));
+        grammar.declare(declaration.syntax()).unwrap();
+        assert!(
+            grammar.export_native().is_err(),
+            "an imported override cannot be discarded when exporting: {command}"
+        );
+        let unexpanded = grammar.expand(usage.syntax()).unwrap();
+        assert!(
+            kinds(&unexpanded).contains(&name("termS!_")),
+            "an unsupported override was silently ignored: {command}"
+        );
+        // Rebuilding the cached grammar must carry the same disabled expansion.
+        if let Ok(parsed) = with_grammar(&grammar.grammar(), || {
+            parse_source_command(br#"def f := s!"value""#)?.expanded()
+        }) {
+            assert!(kinds(parsed.syntax()).contains(&name("termS!_")));
+        }
+    }
+}
+
+#[test]
+fn explicit_macro_kinds_resolve_the_nearest_registered_syntax_namespace() {
+    for (commands, interpolation_kept) in [
+        (vec!["namespace Review"], false),
+        (
+            vec![
+                "namespace Review",
+                r#"syntax (name := «termS!_») "ownLiteral" : term"#,
+            ],
+            true,
+        ),
+    ] {
+        let mut grammar = grammar_after(&[], &commands).own_syntax_only();
+        let usage = with_grammar(&grammar.grammar(), || {
+            parse_source_command(br#"def f := s!"value""#)
+        })
+        .expect("the imported interpolation is available");
+        let declaration = with_grammar(&grammar.grammar(), || {
+            parse_source_command(
+                r#"macro_rules (kind := «termS!_») | _stx => `("replacement")"#.as_bytes(),
+            )
+        })
+        .expect("an explicit syntax kind with an identifier pattern");
+        grammar.declare(declaration.syntax()).unwrap();
+        assert_eq!(grammar.export_native().is_ok(), interpolation_kept);
+        let expanded = grammar.expand(usage.syntax()).unwrap();
+        assert_eq!(
+            kinds(&expanded).contains(&name("termS!_")),
+            !interpolation_kept,
+            "the explicit kind must resolve before invalidating the imported macro"
+        );
+    }
+}
+
+#[test]
 fn empty_and_abbreviated_braces_are_the_pins_choice_with_init_notation() {
     let grammar = grammar_after(&["Init"], &[]);
     let parse = |source: &str| {

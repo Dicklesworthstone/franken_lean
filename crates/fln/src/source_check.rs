@@ -451,8 +451,8 @@ impl Engine {
             let mut scopes = scopes::Scopes::new(engine.environment(), engine.mode());
             scopes.current.private_module = private_module.cloned();
             // The syntax this file declares extends the grammar of what follows it.
-            let mut grammar = grammar::SourceGrammar::for_environment(
-                engine.environment(),
+            let mut grammar = grammar::SourceGrammar::for_engine(
+                &engine,
                 source_module,
                 private_module.is_some(),
             )
