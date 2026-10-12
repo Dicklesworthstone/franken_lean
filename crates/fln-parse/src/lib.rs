@@ -997,8 +997,8 @@ fn elaborator_operator(symbol: &str) -> Option<(&'static str, usize)> {
 }
 
 /// One `binop%`-family term from its keyword at `index`: the identifier, then each argument as
-/// one argument-level term (a token, a bracketed group, or inside a quotation an
-/// antiquotation). Returns the node and the token after it. Out of line, as
+/// one argument-level term (a token, a bracketed group, a nested operator, or inside a
+/// quotation an antiquotation). Returns the node and the token after it. Out of line, as
 /// [`source_declaration`] is.
 #[inline(never)]
 fn elaborator_term(
@@ -1033,9 +1033,41 @@ fn elaborator_term(
     Ok((Syntax::node(parser_kind(&["Term", kind]), args), at))
 }
 
-/// Where the argument-level term at `at` ends: after its bracketed group, after an
-/// antiquotation inside a quotation, otherwise after the token.
+/// Where an argument at the pin's `maxPrec` ends. A leading operator form consumes
+/// its identifier and operands even without parentheses. Count its pending operands
+/// iteratively: boundary scanning must not add host-stack recursion before
+/// [`nested_term`] applies the existing nesting bound to subtree construction.
 fn argument_end(tokens: &[LexedToken], at: usize, end: usize) -> Option<usize> {
+    let mut cursor = at;
+    let mut pending = 1_usize;
+    while pending != 0 {
+        if cursor >= end {
+            return None;
+        }
+        if let Some(TokenKind::Symbol(symbol)) = tokens.get(cursor).map(|token| &token.kind)
+            && let Some((_, arity)) = elaborator_operator(symbol)
+        {
+            if cursor + 1 >= end
+                || !matches!(
+                    tokens.get(cursor + 1).map(|token| &token.kind),
+                    Some(TokenKind::Ident(_))
+                )
+            {
+                return None;
+            }
+            pending = pending.checked_sub(1)?.checked_add(arity)?;
+            cursor += 2;
+        } else {
+            cursor = argument_atom_end(tokens, cursor, end)?;
+            pending -= 1;
+        }
+    }
+    (cursor <= end).then_some(cursor)
+}
+
+/// The end of a non-operator argument: its bracketed group, an antiquotation
+/// inside a quotation, or a single token.
+fn argument_atom_end(tokens: &[LexedToken], at: usize, end: usize) -> Option<usize> {
     let symbol = |index: usize| match tokens.get(index).map(|t| &t.kind) {
         Some(TokenKind::Symbol(symbol)) => Some(symbol.as_str()),
         _ => None,

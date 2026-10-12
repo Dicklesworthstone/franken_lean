@@ -2286,11 +2286,15 @@ impl Context {
                                     ));
                                     continue;
                                 }
-                                // The pin's `binop%`/`binrel%`/`unop%`/`rightact%`
-                                // expression trees. A notation whose function is
-                                // absent keeps the seed bridge below.
-                                if let Some(notation) = operators::pin_notation(kind)
-                                    && self.pin_notation_available(notation)?
+                                // Explicit operator elaborators resolve the authored
+                                // identifier, including local functions. Builtin notation
+                                // whose function is absent keeps the seed bridge below.
+                                let notation = operators::pin_notation(kind);
+                                if operators::explicit_operator(kind).is_some()
+                                    || match notation {
+                                        Some(notation) => self.pin_notation_available(notation)?,
+                                        None => false,
+                                    }
                                 {
                                     let tree = self.operator_tree(syntax, notation)?;
                                     let leaves = tree.leaves.clone();

@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, Environment, KVMap, Name,
-    NatDefinitionFrontendError, OleanCheckLimits, OleanModuleInput, Outcome, SourceCheckError,
-    SourceCheckLimits, SourceFileCheck,
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits,
+    Environment, FlbcExecutionLimits, KVMap, Name, NatDefinitionFrontendError, OleanCheckLimits,
+    OleanModuleInput, Outcome, SourceCheckError, SourceCheckLimits, SourceFileCheck, VmExit,
+    execute_flbc_artifact,
 };
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 use fln_core::level::{Level, LevelView};
@@ -568,6 +569,216 @@ fn operator_trees_elaborate_to_the_pins_terms() {
             FIXTURES.len(),
             mismatches.join("\n")
         );
+    });
+}
+
+/// Generated Unit binders have fresh display names. Compare every expression
+/// node, binder mode and de Bruijn index while ignoring only binder names;
+/// unlike definitional equality, this does not normalize away a wrong expansion.
+fn same_operator_term(left: &Expr, right: &Expr) -> bool {
+    let mut pending = vec![(left, right)];
+    while let Some((left, right)) = pending.pop() {
+        match (left.node(), right.node()) {
+            (ExprNode::App { f: lf, a: la }, ExprNode::App { f: rf, a: ra }) => {
+                pending.push((lf, rf));
+                pending.push((la, ra));
+            }
+            (
+                ExprNode::Lam {
+                    binder_type: lt,
+                    body: lb,
+                    binder_info: li,
+                    ..
+                },
+                ExprNode::Lam {
+                    binder_type: rt,
+                    body: rb,
+                    binder_info: ri,
+                    ..
+                },
+            )
+            | (
+                ExprNode::ForallE {
+                    binder_type: lt,
+                    body: lb,
+                    binder_info: li,
+                    ..
+                },
+                ExprNode::ForallE {
+                    binder_type: rt,
+                    body: rb,
+                    binder_info: ri,
+                    ..
+                },
+            ) if li == ri => {
+                pending.push((lt, rt));
+                pending.push((lb, rb));
+            }
+            _ if left == right => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[test]
+fn explicit_operators_resolve_local_functions_and_preserve_action_and_thunk_types() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    // The pin accepts each pair and gives the same elaborated value. Keeping
+    // the expansion beside its source exercises the ordinary elaboration and
+    // both checkers, including capture under the generated Unit lambda.
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "(op : Nat -> Nat -> Nat) (a b : Nat) : Nat",
+            "binop% op a b",
+            "op a b",
+        ),
+        ("(op : Nat -> Nat) (a : Nat) : Nat", "unop% op a", "op a"),
+        (
+            "(op : Nat -> Nat -> Prop) (a b : Nat) : Prop",
+            "binrel% op a b",
+            "op a b",
+        ),
+        (
+            "(op : Nat -> Nat -> Bool) (a b : Nat) : Bool",
+            "binrel_no_prop% op a b",
+            "op a b",
+        ),
+        (
+            "(op : Nat -> Bool -> Bool) (n : Nat) (b : Bool) : Bool",
+            "leftact% op n b",
+            "op n b",
+        ),
+        (
+            "(op : Bool -> Nat -> Bool) (b : Bool) (n : Nat) : Bool",
+            "rightact% op b n",
+            "op b n",
+        ),
+        (
+            "(op : Nat -> (Unit -> Nat) -> Nat) (a b : Nat) : Nat",
+            "binop_lazy% op a (Nat.add a b)",
+            "op a (fun _ : Unit => Nat.add a b)",
+        ),
+        (
+            "(op : Nat -> (Unit -> (Nat -> Nat)) -> (Nat -> Nat)) (a : Nat) : Nat -> Nat",
+            "binop_lazy% op a (fun b : Nat => Nat.add a b)",
+            "op a (fun _ : Unit => fun b : Nat => Nat.add a b)",
+        ),
+        (
+            "(n : Nat) : Nat",
+            "binop% HAdd.hAdd (unop% Nat.succ n) 1",
+            "(Nat.succ n) + 1",
+        ),
+        (
+            "(n : Nat) : Nat",
+            "binop% Nat.add unop% Nat.succ n 2",
+            "Nat.add (Nat.succ n) 2",
+        ),
+    ];
+    on_a_big_stack(move || {
+        let base = import_modules(
+            &lib,
+            &["Init.Prelude", "Init.Coe", "Init.Notation"],
+            "Init.Notation",
+        );
+        let mut source = String::new();
+        for (index, (signature, raw, expanded)) in CASES.iter().enumerate() {
+            source.push_str(&format!(
+                "def raw{index} {signature} := {raw}\ndef expanded{index} {signature} := {expanded}\n"
+            ));
+        }
+        let checked = match check(&base, &source) {
+            Ok(Outcome::Complete(checked)) => checked,
+            other => panic!("explicit operator fixtures must elaborate: {other:?}"),
+        };
+        for index in 0..CASES.len() {
+            let definition = |prefix: &str| {
+                let text = format!("{prefix}{index}");
+                let name = Name::from_components([text.as_str()]);
+                let Some(ConstantInfo::Defn(info)) = checked.engine.environment().find(&name)
+                else {
+                    panic!("missing {name:?}");
+                };
+                info
+            };
+            let actual = definition("raw");
+            let expanded = definition("expanded");
+            assert_eq!(actual.base.type_, expanded.base.type_, "case {index} type");
+            assert!(
+                same_operator_term(&actual.value, &expanded.value),
+                "case {index} term"
+            );
+        }
+        let setup =
+            "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n
+            def skip (a : Nat) (_ : Unit -> Nat) : Nat := a
+            def force (_ : Nat) (k : Unit -> Nat) : Nat := k ()
+            def capture (n : Nat) : Nat := binop_lazy% force 0 (Nat.add n 2)";
+        let runtime = match check(&base, setup) {
+            Ok(Outcome::Complete(checked)) => checked.engine,
+            other => panic!("lazy runtime fixtures must elaborate: {other:?}"),
+        };
+        let runtime_root = runtime.logical_root(&KVMap::new());
+        let mut execution = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        execution.vm.max_steps = 2_000;
+        for body in ["binop_lazy% skip 42 (expensive 10000)", "capture 40"] {
+            let source = format!("def result : Nat := {body}");
+            let result = runtime
+                .execute_source_definition(source.as_bytes(), &KVMap::new(), execution)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                .into_complete()
+                .expect("skipped work and the captured thunk return within the VM budget");
+            let replay = execute_flbc_artifact(
+                &result.flbc_artifact,
+                &KVMap::new(),
+                FlbcExecutionLimits {
+                    vm: execution.vm,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_complete()
+            .expect("the canonical artifact replays within the same VM budget");
+            for exit in [&result.exit, &replay] {
+                let VmExit::Returned(value) = exit else {
+                    panic!("{source} did not return: {exit:?}");
+                };
+                assert_eq!(
+                    fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+                    Some("42")
+                );
+            }
+        }
+        // Force precisely the same expensive operand under the same budget:
+        // only the lazily emitted Unit closure permits the skipped case above.
+        assert!(matches!(
+            runtime.execute_source_definition(
+                b"def forced : Nat := binop_lazy% force 42 (expensive 10000)",
+                &KVMap::new(),
+                execution,
+            ),
+            Ok(Outcome::Inconclusive(_))
+        ));
+        assert_eq!(runtime.logical_root(&KVMap::new()), runtime_root);
+        let root = base.logical_root(&KVMap::new());
+        for invalid in [
+            "def bad : Nat := binop% missingOperator 1 2",
+            "def bad : Nat := binop% Nat.add true 2",
+            "def bad : Nat := binop_lazy% Nat.add 1 2",
+            "def bad (op : Nat -> Bool -> Bool) : Bool := leftact% op true false",
+            "def bad (op : Bool -> Nat -> Bool) : Bool := rightact% op false true",
+            "def bad : Nat := binop% Nat.add 1",
+        ] {
+            assert!(check(&base, invalid).is_err(), "accepted {invalid}");
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+        }
+        assert!(matches!(
+            check(&base, "def recovered : Nat := binop% Nat.add 20 22"),
+            Ok(Outcome::Complete(_))
+        ));
     });
 }
 
