@@ -414,6 +414,39 @@ impl Scopes {
         Ok(())
     }
 
+    /// `attribute [local instance] x …`: each declaration, resolved in this scope, selected as a
+    /// local instance until the scope ends, in the public world too, as [`Self::admitted_batch`]
+    /// selects a `local instance` declaration.
+    pub fn local_instance_attribute(
+        &mut self,
+        env: &Environment,
+        public_env: Option<&Environment>,
+        requested: &[Name],
+        priority: u32,
+    ) -> Result<(), String> {
+        let mut instances = self.current.instance_scopes.clone();
+        let mut public_instances = self.public_instances.clone();
+        for requested in requested {
+            let name = self
+                .current
+                .resolve(requested, |name| env.contains(name))
+                .map_err(|error| error.to_string())?
+                // The pin's words for a name nothing resolves (`realizeGlobalConstNoOverload`).
+                .ok_or_else(|| format!("Unknown constant `{}`", requested.to_display_string()))?;
+            instances
+                .register_local(env, &name, priority)
+                .map_err(|error| format!("{error:?}"))?;
+            if let Some(public_env) = public_env {
+                public_instances
+                    .register_local(public_env, &name, priority)
+                    .map_err(|error| format!("{error:?}"))?;
+            }
+        }
+        self.current.instance_scopes = instances;
+        self.public_instances = public_instances;
+        Ok(())
+    }
+
     pub fn admitted(&mut self, declaration: &Declaration) {
         match declaration {
             Declaration::Axiom(v) => self.observe(&v.base.name),

@@ -352,6 +352,27 @@ pub(crate) fn apply_module_control_command(
         engine.environment = environment;
         return Ok(Outcome::Complete(()));
     }
+    // `attribute [local instance] x`: selected until the enclosing scope ends, as a `local
+    // instance` declaration is; nothing is written to the persistent registration journal.
+    if let ScopeCommand::Instance(attribute) = &control
+        && attribute.local
+    {
+        let (file, command, offset) = position;
+        scopes
+            .local_instance_attribute(
+                engine.environment(),
+                public.as_ref().map(|world| world.engine().environment()),
+                &attribute.declarations,
+                attribute.priority,
+            )
+            .map_err(|message| SourceCheckError::Scope {
+                file,
+                command,
+                offset,
+                message,
+            })?;
+        return Ok(Outcome::Complete(()));
+    }
     if !matches!(
         control,
         ScopeCommand::Variable(_)
