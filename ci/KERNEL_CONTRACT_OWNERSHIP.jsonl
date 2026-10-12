@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":612,"projection_hash":"f56f51b70905be905a140135fe42c28a8533456af537303f63379ff85d5e05a5"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":621,"projection_hash":"c805574d73b9c244cbbb235ac81d8d8a5aa425c53e5fc19194841cf4fdda4f99"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -110,6 +110,7 @@
 {"id":"fln-d7pr"}
 {"id":"fln-db39"}
 {"id":"fln-dcv"}
+{"id":"fln-decision-check-stack-lq8u"}
 {"id":"fln-derived-declaration-frontier-cj7s"}
 {"id":"fln-dyfz"}
 {"id":"fln-e44s"}
@@ -222,8 +223,11 @@
 {"id":"fln-module-header-tric"}
 {"id":"fln-msou"}
 {"id":"fln-n1ao"}
+{"id":"fln-named-monad-argument-match-6egz"}
 {"id":"fln-narm"}
+{"id":"fln-nested-actions-e60c"}
 {"id":"fln-nhf5"}
+{"id":"fln-nomatch-nofun-h78u"}
 {"id":"fln-notation-from-imports-0edr"}
 {"id":"fln-nu8r"}
 {"id":"fln-o0j"}
@@ -232,6 +236,7 @@
 {"id":"fln-odva"}
 {"id":"fln-okfb"}
 {"id":"fln-olean-doc-self-contradiction-myri"}
+{"id":"fln-open-explicit-in-f9lk"}
 {"id":"fln-ordinary-lean-probe-g03u"}
 {"id":"fln-otk7"}
 {"id":"fln-parity-freshness-denylist-direction-dy22"}
@@ -258,6 +263,7 @@
 {"id":"fln-reality-check-1007-kzz9"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-registry-batch-preflight-sszd"}
+{"id":"fln-rfl-for-step-limit-63a9"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}
 {"id":"fln-rwz"}
@@ -266,12 +272,14 @@
 {"id":"fln-s97y"}
 {"id":"fln-selftest-symlink-blocks-bundle-4yhd"}
 {"id":"fln-set-option-t69b"}
+{"id":"fln-simp-closer-reducible-i2ja"}
 {"id":"fln-simp-default-set-a4nb"}
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
 {"id":"fln-sr2z"}
 {"id":"fln-staged-closure-partial-application-ug55"}
 {"id":"fln-stc1"}
+{"id":"fln-string-char-patterns-up6e"}
 {"id":"fln-structural-fixed-prefix-bcvq"}
 {"id":"fln-sv7x"}
 {"id":"fln-t705"}
@@ -279,6 +287,7 @@
 {"id":"fln-term-plane-population-differential-wv4u"}
 {"id":"fln-tio5"}
 {"id":"fln-tlbo"}
+{"id":"fln-two-column-literal-matrix-78og"}
 {"id":"fln-ubs-stage-no-complete-verdict-z5kt"}
 {"id":"fln-ubs-timeout-promoted-to-rejection-pekl"}
 {"id":"fln-uc44"}
