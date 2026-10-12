@@ -80,7 +80,7 @@ def index_entry(path, cwd):
 def main():
     assert MANIFEST["version"] == 1
     files = MANIFEST["files"]
-    assert len(files) == 13
+    assert len(files) == 16
     paths = [item["path"] for item in files]
     assert len(set(paths)) == len(paths)
     for path in paths:
@@ -142,7 +142,7 @@ def main():
     for label, test_filter, count in [
         ("array-fold-model", "runtime::array_fold::tests", 8),
         ("array-iteration-model", "runtime::array_iteration::tests", 6),
-        ("global-callable-runtime", "runtime::global::", 55),
+        ("global-callable-runtime", "runtime::global::", 58),
         ("well-founded-runtime", "runtime::well_founded::tests", 9),
     ]:
         unit_output = run(
@@ -195,7 +195,7 @@ def main():
         "version": 1, "validatedBase": base,
         "candidateTree": MANIFEST["candidateTree"],
         "gates": {"pinnedOracles": "70 passed", "arrayFoldModel": "8 passed",
-                  "arrayIterationModel": "6 passed", "globalRuntime": "55 passed",
+                  "arrayIterationModel": "6 passed", "globalRuntime": "58 passed",
                   "wellFoundedRuntime": "9 passed", "source_imported_arrays": "4 passed",
                   "strictClippy": "passed"},
         "files": [],

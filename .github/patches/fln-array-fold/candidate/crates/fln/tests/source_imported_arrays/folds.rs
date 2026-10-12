@@ -7,18 +7,20 @@ use fln::{
 
 const ROLLBACK_PREFIX: &str = r#"
 def foldPrepared (xs : Array Nat) : Id Nat :=
-  Array.foldlM (m := Id) (fun acc x => Pure.pure (acc * 10 + x)) 4 xs
+  Array.foldlM (m := Id)
+    (fun (acc : Nat) (x : Nat) => Pure.pure (acc * 10 + x)) (4 : Nat) xs
 "#;
 
 const INVALID_CALLBACK: &str = r#"
 def foldIllTyped (xs : Array Nat) : Id Nat :=
   Array.foldlM (m := Id)
-    (fun (_acc : Nat) (_x : Nat) => Pure.pure Bool.true) 0 xs
+    (fun (_acc : Nat) (_x : Nat) => Pure.pure Bool.true) (0 : Nat) xs
 "#;
 
 const BUDGET_DEFINITION: &str = r#"
 def foldBudget (xs : Array Nat) : Id Nat :=
-  Array.foldlM (m := Id) (fun acc x => Pure.pure (acc * 10 + x)) 0 xs
+  Array.foldlM (m := Id)
+    (fun (acc : Nat) (x : Nat) => Pure.pure (acc * 10 + x)) (0 : Nat) xs
 "#;
 
 pub(super) fn exact_model(engine: &Engine) {

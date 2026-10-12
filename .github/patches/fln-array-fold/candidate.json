@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "base": "b05b3ddc946c92f195be07ff90fe108d4f23a20d",
-  "candidateTree": "898641beb8b8d04e3aa191fc46c613779cf89e0c",
+  "base": "82b12f2450cb24a261b11ca90516758f9395353b",
+  "candidateTree": "dc2b0ae62e70ba53aa3fa1124045f2c13994713f",
   "files": [
     {
       "path": "crates/fln/src/runtime.rs",
@@ -23,6 +23,27 @@
       "baselineMode": null,
       "blobSha": "84f78b5f4c22fe59aa53dfedf9349b23c8ad3c9a",
       "bytes": 24373
+    },
+    {
+      "path": "crates/fln/src/runtime/global/partial/callbacks.rs",
+      "baselineSha": "744edc108d88fcc52da66a924182f52539f4ed17",
+      "baselineMode": "100644",
+      "blobSha": "c6944f7ce2a80ae90b1a93a05a28b6756681c9a6",
+      "bytes": 20355
+    },
+    {
+      "path": "crates/fln/src/runtime/global/partial/tests.rs",
+      "baselineSha": "079e670d4ce12e75ad57877581a6460bfbab5f3f",
+      "baselineMode": "100644",
+      "blobSha": "d97b17e931b97efecfdb963eaee5c3459e57172f",
+      "bytes": 13954
+    },
+    {
+      "path": "crates/fln/src/runtime/global/partial/tests/matcher_callbacks.rs",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "340da43b16caecf97497be901d89c53fb075fc83",
+      "bytes": 7702
     },
     {
       "path": "crates/fln/src/runtime/implemented_by.rs",
@@ -91,8 +112,8 @@
       "path": "crates/fln/tests/source_imported_arrays/folds.rs",
       "baselineSha": null,
       "baselineMode": null,
-      "blobSha": "068421c22f9a0d210e457483c5679527905c8b36",
-      "bytes": 9471
+      "blobSha": "9780dfa3141a77382066d25a1e991d392959c2b9",
+      "bytes": 9535
     }
   ]
 }
