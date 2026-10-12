@@ -13,14 +13,15 @@
 //!   A returning loop also carries Option R; its checked state continuation receives the final
 //!   values before either resuming the suffix or forwarding a nonlocal return.
 //!
-//! - A branch statement whose every reassigning branch ends in `break` or `continue` needs no join:
-//!   the jump yields the values it reads, so it stays a plain `do` element.
+//! - A branch statement whose every reassigning branch ends in `return`, `break` or `continue`
+//!   needs no join: the exit reads the current values, so it stays a plain `do` element.
 //! - In a loop body, a reassigning branch statement whose other branches jump is closed over the
 //!   statements after it: they, and then `continue`, end each branch that falls through, which is
 //!   what falling off the body's end means (`close_over_rest`). Every reassigning branch then jumps.
 //!
 //! Refused where the pin accepts, a refusal and never a different meaning:
-//! - a reassigning branch statement that also contains `return`, or that is a `try`;
+//! - a reassigning branch statement that contains `return` and has a reassigning branch that
+//!   falls through, or that is a `try`;
 //! - outside a loop body, one that also contains `break` or `continue` with a reassigning branch
 //!   that falls through (its join would also have to forward the exit). Inside one, the same when
 //!   a branch binds a name the statements after it read (`| some n => …` before `s := s + n` with
@@ -182,16 +183,17 @@ fn branch_sequences(element: &Syntax) -> Vec<&Syntax> {
     sequences
 }
 
-/// Whether every branch of `element` that reassigns one of `state` ends in `break` or `continue`,
-/// so that control never leaves the statement with one of them reassigned.
+/// Whether every branch of `element` that reassigns one of `state` ends in
+/// `return`, `break` or `continue`, so no reassignment falls through the statement.
 fn jumps_out_with(element: &Syntax, state: &[Name]) -> bool {
     branch_sequences(element).into_iter().all(|sequence| {
         !facts(sequence)
             .reassigned
             .iter()
             .any(|name| state.contains(name))
-            || last_element(sequence)
-                .is_some_and(|last| is(last, "doBreak") || is(last, "doContinue"))
+            || last_element(sequence).is_some_and(|last| {
+                is(last, "doReturn") || is(last, "doBreak") || is(last, "doContinue")
+            })
     })
 }
 
@@ -809,12 +811,13 @@ impl Context {
                 out.push(self.mutable_branches(element, muts, None, looped)?);
                 return Ok(());
             }
-            if facts.returns || facts.handles {
+            if facts.handles {
                 return Err(refused());
             }
-            if facts.jumps {
-                // Every branch that reassigns ends in `break` or `continue`, which yields the
-                // values it reads: no reassignment falls through, so the statement needs no join.
+            if facts.returns || facts.jumps {
+                // Every reassigning branch exits with its current values. A nonlocal return
+                // carries the enclosing result, while loop exits carry their current state.
+                // No reassignment falls through, so this statement needs no state join.
                 if !jumps_out_with(&element, &state) {
                     return Err(refused());
                 }

@@ -153,6 +153,80 @@ def mutableTracedReturn
   mutableTraceMark 6
   return (fallback + total)
 
+def mutableTerminalIf (selected : Bool) : Id Nat := do
+  let mut total := 10
+  if selected then
+    total := total + 5
+    return total
+  total := total + 2
+  return total
+
+def mutableTerminalMatch (selected : Bool) : Id Nat := do
+  let mut total := 10
+  match selected with
+  | true =>
+    total := total + 7
+    return total
+  | false => Pure.pure PUnit.unit
+  total := total + 3
+  return total
+
+def mutableTerminalUnless (skipBranch : Bool) : Id Nat := do
+  let mut total := 10
+  unless skipBranch do
+    total := total + 9
+    return total
+  total := total + 4
+  return total
+
+def mutableTerminalLoop (active : Bool) (stop : Nat) : MutableState Nat := do
+  let mut total := 10
+  for value in mutableItems active do
+    if value == stop then
+      total := total + value
+      return total
+    total := total * 10 + value
+  return total
+
+def mutableTerminalMixed (active stop : Bool) : MutableState Nat := do
+  let mut total := 0
+  for value in mutableItems active do
+    if value == 1 then
+      total := total + 10
+      continue
+    if stop then
+      total := total + 20
+      return total
+    total := total + 30
+    break
+  return (total + 100)
+
+def mutableTerminalString (active stop : Bool) : Id String := do
+  let mut total := 0
+  for value in active do
+    if stop then
+      total := total + value
+      return "hit"
+    total := total + 1
+  return "fallback"
+
+-- Moving the same pure state computation into each branch does not add
+-- Pure.pure or Bind.bind operations, even for this observable non-lawful monad.
+def mutableTerminalTraced
+    (active : Bool) (stop initial fallback : Nat) : MutableTrace Nat := do
+  let mut total := initial
+  for value in mutableItems active do
+    if value == stop then
+      total := total + value
+      mutableTraceMark value
+      return total
+    total := total + value
+    mutableTraceMark value
+    total := total + 10
+    mutableTraceMark 9
+  mutableTraceMark 6
+  return (fallback + total)
+
 -- FLN_MUTABLE_PROBE string_hit String
 #eval mutableStringResult true true 5 "hit" "fallback"
 -- FLN_MUTABLE_PROBE string_fallback String
@@ -211,3 +285,75 @@ def mutableTracedReturn
 #eval (mutableTracedReturn false 1 5 100 0).value
 -- FLN_MUTABLE_PROBE nonlawful_empty_trace Nat
 #eval (mutableTracedReturn false 1 5 100 0).trace
+
+-- FLN_MUTABLE_PROBE terminal_if_hit Nat
+#eval mutableTerminalIf true
+
+-- FLN_MUTABLE_PROBE terminal_if_fallback Nat
+#eval mutableTerminalIf false
+
+-- FLN_MUTABLE_PROBE terminal_match_hit Nat
+#eval mutableTerminalMatch true
+
+-- FLN_MUTABLE_PROBE terminal_match_fallback Nat
+#eval mutableTerminalMatch false
+
+-- FLN_MUTABLE_PROBE terminal_unless_hit Nat
+#eval mutableTerminalUnless false
+
+-- FLN_MUTABLE_PROBE terminal_unless_fallback Nat
+#eval mutableTerminalUnless true
+
+-- FLN_MUTABLE_PROBE terminal_loop_first Nat
+#eval (mutableTerminalLoop true 1 0).value
+
+-- FLN_MUTABLE_PROBE terminal_loop_second Nat
+#eval (mutableTerminalLoop true 2 0).value
+
+-- FLN_MUTABLE_PROBE terminal_loop_fallback Nat
+#eval (mutableTerminalLoop true 0 0).value
+
+-- FLN_MUTABLE_PROBE terminal_loop_empty Nat
+#eval (mutableTerminalLoop false 1 0).value
+
+-- FLN_MUTABLE_PROBE terminal_mixed_return Nat
+#eval (mutableTerminalMixed true true 0).value
+
+-- FLN_MUTABLE_PROBE terminal_mixed_break Nat
+#eval (mutableTerminalMixed true false 0).value
+
+-- FLN_MUTABLE_PROBE terminal_mixed_empty Nat
+#eval (mutableTerminalMixed false true 0).value
+
+-- FLN_MUTABLE_PROBE terminal_string_hit String
+#eval mutableTerminalString true true
+
+-- FLN_MUTABLE_PROBE terminal_string_fallback String
+#eval mutableTerminalString true false
+
+-- FLN_MUTABLE_PROBE terminal_string_empty String
+#eval mutableTerminalString false true
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_first_value Nat
+#eval (mutableTerminalTraced true 1 5 100 0).value
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_first_trace Nat
+#eval (mutableTerminalTraced true 1 5 100 0).trace
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_second_value Nat
+#eval (mutableTerminalTraced true 2 5 100 0).value
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_second_trace Nat
+#eval (mutableTerminalTraced true 2 5 100 0).trace
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_fallback_value Nat
+#eval (mutableTerminalTraced true 9 5 100 0).value
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_fallback_trace Nat
+#eval (mutableTerminalTraced true 9 5 100 0).trace
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_empty_value Nat
+#eval (mutableTerminalTraced false 1 5 100 0).value
+
+-- FLN_MUTABLE_PROBE terminal_nonlawful_empty_trace Nat
+#eval (mutableTerminalTraced false 1 5 100 0).trace

@@ -8,7 +8,7 @@ import re
 import subprocess
 import tempfile
 
-COUNT = 29
+COUNT = 53
 WITNESS_MARKER = "-- FLN_MUTABLE_MONAD_WITNESSES\n"
 WITNESSES = """
 -- Dictionary construction only: both fields use the shared observable operations.

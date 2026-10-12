@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 const SOURCE: &str = include_str!("mutable_returns.lean");
 const EXPECTED: &str = include_str!("mutable_returns.expected.tsv");
 const HEADER: &str = "prelude\nimport Init.Data.List.Control\nimport Init.Control.Id\n\n";
-const COUNT: usize = 29;
+const COUNT: usize = 53;
 
 struct Probe<'a> {
     label: &'a str,
@@ -156,6 +156,8 @@ fn inactive_ill_typed_returns_fail_without_publishing_and_recovery_succeeds() {
     for source in [
         "def rejectedMutableReturn : MutableState Nat := do\n  let mut total := 0\n  for value in mutableItems true do\n    total := total + value\n    if false then return true\n  return total\n",
         "def rejectedNestedReturn : MutableState Nat := do\n  let mut total := 0\n  let mut count := 0\n  for first in mutableItems true do\n    for second in mutableItems true do\n      total := total + first + second\n      count := count + 1\n      if false then return true\n  return (total + count)\n",
+        "def rejectedTerminalReturn : MutableState Nat := do\n  let mut total := 0\n  for value in mutableItems true do\n    if false then\n      total := total + value\n      return true\n  return total\n",
+        "def rejectedTerminalOuterReturn : Id Nat := do\n  let mut total := 0\n  if false then\n    total := total + 1\n    return true\n  return total\n",
     ] {
         fln_parse::parse_definition(source.as_bytes())
             .unwrap_or_else(|error| panic!("the negative must reach elaboration: {error:?}"));
