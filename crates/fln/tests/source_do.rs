@@ -127,8 +127,10 @@ fn pattern_reassignment_is_refused_after_parsing() {
         Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
     }
 }
-/// A `while` loop parses as the pin's `doWhile`; the elaborator does not lower it (the pin's macro
-/// is `repeat if c then s else break`), so it refuses the definition after parsing.
+/// A `while` loop parses as the pin's `doWhile` and is the pin's `for _ in Loop.mk do …`
+/// (`repeat if c then s else break`). The seed world has no `Lean.Loop` (`Init/While.lean`), so it
+/// is refused after parsing; fln-cli `source_while_loops` checks loops where `Init.While` is
+/// imported.
 #[test]
 fn while_loops_are_refused_after_parsing() {
     let source = "def wl (n : Nat) : Id Nat := do\n  let mut i := 0\n  while i < n do\n    i := i + 1\n  return i\n";
