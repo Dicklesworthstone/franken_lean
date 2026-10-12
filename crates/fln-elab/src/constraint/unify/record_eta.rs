@@ -106,6 +106,10 @@ impl Engine<'_> {
             };
             children.push((pair.0, pair.1, locals.clone()));
         }
+        let constructor = if reversed { right } else { left };
+        if self.preserve_pending_record_eta(constructor, neutral, locals, &children)? {
+            return Ok(true);
+        }
         // Full type first, then fields in declaration order. This order matters
         // when a later field's type depends on a parameter or an earlier field.
         for child in children.into_iter().rev() {

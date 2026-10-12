@@ -9,6 +9,11 @@ use super::*;
 // than growing the Rust stack with the expression's unbounded nesting depth.
 const MAX_CONGRUENCE_DEPTH: u8 = 16;
 
+pub(super) enum CongruenceResult {
+    Solved,
+    Refused { made_assignments: bool },
+}
+
 impl Engine<'_> {
     pub(super) fn try_definition_congruence(
         &mut self,
@@ -68,7 +73,10 @@ impl Engine<'_> {
                 locals.clone(),
             ));
         }
-        self.try_congruence_equations(&equations)
+        Ok(matches!(
+            self.try_congruence_equations(&equations)?,
+            CongruenceResult::Solved
+        ))
     }
 
     fn congruence_spine(&mut self, expr: &Expr) -> Result<(Expr, Vec<Expr>), UnificationError> {
@@ -83,10 +91,10 @@ impl Engine<'_> {
         Ok((head.clone(), arguments))
     }
 
-    fn try_congruence_equations(
+    pub(super) fn try_congruence_equations(
         &mut self,
         equations: &[Equation],
-    ) -> Result<bool, UnificationError> {
+    ) -> Result<CongruenceResult, UnificationError> {
         // Account for copying the mutable stores and per-batch identities.
         // Immutable environment/registry data are shared; syntax facts start
         // empty so a large cache is not repeatedly copied by nested trials.
@@ -128,7 +136,9 @@ impl Engine<'_> {
             pending: pending::PendingState::new(None, u64::MAX),
             congruence_depth: self.congruence_depth + 1,
         };
+        let generation = self.generation();
         let result = trial.solve(equations, &[], &[]);
+        let made_assignments = trial.generation() != generation;
         // Failed speculation consumes real work. Never reset cancellation,
         // unifier/node limits or the assignment check's typed non-answer.
         self.meter = trial.meter;
@@ -145,16 +155,16 @@ impl Engine<'_> {
                 self.fact_cache = trial.fact_cache;
                 self.nat_literals_valid = trial.nat_literals_valid;
                 self.projection_registry = trial.projection_registry;
-                Ok(true)
+                Ok(CongruenceResult::Solved)
             }
             Err(UnificationError::Deferred(_))
             | Err(UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })) => {
-                Ok(false)
+                Ok(CongruenceResult::Refused { made_assignments })
             }
             Err(UnificationError::AssignmentCheck { outcome, .. })
                 if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })) =>
             {
-                Ok(false)
+                Ok(CongruenceResult::Refused { made_assignments })
             }
             Err(error) => Err(error),
         }

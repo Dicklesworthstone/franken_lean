@@ -20,7 +20,7 @@ fn engine() -> Engine {
 }
 fn checked(base: &Engine, text: &str) -> Engine {
     base.check_source_files(&[text.as_bytes()], &KVMap::new(), limits())
-        .unwrap()
+        .unwrap_or_else(|error| panic!("{text}\n{error:?}"))
         .into_complete()
         .unwrap()
         .engine
