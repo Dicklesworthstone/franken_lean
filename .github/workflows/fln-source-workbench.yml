@@ -168,7 +168,7 @@ jobs:
 
   scientific-conversions:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify dynamic scientific conversions on the pinned toolchains'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify imported numeric helpers and persistent defaults on current main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -180,11 +180,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'd20991e829e998586a0fa27d4712a37a0033ce53'
+      CANDIDATE_SHA: '6a6e09c09707ade38f4959faf19d1d5bf4032e4f'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'd20991e829e998586a0fa27d4712a37a0033ce53'
+          ref: '6a6e09c09707ade38f4959faf19d1d5bf4032e4f'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -192,6 +192,7 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
           rustc -Vv
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
           echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
@@ -203,6 +204,27 @@ jobs:
             done
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format the five conversion files and preserve the tested bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln/src/source_intrinsics/float.rs
+            crates/fln/src/source_intrinsics/float/tests.rs
+            crates/fln/tests/source_imported_floats.rs
+            crates/fln/src/runtime/partial.rs
+            crates/fln/src/runtime/floats/imported.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_SCI_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_SCI_RUSTFMT_DIFF_END
+          echo FLN_SCI_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_SCI_FORMATTED_BLOBS_END
+          git diff --check
       - name: Compare all dynamic conversion bit expectations with the live pin
         shell: python
         run: |
@@ -227,12 +249,6 @@ jobs:
       - name: Execute and replay actual imported scientific bodies
         if: success() || failure()
         run: cargo test --locked --offline -p fln --test source_imported_floats actual_imported_scientific_floats_execute_and_replay_the_regression -- --exact --nocapture --test-threads=1
-      - name: Check formatting of the candidate source
-        if: success() || failure()
-        run: |
-          set -euo pipefail
-          rustfmt --check --edition 2024 crates/fln/src/source_intrinsics/float.rs crates/fln/tests/source_imported_floats.rs
-          git diff --check
 
   automatic-termination:
     if: >-
@@ -337,7 +353,7 @@ jobs:
 
   default-instances:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(source): verify native default instances and automatic termination'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify imported numeric helpers and persistent defaults on current main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -349,11 +365,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '7aa9deb9131876dcf9a01e1349ce9343cd84c884'
+      CANDIDATE_SHA: '12fecf0a1a36ef07ffb72106717a21ec5d69b057'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '7aa9deb9131876dcf9a01e1349ce9343cd84c884'
+          ref: '12fecf0a1a36ef07ffb72106717a21ec5d69b057'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -385,6 +401,7 @@ jobs:
             crates/fln-elab/src/source.rs
             crates/fln-elab/src/source/instance_command.rs
             crates/fln-elab/src/source/scope/simp.rs
+            crates/fln-elab/src/source/scope/visibility.rs
             crates/fln-olean/src/write/source.rs
             crates/fln-olean/src/write/source/defaults.rs
             crates/fln-olean/src/write/source/namespaces.rs
@@ -423,7 +440,7 @@ jobs:
         run: cargo test --locked --offline -p fln-olean --lib write::source::defaults::tests -- --test-threads=1
       - name: Check source inference, ordinary precedence, visibility and artifact round trips
         if: success() || failure()
-        run: cargo test --locked --offline -p fln --test source_default_instances --test source_module_artifacts --test source_olean_instances --test source_instance_attributes --test source_module_visibility_instances --test source_scoped_instance_commands --no-fail-fast -- --test-threads=1
+        run: cargo test --locked --offline -p fln --test source_default_instances --test source_module_artifacts --test source_olean_instances --test source_instance_attributes --test source_module_visibility_instances --test source_scoped_instance_commands --test source_module_visibility --test source_compiler_hints --test source_reducibility_attributes --test source_noncomputable --test source_default_simp --test source_instance_universe_holes --no-fail-fast -- --test-threads=1
       - name: Check persisted metadata, diamond imports and tamper refusals
         if: success() || failure()
         run: cargo test --locked --offline -p fln --lib source_check::modules::persisted::tests -- --test-threads=1
