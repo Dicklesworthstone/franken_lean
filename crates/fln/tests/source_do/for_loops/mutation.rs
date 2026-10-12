@@ -116,6 +116,11 @@ def mixed : State Nat := do
       break
     s := s + x
   return s
+def typedLoop : State Nat := do
+  let mut s := 0
+  for (x : Nat) in items do
+    s := s + x
+  return s
 "#;
 
 #[test]
@@ -141,6 +146,7 @@ theorem leaveValue : (leaveWith 0).value = 100 := by rfl
 theorem skipValue : (skipWith 0).value = 102 := by rfl
 theorem bothValue : (bothJump 0).value = 1001 := by rfl
 theorem mixedValue : (mixed 0).value = 11 := by rfl
+theorem typedValue : (typedLoop 0).value = 3 := by rfl
 "
         ),
     );
@@ -168,6 +174,7 @@ fn stale_values_are_refused() {
         "theorem w : (bothJump 0).value = 1 := by rfl",
         "theorem w : (mixed 0).value = 10 := by rfl",
         "theorem w : (mixed 0).value = 1 := by rfl",
+        "theorem w : (typedLoop 0).value = 0 := by rfl",
     ] {
         let source = format!("{PROGRAMS}{theorem}\n");
         assert!(
@@ -186,6 +193,7 @@ fn reassigning_an_immutable_and_shadowing_a_mutable_are_refused() {
     let base = state_engine();
     for source in [
         "def bad : Id Nat := do\n  let x := 1\n  x := 2\n  return x\n",
+        "def bad : State Nat := do\n  let mut s := 0\n  for (x : Bool) in items do\n    s := s + 1\n  return s\n",
         "def bad : State Nat := do\n  let s := 0\n  for x in items do\n    if x = 1 then\n      s := s + 100\n      break\n  return s\n",
         "def bad : Id Nat := do\n  let mut x := 1\n  let x := 2\n  return x\n",
         "def bad : State Nat := do\n  let mut x := 0\n  for x in items do\n    mark x\n  return x\n",
