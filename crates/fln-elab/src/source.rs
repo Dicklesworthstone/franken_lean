@@ -4689,6 +4689,8 @@ fn definition_in_context_named(
     context: &mut Context,
     generated_name: Option<Name>,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    let expanded = context.expand_match_alternatives(syntax)?;
+    let syntax = expanded.as_ref();
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -5317,6 +5319,8 @@ fn query_term(
     context: &mut Context,
     evaluate: bool,
 ) -> Result<(Typed, Vec<Name>), NatDefinitionElabError> {
+    let expanded = context.expand_match_alternatives(syntax)?;
+    let syntax = expanded.as_ref();
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
         return Err(if evaluate {
             NatDefinitionElabError::InvalidGeneratedEvaluationName

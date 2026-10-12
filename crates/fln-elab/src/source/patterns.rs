@@ -1186,6 +1186,66 @@ impl Context {
     }
 
     /// Rebuild once, inside out. Ordinary flat matches are not cloned or changed.
+    /// `| p₁ | p₂ => rhs` as `| p₁ => rhs` and `| p₂ => rhs`: the pin's `expandMatchAlt`
+    /// (vendored Lean/Elab/BindersUtil.lean), which its term and do `match` apply to their
+    /// alternatives before elaborating them, as its equations do through `expandEqnsIntoMatch`.
+    /// Each copy keeps the same right-hand side. A name one group binds and another does not is
+    /// then simply unbound in that copy, as at the pin.
+    pub(super) fn expand_match_alternatives<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        let mut scan = vec![syntax];
+        let mut needed = false;
+        while let Some(node) = scan.pop() {
+            self.tick()?;
+            if alternative_groups(node) > 1 {
+                needed = true;
+                break;
+            }
+            if let Syntax::Node { args, .. } = node {
+                scan.extend(args);
+            }
+        }
+        if !needed {
+            return Ok(Cow::Borrowed(syntax));
+        }
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(&'a Syntax, usize),
+        }
+        let null = Name::from_components(["null"]);
+        let mut tasks = vec![Task::Visit(syntax)];
+        let mut built: Vec<Syntax> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(node @ Syntax::Node { args, .. }) => {
+                    tasks.push(Task::Build(node, built.len()));
+                    tasks.extend(args.iter().rev().map(Task::Visit));
+                }
+                Task::Visit(leaf) => built.push(leaf.clone()),
+                Task::Build(Syntax::Node { info, kind, .. }, start) => {
+                    let mut args = built.split_off(start);
+                    // Alternatives live in the `null` node of their `matchAlts`.
+                    if *kind == null && args.iter().any(|arg| alternative_groups(arg) > 1) {
+                        args = args.into_iter().flat_map(split_alternative).collect();
+                    }
+                    built.push(Syntax::Node {
+                        info: *info,
+                        kind: kind.clone(),
+                        args,
+                    });
+                }
+                Task::Build(..) => unreachable!("only nodes are built"),
+            }
+        }
+        built
+            .pop()
+            .map(Cow::Owned)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))
+    }
+
     pub(super) fn lower_pattern_matrices<'a>(
         &mut self,
         syntax: &'a Syntax,
@@ -1382,4 +1442,46 @@ impl Context {
             bodies,
         ))
     }
+}
+
+/// The number of pattern groups of a `matchAlt` (`| p₁ | p₂ => rhs` has two), else 0.
+fn alternative_groups(syntax: &Syntax) -> usize {
+    match syntax {
+        Syntax::Node { kind, args, .. }
+            if *kind == parser_kind(&["Term", "matchAlt"]) && args.len() == 4 =>
+        {
+            match &args[1] {
+                Syntax::Node { args: groups, .. } => groups.len().div_ceil(2),
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// One `matchAlt` per pattern group, each with the alternative's own `|`, `=>` and right-hand side.
+fn split_alternative(alternative: Syntax) -> Vec<Syntax> {
+    if alternative_groups(&alternative) <= 1 {
+        return vec![alternative];
+    }
+    let Syntax::Node { info, kind, args } = &alternative else {
+        unreachable!("an alternative with groups is a node");
+    };
+    let Syntax::Node { args: groups, .. } = &args[1] else {
+        unreachable!("an alternative's groups are a node");
+    };
+    groups
+        .iter()
+        .step_by(2)
+        .map(|group| Syntax::Node {
+            info: *info,
+            kind: kind.clone(),
+            args: vec![
+                args[0].clone(),
+                Syntax::node(Name::from_components(["null"]), vec![group.clone()]),
+                args[2].clone(),
+                args[3].clone(),
+            ],
+        })
+        .collect()
 }
