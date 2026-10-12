@@ -860,3 +860,86 @@ jobs:
         run: |
           cargo clippy --locked --offline -p fln-elab --lib --test native_telescope_closure -- -D warnings
           cargo clippy --locked --offline -p fln --test source_do -- -D warnings
+
+  deferred-record-arguments:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate deferred record arguments against the Lean pin'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '382b45c5a5406e718b7a24b3746fddfdf7e1f758'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '382b45c5a5406e718b7a24b3746fddfdf7e1f758'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete record-argument candidate
+        id: record-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/application/postponed.rs
+            crates/fln/tests/source_postponed_records.rs
+          )
+          paths=(
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/application/postponed.rs
+            crates/fln/tests/source_postponed_records.lean
+            crates/fln/tests/source_postponed_records.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_RECORD_ARGUMENT_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_RECORD_ARGUMENT_RUSTFMT_DIFF_END
+          echo FLN_RECORD_ARGUMENT_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_RECORD_ARGUMENT_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check ten shared computation proofs using the exact Lean pin
+        if: (success() || failure()) && steps.record-format.outcome == 'success'
+        run: |
+          set -euo pipefail
+          timeout 180 "$FLN_REFERENCE_LIB/../../bin/lean" crates/fln/tests/source_postponed_records.lean
+          echo 'FLN_RECORD_ARGUMENT_ORACLE: 10 shared computation proofs checked'
+      - name: Execute deferred records and retained argument, notation and record regressions
+        if: (success() || failure()) && steps.record-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_postponed_records --test source_postponed_applications --test source_postponed_notation --test source_records --no-fail-fast -- --nocapture --test-threads=1
+      - name: Check the changed elaborator and affected source targets
+        if: (success() || failure()) && steps.record-format.outcome == 'success'
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln --test source_postponed_records --test source_postponed_applications --test source_postponed_notation --test source_records -- -D warnings
