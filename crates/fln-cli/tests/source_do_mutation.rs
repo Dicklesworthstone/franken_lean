@@ -138,6 +138,14 @@ fn mutable_variables_have_the_pins_values() {
             "def m13 (o : Option Nat) : Nat := Id.run do\n  let mut x := 0\n  match o with\n  | some n => x := n\n  | none => x := 7\n  return x + 1\ntheorem t1 : m13 (some 3) = 4 := by decide\ntheorem t2 : m13 none = 8 := by decide\n",
         ),
         (
+            "final_loop",
+            "def foo : Unit := Id.run do\n  let mut x : PProd Nat True := ⟨0, trivial⟩\n  for _ in [true] do\n    x := ⟨0, trivial⟩\n    break\n",
+        ),
+        (
+            "final_loop_in_branch",
+            "def f (b : Bool) (xs : List Nat) : Unit := Id.run do\n  let mut s := 0\n  if b then\n    for x in xs do\n      s := s + x\n",
+        ),
+        (
             "typed_binder",
             "def m21 (xs : List Nat) : Nat := Id.run do\n  let mut s := 0\n  for (x : Nat) in xs do\n    s := s + x\n  return s\ntheorem t : m21 [1, 2, 3] = 6 := by decide\n",
         ),
@@ -169,6 +177,11 @@ fn mutation_the_pin_refuses_is_refused() {
         (
             "type",
             "def n3 : Nat := Id.run do\n  let mut x := 1\n  x := \"a\"\n  return x\n",
+            "Type mismatch",
+        ),
+        (
+            "final_loop_result",
+            "def f (xs : List Nat) : Nat := Id.run do\n  let mut s := 0\n  for x in xs do\n    s := s + x\n",
             "Type mismatch",
         ),
         (

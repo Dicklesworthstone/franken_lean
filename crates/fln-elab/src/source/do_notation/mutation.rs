@@ -790,7 +790,7 @@ impl Context {
             return Ok(());
         }
         if is(&element, "doFor") {
-            return self.mutable_loop(element, muts, looped, out);
+            return self.mutable_loop(element, muts, looped, !continues, out);
         }
         if is(&element, "doIf")
             || is(&element, "doMatch")
@@ -1062,11 +1062,15 @@ impl Context {
 
     /// A `for` loop. One that reassigns variables declared before it carries them as its state
     /// (`nativeDoMutFor`, expanded by `expand_state_for_loop`), then binds them again.
+    /// `last`: nothing follows the loop. Its result is then the block's, the pin's `PUnit`
+    /// (`elabDoFor`), so a loop that carries state ends with `pure PUnit.unit` after binding its
+    /// state; a block may not end in a binding.
     fn mutable_loop(
         &mut self,
         element: Syntax,
         muts: &[Name],
         looped: bool,
+        last: bool,
         out: &mut Vec<Syntax>,
     ) -> Result<(), NatDefinitionElabError> {
         let mut parts = node(element, "doFor", 4)?;
@@ -1108,6 +1112,12 @@ impl Context {
                     component(&result, index, state.len()),
                 ));
             }
+        }
+        if last {
+            out.push(term(
+                "doExpr",
+                vec![call(false, vec![root(&["PUnit", "unit"])])],
+            ));
         }
         Ok(())
     }
