@@ -416,3 +416,4 @@ fn generated_entry_collision_refuses_without_publishing_a_stage() {
 }
 
 mod callback_stages;
+mod fully_bound_callbacks;

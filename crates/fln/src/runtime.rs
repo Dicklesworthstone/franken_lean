@@ -33,6 +33,7 @@ mod string_from_list;
 mod string_push;
 mod transport;
 mod variants;
+mod well_founded;
 
 use super::*;
 use fln_comp::ingress::{
@@ -65,6 +66,7 @@ pub(super) struct Preparation<'a> {
     bool_recursor_checked: bool,
     io_world_checked: bool,
     equality_family_checked: bool,
+    well_founded_fix_checked: bool,
     quotient_family_checked: bool,
     conditional_contracts: [bool; 2],
     next_branch: usize,
@@ -158,6 +160,7 @@ impl<'a> Preparation<'a> {
             bool_recursor_checked: false,
             io_world_checked: false,
             equality_family_checked: false,
+            well_founded_fix_checked: false,
             quotient_family_checked: false,
             conditional_contracts: [false; 2],
             next_branch: 0,

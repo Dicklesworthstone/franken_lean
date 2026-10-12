@@ -50,7 +50,21 @@ impl Preparation<'_> {
             .runtime_initializers
             .is_some_and(|names| names.contains(name))
             || self.implementations()?.get(name).is_some()
-            || self.has_recursive_companion(name)?)
+            || self.has_recursive_companion(name)?
+            || self.well_founded_fix_target(name)?.is_some())
+    }
+
+    /// Keep explicit implementations first. The admitted fixpoint equation is
+    /// consulted only for its exact source, and a present recursive companion
+    /// retains ordinary linkage validation and selection at the call site.
+    pub(super) fn executable_replacement(
+        &mut self,
+        requested: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        match self.implementation_target(requested)? {
+            Some(target) => Ok(Some(target)),
+            None => self.well_founded_fix_target(requested),
+        }
     }
 
     /// An attribute authorizes selecting this checked target, not executing an
@@ -183,7 +197,7 @@ impl Preparation<'_> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
-        let target = match self.implementation_target(name)? {
+        let target = match self.executable_replacement(name)? {
             Some(target) => Some(target),
             None => self.recursive_companion_target(name)?,
         };

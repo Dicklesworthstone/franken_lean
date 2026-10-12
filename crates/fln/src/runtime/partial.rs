@@ -27,7 +27,7 @@ impl Preparation<'_> {
         &mut self,
         requested: &Name,
     ) -> Result<Option<DefinitionVal>, IngressError> {
-        let replacement = self.implementation_target(requested)?;
+        let replacement = self.executable_replacement(requested)?;
         let requested = replacement.as_ref().unwrap_or(requested);
         self.recursive_definition(requested)
     }

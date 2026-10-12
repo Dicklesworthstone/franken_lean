@@ -1,9 +1,11 @@
-//! Compile Partial function producers at their real lambda-prefix arity.
+//! Compile Partial functions at their real lambda-prefix arity.
 //!
 //! A stable private global returns the suffix closure. Calls bind that result
 //! before applying later arguments, so recursive prefix work is neither copied
 //! during compilation nor delayed beneath invented lambdas. These entries
 //! remain compiler inputs and pass the ordinary catalog and FIR checks.
+//! Fully applied recursive consumers can also retain a known callback's real
+//! stages, using the same checked recursive-forwarding specialization.
 use super::*;
 use std::collections::HashMap;
 
@@ -62,7 +64,11 @@ impl Preparation<'_> {
         }))
     }
 
-    fn partial_stage(&mut self, name: &Name) -> Result<Option<Entry>, IngressError> {
+    fn partial_stage(
+        &mut self,
+        name: &Name,
+        arguments: &[Expr],
+    ) -> Result<Option<Entry>, IngressError> {
         self.tick()?;
         if self.is_partial_stage(name) {
             return Ok(None);
@@ -115,16 +121,21 @@ impl Preparation<'_> {
             type_ = result.clone();
             body = next.clone();
         }
-        if !matches!(self.type_head(&type_)?.node(), ExprNode::ForallE { .. }) {
-            return Ok(None);
-        }
-        let observed = self.partial_stages.entries.len().saturating_add(1);
-        if observed > self.limits.fir.max_functions {
-            return Err(IngressError::ResourceLimit {
-                resource: IngressResource::ProgramTables,
-                limit: self.limits.fir.max_functions,
-                observed,
-            });
+        let producer = matches!(self.type_head(&type_)?.node(), ExprNode::ForallE { .. });
+        if !producer {
+            // Ordinary fully lambda-bound globals keep their flat ABI. Only a
+            // known callback can justify building a different recursive entry;
+            // neither runtime values nor captures enter its specialization key.
+            let mut known_callback = false;
+            for argument in arguments {
+                if self.inert_callable(argument)?.is_some() {
+                    known_callback = true;
+                    break;
+                }
+            }
+            if !known_callback {
+                return Ok(None);
+            }
         }
         let mut definition = self.normalize_definition_signature(&definition)?;
         if !specialize::closed(&definition.base.type_) {
@@ -169,12 +180,15 @@ impl Preparation<'_> {
             type_ = result.clone();
             body = next.clone();
         }
-        if !matches!(type_.node(), ExprNode::ForallE { .. }) {
+        if producer != matches!(type_.node(), ExprNode::ForallE { .. }) {
             return Ok(None);
         }
-        let Some(result @ ValueType::Closure(_)) = self.value_type(&type_)? else {
+        let Some(result) = self.value_type(&type_)? else {
             return Ok(None);
         };
+        if producer && !matches!(result, ValueType::Closure(_)) {
+            return Ok(None);
+        }
         // This annotation reaches real return lambdas inside strict lets and
         // case branches. It neither constructs nor invokes the returned value.
         body = self.typed_callable_result(body, type_.clone(), result)?;
@@ -203,6 +217,29 @@ impl Preparation<'_> {
             }
             signature.parameters
         };
+        if !producer {
+            // This is only a candidate. The callback pass publishes an entry
+            // after proving that the interfaces differ solely in return stages
+            // and every recursive edge forwards the same callback parameters.
+            // If no interface differs, the original call is left untouched.
+            return Ok(Some(Entry {
+                name: name.clone(),
+                type_: definition.base.type_,
+                parameters,
+                parameter_types,
+                suffix: type_,
+                result,
+                body,
+            }));
+        }
+        let observed = self.partial_stages.entries.len().saturating_add(1);
+        if observed > self.limits.fir.max_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.fir.max_functions,
+                observed,
+            });
+        }
         let serial = u64::try_from(self.partial_stages.entries.len())
             .map_err(|_| unsupported("partial stage identity"))?;
         let entry_name = Name::num(name_of_stages(), serial);
@@ -257,10 +294,13 @@ impl Preparation<'_> {
                 observed: args.len(),
             });
         }
-        let Some(entry) = self.partial_stage(name)? else {
+        let Some(entry) = self.partial_stage(name, args)? else {
             return Ok(None);
         };
         let entry = self.partial_callback_stage(name, entry, args)?;
+        if entry.name == *name {
+            return Ok(None);
+        }
         self.apply_partial_stage(&entry, args)
     }
 
