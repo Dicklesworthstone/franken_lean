@@ -233,3 +233,200 @@ jobs:
           set -euo pipefail
           rustfmt --check --edition 2024 crates/fln/src/source_intrinsics/float.rs crates/fln/tests/source_imported_floats.rs
           git diff --check
+
+  automatic-termination:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(source): verify native default instances and automatic termination'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '05f602ccc5a6869d67bf866c4e41233de60a2bf6'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '05f602ccc5a6869d67bf866c4e41233de60a2bf6'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/WFTactics Init/Omega; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format only the four candidate files and preserve the tested bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-elab/src/source/recursion.rs
+            crates/fln-elab/src/source/recursion/well_founded.rs
+            crates/fln/tests/source_well_founded.rs
+            crates/fln/tests/support/well_founded_inference.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_WF_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_WF_RUSTFMT_DIFF_END
+          echo FLN_WF_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_WF_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Check inferred measures and proof-selection behavior against the live pin
+        shell: python
+        run: |
+          import json, os, pathlib, re, subprocess
+          source = pathlib.Path('crates/fln/tests/support/well_founded_inference.rs').read_text()
+          literal = r'"(?:[^"\\]|\\.)*"'
+          tuple_pattern = re.compile(r'\(\s*(' + literal + r')\s*,\s*(' + literal + r')\s*,\s*(' + literal + r')\s*,?\s*\)')
+          programs = [tuple(json.loads(value) for value in match) for match in tuple_pattern.findall(source.split('const REFUSALS', 1)[0])]
+          refusal_source = source.split('const REFUSALS: &[&str] = &[', 1)[1].split('\n];', 1)[0]
+          refusals = [json.loads(value) for value in re.findall(r'^\s*(' + literal + r'),\s*$', refusal_source, re.M)]
+          assert len(programs) == 16, len(programs)
+          assert len(refusals) == 20, len(refusals)
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'well-founded-inference-oracle.lean'
+          failures = []
+          def check(name, body, accepts, evaluates=False):
+              fixture.write_text('import Init.WFTactics\nimport Init.Omega\n' + body + '\n')
+              result = subprocess.run([str(lean), str(fixture)], text=True, capture_output=True, timeout=120)
+              print('FLN_WF_ORACLE_CASE ' + name, flush=True)
+              print(result.stdout, end='', flush=True)
+              print(result.stderr, end='', flush=True)
+              if (result.returncode == 0) != accepts:
+                  failures.append((name, 'acceptance', result.returncode, accepts))
+              if evaluates and re.findall(r'^\d+$', result.stdout, re.M) != ['42']:
+                  failures.append((name, 'evaluation', result.stdout))
+              if not accepts and ('unexpected token' in result.stdout or 'expected token' in result.stdout):
+                  failures.append((name, 'syntax', result.stdout))
+          for name, definition, application in programs:
+              check(name, definition + '\n#eval ' + application, True, True)
+          # These two native refusals are explicit capability boundaries:
+          # the pin can use an earlier non-Nat SizeOf or a lexicographic tuple.
+          native_only_boundaries = {14, 15}
+          for index, definition in enumerate(refusals):
+              check('refusal-' + str(index), definition, index in native_only_boundaries)
+          assert not failures, failures
+          print('FLN_WF_ORACLE_COMPLETE 16 evaluations; 18 pin refusals; 2 native capability boundaries', flush=True)
+      - name: Check complete native well-founded lowering and proof replay
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_well_founded -- --nocapture --test-threads=1
+      - name: Check postponed applications with the new recursive-definition fallback
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_postponed_applications -- --nocapture --test-threads=1
+
+  default-instances:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(source): verify native default instances and automatic termination'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '7aa9deb9131876dcf9a01e1349ce9343cd84c884'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '7aa9deb9131876dcf9a01e1349ce9343cd84c884'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/WFTactics Init/Omega; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format only candidate files and preserve the tested bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-elab/src/instances/defaults.rs
+            crates/fln-elab/src/instances/defaults/export.rs
+            crates/fln-elab/src/instances/defaults/export/tests.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/instance_command.rs
+            crates/fln-elab/src/source/scope/simp.rs
+            crates/fln-olean/src/write/source.rs
+            crates/fln-olean/src/write/source/defaults.rs
+            crates/fln-olean/src/write/source/namespaces.rs
+            crates/fln-parse/src/command_scope/instances.rs
+            crates/fln/src/lib.rs
+            crates/fln/src/source_check.rs
+            crates/fln/src/source_check/instance_attributes.rs
+            crates/fln/src/source_check/modules/artifacts.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/persisted.rs
+            crates/fln/src/source_check/modules/replay.rs
+            crates/fln/src/source_check/modules/visibility.rs
+            crates/fln/src/source_records.rs
+            crates/fln/tests/source_default_instances.rs
+            crates/fln/tests/source_module_artifacts/classes.rs
+            crates/fln/tests/source_module_artifacts/defaults.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_DEFAULT_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_DEFAULT_RUSTFMT_DIFF_END
+          echo FLN_DEFAULT_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_DEFAULT_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Check parsed default attributes and existing instance refusals
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln-parse --lib command_scope::instances::tests -- --test-threads=1
+      - name: Check native default journals and bounded export
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln-elab --lib instances::defaults -- --test-threads=1
+      - name: Check exact physical default entry encoding
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln-olean --lib write::source::defaults::tests -- --test-threads=1
+      - name: Check source inference, ordinary precedence, visibility and artifact round trips
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_default_instances --test source_module_artifacts --test source_olean_instances --test source_instance_attributes --test source_module_visibility_instances --test source_scoped_instance_commands --no-fail-fast -- --test-threads=1
+      - name: Check persisted metadata, diamond imports and tamper refusals
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --lib source_check::modules::persisted::tests -- --test-threads=1
+      - name: Check batched and sequential activation against the actual pin
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --lib source_check::modules::imported::tests::batched_metadata_activation_equals_one_registration_at_a_time -- --exact --nocapture --test-threads=1
