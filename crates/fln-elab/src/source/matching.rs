@@ -10,6 +10,7 @@ use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
 mod mutual;
+mod nomatch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {

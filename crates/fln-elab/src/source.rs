@@ -1629,6 +1629,7 @@ impl Context {
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            NomatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
@@ -2121,6 +2122,13 @@ impl Context {
                                     tasks.push(Task::BinderNext(
                                         self.start_telescope(syntax, expected, lambda)?,
                                     ));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "nomatch"]) {
+                                    let parts = self.nomatch_parts(syntax)?;
+                                    let discriminant = parts.discriminant;
+                                    tasks.push(Task::NomatchDiscriminant(parts, expected));
+                                    tasks.push(Task::Visit(discriminant, None, true));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "match"])
@@ -2708,6 +2716,14 @@ impl Context {
                                     )?));
                                 }
                             }
+                        }
+                        Task::NomatchDiscriminant(parts, expected) => {
+                            let major = values.pop().expect("empty match discriminant visit");
+                            // Empty matches require checked branch equations, even
+                            // inside a structurally recursive definition.
+                            tasks.push(Task::Proof(
+                                self.start_refined_match(parts, major, expected, false)?,
+                            ));
                         }
                         Task::MatchDiscriminant(parts, expected) => {
                             let major = values.pop().expect("match discriminant visit");
