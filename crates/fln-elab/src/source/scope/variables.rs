@@ -85,6 +85,20 @@ pub fn declare(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<SectionVariables, NatDefinitionElabError> {
+    elaborate_command(syntax, env, kernel, scope, true)
+}
+
+/// [`declare`]'s elaboration. Without `kernel_check` the closed telescope is not checked again:
+/// a declaration elaborates the commands again only to compare each local with the one
+/// [`declare`] checked, and refuses on any difference. Fresh names are drawn exactly as
+/// [`declare`] draws them, so equal elaborations yield equal locals.
+fn elaborate_command(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+    kernel_check: bool,
+) -> Result<SectionVariables, NatDefinitionElabError> {
     let mut context = Context::scoped(env, kernel, scope);
     context.declare_levels(&Syntax::node(Name::from_components(["null"]), vec![]))?;
     context.infer_level_params = true;
@@ -137,12 +151,14 @@ pub fn declare(
         },
         is_unsafe: false,
     });
-    match check(env, &declaration, kernel) {
-        Outcome::Complete(Verdict::Accepted { .. }) => {}
-        outcome => {
-            return Err(failure(SourceInferenceError::TypeObligation(Box::new(
-                outcome,
-            ))));
+    if kernel_check {
+        match check(env, &declaration, kernel) {
+            Outcome::Complete(Verdict::Accepted { .. }) => {}
+            outcome => {
+                return Err(failure(SourceInferenceError::TypeObligation(Box::new(
+                    outcome,
+                ))));
+            }
         }
     }
     let mut lctx = LocalContext::new();
@@ -254,7 +270,16 @@ impl Context {
             .filter(|local| used.contains(&local.id))
             .collect();
         if !selected.is_empty() {
-            let changed = self.reinterpreted_section_variables()?;
+            let selected_ids: HashSet<&FVarId> = selected.iter().map(|local| &local.id).collect();
+            let through = self
+                .source_scope
+                .variables
+                .locals
+                .decls()
+                .iter()
+                .rposition(|local| selected_ids.contains(&local.id))
+                .map_or(0, |position| position + 1);
+            let changed = self.reinterpreted_section_variables(through)?;
             if let Some(local) = selected.iter().find(|local| changed.contains(&local.id)) {
                 return Err(error(ScopeError::ReinterpretedVariable(
                     local.user_name.clone(),
@@ -270,17 +295,27 @@ impl Context {
     /// `varDecls`), so after `open Second` an earlier `Carrier` may name `Second.Carrier`, or
     /// be ambiguous. The commands are elaborated again here, in order, and each local compared
     /// with the one first checked; a command that no longer elaborates leaves its locals and
-    /// every later one unconfirmed.
+    /// every later one unconfirmed. Only the first `through` locals are confirmed: a command
+    /// never depends on a later one, so the commands after the one completing them are not read.
     fn reinterpreted_section_variables(
         &mut self,
+        through: usize,
     ) -> Result<HashSet<FVarId>, NatDefinitionElabError> {
         let stored = self.source_scope.variables.clone();
         let mut scope = self.source_scope.clone();
         scope.variables = SectionVariables::default();
-        for (syntax, _) in &stored.commands {
+        for (syntax, after) in &stored.commands {
             self.tick()?;
-            if let Ok(variables) = declare(syntax, &self.txn.env, self.kernel, &scope) {
+            if scope.variables.locals.len() >= through {
+                break;
+            }
+            if let Ok(variables) =
+                elaborate_command(syntax, &self.txn.env, self.kernel, &scope, false)
+            {
                 scope.variables = variables;
+                if *after >= through {
+                    break;
+                }
                 continue;
             }
             // The pin elaborates binders one group at a time: a later group that no longer
@@ -289,7 +324,9 @@ impl Context {
                 for end in (1..args.len()).rev() {
                     self.tick()?;
                     let prefix = Syntax::node(kind.clone(), args[..end].to_vec());
-                    if let Ok(variables) = declare(&prefix, &self.txn.env, self.kernel, &scope) {
+                    if let Ok(variables) =
+                        elaborate_command(&prefix, &self.txn.env, self.kernel, &scope, false)
+                    {
                         scope.variables = variables;
                         break;
                     }
@@ -299,7 +336,7 @@ impl Context {
         }
         let renewed = scope.variables.locals.decls();
         let mut changed = HashSet::new();
-        for (position, local) in stored.locals.decls().iter().enumerate() {
+        for (position, local) in stored.locals.decls().iter().enumerate().take(through) {
             self.tick()?;
             let same = renewed.get(position).is_some_and(|again| {
                 again.id == local.id
