@@ -172,7 +172,6 @@ fn unsupported_scoped_erasure_and_inline_forms_are_not_silent_noops() {
     let before = base.logical_root(&KVMap::new());
     for source in [
         "attribute [-instance] instInhabitedNat",
-        "attribute [local instance] seven",
         "attribute [scoped instance] seven",
         "attribute [instance high] seven",
         "@[instance] def unsupported : Inhabited Nat := Inhabited.mk 7",
@@ -184,6 +183,9 @@ fn unsupported_scoped_erasure_and_inline_forms_are_not_silent_noops() {
         );
         assert_eq!(before, base.logical_root(&KVMap::new()));
     }
+    // A local instance attribute selects `seven` for its scope and writes nothing persistent.
+    let local = checked(&base, "attribute [local instance] seven");
+    assert_eq!(before, local.logical_root(&KVMap::new()));
 }
 
 #[test]
