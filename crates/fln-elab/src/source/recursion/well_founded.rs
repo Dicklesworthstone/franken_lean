@@ -21,8 +21,6 @@ pub(in crate::source) struct State {
     pub reference: Typed,
     marker: FVarId,
     fixed: Vec<LocalDecl>,
-    major: LocalDecl,
-    measure: Expr,
     continuation: LocalDecl,
     proof_inaccessible: Vec<FVarId>,
     proof_hidden: HashSet<Name>,
@@ -140,13 +138,92 @@ pub(in crate::source) fn hint(syntax: &Syntax) -> Result<Option<Hint<'_>>, NatDe
     }))
 }
 
-fn replace(expr: &Expr, id: &FVarId, value: &Expr) -> Result<Expr, NatDefinitionElabError> {
-    expr.abstract_fvar(id, 0)
-        .and_then(|body| body.subst_loose(0, std::slice::from_ref(value)))
-        .map_err(|_| failure(SourceInferenceError::Scope))
-}
-
 impl Context {
+    /// Matcher branches may replace the private continuation with a binder
+    /// whose domain mentions the constructor. Its private name survives that
+    /// telescope, while its FVar identity and type belong to the active branch.
+    pub(in crate::source) fn well_founded_continuation(&self) -> Option<LocalDecl> {
+        let state = self.well_founded.as_ref().filter(|state| !state.proving)?;
+        self.txn
+            .lctx
+            .find_by_user_name(&state.continuation.user_name)
+            .cloned()
+    }
+
+    /// Pattern matrices evaluate their inputs in checked, unspellable lets.
+    /// Follow those aliases only: matching a genuine `saved := n` must not
+    /// identify its branch input with n in a decreasing obligation.
+    pub(in crate::source) fn well_founded_match_input(
+        &mut self,
+        mut input: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let mut visited = HashSet::new();
+        while let ExprNode::FVar { id } = input.value.node() {
+            self.tick()?;
+            if !visited.insert(id.clone()) {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            let Some(local) = self.txn.lctx.find(id) else {
+                break;
+            };
+            if !local.user_name.parent().is_anonymous()
+                || !matches!(
+                    local.user_name.leaf_view(),
+                    fln_core::name::LeafView::Num(_)
+                )
+            {
+                break;
+            }
+            let Some(value) = &local.value else {
+                break;
+            };
+            let ExprNode::FVar { id } = value.node() else {
+                break;
+            };
+            let original = self
+                .txn
+                .lctx
+                .find(id)
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            input = Typed {
+                value: value.clone(),
+                type_: original.type_.clone(),
+            };
+        }
+        Ok(input)
+    }
+
+    /// Cached calls may still reference the ambient telescope, but the source
+    /// branch sees the specialized hypotheses only. Hide old declarations by
+    /// private names while retaining their FVar identities for those captures.
+    /// Restoring the match's saved local context restores the original names.
+    pub(in crate::source) fn hide_well_founded_match_locals(
+        &mut self,
+        generalized: &[LocalDecl],
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.well_founded_continuation().is_none() {
+            return Ok(false);
+        }
+        let candidates: HashSet<_> = generalized.iter().map(|local| local.id.clone()).collect();
+        let mut locals = LocalContext::new();
+        let mut hidden = Vec::new();
+        for mut local in self.txn.lctx.clone().decls().iter().cloned() {
+            self.tick()?;
+            if candidates.contains(&local.id) {
+                local.user_name = self.fresh_name()?;
+                hidden.push(local.user_name.clone());
+            }
+            tactics::eliminate::add_local(&mut locals, &local);
+        }
+        self.txn.lctx = locals;
+        self.well_founded
+            .as_mut()
+            .expect("active match continuation")
+            .proof_hidden
+            .extend(hidden);
+        Ok(true)
+    }
+
     fn well_founded_measure(
         &mut self,
         hint: &Hint<'_>,
@@ -310,8 +387,6 @@ impl Context {
             },
             marker: marker.clone(),
             fixed: parameters[..parameters.len() - 1].to_vec(),
-            major: major.clone(),
-            measure,
             continuation: continuation.clone(),
             proof_inaccessible: parameters[header_parameters..]
                 .iter()
@@ -502,6 +577,39 @@ impl Context {
         Ok(goals)
     }
 
+    /// `clean_wf` exposes the Nat measure at the actual branch input. Read it
+    /// from the checked fixpoint continuation, so a match refines the current
+    /// argument without rewriting unrelated captured source variables.
+    fn decreasing_target(&mut self, raw_target: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        let mut head = raw_target;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f;
+        }
+        if !matches!(head.node(), ExprNode::Const { name, .. }
+            if name == &Name::from_components(["InvImage"]))
+            || arguments.len() != 6
+        {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        }
+        arguments.reverse();
+        let measure = self.whnf(&arguments[3])?;
+        let ExprNode::Lam { body, .. } = measure.node() else {
+            return Err(failure(SourceInferenceError::ExpectedFunction));
+        };
+        let smaller = self.substitute(body, &arguments[4])?;
+        let current = self.substitute(body, &arguments[5])?;
+        Ok(Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new()),
+                smaller,
+            ),
+            current,
+        ))
+    }
+
     /// Let values remain let values in both telescopes. Making an arbitrary
     /// parameter out of a source let would invalidate proofs that used its
     /// definitional equality. Parameters alone become explicit applications.
@@ -577,10 +685,10 @@ impl Context {
         // Do not copy the growing obligation list on each source application.
         // Only an actual saturated self call needs these small snapshots.
         let fixed = state.fixed.clone();
-        let major = state.major.id.clone();
-        let measure = state.measure.clone();
-        let continuation = state.continuation.clone();
         let proof_inaccessible = state.proof_inaccessible.clone();
+        let continuation = self
+            .well_founded_continuation()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
         arguments.reverse();
         for (argument, parameter) in arguments.iter().zip(&fixed) {
             self.tick()?;
@@ -604,10 +712,7 @@ impl Context {
             return Err(failure(SourceInferenceError::ExpectedFunction));
         };
         let raw_target = self.instantiate(raw_target)?;
-        let measure = self.instantiate(&measure)?;
-        let smaller = replace(&measure, &major, &next)?;
-        let nat_lt = Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new());
-        let target = Expr::app(Expr::app(nat_lt, smaller), measure);
+        let target = self.decreasing_target(&raw_target)?;
         // The pin cleans InvImage and its measure before presenting goals to
         // decreasing_by. The final continuation application still carries the
         // original fixpoint domain, so the kernel checks that conversion.

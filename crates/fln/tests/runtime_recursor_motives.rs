@@ -51,6 +51,14 @@ fn normalized_function_motives_keep_changing_accumulator_arguments() {
     );
 }
 
+#[test]
+fn record_motives_erase_major_dependent_callback_proofs_before_layout_discovery() {
+    execute(
+        "structure Pair where\n  first : Nat\n  second : Nat\ndef unpack (p : Pair) : ((q : Pair) -> q.first = p.first -> Nat) -> Nat := @Pair.rec (fun p : Pair => ((q : Pair) -> q.first = p.first -> Nat) -> Nat) (fun first second next => next (Pair.mk first second) (Eq.refl first)) p\n#eval unpack (Pair.mk 19 23) (fun q h => q.first + q.second)",
+        "42",
+    );
+}
+
 const VECTORS: &str = "inductive Vec (A : Type) : Nat -> Type where\n  | nil : Vec A 0\n  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\ndef Result (n : Nat) : Type := Vec Nat n\ndef copies (value count : Nat) : Vec Nat count := @Nat.rec Result Vec.nil (fun (n : Nat) (tail : Vec Nat n) => Vec.cons n value tail) count\ndef total (n : Nat) (xs : Vec Nat n) : Nat := by\n  induction xs with\n  | nil => exact 0\n  | cons k x tail ih => exact x + ih\n";
 
 #[test]

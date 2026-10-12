@@ -474,7 +474,17 @@ impl Context {
         // call lowering. Only the precise index-shape refusal selects the
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
-        if parts.equation.is_some() || parts.generated && !recursive {
+        let well_founded = self.well_founded_continuation().is_some();
+        if well_founded && parts.equation.is_some() {
+            // That backend substitutes the whole local dependency cone. A
+            // well-founded call must preserve original captured arguments;
+            // named-equation support needs the same dedicated treatment.
+            return Err(error(MatchError::UnrefinedIndices));
+        }
+        if well_founded && parts.generated && parts.conditional.is_none() {
+            major = self.well_founded_match_input(major)?;
+        }
+        if parts.equation.is_some() || parts.generated && !recursive && !well_founded {
             // Earlier columns may occur in later discriminant types. The
             // shared elimination engine generalizes that entire dependency
             // cone; treating each split as an independent case loses it.
@@ -487,7 +497,7 @@ impl Context {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
                 MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
-            ))) => {
+            ))) if !well_founded => {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = saved;
                 self.txn.budget.heartbeats_consumed = spent;
@@ -647,7 +657,10 @@ impl Context {
         let mut generalized = Vec::new();
         if recursive {
             self.recursive_indices(name, &parameters, &indices)?;
-        } else if !indices.is_empty() {
+        } else if !indices.is_empty() || self.well_founded_continuation().is_some() {
+            // Well-founded matches specialize the private continuation and
+            // dependent hypotheses too. Genuine source lets remain captured,
+            // retaining their original values in recursive call arguments.
             let mut dependencies: HashSet<_> =
                 indices.iter().map(|index| index.id.clone()).collect();
             // Parameters stay fixed. Index domains, however, form a telescope:
@@ -1391,7 +1404,12 @@ impl Context {
         // otherwise a captured let would lose its actual free-variable scope.
         // In particular, obsolete dictionaries must not stay searchable merely
         // because their replacement was given the same name.
-        if !state.generalized.is_empty() {
+        // Well-founded calls may retain old identities through cached proof
+        // transports. Those ambient locals remain privately available, while
+        // ordinary source proof and instance search see the specialized ones.
+        if !state.generalized.is_empty()
+            && !self.hide_well_founded_match_locals(&state.generalized)?
+        {
             let candidates: HashSet<_> = state
                 .generalized
                 .iter()

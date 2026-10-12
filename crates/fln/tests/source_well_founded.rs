@@ -10,6 +10,8 @@ use fln::{
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[path = "support/well_founded_matches.rs"]
+mod well_founded_matches;
 #[path = "support/well_founded_opacity.rs"]
 mod well_founded_opacity;
 
@@ -320,6 +322,7 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
             assert_computations(&base);
             assert_decreasing_refusals(&base);
             assert_explicit_scope_limits(&base);
+            well_founded_matches::assert_match_programs(&base);
             well_founded_opacity::assert_source_opacity_routes(&base);
         })
         .expect("spawn native checking thread")
