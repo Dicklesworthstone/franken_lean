@@ -497,3 +497,61 @@ jobs:
       - name: Check batched and sequential activation against the actual pin
         if: success() || failure()
         run: cargo test --locked --offline -p fln --lib source_check::modules::imported::tests::batched_metadata_activation_equals_one_registration_at_a_time -- --exact --nocapture --test-threads=1
+
+  array-iteration-model:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): extract checked Array traversal models from the pinned library'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'b4f51f04892c5c96c63029203156cd13db8db065'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'b4f51f04892c5c96c63029203156cd13db8db065'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format the model extraction target and record exact bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln/tests/source_imported_arrays.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_ARRAY_MODEL_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_ARRAY_MODEL_RUSTFMT_DIFF_END
+          echo FLN_ARRAY_MODEL_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_ARRAY_MODEL_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Admit the exact imported roots and extract traversal dependency identities
+        run: cargo test --locked --offline -p fln --test source_imported_arrays dump_pinned_array_iteration_model -- --exact --nocapture --test-threads=1
