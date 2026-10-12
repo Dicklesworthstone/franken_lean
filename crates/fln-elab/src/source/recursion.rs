@@ -36,6 +36,7 @@ pub enum RecursionError {
     PartialApplication,
     WellFoundedMeasureRequired,
     WellFoundedRelationUnsupported,
+    WellFoundedMeasureDependsOnVaryingParameter,
     WellFoundedMeasureOrderUnsupported,
     WellFoundedArgumentRequired,
     FixedArgumentConversionUnsupported,
@@ -74,10 +75,13 @@ impl std::fmt::Display for RecursionError {
                 "recursive function escapes without its decreasing argument"
             }
             Self::WellFoundedMeasureRequired => {
-                "well-founded measure inference found no supported Nat-valued parameter; provide an explicit Nat-valued termination_by measure"
+                "well-founded measure inference found no supported Nat-valued parameter; provide an explicit termination_by measure"
             }
             Self::WellFoundedRelationUnsupported => {
                 "Nat-valued termination measures require the active WellFoundedRelation Nat instance to use Nat.lt"
+            }
+            Self::WellFoundedMeasureDependsOnVaryingParameter => {
+                "the termination measure's type and well-founded relation must not depend on the function's varying parameters"
             }
             Self::WellFoundedMeasureOrderUnsupported => {
                 "well-founded inference cannot skip earlier SizeOf or lexicographic measures; provide an explicit Nat-valued termination_by measure"

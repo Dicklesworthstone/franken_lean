@@ -346,6 +346,11 @@ impl Context {
             if !seen.insert(expr.allocation_identity()) {
                 continue;
             }
+            // Unflagged subtrees contain no rigid universe parameters.
+            // Keep the ordering and explicit-unused checks below the scan.
+            if !expr.has_level_param() {
+                continue;
+            }
             let mut levels = Vec::new();
             match expr.node() {
                 ExprNode::Sort { level } => levels.push(level),
@@ -395,5 +400,87 @@ impl Context {
         }
         result.extend(used);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> Context {
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
+        Context::new(&env, budget)
+    }
+
+    fn name(text: &str) -> Name {
+        Name::from_components([text])
+    }
+
+    fn large_closed_natural() -> Expr {
+        let successor = Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new());
+        let mut value = Expr::const_(Name::from_components(["Nat", "zero"]), Vec::new());
+        for _ in 0..4_096 {
+            value = Expr::app(successor.clone(), value);
+        }
+        value
+    }
+
+    #[test]
+    fn closed_declaration_bodies_keep_unused_explicit_level_checks() {
+        let mut context = context();
+        let root = large_closed_natural();
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 32;
+        assert!(
+            context
+                .declaration_levels(std::slice::from_ref(&root))
+                .unwrap()
+                .is_empty()
+        );
+
+        let unused = name("unused");
+        context.level_params = vec![unused.clone()];
+        context.explicit_levels = 1;
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 32;
+        assert_eq!(
+            context
+                .declaration_levels(std::slice::from_ref(&root))
+                .unwrap_err(),
+            error(LevelSyntaxError::Unused(unused))
+        );
+    }
+
+    #[test]
+    fn closed_fragments_preserve_scope_explicit_and_automatic_level_order() {
+        let mut context = context();
+        let scope_z = name("scope_z");
+        let scope_a = name("scope_a");
+        let explicit = name("explicit");
+        let automatic_z = name("automatic_z");
+        let automatic_a = name("automatic_a");
+        context.source_scope.universes =
+            vec![scope_z.clone(), scope_a.clone(), name("unused_scope")];
+        context.level_params = vec![explicit.clone()];
+        context.explicit_levels = 1;
+
+        let sort = |name: &Name| Expr::sort(Level::param(name.clone()));
+        let root = Expr::lam(
+            name("T"),
+            sort(&explicit),
+            large_closed_natural(),
+            BinderInfo::Default,
+        );
+        let roots = [
+            root,
+            sort(&automatic_z),
+            sort(&scope_a),
+            sort(&automatic_a),
+            sort(&scope_z),
+        ];
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 64;
+        assert_eq!(
+            context.declaration_levels(&roots).unwrap(),
+            vec![scope_z, scope_a, explicit, automatic_a, automatic_z]
+        );
     }
 }

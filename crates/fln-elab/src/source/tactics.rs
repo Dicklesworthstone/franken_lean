@@ -1282,7 +1282,18 @@ impl Context {
         let mut arguments = Vec::new();
         loop {
             self.tick()?;
-            if self.proof_types_match(&term.type_, &goal.target)? {
+            let mut budget = UnificationBudget::new(self.kernel);
+            if self
+                .well_founded
+                .as_ref()
+                .is_some_and(|state| state.proving)
+            {
+                // WF obligations retain ordinary conversion after clean_wf;
+                // selected relation dictionaries must match constructor
+                // conclusions without opening irreducible definitions.
+                budget.transparency = UnificationTransparency::Default;
+            }
+            if self.proof_types_match_with_budget(&term.type_, &goal.target, budget)? {
                 break;
             }
             term.type_ = self.whnf(&term.type_)?;

@@ -1,6 +1,6 @@
-//! Explicit and inferred Nat measures use the kernel-checked `WellFounded.Nat.fix`
-//! on the native VM. Proofs run in the source branch's local context and every
-//! surviving recursive obligation must be discharged.
+//! Nat measures retain their checked specialized fixpoint; explicitly selected
+//! general relations use the imported checked `WellFounded.fix` computation rule.
+//! Every surviving recursive obligation must be discharged before native execution.
 #![forbid(unsafe_code)]
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
@@ -14,10 +14,14 @@ use std::path::{Path, PathBuf};
 mod well_founded_arguments;
 #[path = "support/well_founded_inference.rs"]
 mod well_founded_inference;
+#[path = "support/well_founded_lex.rs"]
+mod well_founded_lex;
 #[path = "support/well_founded_matches.rs"]
 mod well_founded_matches;
 #[path = "support/well_founded_opacity.rs"]
 mod well_founded_opacity;
+#[path = "support/well_founded_relations.rs"]
+mod well_founded_relations;
 
 const STACK: usize = 256 * 1024 * 1024;
 
@@ -296,7 +300,7 @@ fn assert_decreasing_refusals(base: &Engine) {
 
 fn assert_remaining_scope_limits(base: &Engine) {
     for source in [
-        // This slice retains a Nat-valued measure, not an arbitrary relation.
+        // A scalar Nat proof does not establish the selected product relation.
         "def pairMeasure (a b : Nat) : Nat := if h : 0 < a then pairMeasure 0 (b + 1) else 0\ntermination_by (a, b)\ndecreasing_by exact h",
         // Declaration metadata is attached only by the supported actual-def path.
         "abbrev otherKind (n : Nat) : Nat := if h : 0 < n then otherKind 0 else 0\ntermination_by n\ndecreasing_by exact h",
@@ -408,6 +412,7 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
             well_founded_matches::assert_match_programs(&base);
             well_founded_arguments::assert_argument_programs(&base);
             well_founded_opacity::assert_source_opacity_routes(&base);
+            well_founded_relations::assert_relation_requires_computability(&base);
         })
         .expect("spawn native checking thread")
         .join()
@@ -423,11 +428,32 @@ fn native_automatic_well_founded_termination() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let base = import_closure_for(&lib, &["Init.WFTactics", "Init.Omega"]);
+            let base =
+                import_closure_for(&lib, &["Init.WFTactics", "Init.Omega", "Init.WFComputable"]);
             well_founded_inference::assert_automatic_termination(&base);
             well_founded_inference::assert_search_stops(&base);
+            well_founded_lex::assert_automatic_lexicographic_proofs(&base);
+            well_founded_lex::assert_automatic_lexicographic_refusals(&base);
         })
         .expect("spawn native inference checking thread")
         .join()
         .expect("native well-founded inference checks finish");
+}
+
+#[test]
+fn native_generic_well_founded_relations() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = import_closure_for(&lib, &["Init.WFComputable"]);
+            well_founded_relations::assert_relation_programs(&base);
+            well_founded_relations::assert_relation_execution_budget(&base);
+        })
+        .expect("spawn native general-relation checking thread")
+        .join()
+        .expect("native general-relation checks finish");
 }

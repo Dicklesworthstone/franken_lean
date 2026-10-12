@@ -9,6 +9,7 @@ use super::*;
 use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
+mod conditional_order;
 mod mutual;
 mod nomatch;
 
@@ -119,6 +120,7 @@ pub(super) struct MatchBuild<'a> {
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
+    conditional_order: Option<conditional_order::ConditionalOrder>,
 }
 pub(super) struct BranchBinders {
     // Old indices whose direct field patterns lack an index-equation witness.
@@ -637,6 +639,7 @@ impl Context {
                     // Replaced by the checked body before completion.
                     recursor: major,
                     branches: std::collections::VecDeque::new(),
+                    conditional_order: None,
                 });
             }
         }
@@ -818,6 +821,12 @@ impl Context {
                 syntax,
             });
         }
+        let conditional_order = self.order_well_founded_conditional(
+            parts.conditional.is_some(),
+            name,
+            &recursor,
+            &mut branches,
+        )?;
         Ok(MatchBuild {
             direct: None,
             recursive,
@@ -833,6 +842,7 @@ impl Context {
             levels: levels.clone(),
             recursor,
             branches,
+            conditional_order,
         })
     }
 
@@ -1237,13 +1247,18 @@ impl Context {
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-        let type_ = self.whnf(&state.recursor.type_)?;
-        let ExprNode::ForallE {
-            binder_type: minor_type,
-            ..
-        } = type_.node()
-        else {
-            return Err(error(MatchError::UnsupportedFamily));
+        let minor_type = if let Some(order) = &mut state.conditional_order {
+            self.next_ordered_conditional_domain(order)?
+        } else {
+            let type_ = self.whnf(&state.recursor.type_)?;
+            let ExprNode::ForallE {
+                binder_type: minor_type,
+                ..
+            } = type_.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            minor_type.clone()
         };
         let mut target = minor_type.clone();
         let mut locals = Vec::new();
@@ -1557,13 +1572,13 @@ impl Context {
             };
             return Ok(());
         }
-        state.recursor = self.match_apply(
-            state.recursor.clone(),
-            Typed {
-                value,
-                type_: binders.type_,
-            },
-        )?;
+        let value = Typed {
+            value,
+            type_: binders.type_,
+        };
+        if !self.accept_ordered_conditional_minor(state, value.clone())? {
+            state.recursor = self.match_apply(state.recursor.clone(), value)?;
+        }
         Ok(())
     }
 }

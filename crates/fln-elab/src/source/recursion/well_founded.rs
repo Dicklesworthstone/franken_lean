@@ -1,15 +1,17 @@
-//! Nat-valued measures for changing arguments, using the pin's checked
-//! `WellFounded.Nat.fix`. Recursive calls become a typed continuation and an
-//! explicit proof obligation; the source tactic engine must solve every one.
+//! Explicit measures use the selected checked `WellFoundedRelation` through
+//! `invImage` and `WellFounded.fix`. The ordinary Nat relation uses the pin's
+//! `WellFounded.Nat.fix` specialization. Recursive calls become a typed
+//! continuation and a proof obligation; the source tactics solve every one.
 //!
 //! Varying parameters use `Meta.ArgsPacker`'s dependent PSigma encoding.
 //! Fixed arguments are captured at their actual telescope positions. Missing
 //! measures try Nat parameters in the pin's telescope order, with active
 //! SizeOf and well-founded instances checked. Missing proofs use native
-//! simplification, assumptions and omega. Mutual groups, arbitrary
-//! SizeOf/lexicographic search and non-Nat relations remain separate
-//! elaboration work.
+//! simplification, assumptions and omega. Mutual groups and arbitrary
+//! SizeOf/lexicographic measure inference remain separate elaboration work.
 mod packing;
+mod relation;
+mod scopes;
 
 use super::*;
 use fln_env::constants::ConstantInfo;
@@ -42,9 +44,15 @@ pub(in crate::source) struct State {
     parameters: Vec<LocalDecl>,
     varying: Vec<usize>,
     fixed: Vec<(usize, LocalDecl)>,
+    /// These parameters occur in the selected measure's type or dictionary.
+    /// Unlike other fixed parameters, allowing one to vary would change the
+    /// relation while descending through a single checked fixpoint.
+    measure_captures: HashSet<usize>,
+    natural_measure: bool,
     continuation: LocalDecl,
     proof_inaccessible: Vec<FVarId>,
     proof_hidden: HashSet<Name>,
+    branch_scopes: Vec<Name>,
     calls: HashMap<Expr, CachedCall>,
     goals: Vec<Obligation>,
     pub proving: bool,
@@ -81,6 +89,7 @@ enum MeasureProbe {
 #[derive(Clone)]
 struct CachedCall {
     scope: FVarId,
+    branch_scope: Option<Name>,
     value: Expr,
 }
 
@@ -176,9 +185,9 @@ pub(in crate::source) fn hint(syntax: &Syntax) -> Result<Option<Hint<'_>>, NatDe
     }))
 }
 
-/// The Nat fragment of the pin's decreasing_tactic after the checked
-/// continuation has exposed InvImage and its measure. This is native syntax
-/// expansion; no Reference metaprogram implementation is executed.
+/// The pin's lexicographic constructor prefix and Nat base-case fragment of
+/// decreasing_tactic after the checked continuation has exposed its measure.
+/// This is native syntax expansion; no Reference metaprogram is executed.
 fn automatic_decreasing_proof() -> Syntax {
     fn null(args: Vec<Syntax>) -> Syntax {
         Syntax::node(Name::from_components(["null"]), args)
@@ -202,6 +211,48 @@ fn automatic_decreasing_proof() -> Syntax {
             )],
         )
     }
+    fn first(tactics: Vec<Syntax>) -> Syntax {
+        Syntax::node(
+            parser_kind(&["Tactic", "first"]),
+            vec![
+                atom("first"),
+                null(
+                    tactics
+                        .into_iter()
+                        .map(|tactic| {
+                            Syntax::node(
+                                Name::from_components(["group"]),
+                                vec![atom("|"), sequence(vec![tactic])],
+                            )
+                        })
+                        .collect(),
+                ),
+            ],
+        )
+    }
+    fn lexicographic_constructors(family: &str) -> Syntax {
+        // Preserve the pin's right-before-left order. A right constructor
+        // commits only when the first coordinate is definitionally equal.
+        let alternatives = ["right", "left"]
+            .into_iter()
+            .map(|constructor| {
+                let identifier = Syntax::Ident {
+                    info: fln_syntax::source::SourceInfo::None,
+                    raw_val: fln_syntax::source::ByteSpan::default(),
+                    val: Name::from_components(["_root_", family, "Lex", constructor]),
+                    preresolved: Vec::new(),
+                };
+                Syntax::node(
+                    parser_kind(&["Tactic", "apply"]),
+                    vec![atom("apply"), identifier],
+                )
+            })
+            .collect();
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticRepeat_"]),
+            vec![atom("repeat"), sequence(vec![first(alternatives)])],
+        )
+    }
     let simp = Syntax::node(
         parser_kind(&["Tactic", "simp"]),
         vec![
@@ -220,13 +271,7 @@ fn automatic_decreasing_proof() -> Syntax {
             if name == "omega" {
                 args.push(null(Vec::new()));
             }
-            Syntax::node(
-                Name::from_components(["group"]),
-                vec![
-                    atom("|"),
-                    sequence(vec![Syntax::node(parser_kind(&["Tactic", name]), args)]),
-                ],
-            )
+            Syntax::node(parser_kind(&["Tactic", name]), args)
         })
         .collect();
     sequence(vec![
@@ -234,10 +279,9 @@ fn automatic_decreasing_proof() -> Syntax {
             parser_kind(&["Tactic", "tacticTry_"]),
             vec![atom("try"), sequence(vec![simp])],
         ),
-        Syntax::node(
-            parser_kind(&["Tactic", "first"]),
-            vec![atom("first"), null(alternatives)],
-        ),
+        lexicographic_constructors("Prod"),
+        lexicographic_constructors("PSigma"),
+        first(alternatives),
     ])
 }
 
@@ -332,11 +376,14 @@ impl Context {
         hint: &Hint<'_>,
         parameters: &[LocalDecl],
         header_parameters: usize,
-    ) -> Result<Expr, NatDefinitionElabError> {
+    ) -> Result<Typed, NatDefinitionElabError> {
         if let Some(index) = hint.inferred {
             return parameters
                 .get(index)
-                .map(|parameter| Expr::fvar(parameter.id.clone()))
+                .map(|parameter| Typed {
+                    value: Expr::fvar(parameter.id.clone()),
+                    type_: parameter.type_.clone(),
+                })
                 .ok_or_else(|| failure(SourceInferenceError::Scope));
         }
         let syntax = hint
@@ -367,14 +414,13 @@ impl Context {
         }
         self.txn.lctx = locals;
         let result = (|| {
-            let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-            let term = self.term(syntax, Some(nat.clone()))?;
-            self.constrain_type(&term.type_, &nat)?;
+            let term = self.term(syntax, None)?;
+            self.resolve_instances_with_defaults()?;
             let term = self.finish_open_universes(term)?;
             // An arbitrary measure is checked as source, including unused let
             // initializers and annotations; it is also retained in the final
             // fixpoint application for both admission engines to validate.
-            Ok(term.value)
+            Ok(term)
         })();
         self.txn.lctx = saved;
         self.defining = defining;
@@ -390,11 +436,6 @@ impl Context {
         hint: &Hint<'_>,
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
-        // WF.Rel.elabWFRel synthesizes this dictionary even for an explicit
-        // Nat measure. Nat.fix can only represent the usual Nat relation.
-        if !self.native_nat_well_founded_relation()? {
-            return Err(error(RecursionError::WellFoundedRelationUnsupported));
-        }
         if hint.measure.is_some() {
             return match self.well_founded_selected_body(
                 name,
@@ -408,6 +449,11 @@ impl Context {
                 Attempt::SelectedFailure(problem) => Err(problem),
                 Attempt::Repack(_) => Err(failure(SourceInferenceError::Scope)),
             };
+        }
+        // Automatic inference remains the direct-Nat slice. Explicit measures
+        // select their own dictionary after their actual type is elaborated.
+        if !self.native_nat_well_founded_relation()? {
+            return Err(error(RecursionError::WellFoundedRelationUnsupported));
         }
         // GuessLex walks the varying parameter telescope in order. This slice
         // supports direct Nat measures; fixed positions are discarded after
@@ -551,15 +597,19 @@ impl Context {
         hint: &Hint<'_>,
         header_parameters: usize,
     ) -> Result<Attempt, NatDefinitionElabError> {
+        let measure = self.well_founded_measure(hint, parameters, header_parameters)?;
+        let measure = self.select_well_founded_relation(measure, parameters)?;
         let snapshot = self.clone();
-        let mut varying: Vec<_> = (0..parameters.len()).collect();
+        let mut varying: Vec<_> = (0..parameters.len())
+            .filter(|index| !measure.captures.contains(index))
+            .collect();
         loop {
             let result = self.well_founded_attempt(
                 name,
                 parameters,
                 &varying,
                 (syntax, expected.clone()),
-                hint,
+                (hint, &measure),
                 header_parameters,
             )?;
             match result {
@@ -588,7 +638,7 @@ impl Context {
         parameters: &[LocalDecl],
         varying: &[usize],
         (syntax, expected): (&Syntax, Option<Expr>),
-        hint: &Hint<'_>,
+        (hint, measure): (&Hint<'_>, &relation::Measure),
         header_parameters: usize,
     ) -> Result<Attempt, NatDefinitionElabError> {
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
@@ -602,36 +652,17 @@ impl Context {
         if self.well_founded.is_some() {
             return Err(error(RecursionError::WellFoundedArgumentRequired));
         }
-        let measure = self.well_founded_measure(hint, parameters, header_parameters)?;
         let saved = self.txn.lctx.clone();
         let domain = self.well_founded_domain(&varying_parameters)?;
         let motive = self.well_founded_motive(&varying_parameters, &domain, &expected)?;
-        let measure_fn = self.uncurry_well_founded_value(
-            &varying_parameters,
-            Typed {
-                value: measure,
-                type_: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
-            },
-        )?;
+        let measure_fn =
+            self.uncurry_well_founded_value(&varying_parameters, measure.value.clone())?;
         let current_arguments: Vec<_> = varying_parameters
             .iter()
             .map(|parameter| Expr::fvar(parameter.id.clone()))
             .collect();
         let current = self.pack_well_founded_arguments(&domain, &current_arguments)?;
-        let fix_name = Name::from_components(["WellFounded", "Nat", "fix"]);
-        if !matches!(
-            self.txn.env.find(&fix_name),
-            Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe
-        ) {
-            return Err(failure(SourceInferenceError::UnknownConstant(fix_name)));
-        }
-        let mut fix = self.constant(&fix_name)?;
-        for value in [domain, motive, measure_fn.value] {
-            let type_ = self
-                .known_type(&value)?
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-            fix = self.match_apply(fix, Typed { value, type_ })?;
-        }
+        let fix = self.well_founded_fix(domain, motive, measure_fn.value, measure)?;
         let fix_type = self.whnf(&fix.type_)?;
         let ExprNode::ForallE {
             binder_type: functional_type,
@@ -701,12 +732,15 @@ impl Context {
                 .filter(|(index, _)| !varying.contains(index))
                 .map(|(index, parameter)| (index, parameter.clone()))
                 .collect(),
+            measure_captures: measure.captures.clone(),
+            natural_measure: measure.natural,
             continuation: continuation.clone(),
             proof_inaccessible: parameters[header_parameters..]
                 .iter()
                 .map(|parameter| parameter.id.clone())
                 .collect(),
             proof_hidden: HashSet::new(),
+            branch_scopes: Vec::new(),
             calls: HashMap::new(),
             goals: Vec::new(),
             proving: false,
@@ -794,7 +828,7 @@ impl Context {
                 }
                 let proof_result = (|| {
                     // Final cleanup has already inspected the raw InvImage.
-                    // Only now expose the Nat operands and local let values.
+                    // Only now expose measure operands and local let values.
                     let goals = self.normalize_decreasing_goals(goals)?;
                     if hint.decreasing.is_some() {
                         // The user's final script sees all obligations in the
@@ -1047,16 +1081,23 @@ impl Context {
         zeta_delta: bool,
     ) -> Result<Expr, NatDefinitionElabError> {
         let (head, arguments) = operators::spine(target);
-        if !matches!(head.node(), ExprNode::Const { name, .. }
-            if name == &Name::from_components(["Nat", "lt"])
-                || name == &Name::from_components(["Nat", "le"]))
-            || arguments.len() != 2
-        {
+        let Some((current, prefix)) = arguments.split_last() else {
             return Err(failure(SourceInferenceError::Scope));
+        };
+        let Some((smaller, relation_arguments)) = prefix.split_last() else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut relation = head;
+        for argument in relation_arguments {
+            self.tick()?;
+            relation = Expr::app(relation, argument.clone());
         }
-        let smaller = self.reduce_decreasing_operand(&arguments[0], zeta_delta)?;
-        let current = self.reduce_decreasing_operand(&arguments[1], zeta_delta)?;
-        Ok(Expr::app(Expr::app(head, smaller), current))
+        if zeta_delta {
+            relation = self.clean_decreasing_relation(&relation)?;
+        }
+        let smaller = self.reduce_decreasing_operand(smaller, zeta_delta)?;
+        let current = self.reduce_decreasing_operand(current, zeta_delta)?;
+        Ok(Expr::app(Expr::app(relation, smaller), current))
     }
 
     fn reduce_decreasing_operand(
@@ -1512,37 +1553,18 @@ impl Context {
         Ok(goals)
     }
 
-    /// `clean_wf` exposes the Nat measure at the actual branch input. Read it
+    /// `clean_wf` exposes the measure at the actual branch input. Read it
     /// from the checked fixpoint continuation, so a match refines the current
     /// argument without rewriting unrelated captured source variables.
     fn decreasing_target(&mut self, raw_target: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        let mut head = raw_target;
-        let mut arguments = Vec::new();
-        while let ExprNode::App { f, a } = head.node() {
-            self.tick()?;
-            arguments.push(a.clone());
-            head = f;
-        }
-        if !matches!(head.node(), ExprNode::Const { name, .. }
-            if name == &Name::from_components(["InvImage"]))
-            || arguments.len() != 6
-        {
-            return Err(failure(SourceInferenceError::ExpectedType));
-        }
-        arguments.reverse();
-        let measure = self.whnf(&arguments[3])?;
+        let (relation, measure, next, current) = self.decreasing_relation_parts(raw_target)?;
+        let measure = self.whnf(&measure)?;
         let ExprNode::Lam { body, .. } = measure.node() else {
             return Err(failure(SourceInferenceError::ExpectedFunction));
         };
-        let smaller = self.substitute(body, &arguments[4])?;
-        let current = self.substitute(body, &arguments[5])?;
-        Ok(Expr::app(
-            Expr::app(
-                Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new()),
-                smaller,
-            ),
-            current,
-        ))
+        let smaller = self.substitute(body, &next)?;
+        let current = self.substitute(body, &current)?;
+        Ok(Expr::app(Expr::app(relation, smaller), current))
     }
 
     /// Let values remain let values in both telescopes. Making an arbitrary
@@ -1609,12 +1631,18 @@ impl Context {
         // Do not copy the growing obligation list on each source application.
         // Only an actual saturated self call needs these small snapshots.
         let fixed = state.fixed.clone();
+        let measure_captures = state.measure_captures.clone();
         let varying = state.varying.clone();
         let proof_inaccessible = state.proof_inaccessible.clone();
         arguments.reverse();
         for (index, parameter) in &fixed {
             self.tick()?;
             if !self.fixed_well_founded_argument(&arguments[*index], parameter)? {
+                if measure_captures.contains(index) {
+                    return Err(error(
+                        RecursionError::WellFoundedMeasureDependsOnVaryingParameter,
+                    ));
+                }
                 return Err(error(RecursionError::ChangedParameter));
             }
         }
@@ -1640,9 +1668,11 @@ impl Context {
             .expect("active recursive call")
             .calls
             .get(&call)
+            .cloned()
             && self.txn.lctx.find(&cached.scope).is_some()
+            && self.well_founded_cached_scope(cached.branch_scope.as_ref())?
         {
-            return Ok(cached.value.clone());
+            return Ok(cached.value);
         }
         let continuation = self
             .well_founded_continuation()
@@ -1768,10 +1798,12 @@ impl Context {
             captures,
             arguments: call_arguments,
         });
+        let branch_scope = active.branch_scopes.last().cloned();
         active.calls.insert(
             call,
             CachedCall {
                 scope,
+                branch_scope,
                 value: result.clone(),
             },
         );
