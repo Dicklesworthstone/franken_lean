@@ -1,0 +1,73 @@
+name: Checked empty-match implementation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/fln-empty-matches/**'
+      - '.github/workflows/fln-empty-matches-landing.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-empty-matches-landing
+  cancel-in-progress: false
+
+jobs:
+  implement-test-land:
+    if: github.repository == 'Dicklesworthstone/franken_lean'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - name: Record the exact candidate base and install pinned Rust
+        run: |
+          git rev-parse HEAD
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fln-empty-matches
+          cache-on-failure: true
+      - name: Prove the new positive regression fails before implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/patches/fln-empty-matches/apply.py tests
+          mkdir -p "$RUNNER_TEMP/empty-match-evidence"
+          set +e
+          cargo test --locked -p fln --test source_nomatch false_elimination_keeps_the_admitted_recursor -- --exact > "$RUNNER_TEMP/empty-match-evidence/before.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/empty-match-evidence/before.log"
+          test "$status" -ne 0
+          grep -F 'false_elimination_keeps_the_admitted_recursor ... FAILED' "$RUNNER_TEMP/empty-match-evidence/before.log"
+          grep -F 'unexpected syntax' "$RUNNER_TEMP/empty-match-evidence/before.log"
+      - name: Apply native elaboration and format only changed source files
+        run: |
+          python3 .github/patches/fln-empty-matches/apply.py implementation
+          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/source.rs crates/fln-elab/src/source/matching.rs crates/fln-elab/src/source/matching/nomatch.rs crates/fln/tests/source_nomatch.rs
+          git diff --check
+      - name: Check successful elimination, contradictions and atomic refusal
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --test source_nomatch 2>&1 | tee "$RUNNER_TEMP/empty-match-evidence/after.log"
+          cargo clippy --locked -p fln --test source_nomatch --no-deps -- -D warnings 2>&1 | tee "$RUNNER_TEMP/empty-match-evidence/clippy.log"
+      - name: Publish only the tested source changes directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD)
+          git fetch origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$base"
+          git add crates/fln-elab/src/source.rs crates/fln-elab/src/source/matching.rs crates/fln-elab/src/source/matching/nomatch.rs crates/fln/tests/source_nomatch.rs
+          git diff --cached --stat
+          git -c user.name='ChatGPT' -c user.email='noreply@openai.com' commit -m 'feat(elab): elaborate empty matches through checked case equations' -m 'Connect single-discriminant nomatch to the existing dependent case compiler. Require retained contradiction proofs for impossible indices and preserve coverage refusal for every surviving branch. Keep computed discriminants, dependent targets and both checking engines unchanged.' -m "Validation: the new positive regression failed on the exact parent before implementation; all seven source_nomatch integration tests and target Clippy pass on pinned Rust. GitHub Actions run ${GITHUB_RUN_ID}. No new kernel rules, axioms or dependencies. Multiple discriminants and nofun remain follow-up work."
+          git push origin HEAD:main
+          git rev-parse HEAD
