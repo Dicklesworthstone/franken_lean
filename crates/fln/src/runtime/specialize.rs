@@ -82,7 +82,10 @@ impl Preparation<'_> {
     /// and its Prop result; a decision procedure is a separate runtime argument.
     /// Original binder domains keep genuine type/value dependencies open, and
     /// unknown universes never become evidence for a Prop-valued parameter.
-    fn erased_proposition_argument(&mut self, domain: &Expr) -> Result<Option<Expr>, IngressError> {
+    pub(super) fn erased_proposition_argument(
+        &mut self,
+        domain: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
         let mut type_ = domain.clone();
         let mut binders = Vec::new();
         loop {

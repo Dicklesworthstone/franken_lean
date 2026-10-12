@@ -118,7 +118,10 @@ impl Preparation<'_> {
     }
 
     /// Replace each value-parameter argument of a data family with the erased
-    /// marker, without inspecting it. Static type arguments are unchanged.
+    /// marker, without inspecting it. Static propositions and predicates use
+    /// the same canonical arguments as function specialization, so a supplied
+    /// motive and its specialized recursor retain exactly the same carrier.
+    /// Other static type arguments keep their actual representation.
     pub(super) fn runtime_parameters(
         &mut self,
         family: &InductiveVal,
@@ -129,15 +132,31 @@ impl Preparation<'_> {
             return Ok(None);
         };
         let erased = self.erased_parameter()?;
+        let pending = pending_parameter();
+        let mut type_ =
+            self.universe_instance(&family.base.type_, &family.base.level_params, levels)?;
         let mut result = Vec::new();
         for (parameter, value) in parameters.iter().zip(values) {
             self.tick()?;
-            reserve(&mut result, self.limits.max_application_args)?;
-            result.push(if value {
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            let parameter = if value {
                 erased.clone()
             } else {
-                parameter.clone()
-            });
+                self.erased_proposition_argument(binder_type)?
+                    .unwrap_or_else(|| parameter.clone())
+            };
+            // A later predicate may depend on earlier static parameters. A
+            // runtime value stays unresolved; it must not fabricate a closed
+            // domain for a genuinely value-dependent type argument.
+            type_ = self.substitution(body, if value { &pending } else { &parameter })?;
+            reserve(&mut result, self.limits.max_application_args)?;
+            result.push(parameter);
         }
         Ok(Some(result))
     }
@@ -238,8 +257,9 @@ impl Preparation<'_> {
                     }
                     let mut normal = self.type_head(&source)?;
                     let (head, args) = self.spine(&normal)?;
-                    if let Some(decision) = self.decision_representation(&head, &args)? {
-                        normal = decision;
+                    let decision = self.decision_representation(&head, &args)?;
+                    if let Some(decision) = &decision {
+                        normal = decision.clone();
                     }
                     if let Some(carrier) = self.quotient_carrier(&head, &args)? {
                         // A quotient has its carrier's representation. Reenter
@@ -251,7 +271,10 @@ impl Preparation<'_> {
                         work.push(Work::Enter(carrier));
                         continue;
                     }
-                    if let ExprNode::Const { name, levels } = head.node()
+                    // Keep the checked Decidable representative selected above;
+                    // generic predicate erasure must not replace its carrier.
+                    if decision.is_none()
+                        && let ExprNode::Const { name, levels } = head.node()
                         && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)
                         && args.len()
                             == (family.num_params as usize)

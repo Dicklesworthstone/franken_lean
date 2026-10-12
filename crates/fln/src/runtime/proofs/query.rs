@@ -177,7 +177,19 @@ fn classify(
                     omitted_depth,
                 )?
                 else {
-                    return Ok(None);
+                    // Receiver recovery does not infer the sort of a Pi. A
+                    // predicate application may expose one only after beta,
+                    // zeta or projection reduction, including the canonical
+                    // `forall P : Prop, P -> P` used by specialization. Inspect
+                    // that whole proposition before erasure visits its parts.
+                    // Keep known sorts on the inference path so discarded
+                    // predicate indices never need to be normalized here.
+                    let normal = preparation.type_head(&type_)?;
+                    if normal == type_ {
+                        return Ok(None);
+                    }
+                    type_ = normal;
+                    continue;
                 };
                 let sort = preparation.type_head(&sort)?;
                 return Ok(match sort.node() {

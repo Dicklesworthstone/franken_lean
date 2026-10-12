@@ -142,6 +142,84 @@ decreasing_by exact h"#,
     ),
 ];
 
+const DEPENDENT_PROGRAMS: &[(&str, &str, &str)] = &[
+    (
+        "dependentArguments",
+        DEPENDENT,
+        "dependentArguments 42 (Fin.mk 0 (Nat.succ_pos 42)) + 42",
+    ),
+    (
+        "dependentAccum",
+        r#"def dependentAccum (n : Nat) (p : Fin (Nat.succ n)) : Nat :=
+  if h : 0 < n then dependentAccum (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) + p.val + 1 else p.val
+termination_by n
+decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)"#,
+        "dependentAccum 21 (Fin.mk 21 (by decide))",
+    ),
+    (
+        "dependentChain",
+        r#"def dependentChain (n : Nat) (p : Fin (Nat.succ n)) (q : Fin (Nat.succ p.val)) : Nat :=
+  if h : 0 < n then dependentChain (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) (Fin.mk 0 (Nat.succ_pos 0)) + p.val + q.val else p.val + q.val
+termination_by n
+decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)"#,
+        "dependentChain 42 (Fin.mk 21 (by decide)) (Fin.mk 21 (by decide))",
+    ),
+    (
+        "dependentFixed",
+        r#"def dependentFixed (n step : Nat) (p : Fin (Nat.succ n)) : Nat :=
+  if h : 0 < n then dependentFixed (n - 1) step (Fin.mk 0 (Nat.succ_pos (n - 1))) + p.val + step else p.val
+termination_by n
+decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)"#,
+        "dependentFixed 20 2 (Fin.mk 2 (by decide))",
+    ),
+    (
+        "dependentResult",
+        r#"def dependentResult (n : Nat) (p : Fin (Nat.succ n)) : Fin (Nat.succ n) := match n with
+  | 0 => p
+  | k + 1 =>
+    let r := dependentResult k (Fin.mk 0 (Nat.succ_pos k))
+    Fin.mk (Nat.succ r.val) (Nat.succ_lt_succ r.isLt)
+termination_by n
+decreasing_by exact Nat.lt_succ_self k"#,
+        "(dependentResult 42 (Fin.mk 0 (Nat.succ_pos 42))).val",
+    ),
+    (
+        "dependentProofParam",
+        r#"def dependentProofParam (n : Nat) (h : 0 < Nat.succ n) : Nat :=
+  let p := Fin.mk 0 h
+  if hn : 0 < n then dependentProofParam (n - 1) (Nat.succ_pos (n - 1)) + p.val + 1 else p.val
+termination_by n
+decreasing_by exact Nat.sub_lt hn (Nat.succ_pos 0)"#,
+        "dependentProofParam 42 (Nat.succ_pos 42)",
+    ),
+    (
+        "dependentContext",
+        r#"def dependentContext (n : Nat) (p : Fin (Nat.succ n)) : Nat :=
+  if h : 0 < n then dependentContext (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) + p.val + 1 else p.val
+termination_by n
+decreasing_by
+  have retained : Fin (Nat.succ n) := p
+  exact Nat.sub_lt h (Nat.succ_pos 0)"#,
+        "dependentContext 21 (Fin.mk 21 (by decide))",
+    ),
+    (
+        "dependentLambda",
+        r#"def dependentLambda : (n : Nat) -> Fin (Nat.succ n) -> Nat := fun n p =>
+  if h : 0 < n then dependentLambda (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) + p.val + 1 else p.val
+termination_by remaining position => remaining
+decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)"#,
+        "dependentLambda 21 (Fin.mk 21 (by decide))",
+    ),
+    (
+        "dependentTwice",
+        r#"def dependentTwice (n : Nat) (p : Fin (Nat.succ n)) : Nat :=
+  if h : 0 < n then dependentTwice (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) + dependentTwice (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) + p.val else 21 + p.val
+termination_by n
+decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)"#,
+        "dependentTwice 1 (Fin.mk 0 (Nat.succ_pos 1))",
+    ),
+];
+
 const REFUSALS: &[&str] = &[
     // Changing arguments do not make a nondecreasing call or a wrong proof valid.
     "def bad (a b : Nat) : Nat := if h : 0 < b then bad b b else a\ntermination_by b\ndecreasing_by exact Nat.mod_lt a h",
@@ -165,8 +243,21 @@ const REFUSALS: &[&str] = &[
     "def bad : Nat -> Nat -> Nat := fun acc n => if h : 0 < n then bad (acc + 1) (n - 1) else acc\ntermination_by initial remaining => remaining\ndecreasing_by exact @Nat.sub_lt n 1 h (Nat.succ_pos 0)",
 ];
 
-// Accepted by the pin, but intentionally outside this independent-telescope
-// slice: the type of p depends on a different varying argument.
+const DEPENDENT_REFUSALS: &[&str] = &[
+    // A dependent argument must have the new index, even when its old value
+    // happens to fit some smaller inputs at runtime.
+    "def bad (n : Nat) (p : Fin (Nat.succ n)) : Nat := if h : 0 < n then bad (n - 1) p else p.val\ntermination_by n\ndecreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)",
+    "def bad (n : Nat) (p : Fin (Nat.succ n)) (q : Fin (Nat.succ p.val)) : Nat := if h : 0 < n then bad (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) q else p.val + q.val\ntermination_by n\ndecreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)",
+    // Correctly packed arguments do not discharge false decreasing goals.
+    "def bad (n : Nat) (p : Fin (Nat.succ n)) : Nat := if h : 0 < n then bad n (Fin.mk 0 (Nat.succ_pos n)) else p.val\ntermination_by n\ndecreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)",
+    "def bad (n : Nat) (p : Fin (Nat.succ n)) : Nat := if h : 0 < n then bad (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) else p.val\ntermination_by n\ndecreasing_by exact Nat.succ_pos n",
+    // Post-colon names and independent fixed parameters stay inaccessible.
+    "def bad : (n : Nat) -> Fin (Nat.succ n) -> Nat := fun n p => if h : 0 < n then bad (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) else p.val\ntermination_by remaining position => remaining\ndecreasing_by\n  have inaccessible : Fin (Nat.succ n) := p\n  exact Nat.sub_lt h (Nat.succ_pos 0)",
+    "def bad (n step : Nat) (p : Fin (Nat.succ n)) : Nat := if h : 0 < n then bad (n - 1) step (Fin.mk 0 (Nat.succ_pos (n - 1))) + step else p.val\ntermination_by n\ndecreasing_by\n  have inaccessible : Nat := step\n  exact Nat.sub_lt h (Nat.succ_pos 0)",
+];
+
+// This original pin-accepted frontier now runs beside the programs that use
+// their dependent values, dependent result types, and branch proof contexts.
 const DEPENDENT: &str = r#"def dependentArguments (n : Nat) (p : Fin (Nat.succ n)) : Nat :=
   if h : 0 < n then dependentArguments (n - 1) (Fin.mk 0 (Nat.succ_pos (n - 1))) else 0
 termination_by n
@@ -193,9 +284,9 @@ decreasing_by exact Nat.sub_lt hn (Nat.succ_pos 0)"#;
 
 pub(super) fn assert_argument_programs(base: &Engine) {
     let mut failures = Vec::new();
-    // All sixteen accepted sources compute 42 on the live v4.32.0 pin; each
-    // refusal above was independently rejected with its intended diagnostic.
-    for (name, definition, application) in PROGRAMS {
+    // Every accepted source computes 42 on the live v4.32.0 pin; each refusal
+    // was independently rejected with its intended diagnostic.
+    for (name, definition, application) in PROGRAMS.iter().chain(DEPENDENT_PROGRAMS) {
         let source = format!("{definition}\ndef answer : Nat := {application}");
         match base.execute_source_definitions(
             &[source.as_bytes()],
@@ -220,7 +311,7 @@ pub(super) fn assert_argument_programs(base: &Engine) {
             Err(error) => failures.push(format!("{name}: {error:?}")),
         }
     }
-    for source in REFUSALS {
+    for source in REFUSALS.iter().chain(DEPENDENT_REFUSALS) {
         if base
             .check_source_files(
                 &[source.as_bytes()],
@@ -233,7 +324,6 @@ pub(super) fn assert_argument_programs(base: &Engine) {
         }
     }
     for (source, diagnostic) in [
-        (DEPENDENT, "DependentWellFoundedArguments"),
         (PROOF_CONVERSION, "FixedArgumentConversionUnsupported"),
         (UNIT_PROOF_CONVERSION, "FixedArgumentConversionUnsupported"),
     ] {

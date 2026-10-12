@@ -2,10 +2,10 @@
 //! `WellFounded.Nat.fix`. Recursive calls become a typed continuation and an
 //! explicit proof obligation; the source tactic engine must solve every one.
 //!
-//! Independent varying parameters use `Meta.ArgsPacker`'s PSigma encoding.
+//! Varying parameters use `Meta.ArgsPacker`'s dependent PSigma encoding.
 //! Fixed arguments are captured at their actual telescope positions. Mutual
-//! groups, dependent varying telescopes, automatic measure search, and non-Nat
-//! well-founded relations remain separate elaboration work.
+//! groups, automatic measure search, and non-Nat well-founded relations remain
+//! separate elaboration work.
 mod packing;
 
 use super::*;
@@ -481,19 +481,6 @@ impl Context {
             }
             if actual_varying != varying {
                 return Ok(Attempt::Repack(actual_varying));
-            }
-            let varying_ids: HashSet<_> = varying_parameters
-                .iter()
-                .map(|parameter| parameter.id.clone())
-                .collect();
-            for parameter in &varying_parameters {
-                self.tick()?;
-                if !self
-                    .elimination_reads(&parameter.type_)?
-                    .is_disjoint(&varying_ids)
-                {
-                    return Err(error(RecursionError::DependentWellFoundedArguments));
-                }
             }
             if !obligations.is_empty() {
                 self.well_founded

@@ -170,6 +170,105 @@ fn open_and_unknown_queries_never_borrow_another_scope_or_publish_a_false_answer
 }
 
 #[test]
+fn reduced_predicate_families_erase_whole_proofs_in_callback_telescopes() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    // Specialization uses this closed proposition as the result of a static
+    // predicate. Its application is still under the callback's Nat binder.
+    let proposition = pi(Expr::sort(Level::zero()), pi(b(0), b(1)));
+    let predicate = Expr::lam(
+        Name::anonymous(),
+        c("Nat"),
+        proposition.clone(),
+        BinderInfo::Default,
+    );
+    let applied = Expr::app(predicate, b(0));
+    for source in [applied.clone(), metadata(applied.clone())] {
+        assert!(preparation.proposition_type(&source, &[c("Nat")]).unwrap());
+        let callback_type = pi(c("Nat"), pi(source.clone(), c("Nat")));
+        let callback = Expr::lam(
+            Name::anonymous(),
+            c("Nat"),
+            Expr::lam(Name::anonymous(), source, b(1), BinderInfo::Default),
+            BinderInfo::Default,
+        );
+        assert_eq!(
+            preparation.erase_runtime_type(&callback_type).unwrap(),
+            pi(c("Nat"), pi(c("Bool"), c("Nat"))),
+        );
+        assert_eq!(
+            preparation
+                .erase_proofs(&callback, Some(callback_type))
+                .unwrap(),
+            Expr::lam(
+                Name::anonymous(),
+                c("Nat"),
+                Expr::lam(Name::anonymous(), c("Bool"), b(1), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        );
+    }
+    // Type-valued polymorphic callbacks have the same Pi syntax, but are
+    // executable functions. The recovered codomain sort must decide erasure.
+    let polymorphic_type = pi(Expr::sort(Level::one()), pi(b(0), b(1)));
+    let type_family = Expr::lam(
+        Name::anonymous(),
+        c("Nat"),
+        polymorphic_type.clone(),
+        BinderInfo::Default,
+    );
+    let applied_type = Expr::app(type_family, b(0));
+    assert!(
+        !preparation
+            .proposition_type(&applied_type, &[c("Nat")])
+            .unwrap()
+    );
+    assert_eq!(
+        preparation
+            .erase_runtime_type(&pi(c("Nat"), pi(applied_type, c("Nat"))))
+            .unwrap(),
+        pi(c("Nat"), pi(polymorphic_type, c("Nat"))),
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn reduced_proposition_queries_preserve_unknowns_and_lexical_depth_limits() {
+    let engine = engine();
+    let family = |body| {
+        Expr::app(
+            Expr::lam(Name::anonymous(), c("Nat"), body, BinderInfo::Default),
+            nat::literal(42),
+        )
+    };
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let unknown = family(pi(c("Nat"), c("unknownQueryResult")));
+    assert!(!preparation.proposition_type(&unknown, &[]).unwrap());
+    assert!(preparation.proposition_queries.entries.is_empty());
+
+    let proposition = family(pi(Expr::sort(Level::zero()), pi(b(0), b(1))));
+    let mut stopped = Preparation::new(
+        &engine.environment,
+        IngressLimits {
+            max_context_depth: 2,
+            ..IngressLimits::default()
+        },
+    );
+    assert_eq!(
+        stopped.proposition_type(&proposition, &[c("Nat")]),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::ContextDepth,
+            limit: 2,
+            observed: 3,
+        }),
+    );
+    assert!(stopped.proposition_queries.entries.is_empty());
+    stopped.limits.max_context_depth = IngressLimits::default().max_context_depth;
+    assert!(stopped.proposition_type(&proposition, &[c("Nat")]).unwrap());
+}
+
+#[test]
 fn completed_queries_recheck_after_canonical_declarations_and_private_shapes_grow() {
     let engine = engine();
     let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
