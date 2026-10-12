@@ -500,7 +500,7 @@ jobs:
 
   array-iteration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): check native Array execution and replay'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged Array iteration with actual imports'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -512,11 +512,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
+      CANDIDATE_SHA: '4d42929f6234c61ce501f82f0b843869f9750259'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
+          ref: '4d42929f6234c61ce501f82f0b843869f9750259'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -554,23 +554,11 @@ jobs:
             crates/fln/tests/source_imported_arrays/execution.rs
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln-olean/src/source_extensions.rs
-            crates/fln-olean/src/source_extensions/structures.rs
-            crates/fln-olean/src/source_extension_format.rs
-            crates/fln-elab/src/records.rs
-            crates/fln-elab/src/records/imported.rs
-            crates/fln-elab/src/records/imported/equality.rs
-            crates/fln-elab/src/records/imported/tests.rs
-            crates/fln-elab/src/records/inheritance.rs
-            crates/fln-elab/src/instances/imported.rs
-            crates/fln/src/source_check/modules/imported.rs
-            crates/fln/src/source_check/modules/imported/structures.rs
-            crates/fln/src/source_check/modules/imported/structures/tests.rs
-            crates/fln-elab/src/source/record_terms.rs
-            crates/fln-elab/src/source/record_terms/imported.rs
-            crates/fln-elab/src/source.rs
-            crates/fln-olean/tests/reference_structure_metadata.rs
-            crates/fln/tests/source_imported_structure_parents.rs
+            crates/fln/src/runtime/global/partial.rs
+            crates/fln/src/runtime/global/partial/callbacks.rs
+            crates/fln/src/runtime/callables/stages.rs
+            crates/fln/src/runtime/global/partial/tests.rs
+            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
           )
           paths=(
             crates/fln/src/runtime/array_iteration.rs
@@ -587,25 +575,11 @@ jobs:
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/tests/source_imported_arrays/check_oracle.py
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln-olean/src/source_extensions.rs
-            crates/fln-olean/src/source_extensions/structures.rs
-            scripts/extract/gen_source_extension_contract.py
-            crates/fln-olean/src/source_extension_format.rs
-            crates/fln-elab/src/records.rs
-            crates/fln-elab/src/records/imported.rs
-            crates/fln-elab/src/records/imported/equality.rs
-            crates/fln-elab/src/records/imported/tests.rs
-            crates/fln-elab/src/records/inheritance.rs
-            crates/fln-elab/src/instances/imported.rs
-            crates/fln/src/source_check/modules/imported.rs
-            crates/fln/src/source_check/modules/imported/structures.rs
-            crates/fln/src/source_check/modules/imported/structures/tests.rs
-            crates/fln-elab/src/source/record_terms.rs
-            crates/fln-elab/src/source/record_terms/imported.rs
-            crates/fln-elab/src/source.rs
-            crates/fln-olean/tests/reference_structure_metadata.rs
-            crates/fln/tests/source_imported_structure_parents.lean
-            crates/fln/tests/source_imported_structure_parents.rs
+            crates/fln/src/runtime/global/partial.rs
+            crates/fln/src/runtime/global/partial/callbacks.rs
+            crates/fln/src/runtime/callables/stages.rs
+            crates/fln/src/runtime/global/partial/tests.rs
+            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
@@ -622,6 +596,9 @@ jobs:
       - name: Check exact Array model and compiler-companion authority
         if: (success() || failure()) && steps.array-format.outcome == 'success'
         run: cargo test --locked --offline -p fln --lib runtime::array_iteration::tests -- --nocapture --test-threads=1
+      - name: Check retained recursive producers and staged callbacks
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --lib runtime::global -- --nocapture --test-threads=1
       - name: Execute and replay every Array probe and checked model control
         if: (success() || failure()) && steps.array-format.outcome == 'success'
         run: cargo test --locked --offline -p fln --test source_imported_arrays actual_imported_array_iteration_executes_replays_and_preserves_authority -- --exact --nocapture --test-threads=1
@@ -741,7 +718,7 @@ jobs:
 
   array-iteration-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): check native Array execution and replay'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged Array iteration with actual imports'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -753,11 +730,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
+      CANDIDATE_SHA: '4d42929f6234c61ce501f82f0b843869f9750259'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
+          ref: '4d42929f6234c61ce501f82f0b843869f9750259'
           persist-credentials: false
       - name: Verify candidate and install the exact Reference
         shell: bash
