@@ -7264,6 +7264,8 @@ impl Engine {
         // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
         // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
         let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
+        // `#exit`'s warning (`elabExit`); the partition made it the last command.
+        let mut exit_warning: Option<SourceWarning> = None;
         let mut evaluation_indices = Vec::new();
         evaluation_indices
             .try_reserve_exact(command_count)
@@ -7365,6 +7367,17 @@ impl Engine {
                 use fln_parse::command_scope::ScopeCommand;
                 match control {
                     ScopeCommand::Trivia => {}
+                    // The command ends at its `#exit` token, so the warning sits there.
+                    ScopeCommand::Exit => {
+                        exit_warning = Some(SourceWarning {
+                            command_index,
+                            at: fln_parse::BytePos(
+                                original_offset.0
+                                    + command_source.len().saturating_sub("#exit".len()),
+                            ),
+                            message: "using 'exit' to interrupt Lean".to_owned(),
+                        });
+                    }
                     ScopeCommand::OpenIn {
                         names,
                         scoped,
@@ -8186,7 +8199,7 @@ impl Engine {
                 sorry_commands.insert(command);
             }
         }
-        let warnings = sorry_commands
+        let mut warnings: Vec<SourceWarning> = sorry_commands
             .into_iter()
             .filter_map(|command| {
                 let &(offset, source, warn) = warning_sites.get(&command)?;
@@ -8201,6 +8214,8 @@ impl Engine {
                 })
             })
             .collect();
+        // The last command, so the order by command stays.
+        warnings.extend(exit_warning);
         Ok(Outcome::Complete(SourceCommandBatchExecution {
             scope: scopes.current,
             batch: DefinitionBatchExecution {

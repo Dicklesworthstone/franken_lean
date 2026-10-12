@@ -656,7 +656,8 @@ impl Scopes {
             ScopeCommand::GuardMsgs { .. } => {
                 return Err("`#guard_msgs` needs the executing `lean` front door".into());
             }
-            ScopeCommand::Trivia => {}
+            // `#exit` changes no scope; the partition has already dropped what follows it.
+            ScopeCommand::Trivia | ScopeCommand::Exit => {}
         }
         Ok(())
     }

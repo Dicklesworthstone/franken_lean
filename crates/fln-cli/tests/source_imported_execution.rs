@@ -793,6 +793,49 @@ fn pinned_prelude_imports_can_publish_replayable_bytecode_and_a_verified_sidecar
     assert!(replayed.stdout.contains("\"verified\":true"));
 }
 
+/// `#exit` is the pin's terminal command (`elabExit`, `Parser.isTerminalCommand`): it warns
+/// and the file ends there. The pinned binary beside the library is compared when present.
+#[test]
+fn exit_stops_the_file_with_the_pins_warning() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-exit");
+    // Nothing after `#exit` is read, not even text no grammar parses; a comment naming it
+    // is not it.
+    let entry = workspace.write(
+        "Main.lean",
+        "prelude\ninductive T where | a\n-- a comment that mentions #exit\n#exit\n\
+         def broken : T := nonsense ((\n",
+    );
+    let file = entry.display();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            format!("{file}:4:0: warning: using 'exit' to interrupt Lean\n").as_str(),
+            ""
+        ),
+        "{ours:?}"
+    );
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    match pinned {
+        Some(pinned) => {
+            let theirs = Command::new(pinned)
+                .arg(&entry)
+                .env("LEAN_PATH", &lib)
+                .output()
+                .expect("run the pinned lean");
+            assert!(theirs.status.success(), "{theirs:?}");
+            assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+        }
+        None => eprintln!("SKIP: no pinned lean beside the library; stdout was not compared"),
+    }
+}
+
 /// `sorry` elaborates to the pin's `sorryAx (Lean.Name → T) false tag` and every declaration
 /// that uses it is admitted with the pin's warning, positioned at the declared name, or at the
 /// keyword for an `example`, an anonymous instance and a structure; `warn.sorry false` silences

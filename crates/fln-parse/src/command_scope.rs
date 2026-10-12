@@ -86,6 +86,10 @@ pub enum ScopeCommand {
         names: Vec<Name>,
     },
     Trivia,
+    /// `#exit` (`Lean.Parser.Command.exit`): the pin warns "using 'exit' to interrupt Lean"
+    /// (`elabExit`) and stops there, a terminal command (`Parser.isTerminalCommand`); the
+    /// partition keeps nothing after it.
+    Exit,
 }
 
 /// Lex with the scope layer's table, the one declaration bodies use: the implicit-Init table, or
@@ -514,6 +518,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
+    if keyword == "#exit" && tokens.len() == 1 {
+        return Ok(Some(ScopeCommand::Exit));
+    }
     if matches!(keyword.as_str(), "public" | "@[")
         && let Some(section) = trees::modified_section(&view, &tokens)
     {
@@ -888,6 +895,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     let mut current_open = false;
     let mut open_in = false;
     let mut mutual_until = 0;
+    let mut exit_end = None;
     for (index, token) in tokens.iter().enumerate() {
         if index < mutual_until {
             continue;
@@ -911,6 +919,13 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 || source_view.line_of(token.extent.start())
                     > source_view.line_of(tokens[index - 1].extent.end()))
                 && declaration_column.is_none_or(|base| column(token) <= base);
+            // `#exit` is a terminal command: the pin's frontend parses nothing after it
+            // (`Parser.isTerminalCommand`), so it is the last command, ending at its token.
+            if depth == 0 && command_line && !open_in && symbol == "#exit" {
+                starts.push(view.to_original(token.extent.start()).0);
+                exit_end = Some(view.to_original(token.extent.end()).0);
+                break;
+            }
             // A module doc (`moduleDoc`) is its own command. A declaration's doc comment
             // (`declModifiers`' first slot) leads its declaration's command, as an attribute
             // does, and only before what can carry it, as at the pin, which refuses
@@ -1026,7 +1041,10 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
         output.push((BytePos(start), &source[start..next]));
         start = next;
     }
-    output.push((BytePos(start), &source[start..]));
+    output.push((
+        BytePos(start),
+        &source[start..exit_end.unwrap_or(source.len())],
+    ));
     Ok(output)
 }
 
@@ -1487,6 +1505,21 @@ mod tests {
         assert_eq!(commands.len(), 4);
         assert!(parse_definition(commands[1].1).is_ok());
     }
+    /// `#exit` is terminal, as the pin's `Parser.isTerminalCommand`: it is the last command,
+    /// ending at its token, and nothing after it is a command, even text no grammar reads. A
+    /// comment naming it is not it.
+    #[test]
+    fn exit_is_the_last_command_and_ends_at_its_token() {
+        let source = b"def x : Nat := 1\n-- #exit in a comment\n#exit\ndef y := ((\n";
+        let commands = partition(source).unwrap();
+        let exit_at = source.windows(6).position(|w| w == b"\n#exit").unwrap() + 1;
+        // The comment is trailing trivia of the definition; the `#exit` command is its token.
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1], (BytePos(exit_at), &b"#exit"[..]));
+        assert_eq!(parse(commands[1].1).unwrap(), Some(ScopeCommand::Exit));
+        assert_eq!(parse(b"#exit").unwrap(), Some(ScopeCommand::Exit));
+    }
+
     #[test]
     fn scope_words_inside_branch_binders_and_indented_terms_stay_in_the_declaration() {
         // Each bare scope word is a keyword, so the pinned Reference refuses the declaration;

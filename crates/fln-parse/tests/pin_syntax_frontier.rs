@@ -173,6 +173,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
             "attribute"
         }
         ScopeCommand::Trivia => "trivia",
+        ScopeCommand::Exit => "exit",
     }
 }
 
