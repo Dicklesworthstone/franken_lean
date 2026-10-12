@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":621,"projection_hash":"c805574d73b9c244cbbb235ac81d8d8a5aa425c53e5fc19194841cf4fdda4f99"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":623,"projection_hash":"f48bb0e77bb6c2a5120b42565a2404463eea90468deafc5c58f01338188ed8f7"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -111,6 +111,7 @@
 {"id":"fln-db39"}
 {"id":"fln-dcv"}
 {"id":"fln-decision-check-stack-lq8u"}
+{"id":"fln-default-instance-commit-rule-2709"}
 {"id":"fln-derived-declaration-frontier-cj7s"}
 {"id":"fln-dyfz"}
 {"id":"fln-e44s"}
@@ -212,6 +213,7 @@
 {"id":"fln-lld"}
 {"id":"fln-llg3"}
 {"id":"fln-log-derived-disposition-not-execution-xes2"}
+{"id":"fln-loop-gaps-9gwk"}
 {"id":"fln-lst4"}
 {"id":"fln-lvdh"}
 {"id":"fln-lyc8"}
