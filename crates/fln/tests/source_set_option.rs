@@ -328,7 +328,8 @@ fn silenced_and_inert_options_are_admitted_and_change_nothing() {
     let with_options = format!(
         "set_option linter.unusedVariables false\nset_option warn.sorry false\n\
          set_option maxHeartbeats 400000\nset_option autoImplicit false\n\
-         set_option pp.all false\nset_option maxRecDepth 2048\n{plain}"
+         set_option pp.all false\nset_option maxRecDepth 2048\n\
+         set_option linter.omit false\nset_option linter.unusedSectionVars false\n{plain}"
     );
     let checked = run(&base, &with_options).unwrap();
     assert_eq!(

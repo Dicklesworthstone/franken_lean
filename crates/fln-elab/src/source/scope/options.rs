@@ -229,6 +229,110 @@ pub const ROWS: &[Row] = &[
         "Lean/Linter/ConstructorAsVariable.lean:25",
         Silent,
     ),
+    // The remaining builtin linters the pin's tests/elab files set (2026-10-12): each only
+    // warns, so `false` or the default changes nothing here.
+    row(
+        "linter.loopingSimpArgs",
+        Bool(false),
+        "Lean/Meta/Tactic/Simp/LoopProtection.lean:17",
+        Silent,
+    ),
+    row(
+        "linter.deprecated.options",
+        Bool(true),
+        "Lean/Elab/SetOption.lean:15",
+        Silent,
+    ),
+    row(
+        "linter.unusedSectionVars",
+        Bool(true),
+        "Lean/Elab/MutualDef.lean:497",
+        Silent,
+    ),
+    row(
+        "linter.omit",
+        Bool(false),
+        "Lean/Linter/Omit.lean:17",
+        Silent,
+    ),
+    row(
+        "linter.redundantVisibility",
+        Bool(false),
+        "Lean/Elab/DeclModifiers.lean:17",
+        Silent,
+    ),
+    row(
+        "linter.tacticCheckInstances",
+        Bool(false),
+        "Lean/Linter/TacticTypeCheck.lean:24",
+        Silent,
+    ),
+    row(
+        "linter.indexVariables",
+        Bool(false),
+        "Lean/Linter/List.lean:31",
+        Silent,
+    ),
+    row(
+        "linter.deprecated.arg",
+        Bool(true),
+        "Lean/Elab/DeprecatedArg.lean:18",
+        Silent,
+    ),
+    row(
+        "linter.tactic.docsOnAlt",
+        Bool(true),
+        "Lean/Linter/DocsOnAlt.lean:21",
+        Silent,
+    ),
+    row(
+        "linter.suspiciousUnexpanderPatterns",
+        Bool(true),
+        "Lean/Linter/Builtin.lean:16",
+        Silent,
+    ),
+    row(
+        "linter.unusedVariables.funArgs",
+        Bool(true),
+        "Lean/Linter/UnusedVariables.lean:89",
+        Silent,
+    ),
+    row(
+        "linter.deprecated.syntax",
+        Bool(true),
+        "Lean/Elab/DeprecatedSyntax.lean:17",
+        Silent,
+    ),
+    row(
+        "linter.tactic.unusedName",
+        Bool(true),
+        "Lean/Elab/Tactic/Lets.lean:25",
+        Silent,
+    ),
+    row(
+        "linter.extra.unusedDecidableInType",
+        Bool(false),
+        "Lean/Linter/Extra/UnusedDecidableInType.lean:120",
+        Silent,
+    ),
+    row(
+        "linter.deprecatedCoercions",
+        Bool(true),
+        "Lean/Linter/Coe.lean:23",
+        Silent,
+    ),
+    row(
+        "linter.listVariables",
+        Bool(false),
+        "Lean/Linter/List.lean:40",
+        Silent,
+    ),
+    row(
+        "linter.checkUnivs",
+        Bool(true),
+        "Lean/Linter/CheckUnivs.lean:29",
+        Silent,
+    ),
     // Read by the source executor: a declaration that uses `sorry` warns while it is true.
     row("warn.sorry", Bool(true), "Lean/AddDecl.lean:69", Honored),
     row(
@@ -546,6 +650,20 @@ mod tests {
             admitted("linter.missingDocs", DataValue::OfBool(true)),
             Err(OptionRefusal::Unsupported { .. })
         ));
+        // The same holds for every builtin linter row: a default-off one may only stay off,
+        // a default-on one may be switched off or left on.
+        for (name, value, admits) in [
+            ("linter.omit", false, true),
+            ("linter.omit", true, false),
+            ("linter.unusedSectionVars", false, true),
+            ("linter.unusedSectionVars", true, true),
+        ] {
+            assert_eq!(
+                admitted(name, DataValue::OfBool(value)).is_ok(),
+                admits,
+                "{name} {value}"
+            );
+        }
         assert!(matches!(
             admitted("diagnostics", DataValue::OfBool(true)),
             Err(OptionRefusal::Unsupported { .. })
