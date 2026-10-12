@@ -120,10 +120,18 @@ impl Context {
         const MAX_DEPTH: usize = 32;
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
-        match self.coercion_conversion(&actual, &expected)? {
-            Conversion::Equal => return Ok(true),
+        let mut whole = self.clone();
+        let conversion = whole.coercion_conversion(&actual, &expected);
+        self.txn.budget.heartbeats_consumed = whole.txn.budget.heartbeats_consumed;
+        match conversion? {
             Conversion::Refuted(_) => return Ok(false),
-            Conversion::Deferred => {}
+            // An equation that holds only by choosing an instance is left to synthesis, as the
+            // pin postpones instance arguments: decompose it instead.
+            Conversion::Equal if !whole.assigned_instance_goal_since(self) => {
+                *self = whole;
+                return Ok(true);
+            }
+            Conversion::Equal | Conversion::Deferred => {}
         }
         if depth >= MAX_DEPTH {
             return Ok(true);
@@ -153,16 +161,45 @@ impl Context {
         if !same_head || left_arguments.len() != right_arguments.len() {
             return Ok(true);
         }
-        if let Conversion::Refuted(_) = self.coercion_conversion(&left_head, &right_head)? {
-            return Ok(false);
-        }
-        for (left, right) in left_arguments.iter().zip(&right_arguments) {
+        let pairs = std::iter::once((&left_head, &right_head))
+            .chain(left_arguments.iter().zip(&right_arguments));
+        for (left, right) in pairs {
             self.tick()?;
-            if !self.show_result_hint_trial(left, right, depth + 1)? {
+            let mut pair = self.clone();
+            let settled = pair.show_result_hint_trial(left, right, depth + 1);
+            self.txn.budget.heartbeats_consumed = pair.txn.budget.heartbeats_consumed;
+            if !settled? {
                 return Ok(false);
+            }
+            if !pair.assigned_instance_goal_since(self) {
+                *self = pair;
             }
         }
         Ok(true)
+    }
+
+    /// Whether this context assigned, since `before`, a hole that instance synthesis owns: an
+    /// instance goal, or an `outParam`/`semiOutParam` hole synthesis determines from its inputs.
+    fn assigned_instance_goal_since(&self, before: &Context) -> bool {
+        if before
+            .instance_goals
+            .iter()
+            .any(|id| !before.txn.mvars.is_assigned(id) && self.txn.mvars.is_assigned(id))
+        {
+            return true;
+        }
+        self.txn.mvars.assignments().keys().any(|id| {
+            !before.txn.mvars.is_assigned(id)
+                && before.txn.mvars.get_decl(id).is_some_and(|decl| {
+                    let mut head = &decl.type_;
+                    while let ExprNode::App { f, .. } = head.node() {
+                        head = f;
+                    }
+                    matches!(head.node(), ExprNode::Const { name, .. }
+                        if *name == Name::from_components(["outParam"])
+                            || *name == Name::from_components(["semiOutParam"]))
+                })
+        })
     }
 }
 
