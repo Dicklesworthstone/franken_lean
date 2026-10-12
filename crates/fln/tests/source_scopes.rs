@@ -649,10 +649,11 @@ fn open_in_reaches_exactly_its_one_command() {
 }
 
 /// Declaration modifiers parse to the pin's trees
-/// (`crates/fln-parse/tests/reference_command_trees.rs`), but `private` and
-/// `noncomputable` are not implemented: each is refused by the elaborator as syntax it
-/// does not support, a typed, non-authoritative refusal, never admitted with the modifier
-/// dropped. The pin accepts both files. `protected` is elaborated (bead `fln-eq4k`),
+/// (`crates/fln-parse/tests/reference_command_trees.rs`), but `private` is not implemented:
+/// it is refused by the elaborator as syntax it does not support, a typed, non-authoritative
+/// refusal, never admitted with the modifier dropped. The pin accepts that file.
+/// `noncomputable` is elaborated (the `noncomputable` journal): `noncomputable def b` is
+/// admitted, as the pin admits it. `protected` is elaborated (bead `fln-eq4k`),
 /// admitted and tagged, never admitted with the tag dropped. A nameless instance is
 /// elaborated too, and the pin accepts it. Its name follows `mkInstanceName`
 /// (`instance_name.rs`) except for one stated deviation. The base name
@@ -710,19 +711,27 @@ fn parsed_modifiers_are_refused_until_elaborated_and_nameless_instances_are_admi
         added.len() == 1 && added[0].starts_with("instInhabitedNat_"),
         "exactly one new instance, named off the taken base: {added:?}"
     );
-    for source in ["private def a : Nat := 1", "noncomputable def b : Nat := 2"] {
-        let error = engine()
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits()),
-            )
-            .expect_err(source);
-        let (class, authority, _) = error.disposition();
-        assert_eq!((class, authority), ("input", false), "{source}: {error}");
-        assert!(
-            error.to_string().contains("elaboration refused source"),
-            "{source}: {error}"
-        );
-    }
+    engine()
+        .check_source_files(
+            &[b"noncomputable def b : Nat := 2"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = "private def a : Nat := 1";
+    let error = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(source);
+    let (class, authority, _) = error.disposition();
+    assert_eq!((class, authority), ("input", false), "{source}: {error}");
+    assert!(
+        error.to_string().contains("elaboration refused source"),
+        "{source}: {error}"
+    );
 }
