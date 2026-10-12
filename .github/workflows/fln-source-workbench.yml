@@ -1432,7 +1432,7 @@ jobs:
 
   partial-callback-stages:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged callbacks and loop progress'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify standalone recursive callback support'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -1443,11 +1443,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
-      CANDIDATE_SHA: '702e3ef8aed48debfa54b5981fa1bb460a2841e2'
+      CANDIDATE_SHA: '321d3d9a4176cdd0b15e9271bb1d46f67b932441'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '702e3ef8aed48debfa54b5981fa1bb460a2841e2'
+          ref: '321d3d9a4176cdd0b15e9271bb1d46f67b932441'
           persist-credentials: false
       - name: Verify the immutable candidate and exact Rust compiler
         shell: bash
@@ -1457,46 +1457,24 @@ jobs:
           rustup show active-toolchain
           test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
           rustc -Vv
-      - name: Format the complete Array and Partial callback candidate
+      - name: Format the standalone recursive callback implementation
         id: partial-format
         shell: bash
         run: |
           set -euo pipefail
           rust_paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/src/runtime/array_iteration/tests.rs
             crates/fln/src/runtime/global/partial.rs
             crates/fln/src/runtime/global/partial/callbacks.rs
             crates/fln/src/runtime/callables/stages.rs
+            crates/fln/src/runtime/specialize.rs
             crates/fln/src/runtime/global/partial/tests.rs
             crates/fln/src/runtime/global/partial/tests/callback_stages.rs
           )
           paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/programs.lean
-            crates/fln/tests/source_imported_arrays/effects.lean
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/tests/source_imported_arrays/check_oracle.py
-            crates/fln/src/runtime/array_iteration/tests.rs
             crates/fln/src/runtime/global/partial.rs
             crates/fln/src/runtime/global/partial/callbacks.rs
             crates/fln/src/runtime/callables/stages.rs
+            crates/fln/src/runtime/specialize.rs
             crates/fln/src/runtime/global/partial/tests.rs
             crates/fln/src/runtime/global/partial/tests/callback_stages.rs
           )
