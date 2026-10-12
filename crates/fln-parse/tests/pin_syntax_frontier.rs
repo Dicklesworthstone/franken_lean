@@ -168,6 +168,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         ScopeCommand::Include(_) | ScopeCommand::Omit(_) => "include-omit",
         ScopeCommand::SetOption { .. } | ScopeCommand::SetOptionIn { .. } => "set_option",
         ScopeCommand::GuardMsgs { .. } => "guard_msgs",
+        ScopeCommand::In { .. } => "in",
         ScopeCommand::Simp(_) | ScopeCommand::Instance(_) | ScopeCommand::Reducibility(_) => {
             "attribute"
         }

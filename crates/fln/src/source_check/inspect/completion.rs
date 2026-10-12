@@ -187,6 +187,9 @@ impl SourceModuleSession {
                 // A guard changes presentation, not the body's lexical scope.
                 // Completion makes no claim that its messages are satisfied.
                 Some(ScopeCommand::GuardMsgs { .. }) => None,
+                // The head's own command (`variable`, `universe`, …) is not replayed here:
+                // completion makes no claim about what it binds.
+                Some(ScopeCommand::In { .. }) => None,
                 _ => return Err(invalid(entry, prefix_end, "expected a command wrapper")),
             };
             if let Some(transition) = transition {

@@ -7391,6 +7391,25 @@ impl Engine {
                             queue.push_front(step);
                         }
                     }
+                    // The pin's `in` macro for any other head: `section <head> <command> end`,
+                    // the head run as the command it is.
+                    ScopeCommand::In { head, body } => {
+                        for step in [
+                            Step::Scope(command_index, ScopeCommand::Section(None)),
+                            Step::Command(command_index, original_offset, &command_source[..head]),
+                            Step::Command(
+                                command_index,
+                                fln_parse::BytePos(original_offset.0 + body),
+                                &command_source[body..],
+                            ),
+                            Step::Scope(command_index, ScopeCommand::End(None)),
+                        ]
+                        .into_iter()
+                        .rev()
+                        {
+                            queue.push_front(step);
+                        }
+                    }
                     // The pin's `in` macro: `section set_option o v <command> end`.
                     ScopeCommand::SetOptionIn { name, value, body } => {
                         for step in [

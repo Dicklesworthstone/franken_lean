@@ -139,7 +139,8 @@ impl SourceModuleSession {
                         Some(
                             ScopeCommand::OpenIn { body, .. }
                             | ScopeCommand::SetOptionIn { body, .. }
-                            | ScopeCommand::GuardMsgs { body, .. },
+                            | ScopeCommand::GuardMsgs { body, .. }
+                            | ScopeCommand::In { body, .. },
                         ) => {
                             base += body;
                             command = &command[body..];
