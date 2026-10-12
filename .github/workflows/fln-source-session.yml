@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/fln-source-session.yml'
-      - '.github/patches/fln-native-rcases/**'
+      - '.github/patches/fln-rintro-obtain/**'
 
 permissions:
   contents: write
@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checked-rcases:
+  checked-rintro-obtain:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -36,5 +36,5 @@ jobs:
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
           echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
-      - name: Compile, compare and land recursive case-pattern implementation
-        run: python3 .github/patches/fln-native-rcases/land.py
+      - name: Compile, compare and land introductions and obtained witnesses
+        run: python3 .github/patches/fln-rintro-obtain/land.py
