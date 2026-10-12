@@ -206,6 +206,7 @@ impl Engine {
                                 base_logical_root: root,
                                 result_logical_root: root,
                                 admissions: Vec::new(),
+                                local_instance: None,
                             })
                         }
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -440,6 +441,9 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .then_some(&scope.namespace);
+        let local = fln_elab::source::instance_registration_is_local(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let simp = fln_elab::source::scope::simp::registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -501,12 +505,14 @@ impl Engine {
                         &name,
                         priority,
                         instance_namespace,
+                        local,
                         limits.kernel,
                     )? {
                         Outcome::Complete(engine) => engine,
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                    batch.local_instance = local.then_some((name, priority));
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if let Some((name, priority, reverse)) = simp {
@@ -550,6 +556,7 @@ impl Engine {
         name: &Name,
         priority: u32,
         namespace: Option<&Name>,
+        local: bool,
         kernel: Budget,
     ) -> Result<Outcome<Engine>, EngineExecutionError> {
         if namespace.is_some_and(Name::is_anonymous) {
@@ -574,27 +581,66 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let mut engine = self.clone();
-        engine.environment = match namespace {
-            Some(namespace) => fln_elab::instances::scoped::register(
-                engine.environment(),
-                namespace,
-                name,
-                priority,
-            ),
-            None => fln_elab::instances::register_instance(engine.environment(), name, priority),
-        }
-        .map_err(|error| {
+        let registry_error = |error| {
             EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
                 fln_elab::NatDefinitionElabError::Inference(
                     fln_elab::source::SourceInferenceError::InstanceRegistry(error),
                 ),
             ))
-        })?;
-        if proof {
+        };
+        let registered = if local {
+            // The pin rejects uninferable instance parameters at declaration
+            // time. Reuse the same bounded telescope/index derivation used by
+            // native search; an unsupported model cannot become a local effect.
+            let registry = fln_elab::instances::InstanceRegistry::read(engine.environment())
+                .map_err(registry_error)?;
+            let mut work_left = usize::try_from(kernel.steps)
+                .unwrap_or(usize::MAX)
+                .min(1_000_000);
+            if fln_elab::instances::export::derive_index(
+                engine.environment(),
+                &registry,
+                name,
+                &mut work_left,
+            )
+            .map_err(registry_error)?
+            .is_none()
+            {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "a local instance requires a supported inferable telescope and index",
+                });
+            }
+            // Validate the same checked class and declaration as a persistent
+            // instance, without publishing its selection beyond the scope.
+            fln_elab::instances::scoped::ActiveScopes::default()
+                .register_local(engine.environment(), name, priority)
+                .map(|()| engine.environment().clone())
+        } else {
+            match namespace {
+                Some(namespace) => fln_elab::instances::scoped::register(
+                    engine.environment(),
+                    namespace,
+                    name,
+                    priority,
+                ),
+                None => {
+                    fln_elab::instances::register_instance(engine.environment(), name, priority)
+                }
+            }
+        };
+        engine.environment = registered.map_err(registry_error)?;
+        if proof || local {
             engine.environment = fln_elab::reducibility::register(
                 engine.environment(),
                 name,
-                fln_elab::reducibility::Reducibility::Semireducible,
+                if proof {
+                    fln_elab::reducibility::Reducibility::Semireducible
+                } else {
+                    // Local data instances have no persistent instance row
+                    // from which the usual implicit-reducibility fallback
+                    // could be derived. The status belongs to the declaration.
+                    fln_elab::reducibility::Reducibility::ImplicitReducible
+                },
             )
             .map_err(|error| {
                 EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
@@ -646,7 +692,11 @@ impl Engine {
             return self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope);
         }
         if !fln_elab::source::is_record(syntax) {
-            if scope != &fln_elab::source::scope::SourceScope::default() {
+            if scope != &fln_elab::source::scope::SourceScope::default()
+                || fln_elab::source::instance_registration_is_local(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
+            {
                 let elaborated = match elaboration_outcome(
                     fln_elab::source::scope::elaborate_definition_with_effects(
                         parsed.syntax(),
@@ -675,6 +725,7 @@ impl Engine {
                         base_logical_root: admitted.base_logical_root,
                         result_logical_root: admitted.result_logical_root,
                         admissions: vec![admitted],
+                        local_instance: None,
                     }),
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -833,6 +884,7 @@ impl Engine {
                         parent,
                         1000,
                         None,
+                        false,
                         limits.kernel,
                     )? {
                         Outcome::Complete(engine) => engine,

@@ -624,8 +624,17 @@ impl Engine {
                     .iter()
                     .filter(|row| matches!(row.declaration, Declaration::Thm(_)))
                     .count();
+                scopes
+                    .admitted_batch(
+                        &admitted,
+                        next.environment(),
+                        public
+                            .as_deref()
+                            .filter(|_| exported)
+                            .map(|world| world.engine().environment()),
+                    )
+                    .map_err(|error| error.into_source(file, count, start.0))?;
                 for row in &admitted.admissions {
-                    scopes.admitted(&row.declaration);
                     if let Some(journal) = declarations.as_deref_mut() {
                         journal.push(row.declaration.clone());
                     }

@@ -153,7 +153,6 @@ fn invalid_scoped_declarations_publish_no_dictionary_or_registration() {
         "namespace Region\nscoped instance bad : Nat := 2",
         "namespace Region\nscoped instance bad : Pick := 2",
         "namespace Region\nscoped instance (priority := 4294967296) bad : Pick := Pick.mk 2",
-        "namespace Region\nlocal instance bad : Pick := Pick.mk 2",
     ] {
         assert!(
             base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
@@ -182,6 +181,25 @@ fn invalid_scoped_declarations_publish_no_dictionary_or_registration() {
         .is_err()
     );
     assert_eq!(base.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn local_declarations_expire_instead_of_becoming_dormant_namespace_instances() {
+    let base = base();
+    let result = checked(
+        &base,
+        "namespace Region\nlocal instance choice : Pick := Pick.mk 2\n\
+         theorem inside : chosen = 2 := by rfl\nend Region\n\
+         theorem outside : chosen = 1 := by rfl\nnamespace Region\n\
+         theorem reopened : chosen = 1 := by rfl\n\
+         theorem explicitChoice : @chosen choice = 2 := by rfl\nend Region",
+    );
+    assert_eq!(result.theorems, 4);
+    let registry = InstanceRegistry::read(result.engine.environment()).unwrap();
+    assert_eq!(registry.candidates(&n("Pick")).len(), 1);
+    assert!(registry.instance_namespaces().next().is_none());
+    assert!(result.engine.environment().contains(&n("Region.choice")));
+    assert!(!base.environment().contains(&n("Region.choice")));
 }
 
 #[test]

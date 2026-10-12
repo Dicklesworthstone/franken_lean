@@ -6769,6 +6769,7 @@ impl Engine {
             base_logical_root,
             result_logical_root,
             admissions,
+            local_instance: None,
         }))
     }
 
@@ -6808,6 +6809,9 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .then(|| self.base_source_scope().namespace);
+        let local = fln_elab::source::instance_registration_is_local(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -6868,6 +6872,7 @@ impl Engine {
                         &name,
                         priority,
                         instance_namespace.as_ref(),
+                        local,
                         limits.kernel,
                     )? {
                         Outcome::Complete(engine) => engine,
@@ -7532,9 +7537,15 @@ impl Engine {
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
                 engine = next;
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
-                }
+                scopes
+                    .admitted_batch(
+                        &admission,
+                        engine.environment(),
+                        Some(public.engine().environment()),
+                    )
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
                     admission,
@@ -7573,9 +7584,11 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
-                }
+                scopes
+                    .admitted_batch(&admission, admission.engine.environment(), None)
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -7693,9 +7706,11 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
-                }
+                scopes
+                    .admitted_batch(&admission, admission.engine.environment(), None)
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -7863,9 +7878,11 @@ impl Engine {
                         at: Some(original_offset),
                     },
                 )?;
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
-                }
+                scopes
+                    .admitted_batch(&admission, admission.engine.environment(), None)
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -11400,6 +11417,10 @@ pub struct DeclarationBatchAdmission {
     pub result_logical_root: LogicalRoot,
     /// Every completed admission in input order, including root transitions.
     pub admissions: Vec<DeclarationAdmission>,
+    /// A checked source instance to select only in the caller's current lexical
+    /// scope. Its declaration and reducibility are in `engine`, but its local
+    /// registration is never part of a persistent environment or module export.
+    pub local_instance: Option<(Name, u32)>,
 }
 
 /// The authoritative outputs of one completed bounded engine run.

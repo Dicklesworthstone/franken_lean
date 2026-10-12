@@ -5286,6 +5286,8 @@ fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declar
 /// Registration requested by a canonical named source instance. The caller must
 /// still obtain ordinary declaration admission before installing this metadata.
 /// Use [`instance_registration_is_scoped`] to select namespace registration.
+/// [`instance_registration_is_local`] instead requests a lexical selection;
+/// its registration must never enter the persistent environment journal.
 pub fn instance_registration(
     syntax: &Syntax,
 ) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
@@ -5297,6 +5299,12 @@ pub fn instance_registration(
 /// source namespace, which need not be the qualified declaration name's parent.
 pub fn instance_registration_is_scoped(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
     instance_command::is_scoped(syntax)
+}
+
+/// Whether an instance command requests registration in its lexical source
+/// scope. The checked named declaration itself survives the end of that scope.
+pub fn instance_registration_is_local(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    instance_command::is_local(syntax)
 }
 
 /// `declModifiers`' `protected` slot: docComment, attributes, visibility, then

@@ -152,6 +152,7 @@ impl<'a> PublicWorld<'a> {
         }
         checked.engine = engine.clone();
         checked.result_logical_root = engine.logical_root(options);
+        checked.local_instance = staged.public.local_instance;
         self.engine = staged.public.engine;
         self.declarations.extend(declarations);
         Ok(Outcome::Complete((engine, checked)))

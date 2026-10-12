@@ -23,6 +23,13 @@ def String := Nat
 def value := s!"{(7 : Nat)}"
 end Shadow
 #eval Shadow.value
+section
+local instance : ToString String where
+  toString value := "[" ++ value ++ "]"
+#eval s!"left{(7 : Nat)}right"
+#eval s!""
+#eval s!"{(7 : Nat)}"
+end
 "#;
 
 fn reference(lib: &Path) -> PathBuf {
@@ -51,7 +58,7 @@ fn lean(
 }
 
 #[test]
-fn interpolation_matches_the_pin_with_imported_and_custom_instances_and_recovers_after_errors() {
+fn interpolation_matches_the_pin_with_imported_and_local_instances_and_recovers_after_errors() {
     let Some(lib) = pinned_lib() else { return };
     let oracle = reference(&lib);
     assert!(

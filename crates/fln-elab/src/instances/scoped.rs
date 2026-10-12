@@ -1,7 +1,7 @@
-//! Lexical activation of namespace instances over the native registration journal.
+//! Lexical activation of namespace and local instances over the registration journal.
 //!
 //! The journal stores registrations; an `ActiveScopes` value stores *when* each
-//! namespace was opened. Reconstructing the view interleaves those events, so a
+//! namespace was opened or local instance was declared. The view interleaves those events, so a
 //! later global instance can outrank an earlier activation at equal priority.
 //! Nothing is inserted into the environment by opening a namespace.
 use super::*;
@@ -13,8 +13,18 @@ const MAX_SCOPE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Activation {
-    namespace: Name,
+    kind: ActivationKind,
     at: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivationKind {
+    Namespace(Name),
+    Local {
+        class: Name,
+        declaration: Name,
+        priority: u32,
+    },
 }
 
 /// Immutable-snapshot-friendly lexical state. Its private journal anchor binds
@@ -28,9 +38,9 @@ pub struct ActiveScopes {
 }
 impl ActiveScopes {
     pub fn is_active(&self, namespace: &Name) -> bool {
-        self.activations
-            .iter()
-            .any(|entry| &entry.namespace == namespace)
+        self.activations.iter().any(
+            |entry| matches!(&entry.kind, ActivationKind::Namespace(name) if name == namespace),
+        )
     }
 
     pub fn activate(
@@ -47,9 +57,59 @@ impl ActiveScopes {
         }
         let mut encoded = Vec::new();
         write_name(namespace, &mut encoded)?;
+        self.push(
+            env,
+            ActivationKind::Namespace(namespace.clone()),
+            encoded.len(),
+        )
+    }
+
+    /// Select an already checked local instance until this lexical snapshot is
+    /// restored. The declaration and its reducibility status remain in `env`;
+    /// no registration row is written to the persistent export journal.
+    pub fn register_local(
+        &mut self,
+        env: &Environment,
+        declaration: &Name,
+        priority: u32,
+    ) -> Result<(), InstanceRegistryError> {
+        self.validate_prefix(env)?;
+        let registry = InstanceRegistry::read(env)?;
+        let class = validate_instance(env, declaration)?;
+        if !registry.is_class(&class) {
+            return Err(InstanceRegistryError::UnknownClass(class));
+        }
+        if registry.native_instances().any(|name| name == declaration)
+            || registry.imported_instance_parameters(declaration).is_some()
+            || self.activations.iter().any(|entry| {
+                matches!(&entry.kind, ActivationKind::Local { declaration: name, .. } if name == declaration)
+            })
+        {
+            return Err(InstanceRegistryError::DuplicateInstance(declaration.clone()));
+        }
+        let mut encoded = Vec::new();
+        write_name(&class, &mut encoded)?;
+        write_name(declaration, &mut encoded)?;
+        self.push(
+            env,
+            ActivationKind::Local {
+                class,
+                declaration: declaration.clone(),
+                priority,
+            },
+            encoded.len(),
+        )
+    }
+
+    fn push(
+        &mut self,
+        env: &Environment,
+        kind: ActivationKind,
+        name_bytes: usize,
+    ) -> Result<(), InstanceRegistryError> {
         let bytes = self
             .name_bytes
-            .checked_add(encoded.len())
+            .checked_add(name_bytes)
             .filter(|n| *n <= MAX_SCOPE_BYTES)
             .ok_or(InstanceRegistryError::Limit)?;
         if self.activations.len() >= MAX_SCOPES {
@@ -57,10 +117,7 @@ impl ActiveScopes {
         }
         let anchor = env.extension(&extension_name()).cloned();
         let at = anchor.as_ref().map_or(0, ExtensionState::len);
-        Arc::make_mut(&mut self.activations).push(Activation {
-            namespace: namespace.clone(),
-            at,
-        });
+        Arc::make_mut(&mut self.activations).push(Activation { kind, at });
         self.anchor = anchor;
         self.name_bytes = bytes;
         Ok(())
@@ -103,7 +160,29 @@ impl InstanceRegistry {
             }
         }
         for (activation_index, activation) in scopes.activations.iter().enumerate() {
-            let Some(classes) = registry.scoped.get(&activation.namespace) else {
+            let namespace = match &activation.kind {
+                ActivationKind::Namespace(namespace) => namespace,
+                ActivationKind::Local {
+                    class,
+                    declaration,
+                    priority,
+                } => {
+                    if validate_instance(env, declaration)? != *class || !registry.is_class(class) {
+                        return Err(InstanceRegistryError::Malformed);
+                    }
+                    events.push((
+                        (activation.at, 0u8, activation_index * (MAX_ROWS + 1)),
+                        class.clone(),
+                        InstanceEntry {
+                            declaration: declaration.clone(),
+                            priority: *priority,
+                            order: 0,
+                        },
+                    ));
+                    continue;
+                }
+            };
+            let Some(classes) = registry.scoped.get(namespace) else {
                 continue;
             };
             for (class, rows) in classes {
@@ -125,8 +204,19 @@ impl InstanceRegistry {
             }
         }
         events.sort_by_key(|(key, _, _)| *key);
+        // A later global attribute can promote a still-active local instance.
+        // Its current registration replaces the local priority instead of
+        // leaving a duplicate, potentially higher-priority local candidate.
+        let latest: BTreeMap<_, _> = events
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, row))| (row.declaration.clone(), index))
+            .collect();
         registry.instances.clear();
         for (order, (_, class, mut row)) in events.into_iter().enumerate() {
+            if latest.get(&row.declaration) != Some(&order) {
+                continue;
+            }
             row.order = order;
             registry.instances.entry(class).or_default().push(row);
         }

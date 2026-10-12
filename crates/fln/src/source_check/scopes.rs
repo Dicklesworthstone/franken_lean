@@ -294,6 +294,36 @@ impl Scopes {
     pub(super) fn observe_syntax(&mut self, declaration: &Name) {
         self.observe(declaration);
     }
+
+    /// Publish source-only selection after the command's declarations have
+    /// passed both checkers. Public and private worlds keep distinct journal
+    /// anchors, and neither view advances if either activation fails.
+    pub fn admitted_batch(
+        &mut self,
+        batch: &DeclarationBatchAdmission,
+        env: &Environment,
+        public_env: Option<&Environment>,
+    ) -> Result<(), TransitionError> {
+        if let Some((name, priority)) = &batch.local_instance {
+            let mut instances = self.current.instance_scopes.clone();
+            let mut public_instances = self.public_instances.clone();
+            instances
+                .register_local(env, name, *priority)
+                .map_err(TransitionError::Registry)?;
+            if let Some(public_env) = public_env {
+                public_instances
+                    .register_local(public_env, name, *priority)
+                    .map_err(TransitionError::Registry)?;
+            }
+            self.current.instance_scopes = instances;
+            self.public_instances = public_instances;
+        }
+        for row in &batch.admissions {
+            self.admitted(&row.declaration);
+        }
+        Ok(())
+    }
+
     pub fn admitted(&mut self, declaration: &Declaration) {
         match declaration {
             Declaration::Axiom(v) => self.observe(&v.base.name),

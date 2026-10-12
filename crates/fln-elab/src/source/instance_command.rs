@@ -8,6 +8,7 @@ pub(super) struct Parts<'a> {
     pub value: &'a Syntax,
     pub priority: u32,
     pub scoped: bool,
+    pub local: bool,
 }
 
 /// The pin exposes data instances automatically, while a proof instance needs
@@ -160,21 +161,23 @@ pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError
         1,
         "instance scope",
     )?;
-    let scoped = match expect_null_args(&attr[0], "instance scope")? {
-        [] => false,
+    let (scoped, local) = match expect_null_args(&attr[0], "instance scope")? {
+        [] => (false, false),
         [scope] => {
+            let local = matches!(scope, Syntax::Node { kind, .. } if kind == &parser_kind(&["Term", "local"]));
+            let keyword = if local { "local" } else { "scoped" };
             let parts = expect_node(
                 scope,
-                &parser_kind(&["Term", "scoped"]),
+                &parser_kind(&["Term", keyword]),
                 1,
-                "global or namespace-scoped instance",
+                "global, local or namespace-scoped instance",
             )?;
-            expect_atom(&parts[0], "scoped", "scoped instance keyword")?;
-            true
+            expect_atom(&parts[0], keyword, "instance scope keyword")?;
+            (!local, local)
         }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "global or namespace-scoped instance",
+                expected: "global, local or namespace-scoped instance",
             });
         }
     };
@@ -222,6 +225,7 @@ pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError
         value: &args[5],
         priority,
         scoped,
+        local,
     })
 }
 fn command_parts(syntax: &Syntax) -> Result<Option<Parts<'_>>, NatDefinitionElabError> {
@@ -240,6 +244,10 @@ fn command_parts(syntax: &Syntax) -> Result<Option<Parts<'_>>, NatDefinitionElab
 
 pub(super) fn is_scoped(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
     Ok(command_parts(syntax)?.is_some_and(|parts| parts.scoped))
+}
+
+pub(super) fn is_local(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    Ok(command_parts(syntax)?.is_some_and(|parts| parts.local))
 }
 
 pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
