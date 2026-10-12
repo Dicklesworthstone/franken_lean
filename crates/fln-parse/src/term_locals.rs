@@ -328,6 +328,13 @@ impl Prefix {
         Ok(Self::Assertion(Box::new(assertion)))
     }
 
+    /// See [`term_do::Prefix::repeat_keyword`].
+    pub(super) fn repeat_keyword(&self) -> Option<usize> {
+        match self {
+            Prefix::Do(prefix) => prefix.repeat_keyword(),
+            _ => None,
+        }
+    }
     /// See [`term_do::Prefix::jump_keyword`].
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self {

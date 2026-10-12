@@ -1,7 +1,8 @@
-//! `while c do s`, as the pin (`Lean/Elab/BuiltinDo/Repeat.lean`): `repeat if c then s else break`,
-//! that is `for _ in Loop.mk do …` over `Lean.Loop` (`Init/While.lean`). The loop's `mut`
-//! variables, `break`, `continue`, a named condition `h : c` and a nested action in the condition
-//! are an ordinary `for` loop's.
+//! `while c do s` and `repeat s`, as the pin (`Lean/Elab/BuiltinDo/Repeat.lean`): `while` is
+//! `repeat if c then s else break`, and `repeat s` is `for _ in Loop.mk do s` over `Lean.Loop`
+//! (`Init/While.lean`). The loop's `mut` variables, `break`, `continue`, a named condition `h : c`
+//! and a nested action are an ordinary `for` loop's. `repeat` is a do element only: as a term the
+//! pin refuses it ("unexpected token 'repeat'").
 //!
 //! Through `fln check-source` over `prelude` with `Init.While`, `Init.Control.Except`,
 //! `Init.Control.Id` and `Init.Data.List.Control`. Every program here was run through the pinned
@@ -46,6 +47,22 @@ const ACCEPTED: &[(&str, &str)] = &[
         "except_throw",
         "def f (n : Nat) : Except String Nat := do\n  let mut i := n\n  while i > 0 do\n    if i == 7 then throw \"seven\"\n    i := i - 1\n  return i\n",
     ),
+    (
+        "repeat_except_break",
+        "def f (n : Nat) : Except String Nat := do\n  let mut i := 0\n  repeat\n    if i >= n then break\n    i := i + 1\n  return i\n",
+    ),
+    (
+        "repeat_id_break",
+        "def f (n : Nat) : Id Nat := do\n  let mut i := 0\n  repeat\n    if i >= n then break\n    i := i + 1\n  return i\n",
+    ),
+    (
+        "repeat_throw_unit",
+        "def f : Except String Unit := do\n  repeat\n    throw \"stop\"\n",
+    ),
+    (
+        "repeat_nested_action",
+        "def f (c : Except String Bool) : Except String Unit := do\n  repeat\n    if (← c) then break\n",
+    ),
 ];
 
 const REFUSED: &[(&str, &str)] = &[
@@ -65,6 +82,15 @@ const REFUSED: &[(&str, &str)] = &[
         "result_type",
         "def f : Id Nat := do\n  let mut i := 0\n  while i < 3 do\n    i := i + 1\n",
     ),
+    (
+        "repeat_body_type",
+        "def f : Id Unit := do\n  repeat\n    (5 : Nat)\n",
+    ),
+    (
+        "repeat_not_mutable",
+        "def f : Id Unit := do\n  let i := 0\n  repeat\n    i := i + 1\n    break\n",
+    ),
+    ("repeat_repeat_term", "def f : Id Unit := repeat pure ()\n"),
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
