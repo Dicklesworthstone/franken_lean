@@ -4,13 +4,14 @@
 //! as another obligation. Nonrecursive constructor fields become new columns.
 //! All written discriminants are elaborated before this module is entered and
 //! retained as checked lets, including those an earlier contradiction makes
-//! computationally irrelevant. No ambient assumption search supplies a result.
+//! computationally irrelevant. Leaves use only selected evidence, never an
+//! unrelated ambient hypothesis, to construct a checked contradiction proof.
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 enum EmptyTask {
-    Split(ProofGoal, VecDeque<Name>),
+    Split(ProofGoal, VecDeque<Name>, Vec<Name>),
     Close(ProofGoal, Expr),
 }
 
@@ -186,20 +187,36 @@ impl Context {
             .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
         let mut pending = vec![
             EmptyTask::Close(goal, value),
-            EmptyTask::Split(child, columns.iter().cloned().collect()),
+            EmptyTask::Split(child, columns.iter().cloned().collect(), columns.to_vec()),
         ];
         while let Some(task) = pending.pop() {
             self.tick()?;
-            let (goal, mut remaining) = match task {
+            let (goal, mut remaining, evidence) = match task {
                 EmptyTask::Close(goal, value) => {
                     self.close_proof_goal(goal, value)?;
                     continue;
                 }
-                EmptyTask::Split(goal, remaining) => (goal, remaining),
+                EmptyTask::Split(goal, remaining, evidence) => (goal, remaining, evidence),
             };
             self.txn.lctx = goal.lctx.clone();
             let Some(column) = remaining.pop_front() else {
-                return Err(error(TacticError::EliminationCoverage));
+                let mut selected = Vec::new();
+                for name in evidence {
+                    self.tick()?;
+                    if let Some(local) = goal.lctx.find_by_user_name(&name) {
+                        selected.push(Typed {
+                            value: Expr::fvar(local.id.clone()),
+                            type_: local.type_.clone(),
+                        });
+                    }
+                }
+                match self.contradict_evidence_goal(goal, selected) {
+                    Ok(()) => continue,
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                        TacticError::NoContradiction,
+                    ))) => return Err(error(TacticError::EliminationCoverage)),
+                    Err(error) => return Err(error),
+                }
             };
             let mut local = goal
                 .lctx
@@ -236,7 +253,7 @@ impl Context {
                 _ => None,
             };
             let Some(family) = family else {
-                pending.push(EmptyTask::Split(goal, remaining));
+                pending.push(EmptyTask::Split(goal, remaining, evidence));
                 continue;
             };
             let fields = self.empty_field_names(&family)?;
@@ -274,6 +291,7 @@ impl Context {
                 pending.push(EmptyTask::Split(
                     original.expect("recursive case snapshot"),
                     remaining,
+                    evidence,
                 ));
                 continue;
             }
@@ -282,6 +300,7 @@ impl Context {
                 pending.push(match work {
                     Work::Goal(child) => {
                         let mut columns = remaining.clone();
+                        let mut evidence = evidence.clone();
                         // Other constructors' names do not occur in this
                         // branch. Solved fields have become let aliases; the
                         // pin substitutes and drops those non-variable columns.
@@ -293,9 +312,10 @@ impl Context {
                                 .is_some_and(|local| local.value.is_none())
                             {
                                 columns.push_front(name.clone());
+                                evidence.push(name.clone());
                             }
                         }
-                        EmptyTask::Split(child, columns)
+                        EmptyTask::Split(child, columns, evidence)
                     }
                     Work::Close(parent, value) => EmptyTask::Close(parent, value),
                     _ => return Err(failure(SourceInferenceError::Scope)),

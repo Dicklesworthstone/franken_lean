@@ -1063,6 +1063,20 @@ impl Context {
                 type_: local.type_.clone(),
             })
             .collect();
+        self.contradict_evidence_goal(goal, original)
+    }
+
+    /// Contradiction from an explicit set of checked evidence. Empty matches
+    /// pass only their discriminants and exposed constructor fields: the pin's
+    /// matcher closure does not capture unrelated ambient hypotheses.
+    pub(super) fn contradict_evidence_goal(
+        &mut self,
+        goal: ProofGoal,
+        original: Vec<Typed>,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
         // The pin's `contradictionCore` (vendored Lean/Meta/Tactic/Contradiction.lean) refutes
         // an `Eq` or `HEq` hypothesis by its HEAD constructors only; it never injects into
         // fields. A nested clash it reaches only through `decide` (`Config.useDecide`,
