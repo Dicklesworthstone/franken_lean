@@ -976,7 +976,7 @@ jobs:
 
   imported-structure-metadata:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): exercise checked Prelude record construction'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate imported theorem projections and record defaults'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -988,11 +988,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'c0a0031bc58d8fdab2cc05346d01025373a31994'
+      CANDIDATE_SHA: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'c0a0031bc58d8fdab2cc05346d01025373a31994'
+          ref: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -1087,7 +1087,7 @@ jobs:
 
   imported-record-elaboration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): exercise checked Prelude record construction'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate imported theorem projections and record defaults'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -1099,11 +1099,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'c0a0031bc58d8fdab2cc05346d01025373a31994'
+      CANDIDATE_SHA: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'c0a0031bc58d8fdab2cc05346d01025373a31994'
+          ref: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
