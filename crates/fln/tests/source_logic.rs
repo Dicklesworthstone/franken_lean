@@ -1402,9 +1402,10 @@ fn grind_patterns_are_refused_not_ignored() {
 /// `export` as `Command.export`; the scope layer refuses an attribute command or an `open … in` it
 /// does not model. The pin accepts each of these files. A `public` section, with or without
 /// `@[expose]`, the checker reads as the module system's visibility (1877539f) and admits its
-/// theorem, as the pin does. It models neither `noncomputable` scopes, nor export aliases, nor
-/// the `inline` attribute, nor `open` of selected names, nor conv mode, so it refuses those
-/// rather than reading a plain scope or dropping what it does not read. A syntax or notation
+/// theorem, as the pin does. An `export` registers the pin's aliases, so a file ending in one is
+/// admitted. It models neither `noncomputable` scopes, nor the `inline` attribute command, nor
+/// `open` of selected names followed by `in`, nor conv mode, so it refuses those rather than
+/// reading a plain scope or dropping what it does not read. A syntax or notation
 /// declaration it does read (bead `franken_lean-z8j.1.10`, stage 4): the pin accepts both files
 /// below (exit 0, 2026-10-09).
 #[test]
@@ -1415,6 +1416,7 @@ fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
     for source in [
         "public section\ntheorem plain : True := True.intro\nend\n",
         "@[expose] public section\ntheorem plain : True := True.intro\nend\n",
+        "theorem plain : True := True.intro\nexport Nat (succ)\n",
     ] {
         let checked = checked_environment(source);
         assert!(
@@ -1430,7 +1432,6 @@ fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
     }
     for source in [
         "noncomputable section\ntheorem plain : True := True.intro\nend\n",
-        "theorem plain : True := True.intro\nexport Nat (succ)\n",
         "def d : Nat := 1\nattribute [inline] d\n",
         "open Nat (succ) in\ntheorem plain : True := True.intro\n",
         "theorem plain (a : Nat) : a = a := by\n  conv => lhs\n",
