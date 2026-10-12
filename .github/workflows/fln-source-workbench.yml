@@ -755,7 +755,7 @@ jobs:
 
   mutable-loop-returns:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): capture bounded inference traces for nested mutable returns'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate bounded telescope closure and all mutable returns'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -767,12 +767,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '07d95199d64d28694eca724196c035bc11fc2f08'
-      FLN_TRACE_MUTABLE_RETURN: '1'
+      CANDIDATE_SHA: '44d1654c891f6f48756f61776f470fd4a03306c3'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '07d95199d64d28694eca724196c035bc11fc2f08'
+          ref: '44d1654c891f6f48756f61776f470fd4a03306c3'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -799,8 +798,6 @@ jobs:
         run: |
           set -euo pipefail
           rust_paths=(
-            crates/fln-elab/src/source.rs
-            crates/fln-elab/src/constraint/unify.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
             crates/fln-elab/src/source/do_notation/loop_returns.rs
             crates/fln-elab/src/source/do_notation/control.rs
@@ -809,10 +806,12 @@ jobs:
             crates/fln-elab/src/source/do_notation/for_loop.rs
             crates/fln/tests/source_do/for_loops.rs
             crates/fln/tests/source_do/for_loops/mutable_returns.rs
+            crates/fln-elab/src/constraint/unify/residual.rs
+            crates/fln-elab/src/constraint/unify/residual/closure.rs
+            crates/fln-elab/src/constraint/unify/residual/closure/tests.rs
+            crates/fln-elab/tests/native_telescope_closure.rs
           )
           paths=(
-            crates/fln-elab/src/source.rs
-            crates/fln-elab/src/constraint/unify.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
             crates/fln-elab/src/source/do_notation/loop_returns.rs
             crates/fln-elab/src/source/do_notation/control.rs
@@ -824,6 +823,10 @@ jobs:
             crates/fln/tests/source_do/for_loops/mutable_returns.lean
             crates/fln/tests/source_do/for_loops/mutable_returns.expected.tsv
             crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py
+            crates/fln-elab/src/constraint/unify/residual.rs
+            crates/fln-elab/src/constraint/unify/residual/closure.rs
+            crates/fln-elab/src/constraint/unify/residual/closure/tests.rs
+            crates/fln-elab/tests/native_telescope_closure.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_MUTABLE_RETURN_RUSTFMT_DIFF_BEGIN
@@ -837,6 +840,12 @@ jobs:
           rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
           git diff --check
 
+      - name: Check residual closure and complete existing unifier units
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib constraint::unify -- --test-threads=1
+      - name: Check dependent assignments, captured contexts, sharing and bounded closure
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --test native_telescope_closure --test native_assignment_binders --test native_constraint_contexts --test native_unification_sharing --no-fail-fast -- --nocapture --test-threads=1
       - name: Check bounded do-notation transformations with explicit state types
         if: (success() || failure()) && steps.mutable-format.outcome == 'success'
         run: cargo test --locked --offline -p fln-elab --lib source::do_notation -- --test-threads=1
@@ -849,5 +858,5 @@ jobs:
       - name: Check mutable-return production and focused fixture targets
         if: (success() || failure()) && steps.mutable-format.outcome == 'success'
         run: |
-          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln-elab --lib --test native_telescope_closure -- -D warnings
           cargo clippy --locked --offline -p fln --test source_do -- -D warnings
