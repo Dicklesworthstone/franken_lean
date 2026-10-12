@@ -252,7 +252,7 @@ jobs:
 
   automatic-termination:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify checked projection cleanup with source defaults on current main'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify automatic termination with dependent recursion on current main'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -264,11 +264,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '8b26452baa1a0533227527b7aa1063b6b9328b24'
+      CANDIDATE_SHA: 'b617187c6db7acda22d81ad7ee9756c48ae40d39'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '8b26452baa1a0533227527b7aa1063b6b9328b24'
+          ref: 'b617187c6db7acda22d81ad7ee9756c48ae40d39'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -393,6 +393,12 @@ jobs:
         if: success() || failure()
         run: cargo test --locked --offline -p fln --test source_postponed_applications -- --nocapture --test-threads=1
 
+      - name: Check elaborator warnings on the exact merged implementation
+        if: success() || failure()
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check runtime and well-founded target warnings
+        if: success() || failure()
+        run: cargo clippy --locked --offline -p fln --test source_well_founded -- -D warnings
   default-instances:
     if: >-
       github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify default registration order and persistent source metadata on current main'
