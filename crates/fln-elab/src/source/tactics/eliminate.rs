@@ -25,7 +25,7 @@ pub(super) enum EliminationSyntax<'a> {
     Match(matching::MatchParts<'a>),
     RecursiveMatch(matching::MatchParts<'a>),
     /// Retain each live branch as another empty-matrix obligation.
-    EmptyMatrix,
+    EmptyMatrix(HashMap<Name, Vec<Name>>),
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -38,6 +38,7 @@ struct EliminationContext<'a> {
     equations: Option<&'a index_equations::IndexEquations>,
     recursive_source: bool,
     source_match: bool,
+    empty_fields: Option<&'a [Name]>,
 }
 
 /// The pinned `elimTarget` production retains an optional equation binder and
@@ -283,8 +284,9 @@ impl Context {
             equations,
             recursive_source,
             source_match,
+            empty_fields,
         } = context;
-        let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
+        let names = alternative.map_or(empty_fields.unwrap_or(&[]), |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
         let exact_fields = alternative.is_some_and(|alt| alt.exact_fields);
         let mut ctor = Expr::const_(constructor.base.name.clone(), levels.to_vec());
@@ -661,7 +663,7 @@ impl Context {
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
                 (Name::anonymous(), &[][..], true, &[][..])
             }
-            EliminationSyntax::EmptyMatrix => (Name::anonymous(), &[][..], false, &[][..]),
+            EliminationSyntax::EmptyMatrix(_) => (Name::anonymous(), &[][..], false, &[][..]),
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -802,7 +804,7 @@ impl Context {
         if equations.is_none() {
             if matches!(
                 input,
-                EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix
+                EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix(_)
             ) && self.match_has_field_indices(&family)?
             {
                 return self.eliminate_constrained_indices(
@@ -1188,6 +1190,12 @@ impl Context {
                     equations,
                     recursive_source,
                     source_match: !matches!(input, EliminationSyntax::Tactic(_)),
+                    empty_fields: match input {
+                        EliminationSyntax::EmptyMatrix(fields) => {
+                            fields.get(&rule.ctor).map(Vec::as_slice)
+                        }
+                        _ => None,
+                    },
                 },
                 alternative,
                 &mut hypotheses,

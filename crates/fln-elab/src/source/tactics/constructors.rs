@@ -971,7 +971,7 @@ impl Context {
         self.constructor_clash(&evidence, &family, &right.name, target)
     }
 
-    fn empty_evidence(
+    pub(super) fn empty_evidence(
         &mut self,
         evidence: &Typed,
         target: &Expr,
