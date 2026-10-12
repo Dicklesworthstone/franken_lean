@@ -1259,6 +1259,7 @@ impl Context {
         let mut scan = vec![syntax];
         let mut needed = false;
         let mut mutation = false;
+        let mut nested = false;
         let mut local_roots = HashSet::new();
         while let Some(node) = scan.pop() {
             self.tick()?;
@@ -1266,6 +1267,7 @@ impl Context {
                 continue;
             }
             mutation |= do_notation::is_mutation(node);
+            nested |= node.kind() == Some(&parser_kind(&["Term", "nestedAction"]));
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || collections::is_notation(node)
@@ -1290,6 +1292,13 @@ impl Context {
                 }
                 scan.extend(args);
             }
+        }
+        // `(← e)` becomes `let x ← e` before its element first, as the pin expands an element's
+        // nested actions before elaborating it; a reassignment's action is then the mutation's.
+        if nested && let Some(lifted) = self.lift_nested_actions(syntax)? {
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&lifted)?.into_owned(),
+            ));
         }
         if mutation {
             // `let mut` and reassignment become immutable `do` first; the result has none left.

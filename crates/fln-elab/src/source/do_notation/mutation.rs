@@ -541,7 +541,7 @@ fn let_element(name: &Name, annotation: Syntax, value: Syntax) -> Syntax {
 }
 
 /// `let name annotation ← value`, `value` a do element.
-fn bind_element(name: Syntax, annotation: Syntax, value: Syntax) -> Syntax {
+pub(super) fn bind_element(name: Syntax, annotation: Syntax, value: Syntax) -> Syntax {
     term(
         "doLetArrow",
         vec![
