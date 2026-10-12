@@ -423,10 +423,16 @@ fn fun_patterns(syntax: &Syntax) -> bool {
                         if binders.iter().any(pattern_binder))))
 }
 
-/// An anonymous-constructor (`⟨a, b⟩`) or tuple (`(a, b)`) lambda binder.
+/// An anonymous-constructor (`⟨a, b⟩`) or tuple (`(a, b)`) lambda binder. A binder is lowered as
+/// a term before its lambda is rebuilt, so a tuple arrives here as its macro's
+/// `_root_.Prod.mk a b` (`expandTuple`), itself the pattern the tuple stands for.
 fn pattern_binder(binder: &Syntax) -> bool {
     binder.kind() == Some(&parser_kind(&["Term", "anonymousCtor"]))
         || binder.kind() == Some(&parser_kind(&["Term", "tuple"]))
+        || matches!(binder, Syntax::Node { kind, args, .. }
+            if kind == &parser_kind(&["Term", "app"])
+                && matches!(args.first(), Some(Syntax::Ident { val, .. })
+                    if *val == Name::from_components(["_root_", "Prod", "mk"])))
 }
 
 /// `fun ⟨a, b⟩ c => e`, a lambda with an anonymous-constructor binder, is the pattern lambda
