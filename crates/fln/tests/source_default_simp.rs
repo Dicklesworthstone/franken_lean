@@ -574,27 +574,26 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
     );
 }
 
-/// The parser keeps every attribute the pin parses in the declaration's tree; the elaborator
-/// implements one global `simp` and refuses the rest, so no attribute is dropped and none is
+/// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
+/// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
+/// change no checked meaning, and refuses the rest. So no attribute is dropped and none is
 /// admitted without its meaning.
 #[test]
 fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     let base = engine();
     for source in [
-        "@[inline] def x : Nat := 0",
+        "@[macro_inline] def x : Nat := 0",
         "@[simp, inline] theorem t : (0 : Nat) = 0 := by rfl",
         "@[local simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
         "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
         "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
-        "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
         "@[extern \"lean_x\"] def x : Nat := 0",
         "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp] example : (0 : Nat) = 0 := by rfl",
-        // An instance's attributes likewise, inert or not; the instance alone is admitted below.
-        "@[inline] instance : OfNat Bool 7 := ⟨false⟩",
+        // An instance's unimplemented attributes likewise; the instance alone is admitted below.
         "@[default_instance] instance : OfNat Bool 7 := ⟨false⟩",
     ] {
         assert!(
@@ -604,6 +603,14 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         refused(&base, source);
     }
     checked(&base, &["instance : OfNat Bool 7 := ⟨false⟩"]);
+    // The code generator hints are admitted, on a definition and on an instance.
+    for source in [
+        "@[inline] def x : Nat := 0",
+        "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
+        "@[inline] instance : OfNat Bool 7 := ⟨false⟩",
+    ] {
+        checked(&base, &[source]);
+    }
 }
 
 /// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000
