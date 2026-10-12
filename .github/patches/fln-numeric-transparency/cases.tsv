@@ -1,0 +1,14 @@
+projected_def_zero	reject	structure Box where\n  carrier : Type\ndef b : Box := { carrier := Nat }\ndef f : b.carrier := 0
+projected_def_nonzero	reject	structure Box where\n  carrier : Type\ndef b : Box := { carrier := Nat }\ndef f : b.carrier := 37
+projected_def_annotation	reject	structure Box where\n  carrier : Type\ndef b : Box := { carrier := Nat }\ndef f := (0 : b.carrier)
+projected_def_nested	reject	structure Box where\n  carrier : Type\nstructure Outer where\n  inner : Box\ndef b : Outer := { inner := { carrier := Nat } }\ndef f : b.inner.carrier := 0
+projected_parameter_no_instance	reject	structure Box where\n  carrier : Type\ndef f (b : Box) : b.carrier := 0
+projected_def_wrong_index	reject	structure Box where\n  carrier : Type\ndef b : Box := { carrier := Nat }\ndef f [OfNat b.carrier 1] : b.carrier := 0
+projected_abbrev_zero	accept	structure Box where\n  carrier : Type\nabbrev b : Box := { carrier := Nat }\ndef f : b.carrier := 0
+projected_abbrev_nonzero	accept	structure Box where\n  carrier : Type\nabbrev b : Box := { carrier := Nat }\ndef f : b.carrier := 37
+projected_local_let	accept	structure Box where\n  carrier : Type\ndef f : Nat := let b : Box := { carrier := Nat }; (0 : b.carrier)
+projected_def_local_dictionary	accept	structure Box where\n  carrier : Type\ndef b : Box := { carrier := Nat }\ndef f [OfNat b.carrier 0] : b.carrier := 0
+projected_parameter_dictionary	accept	structure Box where\n  carrier : Type\ndef f (b : Box) [OfNat b.carrier 7] : b.carrier := 7
+ordinary_nat	accept	def f : Nat := 37\ntheorem f_ok : f = 37 := by rfl
+ordinary_inferred_nat	accept	def f := 37\ntheorem f_ok : f = 37 := by rfl
+polymorphic_dictionary	accept	def f (A : Type) [OfNat A 7] : A := 7
