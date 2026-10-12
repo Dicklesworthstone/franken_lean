@@ -1,10 +1,13 @@
-//! Nat-valued measures for a single varying argument, using the pin's checked
+//! Nat-valued measures for changing arguments, using the pin's checked
 //! `WellFounded.Nat.fix`. Recursive calls become a typed continuation and an
 //! explicit proof obligation; the source tactic engine must solve every one.
 //!
-//! This is the unary case of `Lean/Elab/PreDefinition/WF/Fix.lean`. The fixed
-//! prefix is captured, never silently changed. Mutual packing, measure search,
-//! and non-Nat well-founded relations remain separate elaboration work.
+//! Independent varying parameters use `Meta.ArgsPacker`'s PSigma encoding.
+//! Fixed arguments are captured at their actual telescope positions. Mutual
+//! groups, dependent varying telescopes, automatic measure search, and non-Nat
+//! well-founded relations remain separate elaboration work.
+mod packing;
+
 use super::*;
 use fln_env::constants::ConstantInfo;
 
@@ -20,7 +23,9 @@ pub(in crate::source) struct State {
     pub name: Name,
     pub reference: Typed,
     marker: FVarId,
-    fixed: Vec<LocalDecl>,
+    parameters: Vec<LocalDecl>,
+    varying: Vec<usize>,
+    fixed: Vec<(usize, LocalDecl)>,
     continuation: LocalDecl,
     proof_inaccessible: Vec<FVarId>,
     proof_hidden: HashSet<Name>,
@@ -40,6 +45,12 @@ struct Obligation {
     raw_target: Expr,
     transport: MVarId,
     captures: Vec<LocalDecl>,
+    arguments: Vec<Expr>,
+}
+
+enum Attempt {
+    Complete(Typed),
+    Repack(Vec<usize>),
 }
 
 #[derive(Clone)]
@@ -281,11 +292,56 @@ impl Context {
         hint: &Hint<'_>,
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
+        let snapshot = self.clone();
+        let mut varying: Vec<_> = (0..parameters.len()).collect();
+        loop {
+            let result = self.well_founded_attempt(
+                name,
+                parameters,
+                &varying,
+                syntax,
+                expected.clone(),
+                hint,
+                header_parameters,
+            )?;
+            match result {
+                Attempt::Complete(value) => return Ok(value),
+                Attempt::Repack(next) => {
+                    // A typed call analysis can only remove fixed positions.
+                    // Retry from the complete checkpoint without refunding
+                    // the work spent discovering this smaller telescope.
+                    if next.len() >= varying.len()
+                        || next.iter().any(|index| !varying.contains(index))
+                    {
+                        return Err(failure(SourceInferenceError::Scope));
+                    }
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    *self = snapshot.clone();
+                    self.txn.budget.heartbeats_consumed = spent;
+                    varying = next;
+                }
+            }
+        }
+    }
+
+    fn well_founded_attempt(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        varying: &[usize],
+        syntax: &Syntax,
+        expected: Option<Expr>,
+        hint: &Hint<'_>,
+        header_parameters: usize,
+    ) -> Result<Attempt, NatDefinitionElabError> {
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
-        let major = parameters
-            .last()
-            .cloned()
-            .ok_or_else(|| error(RecursionError::WellFoundedArgumentRequired))?;
+        if varying.is_empty() {
+            return Err(error(RecursionError::WellFoundedArgumentRequired));
+        }
+        let varying_parameters: Vec<_> = varying
+            .iter()
+            .map(|index| parameters[*index].clone())
+            .collect();
         let proof = hint
             .decreasing
             .ok_or_else(|| error(RecursionError::DecreasingProofRequired))?;
@@ -294,23 +350,20 @@ impl Context {
         }
         let measure = self.well_founded_measure(hint, parameters, header_parameters)?;
         let saved = self.txn.lctx.clone();
-        let domain = self.instantiate(&major.type_)?;
-        let motive = Expr::lam(
-            major.user_name.clone(),
-            domain.clone(),
-            expected
-                .abstract_fvar(&major.id, 0)
-                .map_err(|_| failure(SourceInferenceError::Scope))?,
-            BinderInfo::Default,
-        );
-        let measure_fn = Expr::lam(
-            major.user_name.clone(),
-            domain,
-            measure
-                .abstract_fvar(&major.id, 0)
-                .map_err(|_| failure(SourceInferenceError::Scope))?,
-            BinderInfo::Default,
-        );
+        let domain = self.well_founded_domain(&varying_parameters)?;
+        let motive = self.well_founded_motive(&varying_parameters, &domain, &expected)?;
+        let measure_fn = self.uncurry_well_founded_value(
+            &varying_parameters,
+            Typed {
+                value: measure,
+                type_: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+            },
+        )?;
+        let current_arguments: Vec<_> = varying_parameters
+            .iter()
+            .map(|parameter| Expr::fvar(parameter.id.clone()))
+            .collect();
+        let current = self.pack_well_founded_arguments(&domain, &current_arguments)?;
         let fix_name = Name::from_components(["WellFounded", "Nat", "fix"]);
         if !matches!(
             self.txn.env.find(&fix_name),
@@ -319,7 +372,7 @@ impl Context {
             return Err(failure(SourceInferenceError::UnknownConstant(fix_name)));
         }
         let mut fix = self.constant(&fix_name)?;
-        for value in [major.type_.clone(), motive, measure_fn] {
+        for value in [domain, motive, measure_fn.value] {
             let type_ = self
                 .known_type(&value)?
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
@@ -337,7 +390,7 @@ impl Context {
         let ExprNode::ForallE { body, .. } = functional_type.node() else {
             return Err(failure(SourceInferenceError::ExpectedFunction));
         };
-        let at_major = self.substitute(body, &Expr::fvar(major.id.clone()))?;
+        let at_major = self.substitute(body, &current.value)?;
         let at_major = self.whnf(&at_major)?;
         let ExprNode::ForallE {
             binder_type: continuation_type,
@@ -386,7 +439,14 @@ impl Context {
                 type_: reference_type,
             },
             marker: marker.clone(),
-            fixed: parameters[..parameters.len() - 1].to_vec(),
+            parameters: parameters.to_vec(),
+            varying: varying.to_vec(),
+            fixed: parameters
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !varying.contains(index))
+                .map(|(index, parameter)| (index, parameter.clone()))
+                .collect(),
             continuation: continuation.clone(),
             proof_inaccessible: parameters[header_parameters..]
                 .iter()
@@ -417,6 +477,26 @@ impl Context {
                 .filter(|obligation| live.contains(&obligation.transport))
                 .cloned()
                 .collect();
+            let actual_varying = self.well_founded_varying_parameters(parameters, &obligations)?;
+            if actual_varying.is_empty() {
+                return Err(error(RecursionError::WellFoundedArgumentRequired));
+            }
+            if actual_varying != varying {
+                return Ok(Attempt::Repack(actual_varying));
+            }
+            let varying_ids: HashSet<_> = varying_parameters
+                .iter()
+                .map(|parameter| parameter.id.clone())
+                .collect();
+            for parameter in &varying_parameters {
+                self.tick()?;
+                if !self
+                    .elimination_reads(&parameter.type_)?
+                    .is_disjoint(&varying_ids)
+                {
+                    return Err(error(RecursionError::DependentWellFoundedArguments));
+                }
+            }
             if !obligations.is_empty() {
                 self.well_founded
                     .as_mut()
@@ -444,33 +524,188 @@ impl Context {
             }
             let mut value = self.instantiate(&value)?;
             self.require_resolved_terms(std::slice::from_ref(&value))?;
-            for local in [&continuation, &major] {
-                value = Expr::lam(
-                    local.user_name.clone(),
-                    self.instantiate(&local.type_)?,
-                    value
-                        .abstract_fvar(&local.id, 0)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?,
-                    BinderInfo::Default,
-                );
-            }
+            value = Expr::lam(
+                continuation.user_name.clone(),
+                self.instantiate(&continuation.type_)?,
+                value
+                    .abstract_fvar(&continuation.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            );
             let type_ = self
                 .known_type(&value)?
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-            let fixed = self.match_apply(fix, Typed { value, type_ })?;
-            self.match_apply(
-                fixed,
-                Typed {
-                    value: Expr::fvar(major.id.clone()),
-                    type_: major.type_.clone(),
-                },
-            )
+            let functional =
+                self.uncurry_well_founded_value(&varying_parameters, Typed { value, type_ })?;
+            let fixed = self.match_apply(fix, functional)?;
+            self.match_apply(fixed, current).map(Attempt::Complete)
         })();
         self.well_founded = None;
         self.txn.lctx = saved;
-        if result.is_ok() {
+        if matches!(&result, Ok(Attempt::Complete(_))) {
             self.well_founded_definition = true;
         }
+        result
+    }
+
+    fn fixed_argument_conversion(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        proof_irrelevance: bool,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.proof_irrelevance = proof_irrelevance;
+        match self.txn.unify(left, right, budget) {
+            Ok(report) => {
+                assert!(report.awakened.is_empty(), "private source queue");
+                Ok(true)
+            }
+            Err(UnificationError::Deferred(_)) => Ok(false),
+            Err(UnificationError::AssignmentCheck { outcome, .. })
+                if matches!(
+                    *outcome,
+                    Outcome::Complete(fln_kernel::verdict::Verdict::Rejected { .. })
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(problem) => Err(failure(SourceInferenceError::Unification(Box::new(
+                problem,
+            )))),
+        }
+    }
+
+    /// The pin retains unitlike eta even under `withoutProofIrrelevance`.
+    /// The admitted family must have exactly one nullary constructor, and the
+    /// actual parameterized types must still compare at reducible transparency.
+    fn fixed_unitlike_argument(
+        &mut self,
+        argument: &Expr,
+        parameter: &LocalDecl,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let domain = self.reduce_source_head(
+            &parameter.type_,
+            UnificationTransparency::Abbreviations,
+            true,
+        )?;
+        let (head, arguments) = operators::spine(&domain);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(false);
+        };
+        self.tick()?;
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name) else {
+            return Ok(false);
+        };
+        if family.is_unsafe
+            || family.is_rec
+            || family.is_reflexive
+            || family.num_indices != 0
+            || family.num_nested != 0
+            || family.all.len() != 1
+            || family.all.first() != Some(name)
+            || family.ctors.len() != 1
+            || levels.len() != family.base.level_params.len()
+            || u32::try_from(arguments.len()).ok() != Some(family.num_params)
+        {
+            return Ok(false);
+        }
+        let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&family.ctors[0]) else {
+            return Ok(false);
+        };
+        if constructor.is_unsafe
+            || constructor.cidx != 0
+            || &constructor.induct != name
+            || constructor.num_params != family.num_params
+            || constructor.num_fields != 0
+            || constructor.base.level_params != family.base.level_params
+        {
+            return Ok(false);
+        }
+        let type_ = self
+            .known_type(argument)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        if self.fixed_argument_conversion(&domain, &type_, false)? {
+            return Ok(true);
+        }
+        if self.fixed_argument_conversion(&domain, &type_, true)? {
+            return Err(error(RecursionError::FixedArgumentConversionUnsupported));
+        }
+        Ok(false)
+    }
+
+    fn fixed_well_founded_argument(
+        &mut self,
+        argument: &Expr,
+        parameter: &LocalDecl,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.flush(false)?;
+        let argument =
+            self.reduce_source_head(argument, UnificationTransparency::Abbreviations, true)?;
+        let original = Expr::fvar(parameter.id.clone());
+        if self.fixed_recursive_argument(&argument, parameter)?
+            || self.fixed_argument_conversion(&original, &argument, false)?
+            || self.fixed_unitlike_argument(&argument, parameter)?
+        {
+            return Ok(true);
+        }
+        // The pin has additional proof-field and implicit-proof-argument
+        // rules even with direct proof irrelevance disabled. Until those
+        // rungs are available, do not mistake a missing conversion for a
+        // varying argument and expose extra locals to decreasing_by.
+        if self.fixed_argument_conversion(&original, &argument, true)? {
+            return Err(error(RecursionError::FixedArgumentConversionUnsupported));
+        }
+        Ok(false)
+    }
+
+    /// Single-function `FixedParams`: inspect the typed recursive arguments,
+    /// then propagate variation through parameter-type dependencies. Analysis
+    /// precedes decreasing tactics, so packing cannot change their local scope.
+    fn well_founded_varying_parameters(
+        &mut self,
+        parameters: &[LocalDecl],
+        obligations: &[Obligation],
+    ) -> Result<Vec<usize>, NatDefinitionElabError> {
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            let mut varying = vec![false; parameters.len()];
+            for obligation in obligations {
+                self.txn.lctx = obligation.goal.lctx.clone();
+                for (index, parameter) in parameters.iter().enumerate() {
+                    self.tick()?;
+                    if varying[index] {
+                        continue;
+                    }
+                    varying[index] = !self
+                        .fixed_well_founded_argument(&obligation.arguments[index], parameter)?;
+                }
+            }
+            self.txn.lctx = saved.clone();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (index, parameter) in parameters.iter().enumerate() {
+                    self.tick()?;
+                    if varying[index] {
+                        continue;
+                    }
+                    let dependencies = self.elimination_reads(&parameter.type_)?;
+                    if parameters.iter().enumerate().any(|(earlier, parameter)| {
+                        varying[earlier] && dependencies.contains(&parameter.id)
+                    }) {
+                        varying[index] = true;
+                        changed = true;
+                    }
+                }
+            }
+            Ok(varying
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, changes)| changes.then_some(index))
+                .collect())
+        })();
+        self.txn.lctx = saved;
         result
     }
 
@@ -655,7 +890,7 @@ impl Context {
             return Ok(value.clone());
         }
         let marker = state.marker.clone();
-        let fixed_count = state.fixed.len();
+        let arity = state.parameters.len();
         let mut head = value;
         let mut arguments = Vec::new();
         while let ExprNode::App { f, a } = head.node() {
@@ -663,45 +898,72 @@ impl Context {
             arguments.push(a.clone());
             head = f;
         }
-        if !matches!(head.node(), ExprNode::FVar { id } if id == &marker)
-            || arguments.len() <= fixed_count
+        if !matches!(head.node(), ExprNode::FVar { id } if id == &marker) || arguments.len() < arity
         {
             return Ok(value.clone());
         }
-        let call = self.instantiate(value)?;
         let state = self.well_founded.as_ref().expect("active recursive call");
         if state.proving {
             return Err(error(RecursionError::RecursionInDecreasingProof));
         }
-        // `replaceRecApps` caches the complete call after stripping its source
-        // annotation. Reuse is directional: the last local of the cached scope
-        // must still be present. A call first seen inside a let or sibling
-        // branch cannot supply another site's proof after that scope closes.
-        if let Some(cached) = state.calls.get(&call)
+        // Do not copy the growing obligation list on each source application.
+        // Only an actual saturated self call needs these small snapshots.
+        let fixed = state.fixed.clone();
+        let varying = state.varying.clone();
+        let proof_inaccessible = state.proof_inaccessible.clone();
+        arguments.reverse();
+        for (index, parameter) in &fixed {
+            self.tick()?;
+            if !self.fixed_well_founded_argument(&arguments[*index], parameter)? {
+                return Err(error(RecursionError::ChangedParameter));
+            }
+        }
+        // PackMutual preserves the original expression only for a unary
+        // varying suffix after fixed parameters. All other encodings remove
+        // fixed arguments before the complete-call cache sees the expression.
+        // Validate those arguments above before a cache hit can discard them.
+        let call = if varying.len() == 1 && varying[0] + 1 == arity {
+            self.instantiate(value)?
+        } else {
+            let mut call = Expr::fvar(marker.clone());
+            for index in varying.iter().copied().chain(arity..arguments.len()) {
+                self.tick()?;
+                call = Expr::app(call, self.instantiate(&arguments[index])?);
+            }
+            call
+        };
+        // Reuse remains directional: the cached original scope's last local
+        // must still be present. Sibling/expired contexts keep distinct goals.
+        if let Some(cached) = self
+            .well_founded
+            .as_ref()
+            .expect("active recursive call")
+            .calls
+            .get(&call)
             && self.txn.lctx.find(&cached.scope).is_some()
         {
             return Ok(cached.value.clone());
         }
-        // Do not copy the growing obligation list on each source application.
-        // Only an actual saturated self call needs these small snapshots.
-        let fixed = state.fixed.clone();
-        let proof_inaccessible = state.proof_inaccessible.clone();
         let continuation = self
             .well_founded_continuation()
             .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-        arguments.reverse();
-        for (argument, parameter) in arguments.iter().zip(&fixed) {
-            self.tick()?;
-            let argument = self.instantiate(argument)?;
-            if !self.fixed_recursive_argument(&argument, parameter)? {
-                return Err(error(RecursionError::ChangedParameter));
-            }
-        }
-        let next = self.instantiate(&arguments[fixed_count])?;
         let continuation_type = self.whnf(&continuation.type_)?;
-        let ExprNode::ForallE { body, .. } = continuation_type.node() else {
+        let ExprNode::ForallE {
+            binder_type: domain,
+            body,
+            ..
+        } = continuation_type.node()
+        else {
             return Err(failure(SourceInferenceError::ExpectedFunction));
         };
+        let mut next_arguments = Vec::new();
+        for index in varying {
+            self.tick()?;
+            next_arguments.push(self.instantiate(&arguments[index])?);
+        }
+        let next = self
+            .pack_well_founded_arguments(domain, &next_arguments)?
+            .value;
         let at_next = self.substitute(body, &next)?;
         let at_next = self.whnf(&at_next)?;
         let ExprNode::ForallE {
@@ -781,7 +1043,8 @@ impl Context {
             }
         }
         let mut result = Expr::app(Expr::app(Expr::fvar(continuation.id), next), transported);
-        for argument in arguments.into_iter().skip(fixed_count + 1) {
+        let call_arguments = arguments[..arity].to_vec();
+        for argument in arguments.into_iter().skip(arity) {
             self.tick()?;
             result = Expr::app(result, argument);
         }
@@ -803,6 +1066,7 @@ impl Context {
             raw_target,
             transport,
             captures,
+            arguments: call_arguments,
         });
         active.calls.insert(
             call,

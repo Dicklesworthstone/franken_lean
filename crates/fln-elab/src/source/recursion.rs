@@ -36,6 +36,8 @@ pub enum RecursionError {
     PartialApplication,
     WellFoundedMeasureRequired,
     WellFoundedArgumentRequired,
+    DependentWellFoundedArguments,
+    FixedArgumentConversionUnsupported,
     DecreasingProofRequired,
     RecursionInDecreasingProof,
     StructuralMeasureNotParameter,
@@ -74,7 +76,13 @@ impl std::fmt::Display for RecursionError {
                 "well-founded recursion requires an explicit Nat-valued termination_by measure"
             }
             Self::WellFoundedArgumentRequired => {
-                "well-founded recursion requires one varying final argument and a fixed prefix"
+                "well-founded recursion requires at least one varying argument"
+            }
+            Self::DependentWellFoundedArguments => {
+                "well-founded recursion with dependent varying argument types is not supported"
+            }
+            Self::FixedArgumentConversionUnsupported => {
+                "well-founded fixed-argument analysis does not yet support this proof-dependent conversion"
             }
             Self::DecreasingProofRequired => {
                 "well-founded recursion requires an explicit decreasing_by proof"

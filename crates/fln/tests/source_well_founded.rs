@@ -10,6 +10,8 @@ use fln::{
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[path = "support/well_founded_arguments.rs"]
+mod well_founded_arguments;
 #[path = "support/well_founded_matches.rs"]
 mod well_founded_matches;
 #[path = "support/well_founded_opacity.rs"]
@@ -288,9 +290,6 @@ fn assert_decreasing_refusals(base: &Engine) {
 
 fn assert_explicit_scope_limits(base: &Engine) {
     for source in [
-        // Multi-varying-argument packing is a later extension; a fixed
-        // parameter must not silently be frozen at its initial value.
-        "def changes (a n : Nat) : Nat := if h : 0 < n then changes (a + 1) (n - 1) else a\ntermination_by n\ndecreasing_by exact @Nat.sub_lt n 1 h (Nat.succ_pos 0)",
         // This slice does not claim measure search or automatic proof synthesis.
         "def absentMeasure (n : Nat) : Nat := if h : 0 < n then absentMeasure 0 else 0\ndecreasing_by exact h",
         "def absentProof (n : Nat) : Nat := if h : 0 < n then absentProof 0 else 0\ntermination_by n",
@@ -323,6 +322,7 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
             assert_decreasing_refusals(&base);
             assert_explicit_scope_limits(&base);
             well_founded_matches::assert_match_programs(&base);
+            well_founded_arguments::assert_argument_programs(&base);
             well_founded_opacity::assert_source_opacity_routes(&base);
         })
         .expect("spawn native checking thread")

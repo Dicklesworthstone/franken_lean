@@ -74,6 +74,9 @@ pub struct UnificationBudget {
     /// Unfold local let declarations. This is independent of global delta
     /// transparency; automatic `simp` closure leaves these names closed.
     pub zeta_delta: bool,
+    /// Enable the direct comparison of proofs of the same proposition. Fixed
+    /// recursion parameters use the pin's `withoutProofIrrelevance` policy.
+    pub proof_irrelevance: bool,
     /// A separate, caller-calibrated bound for each assignment's K1 check.
     pub kernel: Budget,
 }
@@ -87,6 +90,7 @@ impl UnificationBudget {
             max_metavar_depth: 0,
             transparency: UnificationTransparency::Abbreviations,
             zeta_delta: true,
+            proof_irrelevance: true,
             kernel,
         }
     }
@@ -981,7 +985,9 @@ impl Engine<'_> {
                 return Ok(());
             }
         }
-        if self.proof_irrelevance(&left, &right, locals, pending)? {
+        if self.budget.proof_irrelevance
+            && self.proof_irrelevance(&left, &right, locals, pending)?
+        {
             return Ok(());
         }
         if let Some((left, right)) = self.nat_offset_equation(&left, &right, locals)? {
