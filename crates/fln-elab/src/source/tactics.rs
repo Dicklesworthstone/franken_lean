@@ -880,6 +880,10 @@ impl Context {
                     value,
                     opaque,
                 });
+            } else if kind == &parser_kind(&["Tactic", "rintro"]) {
+                self.rintro_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "obtain"]) {
+                self.obtain_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rcases"]) {
                 self.rcases_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "refine"]) {

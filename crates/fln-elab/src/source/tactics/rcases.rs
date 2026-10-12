@@ -4,6 +4,7 @@
 use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
+mod derived;
 
 #[derive(Clone)]
 enum Pattern<'a> {
@@ -183,7 +184,7 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'a>,
         mut goal: ProofGoal,
-        args: &'a [Syntax],
+        args: &[Syntax],
     ) -> Result<(), NatDefinitionElabError> {
         let [keyword, targets, with] = args else {
             return Err(malformed());
@@ -311,7 +312,7 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'a>,
         goal: ProofGoal,
-        mut arena: Vec<Pattern<'a>>,
+        mut arena: Vec<Pattern<'_>>,
         subjects: Vec<Subject>,
     ) -> Result<(), NatDefinitionElabError> {
         let mut pending = vec![Step::Match(goal, subjects)];
