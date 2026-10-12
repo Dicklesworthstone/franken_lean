@@ -386,14 +386,28 @@ fn ascribed_patterns_are_never_misread() {
     );
 }
 
-/// `nofun` and `nomatch h` parse as the pin's `Term.nofun` and `Term.nomatch`; the elaborator
-/// does not read them, so it refuses files the pin accepts.
+/// `nofun` and `nomatch h` elaborate as the pin's empty matches: admitted over an empty type or an
+/// impossible equation, through every binder `nofun` opens.
 #[test]
-fn empty_matches_are_refused_not_misread() {
-    let (engine, limits) = engine();
+fn empty_matches_are_admitted_over_uninhabited_types() {
     for source in [
         "def nf : False → Nat := nofun\n",
         "def nm (h : False) : Nat := nomatch h\n",
+        "def ne : Nat.succ 0 = 0 → Nat := nofun\n",
+        "def n2 : (n : Nat) → Nat.succ n = 0 → Nat := nofun\n",
+    ] {
+        check(source);
+    }
+}
+
+/// An empty match over an inhabited type is the pin's "Missing cases" error, never a function.
+#[test]
+fn empty_matches_over_inhabited_types_are_refused() {
+    let (engine, limits) = engine();
+    for source in [
+        "def bad : Nat → Nat := nofun\n",
+        "def bad : Bool → Nat := nofun\n",
+        "def bad (n : Nat) : Nat := nomatch n\n",
     ] {
         assert!(
             !matches!(
