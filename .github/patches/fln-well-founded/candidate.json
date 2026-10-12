@@ -1,98 +1,119 @@
 {
   "version": 1,
-  "base": "1db466e8815fba0b352ae70fcfd789b56b4a8723",
-  "candidateTree": "f47cfbfbf9a4f183d23adde6c98f7f64999d1310",
+  "base": "ad27964a6f8a57bfa97e3dd6431251b119d85c9e",
+  "candidateTree": "51accde6e63dda9384badcc3fddc87ae1470f25c",
   "files": [
     {
       "path": "crates/fln-elab/src/source/level_syntax.rs",
       "baselineSha": "e5f663bde4f89ca86d79f7052861987152b85610",
       "baselineMode": "100644",
       "blobSha": "38ad06d632986ab6b58f0aa6dcf79f519cb2b26c",
-      "bytes": 19043
+      "bytes": 19043,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/levels/generalization.rs",
       "baselineSha": "02c863ff34e18ae97f7726d2208fb372b525320d",
       "baselineMode": "100644",
       "blobSha": "9e70bebcd3b05c3fcf61e7cb0a49c3b8cc1ccb60",
-      "bytes": 11777
+      "bytes": 11777,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/matching.rs",
       "baselineSha": "88c332e550560dcea80b96efd368f4e57d5011f5",
       "baselineMode": "100644",
       "blobSha": "7bd2aaf959e2160420878c028dbc08def5c3aaf3",
-      "bytes": 66388
+      "bytes": 66388,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/matching/conditional_order.rs",
       "baselineSha": null,
       "baselineMode": null,
       "blobSha": "b0174538c056aa51a59541d13cd77dd04d9ff311",
-      "bytes": 4282
+      "bytes": 4282,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/recursion.rs",
       "baselineSha": "d913cd506d6920d4c17136ee28f65dd6f0c9ed83",
       "baselineMode": "100644",
       "blobSha": "9e287aeb5f36895e107ba8c0604880bf1b65e932",
-      "bytes": 67938
+      "bytes": 67938,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/recursion/well_founded.rs",
       "baselineSha": "a2c76036140f6a8603c40767cf08ebfeac95111a",
       "baselineMode": "100644",
       "blobSha": "c0c7607c7fd52dc1c5716a27126c13307b7bd9c2",
-      "bytes": 72326
+      "bytes": 72326,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/recursion/well_founded/relation.rs",
       "baselineSha": null,
       "baselineMode": null,
       "blobSha": "ceed75256e6a1e6933a6d5917bdc14d29c6c1333",
-      "bytes": 8237
+      "bytes": 8237,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/recursion/well_founded/relation/cleanup.rs",
       "baselineSha": null,
       "baselineMode": null,
       "blobSha": "03711dcc564fdb8348b85e60e4c3daafeafc532b",
-      "bytes": 15815
+      "bytes": 15815,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/recursion/well_founded/scopes.rs",
       "baselineSha": null,
       "baselineMode": null,
       "blobSha": "71c0155a90aab970448f388450379eb6da211ff5",
-      "bytes": 2406
+      "bytes": 2406,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln-elab/src/source/tactics.rs",
       "baselineSha": "b3a76473b3ec9683ca259807000bc9d86f27f7ae",
       "baselineMode": "100644",
       "blobSha": "4096199fde0245d340b21bf1b8a53eaf5ff20fb4",
-      "bytes": 62049
+      "bytes": 62049,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln/tests/source_well_founded.rs",
       "baselineSha": "c4e5d5eedc05a1fe9df5a73667e32600b822ee80",
       "baselineMode": "100644",
       "blobSha": "47dbe518f6cc67098d5bba06c7279d97d1796aa9",
-      "bytes": 18384
+      "bytes": 18384,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln/tests/support/well_founded_lex.rs",
       "baselineSha": null,
       "baselineMode": null,
       "blobSha": "6be388848388060897a3f5bb6a72b33276fb7486",
-      "bytes": 5653
+      "bytes": 5653,
+      "purpose": "well-founded-source"
     },
     {
       "path": "crates/fln/tests/support/well_founded_relations.rs",
       "baselineSha": null,
       "baselineMode": null,
       "blobSha": "20cae58f35361eb1faaf99c23e28011aa3a0e3be",
-      "bytes": 16180
+      "bytes": 16180,
+      "purpose": "well-founded-source"
+    },
+    {
+      "path": "crates/fln/tests/source_imported_arrays.rs",
+      "baselineSha": "081ceb479e29af90856bb61a209c45d3c9e45e56",
+      "baselineMode": "100644",
+      "blobSha": "e00214e7513c54f7a2953e661b83976ff48ff1cd",
+      "bytes": 21890,
+      "purpose": "array-fold-inventory"
     }
   ]
 }
