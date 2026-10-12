@@ -7669,14 +7669,22 @@ fn int_obj(negative: bool, magnitude: &BigNat) -> Obj {
     if magnitude.is_zero() {
         return Obj::mk_int(0);
     }
-    if let Some(word) = magnitude.to_u64()
-        && let Ok(small) = i32::try_from(word)
-    {
-        return Obj::mk_int(if negative {
-            -i64::from(small)
+    if let Some(word) = magnitude.to_u64() {
+        // The negative endpoint has one more magnitude than the positive
+        // endpoint. Testing the unsigned magnitude with i32::try_from would
+        // incorrectly make -2^31 an mpz, observable in Float.scaleB's branch.
+        let scalar_limit = if negative {
+            i64::from(i32::MIN).unsigned_abs()
         } else {
-            i64::from(small)
-        });
+            i32::MAX as u64
+        };
+        if word <= scalar_limit {
+            return Obj::mk_int(if negative {
+                -(word as i64)
+            } else {
+                word as i64
+            });
+        }
     }
     Obj::mk_mpz(magnitude.limbs_le(), negative)
 }
@@ -8893,6 +8901,18 @@ mod tests {
         let underflow = invoke("extern:Int.sub", &[i(i64::from(i32::MIN)), i(1)]);
         let (negative, _, _) = int_words(underflow);
         assert!(negative);
+        for minimum in [
+            invoke("extern:Int.sub", &[i(-2_147_483_647), i(1)]),
+            invoke("extern:Int.add", &[i(i64::from(i32::MIN)), i(0)]),
+            invoke("extern:Int.neg", &[Obj::mk_mpz(&[2_147_483_648], false)]),
+        ] {
+            let minimum = minimum.expect("minimum i32 answers");
+            assert!(
+                minimum.is_scalar(),
+                "the pin includes -2^31 in its scalar Int range"
+            );
+            assert_eq!(minimum.unbox() as u32 as i32, i32::MIN);
+        }
     }
 
     #[test]
@@ -8971,6 +8991,12 @@ mod tests {
         // negSucc n = -(n + 1): Basic.lean:61.
         assert_eq!(int_i64(invoke("extern:Int.negSucc", &[n(0)])), -1);
         assert_eq!(int_i64(invoke("extern:Int.negSucc", &[n(5)])), -6);
+        let minimum = invoke("extern:Int.negSucc", &[n(2_147_483_647)]).unwrap();
+        assert!(
+            minimum.is_scalar(),
+            "negSucc reaches the scalar Int lower endpoint"
+        );
+        assert_eq!(minimum.unbox() as u32 as i32, i32::MIN);
         assert_eq!(int_i64(invoke("extern:Int.ofNat", &[n(5)])), 5);
         assert_eq!(int_i64(invoke("extern:Int.natAbs", &[i(-9)])), 9);
         assert_eq!(owned_usize(invoke("extern:Int.natAbs", &[i(5)])), 5);

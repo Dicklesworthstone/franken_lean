@@ -1,6 +1,12 @@
 //! Private native scalar calls preserve the imported UInt/BitVec/Fin records.
 //! Only complete pinned models authorize these post-admission adapters.
 use super::*;
+use fln_comp::fir::EffectClass;
+use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
+use fln_vm::extern_row::{
+    ArgumentOwnership as ContractArgument, EffectClass as ContractEffect,
+    Ownership as ContractOwnership, ResultOwnership as ContractResult,
+};
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -47,8 +53,86 @@ fn source_type(value: ValueType) -> Result<Expr, IngressError> {
         ValueType::Float32 => "Float32",
         ValueType::UInt32 => "UInt32",
         ValueType::UInt64 => "UInt64",
+        // Only the private Float.scaleB signature uses an ABI-valued input;
+        // its source argument is still the checked logical Int family.
+        ValueType::Abi => "Int",
         _ => return Err(unsupported("Float primitive scalar interface")),
     }))
+}
+
+fn integer_constructor(requested: &Name) -> bool {
+    requested == &name("Int.ofNat") || requested == &name("Int.negSucc")
+}
+
+/// The generated scalar catalog intentionally has no public ABI-shaped Int.
+/// Bind just the scaleB boundary and its two packing operations privately,
+/// retaining the generated census's effect and ownership contracts.
+fn primitive_binding(requested: &Name) -> Result<IntrinsicBinding, IngressError> {
+    if let Some(binding) = generated_source_intrinsic_binding(requested) {
+        return Ok(binding);
+    }
+    let (arguments, result, kind) = if requested == &name("Float.scaleB") {
+        (
+            vec![ValueType::Float, ValueType::Abi],
+            ValueType::Float,
+            "opaque",
+        )
+    } else if requested == &name("Float32.scaleB") {
+        (
+            vec![ValueType::Float32, ValueType::Abi],
+            ValueType::Float32,
+            "opaque",
+        )
+    } else if integer_constructor(requested) {
+        (vec![ValueType::Nat], ValueType::Abi, "ctor")
+    } else {
+        return Err(unsupported("Float generated primitive contract"));
+    };
+    let spelling = requested.to_display_string();
+    let row = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|row| {
+            row.name == spelling
+                && row.kind == kind
+                && row.levels == 0
+                && row.arity as usize == arguments.len()
+        })
+        .ok_or_else(|| unsupported("Float generated Int boundary contract"))?;
+    if ContractEffect::parse(row.effect).ok() != Some(ContractEffect::Pure) {
+        return Err(unsupported("Float Int boundary effect contract"));
+    }
+    let ownership = ContractOwnership::parse(row.ownership)
+        .map_err(|_| unsupported("Float Int boundary ownership contract"))?;
+    let argument_ownership = ownership
+        .argument_ownership(arguments.len())
+        .map_err(|_| unsupported("Float Int boundary argument ownership"))?
+        .into_iter()
+        .map(|ownership| match ownership {
+            ContractArgument::Borrowed => ArgumentOwnership::Borrowed,
+            ContractArgument::Owned => ArgumentOwnership::Owned,
+            ContractArgument::Unique => ArgumentOwnership::Unique,
+            ContractArgument::Scalar => ArgumentOwnership::Scalar,
+        })
+        .collect();
+    let result_ownership = match ownership
+        .result_ownership()
+        .map_err(|_| unsupported("Float Int boundary result ownership"))?
+    {
+        ContractResult::Owned => ResultOwnership::Owned,
+        ContractResult::Borrowed => ResultOwnership::Borrowed,
+        ContractResult::Scalar => ResultOwnership::Scalar,
+        ContractResult::RawObject => ResultOwnership::RawObject,
+    };
+    Ok(IntrinsicBinding {
+        name: requested.clone(),
+        universe_arity: 0,
+        row: row.id.to_owned(),
+        arguments,
+        argument_ownership,
+        result,
+        result_ownership,
+        effect: EffectClass::Pure,
+    })
 }
 
 impl Preparation<'_> {
@@ -87,6 +171,7 @@ impl Preparation<'_> {
         let label = match value {
             ValueType::UInt32 => "_fln_runtime_float_word32",
             ValueType::UInt64 => "_fln_runtime_float_word64",
+            ValueType::Abi => "_fln_runtime_float_int",
             _ => return source_type(value),
         };
         self.tick()?;
@@ -94,7 +179,14 @@ impl Preparation<'_> {
             return Err(unsupported("Float private word carrier name collision"));
         }
         let type_ = c(label);
-        let representation = (value, result_ownership(value));
+        let representation = (
+            value,
+            if value == ValueType::Abi {
+                CallableResultOwnership::OwnedOrScalar
+            } else {
+                result_ownership(value)
+            },
+        );
         if let Some(known) = self.value_types.native.get(&type_) {
             if *known != representation {
                 return Err(unsupported("Float private word carrier representation"));
@@ -115,7 +207,10 @@ impl Preparation<'_> {
 
     pub(super) fn float_bind_primitive(&mut self, requested: &Name) -> Result<Name, IngressError> {
         self.tick()?;
-        if !self.floats.checked || !source_intrinsics::float::is_primitive(requested) {
+        if !self.floats.checked
+            || !(source_intrinsics::float::is_primitive(requested)
+                || integer_constructor(requested))
+        {
             return Err(unsupported(
                 "Float primitive requires its complete admitted model",
             ));
@@ -130,8 +225,7 @@ impl Preparation<'_> {
         if self.environment.contains(&private) {
             return Err(unsupported("Float private primitive name collision"));
         }
-        let mut binding = generated_source_intrinsic_binding(requested)
-            .ok_or_else(|| unsupported("Float generated primitive contract"))?;
+        let mut binding = primitive_binding(requested)?;
         let mut domains = Vec::new();
         for &argument in &binding.arguments {
             reserve(&mut domains, self.limits.max_application_args)?;
@@ -221,6 +315,36 @@ impl Preparation<'_> {
         Ok(constructor(&layout.logical.constructors[0], [bits]))
     }
 
+    fn float_pack_int(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let shape = self.io_checked_shape(c("Int"))?;
+        let [positive, negative] = shape.constructors.as_slice() else {
+            return Err(unsupported("Float logical Int constructors"));
+        };
+        if positive.original != name("Int.ofNat")
+            || positive.tag != 0
+            || positive.fields != [c("Nat")]
+            || negative.original != name("Int.negSucc")
+            || negative.tag != 1
+            || negative.fields != [c("Nat")]
+        {
+            return Err(unsupported("Float logical Int layout"));
+        }
+        let native = self.float_native_type(ValueType::Abi)?;
+        let positive = self.float_bind_primitive(&name("Int.ofNat"))?;
+        let negative = self.float_bind_primitive(&name("Int.negSucc"))?;
+        // A checked recursor selects exactly one field. Merely referencing
+        // scaleB or partially applying it performs no integer conversion.
+        Ok(apply(
+            Expr::const_(name("Int.rec"), vec![Level::one()]),
+            [
+                Expr::lam(Name::anonymous(), c("Int"), native, BinderInfo::Default),
+                Expr::const_(positive, Vec::new()),
+                Expr::const_(negative, Vec::new()),
+                value,
+            ],
+        ))
+    }
+
     pub(in crate::runtime) fn imported_float_call(
         &mut self,
         head: &Expr,
@@ -245,18 +369,22 @@ impl Preparation<'_> {
         if !self.imported_float_model()? {
             return Ok(None);
         }
-        let binding = generated_source_intrinsic_binding(requested)
-            .ok_or_else(|| unsupported("Float generated source interface"))?;
+        let binding = primitive_binding(requested)?;
         if arguments.len() > binding.arguments.len() {
             return Ok(None);
         }
         let primitive = self.float_bind_primitive(requested)?;
-        let has_words = binding
+        let needs_adapter = binding
             .arguments
             .iter()
             .chain(std::iter::once(&binding.result))
-            .any(|value| matches!(value, ValueType::UInt32 | ValueType::UInt64));
-        if !has_words {
+            .any(|value| {
+                matches!(
+                    value,
+                    ValueType::UInt32 | ValueType::UInt64 | ValueType::Abi
+                )
+            });
+        if !needs_adapter {
             return Ok(Some(apply(
                 Expr::const_(primitive, Vec::new()),
                 arguments.iter().cloned(),
@@ -274,6 +402,8 @@ impl Preparation<'_> {
                 Expr::bvar(index).map_err(|_| unsupported("Float adapter binder scope"))?;
             operands.push(if matches!(type_, ValueType::UInt32 | ValueType::UInt64) {
                 self.float_pack_word(type_, argument)?
+            } else if type_ == ValueType::Abi {
+                self.float_pack_int(argument)?
             } else {
                 argument
             });

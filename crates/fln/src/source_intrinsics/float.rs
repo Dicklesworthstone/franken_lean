@@ -13,7 +13,7 @@ const FLOAT_OPERATIONS: &[&str] = &[
     "ofBits", "toBits", "add", "sub", "mul", "div", "neg", "abs", "sqrt", "ceil", "floor", "round",
     "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
     "exp", "exp2", "log", "log2", "log10", "cbrt", "pow", "atan2", "beq", "isNaN", "isFinite",
-    "isInf", "toString", "toUInt32", "toUInt64",
+    "isInf", "toString", "toUInt32", "toUInt64", "scaleB",
 ];
 
 fn name(label: &str) -> Name {
@@ -128,12 +128,13 @@ pub(crate) fn matches(
             });
         }
         check_selected_extern_attribute(environment, &dependency, externs, visited, limits)?;
-        // Constant scientific conversion also executes these native scaling
-        // helpers. Their absence must not authorize the host bit algorithm,
-        // even though dynamic scaleB calls are outside this bridge.
+        // The private scaleB adapter converts the checked two-constructor Int
+        // to the pin's scalar/mpz carrier through these exact native rows.
+        // Their selected externs are authority even though the public Int
+        // constructors continue to use their ordinary logical record layout.
         let requires_extern = is_primitive(&dependency)
-            || dependency == name("Float.scaleB")
-            || dependency == name("Float32.scaleB");
+            || dependency == name("Int.ofNat")
+            || dependency == name("Int.negSucc");
         if requires_extern
             && !extern_attribute_matches(environment, &dependency, true, externs, visited, limits)?
         {

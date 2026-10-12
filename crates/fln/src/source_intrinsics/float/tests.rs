@@ -493,6 +493,52 @@ def importedShift (delta : Float32) : Float32 → Float32 := fun x => x + delta
 }
 
 #[test]
+fn actual_float_scaling_accepts_dynamic_logical_ints_and_higher_order_calls() {
+    with_fixture(|fixture| {
+        execute_and_replay(
+            &Engine::from_environment(fixture.environment.clone()),
+            r#"
+def scale64 (x : Float) (e : Int) : Float := Float.scaleB x e
+def scale32 (x : Float32) (e : Int) : Float32 := Float32.scaleB x e
+def delayedScale (x : Float) : Int → Float := Float.scaleB x
+def useScale (f : Float → Int → Float) (x : Float) (e : Int) : Float := f x e
+structure ExponentBox where
+  exponent : Int
+def boxedScale (b : ExponentBox) (x : Float) : Float := scale64 x b.exponent
+#eval scale64 1.5 (Int.ofNat 3)
+#eval scale32 1.5 (Int.negSucc 0)
+#eval delayedScale 1.5 (Int.ofNat 2)
+#eval useScale Float.scaleB 1.5 (Int.negSucc 1)
+#eval boxedScale (ExponentBox.mk (Int.negSucc 2)) 8.0
+#eval scale64 (Float.ofBits (UInt64.ofNat 4607182418800017409)) (Int.negSucc 1074)
+#eval scale32 (Float32.ofBits (UInt32.ofNat 1065353217)) (Int.negSucc 149)
+#eval scale64 (Float.ofBits (UInt64.ofNat 1)) (Int.ofNat 1074)
+#eval scale32 (Float32.ofBits (UInt32.ofNat 1)) (Int.ofNat 149)
+#eval scale64 (-0.0) (Int.negSucc 2147483647)
+#eval scale64 (-0.0) (Int.negSucc 2147483648)
+#eval scale32 (-0.0) (Int.ofNat 2147483648)
+#eval scale64 (-1.0) (Int.ofNat 2147483648)
+"#,
+            &[
+                Expected::Float(12.0),
+                Expected::Float32(0.75),
+                Expected::Float(6.0),
+                Expected::Float(0.375),
+                Expected::Float(1.0),
+                Expected::Float(f64::from_bits(1)),
+                Expected::Float32(f32::from_bits(1)),
+                Expected::Float(1.0),
+                Expected::Float32(1.0),
+                Expected::Float(-0.0),
+                Expected::Float(0.0),
+                Expected::Float32(0.0),
+                Expected::Float(f64::NEG_INFINITY),
+            ],
+        );
+    });
+}
+
+#[test]
 fn original_float_examples_execute_and_replay_over_the_actual_pin_model() {
     with_fixture(|fixture| {
         let engine = Engine::from_environment(fixture.environment.clone());
@@ -580,6 +626,8 @@ fn actual_float_model_refuses_missing_dependencies_foreign_externs_and_exhaustio
             "Float32.scaleB",
             "UInt32.ofNat",
             "UInt64.toNat",
+            "Int.ofNat",
+            "Int.negSucc",
         ] {
             let missing = rebuild(fixture, None, Some(&name(label)));
             assert!(
@@ -593,6 +641,7 @@ fn actual_float_model_refuses_missing_dependencies_foreign_externs_and_exhaustio
             "Float.mk",
             "UInt64.ofBitVec",
             "Fin.mk",
+            "Int.rec",
         ] {
             assert!(fixture.environment.contains(&name(label)), "{label}");
             assert!(
@@ -606,6 +655,8 @@ fn actual_float_model_refuses_missing_dependencies_foreign_externs_and_exhaustio
             "Float.scaleB",
             "Float32.scaleB",
             "UInt64.toNat",
+            "Int.ofNat",
+            "Int.negSucc",
         ] {
             let changed = externs::register(
                 &fixture.environment,
