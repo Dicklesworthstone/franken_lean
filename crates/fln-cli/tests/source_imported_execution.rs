@@ -690,11 +690,19 @@ fn imported_artifact_publication_keeps_failed_sources_and_existing_outputs_atomi
         .refused("inconclusive", 3);
     assert!(!product.exists() && !sidecar.exists());
 
+    // `#guard_msgs` is syntax `Init.Notation` declares, which this `.olean` world does not
+    // reach: the pin reads an unknown token there ("expected token", exit 1), and so does this
+    // door (111d5cc2), a parse refusal at the `#guard_msgs`. Either way nothing is published.
     workspace.write(
         "Main.lean",
         "prelude\nimport External\n/-- info: 999 -/\n#guard_msgs in\n#eval (42 : Nat)\n",
     );
-    workspace.run(&entry, None, &emit).refused("guard-msgs", 1);
+    assert!(
+        workspace
+            .run(&entry, None, &emit)
+            .refused("input", 1)
+            .contains("parse refused source")
+    );
     assert!(!product.exists() && !sidecar.exists());
 
     workspace.write(
