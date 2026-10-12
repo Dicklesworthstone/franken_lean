@@ -273,7 +273,27 @@ impl ImportContexts {
         let module = &self.modules[name];
         let export =
             replay::Export::capture(name, &module.before, &module.after, Vec::new(), meter)?;
-        export.replay(engine, name, options, meter, cancellation)
+        let mut engine = match export.replay(engine, name, options, meter, cancellation)? {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        for entry in &module.entries {
+            meter.work(1)?;
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "source-modules/replay-executable-metadata",
+                )));
+            }
+            let declaration = entry.declaration().name();
+            if self.complete.executable_opaques.contains(declaration) {
+                Arc::make_mut(&mut engine.executable_opaques).insert(declaration.clone());
+            }
+            if self.complete.runtime_initializers.contains(declaration) {
+                Arc::make_mut(&mut engine.runtime_initializers).insert(declaration.clone());
+            }
+        }
+        Ok(Outcome::Complete(engine))
     }
 }
 

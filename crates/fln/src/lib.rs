@@ -4004,6 +4004,7 @@ impl EngineBuilder {
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4021,6 +4022,7 @@ impl EngineBuilder {
             imported_module_dependencies: std::sync::Arc::default(),
             // An environment of unknown provenance runs no opaque value.
             executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4044,6 +4046,7 @@ impl EngineBuilder {
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4266,12 +4269,14 @@ pub struct Engine {
     imported_environment: Option<Environment>,
     /// Direct import edges retained from each checked module's decoded header.
     imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
-    /// Opaques this engine's lineage admitted through [`Engine::admit_declaration`]
-    /// from a declaration it was handed (source text, a replayed source record, an
-    /// embedder), never one read from an `.olean`. Only these may run their value:
-    /// an artifact's opaque can carry an `init` attribute the importer does not
-    /// read, and the pin then runs the initializer rather than the value.
+    /// Admitted opaques whose stored values have executable meaning: handed
+    /// declarations, or imported declarations whose complete private metadata
+    /// excludes a named initializer. Externs and companions still take precedence.
     executable_opaques: std::sync::Arc<BTreeSet<Name>>,
+    /// Imported globals whose regular or builtin initializer supplies the runtime
+    /// value. Their stored values and recursive companions are placeholders,
+    /// never executable fallbacks. Import records rebuild this from artifact data.
+    runtime_initializers: std::sync::Arc<BTreeSet<Name>>,
     epoch: ModuleEpoch,
     mode: Mode,
     reproducibility: ReproducibilityProfile,
@@ -4481,6 +4486,7 @@ impl Engine {
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: Self::pinned_epoch(),
             mode: Mode::DEFAULT,
             reproducibility: ReproducibilityProfile::Standard,
@@ -4505,6 +4511,7 @@ impl Engine {
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -5912,6 +5919,7 @@ impl Engine {
             imported_environment,
             imported_module_dependencies: std::sync::Arc::new(dependencies),
             executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+            runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -6661,6 +6669,7 @@ impl Engine {
                     &self.imported_module_dependencies,
                 ),
                 executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+                runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
                 epoch: self.epoch.clone(),
                 mode: self.mode,
                 reproducibility: self.reproducibility,
@@ -9111,7 +9120,8 @@ impl Engine {
         };
 
         let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress)
-            .with_executable_opaques(&self.executable_opaques);
+            .with_executable_opaques(&self.executable_opaques)
+            .with_runtime_initializers(&self.runtime_initializers);
         let evaluated = match entry {
             source_evaluation::Entry::Value => None,
             source_evaluation::Entry::Evaluation => preparation
@@ -12452,6 +12462,10 @@ pub(crate) fn assert_engines_identical(left: &Engine, right: &Engine, what: &str
     assert_eq!(
         left.executable_opaques, right.executable_opaques,
         "{what}: executable opaques"
+    );
+    assert_eq!(
+        left.runtime_initializers, right.runtime_initializers,
+        "{what}: runtime initializers"
     );
     assert_eq!(left.epoch, right.epoch, "{what}: epoch");
     assert_eq!(left.mode, right.mode, "{what}: mode");

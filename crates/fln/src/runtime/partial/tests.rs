@@ -151,8 +151,20 @@ fn an_opaque_value_runs_only_when_its_engine_admitted_it() {
     let paired = world(logical.clone(), executable.clone());
     assert_eq!(
         selected(&paired, Some(&admitted), &label).unwrap(),
-        Some(executable)
+        Some(executable.clone())
     );
+    // Init attributes override stored bodies and even recursive companions.
+    // A direct companion reference normalizes back to the initialized parent.
+    for requested in [&label, &executable.base.name] {
+        assert_eq!(
+            Preparation::new(&paired, IngressLimits::default())
+                .with_executable_opaques(&admitted)
+                .with_runtime_initializers(&admitted)
+                .executable_definition(requested)
+                .unwrap(),
+            None,
+        );
+    }
     let mut unsafe_logical = logical.clone();
     unsafe_logical.is_unsafe = true;
     let unsafe_world = Environment::new()

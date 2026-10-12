@@ -360,7 +360,8 @@ impl Engine {
         // and explicit replacement. A forged suffix must not select a body,
         // and an unsupported opaque/unsafe main must not run its logical value.
         let mut preparation = crate::runtime::Preparation::new(self.environment(), limits.ingress)
-            .with_executable_opaques(&self.executable_opaques);
+            .with_executable_opaques(&self.executable_opaques)
+            .with_runtime_initializers(&self.runtime_initializers);
         if preparation
             .executable_definition(&requested)
             .map_err(MainExecutionError::Preparation)?

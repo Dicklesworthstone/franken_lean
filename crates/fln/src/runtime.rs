@@ -49,6 +49,8 @@ pub(super) struct Preparation<'a> {
     /// Opaques whose values may run; see `Engine::executable_opaques`. None
     /// unless the caller names its engine's set.
     executable_opaques: Option<&'a BTreeSet<Name>>,
+    /// Globals with initialized runtime values; their stored bodies cannot run.
+    runtime_initializers: Option<&'a BTreeSet<Name>>,
     native_intrinsics: native_intrinsics::Store,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
@@ -139,6 +141,7 @@ impl<'a> Preparation<'a> {
             externs: None,
             implementations: None,
             executable_opaques: None,
+            runtime_initializers: None,
             native_intrinsics: native_intrinsics::Store::default(),
             lambdas: Vec::new(),
             cases: Vec::new(),
@@ -182,6 +185,11 @@ impl<'a> Preparation<'a> {
     /// an opaque with no extern or init attribute.
     pub(super) fn with_executable_opaques(mut self, names: &'a BTreeSet<Name>) -> Self {
         self.executable_opaques = Some(names);
+        self
+    }
+
+    pub(super) fn with_runtime_initializers(mut self, names: &'a BTreeSet<Name>) -> Self {
+        self.runtime_initializers = Some(names);
         self
     }
 
@@ -485,8 +493,12 @@ impl<'a> Preparation<'a> {
             reserve(&mut values, self.limits.max_nodes.saturating_add(1))?;
             match task {
                 Task::Visit(expr) => {
+                    if !matches!(expr.node(), ExprNode::App { .. }) {
+                        self.check_initialized_head(&expr)?;
+                    }
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        self.check_initialized_head(&head)?;
                         if let Some((case, result)) = self.nat_case(&head)? {
                             if args.len() != 3 {
                                 return Err(unsupported("Nat case arity"));

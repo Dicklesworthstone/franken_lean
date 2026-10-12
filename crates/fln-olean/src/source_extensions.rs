@@ -1,5 +1,5 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! protected-declaration, auxiliary-recursor, extern and implemented_by journals.
+//! protected-declaration, auxiliary-recursor, extern, implemented_by and initialization journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -126,6 +126,9 @@ pub struct SourceExtensions {
     pub externs: Vec<ExternAttribute>,
     /// Executable replacements, separate from the declarations' logical bodies.
     pub implemented_by: Vec<ImplementedByEntry>,
+    /// Ordered initialization journals. A named initializer replaces a stored
+    /// body at runtime; an anonymous parameter denotes a standalone IO action.
+    pub initializers: crate::initializers::InitJournals,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -424,6 +427,8 @@ pub fn decode(
         name(format::EXTERN_EXTENSION),
         name(format::IMPLEMENTED_BY_EXTENSION),
         name(format::AUX_RECURSOR_EXTENSION),
+        name(crate::initializers::REGULAR_INIT_EXTENSION),
+        name(crate::initializers::BUILTIN_INIT_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -494,7 +499,21 @@ pub fn decode(
                     }
                     out.aux_recursors.push(declaration);
                 }
-                _ => unreachable!("ten selected extension families"),
+                10 => out
+                    .initializers
+                    .regular
+                    .push(crate::initializers::project_entry(
+                        &mut reader.conversion,
+                        &obj,
+                    )?),
+                11 => out
+                    .initializers
+                    .builtin
+                    .push(crate::initializers::project_entry(
+                        &mut reader.conversion,
+                        &obj,
+                    )?),
+                _ => unreachable!("twelve selected extension families"),
             }
         }
     }

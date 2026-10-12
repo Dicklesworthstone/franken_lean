@@ -80,6 +80,21 @@ fn row(source: &str, implementation: &str) -> Obj {
     )
 }
 fn encode(constants: &[ConstantInfo], imports: &[&str], rows: Vec<Obj>) -> Vec<u8> {
+    let extension = n(IMPLEMENTED_BY_EXTENSION);
+    encode_extensions(
+        constants,
+        imports,
+        &[ModuleExtensionInput {
+            name: &extension,
+            entries: &rows,
+        }],
+    )
+}
+fn encode_extensions(
+    constants: &[ConstantInfo],
+    imports: &[&str],
+    extensions: &[ModuleExtensionInput<'_>],
+) -> Vec<u8> {
     let imports: Vec<_> = imports
         .iter()
         .map(|module| OleanModuleImport {
@@ -89,7 +104,6 @@ fn encode(constants: &[ConstantInfo], imports: &[&str], rows: Vec<Obj>) -> Vec<u
             is_meta: false,
         })
         .collect();
-    let extension = n(IMPLEMENTED_BY_EXTENSION);
     encode_module_with_extensions(
         OleanModuleWriteInput {
             is_module: false,
@@ -97,10 +111,7 @@ fn encode(constants: &[ConstantInfo], imports: &[&str], rows: Vec<Obj>) -> Vec<u
             constants,
             extra_const_names: &[],
         },
-        &[ModuleExtensionInput {
-            name: &extension,
-            entries: &rows,
-        }],
+        extensions,
         OleanWriteHeader {
             version: OLEAN_ACCEPTED_VERSIONS[0],
             flags: 1,
@@ -535,6 +546,264 @@ fn metadata_and_executable_selection_survive_cold_mixed_and_warm_import_reuse() 
                     own_context(&actual);
                 }
             }
+        }
+    });
+}
+
+#[test]
+fn imported_opaque_values_execute_while_the_kernel_keeps_them_opaque() {
+    on_stack(|| {
+        let base = seed();
+        let constants = added(
+            &base,
+            r#"
+opaque hidden : Nat := 42
+opaque hiddenIdentity.{u} {A : Sort u} (x : A) : A := x
+opaque hiddenMaker (n : Nat) : Nat -> Nat := fun m => n + m
+def hiddenAlias : Nat := hidden
+"#,
+        );
+        let artifacts = vec![(n("Own"), encode(&constants, &[], vec![]))];
+        let imported = import(&base, &artifacts, &[n("Own")], 1);
+        for expression in [
+            "hidden",
+            "hiddenAlias",
+            "hiddenIdentity 42",
+            "hiddenMaker 20 22",
+            "let f : Nat -> Nat := hiddenMaker 20; f 22",
+        ] {
+            evaluate(&imported.engine, expression, "42");
+        }
+        assert!(
+            imported
+                .engine
+                .check_source_files(
+                    &[b"theorem revealHidden : hidden = 42 := by rfl"],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(admission()),
+                )
+                .is_err(),
+            "executable opacity must not become logical transparency"
+        );
+        // The same declarations without the private import lineage cannot
+        // inherit executable-body authority from their spelling or raw values.
+        let detached = Engine::from_environment(imported.engine.environment().clone());
+        assert!(
+            detached
+                .execute_source_definitions(&[b"#eval hidden"], &KVMap::new(), execution())
+                .is_err()
+        );
+    });
+}
+
+#[test]
+fn initialized_globals_never_execute_stored_placeholder_values() {
+    on_stack(|| {
+        let base = seed();
+        let constants = added(
+            &base,
+            r#"
+def IO (A : Type) : Type := A
+opaque hidden : Nat := 0
+def globalDefinition : Nat := 0
+def initializeHidden : IO Nat := (42 : Nat)
+opaque ordinary : Nat := 42
+structure InitializedBox where
+  value : Nat
+def initializedBox : InitializedBox := InitializedBox.mk 0
+def initializeBox : IO InitializedBox := InitializedBox.mk 42
+def initializedBoxAlias : InitializedBox := initializedBox
+"#,
+        );
+        for extension in [
+            fln_olean::initializers::REGULAR_INIT_EXTENSION,
+            fln_olean::initializers::BUILTIN_INIT_EXTENSION,
+        ] {
+            let extension = n(extension);
+            let entries = [
+                row("hidden", "initializeHidden"),
+                row("globalDefinition", "initializeHidden"),
+                row("initializedBox", "initializeBox"),
+            ];
+            let artifacts = vec![(
+                n("Own"),
+                encode_extensions(
+                    &constants,
+                    &[],
+                    &[ModuleExtensionInput {
+                        name: &extension,
+                        entries: &entries,
+                    }],
+                ),
+            )];
+            let imported = import(&base, &artifacts, &[n("Own")], 1);
+            assert!(!imported.modules[0].uninterpreted.contains(&extension));
+            assert_eq!(
+                imported.modules[0].regular_initializers + imported.modules[0].builtin_initializers,
+                3
+            );
+            evaluate(&imported.engine, "ordinary", "42");
+            for expression in [
+                "hidden",
+                "globalDefinition",
+                "initializedBox.value",
+                "initializedBoxAlias.value",
+                "let box : InitializedBox := initializedBox; box.value",
+            ] {
+                let source = format!("#eval {expression}");
+                assert!(
+                    imported
+                        .engine
+                        .execute_source_definitions(
+                            &[source.as_bytes()],
+                            &KVMap::new(),
+                            execution()
+                        )
+                        .is_err(),
+                    "{extension:?}: {expression} must await its initializer"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn initializer_metadata_validates_ownership_duplicates_and_exact_action_types() {
+    on_stack(|| {
+        let base = seed();
+        let own = added(
+            &base,
+            "def IO (A : Type) : Type := A\nopaque own : Nat := 42\ndef initOwn : IO Nat := (0 : Nat)",
+        );
+        let other = added(&base, "opaque other : Nat := 42");
+        let extension = n(fln_olean::initializers::REGULAR_INIT_EXTENSION);
+        for entries in [
+            vec![row("other", "initOwn")],
+            vec![row("own", "missingInitializer")],
+            vec![row("own", "initOwn"), row("own", "initOwn")],
+            vec![row("own", "own")],
+            vec![Obj::mk_ctor(
+                0,
+                vec![inject_name(&n("own")), inject_name(&Name::anonymous())],
+                &[],
+            )],
+        ] {
+            let artifacts = vec![
+                (
+                    n("Own"),
+                    encode_extensions(
+                        &own,
+                        &["Other"],
+                        &[ModuleExtensionInput {
+                            name: &extension,
+                            entries: &entries,
+                        }],
+                    ),
+                ),
+                (n("Other"), encode(&other, &[], vec![])),
+            ];
+            assert!(matches!(
+                base.import_olean_modules_for_source(
+                    &inputs(&artifacts),
+                    &[n("Own")],
+                    &KVMap::new(),
+                    limits(1)
+                ),
+                Err(SourceOleanImportError::Metadata { .. })
+            ));
+        }
+    });
+}
+
+#[test]
+fn opaque_execution_classification_survives_reuse_and_each_modules_import_world() {
+    on_stack(|| {
+        let base = seed();
+        let own = added(
+            &base,
+            "opaque original (x : Nat) : Nat := x + 2\ndef IO (A : Type) : Type := A\nopaque waiting : Nat := 0\ndef initializeWaiting : IO Nat := (17 : Nat)",
+        );
+        let other = added(&base, "opaque inaccessible : Nat := 17");
+        let extension = n(fln_olean::initializers::REGULAR_INIT_EXTENSION);
+        let entries = [row("waiting", "initializeWaiting")];
+        let artifacts = vec![
+            (
+                n("Own"),
+                encode_extensions(
+                    &own,
+                    &[],
+                    &[ModuleExtensionInput {
+                        name: &extension,
+                        entries: &entries,
+                    }],
+                ),
+            ),
+            (n("Other"), encode(&other, &[], vec![])),
+        ];
+        let roots = [n("Own"), n("Other")];
+        let store = Memory::default();
+        let checker = CheckerIdentity::of_executable(b"opaque classification fixture");
+        let mut logical_root = None;
+        for threads in [1, 8, 32] {
+            let (imported, _) = base
+                .import_olean_modules_with_posture(
+                    &inputs(&artifacts),
+                    &roots,
+                    &KVMap::new(),
+                    limits(threads),
+                    ImportPostureRequest::ReuseVerified(ReuseVerified {
+                        checker,
+                        store: &store,
+                    }),
+                    None,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            if let Some(expected) = &logical_root {
+                assert_eq!(expected, &imported.result_logical_root);
+            } else {
+                logical_root = Some(imported.result_logical_root);
+            }
+            own_context(&imported);
+            let consumer = n("Consumer");
+            assert!(
+                imported
+                    .engine
+                    .execute_source_definitions(&[b"#eval waiting"], &KVMap::new(), execution())
+                    .is_err(),
+                "reusing a record must preserve initialized-global classification"
+            );
+            assert!(
+                imported
+                    .execute_source_modules(
+                        &[SourceModuleInput {
+                            name: &consumer,
+                            source: b"prelude\nimport Own\n#eval waiting",
+                        }],
+                        &consumer,
+                        &KVMap::new(),
+                        SourceProgramLimits::new(execution()),
+                        None,
+                    )
+                    .is_err(),
+                "module projection must preserve initialized-global classification"
+            );
+            assert!(
+                imported
+                    .execute_source_modules(
+                        &[SourceModuleInput {
+                            name: &consumer,
+                            source: b"prelude\nimport Own\n#eval inaccessible",
+                        }],
+                        &consumer,
+                        &KVMap::new(),
+                        SourceProgramLimits::new(execution()),
+                        None,
+                    )
+                    .is_err(),
+                "an unrelated root's opaque cannot enter a module's import world"
+            );
         }
     });
 }

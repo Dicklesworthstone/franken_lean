@@ -57,6 +57,15 @@ impl Preparation<'_> {
             Some(_) => return Ok(None),
             None => return Ok(self.specialized_definition(requested)),
         };
+        // A named initializer supplies the runtime global, even when an ordinary
+        // definition or recursive companion also carries a stored value. Native
+        // extern lookup retains its existing precedence; no body is a fallback.
+        if self
+            .runtime_initializers
+            .is_some_and(|names| names.contains(&logical))
+        {
+            return Ok(None);
+        }
         let implementation_name = Name::str(logical.clone(), "_unsafe_rec");
         let Some(candidate) = environment.find(&implementation_name) else {
             // An ordinary safe definition needs no executable companion. Once
@@ -118,10 +127,44 @@ impl Preparation<'_> {
         Ok(Some(implementation.clone()))
     }
 
+    /// Native models are reached before executable-body lookup. A named
+    /// initializer must not be bypassed by recognizing a stored library body;
+    /// only an explicit, supported extern has the pin's precedence over init.
+    pub(super) fn check_initialized_head(&mut self, head: &Expr) -> Result<(), IngressError> {
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(());
+        };
+        if !self
+            .runtime_initializers
+            .is_some_and(|names| names.contains(name))
+            || self.implementation_target(name)?.is_some()
+        {
+            return Ok(());
+        }
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(name).is_some())
+        {
+            Ok(())
+        } else {
+            Err(unsupported(
+                "imported global requires runtime initialization",
+            ))
+        }
+    }
+
     /// The pin compiles an opaque with no companion, extern or init attribute
     /// from its value (`Compiler/LCNF/ToDecl.lean`, `toDecl`). That runs here
-    /// only for an opaque the engine admitted from a handed declaration: an
-    /// artifact's opaque may carry an init attribute the importer drops. An
+    /// for a handed declaration or an imported opaque whose complete private
+    /// journal rules out an initializer. An
     /// extern row is an explicit contract that the native catalogs, consulted
     /// before any body, did not satisfy, so it never falls back to the value.
     fn opaque_value(&mut self, opaque: &OpaqueVal) -> Result<Option<DefinitionVal>, IngressError> {

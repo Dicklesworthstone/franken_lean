@@ -863,8 +863,8 @@ impl Preparation<'_> {
         if let Some(type_) = self.specializations.constructor_types.get(name) {
             return Ok(Some(type_.clone()));
         }
-        // Imported safe opaques have no executable logical body. Their native
-        // contract must authorize the same callable telescope used for a
+        // An opaque without an authorized executable body needs a native
+        // contract authorizing the same callable telescope used for a
         // saturated invocation, including its selected extern. The ordinary
         // partial-call path then captures supplied values in strict lets and
         // emits a saturated native call inside a checked closure.

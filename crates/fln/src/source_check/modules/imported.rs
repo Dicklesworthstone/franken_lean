@@ -78,6 +78,10 @@ pub struct SourceMetadataReport {
     /// Compatible executable replacements, bound to this module's own checked
     /// declarations and to targets in its actual import closure.
     pub implemented_by: usize,
+    /// Ordered initialization entries retained for executable-body classification.
+    /// No initialization action is executed by importing metadata.
+    pub regular_initializers: usize,
+    pub builtin_initializers: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -302,6 +306,8 @@ impl Engine {
             metadata::EXTERN_EXTENSION,
             metadata::IMPLEMENTED_BY_EXTENSION,
             metadata::AUX_RECURSOR_EXTENSION,
+            fln_olean::initializers::REGULAR_INIT_EXTENSION,
+            fln_olean::initializers::BUILTIN_INIT_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -337,6 +343,8 @@ impl Engine {
                 reducibility: 0,
                 externs: 0,
                 implemented_by: 0,
+                regular_initializers: 0,
+                builtin_initializers: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -367,6 +375,8 @@ impl Engine {
                         6 => report.externs = block.entries.len(),
                         7 => report.implemented_by = block.entries.len(),
                         8 => report.aux_recursors = block.entries.len(),
+                        9 => report.regular_initializers = block.entries.len(),
+                        10 => report.builtin_initializers = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -399,7 +409,11 @@ impl Engine {
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
+        let mut regular_initializers = decoded.initializers.regular.into_iter();
+        let mut builtin_initializers = decoded.initializers.builtin.into_iter();
         let mut engine = checked.engine.clone();
+        let mut executable_opaques = (*engine.executable_opaques).clone();
+        let mut runtime_initializers = (*engine.runtime_initializers).clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
         // One activation for the whole closure: the registries are read once and
@@ -640,6 +654,47 @@ impl Engine {
                         })?;
                 }
             }
+            // Parametric attributes export their complete journal in the private
+            // part (Lean/Attributes.lean, registerParametricAttribute). Capture
+            // required that part for a module-system artifact, so absence here
+            // means no initializer, not a filtered public view. Each entry must
+            // belong to this module; a sibling cannot change another global's
+            // executable interpretation through forged initialization metadata.
+            for (count, rows) in [
+                (report.regular_initializers, &mut regular_initializers),
+                (report.builtin_initializers, &mut builtin_initializers),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    count,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..count {
+                    cancelled!("source-olean/initializer");
+                    let row = rows.next().ok_or(SourceOleanImportError::Internal(
+                        "initializer count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    validate_initializer(activation.environment(), &report.module, &row)?;
+                    if row.initializer.is_some() {
+                        runtime_initializers.insert(row.declaration);
+                    }
+                }
+            }
+            for constant in &checked.modules[index].decoded.constants {
+                cancelled!("source-olean/opaque-value");
+                if let ConstantInfo::Opaque(opaque) = constant
+                    && !opaque.is_unsafe
+                    && !runtime_initializers.contains(&opaque.base.name)
+                    && activation.environment().find(&opaque.base.name) == Some(constant)
+                {
+                    executable_opaques.insert(opaque.base.name.clone());
+                }
+            }
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
@@ -664,12 +719,16 @@ impl Engine {
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
+            || regular_initializers.next().is_some()
+            || builtin_initializers.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
             ));
         }
         cancelled!("source-olean/before-publication");
+        engine.executable_opaques = std::sync::Arc::new(executable_opaques);
+        engine.runtime_initializers = std::sync::Arc::new(runtime_initializers);
         // Adding metadata changes the logical root, but not the declarations
         // represented by the retained independent-checker projection.
         if bound {
@@ -977,6 +1036,46 @@ impl<'a> AttributeOwners<'a> {
     }
 }
 
+/// Match the pin's exact `IO T` / `IO Unit` attribute contract without reducing
+/// any body or running an action (Lean/Compiler/InitAttr.lean, getParam).
+fn validate_initializer(
+    env: &Environment,
+    module: &Name,
+    row: &fln_olean::initializers::InitEntry,
+) -> Result<()> {
+    fn io_argument(type_: &Expr) -> Option<&Expr> {
+        if let ExprNode::App { f, a } = type_.node()
+            && let ExprNode::Const { name, .. } = f.node()
+            && *name == Name::from_components(["IO"])
+        {
+            Some(a)
+        } else {
+            None
+        }
+    }
+    let error = |reason| SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration: row.declaration.clone(),
+        reason,
+    };
+    let owner = env
+        .find(&row.declaration)
+        .ok_or_else(|| error("an initialized declaration is not admitted"))?;
+    if let Some(initializer) = &row.initializer {
+        let action = env.find(initializer).ok_or_else(|| {
+            error("an initializer names no admitted declaration")
+        })?;
+        if io_argument(&action.constant_val().type_) != Some(&owner.constant_val().type_) {
+            return Err(error("an initializer must have type IO of its declaration's exact type"));
+        }
+    } else if !io_argument(&owner.constant_val().type_).is_some_and(|type_| {
+        matches!(type_.node(), ExprNode::Const { name, .. } if *name == Name::from_components(["Unit"]))
+    }) {
+        return Err(error("an anonymous initialization action must have type IO Unit"));
+    }
+    Ok(())
+}
+
 fn extern_entry(entry: metadata::ExternEntry) -> fln_elab::externs::ExternEntry {
     use fln_elab::externs::ExternEntry;
     match entry {
@@ -1127,12 +1226,15 @@ pub(super) mod tests {
     }
 
     pub(in crate::source_check::modules) fn pinned_lib() -> Option<std::path::PathBuf> {
-        let lib = std::env::var_os("HOME")
+        let lib = std::env::var_os("FLN_REFERENCE_LIB")
             .map(std::path::PathBuf::from)
-            .map(|home| {
-                home.join(".elan/toolchains")
-                    .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
-                    .join("lib/lean")
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    std::path::PathBuf::from(home)
+                        .join(".elan/toolchains")
+                        .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
+                        .join("lib/lean")
+                })
             })
             .filter(|lib| lib.join("Init/Prelude.olean").is_file());
         assert!(
@@ -1299,6 +1401,60 @@ pub(super) mod tests {
                 &parallel.checked.engine,
                 "source result",
             );
+        });
+    }
+
+    #[test]
+    fn pinned_opaque_identity_runs_after_complete_private_metadata() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let closure = closure(&lib, &["Init.Core"]);
+        let all = inputs(&closure);
+        let roots = [n("Init.Core")];
+        on_import_stack(|| {
+            let imported = import(&all, &roots, limits(1))
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert!(matches!(
+                imported.engine.environment().find(&n("Lean.opaqueId")),
+                Some(ConstantInfo::Opaque(_))
+            ));
+            let run = imported
+                .engine
+                .execute_source_commands_with_checks(
+                    b"#eval Lean.opaqueId 42",
+                    &KVMap::new(),
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let evaluation = run.batch.executions.last().unwrap();
+            assert_eq!(
+                closed_vm_value(&evaluation.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+            let replay =
+                execute_flbc_artifact(&evaluation.flbc_artifact, &KVMap::new(), Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+            // A public journal can omit initialized globals. Missing private
+            // metadata must fail before any opaque's value becomes executable.
+            let mut incomplete = all.clone();
+            let owner = incomplete
+                .iter_mut()
+                .find(|module| module.name == &roots[0])
+                .unwrap();
+            owner.private_artifact = None;
+            assert!(import(&incomplete, &roots, limits(1)).is_err());
         });
     }
 

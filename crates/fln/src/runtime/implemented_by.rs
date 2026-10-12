@@ -41,11 +41,16 @@ impl Preparation<'_> {
             .expect("only validated implementation tables are cached"))
     }
 
-    /// Static dictionaries cannot unfold a logical body with an explicit
-    /// replacement or recursive executable companion. Leave these values on
-    /// the execution path; neither body may replace dependent type metadata.
+    /// Static dictionaries cannot unfold a logical body replaced by an
+    /// initializer, explicit implementation, or recursive executable companion.
+    /// Leave these values on the execution path; neither body may replace
+    /// dependent type metadata or become an inert projected field.
     pub(super) fn has_implementation(&mut self, name: &Name) -> Result<bool, IngressError> {
-        Ok(self.implementations()?.get(name).is_some() || self.has_recursive_companion(name)?)
+        Ok(self
+            .runtime_initializers
+            .is_some_and(|names| names.contains(name))
+            || self.implementations()?.get(name).is_some()
+            || self.has_recursive_companion(name)?)
     }
 
     /// An attribute authorizes selecting this checked target, not executing an

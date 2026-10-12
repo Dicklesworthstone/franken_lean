@@ -149,7 +149,10 @@ fn zero_budgets_allow_empty_journals_but_not_an_entry() {
 fn names_are_structural_and_duplicate_blocks_are_rejected() {
     let original = block(REGULAR_INIT_EXTENSION, &[pair(&name("a"), &name("ia"))]);
     assert!(matches!(
-        decode(&[original.clone(), original.clone()], DecodeLimits::default()),
+        decode(
+            &[original.clone(), original.clone()],
+            DecodeLimits::default()
+        ),
         Err(DecodeError::Shape { .. })
     ));
     let mut lookalike = original;
@@ -159,5 +162,57 @@ fn names_are_structural_and_duplicate_blocks_are_rejected() {
     assert_eq!(
         decode(&[lookalike], DecodeLimits::default()).unwrap(),
         InitJournals::default()
+    );
+}
+
+#[test]
+fn source_metadata_accounts_for_initializer_rows_in_its_shared_budget() {
+    let init = block(
+        REGULAR_INIT_EXTENSION,
+        &[pair(&name("value"), &name("initializeValue"))],
+    );
+    let alias = block(
+        fln_olean::source_extensions::ALIAS_EXTENSION,
+        &[pair(&name("alias"), &name("value"))],
+    );
+    let decoded = fln_olean::source_extensions::decode(
+        &[alias.clone(), init.clone()],
+        DecodeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decoded.initializers,
+        decode(std::slice::from_ref(&init), DecodeLimits::default()).unwrap()
+    );
+    assert_eq!(decoded.aliases.len(), 1);
+    assert!(decoded.uninterpreted.is_empty());
+    for limits in [
+        DecodeLimits {
+            max_entries: 1,
+            ..Default::default()
+        },
+        DecodeLimits {
+            max_bytes: alias.entries[0].len().max(init.entries[0].len()),
+            ..Default::default()
+        },
+        DecodeLimits {
+            max_objects: audit(&alias.entries[0], 0)
+                .unwrap()
+                .objects
+                .max(audit(&init.entries[0], 0).unwrap().objects),
+            ..Default::default()
+        },
+    ] {
+        assert!(fln_olean::source_extensions::decode(std::slice::from_ref(&alias), limits).is_ok());
+        assert!(fln_olean::source_extensions::decode(std::slice::from_ref(&init), limits).is_ok());
+        assert!(
+            fln_olean::source_extensions::decode(&[alias.clone(), init.clone()], limits)
+                .unwrap_err()
+                .is_resource()
+        );
+    }
+    let malformed = block(BUILTIN_INIT_EXTENSION, &[Obj::mk_nat(0)]);
+    assert!(
+        fln_olean::source_extensions::decode(&[alias, malformed], DecodeLimits::default()).is_err()
     );
 }
