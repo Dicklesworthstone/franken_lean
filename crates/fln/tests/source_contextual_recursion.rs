@@ -167,7 +167,7 @@ fn contextual_recursion_cannot_hide_non_decreasing_or_escaping_calls() {
         ),
         (
             "(match n with | .zero => 0 | .succ k => let escaped := loop; escaped k) + 1",
-            "recursive function escapes without its structural argument",
+            "recursive function escapes without its decreasing argument",
         ),
     ] {
         let source = format!("def beforeLoop : Nat := 7\ndef loop (n : Nat) : Nat := {body}");
