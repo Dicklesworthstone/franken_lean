@@ -13,6 +13,9 @@ mod fallback;
 pub(super) struct Prefix {
     keyword: usize,
     sequence_only: bool,
+    /// `unless …`/`for …` in term position (`Term.termUnless`, `Term.termFor`): one element,
+    /// given its term kind by [`Prefix::finish`].
+    term_element: bool,
     baseline: usize,
     braces: Option<(usize, Option<usize>)>,
     items: Vec<Syntax>,
@@ -37,6 +40,12 @@ enum Statement {
         position: BytePos,
     },
     Return(usize),
+    /// `return` with no value: no term follows on its line (`doReturn`'s `checkLineEq`). Its
+    /// keyword is the frame's one leaf, as a jump's is.
+    BareReturn {
+        keyword: usize,
+        position: BytePos,
+    },
     Unless {
         keyword: usize,
         position: BytePos,
@@ -129,6 +138,14 @@ fn closing_bracket(tokens: &[LexedToken], open: usize, end: usize) -> Option<usi
     }
     None
 }
+/// Whether the `return` at `at` has no value: `"return" (ppSpace checkLineEq termParser)?` takes
+/// a term only on its own line, and none starts at a delimiter or separator.
+pub(super) fn bare_return(view: &SourceView, tokens: &[LexedToken], at: usize, end: usize) -> bool {
+    at + 1 >= end
+        || newline(view, tokens, at + 1)
+        || closing(tokens, at + 1)
+        || word(tokens, at + 1, ";")
+}
 fn closing(tokens: &[LexedToken], at: usize) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind),
         Some(TokenKind::Symbol(s)) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | "⟩" | ","))
@@ -184,6 +201,7 @@ impl Prefix {
         let mut p = Self {
             keyword,
             sequence_only: false,
+            term_element: false,
             baseline: column(view, tokens, *cursor),
             braces,
             items: Vec::new(),
@@ -207,6 +225,19 @@ impl Prefix {
     ) -> Result<Self, NatDefinitionParseError> {
         let mut prefix = Self::start(view, tokens, *cursor, cursor, end)?;
         prefix.sequence_only = true;
+        Ok(prefix)
+    }
+    /// `unless c do s` and `for x in xs do s` in term position (`Lean/Parser/Do.lean`'s
+    /// `termUnless` and `termFor`): the grammar is the do element's own, so this reads exactly
+    /// one element at the keyword `cursor` points to. What follows belongs to the enclosing term.
+    pub(super) fn element(
+        view: &SourceView,
+        tokens: &[LexedToken],
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let mut prefix = Self::start(view, tokens, *cursor, cursor, end)?;
+        prefix.term_element = true;
         Ok(prefix)
     }
     fn begin(
@@ -379,6 +410,11 @@ impl Prefix {
                 is_break: word(tokens, at, "break"),
                 position: original_position(view, tokens, at),
             };
+        } else if word(tokens, at, "return") && bare_return(view, tokens, at, end) {
+            self.statement = Statement::BareReturn {
+                keyword: at,
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "return") {
             self.statement = Statement::Return(at);
             *cursor += 1;
@@ -443,7 +479,9 @@ impl Prefix {
     /// read them as an identifier leaf; the driver hands the keyword to the frame itself.
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self.statement {
-            Statement::Jump { keyword, .. } => Some(keyword),
+            Statement::Jump { keyword, .. } | Statement::BareReturn { keyword, .. } => {
+                Some(keyword)
+            }
             _ => None,
         }
     }
@@ -528,6 +566,18 @@ impl Prefix {
                 parser_kind(&["Term", "doReturn"]),
                 vec![atom(leaves, at, "return")?, null_node(vec![value])],
             ),
+            Statement::BareReturn { keyword, position } => {
+                if value != leaves.leaf(keyword)? {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::EndOfCommand,
+                    });
+                }
+                Syntax::node(
+                    parser_kind(&["Term", "doReturn"]),
+                    vec![atom(leaves, keyword, "return")?, null_node(vec![])],
+                )
+            }
             Statement::Jump {
                 keyword,
                 is_break,
@@ -1015,11 +1065,16 @@ impl Prefix {
         if self.phase != Phase::Value {
             return Err(refuse(view, tokens, at));
         }
+        if self.term_element {
+            self.item(leaves, expression, None)?;
+            self.phase = Phase::Done;
+            return Ok((self, at));
+        }
         let semi = word(tokens, at, ";").then_some(at);
         let mut next = at + usize::from(semi.is_some());
         let terminal = matches!(
             self.statement,
-            Statement::Return(_) | Statement::Jump { .. }
+            Statement::Return(_) | Statement::BareReturn { .. } | Statement::Jump { .. }
         );
         // A binding needs a continuation; a reassignment is a complete statement.
         let binding = matches!(
@@ -1104,6 +1159,9 @@ impl Prefix {
         if self.sequence_only {
             return Ok((sequence, self.keyword));
         }
+        if self.term_element {
+            return term_element(sequence, self.keyword);
+        }
         Ok((
             Syntax::node(
                 parser_kind(&["Term", "do"]),
@@ -1112,6 +1170,41 @@ impl Prefix {
             self.keyword,
         ))
     }
+}
+
+/// The one element of a term-position `unless`/`for`, given the pin's term kind: `termUnless`
+/// and `termFor` have exactly `doUnless`'s and `doFor`'s arguments.
+fn term_element(
+    sequence: Syntax,
+    keyword: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let refused = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: BytePos(0),
+        expected: NatDefinitionExpectation::ScalarValue,
+    };
+    let Syntax::Node { args, .. } = &sequence else {
+        return Err(refused());
+    };
+    let [Syntax::Node { args: items, .. }] = args.as_slice() else {
+        return Err(refused());
+    };
+    let [Syntax::Node { args: item, .. }] = items.as_slice() else {
+        return Err(refused());
+    };
+    let Some(Syntax::Node { kind, args, .. }) = item.first() else {
+        return Err(refused());
+    };
+    let term = if kind == &parser_kind(&["Term", "doUnless"]) {
+        "termUnless"
+    } else if kind == &parser_kind(&["Term", "doFor"]) {
+        "termFor"
+    } else {
+        return Err(refused());
+    };
+    Ok((
+        Syntax::node(parser_kind(&["Term", term]), args.clone()),
+        keyword,
+    ))
 }
 
 /// Only body prefixes may close before the next do statement. Parentheses,

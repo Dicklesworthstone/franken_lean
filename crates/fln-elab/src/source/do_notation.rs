@@ -25,6 +25,43 @@ mod unless;
 fn null(args: Vec<Syntax>) -> Syntax {
     Syntax::node(Name::from_components(["null"]), args)
 }
+
+/// `unless`, `for` and `return` in term position (`Term.termUnless`, `termFor`, `termReturn`):
+/// the do element the pin's `toDoElem` macros (`Lean/Elab/Do/Switch.lean`) make of the node, the
+/// same arguments under the element's kind.
+fn term_element(syntax: &Syntax) -> Option<Syntax> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
+    };
+    let element = ["Unless", "For", "Return"]
+        .into_iter()
+        .find(|form| kind == &parser_kind(&["Term", &format!("term{form}")]))?;
+    Some(Syntax::node(
+        parser_kind(&["Term", &format!("do{element}")]),
+        args.clone(),
+    ))
+}
+
+pub(super) fn is_term_block(syntax: &Syntax) -> bool {
+    term_element(syntax).is_some()
+}
+
+/// `do $element`, as `toDoElem` writes it.
+fn do_block(element: Syntax) -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "do"]),
+        vec![
+            atom("do"),
+            Syntax::node(
+                parser_kind(&["Term", "doSeqIndent"]),
+                vec![null(vec![Syntax::node(
+                    parser_kind(&["Term", "doSeqItem"]),
+                    vec![element, null(vec![])],
+                )])],
+            ),
+        ],
+    )
+}
 fn atom(s: &str) -> Syntax {
     Syntax::Atom {
         info: fln_syntax::source::SourceInfo::None,
@@ -321,11 +358,51 @@ impl Context {
         })
     }
 
+    /// A valueless `return`, and `unless`, `for` and `return` in term position. Out of line: this
+    /// pass runs on the deep-nesting tests' small host stacks.
+    #[inline(never)]
+    fn expand_term_do_form(
+        &mut self,
+        syntax: &Syntax,
+        pattern: bool,
+    ) -> Result<Option<Syntax>, NatDefinitionElabError> {
+        // `return` with no value: the pin's `elabDoReturn` returns `PUnit.unit` (`mkPUnitUnit`),
+        // checked against the result type like any value.
+        if syntax.kind() == Some(&parser_kind(&["Term", "doReturn"]))
+            && let Syntax::Node { args, .. } = syntax
+            && let [keyword, Syntax::Node { args: value, .. }] = args.as_slice()
+            && value.is_empty()
+        {
+            return Ok(Some(Syntax::node(
+                parser_kind(&["Term", "doReturn"]),
+                vec![
+                    keyword.clone(),
+                    null(vec![ident(Name::from_components([
+                        "_root_", "PUnit", "unit",
+                    ]))]),
+                ],
+            )));
+        }
+        let Some(element) = term_element(syntax) else {
+            return Ok(None);
+        };
+        if pattern {
+            return Err(invalid());
+        }
+        // Its arguments are expanded already: the element is expanded as the block's, then the
+        // block.
+        let element = self.expand_do_node(element, false)?;
+        self.expand_do_node(do_block(element), false).map(Some)
+    }
+
     pub(super) fn expand_do_node(
         &mut self,
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if let Some(expanded) = self.expand_term_do_form(&syntax, pattern)? {
+            return Ok(expanded);
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "doIf"])) {
             return nest_else_ifs(syntax);
         }

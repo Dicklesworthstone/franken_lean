@@ -4071,6 +4071,59 @@ const DOTTED_IDENTIFIERS: &[Accepted] = &[
 
 /// `guard_target` with each relation (`syntax (name := guardTarget) "guard_target " equal term :
 /// tactic`, `Init/Guard.lean:75`; `equal` at `:38-46`). Captured 2026-10-11.
+/// `unless c do s` and `for x in xs do s` in term position (`Term.termUnless`, `Term.termFor`,
+/// `Lean/Parser/Do.lean`): the do element's grammar and arguments under the term kind. Captured
+/// 2026-10-12 from one file the pin elaborated without an error, in this order.
+const TERM_DO_ELEMENTS: &[Accepted] = &[
+    Accepted {
+        source: "def tu1 (b : Bool) : IO Unit :=\nunless b do throw (IO.userError \"no\")",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `tu1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.termUnless "unless" `b "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `throw [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.app `IO.userError [(str "\"no\"")]) ")")])) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def tu2 (x : Nat) : IO Unit :=\n  unless x > 10 do\n    IO.println \"small\"\n    IO.println \"done\"",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `tu2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`x] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.termUnless "unless" («term_>_» `x ">" (num "10")) "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"small\"")])) []) (Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"done\"")])) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def tf1 (xs : List Nat) : IO Unit :=\n  for x in xs do\n    IO.println \"x\"",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `tf1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`xs] [":" (Term.app `List [`Nat])] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.termFor "for" [(Term.doForDecl [] `x "in" `xs)] "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"x\"")])) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def tf2 (xs : List Nat) : IO Unit := id <| for x in xs do IO.println \"x\"",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `tf2 []) (Command.optDeclSig [(Term.explicitBinder "(" [`xs] [":" (Term.app `List [`Nat])] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" («term_<|_» `id "<|" (Term.termFor "for" [(Term.doForDecl [] `x "in" `xs)] "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"x\"")])) [])]))) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def tu3 (b : Bool) : IO Unit := (fun (x : IO Unit) => x) (unless b do pure ())",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `tu3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.app (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [(Term.typeAscription (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) `x ":" [(Term.app `IO [`Unit])] ")")] [] "=>" `x)) ")") [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.termUnless "unless" `b "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `pure [(Term.tuple (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) [] ")")])) [])])) ")")]) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
+/// `return` with no value (`"return" (ppSpace checkLineEq termParser)?`): nothing follows on its
+/// line, in a do sequence, outside `do` (`Term.termReturn`), as a term-position `unless`'s body,
+/// in a conditional branch and in parentheses. Captured 2026-10-12 from one file the pin
+/// elaborated without an error, in this order.
+const BARE_RETURNS: &[Accepted] = &[
+    Accepted {
+        source: "def br1 : IO Unit := do\n  IO.println \"a\"\n  return",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `br1 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"a\"")])) []) (Term.doSeqItem (Term.doReturn "return" []) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def br2 : IO Unit := return",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `br2 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.termReturn "return" []) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def br3 (b : Bool) : IO Unit :=\n  unless b do\n    return",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `br3 []) (Command.optDeclSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.termUnless "unless" `b "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doReturn "return" []) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def br4 (b : Bool) : IO Unit := do\n  if b then\n    return\n  IO.println \"b\"",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `br4 []) (Command.optDeclSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doIf "if" (Term.doIfProp [] `b) "then" (Term.doSeqIndent [(Term.doSeqItem (Term.doReturn "return" []) [])]) [] []) []) (Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"b\"")])) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def br5 : IO Unit := (return)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `br5 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.termReturn "return" []) ")") (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 const GUARD_TARGETS: &[Accepted] = &[
     Accepted {
         source: "theorem a (p : Prop) (h : p) : p := by\n  guard_target = p\n  exact h",
@@ -5786,6 +5839,22 @@ fn dotted_identifiers_produce_the_pins_trees() {
 #[test]
 fn relations_and_existentials_produce_the_pins_trees() {
     for row in RELATIONS_AND_EXISTENTIALS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn term_position_do_elements_produce_the_pins_trees() {
+    for row in TERM_DO_ELEMENTS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn bare_returns_produce_the_pins_trees() {
+    for row in BARE_RETURNS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }
