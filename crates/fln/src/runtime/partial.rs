@@ -231,8 +231,9 @@ impl Preparation<'_> {
     }
 
     /// Explicit native implementations belong to the logical declaration and
-    /// precede its companion, as in the pin's ToDecl. Unknown externs never
-    /// disappear when an executable head acquires a different name.
+    /// precede its companion, as in the pin's ToDecl. Checked Float helpers use
+    /// their complete model before preserving the logical native head. Unknown
+    /// externs never disappear when an executable head acquires a different name.
     fn companion_has_native_parent(&mut self, logical: &Name) -> Result<bool, IngressError> {
         source_intrinsics::check_selected_extern_attribute(
             self.environment,
@@ -249,6 +250,7 @@ impl Preparation<'_> {
             return Ok(false);
         }
         let native = self.native_intrinsic_binding(logical)?.is_some()
+            || (source_intrinsics::float::is_primitive(logical) && self.imported_float_model()?)
             || match source_intrinsics::io::fs::Operation::from_name(logical) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(
                     self.environment,

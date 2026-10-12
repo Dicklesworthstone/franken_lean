@@ -282,6 +282,13 @@ fn fixture() -> Option<&'static Fixture> {
                     roots.push(name(&format!("inst{class}{width}")));
                 }
             }
+            // Retain the actual executable companions too: their selected
+            // externs must keep precedence before Float's private adaptation.
+            roots.extend(
+                ["Nat.shiftLeft._unsafe_rec", "Nat.shiftRight._unsafe_rec"]
+                    .into_iter()
+                    .map(name),
+            );
             let needed = dependencies(&constants, roots);
             let mut environment = Environment::new();
             for (label, info) in constants {
@@ -493,6 +500,43 @@ def importedShift (delta : Float32) : Float32 → Float32 := fun x => x + delta
 }
 
 #[test]
+fn actual_float_bit_helpers_preserve_native_precedence_over_recursive_companions() {
+    with_fixture(|fixture| {
+        for label in ["Nat.shiftLeft", "Nat.shiftRight"] {
+            assert!(
+                matches!(
+                    fixture.environment.find(&Name::str(name(label), "_unsafe_rec")),
+                    Some(ConstantInfo::Defn(value))
+                        if value.safety == fln_env::constants::DefinitionSafety::Partial
+                ),
+                "{label}"
+            );
+        }
+        execute_and_replay(
+            &Engine::from_environment(fixture.environment.clone()),
+            r#"
+def shiftedLeft (n e : Nat) : Nat := Nat.shiftLeft n e
+def shiftedRight (n e : Nat) : Nat := Nat.shiftRight n e
+def useShift (f : Nat → Nat → Nat) (n e : Nat) : Nat := f n e
+def useLog (f : Nat → Nat) (n : Nat) : Nat := f n
+#eval shiftedLeft 1 130
+#eval shiftedRight 1361129467683753853853498429727072845824 129
+#eval useShift Nat.shiftLeft 7 65
+#eval useShift Nat.shiftRight 258254417031933722624 64
+#eval useLog Nat.log2 1361129467683753853853498429727072845824
+"#,
+            &[
+                Expected::Nat("1361129467683753853853498429727072845824"),
+                Expected::Nat("2"),
+                Expected::Nat("258254417031933722624"),
+                Expected::Nat("14"),
+                Expected::Nat("130"),
+            ],
+        );
+    });
+}
+
+#[test]
 fn actual_float_scaling_accepts_dynamic_logical_ints_and_higher_order_calls() {
     with_fixture(|fixture| {
         execute_and_replay(
@@ -628,6 +672,9 @@ fn actual_float_model_refuses_missing_dependencies_foreign_externs_and_exhaustio
             "UInt64.toNat",
             "Int.ofNat",
             "Int.negSucc",
+            "Nat.log2",
+            "Nat.shiftLeft",
+            "Nat.shiftRight",
         ] {
             let missing = rebuild(fixture, None, Some(&name(label)));
             assert!(
@@ -657,6 +704,9 @@ fn actual_float_model_refuses_missing_dependencies_foreign_externs_and_exhaustio
             "UInt64.toNat",
             "Int.ofNat",
             "Int.negSucc",
+            "Nat.log2",
+            "Nat.shiftLeft",
+            "Nat.shiftRight",
         ] {
             let changed = externs::register(
                 &fixture.environment,

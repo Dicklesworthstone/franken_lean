@@ -150,7 +150,7 @@ impl Preparation<'_> {
             .map(|(_, type_)| type_.clone())
     }
 
-    pub(super) fn imported_float_model(&mut self) -> Result<bool, IngressError> {
+    pub(in crate::runtime) fn imported_float_model(&mut self) -> Result<bool, IngressError> {
         self.tick()?;
         if !self.floats.checked {
             if !source_intrinsics::float::matches(

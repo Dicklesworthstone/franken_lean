@@ -32,6 +32,11 @@ pub(crate) fn is_primitive(requested: &Name) -> bool {
         FLOAT_OPERATIONS.contains(&operation) || operation == "toFloat"
     } else if family == name("UInt32") || family == name("UInt64") {
         matches!(operation, "ofNat" | "toNat" | "toFloat" | "toFloat32")
+    } else if family == name("Nat") {
+        // Scientific conversion needs the selected native bit operations:
+        // their logical recursors grow with the value or shift count. The
+        // complete Float inventory already binds all three checked models.
+        matches!(operation, "log2" | "shiftLeft" | "shiftRight")
     } else {
         false
     }
