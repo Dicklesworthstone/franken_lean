@@ -600,6 +600,9 @@ impl Context {
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
+                    // A term-position `for`/`unless` is its `do` block first, so a `let mut` in
+                    // its body is that block's.
+                    let node = term_element(&node).map_or(node, do_block);
                     built.push(if is(&node, "do") && contains_mutation(&node) {
                         self.mutable_block(node)?
                     } else {

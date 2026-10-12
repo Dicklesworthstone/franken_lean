@@ -3187,6 +3187,36 @@ fn push_jump_keyword(leaves: &Leaves, frames: &mut [BoundedTermFrame], index: us
     }
 }
 
+/// A `return` with no value on its line (`checkLineEq`): a do element's keyword leaf, or outside
+/// `do` the complete `Term.termReturn` with an empty value. Out of line and infallible for the
+/// driver's stack budget, as [`push_jump_keyword`].
+#[inline(never)]
+fn push_bare_return(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &mut [BoundedTermFrame],
+    index: usize,
+    end: usize,
+) -> bool {
+    if push_jump_keyword(leaves, frames, index) {
+        return true;
+    }
+    let (true, Ok(keyword), Some(frame)) = (
+        term_do::bare_return(view, tokens, index, end),
+        leaves.leaf(index),
+        frames.last_mut(),
+    ) else {
+        return false;
+    };
+    let syntax = Syntax::node(
+        parser_kind(&["Term", "termReturn"]),
+        vec![keyword, null_node(vec![])],
+    );
+    frame.application.push((syntax, index));
+    true
+}
+
 /// Whether an application's head is a `Term.dotIdent` (`.c a`) or a `Term.proj` (`[1, 2].map f`,
 /// whose first token is not an identifier). Out of line for the same stack budget.
 #[inline(never)]
@@ -3629,8 +3659,19 @@ fn bounded_term_token(
     mut cursor: usize,
 ) -> Result<usize, NatDefinitionParseError> {
     match tokens.get(index).map(|token| &token.kind) {
-        _ if grammar == DefinitionGrammar::Scalar && term_locals::word(tokens, index, "do") => {
-            let prefix = term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)?;
+        // `unless`/`for` in term position are one do element on the same heap frames. One arm
+        // with `do`'s, for the driver's stack budget.
+        _ if grammar == DefinitionGrammar::Scalar
+            && (term_locals::word(tokens, index, "do")
+                || term_locals::word(tokens, index, "unless")
+                || term_locals::word(tokens, index, "for")) =>
+        {
+            let prefix = if term_locals::word(tokens, index, "do") {
+                term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)
+            } else {
+                cursor = index;
+                term_do::Prefix::element(view, tokens, &mut cursor, range.end)
+            }?;
             frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
                 prefix,
             ))));
@@ -3699,11 +3740,14 @@ fn bounded_term_token(
         {
             frames.push(term_binders::frame(term_locals::Prefix::Nested(index)));
         }
-        // `return e` outside `do`: the do parser reads its own statements first.
+        // `return e` outside `do`: the do parser reads its own statements first. A do element's
+        // bare `return` is its keyword leaf, and a bare one here is complete.
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "return" =>
         {
-            frames.push(term_binders::frame(term_locals::Prefix::Return(index)));
+            if !push_bare_return(leaves, view, tokens, frames, index, range.end) {
+                frames.push(term_binders::frame(term_locals::Prefix::Return(index)));
+            }
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>

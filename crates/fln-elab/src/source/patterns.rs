@@ -1280,7 +1280,8 @@ impl Context {
                 || let_pattern(node)
                 || node.kind() == Some(&Name::from_components(["Lean", "term_Matches_|"]))
                 || node.kind() == Some(&parser_kind(&["Term", "structInstFieldEqns"]))
-                || node.kind() == Some(&parser_kind(&["Term", "do"]));
+                || node.kind() == Some(&parser_kind(&["Term", "do"]))
+                || do_notation::is_term_block(node);
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
                     let binding = self.let_parts(args, false, true)?;
