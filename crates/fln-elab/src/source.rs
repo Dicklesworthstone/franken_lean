@@ -2766,6 +2766,7 @@ impl Context {
                             self.sort_level(&type_)?;
                             if show && let Some(expected) = &expected {
                                 self.constrain_result_hint(&type_.value, expected)?;
+                                self.show_result_hint(&type_.value, expected)?;
                             }
                             tasks.push(Task::AscribedValue(type_.value.clone(), expected, show));
                             tasks.push(Task::Visit(syntax, Some(type_.value), true));
