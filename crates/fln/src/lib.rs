@@ -7873,6 +7873,30 @@ impl Engine {
                 declaration,
                 irreducible,
             } = elaborated;
+            // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
+            // a later command's atomic name does not reach it through its namespace, an `open` or
+            // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).
+            let protected = if !is_evaluation
+                && fln_elab::source::protected_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some()
+            {
+                match &declaration {
+                    Declaration::Defn(value) => Some(value.base.name.clone()),
+                    Declaration::Thm(value) => Some(value.base.name.clone()),
+                    Declaration::Opaque(value) => Some(value.base.name.clone()),
+                    Declaration::Axiom(value) => Some(value.base.name.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             if matches!(
                 evaluation_presentation,
                 Some(
@@ -7963,6 +7987,17 @@ impl Engine {
                         at: Some(original_offset),
                     },
                 )?;
+                if let Some(name) = &protected {
+                    admission.engine.environment =
+                        source_records::tag_protected(&admission.engine, name).map_err(
+                            |error| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            },
+                        )?;
+                    admission.result_logical_root = admission.engine.logical_root(options);
+                }
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
                     .map_err(|error| {
@@ -8018,6 +8053,19 @@ impl Engine {
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
+            if let Some(name) = &protected {
+                execution.engine.environment =
+                    source_records::tag_protected(&execution.engine, name).map_err(|error| {
+                        EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        }
+                    })?;
+                execution.result_logical_root = execution
+                    .engine
+                    .logical_root(scoped_options.as_ref().unwrap_or(options));
+            }
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
