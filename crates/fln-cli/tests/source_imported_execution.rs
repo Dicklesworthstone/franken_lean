@@ -926,6 +926,53 @@ fn guard_msgs_exists_only_where_init_notation_is_imported() {
     );
 }
 
+/// A decidable proposition where a `Bool` is expected is `decide p` (`decPropToBool`,
+/// `Init/Coe.lean`), also while a numeral's type is still open: the pin postpones such a
+/// coercion until the default instance fixes it (`mkCoe`'s `.undef`). Before that
+/// postponement this door refused `(2 = 1 + 1 : Bool)` with a type mismatch. Each file was
+/// run through the pin first.
+#[test]
+fn decidable_propositions_coerce_to_bool() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-decide-coercion");
+    let decide = workspace.write(
+        "Decide.lean",
+        "prelude\nimport Init.Core\ndef b : Bool := (2 = 1 + 1 : Bool)\n\
+         theorem b_true : b = true := rfl\ndef w : Bool := (2 = 3 : Bool)\n\
+         theorem w_false : w = false := rfl\n",
+    );
+    let ours = lean_door(&workspace, &decide, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (0, "", ""),
+        "{ours:?}"
+    );
+    // `p` is a definition with no `Decidable` instance: the pin's type mismatch.
+    let opaque = workspace.write(
+        "Opaque.lean",
+        "prelude\nimport Init.Core\ndef p : Prop := 2 = 1 + 1\ndef bad : Bool := (p : Bool)\n",
+    );
+    let refused = lean_door(&workspace, &opaque, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stderr.contains("Type mismatch"), "{refused:?}");
+    // An overloaded `foo` against `Bool`: `A.foo 2 : Prop`, whose numeral still waits for its
+    // default instance, is no interpretation, as at the pin (it accepts, through `B.foo`). The
+    // pin keeps a delayed coercion only as a sole success, so an overload trial does not
+    // postpone one; one that did would read as a second success, "Ambiguous term".
+    let overloaded = workspace.write(
+        "Overloaded.lean",
+        "prelude\nimport Init.Core\nnamespace A\ndef foo {α : Type} (_ : α) : Prop := True\n\
+         end A\nnamespace B\ndef foo (n : Nat) : Bool := n == 2\nend B\nopen A B\n\
+         def t : Bool := foo 2\ntheorem t_true : t = true := rfl\n",
+    );
+    let ours = lean_door(&workspace, &overloaded, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (0, "", ""),
+        "{ours:?}"
+    );
+}
+
 /// The drop-in `lean` on one file, with the search path and the record store
 /// both inside the workspace so a run neither reads nor leaves anything else.
 fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {

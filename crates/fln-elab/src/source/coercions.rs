@@ -9,7 +9,10 @@ use fln_env::constants::ConstantInfo;
 mod expand;
 mod function;
 mod monad;
+mod postponed;
 mod result_hint;
+
+pub(super) use postponed::PostponedCoercion;
 
 /// A native probe can be blocked before a closed kernel query is possible.
 /// Keep that distinct from a completed query's concrete conversion refusal.
@@ -496,6 +499,7 @@ impl Context {
     ) -> Result<bool, NatDefinitionElabError> {
         if self.pending_source_arguments
             || !self.postponed_eliminators.is_empty()
+            || !self.postponed_coercions.is_empty()
             || !self.equations.is_empty()
             || self.application_type_unavailable(type_)?.is_none()
         {
@@ -631,6 +635,11 @@ impl Context {
         if let Some(candidate) = result? {
             *self = trial;
             return Ok(candidate);
+        }
+        // No path yet. While the value is open, the pin postpones a coercion
+        // (`mkCoe`'s `.undef`); instance synthesis resumes it.
+        if let Some(postponed) = self.postpone_coercion(&term, expected)? {
+            return Ok(postponed);
         }
         // No path. A rigid mismatch is the pin's elaboration-time `Type mismatch`; any
         // other closed mismatch still reaches K1, while an unification/resource

@@ -330,6 +330,7 @@ impl Context {
             .instance_goals
             .iter()
             .all(|id| self.txn.mvars.is_assigned(id))
+            && self.postponed_coercions.is_empty()
         {
             return Ok(());
         }
@@ -380,6 +381,12 @@ impl Context {
             // blocked OfNat/HAdd goals must not exhaust the command budget
             // before the final default-instance phase becomes eligible.
             if self.txn.mvars.assignments().len() == before {
+                // As the pin's synthesis loop: resume postponed coercions at
+                // the fixed point, and only then try a default instance.
+                if self.resume_postponed_coercions()? {
+                    self.flush(false)?;
+                    continue;
+                }
                 if final_pass && self.resolve_default_instance(&registry)? {
                     continue;
                 }
@@ -389,6 +396,11 @@ impl Context {
             // projections. Resume every retained equation after that progress;
             // skipping a redundant pass is not permission to drop obligations.
             self.flush(false)?;
+        }
+        if final_pass {
+            // What is still open is refused as it was found, before any
+            // instance goal it left unsolved is reported instead.
+            self.finish_postponed_coercions()?;
         }
         if final_pass
             && self

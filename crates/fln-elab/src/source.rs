@@ -563,6 +563,9 @@ struct Context {
     // Eliminator applications waiting for their expected type (`elabAsElim`'s
     // postponement), resumed after default instances run.
     postponed_eliminators: Vec<eliminator::PostponedEliminator>,
+    // Coercions whose value was still open (`mkCoe`'s `.undef`), resumed by
+    // instance synthesis and refused, as they were found, on its final pass.
+    postponed_coercions: Vec<coercions::PostponedCoercion>,
     // Resumed argument failures are delayed source diagnostics, just like the
     // pin's synthetic metavariable errors. Tactic/recursion rollback restores
     // them; a selected declaration can never discard them or admit its holes.
@@ -635,6 +638,7 @@ impl Context {
             well_founded_definition: false,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
+            postponed_coercions: Vec::new(),
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
             source_recursors: Vec::new(),
