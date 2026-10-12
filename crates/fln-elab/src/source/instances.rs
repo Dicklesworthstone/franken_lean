@@ -215,6 +215,15 @@ impl Context {
         result.map_err(registry_error)
     }
 }
+
+/// The distinct default priorities, highest first (`getDefaultInstancesPriorities`).
+fn default_priorities(defaults: &[crate::instances::defaults::DefaultInstance]) -> Vec<u32> {
+    let mut priorities: Vec<u32> = defaults.iter().map(|row| row.candidate.priority).collect();
+    priorities.sort_unstable_by(|a, b| b.cmp(a));
+    priorities.dedup();
+    priorities
+}
+
 pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
     // A completed closed-conversion refusal can start another coercion or
     // instance trial. Exhaustion, cancellation and faults remain terminal.
@@ -502,57 +511,176 @@ impl Context {
         registry: &InstanceRegistry,
     ) -> Result<bool, NatDefinitionElabError> {
         let defaults = crate::instances::defaults::read(&self.txn.env).map_err(registry_error)?;
-        let mut priorities = std::collections::BTreeSet::new();
-        for row in &defaults {
-            priorities.insert(row.candidate.priority);
-        }
-        for priority in priorities.into_iter().rev() {
+        for priority in default_priorities(&defaults) {
             for id in self.instance_goals.clone() {
                 self.tick()?;
                 if self.txn.mvars.is_assigned(&id) {
                     continue;
                 }
-                let decl = self
-                    .txn
-                    .mvars
-                    .get_decl(&id)
-                    .cloned()
-                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                let mut probe = self.clone();
-                probe.txn.lctx = decl.lctx;
-                let target = probe.instance_type(&decl.type_);
-                self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
-                let Some(class) = result_head(&target?) else {
+                let Some(class) = self.goal_class(&id)? else {
                     continue;
                 };
-                // The pin prepends each default registration and tries that list from its head
-                // (vendored Meta/Instances.lean and Elab/SyntheticMVars.lean). `defaults::read`
-                // already orders rows by descending priority, then newest registration first.
-                // Preserve that order here; reversing it would prefer older equal-priority rows.
-                for row in &defaults {
+                if self.default_at_priority(&id, &class, priority, registry, &defaults, 0)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The class a pending instance goal asks for, if its type has a class head.
+    fn goal_class(&mut self, id: &MVarId) -> Result<Option<Name>, NatDefinitionElabError> {
+        let decl = self
+            .txn
+            .mvars
+            .get_decl(id)
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        let mut probe = self.clone();
+        probe.txn.lctx = decl.lctx;
+        let target = probe.instance_type(&decl.type_);
+        self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
+        Ok(result_head(&target?))
+    }
+
+    /// `synthesizeUsingDefaultPrio` (vendored Lean/Elab/SyntheticMVars.lean): the defaults of
+    /// `priority` for this goal's class, in list order. The pin prepends each default
+    /// registration and tries that list from its head (Meta/Instances.lean); `defaults::read`
+    /// already orders rows by descending priority, then newest registration first, so the
+    /// order is kept here: `Pow`'s `Pow α α` is tried before the older `instPowNat`.
+    fn default_at_priority(
+        &mut self,
+        id: &MVarId,
+        class: &Name,
+        priority: u32,
+        registry: &InstanceRegistry,
+        defaults: &[crate::instances::defaults::DefaultInstance],
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        for row in defaults {
+            self.tick()?;
+            if row.candidate.priority != priority || &row.class != class {
+                continue;
+            }
+            if self.apply_default(id, &row.candidate.declaration, registry, defaults, depth)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `synthesizeUsingDefaultInstance`, under `commitWhen`: apply the default to fresh holes,
+    /// then `synthesizePending` its instance arguments. A default whose arguments do not all
+    /// resolve now is rolled back and the next one is tried: `Pow α α` applies to `Pow Nat ?β`,
+    /// but `HomogeneousPow Nat` has no instance, so `2 ^ 10` takes `instPowNat`.
+    fn apply_default(
+        &mut self,
+        id: &MVarId,
+        declaration: &Name,
+        registry: &InstanceRegistry,
+        defaults: &[crate::instances::defaults::DefaultInstance],
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let known: std::collections::HashSet<MVarId> =
+            self.instance_goals.iter().cloned().collect();
+        let mut trial = self.clone();
+        let saved = trial.txn.lctx.clone();
+        let suspended = std::mem::take(&mut trial.equations);
+        let result = trial.search_instance_mode(id.clone(), registry, Some(declaration));
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        if result? != SearchResult::Solved {
+            return Ok(false);
+        }
+        trial.txn.lctx = saved;
+        trial.equations.extend(suspended);
+        let pending = trial
+            .instance_goals
+            .iter()
+            .filter(|goal| !known.contains(*goal) && !trial.txn.mvars.is_assigned(goal))
+            .cloned()
+            .collect();
+        let settled = trial.synthesize_pending_arguments(pending, registry, defaults, depth);
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(error) if nonmatch(&error) => false,
+            Err(error) => return Err(error),
+        };
+        if settled {
+            *self = trial;
+        }
+        Ok(settled)
+    }
+
+    /// `synthesizePending`: ordinary synthesis to a fixed point, then one default for the first
+    /// goal that takes one (`synthesizeSomeUsingDefault?`), until no goal is left. False when a
+    /// goal takes neither. The nesting bound is this engine's own; past it the default is not
+    /// applied, so a deeper chain is refused, never accepted.
+    fn synthesize_pending_arguments(
+        &mut self,
+        mut pending: Vec<MVarId>,
+        registry: &InstanceRegistry,
+        defaults: &[crate::instances::defaults::DefaultInstance],
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        const MAX_DEFAULT_NESTING: usize = 16;
+        loop {
+            loop {
+                let count = pending.len();
+                let mut blocked = Vec::new();
+                for goal in pending {
                     self.tick()?;
-                    if row.candidate.priority != priority || row.class != class {
+                    if self.txn.mvars.is_assigned(&goal) {
                         continue;
                     }
                     let mut trial = self.clone();
                     let saved = trial.txn.lctx.clone();
                     let suspended = std::mem::take(&mut trial.equations);
-                    let result = trial.search_instance_mode(
-                        id.clone(),
-                        registry,
-                        Some(&row.candidate.declaration),
-                    );
+                    let result = trial.search_instance(goal.clone(), registry);
                     self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                     if result? == SearchResult::Solved {
                         trial.txn.lctx = saved;
                         trial.equations.extend(suspended);
                         *self = trial;
-                        return Ok(true);
+                    } else {
+                        blocked.push(goal);
+                    }
+                }
+                pending = blocked;
+                if pending.is_empty() || pending.len() == count {
+                    break;
+                }
+            }
+            if pending.is_empty() {
+                return Ok(true);
+            }
+            if depth >= MAX_DEFAULT_NESTING {
+                return Ok(false);
+            }
+            let mut taken = None;
+            'goals: for (index, goal) in pending.iter().enumerate() {
+                let Some(class) = self.goal_class(goal)? else {
+                    continue;
+                };
+                for priority in default_priorities(defaults) {
+                    if self.default_at_priority(
+                        goal,
+                        &class,
+                        priority,
+                        registry,
+                        defaults,
+                        depth + 1,
+                    )? {
+                        taken = Some(index);
+                        break 'goals;
                     }
                 }
             }
+            let Some(index) = taken else {
+                return Ok(false);
+            };
+            pending.remove(index);
         }
-        Ok(false)
     }
 
     /// Build a speculative frame. Unknown ordinary inputs block this goal;
@@ -994,12 +1122,11 @@ impl Context {
                     continue;
                 }
                 if remaining {
-                    // `tryToSynthesizeUsingDefaultInstance` (vendored
-                    // Lean/Elab/SyntheticMVars.lean) assigns the goal to the default
-                    // instance applied to fresh holes and registers its instance arguments as
-                    // new goals, solved by later synthesis or by another default: `instHAdd`
-                    // answers `HAdd ?α ?β ?γ`, and `instOfNatNat` then fixes `?α` for `Add ?α`.
-                    // Its blocked prerequisites are already instance goals here.
+                    // `synthesizeUsingDefaultInstance` (vendored Lean/Elab/SyntheticMVars.lean)
+                    // assigns the goal to the default instance applied to fresh holes. Its
+                    // blocked prerequisites are already instance goals here; `apply_default`
+                    // then runs `synthesizePending` on them and rolls the default back unless
+                    // each one resolves, by an instance or by another default.
                     if index == 0 && frames[0].default_application {
                         let value = self.instantiate(&expansion.value)?;
                         self.assign_instance_answer(&frames[0], value)?;

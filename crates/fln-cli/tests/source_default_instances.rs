@@ -88,8 +88,9 @@ fn default_instances_leave_their_arguments_to_later_synthesis() {
             "def m := match 3 with\n  | 0 => 1\n  | _ => 2\ntheorem t : m = 2 := rfl\n",
         ),
         ("condition", "def i := if 1 = 1 then 2 else 3\n"),
-        // `Pow` has two defaults; the pin tries the last added first, `instPowNat` before
-        // `Pow α α`, so the exponent is a `Nat`.
+        // `Pow` has two defaults. The pin tries the newest, `Pow α α`, first and rolls it back,
+        // because its argument `HomogeneousPow Nat` has no instance
+        // (`trace.Elab.defaultInstance`), then takes `instPowNat`: the exponent is a `Nat`.
         ("power", "theorem t : 2 ^ 10 = 1024 := rfl\n"),
         ("power_mod", "theorem t : (2 ^ 64 + 1) % 7 = 3 := rfl\n"),
         ("power_def", "def p := 2 ^ 5\ntheorem t : p = 32 := rfl\n"),
@@ -97,6 +98,13 @@ fn default_instances_leave_their_arguments_to_later_synthesis() {
             "power_var",
             "def f (n : Nat) := 2 ^ n\ntheorem t : f 3 = 8 := rfl\n",
         ),
+        ("power_tower", "theorem t : 2 ^ 2 ^ 3 = 256 := rfl\n"),
+        ("power_sum_exponent", "theorem t : 2 ^ (1 + 1) = 4 := rfl\n"),
+        (
+            "power_square",
+            "def f (n : Nat) := n ^ 2 + 1\ntheorem t : f 3 = 10 := rfl\n",
+        ),
+        ("power_lambda", "example : (fun x => x ^ 2) 3 = 9 := rfl\n"),
     ] {
         let (code, stdout, stderr) = check(&lib, &root, name, program);
         assert_eq!(code, 0, "{name}: {program}\n{stdout}\n{stderr}");
@@ -143,6 +151,16 @@ fn default_instance_refusals_match_the_pin() {
             "power_string",
             "def s : String := 2 ^ 3\n",
             "failed to synthesize instance of type class",
+        ),
+        (
+            "power_bool",
+            "def b : Bool := 2 ^ 3\n",
+            "failed to synthesize instance of type class",
+        ),
+        (
+            "power_lambda_wrong",
+            "example : (fun x => x ^ 2) 3 = 8 := rfl\n",
+            "Type mismatch",
         ),
     ] {
         let (code, stdout, stderr) = check(&lib, &root, name, program);
