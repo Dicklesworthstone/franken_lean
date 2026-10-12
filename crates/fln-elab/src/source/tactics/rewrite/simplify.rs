@@ -40,6 +40,14 @@ impl Context {
         type_: &Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         self.tick()?;
+        // `¬ p` itself: simp prepares its facts at reducible transparency, which keeps `Not`
+        // folded, and the pin's `preprocess` reads it as `p = False` (`Expr.not?`).
+        if let ExprNode::App { f, a } = type_.node()
+            && matches!(f.node(), ExprNode::Const { name, levels }
+                if name == &Name::from_components(["Not"]) && levels.is_empty())
+        {
+            return Ok(Some(a.clone()));
+        }
         let ExprNode::ForallE {
             binder_type, body, ..
         } = type_.node()
