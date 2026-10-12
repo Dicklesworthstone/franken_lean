@@ -12132,9 +12132,11 @@ fn render_lean_source_commands(
                 let line = match render_lean_source_check_line(
                     check,
                     completed.batch.engine.environment(),
+                    // The scope at the `#check`, not at the end of the file: its namespace and
+                    // `open`s decide how a constant is named.
                     &mut fln::pretty::Printer::in_scope(
                         completed.batch.engine.environment(),
-                        &completed.scope,
+                        &check.scope,
                     ),
                 ) {
                     Ok(line) => line,

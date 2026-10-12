@@ -7116,6 +7116,7 @@ impl Engine {
                     checked_type,
                     environment_root: admission.base_logical_root,
                     checker: admission.checker,
+                    scope: scope.clone(),
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -11649,6 +11650,9 @@ pub struct SourceCheck {
     pub environment_root: LogicalRoot,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+    /// The scope in force at the command (namespace, `open`s): its output names constants
+    /// the way they resolve there, as the pin's delaborator does.
+    pub scope: fln_elab::source::scope::SourceScope,
 }
 
 /// One completed definition-only source prefix followed by a terminal check.

@@ -1018,6 +1018,42 @@ fn decidable_propositions_coerce_to_bool() {
     );
 }
 
+/// `#check` names a constant in a term as the pin's delaborator does (`unresolveNameGlobal`):
+/// by the shortest spelling that resolves back to it, so an `export`ed one by its alias
+/// (`Option.some` is `some`, `Decidable.decide` is `decide`, and `Lean.MonadRef.getRef`, exported
+/// inside `namespace Lean`, is `Lean.getRef`), and one the current namespace or an `open`
+/// reaches by its suffix. A signature still heads with the whole name. `!`, `&&`,
+/// `||` and `!=` print as their notations. The expected text is the pinned `lean`'s stdout
+/// for the same file (2026-10-11).
+#[test]
+fn check_prints_names_the_way_they_resolve() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-check-names");
+    let file = workspace.write(
+        "Names.lean",
+        "prelude\nimport Init.Core\n#check some 3\n#check (none : Option Nat)\n\
+         #check decide (1 = 1)\n#check fun (b : Bool) => !b && true || b != false\n\
+         #check (default : Nat)\n#check Bool.false\n#check Option.some\n#check @Option.some\n\
+         namespace Nat\n#check Nat.succ 2\nend Nat\nopen Nat in\n#check Nat.succ 1\n\
+         #check Nat.succ 1\n#check @Lean.MonadRef.getRef\n",
+    );
+    let ours = lean_door(&workspace, &file, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            "some 3 : Option Nat\nnone : Option Nat\ndecide (1 = 1) : Bool\n\
+             fun b => !b && true || b != false : Bool → Bool\ndefault : Nat\n\
+             Bool.false : Bool\nOption.some.{u} {α : Type u} (val : α) : Option α\n\
+             @some : {α : Type u_1} → α → Option α\nsucc 2 : Nat\nsucc 1 : Nat\n\
+             Nat.succ 1 : Nat\n\
+             @Lean.getRef : {m : Type → Type} → [self : Lean.MonadRef m] → m Lean.Syntax\n",
+            ""
+        ),
+        "{ours:?}"
+    );
+}
+
 /// The drop-in `lean` on one file, with the search path and the record store
 /// both inside the workspace so a run neither reads nor leaves anything else.
 fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {

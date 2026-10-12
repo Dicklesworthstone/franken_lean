@@ -999,7 +999,7 @@ fn render_commands(
                         .parsed
                         .query_term_normalized()
                         .ok_or_else(|| internal("source program check has no query term"))?;
-                    let type_ = fln::pretty::Printer::in_scope(commands.batch.engine.environment(), &commands.scope)
+                    let type_ = fln::pretty::Printer::in_scope(commands.batch.engine.environment(), &check.scope)
                         .expr(&check.checked_type, 0)
                         .map_err(|fln::pretty::Unsupported(what)| Failure::new(
                             "capability", &format!("module `{module}`, command {command}: cannot print checked type {what}"),

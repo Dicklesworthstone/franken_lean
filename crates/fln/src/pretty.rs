@@ -112,6 +112,30 @@ const INFIXES: &[Infix] = &[
         precedence: 50,
         right: false,
     },
+    // `infix:50 " != " => bne` (`Init/Core.lean`).
+    Infix {
+        function: "bne",
+        arity: 4,
+        symbol: "!=",
+        precedence: 50,
+        right: false,
+    },
+    // `infixl:35 " && " => and`, `infixl:30 " || " => or` (`Init/Notation.lean`), whose
+    // `and`/`or` are `Bool.and`/`Bool.or` through `export Bool (or and not)`.
+    Infix {
+        function: "Bool.and",
+        arity: 2,
+        symbol: "&&",
+        precedence: 35,
+        right: false,
+    },
+    Infix {
+        function: "Bool.or",
+        arity: 2,
+        symbol: "||",
+        precedence: 30,
+        right: false,
+    },
     Infix {
         function: "LT.lt",
         arity: 4,
@@ -452,6 +476,83 @@ pub struct Printer<'a> {
     /// proof. When false, a proof inside the term that is not atomic prints as `⋯`.
     proofs: bool,
     budget: usize,
+    /// What name unresolution reads, with a scope: `None` without one, or when a journal
+    /// cannot be read, and then names print in full.
+    resolution: Option<Resolution>,
+}
+
+/// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
+/// the pin's `resolveGlobalName` consults, read once per printer.
+struct Resolution {
+    aliases: fln_elab::aliases::AliasTable,
+    reverse: std::collections::BTreeMap<Name, Vec<Name>>,
+    protected: fln_elab::protected_names::ProtectedNames,
+}
+
+impl Resolution {
+    fn read(env: &Environment) -> Option<Self> {
+        let aliases = fln_elab::aliases::AliasTable::read(env).ok()?;
+        let protected = fln_elab::protected_names::ProtectedNames::read(env).ok()?;
+        let mut reverse = std::collections::BTreeMap::<Name, Vec<Name>>::new();
+        for (alias, targets) in aliases.entries() {
+            for target in targets {
+                reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
+        }
+        Some(Self {
+            aliases,
+            reverse,
+            protected,
+        })
+    }
+
+    /// The pin's `unresolveNameGlobal` (vendored `Lean/ResolveName.lean`): the shortest suffix
+    /// of an `export` alias of `name`, then of `_root_.name`, that resolves to exactly `name` in
+    /// `scope`, so `Option.some` prints `some` and, under `open Nat`, `Nat.add` prints `add`.
+    /// A name with macro scopes, or one no suffix reaches, keeps its source spelling.
+    fn unresolve(
+        &self,
+        env: &Environment,
+        scope: &fln_elab::source::scope::SourceScope,
+        name: &Name,
+    ) -> Name {
+        if name.has_macro_scopes() {
+            return scope.user_name(name);
+        }
+        let root = Name::from_components(["_root_"]).append_core(name);
+        let aliases = self.reverse.get(name).map_or(&[][..], Vec::as_slice);
+        for initial in aliases.iter().chain(std::iter::once(&root)) {
+            let mut components = Vec::new();
+            let mut cursor = initial.clone();
+            while !cursor.is_anonymous() {
+                components.push(cursor.clone());
+                cursor = cursor.parent();
+            }
+            // Leaf first: `false`, then `Bool.false`, then `_root_.Bool.false`.
+            let mut candidate = Name::anonymous();
+            for component in &components {
+                let leaf = match component.leaf_view() {
+                    LeafView::Str(text) => Name::str(Name::anonymous(), text),
+                    LeafView::Num(value) => Name::num(Name::anonymous(), value),
+                    LeafView::Anonymous => break,
+                };
+                candidate = leaf.append_core(&candidate);
+                let resolved = scope.resolve_with_aliases(
+                    &candidate,
+                    |declaration| env.contains(declaration),
+                    &self.aliases,
+                    &self.protected,
+                );
+                if matches!(resolved, Ok(Some(found)) if found == *name) {
+                    return candidate;
+                }
+            }
+        }
+        scope.user_name(name)
+    }
 }
 
 /// The pin's `Expr.isAtomic`: no subterms.
@@ -489,6 +590,7 @@ impl<'a> Printer<'a> {
             nested: false,
             proofs: false,
             budget: 100_000,
+            resolution: None,
         }
     }
 
@@ -510,11 +612,23 @@ impl<'a> Printer<'a> {
     pub fn in_scope(env: &'a Environment, scope: &'a fln_elab::source::scope::SourceScope) -> Self {
         Self {
             scope: Some(scope),
+            resolution: Resolution::read(env),
             ..Self::new(env)
         }
     }
 
+    /// A constant in a term, as the delaborator names it (`pp.fullNames false`).
     fn display_name(&self, name: &Name) -> String {
+        match (self.scope, &self.resolution) {
+            (Some(scope), Some(resolution)) => {
+                escaped_name(&resolution.unresolve(self.env, scope, name))
+            }
+            _ => self.full_name(name),
+        }
+    }
+
+    /// A constant by its whole name, as `#check c`'s signature heads it.
+    fn full_name(&self, name: &Name) -> String {
         self.scope.map_or_else(
             || escaped_name(name),
             |scope| escaped_name(&scope.user_name(name)),
@@ -761,10 +875,12 @@ impl<'a> Printer<'a> {
             {
                 return Ok(Format::text(nat_decimal(value)));
             }
-            // `notation:max "¬" p:40 => Not p`.
-            if text == "Not" && args.len() == 1 {
+            // `notation:max "¬" p:40 => Not p`; `notation:max "!" b:40 => not b`
+            // (`Init/Notation.lean`, `not` being `Bool.not`).
+            if (text == "Not" || text == "Bool.not") && args.len() == 1 {
+                let symbol = if text == "Not" { "¬" } else { "!" };
                 return Ok(paren_doc(
-                    node(Format::text("¬").then(self.doc(&args[0], 40)?)),
+                    node(Format::text(symbol).then(self.doc(&args[0], 40)?)),
                     MAX_PREC,
                     outer,
                 ));
@@ -1223,12 +1339,13 @@ impl<'a> Printer<'a> {
             .find(name)
             .map(|info| info.constant_val().level_params.clone())
             .unwrap_or_default();
+        // `delabConstWithSignature` heads the signature with the whole name.
         let head = if parameters.is_empty() {
-            self.display_name(name)
+            self.full_name(name)
         } else {
             format!(
                 "{}.{{{}}}",
-                self.display_name(name),
+                self.full_name(name),
                 parameters
                     .iter()
                     .map(escaped_name)
