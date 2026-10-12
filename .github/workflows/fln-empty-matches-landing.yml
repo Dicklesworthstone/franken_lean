@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/patches/fln-empty-matches/**'
       - '.github/patches/fln-empty-matrix/**'
+      - '.github/patches/fln-empty-branches/**'
       - '.github/workflows/fln-empty-matches-landing.yml'
 
 permissions:
@@ -39,5 +40,5 @@ jobs:
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
           echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
-      - name: Validate and commit each feature directly to current main
-        run: python3 .github/patches/fln-empty-matrix/land.py
+      - name: Validate and commit constructor-field elimination directly to current main
+        run: python3 .github/patches/fln-empty-branches/land.py
