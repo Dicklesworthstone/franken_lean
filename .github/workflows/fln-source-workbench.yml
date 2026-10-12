@@ -1199,7 +1199,7 @@ jobs:
 
   distance-termination-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged callbacks and loop progress'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -1211,12 +1211,12 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'c19c884d255bdf0970374cfbfe9867bc436b4955'
+      CANDIDATE_SHA: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
     steps:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'c19c884d255bdf0970374cfbfe9867bc436b4955'
+          ref: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -1275,7 +1275,7 @@ jobs:
 
   distance-termination:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged callbacks and loop progress'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -1287,12 +1287,12 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'c19c884d255bdf0970374cfbfe9867bc436b4955'
+      CANDIDATE_SHA: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
     steps:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'c19c884d255bdf0970374cfbfe9867bc436b4955'
+          ref: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -1498,7 +1498,7 @@ jobs:
 
   while-loop-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate checked while loops and observable effects'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -1510,12 +1510,12 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '1733c48fa3cd228f69f630edd1d46879e56b025f'
+      CANDIDATE_SHA: '881df599b6a69289093dfc1cb198b49ffbc687ec'
     steps:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '1733c48fa3cd228f69f630edd1d46879e56b025f'
+          ref: '881df599b6a69289093dfc1cb198b49ffbc687ec'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -1542,59 +1542,23 @@ jobs:
         run: |
           set -euo pipefail
           rust_paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/runtime/global/partial.rs
-            crates/fln/src/runtime/global/partial/callbacks.rs
-            crates/fln/src/runtime/callables/stages.rs
-            crates/fln/src/runtime/global/partial/tests.rs
-            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
-            crates/fln-elab/src/source/do_notation.rs
-            crates/fln-elab/src/source/patterns.rs
-            crates/fln-elab/src/source/do_notation/while_loop.rs
-            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/repeat.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
             crates/fln-elab/src/source/do_notation/conditional.rs
             crates/fln/tests/source_while.rs
+            crates/fln/src/runtime/indexed.rs
           )
           paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/programs.lean
-            crates/fln/tests/source_imported_arrays/effects.lean
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/tests/source_imported_arrays/check_oracle.py
-            crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/runtime/global/partial.rs
-            crates/fln/src/runtime/global/partial/callbacks.rs
-            crates/fln/src/runtime/callables/stages.rs
-            crates/fln/src/runtime/global/partial/tests.rs
-            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
-            crates/fln-elab/src/source/do_notation.rs
-            crates/fln-elab/src/source/patterns.rs
-            crates/fln-elab/src/source/do_notation/while_loop.rs
-            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/repeat.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
             crates/fln-elab/src/source/do_notation/conditional.rs
             crates/fln/tests/source_while.rs
             crates/fln/tests/support/source_while.lean
             crates/fln/tests/support/source_while_expected.tsv
             crates/fln/tests/support/check_source_while_oracle.py
+            crates/fln/src/runtime/indexed.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_WHILE_RUSTFMT_DIFF_BEGIN
@@ -1614,7 +1578,7 @@ jobs:
 
   while-loop:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate checked while loops and observable effects'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -1626,12 +1590,13 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '1733c48fa3cd228f69f630edd1d46879e56b025f'
+      FLN_TRACE_NAT_MOTIVE: '1'
+      CANDIDATE_SHA: '881df599b6a69289093dfc1cb198b49ffbc687ec'
     steps:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '1733c48fa3cd228f69f630edd1d46879e56b025f'
+          ref: '881df599b6a69289093dfc1cb198b49ffbc687ec'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -1658,59 +1623,23 @@ jobs:
         run: |
           set -euo pipefail
           rust_paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/runtime/global/partial.rs
-            crates/fln/src/runtime/global/partial/callbacks.rs
-            crates/fln/src/runtime/callables/stages.rs
-            crates/fln/src/runtime/global/partial/tests.rs
-            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
-            crates/fln-elab/src/source/do_notation.rs
-            crates/fln-elab/src/source/patterns.rs
-            crates/fln-elab/src/source/do_notation/while_loop.rs
-            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/repeat.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
             crates/fln-elab/src/source/do_notation/conditional.rs
             crates/fln/tests/source_while.rs
+            crates/fln/src/runtime/indexed.rs
           )
           paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/programs.lean
-            crates/fln/tests/source_imported_arrays/effects.lean
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/tests/source_imported_arrays/check_oracle.py
-            crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/runtime/global/partial.rs
-            crates/fln/src/runtime/global/partial/callbacks.rs
-            crates/fln/src/runtime/callables/stages.rs
-            crates/fln/src/runtime/global/partial/tests.rs
-            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
-            crates/fln-elab/src/source/do_notation.rs
-            crates/fln-elab/src/source/patterns.rs
-            crates/fln-elab/src/source/do_notation/while_loop.rs
-            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/repeat.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
             crates/fln-elab/src/source/do_notation/conditional.rs
             crates/fln/tests/source_while.rs
             crates/fln/tests/support/source_while.lean
             crates/fln/tests/support/source_while_expected.tsv
             crates/fln/tests/support/check_source_while_oracle.py
+            crates/fln/src/runtime/indexed.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_WHILE_RUSTFMT_DIFF_BEGIN
@@ -1724,6 +1653,9 @@ jobs:
           rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
           git diff --check
 
+      - name: Check native while computations, control-flow, effects and independent replay
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_while -- --nocapture --test-threads=1
       - name: Check the existing do-notation elaboration and execution regressions
         if: (success() || failure()) && steps.while-format.outcome == 'success'
         shell: bash
@@ -1736,6 +1668,46 @@ jobs:
       - name: Check the affected source and native execution targets
         if: (success() || failure()) && steps.while-format.outcome == 'success'
         run: cargo clippy --locked --offline -p fln --lib --test source_while --test source_do -- -D warnings
-      - name: Check native while computations, control-flow, effects and independent replay
-        if: (success() || failure()) && steps.while-format.outcome == 'success'
-        run: cargo test --locked --offline -p fln --test source_while -- --nocapture --test-threads=1
+
+  while-source-regressions:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/While Init/Control/Id Init/Control/Except Init/Data/List/Control Init/System/IO; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Check current while, repeat, nested action and term do syntax through the CLI and exact Lean pin
+        run: cargo test --locked --offline -p fln-cli --test source_while_loops --test source_nested_actions --test source_term_do_elements -- --nocapture --test-threads=1
