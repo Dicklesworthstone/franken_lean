@@ -33,6 +33,9 @@ pub struct SourceScope {
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
     pub instance_scopes: crate::instances::scoped::ActiveScopes,
+    /// `attribute [local simp] x`'s rules, in order: `simp`'s default set until this scope ends.
+    /// They are never registered, as the pin keeps local attributes out of the `.olean`.
+    pub local_simp: Vec<simp::SimpEntry>,
     /// Set only by an engine in `frontier` mode: a compiled declaration may then apply
     /// a recursor the pin's code generator refuses (`codegen.rs`, bead
     /// `franken_lean-z8j.1.6.6`). Not a lexical scope; every command inherits it.
@@ -788,6 +791,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            local_simp: Vec::new(),
             frontier_recursors: false,
             arithmetic: None,
             options: KVMap::new(),
@@ -979,6 +983,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            local_simp: Vec::new(),
             frontier_recursors: false,
             arithmetic: None,
             options: KVMap::new(),
@@ -1053,6 +1058,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            local_simp: Vec::new(),
             frontier_recursors: false,
             arithmetic: None,
             options: KVMap::new(),

@@ -352,6 +352,56 @@ pub(crate) fn apply_module_control_command(
         engine.environment = environment;
         return Ok(Outcome::Complete(()));
     }
+    // `attribute [local simp] x`: a rule of `simp`'s default set until the enclosing scope ends,
+    // validated as a registered rule is, and never registered.
+    if let ScopeCommand::Simp(attribute) = &control
+        && attribute.local
+        && let Some((priority, reverse)) = attribute.rule
+    {
+        let (file, command, offset) = position;
+        let refuse = |message: String| SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message,
+        };
+        let environment = engine.environment();
+        let mut rules = Vec::with_capacity(attribute.declarations.len());
+        for requested in &attribute.declarations {
+            let name = scopes
+                .current
+                .resolve(requested, |name| environment.contains(name))
+                .map_err(|error| refuse(error.to_string()))?
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "unknown simp declaration `{}`",
+                        requested.to_display_string()
+                    ))
+                })?;
+            fln_elab::source::scope::simp::update(environment, &name, Some((priority, reverse)))
+                .map_err(|error| {
+                    command_error(
+                        file,
+                        command,
+                        fln_parse::BytePos(offset),
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::SimpSet(error),
+                            ),
+                        )),
+                    )
+                })?;
+            rules.push(fln_elab::source::scope::simp::SimpEntry {
+                declaration: name,
+                proof: None,
+                priority,
+                reverse,
+                order: usize::MAX - scopes.current.local_simp.len() - rules.len(),
+            });
+        }
+        scopes.current.local_simp.extend(rules);
+        return Ok(Outcome::Complete(()));
+    }
     // `attribute [local instance] x`: selected until the enclosing scope ends, as a `local
     // instance` declaration is; nothing is written to the persistent registration journal.
     if let ScopeCommand::Instance(attribute) = &control
