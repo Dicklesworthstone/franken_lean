@@ -622,6 +622,31 @@ impl Model<'_> {
         })
     }
 
+    /// Whether the pin's first-order approximation (`processAssignmentFOApprox`) may still solve
+    /// `?f a₁ … aₙ =?= g b₁ … bₘ`: it matches the arguments from the right (`aᵢ =?= bᵢ`), then the
+    /// head against the rest (`?f =?= g b₁ … bₘ₋ₙ`). It needs `m ≥ n` and no certainly unequal
+    /// pair: `pure 5 : Option Nat` is `?f ?α =?= Option Nat`, `?f := Option`.
+    fn first_order_approximable(
+        &mut self,
+        stuck: &Expr,
+        wanted: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let (_, arguments) = spine(stuck);
+        let (_, wanted_arguments) = spine(wanted);
+        if wanted_arguments.len() < arguments.len() {
+            return Ok(false);
+        }
+        let saved = self.assigned.clone();
+        for (argument, wanted) in arguments.iter().rev().zip(wanted_arguments.iter().rev()) {
+            if self.compare(argument, wanted, 0)? == Answer::No {
+                self.assigned = saved;
+                return Ok(false);
+            }
+        }
+        self.assigned = saved;
+        Ok(true)
+    }
+
     fn model_mvar(&self, expr: &Expr) -> Option<Name> {
         let ExprNode::MVar { id } = expr.node() else {
             return None;
@@ -1206,7 +1231,10 @@ impl Model<'_> {
             let pattern = args
                 .iter()
                 .any(|arg| matches!(arg.node(), ExprNode::FVar { .. }));
-            if implicit_head && !pattern && self.stuck_against(&result, &wanted) == Some(Answer::No)
+            if implicit_head
+                && !pattern
+                && self.stuck_against(&result, &wanted) == Some(Answer::No)
+                && !self.first_order_approximable(&result, &wanted)?
             {
                 return Ok(Some((self.render(&result, 0)?, self.render(&wanted, 0)?)));
             }
