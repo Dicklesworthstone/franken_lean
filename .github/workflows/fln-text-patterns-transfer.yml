@@ -47,7 +47,7 @@ jobs:
           assert hashlib.sha256(patch).hexdigest() == 'e4fe2f946be29640286b0f740ee85c30b007821d34caed2c95cedf22cddcddee'
           manifest = {
               'crates/fln-elab/src/constraint/unify/reduce.rs': ['3f5f48e188de363e11b8550d6768d903de563b79', '5a7d677a798c082bf87d3d4268c29eb4698d8926'],
-              'crates/fln-elab/src/constraint/unify/reduce/string.rs': [None, 'e03ba116c157199325b795fb288c4f100017bd5'],
+              'crates/fln-elab/src/constraint/unify/reduce/string.rs': [None, 'e03ba116c1571993259b795fb288c4f100017bd5'],
               'crates/fln/tests/source_text_patterns.rs': ['97b0ea6d14ef2d11f0a6d04b18eb9fb3700f5e8a', 'dc468e578a0fbb1505d8972c8abcd54ab8ed8566'],
           }
           # Each path and both source identities are fixed before any mutation.
