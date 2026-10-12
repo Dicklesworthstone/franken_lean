@@ -7,6 +7,7 @@ pub(super) struct Parts<'a> {
     pub signature: &'a Syntax,
     pub value: &'a Syntax,
     pub priority: u32,
+    pub scoped: bool,
 }
 
 /// The pin exposes data instances automatically, while a proof instance needs
@@ -157,9 +158,26 @@ pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError
         &args[0],
         &parser_kind(&["Term", "attrKind"]),
         1,
-        "global instance scope",
+        "instance scope",
     )?;
-    expect_empty_null(&attr[0], "global instance scope")?;
+    let scoped = match expect_null_args(&attr[0], "instance scope")? {
+        [] => false,
+        [scope] => {
+            let parts = expect_node(
+                scope,
+                &parser_kind(&["Term", "scoped"]),
+                1,
+                "global or namespace-scoped instance",
+            )?;
+            expect_atom(&parts[0], "scoped", "scoped instance keyword")?;
+            true
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "global or namespace-scoped instance",
+            });
+        }
+    };
     expect_atom(&args[1], "instance", "instance keyword")?;
     let priority = match expect_null_args(&args[2], "instance priority")? {
         [] => 1000,
@@ -203,9 +221,10 @@ pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError
         signature: &args[4],
         value: &args[5],
         priority,
+        scoped,
     })
 }
-pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
+fn command_parts(syntax: &Syntax) -> Result<Option<Parts<'_>>, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -216,7 +235,17 @@ pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDe
     {
         return Ok(None);
     }
-    let parts = parts(&declaration[1])?;
+    parts(&declaration[1]).map(Some)
+}
+
+pub(super) fn is_scoped(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    Ok(command_parts(syntax)?.is_some_and(|parts| parts.scoped))
+}
+
+pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
+    let Some(parts) = command_parts(syntax)? else {
+        return Ok(None);
+    };
     // An anonymous instance is registered under the name its elaboration generates;
     // the caller takes it from the elaborated declaration.
     let Some(id) = parts.id else {

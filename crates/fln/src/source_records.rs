@@ -431,6 +431,10 @@ impl Engine {
         let registration = fln_elab::source::instance_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let instance_namespace = fln_elab::source::instance_registration_is_scoped(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .then_some(&scope.namespace);
         let simp = fln_elab::source::scope::simp::registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -491,6 +495,7 @@ impl Engine {
                     batch.engine = match batch.engine.register_checked_source_instance(
                         &name,
                         priority,
+                        instance_namespace,
                         limits.kernel,
                     )? {
                         Outcome::Complete(engine) => engine,
@@ -539,8 +544,18 @@ impl Engine {
         &self,
         name: &Name,
         priority: u32,
+        namespace: Option<&Name>,
         kernel: Budget,
     ) -> Result<Outcome<Engine>, EngineExecutionError> {
+        if namespace.is_some_and(Name::is_anonymous) {
+            return Err(EngineExecutionError::Frontend(
+                DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "scoped instances inside a non-root namespace",
+                    },
+                ),
+            ));
+        }
         let base = self
             .environment()
             .find(name)
@@ -554,16 +569,22 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let mut engine = self.clone();
-        engine.environment =
-            fln_elab::instances::register_instance(engine.environment(), name, priority).map_err(
-                |error| {
-                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                        fln_elab::NatDefinitionElabError::Inference(
-                            fln_elab::source::SourceInferenceError::InstanceRegistry(error),
-                        ),
-                    ))
-                },
-            )?;
+        engine.environment = match namespace {
+            Some(namespace) => fln_elab::instances::scoped::register(
+                engine.environment(),
+                namespace,
+                name,
+                priority,
+            ),
+            None => fln_elab::instances::register_instance(engine.environment(), name, priority),
+        }
+        .map_err(|error| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                ),
+            ))
+        })?;
         if proof {
             engine.environment = fln_elab::reducibility::register(
                 engine.environment(),
@@ -806,6 +827,7 @@ impl Engine {
                     batch.engine = match batch.engine.register_checked_source_instance(
                         parent,
                         1000,
+                        None,
                         limits.kernel,
                     )? {
                         Outcome::Complete(engine) => engine,

@@ -6792,6 +6792,10 @@ impl Engine {
         let registration = fln_elab::source::instance_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let instance_namespace = fln_elab::source::instance_registration_is_scoped(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .then(|| self.base_source_scope().namespace);
         let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -6851,6 +6855,7 @@ impl Engine {
                     admitted.engine = match admitted.engine.register_checked_source_instance(
                         &name,
                         priority,
+                        instance_namespace.as_ref(),
                         limits.kernel,
                     )? {
                         Outcome::Complete(engine) => engine,

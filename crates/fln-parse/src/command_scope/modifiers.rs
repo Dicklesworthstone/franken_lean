@@ -132,6 +132,21 @@ pub struct DeclarationPrefix {
     pub is_example: bool,
 }
 
+/// The instance's `attrKind` precedes its keyword, after `declModifiers`.
+/// Match the same two-token prefix as the full declaration parser so visibility
+/// and an unfinished proof's boundary keep their ordinary declaration meaning.
+fn instance_keyword(tokens: &[LexedToken], start: usize) -> usize {
+    if matches!(tokens.get(start).map(|token| &token.kind),
+        Some(TokenKind::Symbol(kind)) if kind == "scoped" || kind == "local")
+        && matches!(tokens.get(start + 1).map(|token| &token.kind),
+            Some(TokenKind::Symbol(kind)) if kind == "instance")
+    {
+        start + 1
+    } else {
+        start
+    }
+}
+
 /// Read only the declaration prefix, reusing the ordinary parser's attribute
 /// grammar and fixed modifier slots. Variable/attribute controls inherit the
 /// section's visibility too. The body may end at an incomplete name or binder.
@@ -143,6 +158,7 @@ pub fn prefix(source: &[u8]) -> Result<Option<DeclarationPrefix>, DefinitionPars
     let tokens = super::tokens(&view)?;
     let (_, attributes_end, declaration_start) =
         crate::declaration_prefix(&view, &tokens, DefinitionGrammar::Scalar)?;
+    let declaration_start = instance_keyword(&tokens, declaration_start);
     let Some(TokenKind::Symbol(kind)) = tokens.get(declaration_start).map(|token| &token.kind)
     else {
         return Ok(None);
@@ -195,6 +211,7 @@ fn declaration_body_start(
     let tokens = super::tokens(&view)?;
     let (_, _, declaration_start) =
         crate::declaration_prefix(&view, &tokens, DefinitionGrammar::Scalar)?;
+    let declaration_start = instance_keyword(&tokens, declaration_start);
     if !matches!(tokens.get(declaration_start).map(|token| &token.kind),
         Some(TokenKind::Symbol(kind)) if kind == if instance { "instance" } else { "theorem" })
     {
@@ -380,6 +397,44 @@ mod tests {
                 instance_body_start(source.as_bytes()).unwrap(),
                 source.find(marker)
             );
+        }
+    }
+
+    #[test]
+    fn scoped_instance_visibility_and_proof_boundaries_preserve_the_header() {
+        for source in [
+            "public scoped instance named : Law True := by exact",
+            "@[no_expose] public scoped instance (priority := 23) : Law True := by",
+            "/-- proof -/\r\npublic scoped instance : Law True := by\r\n exact",
+        ] {
+            assert_eq!(
+                prefix(source.as_bytes()).unwrap(),
+                Some(DeclarationPrefix {
+                    public: Some(true),
+                    is_example: false,
+                }),
+                "{source}"
+            );
+            assert_eq!(
+                instance_body_start(source.as_bytes()).unwrap(),
+                source.rfind(":="),
+                "{source}"
+            );
+        }
+        for header in [
+            "public scoped instance",
+            "public scoped instance (priority := 23",
+            "public scoped instance (x : Nat := 0) : Law (x = x)",
+        ] {
+            assert_eq!(instance_body_start(header.as_bytes()).unwrap(), None);
+        }
+        for source in [
+            "scoped notation",
+            "public «scoped» instance named : Law True :=",
+            "scoped theorem proof : True :=",
+        ] {
+            assert_eq!(prefix(source.as_bytes()).unwrap(), None, "{source}");
+            assert_eq!(instance_body_start(source.as_bytes()).unwrap(), None);
         }
     }
 }

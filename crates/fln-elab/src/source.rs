@@ -5273,10 +5273,18 @@ fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declar
 
 /// Registration requested by a canonical named source instance. The caller must
 /// still obtain ordinary declaration admission before installing this metadata.
+/// Use [`instance_registration_is_scoped`] to select namespace registration.
 pub fn instance_registration(
     syntax: &Syntax,
 ) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
     instance_command::registration(syntax)
+}
+
+/// Whether an instance command requests namespace-scoped registration. Read
+/// alongside [`instance_registration`]; after admission, register in the current
+/// source namespace, which need not be the qualified declaration name's parent.
+pub fn instance_registration_is_scoped(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    instance_command::is_scoped(syntax)
 }
 
 /// `declModifiers`' `protected` slot: docComment, attributes, visibility, then
