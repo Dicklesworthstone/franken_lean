@@ -11,6 +11,7 @@ mod exceptions;
 mod fallback;
 mod for_loop;
 mod if_let;
+mod lift;
 mod loop_returns;
 mod matching;
 mod mutation;
