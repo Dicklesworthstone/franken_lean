@@ -13,11 +13,16 @@
 //!
 //! - A branch statement whose every reassigning branch ends in `break` or `continue` needs no join:
 //!   the jump yields the values it reads, so it stays a plain `do` element.
+//! - In a loop body, a reassigning branch statement whose other branches jump is closed over the
+//!   statements after it: they, and then `continue`, end each branch that falls through, which is
+//!   what falling off the body's end means (`close_over_rest`). Every reassigning branch then jumps.
 //!
 //! Refused where the pin accepts, a refusal and never a different meaning:
-//! - a reassigning branch statement that also contains `return`, or `break` or `continue` with a
-//!   reassigning branch that falls through (its join would also have to forward the exit), or
-//!   that is a `try`;
+//! - a reassigning branch statement that also contains `return`, or that is a `try`;
+//! - outside a loop body, one that also contains `break` or `continue` with a reassigning branch
+//!   that falls through (its join would also have to forward the exit). Inside one, the same when
+//!   a branch binds a name the statements after it read (`| some n => …` before `s := s + n` with
+//!   an outer `n`): their copy in that branch would capture it;
 //! - a reassigning loop whose body returns;
 //! - a pattern reassignment (`(a, b) := e`).
 //!
@@ -187,6 +192,228 @@ fn jumps_out_with(element: &Syntax, state: &[Name]) -> bool {
             || last_element(sequence)
                 .is_some_and(|last| is(last, "doBreak") || is(last, "doContinue"))
     })
+}
+
+/// A loop body's branch statement that reassigns, jumps in one branch and falls through in
+/// another (`if c then s := s + 1 else break`, then statements that read `s`), with `rest`, the
+/// statements after it, and then `continue` appended to each branch that falls through. Falling
+/// off the end of the body is `continue`, so this is the same loop body, and now every branch that
+/// reassigns ends in a jump, which needs no join (`jumps_out_with`). `None` when the statement is
+/// not of that kind, or when a branch binds a name that `rest` reads: the copy in that branch would
+/// capture it.
+fn close_over_rest(
+    element: &Syntax,
+    muts: &[Name],
+    rest: &[Syntax],
+) -> Result<Option<Syntax>, NatDefinitionElabError> {
+    if !["doIf", "doMatch", "doUnless", "doNested"]
+        .iter()
+        .any(|kind| is(element, kind))
+    {
+        return Ok(None);
+    }
+    let facts = facts(element);
+    let state: Vec<Name> = muts
+        .iter()
+        .filter(|name| facts.reassigned.contains(name))
+        .cloned()
+        .collect();
+    if state.is_empty() || !facts.jumps || facts.returns || facts.handles {
+        return Ok(None);
+    }
+    if jumps_out_with(element, &state) {
+        return Ok(None);
+    }
+    let mut read = Vec::new();
+    for statement in rest {
+        identifier_roots(statement, &mut read);
+    }
+    let element = if is(element, "doUnless") {
+        unless::expand(element.clone())?
+    } else {
+        element.clone()
+    };
+    let close = |sequence: Syntax,
+                 bound: Vec<Name>|
+     -> Result<Option<Syntax>, NatDefinitionElabError> {
+        if last_element(&sequence).is_some_and(|last| is(last, "doBreak") || is(last, "doContinue"))
+        {
+            return Ok(Some(sequence));
+        }
+        let Some(mut bound) = sequence_binders(&sequence, bound) else {
+            return Ok(None);
+        };
+        bound.retain(|name| !muts.contains(name));
+        if bound.iter().any(|name| read.contains(name)) {
+            return Ok(None);
+        }
+        let bracketed = is(&sequence, "doSeqBracketed");
+        let mut items = sequence_items(sequence)?;
+        items.extend(rest.iter().cloned());
+        items.push(term("doSeqItem", vec![continue_element(), null(vec![])]));
+        Ok(Some(items_sequence(items, bracketed)))
+    };
+    if is(&element, "doNested") {
+        let mut parts = node(element, "doNested", 2)?;
+        let sequence = parts.pop().expect("nested sequence");
+        let Some(sequence) = close(sequence, Vec::new())? else {
+            return Ok(None);
+        };
+        parts.push(sequence);
+        return Ok(Some(term("doNested", parts)));
+    }
+    if is(&element, "doMatch") {
+        let mut parts = node(element, "doMatch", 7)?;
+        let mut alternatives = node(parts.pop().expect("match alternatives"), "matchAlts", 1)?;
+        let rows = children(alternatives.pop().expect("match rows"))?;
+        let mut rebuilt = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut row = node(row, "matchAlt", 4)?;
+            let sequence = row.pop().expect("match alternative sequence");
+            let mut bound = Vec::new();
+            binder_names(&row[1], &mut bound);
+            let Some(sequence) = close(sequence, bound)? else {
+                return Ok(None);
+            };
+            row.push(sequence);
+            rebuilt.push(term("matchAlt", row));
+        }
+        parts.push(term("matchAlts", vec![null(rebuilt)]));
+        return Ok(Some(term("doMatch", parts)));
+    }
+    let mut parts = node(element, "doIf", 6)?;
+    let otherwise = parts.pop().expect("else clause");
+    let clauses = children(parts.pop().expect("else-if clauses"))?;
+    let sequence = parts.pop().expect("then sequence");
+    let mut bound = Vec::new();
+    if let Some(binder) = condition_binder(&parts[1]) {
+        binder_names(binder, &mut bound);
+    }
+    let Some(sequence) = close(sequence, bound)? else {
+        return Ok(None);
+    };
+    parts.push(sequence);
+    let mut rebuilt = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let mut clause = take(clause, Name::from_components(["group"]), Some(4))?;
+        let sequence = clause.pop().expect("else-if sequence");
+        let mut bound = Vec::new();
+        if let Some(binder) = condition_binder(&clause[1]) {
+            binder_names(binder, &mut bound);
+        }
+        let Some(sequence) = close(sequence, bound)? else {
+            return Ok(None);
+        };
+        clause.push(sequence);
+        rebuilt.push(Syntax::node(Name::from_components(["group"]), clause));
+    }
+    parts.push(null(rebuilt));
+    let mut otherwise = children(otherwise)?;
+    let otherwise = match otherwise.pop() {
+        Some(sequence) => {
+            let keyword = otherwise.pop().ok_or_else(invalid)?;
+            let Some(sequence) = close(sequence, Vec::new())? else {
+                return Ok(None);
+            };
+            vec![keyword, sequence]
+        }
+        // An absent `else` falls through to `rest`.
+        None => {
+            let mut items = rest.to_vec();
+            items.push(term("doSeqItem", vec![continue_element(), null(vec![])]));
+            vec![atom("else"), items_sequence(items, false)]
+        }
+    };
+    parts.push(null(otherwise));
+    Ok(Some(term("doIf", parts)))
+}
+
+/// The names a branch sequence binds for the statements after its end: `bound` (its condition's
+/// or pattern's names) and its top-level `let`, `have` and `←` binders. `None` for a binding form
+/// this does not read (`let … | else`, `let rec`, a pattern bind with a fallback).
+fn sequence_binders(sequence: &Syntax, mut bound: Vec<Name>) -> Option<Vec<Name>> {
+    let items = match sequence {
+        Syntax::Node { args, .. } if is(sequence, "doSeqBracketed") => args.get(1),
+        Syntax::Node { args, .. } => args.first(),
+        _ => None,
+    };
+    let Some(Syntax::Node { args: items, .. }) = items else {
+        return Some(bound);
+    };
+    for item in items {
+        let Syntax::Node { args, .. } = item else {
+            continue;
+        };
+        let Some(element) = args.first() else {
+            continue;
+        };
+        if is(element, "doLetElse") || is(element, "doLetRec") || fallback::is_binding(element) {
+            return None;
+        }
+        let Syntax::Node { args, .. } = element else {
+            continue;
+        };
+        if is(element, "doLet") || is(element, "doHave") {
+            // `letDecl`'s binder: `letIdDecl`'s `letId`, or `letPatDecl`'s pattern.
+            if let Some(Syntax::Node { args, .. }) = args.last()
+                && let Some(Syntax::Node { args, .. }) = args.first()
+                && let Some(binder) = args.first()
+            {
+                binder_names(binder, &mut bound);
+            }
+        } else if is(element, "doLetArrow")
+            && let Some(Syntax::Node { args, .. }) = args.last()
+            && let Some(binder) = args.first()
+        {
+            binder_names(binder, &mut bound);
+        }
+    }
+    Some(bound)
+}
+
+/// Every name a binder or pattern mentions, constructor names included (a superset is safe).
+fn binder_names(binder: &Syntax, out: &mut Vec<Name>) {
+    let mut pending = vec![binder];
+    while let Some(syntax) = pending.pop() {
+        match syntax {
+            Syntax::Ident { val, .. } => out.push(root_name(val)),
+            Syntax::Node { args, .. } => pending.extend(args),
+            _ => {}
+        }
+    }
+}
+
+/// The first component of every identifier in `syntax`: what `x.succ` reads is `x`.
+fn identifier_roots(syntax: &Syntax, out: &mut Vec<Name>) {
+    let mut pending = vec![syntax];
+    while let Some(syntax) = pending.pop() {
+        match syntax {
+            Syntax::Ident { val, .. } => out.push(root_name(val)),
+            Syntax::Node { args, .. } => pending.extend(args),
+            _ => {}
+        }
+    }
+}
+
+fn root_name(name: &Name) -> Name {
+    let mut name = name.clone();
+    while !name.parent().is_anonymous() {
+        name = name.parent();
+    }
+    name
+}
+
+fn continue_element() -> Syntax {
+    term("doContinue", vec![atom("continue")])
+}
+
+/// A `doSeqIndent` or `doSeqBracketed` of these `doSeqItem`s.
+fn items_sequence(items: Vec<Syntax>, bracketed: bool) -> Syntax {
+    if bracketed {
+        term("doSeqBracketed", vec![atom("{"), null(items), atom("}")])
+    } else {
+        term("doSeqIndent", vec![null(items)])
+    }
 }
 
 /// Whether a binder (a name or a pattern) mentions a `mut` variable.
@@ -419,11 +646,23 @@ impl Context {
         let count = statements.len();
         let mut muts = muts.to_vec();
         let mut elements = Vec::with_capacity(count);
-        for (index, statement) in statements.into_iter().enumerate() {
+        // The body of a loop that carries state: falling off its end is `continue`.
+        let loop_body = looped && continues && tail.is_none();
+        let mut statements = statements.into_iter();
+        let mut index = 0;
+        while let Some(statement) = statements.next() {
             self.tick()?;
             let element = sequence_element(statement)?;
             let continues = index + 1 < count || tail.is_some() || continues;
+            if loop_body
+                && let Some(closed) = close_over_rest(&element, &muts, statements.as_slice())?
+            {
+                // The statements after it now end each branch that falls through.
+                self.mutable_element(closed, &mut muts, continues, looped, &mut elements)?;
+                break;
+            }
             self.mutable_element(element, &mut muts, continues, looped, &mut elements)?;
+            index += 1;
         }
         if let Some(state) = tail {
             let state: Vec<Syntax> = state.iter().map(named).collect();

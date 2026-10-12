@@ -2,7 +2,8 @@
 //! (`#eval`). `List`'s `ForIn` instance passes `forIn'` the two-binder `fun a _ => f a`, where
 //! `forIn'` calls back with three arguments, so the callback's closure type differs from the
 //! parameter's flat one until the lambda is eta-expanded at the call. Branches that reassign and
-//! then `break` or `continue` leave the loop with the values they read. Every program here was run
+//! then `break` or `continue` leave the loop with the values they read, and one that falls through
+//! beside one that jumps continues with the statements after it. Every program here was run
 //! through the pinned `lean` v4.32.0 with the same header first (2026-10-11), printing the value
 //! asserted here, and is compared with the pinned binary's output again when it is present.
 #![forbid(unsafe_code)]
@@ -177,6 +178,78 @@ const PROGRAMS: &[(&str, &str, &str)] = &[
          #eval m [3, 1, 2, 5]\n",
         "33",
     ),
+    (
+        "reassign_or_break",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x > 2 then\n\
+         \x20     s := s + 1\n\
+         \x20   else\n\
+         \x20     break\n\
+         \x20   s := s + x\n\
+         \x20 return s\n\
+         #eval m [3, 4, 1, 5]\n",
+        "9",
+    ),
+    (
+        "match_reassign_or_break",
+        "def m (xs : List (Option Nat)) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for o in xs do\n\
+         \x20   match o with\n\
+         \x20   | some n => s := s + n\n\
+         \x20   | none => break\n\
+         \x20   s := s + 100\n\
+         \x20 return s\n\
+         #eval m [some 1, some 2, none, some 5]\n",
+        "203",
+    ),
+    (
+        "else_if_reassign_or_break",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x == 1 then\n\
+         \x20     s := s + 10\n\
+         \x20   else if x == 2 then\n\
+         \x20     break\n\
+         \x20   s := s + x\n\
+         \x20 return s\n\
+         #eval m [1, 3, 2, 5]\n",
+        "14",
+    ),
+    (
+        "break_then_later_branches",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x > 3 then\n\
+         \x20     break\n\
+         \x20   else\n\
+         \x20     s := s + 1\n\
+         \x20   if x == 2 then\n\
+         \x20     s := s + 100\n\
+         \x20   s := s + x\n\
+         \x20 return s\n\
+         #eval m [1, 2, 5]\n",
+        "105",
+    ),
+    (
+        "two_variables_reassign_or_break",
+        "def m (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 let mut c := 0\n\
+         \x20 for x in xs do\n\
+         \x20   if x % 2 == 0 then\n\
+         \x20     c := c + 1\n\
+         \x20   else if x > 6 then\n\
+         \x20     break\n\
+         \x20   s := s + x\n\
+         \x20 return s * 100 + c\n\
+         #eval m [2, 3, 4, 7, 8]\n",
+        "902",
+    ),
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -228,6 +301,36 @@ fn run(binary: &Path, lib: &Path, root: &Path, entry: &Path) -> (i32, String, St
         String::from_utf8_lossy(&output.stdout).trim().to_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// A branch whose pattern binds `n`, before statements that read an outer `n`: copying those
+/// statements into the branch would capture it. The pin prints `11`; this engine refuses it rather
+/// than print the captured value.
+#[test]
+fn a_branch_binder_never_captures_the_statements_after_it() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("capture.lean");
+    std::fs::write(
+        &entry,
+        format!(
+            "{HEADER}{}",
+            "def m (xs : List (Option Nat)) (n : Nat) : Nat := Id.run do\n\
+         \x20 let mut s := 0\n\
+         \x20 for o in xs do\n\
+         \x20   match o with\n\
+         \x20   | some n => s := s + n\n\
+         \x20   | none => break\n\
+         \x20   s := s + n\n\
+         \x20 return s\n\
+         #eval m [some 1, none] 10\n"
+        ),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(Path::new(env!("CARGO_BIN_EXE_lean")), &lib, &root, &entry);
+    assert!(code != 0 || stdout == "11", "printed {stdout}: {stderr}");
 }
 
 #[test]
