@@ -976,7 +976,7 @@ jobs:
 
   imported-structure-metadata:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): check imported records with bounded journal byte views'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate native imported record activation'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -988,11 +988,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '21723bec3dda825659819a45dd07e3b99e2492ab'
+      CANDIDATE_SHA: '41a39cf7b231ec88339d3478f4dde171e0549cb0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '21723bec3dda825659819a45dd07e3b99e2492ab'
+          ref: '41a39cf7b231ec88339d3478f4dde171e0549cb0'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -1087,7 +1087,7 @@ jobs:
 
   imported-record-elaboration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): check imported records with bounded journal byte views'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate native imported record activation'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -1099,11 +1099,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '21723bec3dda825659819a45dd07e3b99e2492ab'
+      CANDIDATE_SHA: '41a39cf7b231ec88339d3478f4dde171e0549cb0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '21723bec3dda825659819a45dd07e3b99e2492ab'
+          ref: '41a39cf7b231ec88339d3478f4dde171e0549cb0'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
