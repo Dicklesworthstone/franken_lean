@@ -1,4 +1,4 @@
-//! Explicit Nat measures use the pinned, kernel-checked `WellFounded.Nat.fix`
+//! Explicit and inferred Nat measures use the kernel-checked `WellFounded.Nat.fix`
 //! on the native VM. Proofs run in the source branch's local context and every
 //! surviving recursive obligation must be discharged.
 #![forbid(unsafe_code)]
@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 #[path = "support/well_founded_arguments.rs"]
 mod well_founded_arguments;
+#[path = "support/well_founded_inference.rs"]
+mod well_founded_inference;
 #[path = "support/well_founded_matches.rs"]
 mod well_founded_matches;
 #[path = "support/well_founded_opacity.rs"]
@@ -44,8 +46,12 @@ fn pinned_lib() -> Option<PathBuf> {
 }
 
 fn import_closure(lib: &Path) -> Engine {
-    let root = n("Init.WFTactics");
-    let mut pending = vec![root.clone()];
+    import_closure_for(lib, &["Init.WFTactics"])
+}
+
+fn import_closure_for(lib: &Path, modules: &[&str]) -> Engine {
+    let roots: Vec<_> = modules.iter().map(|module| n(module)).collect();
+    let mut pending = roots.clone();
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
     let mut parts = Vec::new();
@@ -84,7 +90,7 @@ fn import_closure(lib: &Path) -> Engine {
         .build_empty()
         .import_olean_modules_for_source(
             &inputs,
-            &[root],
+            &roots,
             &KVMap::new(),
             SourceOleanImportLimits::new(OleanCheckLimits::new(256 * 1024 * 1024, limits().kernel)),
         )
@@ -288,11 +294,10 @@ fn assert_decreasing_refusals(base: &Engine) {
     .expect("ordinary source checking completes");
 }
 
-fn assert_explicit_scope_limits(base: &Engine) {
+fn assert_remaining_scope_limits(base: &Engine) {
     for source in [
-        // This slice does not claim measure search or automatic proof synthesis.
-        "def absentMeasure (n : Nat) : Nat := if h : 0 < n then absentMeasure 0 else 0\ndecreasing_by exact h",
-        "def absentProof (n : Nat) : Nat := if h : 0 < n then absentProof 0 else 0\ntermination_by n",
+        // This slice retains a Nat-valued measure, not an arbitrary relation.
+        "def pairMeasure (a b : Nat) : Nat := if h : 0 < a then pairMeasure 0 (b + 1) else 0\ntermination_by (a, b)\ndecreasing_by exact h",
         // Declaration metadata is attached only by the supported actual-def path.
         "abbrev otherKind (n : Nat) : Nat := if h : 0 < n then otherKind 0 else 0\ntermination_by n\ndecreasing_by exact h",
     ] {
@@ -320,7 +325,7 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
             let base = import_closure(&lib);
             assert_computations(&base);
             assert_decreasing_refusals(&base);
-            assert_explicit_scope_limits(&base);
+            assert_remaining_scope_limits(&base);
             well_founded_matches::assert_match_programs(&base);
             well_founded_arguments::assert_argument_programs(&base);
             well_founded_opacity::assert_source_opacity_routes(&base);
@@ -328,4 +333,22 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
         .expect("spawn native checking thread")
         .join()
         .expect("native well-founded checks finish");
+}
+
+#[test]
+fn native_automatic_well_founded_termination() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = import_closure_for(&lib, &["Init.WFTactics", "Init.Omega"]);
+            well_founded_inference::assert_automatic_termination(&base);
+            well_founded_inference::assert_search_stops(&base);
+        })
+        .expect("spawn native inference checking thread")
+        .join()
+        .expect("native well-founded inference checks finish");
 }

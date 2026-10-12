@@ -35,9 +35,11 @@ pub enum RecursionError {
     ChangedIndex,
     PartialApplication,
     WellFoundedMeasureRequired,
+    WellFoundedRelationUnsupported,
+    WellFoundedMeasureOrderUnsupported,
     WellFoundedArgumentRequired,
     FixedArgumentConversionUnsupported,
-    DecreasingProofRequired,
+    WellFoundedMeasureSearchFailed,
     RecursionInDecreasingProof,
     StructuralMeasureNotParameter,
     StructuralParameterNotInductive,
@@ -72,7 +74,13 @@ impl std::fmt::Display for RecursionError {
                 "recursive function escapes without its decreasing argument"
             }
             Self::WellFoundedMeasureRequired => {
-                "well-founded recursion requires an explicit Nat-valued termination_by measure"
+                "well-founded measure inference found no supported Nat-valued parameter; provide an explicit Nat-valued termination_by measure"
+            }
+            Self::WellFoundedRelationUnsupported => {
+                "Nat-valued termination measures require the active WellFoundedRelation Nat instance to use Nat.lt"
+            }
+            Self::WellFoundedMeasureOrderUnsupported => {
+                "well-founded inference cannot skip earlier SizeOf or lexicographic measures; provide an explicit Nat-valued termination_by measure"
             }
             Self::WellFoundedArgumentRequired => {
                 "well-founded recursion requires at least one varying argument"
@@ -80,8 +88,8 @@ impl std::fmt::Display for RecursionError {
             Self::FixedArgumentConversionUnsupported => {
                 "well-founded fixed-argument analysis does not yet support this proof-dependent conversion"
             }
-            Self::DecreasingProofRequired => {
-                "well-founded recursion requires an explicit decreasing_by proof"
+            Self::WellFoundedMeasureSearchFailed => {
+                "could not find a Nat parameter decreasing on every recursive call; provide termination_by or decreasing_by"
             }
             Self::RecursionInDecreasingProof => {
                 "a decreasing_by proof cannot call the recursive function"
@@ -110,6 +118,8 @@ pub(super) struct StructuralHint<'a> {
 
 pub(super) enum TerminationHint<'a> {
     Structural(StructuralHint<'a>),
+    /// Only safe definitions enter the structural-then-well-founded fallback.
+    Automatic,
     WellFounded {
         hint: well_founded::Hint<'a>,
         allowed: bool,
@@ -126,7 +136,11 @@ pub(super) fn termination_hint(
             allowed: well_founded_allowed,
         }));
     }
-    structural_hint(syntax).map(|hint| hint.map(TerminationHint::Structural))
+    Ok(match structural_hint(syntax)? {
+        Some(hint) => Some(TerminationHint::Structural(hint)),
+        None if well_founded_allowed => Some(TerminationHint::Automatic),
+        None => None,
+    })
 }
 
 /// The binder of a structural definition's original-body obligation (`recursion/obligation.rs`):
@@ -609,6 +623,57 @@ impl Context {
                     return Err(NatDefinitionElabError::UnexpectedSyntax {
                         expected: "well-founded recursion in a safe def declaration",
                     });
+                }
+                Some(TerminationHint::Automatic) => {
+                    // The pin tries structural recursion first when neither
+                    // hint was supplied. A rollback retains all consumed work;
+                    // unrelated body errors and resource stops do not select
+                    // the well-founded fallback.
+                    let structural = self.clone();
+                    match self.structural_definition_body(
+                        name,
+                        &parameters,
+                        body,
+                        expected.clone(),
+                        None,
+                    ) {
+                        Ok(value) => value,
+                        Err(
+                            problem @ NatDefinitionElabError::Inference(
+                                SourceInferenceError::Recursion(
+                                    RecursionError::NotDecreasing
+                                    | RecursionError::ChangedParameter
+                                    | RecursionError::ChangedIndex
+                                    | RecursionError::RootMatchRequired
+                                    | RecursionError::ExplicitParameterRequired
+                                    | RecursionError::PartialApplication,
+                                ),
+                            ),
+                        ) => {
+                            let spent = self.txn.budget.heartbeats_consumed;
+                            *self = structural;
+                            self.txn.budget.heartbeats_consumed = spent;
+                            // An environment without the imported fixpoint
+                            // cannot attempt this lowering. Keep the original
+                            // structural diagnostic in bounded source seeds.
+                            if !self.txn.env.contains(&Name::from_components([
+                                "WellFounded",
+                                "Nat",
+                                "fix",
+                            ])) {
+                                return Err(problem);
+                            }
+                            self.well_founded_body(
+                                name,
+                                &parameters,
+                                body,
+                                expected,
+                                &well_founded::Hint::automatic(),
+                                header_parameters,
+                            )?
+                        }
+                        Err(problem) => return Err(problem),
+                    }
                 }
                 _ => {
                     let selected = match hint {

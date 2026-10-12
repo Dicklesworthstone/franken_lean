@@ -3,9 +3,12 @@
 //! explicit proof obligation; the source tactic engine must solve every one.
 //!
 //! Varying parameters use `Meta.ArgsPacker`'s dependent PSigma encoding.
-//! Fixed arguments are captured at their actual telescope positions. Mutual
-//! groups, automatic measure search, and non-Nat well-founded relations remain
-//! separate elaboration work.
+//! Fixed arguments are captured at their actual telescope positions. Missing
+//! measures try Nat parameters in the pin's telescope order, with active
+//! SizeOf and well-founded instances checked. Missing proofs use native
+//! simplification, assumptions and omega. Mutual groups, arbitrary
+//! SizeOf/lexicographic search and non-Nat relations remain separate
+//! elaboration work.
 mod packing;
 
 use super::*;
@@ -16,6 +19,19 @@ pub(in crate::source) struct Hint<'a> {
     aliases: Vec<Option<Name>>,
     measure: Option<&'a Syntax>,
     decreasing: Option<&'a Syntax>,
+    /// Retain the original local identity, including inaccessible lambda names.
+    inferred: Option<usize>,
+}
+
+impl Hint<'_> {
+    pub(super) fn automatic() -> Self {
+        Self {
+            aliases: Vec::new(),
+            measure: None,
+            decreasing: None,
+            inferred: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -51,6 +67,15 @@ struct Obligation {
 enum Attempt {
     Complete(Typed),
     Repack(Vec<usize>),
+    /// Inference has already selected this measure. A final aggregate proof
+    /// failure cannot authorize guessing a later measure.
+    SelectedFailure(NatDefinitionElabError),
+}
+
+enum MeasureProbe {
+    Strict,
+    Unusable(NatDefinitionElabError),
+    Lexicographic,
 }
 
 #[derive(Clone)]
@@ -96,6 +121,7 @@ pub(in crate::source) fn hint(syntax: &Syntax) -> Result<Option<Hint<'_>>, NatDe
                 aliases: Vec::new(),
                 measure: None,
                 decreasing: Some(decreasing),
+                inferred: None,
             }));
         }
         [clause] => clause,
@@ -146,7 +172,73 @@ pub(in crate::source) fn hint(syntax: &Syntax) -> Result<Option<Hint<'_>>, NatDe
         aliases,
         measure: Some(&clause[3]),
         decreasing,
+        inferred: None,
     }))
+}
+
+/// The Nat fragment of the pin's decreasing_tactic after the checked
+/// continuation has exposed InvImage and its measure. This is native syntax
+/// expansion; no Reference metaprogram implementation is executed.
+fn automatic_decreasing_proof() -> Syntax {
+    fn null(args: Vec<Syntax>) -> Syntax {
+        Syntax::node(Name::from_components(["null"]), args)
+    }
+    fn atom(value: &str) -> Syntax {
+        Syntax::atom(fln_syntax::source::SourceInfo::None, value)
+    }
+    fn sequence(tactics: Vec<Syntax>) -> Syntax {
+        let mut rows = Vec::new();
+        for tactic in tactics {
+            if !rows.is_empty() {
+                rows.push(null(Vec::new()));
+            }
+            rows.push(tactic);
+        }
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticSeq"]),
+            vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                vec![null(rows)],
+            )],
+        )
+    }
+    let simp = Syntax::node(
+        parser_kind(&["Tactic", "simp"]),
+        vec![
+            atom("simp"),
+            null(Vec::new()),
+            null(Vec::new()),
+            null(Vec::new()),
+            null(Vec::new()),
+            null(Vec::new()),
+        ],
+    );
+    let alternatives = ["done", "assumption", "omega"]
+        .into_iter()
+        .map(|name| {
+            let mut args = vec![atom(name)];
+            if name == "omega" {
+                args.push(null(Vec::new()));
+            }
+            Syntax::node(
+                Name::from_components(["group"]),
+                vec![
+                    atom("|"),
+                    sequence(vec![Syntax::node(parser_kind(&["Tactic", name]), args)]),
+                ],
+            )
+        })
+        .collect();
+    sequence(vec![
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticTry_"]),
+            vec![atom("try"), sequence(vec![simp])],
+        ),
+        Syntax::node(
+            parser_kind(&["Tactic", "first"]),
+            vec![atom("first"), null(alternatives)],
+        ),
+    ])
 }
 
 impl Context {
@@ -241,6 +333,12 @@ impl Context {
         parameters: &[LocalDecl],
         header_parameters: usize,
     ) -> Result<Expr, NatDefinitionElabError> {
+        if let Some(index) = hint.inferred {
+            return parameters
+                .get(index)
+                .map(|parameter| Expr::fvar(parameter.id.clone()))
+                .ok_or_else(|| failure(SourceInferenceError::Scope));
+        }
         let syntax = hint
             .measure
             .ok_or_else(|| error(RecursionError::WellFoundedMeasureRequired))?;
@@ -292,6 +390,167 @@ impl Context {
         hint: &Hint<'_>,
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // WF.Rel.elabWFRel synthesizes this dictionary even for an explicit
+        // Nat measure. Nat.fix can only represent the usual Nat relation.
+        if !self.native_nat_well_founded_relation()? {
+            return Err(error(RecursionError::WellFoundedRelationUnsupported));
+        }
+        if hint.measure.is_some() {
+            return match self.well_founded_selected_body(
+                name,
+                parameters,
+                syntax,
+                expected,
+                hint,
+                header_parameters,
+            )? {
+                Attempt::Complete(value) => Ok(value),
+                Attempt::SelectedFailure(problem) => Err(problem),
+                Attempt::Repack(_) => Err(failure(SourceInferenceError::Scope)),
+            };
+        }
+        // GuessLex walks the varying parameter telescope in order. This slice
+        // supports direct Nat measures; fixed positions are discarded after
+        // typed call analysis, before any decreasing proof is attempted.
+        let mut candidates = Vec::new();
+        for (index, parameter) in parameters.iter().enumerate() {
+            self.tick()?;
+            let type_ = self.reduce_source_head(
+                &parameter.type_,
+                UnificationTransparency::Abbreviations,
+                true,
+            )?;
+            if matches!(type_.node(), ExprNode::Const { name, levels }
+                if name == &Name::from_components(["Nat"]) && levels.is_empty())
+                && self.native_nat_size_measure(parameter)?
+            {
+                candidates.push(index);
+            }
+        }
+        if candidates.is_empty() {
+            return Err(error(RecursionError::WellFoundedMeasureRequired));
+        }
+        let snapshot = self.clone();
+        let mut first_error = None;
+        for index in candidates {
+            self.tick()?;
+            let selected = Hint {
+                aliases: Vec::new(),
+                measure: None,
+                decreasing: hint.decreasing,
+                inferred: Some(index),
+            };
+            let result = self.well_founded_selected_body(
+                name,
+                parameters,
+                syntax,
+                expected.clone(),
+                &selected,
+                header_parameters,
+            );
+            let problem = match result {
+                Ok(Attempt::Complete(value)) => return Ok(value),
+                Ok(Attempt::SelectedFailure(problem)) => return Err(problem),
+                Ok(Attempt::Repack(_)) => return Err(failure(SourceInferenceError::Scope)),
+                Err(problem) => problem,
+            };
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = snapshot.clone();
+            self.txn.budget.heartbeats_consumed = spent;
+            if !tactics::backtrack::recoverable(&problem) {
+                return Err(problem);
+            }
+            if !matches!(
+                &problem,
+                NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                    RecursionError::WellFoundedMeasureSearchFailed
+                ))
+            ) {
+                first_error.get_or_insert(problem);
+            }
+        }
+        Err(first_error.unwrap_or_else(|| error(RecursionError::WellFoundedMeasureSearchFailed)))
+    }
+
+    /// Ordinary scoped instance search honors local dictionaries and user
+    /// instances. These probes retain consumed work but publish no assignments.
+    fn native_nat_well_founded_relation(&mut self) -> Result<bool, NatDefinitionElabError> {
+        let mut trial = self.clone();
+        let result = (|| {
+            let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+            let target = Expr::app(
+                Expr::const_(
+                    Name::from_components(["WellFoundedRelation"]),
+                    vec![Level::one()],
+                ),
+                nat.clone(),
+            );
+            let Some(dictionary) = trial.coercion_instance(target)? else {
+                return Ok(false);
+            };
+            let mut actual = Expr::proj(
+                Name::from_components(["WellFoundedRelation"]),
+                0,
+                dictionary,
+            );
+            let mut expected = Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new());
+            for _ in 0..2 {
+                trial.tick()?;
+                let id = FVarId(trial.fresh_name()?);
+                trial.txn.lctx.add_param(
+                    id.clone(),
+                    Name::anonymous(),
+                    nat.clone(),
+                    BinderInfo::Default,
+                );
+                let argument = Expr::fvar(id);
+                actual = Expr::app(actual, argument.clone());
+                expected = Expr::app(expected, argument);
+            }
+            let actual =
+                trial.reduce_source_head(&actual, UnificationTransparency::Default, true)?;
+            let expected =
+                trial.reduce_source_head(&expected, UnificationTransparency::Default, true)?;
+            trial.well_founded_default_conversion(&actual, &expected)
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        result
+    }
+
+    fn native_nat_size_measure(
+        &mut self,
+        parameter: &LocalDecl,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut trial = self.clone();
+        let result = (|| {
+            let target = Expr::app(
+                Expr::const_(Name::from_components(["SizeOf"]), vec![Level::one()]),
+                Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+            );
+            let Some(dictionary) = trial.coercion_instance(target)? else {
+                return Ok(false);
+            };
+            let parameter = Expr::fvar(parameter.id.clone());
+            let size = Expr::app(
+                Expr::proj(Name::from_components(["SizeOf"]), 0, dictionary),
+                parameter.clone(),
+            );
+            let size = trial.reduce_source_head(&size, UnificationTransparency::Default, true)?;
+            trial.well_founded_default_conversion(&size, &parameter)
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        result
+    }
+
+    fn well_founded_selected_body(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        syntax: &Syntax,
+        expected: Option<Expr>,
+        hint: &Hint<'_>,
+        header_parameters: usize,
+    ) -> Result<Attempt, NatDefinitionElabError> {
         let snapshot = self.clone();
         let mut varying: Vec<_> = (0..parameters.len()).collect();
         loop {
@@ -304,7 +563,7 @@ impl Context {
                 header_parameters,
             )?;
             match result {
-                Attempt::Complete(value) => return Ok(value),
+                result @ (Attempt::Complete(_) | Attempt::SelectedFailure(_)) => return Ok(result),
                 Attempt::Repack(next) => {
                     // A typed call analysis can only remove fixed positions.
                     // Retry from the complete checkpoint without refunding
@@ -340,9 +599,6 @@ impl Context {
             .iter()
             .map(|index| parameters[*index].clone())
             .collect();
-        let proof = hint
-            .decreasing
-            .ok_or_else(|| error(RecursionError::DecreasingProofRequired))?;
         if self.well_founded.is_some() {
             return Err(error(RecursionError::WellFoundedArgumentRequired));
         }
@@ -482,15 +738,81 @@ impl Context {
             if actual_varying != varying {
                 return Ok(Attempt::Repack(actual_varying));
             }
+            if let Some(index) = hint.inferred {
+                if !varying.contains(&index) {
+                    return Err(error(RecursionError::WellFoundedMeasureSearchFailed));
+                }
+                if hint.decreasing.is_some() {
+                    // A supplied script can behave differently during single
+                    // call inference and its final aggregate run. Do not skip
+                    // an earlier unsupported SizeOf candidate which the pin
+                    // might select before this Nat measure.
+                    for &prior in varying.iter().filter(|prior| **prior < index) {
+                        self.tick()?;
+                        let type_ = self.reduce_source_head(
+                            &parameters[prior].type_,
+                            UnificationTransparency::Abbreviations,
+                            true,
+                        )?;
+                        if !matches!(type_.node(), ExprNode::Const { name, levels }
+                            if name == &Name::from_components(["Nat"]) && levels.is_empty())
+                        {
+                            return Ok(Attempt::SelectedFailure(error(
+                                RecursionError::WellFoundedMeasureOrderUnsupported,
+                            )));
+                        }
+                    }
+                }
+            }
             if !obligations.is_empty() {
                 self.well_founded
                     .as_mut()
                     .expect("active well-founded proof")
                     .proving = true;
-                let prepared = self.lower_pattern_matrices(proof)?;
                 let goals = self.prepare_decreasing_goals(&obligations)?;
-                let state = self.start_decreasing_proof(&prepared, goals)?;
-                self.run_decreasing_proof(&prepared, state)?;
+                let automatic;
+                let proof = match hint.decreasing {
+                    Some(proof) => proof,
+                    None => {
+                        automatic = automatic_decreasing_proof();
+                        &automatic
+                    }
+                };
+                let prepared = self.lower_pattern_matrices(proof)?;
+                if hint.inferred.is_some()
+                    && !self.single_direct_measure(parameters, varying, &obligations)?
+                {
+                    match self.check_inferred_measure(&prepared, &goals)? {
+                        MeasureProbe::Strict => {}
+                        MeasureProbe::Unusable(problem) => return Err(problem),
+                        MeasureProbe::Lexicographic => {
+                            return Ok(Attempt::SelectedFailure(error(
+                                RecursionError::WellFoundedMeasureOrderUnsupported,
+                            )));
+                        }
+                    }
+                }
+                let proof_result = (|| {
+                    // Final cleanup has already inspected the raw InvImage.
+                    // Only now expose the Nat operands and local let values.
+                    let goals = self.normalize_decreasing_goals(goals)?;
+                    if hint.decreasing.is_some() {
+                        // The user's final script sees all obligations in the
+                        // original order, after inference has selected a measure.
+                        let state = self.start_decreasing_proof(&prepared, goals)?;
+                        self.run_decreasing_proof(&prepared, state)?;
+                    } else {
+                        for goal in goals {
+                            self.tick()?;
+                            let state = self.start_decreasing_proof(&prepared, vec![goal])?;
+                            self.run_decreasing_proof(&prepared, state)?;
+                        }
+                    }
+                    Ok::<_, NatDefinitionElabError>(())
+                })();
+                if let Err(problem) = proof_result {
+                    return Ok(Attempt::SelectedFailure(problem));
+                }
                 for obligation in obligations {
                     self.tick()?;
                     let proof = self.instantiate(&Expr::mvar(obligation.goal.id))?;
@@ -531,6 +853,399 @@ impl Context {
             self.well_founded_definition = true;
         }
         result
+    }
+
+    /// GuessLex's singleton shortcut counts every SizeOf and complex measure.
+    /// Prove that precondition only for one varying Nat, with positive Nat
+    /// comparisons whose left sides are fixed and right sides are parameters.
+    /// Other contexts conservatively require per-call inference. Inspect the
+    /// original call contexts: cleanup may discard a fixed-parameter comparison
+    /// that still contributes a complex measure to the pin's candidate set.
+    fn single_direct_measure(
+        &mut self,
+        parameters: &[LocalDecl],
+        varying: &[usize],
+        obligations: &[Obligation],
+    ) -> Result<bool, NatDefinitionElabError> {
+        if varying.len() != 1 {
+            return Ok(false);
+        }
+        let original: HashSet<_> = parameters
+            .iter()
+            .map(|parameter| parameter.id.clone())
+            .collect();
+        let varying = &parameters[varying[0]].id;
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            for obligation in obligations {
+                let goal = &obligation.goal;
+                self.txn.lctx = goal.lctx.clone();
+                for local in goal.lctx.decls() {
+                    self.tick()?;
+                    let Some(sort) = self.known_type(&local.type_)? else {
+                        return Ok(false);
+                    };
+                    let sort = self.whnf(&sort)?;
+                    if !matches!(sort.node(), ExprNode::Sort { level } if level == &Level::zero()) {
+                        continue;
+                    }
+                    let type_ = self.instantiate(&local.type_)?;
+                    let (head, arguments) = operators::spine(&type_);
+                    let ExprNode::Const { name, .. } = head.node() else {
+                        return Ok(false);
+                    };
+                    let (left, right) = if (name == &Name::from_components(["Nat", "lt"])
+                        || name == &Name::from_components(["Nat", "le"]))
+                        && arguments.len() == 2
+                    {
+                        (&arguments[0], &arguments[1])
+                    } else if (name == &Name::from_components(["LT", "lt"])
+                        || name == &Name::from_components(["LE", "le"]))
+                        && arguments.len() == 4
+                    {
+                        let domain = self.reduce_source_head(
+                            &arguments[0],
+                            UnificationTransparency::Abbreviations,
+                            true,
+                        )?;
+                        if !matches!(domain.node(), ExprNode::Const { name, levels }
+                            if name == &Name::from_components(["Nat"]) && levels.is_empty())
+                        {
+                            return Ok(false);
+                        }
+                        (&arguments[2], &arguments[3])
+                    } else {
+                        return Ok(false);
+                    };
+                    let ExprNode::FVar { id } = right.node() else {
+                        return Ok(false);
+                    };
+                    let reads = self.elimination_reads(left)?;
+                    if !original.contains(id)
+                        || reads.contains(varying)
+                        || !reads.is_subset(&original)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })();
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// The pin tries equality, then the supplied/default proof for < and <=.
+    /// A candidate with some strict and some weak calls is an earlier viable
+    /// lexicographic prefix. Do not silently skip it for a later Nat measure.
+    fn check_inferred_measure(
+        &mut self,
+        proof: &Syntax,
+        goals: &[tactics::ProofGoal],
+    ) -> Result<MeasureProbe, NatDefinitionElabError> {
+        let mut strict = 0usize;
+        for goal in goals {
+            self.tick()?;
+            let mut trial = self.clone();
+            trial.txn.lctx = goal.lctx.clone();
+            // BasicMeasure.beta has already removed the argument pack before
+            // the pin creates this comparison. Keep user let identities until
+            // cleanup, but remove our equivalent beta/iota/projection redexes.
+            let target = trial.reduce_decreasing_comparison(&goal.target, false);
+            self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            let target = target?;
+            let (head, arguments) = operators::spine(&target);
+            if !matches!(head.node(), ExprNode::Const { name, .. }
+                if name == &Name::from_components(["Nat", "lt"]))
+                || arguments.len() != 2
+            {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            let equal = trial.well_founded_default_conversion(&arguments[0], &arguments[1]);
+            self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            if equal? {
+                continue;
+            }
+            let problem = match self.probe_inferred_goal(proof, goal, target) {
+                Ok(()) => {
+                    strict += 1;
+                    continue;
+                }
+                Err(problem) if !tactics::backtrack::recoverable(&problem) => return Err(problem),
+                Err(problem) => problem,
+            };
+            let le = Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["Nat", "le"]), Vec::new()),
+                    arguments[0].clone(),
+                ),
+                arguments[1].clone(),
+            );
+            match self.probe_inferred_goal(proof, goal, le) {
+                Ok(()) => {}
+                Err(stopped) if !tactics::backtrack::recoverable(&stopped) => return Err(stopped),
+                Err(_) => return Ok(MeasureProbe::Unusable(problem)),
+            }
+        }
+        if strict == goals.len() {
+            Ok(MeasureProbe::Strict)
+        } else if strict > 0 {
+            Ok(MeasureProbe::Lexicographic)
+        } else {
+            Ok(MeasureProbe::Unusable(error(
+                RecursionError::WellFoundedMeasureSearchFailed,
+            )))
+        }
+    }
+
+    /// GuessLex cleans a direct Nat comparison, not the later packed InvImage.
+    /// Fresh goals prevent a <= probe from retyping the existing < metavariable.
+    /// Every probe restores all semantic state while retaining spent work.
+    fn probe_inferred_goal(
+        &mut self,
+        proof: &Syntax,
+        goal: &tactics::ProofGoal,
+        target: Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let snapshot = self.clone();
+        let result = (|| {
+            let locals = self.clean_decreasing_context(&goal.lctx, &target)?;
+            self.txn.lctx = locals.clone();
+            let target = self.reduce_decreasing_comparison(&target, true)?;
+            let name = self.fresh_name()?;
+            let id = MVarId(name.clone());
+            self.txn.mvars.declare(
+                id.clone(),
+                name,
+                target.clone(),
+                locals.clone(),
+                MetavarKind::SyntheticOpaque,
+                0,
+                None,
+            );
+            let fresh = tactics::ProofGoal {
+                id,
+                target,
+                lctx: locals,
+                introduced: Vec::new(),
+            };
+            let state = self.start_decreasing_proof(proof, vec![fresh])?;
+            self.run_decreasing_proof(proof, state).map(|_| ())
+        })();
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        result
+    }
+
+    /// Expose the checked argument-pack redexes without unfolding ordinary
+    /// arithmetic definitions. Inference retains local let identities until
+    /// cleanup; the subsequent clean_wf stage can unfold their head values.
+    fn reduce_decreasing_comparison(
+        &mut self,
+        target: &Expr,
+        zeta_delta: bool,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let (head, arguments) = operators::spine(target);
+        if !matches!(head.node(), ExprNode::Const { name, .. }
+            if name == &Name::from_components(["Nat", "lt"])
+                || name == &Name::from_components(["Nat", "le"]))
+            || arguments.len() != 2
+        {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let smaller = self.reduce_decreasing_operand(&arguments[0], zeta_delta)?;
+        let current = self.reduce_decreasing_operand(&arguments[1], zeta_delta)?;
+        Ok(Expr::app(Expr::app(head, smaller), current))
+    }
+
+    fn reduce_decreasing_operand(
+        &mut self,
+        operand: &Expr,
+        clean: bool,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut value = self.reduce_source_head(operand, UnificationTransparency::None, clean)?;
+        // The pin's simp-based clean_wf reduces ordinary structure projections
+        // only when their receiver exposes a constructor. This comes after
+        // cleanup: inference's beta reduction must retain source dependencies.
+        if clean {
+            while let Some(field) = self.clean_decreasing_projection(&value)? {
+                value = self.reduce_source_head(&field, UnificationTransparency::None, true)?;
+            }
+        }
+        Ok(value)
+    }
+
+    /// A generated, reducible non-class field on an actual constructor. Keep
+    /// stuck projections in their original spelling, so e.g. Prod.fst p remains
+    /// the same arithmetic atom in the goal and an existing hypothesis.
+    fn clean_decreasing_projection(
+        &mut self,
+        value: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.tick()?;
+        let (head, arguments) = operators::spine(value);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(name).cloned() else {
+            return Ok(None);
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params.len() != levels.len()
+        {
+            return Ok(None);
+        }
+        let reducible = crate::reducibility::table(&self.txn.env)
+            .map_err(|problem| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Reducibility(problem),
+                )))
+            })?
+            .get(name)
+            .map_or(definition.hints == ReducibilityHints::Abbrev, |status| {
+                status == crate::reducibility::Reducibility::Reducible
+            });
+        if !reducible {
+            return Ok(None);
+        }
+        let mut body = &definition.value;
+        let mut binders = 0usize;
+        let mut receiver = BinderInfo::Default;
+        while let ExprNode::Lam {
+            body: next,
+            binder_info,
+            ..
+        } = body.node()
+        {
+            self.tick()?;
+            binders = binders
+                .checked_add(1)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+            receiver = *binder_info;
+            body = next;
+        }
+        let ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } = body.node()
+        else {
+            return Ok(None);
+        };
+        if receiver != BinderInfo::Default || !matches!(expr.node(), ExprNode::BVar { idx: 0 }) {
+            return Ok(None);
+        }
+        let env = self.txn.env.clone();
+        let Some(ConstantInfo::Induct(family)) = env.find(struct_name) else {
+            return Ok(None);
+        };
+        let Ok(parameters) = usize::try_from(family.num_params) else {
+            return Ok(None);
+        };
+        if family.is_unsafe
+            || family.num_indices != 0
+            || family.ctors.len() != 1
+            || parameters.checked_add(1) != Some(binders)
+            || arguments.len() < binders
+            || definition.base.level_params != family.base.level_params
+        {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Ctor(constructor)) = env.find(&family.ctors[0]) else {
+            return Ok(None);
+        };
+        if constructor.is_unsafe
+            || &constructor.induct != struct_name
+            || constructor.num_params != family.num_params
+            || constructor.base.level_params != family.base.level_params
+            || *idx >= u64::from(constructor.num_fields)
+        {
+            return Ok(None);
+        }
+        let mut field_type = &constructor.base.type_;
+        for _ in 0..u64::from(family.num_params) + *idx {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = field_type.node() else {
+                return Ok(None);
+            };
+            field_type = body;
+        }
+        let ExprNode::ForallE { binder_name, .. } = field_type.node() else {
+            return Ok(None);
+        };
+        if definition.base.name != struct_name.append_core(binder_name) {
+            return Ok(None);
+        }
+        let receiver =
+            self.reduce_source_head(&arguments[parameters], UnificationTransparency::None, true)?;
+        let (constructor, mut fields) = operators::spine(&receiver);
+        fields.reverse();
+        let Some(mut field) =
+            crate::records::constructor_field(&env, struct_name, *idx, &constructor, &fields)
+        else {
+            return Ok(None);
+        };
+        for argument in arguments.into_iter().skip(binders) {
+            self.tick()?;
+            field = Expr::app(field, argument);
+        }
+        Ok(Some(field))
+    }
+
+    /// Final goals retain the context selected from raw InvImage dependencies.
+    /// Normalization changes only the displayed comparison; assignment checks
+    /// and final admission still validate the original obligation and captures.
+    fn normalize_decreasing_goals(
+        &mut self,
+        mut goals: Vec<tactics::ProofGoal>,
+    ) -> Result<Vec<tactics::ProofGoal>, NatDefinitionElabError> {
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            for goal in &mut goals {
+                self.tick()?;
+                self.txn.lctx = goal.lctx.clone();
+                goal.target = self.reduce_decreasing_comparison(&goal.target, true)?;
+            }
+            Ok(goals)
+        })();
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// GuessLex compares instances and tries reflexivity at default transparency.
+    /// A conversion failure is a negative answer; internal/resource stops are not.
+    fn well_founded_default_conversion(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.flush(false)?;
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.transparency = UnificationTransparency::Default;
+        match self.txn.unify(left, right, budget) {
+            Ok(report) => {
+                assert!(report.awakened.is_empty(), "private source queue");
+                Ok(true)
+            }
+            Err(UnificationError::Deferred(reason))
+                if !matches!(
+                    reason,
+                    crate::constraint::unify::UnificationDeferred::InvalidLocalContext
+                        | crate::constraint::unify::UnificationDeferred::UnknownMetavariable(_)
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(UnificationError::AssignmentCheck { outcome, .. })
+                if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })) =>
+            {
+                Ok(false)
+            }
+            Err(problem) => Err(failure(SourceInferenceError::Unification(Box::new(
+                problem,
+            )))),
+        }
     }
 
     fn fixed_argument_conversion(
