@@ -500,9 +500,9 @@ jobs:
 
   array-iteration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate mutable loop returns and imported Array execution'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate complete imported Array execution'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
@@ -512,11 +512,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '85912fee213d168817011fbc738db8ba30b284b5'
+      CANDIDATE_SHA: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '85912fee213d168817011fbc738db8ba30b284b5'
+          ref: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -554,12 +554,42 @@ jobs:
             crates/fln/tests/source_imported_arrays/execution.rs
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln-elab/src/source/do_notation/mutation.rs
-            crates/fln-elab/src/source/do_notation/loop_returns.rs
-            crates/fln-elab/src/source/do_notation/control.rs
-            crates/fln-elab/src/source/do_notation/returns.rs
-            crates/fln-elab/src/source/do_notation.rs
-            crates/fln-elab/src/source/do_notation/for_loop.rs
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.rs
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            scripts/extract/gen_source_extension_contract.py
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.lean
+            crates/fln/tests/source_imported_structure_parents.rs
           )
           paths=(
             crates/fln/src/runtime/array_iteration.rs
@@ -576,12 +606,6 @@ jobs:
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/tests/source_imported_arrays/check_oracle.py
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln-elab/src/source/do_notation/mutation.rs
-            crates/fln-elab/src/source/do_notation/loop_returns.rs
-            crates/fln-elab/src/source/do_notation/control.rs
-            crates/fln-elab/src/source/do_notation/returns.rs
-            crates/fln-elab/src/source/do_notation.rs
-            crates/fln-elab/src/source/do_notation/for_loop.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
@@ -717,7 +741,7 @@ jobs:
 
   array-iteration-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): compare Array control flow with the complete pinned imports'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate complete imported Array execution'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -729,11 +753,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'e1eef11a30ff42f8bc0c5d9cc9efb7dc55f04f1d'
+      CANDIDATE_SHA: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'e1eef11a30ff42f8bc0c5d9cc9efb7dc55f04f1d'
+          ref: '882ece44f3b96c5eaead122cbfcabd64cd24585d'
           persist-credentials: false
       - name: Verify candidate and install the exact Reference
         shell: bash
