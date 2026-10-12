@@ -1081,6 +1081,20 @@ impl Context {
                 expect_atom(keyword, "change", "target replacement tactic")?;
                 expect_empty_null(location, "goal-only change location")?;
                 return Ok(ProofAction::Change { goal, target });
+            } else if kind == &parser_kind(&["Tactic", "show"]) {
+                // `syntax (name := «show») "show " term : tactic` (`Init/Tactics.lean`): the first
+                // goal whose target unifies with the term becomes the main goal, its target
+                // replaced by it (`Lean/Elab/Tactic/Show.lean`). Only the main goal is tried here;
+                // a later goal the pin would select is refused, never changed.
+                let [keyword, target] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "show", "show tactic")?;
+                let syntax = Name::from_components(["Lean", "Parser", "Tactic", "show"]);
+                if !self.txn.env.contains(&syntax) {
+                    return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
+                }
+                return Ok(ProofAction::Change { goal, target });
             } else if kind == &parser_kind(&["Tactic", "symm"]) {
                 let [keyword, location] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
