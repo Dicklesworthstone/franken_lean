@@ -88,6 +88,12 @@ impl Preparation<'_> {
             let Some(next) = self.implementations()?.get(&target).cloned() else {
                 break;
             };
+            // Only this exact explicit edge admits the checked native Array
+            // traversal. Other safe replacements retain generic selection;
+            // an arbitrary unsafe target never gains a logical-body fallback.
+            if array_iteration::canonical_pair(&target, &next) {
+                return self.array_iteration_target().map(Some);
+            }
             replaced = true;
             target = next;
         }

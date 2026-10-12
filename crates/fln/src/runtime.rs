@@ -3,6 +3,7 @@
 //! This never changes the declaration sent to either checker. Special forms
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
+mod array_iteration;
 mod callables;
 mod conditionals;
 mod data_recursion;
@@ -77,6 +78,7 @@ pub(super) struct Preparation<'a> {
     partial_stages: global::PartialStages,
     specializations: specialize::Store,
     text_decisions: decisions::Store,
+    array_iteration: array_iteration::Store,
     st: st::Store,
     io: io::Store,
     fs: fs::Store,
@@ -169,6 +171,7 @@ impl<'a> Preparation<'a> {
             partial_stages: global::PartialStages::default(),
             specializations: specialize::Store::default(),
             text_decisions: decisions::Store::default(),
+            array_iteration: array_iteration::Store::default(),
             st: st::Store::default(),
             io: io::Store::default(),
             fs: fs::Store::default(),

@@ -138,6 +138,37 @@ impl Preparation<'_> {
         self.specializations.constructor_types.insert(name, type_);
         Ok(())
     }
+    /// Register only the fully model-checked Array traversal template. This
+    /// private definition must participate in the same callable and universe
+    /// specialization paths as ordinary executable definitions.
+    pub(super) fn remember_array_iteration_definition(
+        &mut self,
+        definition: DefinitionVal,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let name = &definition.base.name;
+        if name != &Name::from_components(["_fln_runtime_array_forIn"])
+            || self.environment.contains(name)
+            || self.has_private_callable(name)
+        {
+            return Err(unsupported(
+                "Array iteration private callable name collision",
+            ));
+        }
+        let observed = self.specializations.definitions.len().saturating_add(1);
+        if observed > self.limits.fir.max_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.fir.max_functions,
+                observed,
+            });
+        }
+        self.specializations
+            .definitions
+            .insert(name.clone(), definition);
+        Ok(())
+    }
+
     pub(crate) fn specialized_definition(&self, name: &Name) -> Option<DefinitionVal> {
         self.specializations.definitions.get(name).cloned()
     }
