@@ -1,5 +1,8 @@
-//! Checked, lexical section parameters. Their types are resolved at the
-//! variable command, not reinterpreted after a later `open` or declaration.
+//! Checked, lexical section parameters. Their types are checked at the variable
+//! command. The pin keeps the command's syntax and elaborates it again in each
+//! declaration, so a later `open` or declaration can change what its names mean:
+//! a declaration using a variable whose binder would now elaborate differently is
+//! refused, never checked against the earlier reading.
 //! They become ordinary Pi/lambda binders; no section state reaches admission.
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +16,9 @@ pub struct SectionVariables {
     levels: Vec<Name>,
     included: HashSet<FVarId>,
     omitted: HashSet<FVarId>,
+    /// Each `variable` command's binders, with the number of section locals after it. The pin
+    /// keeps this syntax (`varDecls`) and elaborates it again in every declaration.
+    commands: Vec<(Syntax, usize)>,
 }
 
 impl SectionVariables {
@@ -143,12 +149,15 @@ pub fn declare(
     for local in locals {
         lctx.add_param(local.id, local.user_name, local.type_, local.binder_info);
     }
+    let mut commands = scope.variables.commands.clone();
+    commands.push((syntax.clone(), lctx.len()));
     Ok(SectionVariables {
         locals: lctx,
         next: context.next,
         levels: context.level_params,
         included: scope.variables.included.clone(),
         omitted: scope.variables.omitted.clone(),
+        commands,
     })
 }
 
@@ -240,10 +249,69 @@ impl Context {
                 }
             }
         }
-        Ok(locals
+        let selected: Vec<LocalDecl> = locals
             .into_iter()
             .filter(|local| used.contains(&local.id))
-            .collect())
+            .collect();
+        if !selected.is_empty() {
+            let changed = self.reinterpreted_section_variables()?;
+            if let Some(local) = selected.iter().find(|local| changed.contains(&local.id)) {
+                return Err(error(ScopeError::ReinterpretedVariable(
+                    local.user_name.clone(),
+                )));
+            }
+        }
+        Ok(selected)
+    }
+
+    /// The section variables whose binders elaborate differently in this declaration's scope
+    /// and environment than they did at their `variable` commands. The pin elaborates the
+    /// commands' syntax again in every declaration (`Lean.Elab.Command.runTermElabM` over
+    /// `varDecls`), so after `open Second` an earlier `Carrier` may name `Second.Carrier`, or
+    /// be ambiguous. The commands are elaborated again here, in order, and each local compared
+    /// with the one first checked; a command that no longer elaborates leaves its locals and
+    /// every later one unconfirmed.
+    fn reinterpreted_section_variables(
+        &mut self,
+    ) -> Result<HashSet<FVarId>, NatDefinitionElabError> {
+        let stored = self.source_scope.variables.clone();
+        let mut scope = self.source_scope.clone();
+        scope.variables = SectionVariables::default();
+        for (syntax, _) in &stored.commands {
+            self.tick()?;
+            if let Ok(variables) = declare(syntax, &self.txn.env, self.kernel, &scope) {
+                scope.variables = variables;
+                continue;
+            }
+            // The pin elaborates binders one group at a time: a later group that no longer
+            // elaborates leaves the earlier ones as they are. Keep the longest prefix that does.
+            if let Syntax::Node { kind, args, .. } = syntax {
+                for end in (1..args.len()).rev() {
+                    self.tick()?;
+                    let prefix = Syntax::node(kind.clone(), args[..end].to_vec());
+                    if let Ok(variables) = declare(&prefix, &self.txn.env, self.kernel, &scope) {
+                        scope.variables = variables;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        let renewed = scope.variables.locals.decls();
+        let mut changed = HashSet::new();
+        for (position, local) in stored.locals.decls().iter().enumerate() {
+            self.tick()?;
+            let same = renewed.get(position).is_some_and(|again| {
+                again.id == local.id
+                    && again.user_name == local.user_name
+                    && again.type_ == local.type_
+                    && again.binder_info == local.binder_info
+            });
+            if !same {
+                changed.insert(local.id.clone());
+            }
+        }
+        Ok(changed)
     }
 
     pub(in crate::source) fn restrict_section_locals(&mut self, selected: &[LocalDecl]) {

@@ -68,6 +68,9 @@ pub enum ScopeError {
         declaration: Name,
         taken: Name,
     },
+    /// A section variable used by a declaration whose binder elaborates differently in the
+    /// declaration's scope than at its `variable` command (the pin elaborates it again there).
+    ReinterpretedVariable(Name),
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,6 +115,11 @@ impl std::fmt::Display for ScopeError {
                 "failed to declare `{}` because `{}` has already been declared",
                 declaration.to_display_string(),
                 taken.to_display_string()
+            ),
+            Self::ReinterpretedVariable(name) => write!(
+                f,
+                "section variable `{}` elaborates differently here than at its `variable` command",
+                name.to_display_string()
             ),
             Self::Ambiguous(name, candidates) => {
                 write!(f, "ambiguous name `{}`: ", name.to_display_string())?;
