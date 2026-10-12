@@ -973,3 +973,225 @@ jobs:
       - name: Decode exact structure layouts and default helper interfaces
         if: (success() || failure()) && steps.inventory-format.outcome == 'success'
         run: cargo test --locked --offline -p fln-olean --test reference_structure_inventory dump_pinned_structure_layout -- --nocapture --test-threads=1
+
+  imported-structure-metadata:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate imported structure fields and dependent defaults'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '8d7951878cb9bc1994977c584d68139401c6ed00'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '8d7951878cb9bc1994977c584d68139401c6ed00'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete imported-structure candidate
+        id: structure-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            scripts/extract/gen_source_extension_contract.py
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.lean
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_END
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+      - name: Verify extracted structure layouts against the locked Reference source
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: python3 -I -S scripts/extract/gen_source_extension_contract.py --check
+      - name: Decode every actual Prelude structure row and reject alias and resource controls
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-olean --test reference_structure_metadata -- --nocapture --test-threads=1
+      - name: Check native record journals and malformed interface controls
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib records -- --nocapture --test-threads=1
+      - name: Check module ownership and scoped activation regressions
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --lib source_check::modules::imported -- --nocapture --test-threads=1
+      - name: Check decoder and record registry production targets
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-olean --lib --test reference_structure_metadata -- -D warnings
+
+  imported-record-elaboration:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate imported structure fields and dependent defaults'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '8d7951878cb9bc1994977c584d68139401c6ed00'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '8d7951878cb9bc1994977c584d68139401c6ed00'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete imported-structure candidate
+        id: structure-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            scripts/extract/gen_source_extension_contract.py
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.lean
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_END
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+      - name: Check all 27 shared imported-record proofs with the exact Lean pin
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: timeout 180 "$FLN_REFERENCE_LIB/../../bin/lean" crates/fln/tests/source_imported_structure_parents.lean
+      - name: Admit the real Prelude then check and replay all imported-record values
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_imported_structure_parents -- --nocapture --test-threads=1
+      - name: Check retained record literals defaults updates and deferred arguments
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_records --test source_record_literals --test source_record_defaults --test source_record_updates --test source_postponed_records --test source_default_instances --no-fail-fast -- --nocapture --test-threads=1
+      - name: Check the complete elaborator production target
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check source importer and affected record integration targets
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib --test source_imported_structure_parents --test source_records --test source_record_literals --test source_record_defaults --test source_record_updates --test source_postponed_records --test source_default_instances -- -D warnings
