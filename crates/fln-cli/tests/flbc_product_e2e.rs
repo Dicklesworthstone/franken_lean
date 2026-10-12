@@ -362,8 +362,10 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     let future_dependency_check = run_lean(&[&source]);
     assert!(!future_dependency_check.status.success());
     assert!(future_dependency_check.stdout.is_empty());
+    // The pin, for a `#check` before its name is declared: `error(lean.unknownIdentifier):
+    // Unknown identifier `later`` (v4.32.0, 2026-10-12).
     assert!(
-        utf8(&future_dependency_check.stderr).contains("no inferable type"),
+        utf8(&future_dependency_check.stderr).contains("Unknown identifier `later`"),
         "future dependency check stderr: {}",
         utf8(&future_dependency_check.stderr)
     );
@@ -374,8 +376,9 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!unknown_check.status.success());
     assert!(unknown_check.stdout.is_empty());
-    assert!(utf8(&unknown_check.stderr).starts_with("lean: input: "));
-    assert!(utf8(&unknown_check.stderr).contains("no inferable type"));
+    // An unknown name is an elaboration refusal, as the pin's `lean.unknownIdentifier` is.
+    assert!(utf8(&unknown_check.stderr).starts_with("lean: elaboration: "));
+    assert!(utf8(&unknown_check.stderr).contains("Unknown identifier `Missing`"));
 
     let terminal_check = run_lean_stdin(
         &[Path::new("--stdin")],
@@ -426,8 +429,8 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!late_check_refusal.status.success());
     assert!(late_check_refusal.stdout.is_empty());
-    assert!(utf8(&late_check_refusal.stderr).starts_with("lean: input: "));
-    assert!(utf8(&late_check_refusal.stderr).contains("no inferable type"));
+    assert!(utf8(&late_check_refusal.stderr).starts_with("lean: elaboration: "));
+    assert!(utf8(&late_check_refusal.stderr).contains("Unknown identifier `Missing`"));
 
     let future_definition = run_lean_stdin(
         &[Path::new("--stdin")],
@@ -435,8 +438,8 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!future_definition.status.success());
     assert!(future_definition.stdout.is_empty());
-    assert!(utf8(&future_definition.stderr).starts_with("lean: input: "));
-    assert!(utf8(&future_definition.stderr).contains("no inferable type"));
+    assert!(utf8(&future_definition.stderr).starts_with("lean: elaboration: "));
+    assert!(utf8(&future_definition.stderr).contains("Unknown identifier `later`"));
 
     let piped_late_refusal = run_lean_stdin(
         &[Path::new("--stdin")],
@@ -444,7 +447,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(!piped_late_refusal.status.success());
     assert!(piped_late_refusal.stdout.is_empty());
-    assert!(utf8(&piped_late_refusal.stderr).starts_with("lean: input: "));
+    assert!(utf8(&piped_late_refusal.stderr).starts_with("lean: elaboration: "));
     // The pin, on this stdin: `<stdin>:2:20: error(lean.unknownIdentifier): Unknown
     // identifier `missing`` (v4.32.0, 2026-10-05). An elaboration error, not a K1 rejection.
     assert!(utf8(&piped_late_refusal.stderr).contains("Unknown identifier `missing`"));
@@ -523,7 +526,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     let refused = run_lean(&[&source]);
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
-    assert!(utf8(&refused.stderr).starts_with("lean: input: "));
+    assert!(utf8(&refused.stderr).starts_with("lean: elaboration: "));
     // The pin on this file: `2:20: error(lean.unknownIdentifier): Unknown identifier
     // `missing`` (v4.32.0, 2026-10-05).
     assert!(utf8(&refused.stderr).contains("Unknown identifier `missing`"));
@@ -788,8 +791,8 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         let future_entry = run_lean(&[&main]);
         assert!(!future_entry.status.success());
         assert!(future_entry.stdout.is_empty());
-        assert!(utf8(&future_entry.stderr).starts_with("lean: input: "));
-        assert!(utf8(&future_entry.stderr).contains("no inferable type"));
+        assert!(utf8(&future_entry.stderr).starts_with("lean: elaboration: "));
+        assert!(utf8(&future_entry.stderr).contains("Unknown identifier `later`"));
 
         std::fs::write(&base, b"#eval 99\ndef base : Nat := 20\n")
             .expect("plant an output-producing imported dependency");
@@ -891,7 +894,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         let late_refusal = run_lean_in(lib, &root, &[&main]);
         assert!(!late_refusal.status.success());
         assert!(late_refusal.stdout.is_empty());
-        assert!(utf8(&late_refusal.stderr).starts_with("lean: input: "));
+        assert!(utf8(&late_refusal.stderr).starts_with("lean: elaboration: "));
         // The pin on this project (Base and Middle compiled to .olean, then Main): `3:20:
         // error(lean.unknownIdentifier): Unknown identifier `missing`` (v4.32.0, 2026-10-05).
         assert!(utf8(&late_refusal.stderr).contains("Unknown identifier `missing`"));

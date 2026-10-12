@@ -85,7 +85,6 @@ pub enum NatDefinitionElabError {
     AnonymousDeclarationName,
     InvalidGeneratedEvaluationName,
     InvalidGeneratedCheckName,
-    CannotInferCheckType,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
     InvalidScientificLiteral,
@@ -109,9 +108,6 @@ impl std::fmt::Display for NatDefinitionElabError {
                 formatter,
                 "check name must be one numeric component below the anonymous root"
             ),
-            Self::CannotInferCheckType => {
-                write!(formatter, "bounded check term has no inferable type")
-            }
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
             Self::InvalidScientificLiteral => write!(formatter, "scientific literal is invalid"),
@@ -562,12 +558,9 @@ pub fn elaborate_check_in_scope_with_budget(
     budget: Budget,
     scope: &source::scope::SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::scope::elaborate_check(syntax, generated_name, environment, budget, scope) {
-        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
-            _,
-        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
-        result => result,
-    }
+    // An unknown name is the pin's "Unknown identifier `x`" here too, as for a definition.
+    source::scope::elaborate_check(syntax, generated_name, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
 /// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a
@@ -592,12 +585,8 @@ pub fn elaborate_check_in_with_budget(
     environment: &Environment,
     budget: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::query(syntax, generated_name, environment, budget, false) {
-        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
-            _,
-        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
-        result => result,
-    }
+    source::query(syntax, generated_name, environment, budget, false)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
 fn elaborate_definition_with_types(
@@ -2567,6 +2556,31 @@ mod tests {
                 expected: "Lean.Parser.Command.check"
             })
         ));
+
+        // An unknown name is the pin's `error(lean.unknownIdentifier)` through either entry
+        // point, naming it, as for a definition.
+        let unknown = fln_parse::parse_source_command(b"#check Missing")
+            .expect("the unknown-name check parses");
+        let scope = source::scope::SourceScope::default();
+        for refused in [
+            elaborate_check_in(
+                unknown.syntax(),
+                Name::num(Name::anonymous(), 12),
+                &environment,
+            ),
+            elaborate_check_in_scope_with_budget(
+                unknown.syntax(),
+                Name::num(Name::anonymous(), 13),
+                &environment,
+                Budget::DEFAULT,
+                &scope,
+            ),
+        ] {
+            assert_eq!(
+                refused.map(|_| ()).map_err(|error| error.to_string()),
+                Err("Unknown identifier `Missing`".to_owned())
+            );
+        }
     }
 
     #[test]

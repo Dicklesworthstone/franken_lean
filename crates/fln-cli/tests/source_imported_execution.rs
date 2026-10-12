@@ -400,7 +400,11 @@ fn prelude_is_an_empty_world_and_local_legacy_runs_keep_their_contract() {
     assert!(text.contains("\"executions\":0"), "{text}");
     ws.write("Main.lean", "prelude\n#check Nat\n");
     let unknown = ws.run(&main, None, &[]);
-    assert!(unknown.refused("input", 1).contains("\"authority\":false"));
+    // The pin, in this empty world: `error(lean.unknownIdentifier): Unknown identifier `Nat``
+    // (v4.32.0, 2026-10-12), an elaboration refusal.
+    let refused = unknown.refused("elaboration", 1);
+    assert!(refused.contains("\"authority\":false"), "{refused}");
+    assert!(refused.contains("Unknown identifier `Nat`"), "{refused}");
 
     ws.write("Local.lean", "prelude\ninductive Token where\n  | mk\n");
     ws.write("Main.lean", "prelude\nimport Local\n#check Token\n");

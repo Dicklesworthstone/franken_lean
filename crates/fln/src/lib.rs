@@ -19016,7 +19016,8 @@ mod tests {
             .check_source_command(b"#check Missing", &options, test_limits().admission())
             .expect_err("an unknown check term has no guessed type");
         assert!(matches!(unknown, EngineExecutionError::Frontend(_)));
-        assert!(unknown.to_string().contains("no inferable type"));
+        // The pin: `error(lean.unknownIdentifier): Unknown identifier `Missing`` (v4.32.0).
+        assert!(unknown.to_string().contains("Unknown identifier `Missing`"));
         assert_eq!(engine.logical_root(&options), before);
 
         let interleaved = engine
