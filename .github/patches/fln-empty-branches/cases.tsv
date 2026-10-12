@@ -3,10 +3,10 @@ and_false_right	accept	def f (h : True ∧ False) : Nat := nomatch h
 or_empty_data	accept	def f (h : False ∨ False) : Nat := nomatch h
 or_empty_prop	accept	def f (h : False ∨ False) : False := nomatch h
 nested_proof_fields	accept	def f (h : True ∧ (False ∨ False)) : Nat := nomatch h
-exists_empty_data	accept	def f (h : ∃ n : Nat, False) : Nat := nomatch h
-exists_empty_prop	accept	def f (h : ∃ n : Nat, False) : False := nomatch h
+exists_empty_data	accept	def f (h : Exists (fun (n : Nat) => False)) : Nat := nomatch h
+exists_empty_prop	accept	def f (h : Exists (fun (n : Nat) => False)) : False := nomatch h
 nofun_or	accept	def f : (False ∨ False) → Nat := nofun
-nofun_exists	accept	def f : (∃ n : Nat, False) → Nat := nofun
+nofun_exists	accept	def f : (Exists (fun (n : Nat) => False)) → Nat := nofun
 user_empty_field	accept	inductive Wrap where | mk (h : False)\ndef f (x : Wrap) : Nat := nomatch x
 all_constructor_fields	accept	inductive Dead where | a (h : False) | b (h : False)\ndef f (x : Dead) : Nat := nomatch x
 nested_structure_fields	accept	structure W where\n  p : True\n  h : False\nstructure Box where\n  value : W\ndef f (x : Box) : Nat := nomatch x
@@ -20,7 +20,7 @@ fields_before_later_column	accept	def f (h : True ∧ False) (n : Nat) : Nat := 
 and_inhabited	reject	def f (h : True ∧ True) : Nat := nomatch h
 or_live_left	reject	def f (h : True ∨ False) : Nat := nomatch h
 or_live_right	reject	def f (h : False ∨ True) : Nat := nomatch h
-exists_live	reject	def f (h : ∃ n : Nat, True) : Nat := nomatch h
+exists_live	reject	def f (h : Exists (fun (n : Nat) => True)) : Nat := nomatch h
 user_live_constructor	reject	inductive D where | dead (h : False) | live\ndef f (x : D) : Nat := nomatch x
 recursive_family	reject	inductive Loop where | next (tail : Loop)\ndef f (x : Loop) : Nat := nomatch x
 recursive_false_field	reject	inductive Loop where | next (h : False) (tail : Loop)\ndef f (x : Loop) : Nat := nomatch x
