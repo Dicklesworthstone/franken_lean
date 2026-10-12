@@ -75,7 +75,7 @@ fn guard_term(syntax: &Syntax, context: &mut Context) -> Result<Typed, NatDefini
         return Err(failure(SourceInferenceError::ExpectedType));
     };
     let term = context.finish(term)?;
-    context.check_compiled_recursors(&term.value)?;
+    context.check_compiled_recursors(&term)?;
     Ok(term)
 }
 
