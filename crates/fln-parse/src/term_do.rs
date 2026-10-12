@@ -16,6 +16,9 @@ pub(super) struct Prefix {
     /// `unless …`/`for …` in term position (`Term.termUnless`, `Term.termFor`): one element,
     /// given its term kind by [`Prefix::finish`].
     term_element: bool,
+    /// The keyword that opened this sequence: `do`, or a `repeat` statement's own keyword
+    /// (`doRepeat := "repeat " doSeq`).
+    keyword_text: &'static str,
     baseline: usize,
     braces: Option<(usize, Option<usize>)>,
     items: Vec<Syntax>,
@@ -40,6 +43,11 @@ enum Statement {
         position: BytePos,
     },
     Return(usize),
+    /// `repeat seq` (`doRepeat`): its keyword opens the body's sequence, as `do` would.
+    Repeat {
+        keyword: usize,
+        position: BytePos,
+    },
     /// `return` with no value: no term follows on its line (`doReturn`'s `checkLineEq`). Its
     /// keyword is the frame's one leaf, as a jump's is.
     BareReturn {
@@ -202,6 +210,7 @@ impl Prefix {
             keyword,
             sequence_only: false,
             term_element: false,
+            keyword_text: "do",
             baseline: column(view, tokens, *cursor),
             braces,
             items: Vec::new(),
@@ -410,6 +419,13 @@ impl Prefix {
                 is_break: word(tokens, at, "break"),
                 position: original_position(view, tokens, at),
             };
+        } else if word(tokens, at, "repeat") {
+            // The keyword stays for the term driver, which opens the body's sequence at it
+            // (`repeat_keyword`).
+            self.statement = Statement::Repeat {
+                keyword: at,
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "return") && bare_return(view, tokens, at, end) {
             self.statement = Statement::BareReturn {
                 keyword: at,
@@ -459,7 +475,8 @@ impl Prefix {
         } else {
             // These belong to doElem, not ordinary term application. Unsupported
             // control forms must not be laundered into calls to user declarations.
-            for unsupported in ["repeat", "catch", "finally", "let_expr"] {
+            // `until` closes `repeat … until c` (`doRepeatUntil`), which is not read yet.
+            for unsupported in ["until", "catch", "finally", "let_expr"] {
                 if word(tokens, at, unsupported) {
                     return Err(refuse(view, tokens, at));
                 }
@@ -477,6 +494,25 @@ impl Prefix {
     /// The token index of the `break`/`continue` this element is, if it is a jump. Both are
     /// builtin tokens at the pin (`doBreak`, `doContinue`), so the ordinary term frame cannot
     /// read them as an identifier leaf; the driver hands the keyword to the frame itself.
+    /// The `repeat` keyword this element was classified as, while its body is still unread.
+    pub(super) fn repeat_keyword(&self) -> Option<usize> {
+        match self.statement {
+            Statement::Repeat { keyword, .. } if self.phase == Phase::Value => Some(keyword),
+            _ => None,
+        }
+    }
+    /// A sequence opened by a `repeat` statement's keyword rather than `do`.
+    pub(super) fn repeat_body(
+        view: &SourceView,
+        tokens: &[LexedToken],
+        keyword: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let mut prefix = Self::start(view, tokens, keyword, cursor, end)?;
+        prefix.keyword_text = "repeat";
+        Ok(prefix)
+    }
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self.statement {
             Statement::Jump { keyword, .. } | Statement::BareReturn { keyword, .. } => {
@@ -632,6 +668,25 @@ impl Prefix {
                         sequence,
                     ],
                 )
+            }
+            Statement::Repeat { position, .. } => {
+                // The sequence the keyword opened is the loop's body (`doRepeat`).
+                let Syntax::Node { kind, args, .. } = &value else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                };
+                if *kind != parser_kind(&["Term", "do"])
+                    || args.len() != 2
+                    || !matches!(&args[0], Syntax::Atom { val, .. } if val == "repeat")
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                Syntax::node(parser_kind(&["Term", "doRepeat"]), args.clone())
             }
             Statement::While {
                 keyword,
@@ -1165,7 +1220,7 @@ impl Prefix {
         Ok((
             Syntax::node(
                 parser_kind(&["Term", "do"]),
-                vec![atom(leaves, self.keyword, "do")?, sequence],
+                vec![atom(leaves, self.keyword, self.keyword_text)?, sequence],
             ),
             self.keyword,
         ))

@@ -4124,6 +4124,19 @@ const BARE_RETURNS: &[Accepted] = &[
     },
 ];
 
+/// `repeat seq` (`Term.doRepeat`, `"repeat " doSeq`): the keyword opens the body's sequence, with
+/// `break`. Captured 2026-10-12 from one file the pin elaborated without an error, in this order.
+const REPEAT_LOOPS: &[Accepted] = &[
+    Accepted {
+        source: "def rp1 (n : Nat) : IO Nat := do\n  let mut i := 0\n  repeat\n    if i >= n then break\n    i := i + 1\n  return i",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `rp1 []) (Command.optDeclSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] [(Term.typeSpec ":" (Term.app `IO [`Nat]))]) (Command.declValSimple ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doLet "let" ["mut"] (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `i) [] [] ":=" (num "0")))) []) (Term.doSeqItem (Term.doRepeat "repeat" (Term.doSeqIndent [(Term.doSeqItem (Term.doIf "if" (Term.doIfProp [] («term_≥_» `i ">=" `n)) "then" (Term.doSeqIndent [(Term.doSeqItem (Term.doBreak "break") [])]) [] []) []) (Term.doSeqItem (Term.doReassign (Term.letIdDeclNoBinders (Term.letId `i) [] [] ":=" («term_+_» `i "+" (num "1")))) [])])) []) (Term.doSeqItem (Term.doReturn "return" [`i]) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def rp2 : IO Unit := do\n  repeat\n    IO.println \"x\"\n    break",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `rp2 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.app `IO [`Unit]))]) (Command.declValSimple ":=" (Term.do "do" (Term.doSeqIndent [(Term.doSeqItem (Term.doRepeat "repeat" (Term.doSeqIndent [(Term.doSeqItem (Term.doExpr (Term.app `IO.println [(str "\"x\"")])) []) (Term.doSeqItem (Term.doBreak "break") [])])) [])])) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 const GUARD_TARGETS: &[Accepted] = &[
     Accepted {
         source: "theorem a (p : Prop) (h : p) : p := by\n  guard_target = p\n  exact h",
@@ -5855,6 +5868,14 @@ fn term_position_do_elements_produce_the_pins_trees() {
 #[test]
 fn bare_returns_produce_the_pins_trees() {
     for row in BARE_RETURNS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn repeat_loops_produce_the_pins_trees() {
+    for row in REPEAT_LOOPS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

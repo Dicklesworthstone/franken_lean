@@ -3187,6 +3187,20 @@ fn push_jump_keyword(leaves: &Leaves, frames: &mut [BoundedTermFrame], index: us
     }
 }
 
+/// Whether `index` is the `repeat` keyword the innermost do element was classified as: only there
+/// does it open a sequence. Out of line for the driver's stack budget.
+#[inline(never)]
+fn repeat_keyword(frames: &[BoundedTermFrame], index: usize) -> bool {
+    frames.last().is_some_and(|frame| {
+        frame.application.is_empty()
+            && frame
+                .prefix
+                .as_ref()
+                .and_then(term_locals::Prefix::repeat_keyword)
+                == Some(index)
+    })
+}
+
 /// A `return` with no value on its line (`checkLineEq`): a do element's keyword leaf, or outside
 /// `do` the complete `Term.termReturn` with an empty value. Out of line and infallible for the
 /// driver's stack budget, as [`push_jump_keyword`].
@@ -3664,10 +3678,13 @@ fn bounded_term_token(
         _ if grammar == DefinitionGrammar::Scalar
             && (term_locals::word(tokens, index, "do")
                 || term_locals::word(tokens, index, "unless")
-                || term_locals::word(tokens, index, "for")) =>
+                || term_locals::word(tokens, index, "for")
+                || repeat_keyword(frames, index)) =>
         {
             let prefix = if term_locals::word(tokens, index, "do") {
                 term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)
+            } else if term_locals::word(tokens, index, "repeat") {
+                term_do::Prefix::repeat_body(view, tokens, index, &mut cursor, range.end)
             } else {
                 cursor = index;
                 term_do::Prefix::element(view, tokens, &mut cursor, range.end)

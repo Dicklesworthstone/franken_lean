@@ -1,9 +1,9 @@
-//! `while c do s`, as the pin (`Lean/Elab/BuiltinDo/Repeat.lean`): the macro `expandDoWhile` makes
-//! it `repeat if c then s else break`, and `elabDoRepeat` makes that `for _ in Loop.mk do …`, a
-//! loop over `Lean.Loop` (`Init/While.lean`) whose `ForIn` instance runs until a `break`. The
-//! rewrite runs before nested actions are lifted and before `mut` variables are threaded, as a
-//! macro expands before its element elaborates: an action in the condition runs on every
-//! iteration, and the loop's reassignments are an ordinary loop's.
+//! `while c do s` and `repeat s`, as the pin (`Lean/Elab/BuiltinDo/Repeat.lean`). The macro
+//! `expandDoWhile` makes `while c do s` into `repeat if c then s else break`, and `elabDoRepeat`
+//! makes `repeat s` into `for _ in Loop.mk do s`, a loop over `Lean.Loop` (`Init/While.lean`) whose
+//! `ForIn` instance runs until a `break`. The rewrite runs before nested actions are lifted and
+//! before `mut` variables are threaded, as a macro expands before its element elaborates: an action
+//! in the condition runs on every iteration, and the loop's reassignments are an ordinary loop's.
 use super::*;
 
 fn is(syntax: &Syntax, kind: &str) -> bool {
@@ -11,7 +11,7 @@ fn is(syntax: &Syntax, kind: &str) -> bool {
 }
 
 pub(in crate::source) fn is_while_loop(syntax: &Syntax) -> bool {
-    is(syntax, "doWhile")
+    is(syntax, "doWhile") || is(syntax, "doRepeat")
 }
 
 fn sequence(element: Syntax) -> Syntax {
@@ -21,6 +21,33 @@ fn sequence(element: Syntax) -> Syntax {
             parser_kind(&["Term", "doSeqItem"]),
             vec![element, null(vec![])],
         )])],
+    )
+}
+
+/// `repeat body` as `for _ in Loop.mk do body` (`elabDoRepeat`). The pin appends `unreachable!` when
+/// the body cannot `break` and the block's value is not `PUnit`; without it such a block is refused
+/// here (a gap, never a different value).
+fn repeat_loop(syntax: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    let mut parts = node(syntax, "doRepeat", 2)?;
+    let body = parts.pop().expect("loop body");
+    expect_atom(&parts[0], "repeat", "loop keyword")?;
+    Ok(loop_over(body))
+}
+
+/// `for _ in Loop.mk do body`.
+fn loop_over(body: Syntax) -> Syntax {
+    let declaration = Syntax::node(
+        parser_kind(&["Term", "doForDecl"]),
+        vec![
+            null(vec![]),
+            Syntax::node(parser_kind(&["Term", "hole"]), vec![atom("_")]),
+            atom("in"),
+            ident(Name::from_components(["_root_", "Lean", "Loop", "mk"])),
+        ],
+    );
+    Syntax::node(
+        parser_kind(&["Term", "doFor"]),
+        vec![atom("for"), null(vec![declaration]), atom("do"), body],
     )
 }
 
@@ -48,28 +75,11 @@ fn while_loop(syntax: Syntax) -> Result<Syntax, NatDefinitionElabError> {
             ]),
         ],
     );
-    let declaration = Syntax::node(
-        parser_kind(&["Term", "doForDecl"]),
-        vec![
-            null(vec![]),
-            Syntax::node(parser_kind(&["Term", "hole"]), vec![atom("_")]),
-            atom("in"),
-            ident(Name::from_components(["_root_", "Lean", "Loop", "mk"])),
-        ],
-    );
-    Ok(Syntax::node(
-        parser_kind(&["Term", "doFor"]),
-        vec![
-            atom("for"),
-            null(vec![declaration]),
-            atom("do"),
-            sequence(conditional),
-        ],
-    ))
+    Ok(loop_over(sequence(conditional)))
 }
 
 impl Context {
-    /// `syntax` with every `while` loop rewritten, inner loops first.
+    /// `syntax` with every `while` and `repeat` loop rewritten, inner loops first.
     pub(in crate::source) fn expand_while_loops(
         &mut self,
         syntax: &Syntax,
@@ -94,8 +104,10 @@ impl Context {
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
-                    built.push(if is_while_loop(&node) {
+                    built.push(if is(&node, "doWhile") {
                         while_loop(node)?
+                    } else if is(&node, "doRepeat") {
+                        repeat_loop(node)?
                     } else {
                         node
                     });

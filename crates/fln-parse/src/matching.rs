@@ -239,7 +239,10 @@ fn plan(
         let statement = do_scopes
             .statement_at(view, tokens, at, depth)
             .or_else(|| do_scopes.arrow_element(view, tokens, at, depth));
-        if term_locals::word(tokens, at, "do") {
+        // A `repeat` statement's keyword opens its body's sequence, as `do` does (`doRepeat`).
+        if term_locals::word(tokens, at, "do")
+            || (statement.is_some() && term_locals::word(tokens, at, "repeat"))
+        {
             do_scopes.open(view, tokens, at, depth, None, range.end)?;
         }
         // The value of an offside local declaration has ended. Close only
