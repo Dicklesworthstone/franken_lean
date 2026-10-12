@@ -58,6 +58,96 @@ impl<'a> PendingState<'a> {
 }
 
 impl Engine<'_> {
+    /// Keep a reduction-blocked application available to `synthPending` before
+    /// rigid congruence can discard its projection receiver. Ordinary patterns
+    /// have already had their chance. Matching heads retain argument congruence,
+    /// which can determine the dictionary without any search. Restrict this to
+    /// distinct rigid names with an exactly saturated class projection:
+    /// projective heads can solve by singleton inversion or receiver congruence,
+    /// and extra field arguments may determine the instance's inputs. Keep
+    /// those congruence opportunities. Ordinary reduction and lazy delta have
+    /// already had priority at the call.
+    pub(super) fn preserve_pending_application(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        if self.pending.owner.is_none() || (!left.has_expr_mvar() && !right.has_expr_mvar()) {
+            return Ok(false);
+        }
+        let mut left_head = left;
+        let mut left_arity = 0usize;
+        while let ExprNode::App { f, .. } = left_head.node() {
+            self.meter.node()?;
+            left_arity = left_arity
+                .checked_add(1)
+                .ok_or(UnificationError::ExpressionScope)?;
+            left_head = f;
+        }
+        let mut right_head = right;
+        let mut right_arity = 0usize;
+        while let ExprNode::App { f, .. } = right_head.node() {
+            self.meter.node()?;
+            right_arity = right_arity
+                .checked_add(1)
+                .ok_or(UnificationError::ExpressionScope)?;
+            right_head = f;
+        }
+        match (left_head.node(), right_head.node()) {
+            (ExprNode::Const { name: left, .. }, ExprNode::Const { name: right, .. })
+                if left != right => {}
+            (ExprNode::Const { .. }, ExprNode::FVar { .. })
+            | (ExprNode::FVar { .. }, ExprNode::Const { .. }) => {}
+            _ => return Ok(false),
+        }
+        Ok(
+            self.saturated_projection_blocker(left, left_head, left_arity, locals)?
+                || self.saturated_projection_blocker(right, right_head, right_arity, locals)?,
+        )
+    }
+
+    /// Stop at the actual receiver boundary, using the admitted projection
+    /// body and constructor metadata. An overapplied field still needs ordinary
+    /// argument congruence before synthesis, which can fix class inputs.
+    fn saturated_projection_blocker(
+        &mut self,
+        expr: &Expr,
+        head: &Expr,
+        arity: usize,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(false);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.work.env.find(name) else {
+            return Ok(false);
+        };
+        if definition.base.level_params.len() != levels.len() {
+            return Ok(false);
+        }
+        let Some(projection) =
+            crate::records::projection::class_projection(&self.work.env, definition, || {
+                self.meter.node()
+            })?
+        else {
+            return Ok(false);
+        };
+        if projection.parameters.checked_add(1) != Some(arity)
+            || !self
+                .projection_registry
+                .read(&self.work.env)
+                .map_err(UnificationError::InstanceRegistry)?
+                .is_class(&projection.structure)
+        {
+            return Ok(false);
+        }
+        let ExprNode::App { a: receiver, .. } = expr.node() else {
+            return Ok(false);
+        };
+        Ok(self.reduction_blocker(receiver, locals)?.is_some())
+    }
+
     /// One `synthPending` step at a fixed point: ask for the first owned opaque
     /// hole or ordinary reduction blocker that the owner can solve now, in
     /// deterministic equation order. Returns whether one was assigned.
@@ -80,7 +170,7 @@ impl Engine<'_> {
             for side in [left, right] {
                 let side = self.instantiate(side)?;
                 self.opaque_holes(&side, &mut seen, &mut goals)?;
-                if let Some(goal) = self.assignable_blocker(&side, locals)?
+                if let Some(goal) = self.reduction_blocker(&side, locals)?
                     && seen.insert(goal.clone())
                 {
                     goals.push(goal);
@@ -153,8 +243,10 @@ impl Engine<'_> {
     /// The pin's `getStuckMVar?` follows flexible heads and class projection
     /// receivers. Candidate dictionaries are ordinary metavariables, so the
     /// opaque-hole scan alone cannot resume their stuck parent projections.
+    /// Opaque blockers are returned too, so their original applications survive
+    /// congruence; the earlier opaque scan deduplicates them during synthesis.
     /// The owner still decides whether a discovered hole is an instance goal.
-    fn assignable_blocker(
+    fn reduction_blocker(
         &mut self,
         expr: &Expr,
         locals: &LocalContext,
@@ -176,9 +268,7 @@ impl Engine<'_> {
             match head.node() {
                 ExprNode::MVar { id } => {
                     let assignable = self.work.mvars.get_decl(id).is_some_and(|declaration| {
-                        declaration.kind != MetavarKind::SyntheticOpaque
-                            && declaration.delayed.is_none()
-                            && !self.work.mvars.is_assigned(id)
+                        declaration.delayed.is_none() && !self.work.mvars.is_assigned(id)
                     });
                     return Ok(assignable.then(|| id.clone()));
                 }

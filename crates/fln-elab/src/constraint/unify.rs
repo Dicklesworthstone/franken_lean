@@ -1022,6 +1022,12 @@ impl Engine<'_> {
                     // available above and below this rigid-congruence case.
                     return Err(UnificationError::Deferred(reason));
                 }
+                if self.preserve_pending_application(&left, &right, locals)? {
+                    // Retain the named projection at its receiver boundary.
+                    // Its owner's checked dictionary can reduce the original
+                    // application, but cannot repair discarded head equations.
+                    return Err(UnificationError::Deferred(reason));
+                }
                 pending.push_front((b.clone(), d.clone(), locals.clone()));
                 pending.push_front((a.clone(), c.clone(), locals.clone()));
             }
