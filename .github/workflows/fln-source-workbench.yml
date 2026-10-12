@@ -755,7 +755,7 @@ jobs:
 
   mutable-loop-returns:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate typed state continuations and native mutable returns'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): profile nested mutable returns and isolate every pinned probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -767,11 +767,12 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '435c5fd99d18d06b7415c04abaccbd75e9fa1df4'
+      CANDIDATE_SHA: '8a81260f420fbe271b9242fbaa27c4990f3492a1'
+      FLN_TRACE_MUTABLE_RETURN: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '435c5fd99d18d06b7415c04abaccbd75e9fa1df4'
+          ref: '8a81260f420fbe271b9242fbaa27c4990f3492a1'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -798,6 +799,8 @@ jobs:
         run: |
           set -euo pipefail
           rust_paths=(
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/constraint/unify.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
             crates/fln-elab/src/source/do_notation/loop_returns.rs
             crates/fln-elab/src/source/do_notation/control.rs
@@ -808,6 +811,8 @@ jobs:
             crates/fln/tests/source_do/for_loops/mutable_returns.rs
           )
           paths=(
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/constraint/unify.rs
             crates/fln-elab/src/source/do_notation/mutation.rs
             crates/fln-elab/src/source/do_notation/loop_returns.rs
             crates/fln-elab/src/source/do_notation/control.rs
