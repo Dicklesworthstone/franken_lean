@@ -47,7 +47,7 @@ jobs:
           cat "$RUNNER_TEMP/empty-match-evidence/before.log"
           test "$status" -ne 0
           grep -F 'false_elimination_keeps_the_admitted_recursor ... FAILED' "$RUNNER_TEMP/empty-match-evidence/before.log"
-          grep -F 'unexpected syntax' "$RUNNER_TEMP/empty-match-evidence/before.log"
+          grep -F 'UnexpectedSyntax { expected: "supported scalar literal or constant identifier" }' "$RUNNER_TEMP/empty-match-evidence/before.log"
       - name: Apply native elaboration and format only changed source files
         run: |
           python3 .github/patches/fln-empty-matches/apply.py implementation
