@@ -500,7 +500,7 @@ jobs:
 
   array-iteration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged Array iteration with actual imports'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate Array execution with current source elaboration'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -512,11 +512,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '4d42929f6234c61ce501f82f0b843869f9750259'
+      CANDIDATE_SHA: 'ab488a0556d986f1a97790f944891dc3595f6b79'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '4d42929f6234c61ce501f82f0b843869f9750259'
+          ref: 'ab488a0556d986f1a97790f944891dc3595f6b79'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -554,11 +554,6 @@ jobs:
             crates/fln/tests/source_imported_arrays/execution.rs
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/runtime/global/partial.rs
-            crates/fln/src/runtime/global/partial/callbacks.rs
-            crates/fln/src/runtime/callables/stages.rs
-            crates/fln/src/runtime/global/partial/tests.rs
-            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
           )
           paths=(
             crates/fln/src/runtime/array_iteration.rs
@@ -575,11 +570,6 @@ jobs:
             crates/fln/tests/source_imported_arrays/authority.rs
             crates/fln/tests/source_imported_arrays/check_oracle.py
             crates/fln/src/runtime/array_iteration/tests.rs
-            crates/fln/src/runtime/global/partial.rs
-            crates/fln/src/runtime/global/partial/callbacks.rs
-            crates/fln/src/runtime/callables/stages.rs
-            crates/fln/src/runtime/global/partial/tests.rs
-            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
@@ -718,7 +708,7 @@ jobs:
 
   array-iteration-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged Array iteration with actual imports'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate Array execution with current source elaboration'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -730,11 +720,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '4d42929f6234c61ce501f82f0b843869f9750259'
+      CANDIDATE_SHA: 'ab488a0556d986f1a97790f944891dc3595f6b79'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '4d42929f6234c61ce501f82f0b843869f9750259'
+          ref: 'ab488a0556d986f1a97790f944891dc3595f6b79'
           persist-credentials: false
       - name: Verify candidate and install the exact Reference
         shell: bash
