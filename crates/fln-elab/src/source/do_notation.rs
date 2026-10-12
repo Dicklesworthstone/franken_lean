@@ -12,6 +12,8 @@ mod fallback;
 mod for_loop;
 mod if_let;
 mod lift;
+mod repeat;
+pub(super) use repeat::is_while_loop;
 mod loop_returns;
 mod matching;
 mod mutation;
