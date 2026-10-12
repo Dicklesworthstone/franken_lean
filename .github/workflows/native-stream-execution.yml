@@ -53,6 +53,30 @@ jobs:
           candidate.write_bytes(patch)
           subprocess.run(['git', 'apply', '--check', '--whitespace=error', str(candidate)], check=True)
           subprocess.run(['git', 'apply', '--index', str(candidate)], check=True)
+          # Replace the obsolete refusal expectation with both checked success
+          # and independent FLBC replay. Exact source guards prevent broad edits.
+          regression = pathlib.Path('crates/fln/src/runtime/stdout/tests.rs')
+          text = regression.read_text()
+          before_test = '''    assert!(matches!(
+                  &batch.batch.executions[batch.batch.source_evaluation_indices[0]].exit,
+                  VmExit::Refused {
+                      refusal: fln_vm::interpreter::VmRefusal::UnsupportedNativeClosure,
+                      ..
+                  }
+              ));
+              assert_eq!(engine.logical_root(&KVMap::new()), root);'''
+          after_test = '''    let execution = &batch.batch.executions[batch.batch.source_evaluation_indices[0]];
+              assert_unit_packet(&execution.exit);
+              let program = assert_native_row(execution);
+              assert_unit_packet(
+                  &execute_golem_with_options(&program, &KVMap::new(), VmExecutionLimits::default())
+                      .into_complete()
+                      .unwrap(),
+              );
+              assert_eq!(engine.logical_root(&KVMap::new()), root);'''
+          assert text.count(before_test) == 1
+          regression.write_text(text.replace(before_test, after_test))
+          subprocess.run(['git', 'add', str(regression)], check=True)
           expected = set('''ci/BOUNDARY_API.txt
           ci/UNSAFE_LEDGER.txt
           crates/fln-rt/src/lib.rs
@@ -65,6 +89,7 @@ jobs:
           crates/fln-vm/src/interpreter.rs
           crates/fln-vm/tests/stdio_bridge.rs
           crates/fln/src/runtime/stdout.rs
+          crates/fln/src/runtime/stdout/tests.rs
           crates/fln/src/runtime/stdout/tests/input.rs'''.splitlines())
           paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
           assert set(paths) == expected
