@@ -1,6 +1,6 @@
 //! The pin postpones a callee whose type is still a metavariable application,
-//! and expected-type notation whose constructor or namespace is not yet known
-//! (`Elab/App.lean` / `Elab/BuiltinNotation.lean`, `tryPostponeIfMVar`). The
+//! and expected-type notation whose constructor, structure or namespace is unknown
+//! (`Elab/App.lean`, `Elab/BuiltinNotation.lean`, `Elab/StructInst.lean`). The
 //! containing argument is retried on the ordinary term worklist after later
 //! arguments constrain its expected type. No function or constructor is guessed.
 //!
@@ -298,6 +298,9 @@ impl Context {
         match problem {
             NatDefinitionElabError::Inference(SourceInferenceError::AnonymousCtor(
                 anonymous_ctor::AnonymousCtorError::ExpectedTypeUnknown,
+            )) => self.application_type_unavailable(expected),
+            NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
+                record_terms::RecordTermError::ExpectedRecordType,
             )) => self.application_type_unavailable(expected),
             NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(
                 dotted_ident::DottedIdentError::ExpectedTypeUnknown { .. }

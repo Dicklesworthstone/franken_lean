@@ -2808,9 +2808,17 @@ impl Context {
                                 tasks.push(Task::RecordSource(parts, expected, sources));
                                 tasks.push(Task::Visit(syntax, None, true));
                             } else {
-                                tasks.push(Task::RecordNext(
-                                    self.start_record(parts, expected, sources)?,
-                                ));
+                                let record_expected = expected.clone();
+                                match self.start_record(parts, expected, sources) {
+                                    Ok(record) => tasks.push(Task::RecordNext(record)),
+                                    Err(problem) => {
+                                        blocked_application = self.notation_type_unavailable(
+                                            &problem,
+                                            record_expected.as_ref(),
+                                        )?;
+                                        return Err(problem);
+                                    }
+                                }
                             }
                         }
                         Task::RecordSource(parts, expected, mut sources) => {
