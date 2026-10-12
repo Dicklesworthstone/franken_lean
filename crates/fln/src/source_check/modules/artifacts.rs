@@ -232,6 +232,33 @@ impl PendingArtifact {
             });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let defaults = fln_elab::instances::defaults::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::instances::InstanceRegistryError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: meter.limits.max_work,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::instances::defaults::journal_name(),
+                    reason: "invalid default instance metadata export",
+                },
+            })?;
+        meter.work(defaults.work)?;
+        meter.bytes(defaults.bytes_examined)?;
+        for row in defaults.entries {
+            meter.work(1)?;
+            metadata
+                .defaults
+                .push(fln_olean::source_extensions::DefaultEntry {
+                    class: row.class,
+                    declaration: row.candidate.declaration,
+                    priority: row.candidate.priority,
+                });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let exported = fln_elab::reducibility::export::statuses(base, checked, remaining).map_err(
             |error| match error {
                 fln_elab::reducibility::ReducibilityError::Limit => SourceModuleCheckError::Limit {

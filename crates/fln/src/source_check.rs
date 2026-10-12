@@ -324,7 +324,7 @@ pub(crate) fn apply_module_control_command(
     control: fln_parse::command_scope::ScopeCommand,
     kernel: Budget,
     position: (usize, usize, usize),
-    public: Option<&mut modules::visibility::PublicWorld<'_>>,
+    mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
     options: &KVMap,
 ) -> Result<Outcome<()>, SourceCheckError> {
     use fln_parse::command_scope::ScopeCommand;
@@ -374,6 +374,36 @@ pub(crate) fn apply_module_control_command(
         };
         transitioned.map_err(|error| error.into_source(file, command, offset))?;
         return Ok(Outcome::Complete(()));
+    }
+    // Global default attributes export according to each candidate's visibility,
+    // including commands written in a private section or mixing both worlds.
+    if !scopes.current.exports_declaration() {
+        if let (ScopeCommand::Instance(attribute), Some(public)) = (&control, public.as_deref_mut())
+        {
+            if attribute.is_default {
+                let (file, command, offset) = position;
+                let next = instance_attributes::apply(
+                    engine.environment(),
+                    &scopes.current,
+                    attribute.clone(),
+                    file,
+                    command,
+                    offset,
+                )?;
+                return match public
+                    .publish_default_attributes(engine, next)
+                    .map_err(|error| {
+                        command_error(file, command, fln_parse::BytePos(offset), error)
+                    })? {
+                    Outcome::Complete(next) => {
+                        *engine = next;
+                        Ok(Outcome::Complete(()))
+                    }
+                    Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+                };
+            }
+        }
     }
     let Some(public) = public.filter(|_| scopes.current.exports_declaration()) else {
         return apply_control_command(

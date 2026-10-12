@@ -6806,6 +6806,9 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let default_priorities = fln_elab::source::default_instance_registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let registration = fln_elab::source::instance_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -6889,6 +6892,13 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if !default_priorities.is_empty() {
+                    admitted.engine = admitted.engine.register_checked_source_defaults(
+                        &admitted.declaration,
+                        &default_priorities,
+                    )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some((name, priority, reverse)) = simp {
@@ -7672,10 +7682,23 @@ impl Engine {
                             at: Some(original_offset),
                         })?
                         .is_some());
+            let has_inline_default =
+                matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Definition | SourceCommandKind::Example
+                ) && !fln_elab::source::default_instance_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_empty();
             if matches!(
                 parsed.kind(),
                 SourceCommandKind::Check | SourceCommandKind::Example
-            ) && !has_inline_simp
+            ) && !(has_inline_simp || has_inline_default)
             {
                 let is_example = parsed.kind() == SourceCommandKind::Example;
                 if !allow_checks && !is_example {
@@ -7748,6 +7771,7 @@ impl Engine {
                 || fln_elab::source::is_inductive(parsed.syntax())
                 || is_instance
                 || has_inline_simp
+                || has_inline_default
                 || is_noncomputable
             {
                 let admission = match grammar
@@ -8600,11 +8624,15 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .is_some()
+            || !fln_elab::source::default_instance_registration(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_empty()
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(
                     fln_elab::NatDefinitionElabError::UnexpectedSyntax {
-                        expected: "an executable definition; use check-source for instance declarations",
+                        expected: "an executable definition; use check-source for instance attributes",
                     },
                 ),
             ));

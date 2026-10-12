@@ -186,9 +186,15 @@ impl SourceScope {
                 // may explicitly retain a hidden body with no_expose; a data
                 // instance with that attribute is refused after classification.
                 // This selector only chooses the public header environment.
-            } else if kind == Some(&parser_kind(&["Command", "theorem"])) {
+            } else if kind == Some(&parser_kind(&["Command", "theorem"]))
+                || kind == Some(&parser_kind(&["Command", "axiom"]))
+            {
+                // A public axiom has only a signature. Elaborate that signature
+                // in the exported predecessor just like every public header.
                 if expose || no_expose {
-                    return Err(refused("public theorems without exposure attributes"));
+                    return Err(refused(
+                        "public theorems or axioms without exposure attributes",
+                    ));
                 }
             } else if kind == Some(&parser_kind(&["Command", "inductive"]))
                 || kind == Some(&parser_kind(&["Command", "structure"]))

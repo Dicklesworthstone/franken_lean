@@ -434,6 +434,9 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let default_priorities = fln_elab::source::default_instance_registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let registration = fln_elab::source::instance_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -521,6 +524,18 @@ impl Engine {
                     batch.local_instance = local.then_some((name, priority));
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
+                if !default_priorities.is_empty() {
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "default instance attributes require one checked declaration",
+                        });
+                    };
+                    batch.engine = batch.engine.register_checked_source_defaults(
+                        &admitted.declaration,
+                        &default_priorities,
+                    )?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
                 if let Some((name, priority, reverse)) = simp {
                     let name = scope.declaration_name(&name).map_err(|error| {
                         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
@@ -574,6 +589,39 @@ impl Engine {
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         })
+    }
+
+    /// Register defaults under the actual checked declaration identity, including
+    /// anonymous instances, private names and a public proof's safe interface.
+    pub(super) fn register_checked_source_defaults(
+        &self,
+        declaration: &Declaration,
+        priorities: &[u32],
+    ) -> Result<Self, EngineExecutionError> {
+        let name = match declaration {
+            Declaration::Defn(definition) => &definition.base.name,
+            Declaration::Thm(theorem) => &theorem.base.name,
+            Declaration::Opaque(value) if !value.is_unsafe => &value.base.name,
+            Declaration::Axiom(interface) if !interface.is_unsafe => &interface.base.name,
+            _ => {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "default instance metadata requires a checked safe declaration",
+                });
+            }
+        };
+        let mut next = self.clone();
+        for &priority in priorities {
+            next.environment =
+                fln_elab::instances::defaults::register(next.environment(), name, priority)
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ))
+                    })?;
+        }
+        Ok(next)
     }
 
     /// Metadata follows a completed admission. Native instance fallback is

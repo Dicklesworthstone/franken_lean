@@ -5,6 +5,8 @@ use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportL
 use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
 use fln_olean::source_extensions::{self, ClassEntry, DecodeLimits};
 
+#[path = "defaults.rs"]
+mod defaults;
 #[path = "instances.rs"]
 mod instances;
 

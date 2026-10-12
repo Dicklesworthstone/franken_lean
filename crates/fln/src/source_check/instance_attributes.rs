@@ -24,6 +24,14 @@ pub(super) fn apply(
             limit: MAX_DECLARATIONS,
         });
     }
+    if attribute.is_default && attribute.scoped {
+        return Err(SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message: "default instances require global registration".into(),
+        });
+    }
     if attribute.scoped && scope.namespace.is_anonymous() {
         return Err(SourceCheckError::Scope {
             file,
@@ -50,6 +58,22 @@ pub(super) fn apply(
                 offset,
                 message: format!("Unknown constant `{}`", requested.to_display_string()),
             })?;
+        if attribute.is_default {
+            next = fln_elab::instances::defaults::register(&next, &name, attribute.priority)
+                .map_err(|error| SourceCheckError::Command {
+                    file,
+                    command,
+                    offset,
+                    error: Box::new(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ),
+                    )),
+                })?;
+            continue;
+        }
         // The standalone attribute does not acquire the `instance` command's
         // implicitReducible default (Lean/ReducibilityAttrs.lean:205–220).
         // Preserve an unrecorded declaration's previous status before the

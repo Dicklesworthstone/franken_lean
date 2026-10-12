@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 const RECORD_MAGIC: &[u8] = b"fln.source-module-record/1\0";
 const RECORD_SEAL_PREFIX: &[u8] = b"fln.source-module-record-seal/1\0";
-/// More journals than an artifact-mode module can carry today (one); a bound, not a model.
+/// A bound on supported artifact journals, not a model of their current count.
 const MAX_RECORDED_EXTENSIONS: usize = 64;
 
 /// The `Domain::CacheKey` digest a source module record is stored and found under.
@@ -359,12 +359,29 @@ impl SourceModuleRecord {
         if count > MAX_RECORDED_EXTENSIONS {
             return Err(ModuleRecordRefusal::Malformed("extension count"));
         }
-        let journal = fln_elab::instances::export::journal_name().to_canonical_bytes();
+        let journals = [
+            fln_elab::instances::export::journal_name(),
+            fln_elab::instances::defaults::journal_name(),
+            fln_elab::protected_names::journal_name(),
+            fln_elab::aux_recursors::journal_name(),
+            fln_elab::reducibility::export::journal_name(),
+        ]
+        .map(|name| {
+            let bytes = name.to_canonical_bytes();
+            (name, bytes)
+        });
+        let mut seen = std::collections::BTreeSet::new();
         let mut extensions = Vec::with_capacity(count);
         for _ in 0..count {
             // An artifact-mode module can append only the journals its writer can
             // serialize; the name is checked here and the descriptor below.
-            if reader.bytes32()? != journal.as_slice() {
+            let encoded = reader.bytes32()?;
+            let journal = journals
+                .iter()
+                .find(|(_, bytes)| bytes.as_slice() == encoded)
+                .map(|(name, _)| name.clone())
+                .ok_or(ModuleRecordRefusal::Extension)?;
+            if !seen.insert(journal.clone()) {
                 return Err(ModuleRecordRefusal::Extension);
             }
             let merge = match reader.u8()? {
@@ -384,12 +401,12 @@ impl SourceModuleRecord {
                 _ => return Err(ModuleRecordRefusal::Malformed("provenance")),
             };
             let descriptor = ExtensionDescriptor {
-                name: fln_elab::instances::export::journal_name(),
+                name: journal,
                 merge,
                 checkpoint,
                 provenance,
             };
-            if !fln_elab::instances::export::supports(&descriptor) {
+            if !super::replay::supports_artifact_extension(&descriptor) {
                 return Err(ModuleRecordRefusal::Extension);
             }
             let rows = usize::try_from(reader.u32()?)
@@ -818,6 +835,87 @@ mod tests {
 
     fn checker(label: &[u8]) -> CheckerIdentity {
         CheckerIdentity::of_executable(label)
+    }
+
+    #[test]
+    fn default_journals_replay_across_persisted_diamond_builds() {
+        let graph = [
+            (
+                "Base",
+                "prelude\ninductive First where | mk\ninductive Second where | mk\nclass Choice (A : Type) where\n  value : A\n@[default_instance] def firstChoice : Choice First := Choice.mk First.mk\ndef secondChoice : Choice Second := Choice.mk Second.mk",
+            ),
+            (
+                "Left",
+                "prelude\nimport Base\nattribute [default_instance] secondChoice\nattribute [default_instance] secondChoice",
+            ),
+            ("Right", "prelude\nimport Base"),
+            (
+                "Main",
+                "prelude\nimport Left\nimport Right\ndef bare := Choice.value\ndef inferred := let value : _ := Choice.value; value\ndef selected (P : Second -> Prop) (h : P Second.mk) : P inferred := h",
+            ),
+        ];
+        let store = Memory::default();
+        let identity = checker(b"default-instance-replay");
+        let run = || {
+            compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+                .unwrap()
+                .into_complete()
+                .unwrap()
+        };
+        let cold = run();
+        assert_eq!((cold.elaborated_modules, cold.persisted_modules), (4, 0));
+        let warm = run();
+        assert_eq!((warm.elaborated_modules, warm.persisted_modules), (0, 4));
+        assert_eq!(products(&warm), products(&cold));
+        assert_eq!(
+            warm.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
+        );
+        let env = warm.checked.checked.engine.environment();
+        assert!(matches!(
+            env.find(&n("bare")).unwrap().constant_val().type_.node(),
+            fln_core::expr::ExprNode::ForallE {
+                binder_info: fln_core::expr::BinderInfo::Implicit,
+                ..
+            }
+        ));
+        assert_eq!(
+            env.find(&n("inferred")).unwrap().constant_val().type_,
+            fln_core::expr::Expr::const_(n("Second"), vec![])
+        );
+        let defaults = fln_elab::instances::defaults::read(env).unwrap();
+        assert_eq!(defaults.len(), 3);
+        assert_eq!(defaults[0].candidate.declaration, n("secondChoice"));
+        assert_eq!(defaults[1].candidate.declaration, n("secondChoice"));
+        assert_eq!(defaults[0].candidate.order, 2);
+        assert_eq!(defaults[1].candidate.order, 1);
+
+        // A cached row gets exactly its registered descriptor and one journal
+        // slot. Familiar names do not authorize altered merge semantics or a
+        // second journal section containing another copy of the same suffix.
+        let key = key_of(&cold, "Left");
+        let original = SourceModuleRecord::parse(
+            &store.load(key).unwrap().unwrap(),
+            key,
+            identity,
+            &n("Left"),
+        )
+        .unwrap();
+        let index = original
+            .extensions
+            .iter()
+            .position(|row| row.descriptor.name == fln_elab::instances::defaults::journal_name())
+            .unwrap();
+        let mut altered = original.clone();
+        altered.extensions[index].descriptor.merge = MergeSemantics::SetUnion;
+        let mut repeated = original.clone();
+        repeated.extensions.push(original.extensions[index].clone());
+        for record in [altered, repeated] {
+            assert!(matches!(
+                SourceModuleRecord::parse(&record.to_bytes(), key, identity, &n("Left")),
+                Err(ModuleRecordRefusal::Extension)
+            ));
+        }
     }
 
     /// A record a frontier session wrote never answers a default lookup: frontier admits

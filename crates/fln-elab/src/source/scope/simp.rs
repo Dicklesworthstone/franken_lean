@@ -20,7 +20,7 @@ pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
 /// A `prio` tree's value: a decimal numeral, `default`/`low`/`mid`/`high` (1000, 100, 500 and
 /// 10000, vendored `src/Init/Notation.lean`), or either in parentheses. Priority arithmetic and
 /// other radixes are refused.
-fn priority_value(
+pub(in crate::source) fn priority_value(
     priority: &fln_syntax::tree::Syntax,
 ) -> Result<u32, crate::NatDefinitionElabError> {
     use super::super::*;
@@ -259,10 +259,13 @@ pub fn registration(
         7,
         "declaration modifiers",
     )?;
+    instance_command::default_registration(syntax)?;
     let mut simp = None;
     let mut inlining = false;
     for attribute in super::visibility::attributes(&modifiers[1])? {
-        if super::visibility::exposure_attribute(attribute)?.is_some() {
+        if super::visibility::exposure_attribute(attribute)?.is_some()
+            || instance_command::default_attribute(attribute)?.is_some()
+        {
             continue;
         }
         if let Some(requires_definition) = compiler_hint(attribute)? {

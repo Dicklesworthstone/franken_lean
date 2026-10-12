@@ -5430,6 +5430,12 @@ pub fn instance_registration(
     instance_command::registration(syntax)
 }
 
+/// Chronological global default-instance priorities requested by a declaration.
+/// Apply these only to the actual name returned by ordinary checked admission.
+pub fn default_instance_registration(syntax: &Syntax) -> Result<Vec<u32>, NatDefinitionElabError> {
+    instance_command::default_registration(syntax)
+}
+
 /// Whether an instance command requests namespace-scoped registration. Read
 /// alongside [`instance_registration`]; after admission, register in the current
 /// source namespace, which need not be the qualified declaration name's parent.

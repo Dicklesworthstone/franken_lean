@@ -184,6 +184,98 @@ impl<'a> PublicWorld<'a> {
         Ok(Outcome::Complete(()))
     }
 
+    /// Publish the public subset of an already staged global default attribute.
+    /// The private journal keeps its complete source order; replaying the public
+    /// subset into it would duplicate registrations and change equal priorities.
+    pub(crate) fn publish_default_attributes(
+        &mut self,
+        private: &Engine,
+        next_private: Environment,
+    ) -> Result<Outcome<Engine>, EngineExecutionError> {
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-module/default-attributes",
+            )));
+        }
+        let remaining = self.meter.limits.max_work.saturating_sub(self.meter.work);
+        let registrations = fln_elab::instances::defaults::registrations(
+            private.environment(),
+            &next_private,
+            remaining,
+        )
+        .map_err(|error| {
+            execution_error(match error {
+                fln_elab::instances::InstanceRegistryError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: self.meter.limits.max_work,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: self.module.clone(),
+                    extension: fln_elab::instances::defaults::journal_name(),
+                    reason: "default attributes must extend the checked predecessor journal",
+                },
+            })
+        })?;
+        self.meter
+            .work(registrations.work)
+            .map_err(execution_error)?;
+        self.meter
+            .bytes(registrations.bytes_examined)
+            .map_err(execution_error)?;
+        let mut next_public = self.engine.clone();
+        for registration in registrations.entries {
+            self.meter.work(1).map_err(execution_error)?;
+            if self
+                .cancellation
+                .is_some_and(CancellationProbe::is_cancelled)
+            {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "source-module/default-attributes",
+                )));
+            }
+            let candidate = &registration.candidate;
+            if next_public.environment().contains(&candidate.declaration) {
+                next_public.environment = fln_elab::instances::defaults::register(
+                    next_public.environment(),
+                    &candidate.declaration,
+                    candidate.priority,
+                )
+                .map_err(|error| {
+                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                        ),
+                    ))
+                })?;
+            }
+        }
+        replay::Export::capture(
+            &self.module,
+            self.engine.environment(),
+            next_public.environment(),
+            Vec::new(),
+            self.meter,
+        )
+        .map_err(execution_error)?;
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-module/default-attributes",
+            )));
+        }
+        let mut next = private.clone();
+        next.environment = next_private;
+        self.engine = next_public;
+        Ok(Outcome::Complete(next))
+    }
+
     /// Publish one successfully checked public command in both worlds. A failure
     /// in name collision checking, replay or metadata leaves this receipt intact.
     pub(crate) fn publish(

@@ -35,7 +35,7 @@ pub(super) struct Metadata {
     pub instances: BTreeMap<Name, InstanceParameters>,
 }
 
-fn name() -> Name {
+pub(super) fn name() -> Name {
     Name::from_components(["FrankenLean", "importedInstances", "v2"])
 }
 fn descriptor() -> ExtensionDescriptor {
@@ -427,7 +427,7 @@ pub fn register_instance(
 pub struct ImportActivation {
     env: Environment,
     registry: Option<(InstanceRegistry, super::Positions)>,
-    defaults: Option<Vec<Name>>,
+    defaults: Option<usize>,
 }
 
 /// The ordinary registry as [`InstanceRegistry::read`] would find it in `env`,
@@ -549,20 +549,12 @@ impl ImportActivation {
     ) -> Result<Self, InstanceRegistryError> {
         let existing = match &mut self.defaults {
             Some(existing) => existing,
-            None => self.defaults.insert(
-                super::defaults::read(&self.env)?
-                    .into_iter()
-                    .map(|row| row.candidate.declaration)
-                    .collect(),
-            ),
+            None => self
+                .defaults
+                .insert(super::defaults::read(&self.env)?.len()),
         };
-        if existing.len() >= MAX_ROWS {
+        if *existing >= MAX_ROWS {
             return Err(InstanceRegistryError::Limit);
-        }
-        if existing.contains(declaration) {
-            return Err(InstanceRegistryError::DuplicateInstance(
-                declaration.clone(),
-            ));
         }
         let class = validate_instance(&self.env, declaration)?;
         let (registry, _) = kept(&mut self.registry, &self.env)?;
@@ -570,7 +562,7 @@ impl ImportActivation {
             return Err(InstanceRegistryError::UnknownClass(class));
         }
         self.env = super::defaults::append(&self.env, declaration, priority)?;
-        existing.push(declaration.clone());
+        *existing += 1;
         Ok(self)
     }
 

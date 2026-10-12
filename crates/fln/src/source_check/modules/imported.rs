@@ -1652,7 +1652,19 @@ pub(super) mod tests {
                     }),
                 ),
                 (
-                    "a default candidate registered twice",
+                    "a non-instance declaration registered as a default",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("Nat.add");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_default(&declaration, 100)
+                            }),
+                            outcome::<Sequential>(env, |r| r.register_default(&declaration, 100)),
+                        )
+                    }),
+                ),
+                (
+                    "a default candidate registered twice is preserved",
                     Box::new(|env: &Environment| {
                         let declaration = n("instInhabitedNat");
                         (
@@ -1695,7 +1707,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 refused, 3,
-                "three planted rows are refused, the control is not"
+                "three invalid rows are refused; ordinary upserts and repeated defaults succeed"
             );
         });
     }

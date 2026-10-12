@@ -5,9 +5,12 @@
 //! arrays and records share the module's object and byte budgets.
 use super::*;
 use crate::source_extension_format as layout;
-use crate::source_extensions::{ClassEntry, InstanceEntry, InstanceKey, ReducibilityEntry};
+use crate::source_extensions::{
+    ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
+};
 use std::collections::HashSet;
 
+mod defaults;
 mod instances;
 mod namespaces;
 mod reducibility;
@@ -17,6 +20,9 @@ pub struct SourceMetadata {
     pub classes: Vec<ClassEntry>,
     /// Chronological global/scoped entries, retaining repeated priority updates.
     pub instances: Vec<InstanceEntry>,
+    /// Chronological module-owned defaults, preserving repeated registrations
+    /// and rows for candidates whose declarations belong to imported modules.
+    pub defaults: Vec<DefaultEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
     /// entries, one `Name` each. They are written sorted by `Name.quickLt`, the
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
@@ -92,6 +98,9 @@ impl Encoder {
         }
         if !metadata.instances.is_empty() {
             blocks.push(self.instance_block(&metadata.instances)?);
+        }
+        if !metadata.defaults.is_empty() {
+            blocks.push(self.default_block(&metadata.defaults)?);
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.tagged_names_block(

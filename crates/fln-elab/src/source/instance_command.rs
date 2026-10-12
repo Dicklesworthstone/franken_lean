@@ -274,3 +274,79 @@ pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDe
     }
     Ok(Some((val.clone(), parts.priority)))
 }
+
+pub(super) fn default_attribute(attribute: &Syntax) -> Result<Option<u32>, NatDefinitionElabError> {
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    if !matches!(&instance[1], Syntax::Node { kind, .. }
+        if kind == &parser_kind(&["Attr", "default_instance"]))
+    {
+        return Ok(None);
+    }
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "default instance attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global default instance attribute")?;
+    let parts = expect_node(
+        &instance[1],
+        &parser_kind(&["Attr", "default_instance"]),
+        2,
+        "default instance attribute",
+    )?;
+    expect_atom(
+        &parts[0],
+        "default_instance",
+        "default instance attribute keyword",
+    )?;
+    Ok(Some(
+        match expect_null_args(&parts[1], "default instance priority")? {
+            [] => 1000,
+            [priority] => scope::simp::priority_value(priority)?,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "one default instance priority",
+                });
+            }
+        },
+    ))
+}
+
+/// Attribute order is persistent: registering the same declaration again does
+/// not erase an earlier, higher-priority default candidate.
+pub(super) fn default_registration(syntax: &Syntax) -> Result<Vec<u32>, NatDefinitionElabError> {
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    let mut priorities = Vec::new();
+    for attribute in scope::visibility::attributes(&modifiers[1])? {
+        if let Some(priority) = default_attribute(attribute)? {
+            priorities.push(priority);
+        }
+    }
+    if !priorities.is_empty()
+        && !matches!(&declaration[1], Syntax::Node { kind, .. }
+            if ["definition", "theorem", "instance", "abbrev", "opaque", "axiom"]
+                .iter().any(|command| kind == &parser_kind(&["Command", command])))
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a persistent declaration for default instance registration",
+        });
+    }
+    Ok(priorities)
+}
