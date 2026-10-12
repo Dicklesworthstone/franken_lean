@@ -618,9 +618,14 @@ fn generic_in(
 ) -> Option<ScopeCommand> {
     let explicit_open = keyword == "open"
         && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(");
-    // `attribute [a] x in …` is not one: the pin refuses a global attribute there ("Despite the
-    // `in`, the attribute … is added globally"), and only `local`/`scoped` ones may scope to it.
-    if !matches!(keyword, "variable" | "universe" | "include" | "omit") && !explicit_open {
+    // A global `attribute [a] x in …` is not one: the pin refuses it ("Despite the `in`, the
+    // attribute … is added globally"). A `local` one scopes to the body.
+    let local_attribute = keyword == "attribute"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "local");
+    if !matches!(keyword, "variable" | "universe" | "include" | "omit")
+        && !explicit_open
+        && !local_attribute
+    {
         return None;
     }
     let mut depth = 0usize;

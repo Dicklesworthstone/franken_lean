@@ -1,5 +1,6 @@
-//! Global and namespace-scoped instance attributes and global default candidates.
-//! Local attributes and erasure are not approximated as persistent registrations.
+//! Global, namespace-scoped and local instance attributes, and global default candidates. A local
+//! instance is never a persistent registration: it holds until the enclosing scope ends. Erasure
+//! is not read.
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,6 +9,8 @@ pub struct InstanceAttribute {
     pub priority: u32,
     pub scoped: bool,
     pub is_default: bool,
+    /// `attribute [local instance] x`: selected until the enclosing `section`/`namespace` ends.
+    pub local: bool,
 }
 
 /// Inspect the existing scope-command token stream, preserving original source
@@ -33,7 +36,8 @@ pub(super) fn parse(
         at: original_position(view, tokens, at),
         expected: NatDefinitionExpectation::EndOfCommand,
     };
-    if local || (is_default && scoped) {
+    // A local or scoped default instance is not read; a local instance is.
+    if is_default && (local || scoped) {
         return Err(bad(2));
     }
     let mut at = keyword + 1;
@@ -99,6 +103,7 @@ pub(super) fn parse(
         priority,
         scoped,
         is_default,
+        local,
     }))
 }
 
@@ -218,7 +223,6 @@ mod tests {
             "attribute [instance] d in",
             "attribute [instance] d := 0",
             "attribute [instance] d [simp]",
-            "attribute [local instance] d",
             "attribute [scoped instance]",
             "attribute [scoped instance 4294967296] d",
             "attribute [scoped instance, simp] d",
@@ -228,6 +232,16 @@ mod tests {
         ] {
             assert!(parse_command(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    /// `local` (`attrKind`) is read beside `scoped`; `scoped local` is no kind.
+    #[test]
+    fn a_local_instance_attribute_is_read() {
+        let local = attribute("attribute [local instance 2000] d e");
+        assert!(local.local && !local.scoped);
+        assert_eq!(local.priority, 2000);
+        assert_eq!(local.declarations.len(), 2);
+        assert!(!attribute("attribute [instance] d").local);
     }
 
     #[test]
