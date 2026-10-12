@@ -4534,6 +4534,9 @@ impl Engine {
     fn base_source_scope(&self) -> fln_elab::source::scope::SourceScope {
         fln_elab::source::scope::SourceScope {
             frontier_recursors: self.mode.permits_frontier(),
+            arithmetic: Some(fln_elab::arithmetic::ArithmeticProvider(
+                fln_anvil::omega::solve,
+            )),
             ..fln_elab::source::scope::SourceScope::default()
         }
     }
@@ -7233,7 +7236,7 @@ impl Engine {
         }
         let mut file_base = engine.environment.clone();
         let mut file_starts = file_starts.iter().copied().peekable();
-        let mut scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+        let mut scopes = source_check::scopes::Scopes::new(&engine);
         scopes.current.private_module = private_module.cloned();
         // The syntax a file declares extends the grammar of its commands after it
         // (`source_check::grammar`). The stream was partitioned before any of it was declared.
@@ -7286,7 +7289,7 @@ impl Engine {
             if file_starts.peek() == Some(&command_index) {
                 file_starts.next();
                 file_base = engine.environment.clone();
-                scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+                scopes = source_check::scopes::Scopes::new(&engine);
                 scopes.current.private_module = private_module.cloned();
                 grammar = source_check::grammar::SourceGrammar::for_engine(
                     &engine,

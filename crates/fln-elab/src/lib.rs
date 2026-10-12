@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aliases;
+pub mod arithmetic;
 pub mod aux_recursors;
 pub mod constraint;
 pub mod dataflow;

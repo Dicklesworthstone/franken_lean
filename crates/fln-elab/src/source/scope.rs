@@ -33,6 +33,9 @@ pub struct SourceScope {
     /// a recursor the pin's code generator refuses (`codegen.rs`, bead
     /// `franken_lean-z8j.1.6.6`). Not a lexical scope; every command inherits it.
     pub frontier_recursors: bool,
+    /// The embedding engine's untrusted arithmetic accelerator. This capability
+    /// is inherited by lexical scopes but is never exported as module metadata.
+    pub arithmetic: Option<crate::arithmetic::ArithmeticProvider>,
     /// Options `set_option` set and [`options::admit`] honors, until the end of the enclosing
     /// section or namespace. Every elaboration in this scope starts with them.
     pub options: KVMap,
@@ -736,6 +739,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             frontier_recursors: false,
+            arithmetic: None,
             options: KVMap::new(),
         };
         let env = [
@@ -925,6 +929,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             frontier_recursors: false,
+            arithmetic: None,
             options: KVMap::new(),
         };
         let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
@@ -997,6 +1002,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             frontier_recursors: false,
+            arithmetic: None,
             options: KVMap::new(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];

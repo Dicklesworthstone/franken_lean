@@ -116,6 +116,7 @@ pub enum SourceInferenceError {
     /// may unfold definitions that this query must keep opaque.
     ConversionRefused(Box<Verdict>),
     Tactic(tactics::TacticError),
+    ArithmeticInconclusive(Box<fln_core::outcome::Inconclusive>),
     UnresolvedHoles {
         count: usize,
     },
@@ -335,6 +336,9 @@ impl std::fmt::Display for SourceInferenceError {
                 write!(f, "source application requires a function type")
             }
             Self::Tactic(error) => write!(f, "{error}"),
+            Self::ArithmeticInconclusive(reason) => {
+                write!(f, "omega did not complete: {:?}", reason.cause)
+            }
             Self::Record(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
                 write!(f, "source type obligation failed: {outcome:?}")

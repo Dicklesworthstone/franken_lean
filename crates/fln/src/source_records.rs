@@ -67,6 +67,11 @@ pub(crate) fn elaboration_outcome<T>(
         Ok(value) => return Ok(Outcome::Complete(value)),
         Err(error) => error,
     };
+    if let NatDefinitionElabError::Inference(SourceInferenceError::ArithmeticInconclusive(reason)) =
+        &error
+    {
+        return Ok(Outcome::Inconclusive((**reason).clone()));
+    }
     let kernel = match &error {
         NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)) => {
             Some(outcome.as_ref())

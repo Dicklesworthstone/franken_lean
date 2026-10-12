@@ -26,7 +26,7 @@ impl<'a> PublicWorld<'a> {
         let scope = fln_elab::source::scope::SourceScope {
             private_module: Some(module.clone()),
             frontier_recursors: engine.mode().permits_frontier(),
-            ..Default::default()
+            ..engine.base_source_scope()
         };
         Self {
             module: module.clone(),

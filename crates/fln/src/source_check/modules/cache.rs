@@ -630,6 +630,12 @@ pub(super) fn run_collecting(
             }
             if let Some(hit) = recorded {
                 artifacts.push(Arc::clone(&hit.artifact));
+                let scope = fln_elab::source::scope::SourceScope {
+                    private_module: plan.headers[index]
+                        .module_system
+                        .then(|| module.name.clone()),
+                    ..hit.engine.base_source_scope()
+                };
                 let checked = SourceFileCheck {
                     engine: hit.engine.clone(),
                     files: 1,
@@ -637,7 +643,7 @@ pub(super) fn run_collecting(
                     theorems: hit.theorems,
                     base_logical_root: hit.base_root,
                     result_logical_root: hit.result_root,
-                    scope: fln_elab::source::scope::SourceScope::default(),
+                    scope: scope.clone(),
                 };
                 if cache.is_some() {
                     let stamp = Arc::new(());
@@ -660,7 +666,7 @@ pub(super) fn run_collecting(
                                 result_root: hit.result_root,
                                 work: meter.work - before_work,
                                 bytes: meter.bytes - before_bytes,
-                                scope: fln_elab::source::scope::SourceScope::default(),
+                                scope,
                             }),
                         );
                         retained_bytes += module.source.len();
@@ -723,7 +729,7 @@ pub(super) fn run_collecting(
                         result_logical_root: root,
                         scope: fln_elab::source::scope::SourceScope {
                             private_module: header.module_system.then(|| module.name.clone()),
-                            ..Default::default()
+                            ..imported.base_source_scope()
                         },
                     }))
                 } else {

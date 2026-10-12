@@ -17,6 +17,7 @@ mod decision;
 pub(in crate::source) mod eliminate;
 mod equality;
 mod index_equations;
+mod omega;
 mod refine;
 mod relations;
 mod rewrite;
@@ -83,6 +84,9 @@ pub enum TacticError {
     },
     ConstructorEquality,
     NoContradiction,
+    ArithmeticUnsupported,
+    ArithmeticNoContradiction,
+    ArithmeticInvalidCertificate,
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,6 +177,14 @@ impl std::fmt::Display for TacticError {
                 "constructor equality has no supported injective fields or contradiction"
             ),
             Self::NoContradiction => write!(f, "no supported contradictory evidence was found"),
+            Self::ArithmeticUnsupported => write!(
+                f,
+                "omega requires its native provider and checked Init.Omega declarations"
+            ),
+            Self::ArithmeticNoContradiction => write!(f, "omega could not prove the goal"),
+            Self::ArithmeticInvalidCertificate => {
+                write!(f, "native arithmetic returned an invalid certificate")
+            }
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
         }
     }
@@ -1038,6 +1050,13 @@ impl Context {
                     goal,
                     apply: false,
                 });
+            } else if kind == &parser_kind(&["Tactic", "omega"]) {
+                let [keyword, config] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "omega", "linear arithmetic tactic")?;
+                expect_default_config(config, "omega configuration")?;
+                self.omega_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
                 let [keyword, star, config, only, arguments, using] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

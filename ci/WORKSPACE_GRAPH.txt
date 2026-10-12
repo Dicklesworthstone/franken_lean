@@ -71,6 +71,7 @@ edge fln-conformance -> fln-parse  # G0-4 syntax fidelity spike drives real Prat
 edge fln-conformance -> fln-server # diagnostic LSP projection conformance (franken_lean-wlan)
 edge fln-conformance -> fln-syntax # G0-4 syntax fidelity spike binds lexer, trivia, SourceInfo, and tree identity (franken_lean-hly)
 edge fln -> fln-checker            # independent checker veto on embeddable definition publication
+edge fln -> fln-anvil              # native arithmetic provider; source proofs replay through ordinary admission (fln-7kv)
 edge fln -> fln-core               # embeddable typed diagnostic projection (franken_lean-wlan)
 edge fln -> fln-comp               # bounded checked-source to canonical FLBC facade (franken_lean-7kc)
 edge fln -> fln-elab               # bounded checked-source elaboration facade (franken_lean-7kc)
@@ -148,6 +149,8 @@ edge fln-vm -> fln-hash            # inline-cache namespaces bind canonical FLBC
 edge fln-vm -> fln-libm            # Float/Float32 unary-math and pow/atan2 extern rows execute on the owned deterministic numerics plane (§6.8, D21)
 edge fln-vm -> fln-rt              # every live FLBC register is an owned Marrow Obj handle (franken_lean-zoe prototype handoff)
 edge fln-anvil -> fln-core         # simp/egraph/grind types reference canonical Name and Expr (§12, rank 14 -> 0)
+edge fln-anvil -> fln-bignum       # arbitrary-precision coefficient arithmetic and certificate checking (fln-7kv)
+edge fln-anvil -> fln-elab         # untrusted arithmetic provider protocol; no upward elaborator dependency (fln-7kv)
 edge fln-anvil -> fln-env          # rewrite indexes consult the environment for transparency and unfolding (§12.1, rank 14 -> 4)
 edge fln-ledger -> fln-core        # content-addressed records reference declaration Name and Mode (§13, rank 15 -> 0)
 edge fln-ledger -> fln-hash        # CAS keys, logical roots, and epoch digests (§13.1, rank 15 -> 1)

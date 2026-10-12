@@ -299,8 +299,7 @@ impl Context {
                 name,
                 parameters,
                 &varying,
-                syntax,
-                expected.clone(),
+                (syntax, expected.clone()),
                 hint,
                 header_parameters,
             )?;
@@ -329,8 +328,7 @@ impl Context {
         name: &Name,
         parameters: &[LocalDecl],
         varying: &[usize],
-        syntax: &Syntax,
-        expected: Option<Expr>,
+        (syntax, expected): (&Syntax, Option<Expr>),
         hint: &Hint<'_>,
         header_parameters: usize,
     ) -> Result<Attempt, NatDefinitionElabError> {

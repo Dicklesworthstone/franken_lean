@@ -109,7 +109,9 @@ impl<'a> Checkpoint<'a> {
 pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
     match problem {
         NatDefinitionElabError::Inference(SourceInferenceError::Tactic(reason)) => {
-            !matches!(reason, TacticError::MalformedScript)
+            !matches!(reason, TacticError::MalformedScript
+                | TacticError::ArithmeticUnsupported
+                | TacticError::ArithmeticInvalidCertificate)
         }
         // With a known expected type, these are ordinary elaboration errors.
         // An unknown-type suspension is routed to its owning argument before

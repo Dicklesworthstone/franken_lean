@@ -141,6 +141,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
+            SourceInferenceError::ArithmeticInconclusive(_) => ("inconclusive", false, 3),
             SourceInferenceError::EvaluationPrinting(_) => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
@@ -443,12 +444,12 @@ impl Engine {
         let mut engine = self.clone();
         let mut count = 0;
         let mut theorems = 0;
-        let mut final_scope = fln_elab::source::scope::SourceScope::default();
+        let mut final_scope = engine.base_source_scope();
         for (file, source) in sources.iter().enumerate() {
             // Global reducibility attributes may change only definitions authored
             // in this file, never declarations supplied by its predecessor.
             let file_base = engine.environment.clone();
-            let mut scopes = scopes::Scopes::new(engine.environment(), engine.mode());
+            let mut scopes = scopes::Scopes::new(&engine);
             scopes.current.private_module = private_module.cloned();
             // The syntax this file declares extends the grammar of what follows it.
             let mut grammar = grammar::SourceGrammar::for_engine(
