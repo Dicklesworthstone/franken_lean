@@ -753,11 +753,11 @@ jobs:
       - name: Compare all 43 Array probes with the exact pinned Lean oracle
         run: python3 crates/fln/tests/source_imported_arrays/check_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
 
-  mutable-return-oracle:
+  mutable-loop-returns:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): observe pinned mutable-return effects before freezing native probes'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): check mutable loop returns against all pinned effect traces'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read
     env:
@@ -767,26 +767,79 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '0f8c98a8ffd321d3c21b4401423db02468b1532b'
+      CANDIDATE_SHA: '5c9f17b4dad88775434bc16f913a222b950392f5'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '0f8c98a8ffd321d3c21b4401423db02468b1532b'
+          ref: '5c9f17b4dad88775434bc16f913a222b950392f5'
           persist-credentials: false
-      - name: Verify candidate and install the exact Reference
+      - name: Verify candidate and install the exact compiler and Reference
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
           curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
           echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
           tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
-          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control Init/Data/String/Defs; do
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
             for suffix in olean olean.server olean.private; do
               test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
             done
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
-      - name: Observe mutable-return control flow and exact user-monad sequencing
-        run: python3 crates/fln/tests/source_do/for_loops/observe_mutable_returns_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+
+      - name: Format the complete mutable-return candidate and retain its exact bytes
+        id: mutable-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/loop_returns.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/returns.rs
+            crates/fln-elab/src/source/do_notation.rs
+            crates/fln-elab/src/source/do_notation/for_loop.rs
+            crates/fln/tests/source_do/for_loops.rs
+            crates/fln/tests/source_do/for_loops/mutable_returns.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/loop_returns.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/returns.rs
+            crates/fln-elab/src/source/do_notation.rs
+            crates/fln-elab/src/source/do_notation/for_loop.rs
+            crates/fln/tests/source_do/for_loops.rs
+            crates/fln/tests/source_do/for_loops/mutable_returns.rs
+            crates/fln/tests/source_do/for_loops/mutable_returns.lean
+            crates/fln/tests/source_do/for_loops/mutable_returns.expected.tsv
+            crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_MUTABLE_RETURN_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_MUTABLE_RETURN_RUSTFMT_DIFF_END
+          echo FLN_MUTABLE_RETURN_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_MUTABLE_RETURN_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Require all 29 exact pinned mutable-return values and effect traces
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: python3 crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+      - name: Execute every mutable-return probe and independently replay its FLBC
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_do for_loops::mutable_returns -- --nocapture --test-threads=1
+      - name: Check mutable-return production and focused fixture targets
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: |
+          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln --test source_do -- -D warnings
