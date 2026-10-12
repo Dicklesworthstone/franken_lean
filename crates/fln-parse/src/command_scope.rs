@@ -40,6 +40,14 @@ pub enum ScopeCommand {
         scoped: bool,
         body: usize,
     },
+    /// `<command> in <command>` (`Lean.Parser.Command.in`) for any other head the partition joins
+    /// (`variable`, `universe`, `include`, `omit`, an explicit `open Ns (a)`): the
+    /// pin's macro elaborates it as `section <head> <body> end`. `head` is where the head command's
+    /// own source ends (the `in`), and `body` is as in [`ScopeCommand::OpenIn`].
+    In {
+        head: usize,
+        body: usize,
+    },
     /// `set_option <name> <value>` (`Lean.Parser.Command.«set_option»`): the option holds to the
     /// end of the enclosing `section` or `namespace`. `value` is the pin's `optionValue` (`true`,
     /// `false`, a string or a numeral) as read; whether it is admitted is the option table's
@@ -511,6 +519,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     {
         return Ok(Some(section));
     }
+    if let Some(command) = generic_in(&view, &tokens, keyword, source.len()) {
+        return Ok(Some(command));
+    }
     if keyword == "variable" {
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
     }
@@ -595,6 +606,41 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         _ => return Err(bad(1)),
     };
     Ok(Some(command))
+}
+
+/// `<head> in <body>` for the heads [`ScopeCommand::In`] covers: the first `in` outside brackets,
+/// with a command after it. `open Ns in …` and `set_option … in …` keep their own forms.
+fn generic_in(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: &str,
+    end: usize,
+) -> Option<ScopeCommand> {
+    let explicit_open = keyword == "open"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(");
+    // `attribute [a] x in …` is not one: the pin refuses a global attribute there ("Despite the
+    // `in`, the attribute … is added globally"), and only `local`/`scoped` ones may scope to it.
+    if !matches!(keyword, "variable" | "universe" | "include" | "omit") && !explicit_open {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        let TokenKind::Symbol(symbol) = &token.kind else {
+            continue;
+        };
+        match crate::canonical_bracket(symbol.as_str()) {
+            "(" | "[" | "{" | ".{" | "⦃" | "⟨" | "@[" => depth += 1,
+            ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+            "in" if depth == 0 => {
+                let body = tokens.get(index + 1)?;
+                let head = view.to_original(token.extent.start()).0;
+                let body = view.to_original(body.extent.start()).0;
+                return (head < body && body < end).then_some(ScopeCommand::In { head, body });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The body boundary of a temporary command scope. This query reads only an
@@ -923,7 +969,13 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                     current_open = scope_start
                         && matches!(
                             symbol.as_str(),
-                            "open" | "set_option" | "attribute" | "variable" | "omit" | "include"
+                            "open"
+                                | "set_option"
+                                | "attribute"
+                                | "variable"
+                                | "omit"
+                                | "include"
+                                | "universe"
                         );
                     prefix_column = inline_start.then(|| column(token));
                 }

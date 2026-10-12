@@ -548,6 +548,15 @@ impl Engine {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
                         continue;
                     }
+                    if let fln_parse::command_scope::ScopeCommand::In { head, body } = control {
+                        for step in in_command_steps(start, command, head, body)
+                            .into_iter()
+                            .rev()
+                        {
+                            queue.push_front(step);
+                        }
+                        continue;
+                    }
                     let expanded = match control {
                         fln_parse::command_scope::ScopeCommand::OpenIn {
                             names,
@@ -741,7 +750,8 @@ pub fn preflight_source_files(sources: &[&[u8]]) -> Result<(), SourceCheckError>
                     Some(
                         fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
                         | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::GuardMsgs { body, .. },
+                        | fln_parse::command_scope::ScopeCommand::GuardMsgs { body, .. }
+                        | fln_parse::command_scope::ScopeCommand::In { body, .. },
                     ) => {
                         start = fln_parse::BytePos(start.0 + body);
                         command = &command[body..];
@@ -823,6 +833,23 @@ fn in_steps<'source>(
     [
         SourceStep::Scope(start, ScopeCommand::Section(None)),
         SourceStep::Scope(start, scope),
+        SourceStep::Command((fln_parse::BytePos(start.0 + body), &command[body..])),
+        SourceStep::Scope(start, ScopeCommand::End(None)),
+    ]
+}
+
+/// `<head> in <body>` (`Lean.Parser.Command.in`): the pin's `section <head> <body> end`, each
+/// command at its own offset.
+fn in_command_steps<'source>(
+    start: fln_parse::BytePos,
+    command: &'source [u8],
+    head: usize,
+    body: usize,
+) -> [SourceStep<'source>; 4] {
+    use fln_parse::command_scope::ScopeCommand;
+    [
+        SourceStep::Scope(start, ScopeCommand::Section(None)),
+        SourceStep::Command((start, &command[..head])),
         SourceStep::Command((fln_parse::BytePos(start.0 + body), &command[body..])),
         SourceStep::Scope(start, ScopeCommand::End(None)),
     ]

@@ -161,6 +161,15 @@ fn check_command(
                 )));
                 continue;
             }
+            Some(ScopeCommand::In { head, body }) => {
+                for step in crate::source_check::in_command_steps(at, source, head, body)
+                    .into_iter()
+                    .rev()
+                {
+                    queue.push_front(step);
+                }
+                continue;
+            }
             Some(scope) => {
                 grammar.observe(&scope);
                 continue;
