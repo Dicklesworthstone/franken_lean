@@ -10,14 +10,14 @@
 # Fixing a divergence changes the observed outcome, so its row must be updated in the same change.
 crates/fln-cli/tests/fixtures/source_ladder/eval_and_check_output.lean	accept	accept	match	agree	
 crates/fln-cli/tests/fixtures/source_ladder/example_by_decide.lean	accept	accept	match	agree	anonymous example checks in a discarded council successor
-crates/fln-cli/tests/fixtures/source_ladder/induction_rw.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/induction_rw.lean	accept	accept	match	agree	both doors accept with the pin's output (observed by the pin-gated differential at 98a3ec92 and d81da668, 2026-10-12; already in runs of 2026-10-11)
 crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean	accept	accept	match	agree	dotted constructors (Term.dotIdent) and the recursive field-notation call l.size now elaborate (franken_lean-z8j.1.10)
-crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
-crates/fln-cli/tests/fixtures/source_ladder/io_main.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean	accept	accept	match	agree	both doors accept with the pin's output (observed by the pin-gated differential at 98a3ec92 and d81da668, 2026-10-12; already in runs of 2026-10-11)
+crates/fln-cli/tests/fixtures/source_ladder/io_main.lean	accept	accept	match	agree	both doors accept with the pin's output (observed by the pin-gated differential at 98a3ec92 and d81da668, 2026-10-12; already in runs of 2026-10-11)
 crates/fln-cli/tests/fixtures/source_ladder/list_literal_length.lean	accept	accept	match	agree	lean resolves List.length field notation and prints 3
 crates/fln-cli/tests/fixtures/source_ladder/nat_definitions_eval_check.lean	accept	accept	match	agree	
 crates/fln-cli/tests/fixtures/source_ladder/omega_and_simp.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
-crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
+crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean	accept	accept	match	agree	both doors accept with the pin's output (observed by the pin-gated differential at 98a3ec92 and d81da668, 2026-10-12; already in runs of 2026-10-11)
 crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean	accept	accept	match	agree	`s!"…"` (termS!_) is the first imported syntax entered natively, expanded as the pin's expandInterpolatedStr (fln-notation-from-imports-0edr)
 crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean	accept	reject	n/a	unsupported	both FrankenLean doors refuse
 crates/fln-cli/tests/fixtures/source_ladder/theorem_rfl_numerals.lean	accept	accept	match	agree	both FrankenLean doors now accept (measured 2026-10-06 at 5a3ff40e)
