@@ -1,4 +1,4 @@
-name: Checked text-pattern source transfer
+name: Checked String inference source transfer
 on:
   push:
     branches: [main]
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 943ae0c18b9938188a90ae2969ddf0e95b61f395
+          ref: 5473bb9e5e1b5e399663a2bec24a5df8c0c62abc
           persist-credentials: false
       - name: Transfer the exact locally verified source as immutable blobs
         env:
@@ -24,7 +24,7 @@ jobs:
         run: |
           python3 -I - <<'PY'
           import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'text-pattern-transfer'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'string-inference-transfer'
           root.mkdir()
           api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
           def request(path, data=None):
@@ -37,42 +37,20 @@ jobs:
                   return json.load(response)
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == 'fb666e2ab95d3bdf6eff028acd14461791805762'
-          chunks = [
-              ('c1b38ab33ee86f85b784820bced859dc53d9e70f', '3e42c6404e36e4182fbd27b4e7e47698f0e16750'),
-              ('ff5acfb4e4b7c7a4297fc8128787397a50641aac', 'ff5acfb4e4b7c7a4297fc8128787397a50641aac'),
-              ('eb4a16ec479db7b9c155a906d83360cc2b589271', 'eb4a16ec479db7b9c155a906d83360cc2b589271'),
-              ('e193ac233d415f16db61d53cb799b6ee4c596dfd', 'e193ac233d415f16db61d53cb799b6ee4c596dfd'),
-          ]
-          encoded = []
-          for index, (source, expected) in enumerate(chunks):
-              obj = request('/git/blobs/' + source)
-              assert obj['encoding'] == 'base64'
-              data = base64.b64decode(obj['content'])
-              assert blob(data) == source
-              if index == 0:
-                  # Correct one transport character, never source code. Both
-                  # the original encoded identity and full patch digest bind it.
-                  assert data.count(b'O5ge3ndh') == 1
-                  data = data.replace(b'O5ge3ndh', b'O5ge7ndh')
-              assert blob(data) == expected, (index, blob(data), expected)
-              encoded.append(data)
-          patch = gzip.decompress(base64.b64decode(b''.join(encoded), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '88b8357553c054ac74ce4dae8f8a39fe7835ddf07fc23f02e9f5d5ff59830898'
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '1891e8e06d34ec39ed9b45d855ac6d3df300a133'
+          source = '97c54b74da11393f35c311941a8963cee1221f24'
+          obj = request('/git/blobs/' + source)
+          assert obj['encoding'] == 'base64'
+          encoded = base64.b64decode(obj['content'])
+          assert blob(encoded) == source
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'e4fe2f946be29640286b0f740ee85c30b007821d34caed2c95cedf22cddcddee'
           manifest = {
-              'crates/fln-elab/src/source/character.rs': ['779d13984703808c7a817116d29bf0d2d8a2c964', '99d1b2d4affbfd8b626a9d3b33c90598acb38af9'],
-              'crates/fln-elab/src/source/patterns/literals.rs': ['82458d272247f567a3c03023a4bb409ceba25bbf', 'c4d302953d471f35d05dde66660116808b722776'],
-              'crates/fln-parse/src/matching.rs': ['222b9a0bc8b24400bc71e16a48f1fd7cf61f54aa', 'fcb951927d4bf198fc48a0ddc3b234c1ad111581'],
-              'crates/fln/examples/extract_text_equality.rs': [None, '8dc3d1666ed0b7a2189a65475acf7c6e4c40452c'],
-              'crates/fln/src/lib.rs': ['91f11e94b961b95c41837a755abaaeb263b185cd', '6dfb6832f2e2da7c1e82a04325cba348cd164e13'],
-              'crates/fln/src/runtime.rs': ['8c489ff63c7fe5c85bfc6cc7676fd63e5249bb93', 'b385e2c7f179f569bcc2acd0ce3ad2950f0f479e'],
-              'crates/fln/src/runtime/decisions.rs': ['e3eb1560104422c883acf12ffdf38dc0862c9438', '7c215803d03d0d6ac5b1cab624ffaf8da7972571'],
-              'crates/fln/src/runtime/decisions/char_dependencies.txt': [None, '59ecfcf9dfd7a22abe8e41c5ae978afa5ea06eee'],
-              'crates/fln/src/runtime/decisions/string_dependencies.txt': [None, '3aa883add0eed2741e14e131647fc87b58b9a62f'],
-              'crates/fln/src/runtime/decisions/text.rs': [None, '6cfc122cd9eebb51c196762ce05766655d54e66e'],
-              'crates/fln/src/runtime/specialize.rs': ['d9000ee9b46ec9c02eee42193f7ea5a343357c7f', '1e27620f52226b0f8dd4e6fea4c3b3526233090e'],
-              'crates/fln/tests/source_text_patterns.rs': [None, '97b0ea6d14ef2d11f0a6d04b18eb9fb3700f5e8a'],
+              'crates/fln-elab/src/constraint/unify/reduce.rs': ['3f5f48e188de363e11b8550d6768d903de563b79', '5a7d677a798c082bf87d3d4268c29eb4698d8926'],
+              'crates/fln-elab/src/constraint/unify/reduce/string.rs': [None, 'e03ba116c157199325b795fb288c4f100017bd5'],
+              'crates/fln/tests/source_text_patterns.rs': ['97b0ea6d14ef2d11f0a6d04b18eb9fb3700f5e8a', 'dc468e578a0fbb1505d8972c8abcd54ab8ed8566'],
           }
+          # Each path and both source identities are fixed before any mutation.
           paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
           assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
           assert '\ndeleted file mode ' not in patch.decode()
@@ -80,7 +58,7 @@ jobs:
               file = pathlib.Path(path)
               assert not file.is_symlink()
               assert (blob(file.read_bytes()) if file.exists() else None) == before, path
-          patch_file = root / 'text-patterns.patch'
+          patch_file = root / 'string-inference.patch'
           patch_file.write_bytes(patch)
           subprocess.run(['git', 'apply', '--check', str(patch_file)], check=True)
           subprocess.run(['git', 'apply', str(patch_file)], check=True)
@@ -91,14 +69,14 @@ jobs:
               result = request('/git/blobs', {'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode(), 'encoding': 'base64'})
               assert result['sha'] == after, path
               print(after, path)
-          # No commit or ref operation occurs in this job. The connected GitHub
-          # client reconciles current main and publishes these immutable objects.
+          # This job never creates a commit or updates a ref. The connected
+          # client reconciles current main and publishes the verified objects.
           (root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: text-pattern-transfer-${{ github.sha }}
-          path: ${{ runner.temp }}/text-pattern-transfer
+          name: string-inference-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/string-inference-transfer
           retention-days: 7
           if-no-files-found: error
