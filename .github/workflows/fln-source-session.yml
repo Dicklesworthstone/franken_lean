@@ -3,67 +3,38 @@ name: Native source implementation checkout
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/fln-source-session.yml']
+    paths:
+      - '.github/workflows/fln-source-session.yml'
+      - '.github/patches/fln-native-rcases/**'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: native-rcases-implementation
+  cancel-in-progress: false
 
 jobs:
-  source-probes:
+  checked-rcases:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
+      FLN_REQUIRE_REFERENCE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - name: Read functional blockers and relevant implementation locations
-        shell: python
-        run: |
-          import json, re
-          from pathlib import Path
-          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          selected = [r for r in rows if r.get('status') in ('open', 'in_progress', 'blocked') and r.get('priority', 9) <= 1]
-          for r in sorted(selected, key=lambda r: (r.get('priority', 9), r['id'])):
-              print(r['id'], r.get('status'), r.get('priority'), r.get('title', '')[:180])
-          focus = [r for r in rows if r.get('status') != 'closed' and re.search(r'rcases|rintro|obtain|motive|pattern.*tactic|eliminat', r.get('title', ''), re.I)]
-          for r in focus[:12]:
-              print('FOCUS', json.dumps({k: r.get(k) for k in ('id', 'title', 'description', 'acceptance_criteria')}, ensure_ascii=False)[:2500])
-          for directory in ('crates/fln-parse/src/proofs', 'crates/fln-elab/src/source/tactics'):
-              for path in sorted(Path(directory).rglob('*.rs')):
-                  text = path.read_text()
-                  for i, line in enumerate(text.splitlines(), 1):
-                      if re.search(r'rcases|rintro|obtain|matchMotive', line):
-                          print('CODE', str(path), i, line[:180])
-      - name: Run focused native source capability probes
+      - name: Install pinned Rust and authenticated differential Reference
         shell: bash
         run: |
           set -euo pipefail
           rustup show active-toolchain
-          test ! -e crates/fln/examples/source_session_probe.rs
-          cat > crates/fln/examples/source_session_probe.rs <<'RS'
-          use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
-          fn main() {
-              let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-              let e = Engine::with_source_seed(limits).unwrap().into_complete().unwrap();
-              for (id, source) in [
-                  ("rcases_pair", "theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h with ⟨hp, hq⟩; exact hq"),
-                  ("rintro_pair", "theorem f (p q : Prop) : p ∧ q → q := by rintro ⟨hp, hq⟩; exact hq"),
-                  ("obtain_pair", "theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ := h; exact hq"),
-                  ("match_motive", "def f (b : Bool) : Nat := match (motive := fun _ => Nat) b with | true => 1 | false => 2"),
-                  ("exists_tactic", "theorem f : ∃ n : Nat, n = 3 := by exists 3"),
-                  ("refine_pair", "theorem f (p q : Prop) (hp : p) (hq : q) : p ∧ q := by refine ⟨?_, ?_⟩; exact hp; exact hq"),
-                  ("cases_pair", "theorem f (p q : Prop) (h : p ∧ q) : q := by cases h with | intro hp hq => exact hq"),
-              ] {
-                  match e.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
-                      Ok(value) => println!("PROBE {id}: complete={}", value.into_complete().is_some()),
-                      Err(error) => println!("PROBE {id}: {error:?}"),
-                  }
-              }
-          }
-          RS
-          cargo run --locked -p fln --example source_session_probe > "$RUNNER_TEMP/probes.log" 2>&1 || { tail -100 "$RUNNER_TEMP/probes.log"; exit 1; }
-          grep '^PROBE ' "$RUNNER_TEMP/probes.log"
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+          echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Compile, compare and land recursive case-pattern implementation
+        run: python3 .github/patches/fln-native-rcases/land.py
