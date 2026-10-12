@@ -353,7 +353,7 @@ jobs:
 
   default-instances:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify imported numeric helpers and persistent defaults on current main'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify default registration order and persistent source metadata on current main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -365,11 +365,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '12fecf0a1a36ef07ffb72106717a21ec5d69b057'
+      CANDIDATE_SHA: '18f9ef22ae702128bc1c9ed7eaf19d4776bf567c'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '12fecf0a1a36ef07ffb72106717a21ec5d69b057'
+          ref: '18f9ef22ae702128bc1c9ed7eaf19d4776bf567c'
           persist-credentials: false
       - name: Verify candidate and install the exact compiler and Reference
         shell: bash
@@ -400,6 +400,7 @@ jobs:
             crates/fln-elab/src/instances/imported.rs
             crates/fln-elab/src/source.rs
             crates/fln-elab/src/source/instance_command.rs
+            crates/fln-elab/src/source/instances.rs
             crates/fln-elab/src/source/scope/simp.rs
             crates/fln-elab/src/source/scope/visibility.rs
             crates/fln-olean/src/write/source.rs
@@ -416,6 +417,7 @@ jobs:
             crates/fln/src/source_check/modules/visibility.rs
             crates/fln/src/source_records.rs
             crates/fln/tests/source_default_instances.rs
+            crates/fln/tests/source_default_simp.rs
             crates/fln/tests/source_module_artifacts/classes.rs
             crates/fln/tests/source_module_artifacts/defaults.rs
           )
@@ -440,7 +442,7 @@ jobs:
         run: cargo test --locked --offline -p fln-olean --lib write::source::defaults::tests -- --test-threads=1
       - name: Check source inference, ordinary precedence, visibility and artifact round trips
         if: success() || failure()
-        run: cargo test --locked --offline -p fln --test source_default_instances --test source_module_artifacts --test source_olean_instances --test source_instance_attributes --test source_module_visibility_instances --test source_scoped_instance_commands --test source_module_visibility --test source_compiler_hints --test source_reducibility_attributes --test source_noncomputable --test source_default_simp --test source_instance_universe_holes --no-fail-fast -- --test-threads=1
+        run: cargo test --locked --offline -p fln --test source_default_instances --test source_module_artifacts --test source_olean_instances --test source_instance_attributes --test source_module_visibility_instances --test source_scoped_instance_commands --test source_module_visibility --test source_compiler_hints --test source_reducibility_attributes --test source_noncomputable --test source_default_simp --test source_numeric_literals --test source_instance_universe_holes --no-fail-fast -- --test-threads=1
       - name: Check persisted metadata, diamond imports and tamper refusals
         if: success() || failure()
         run: cargo test --locked --offline -p fln --lib source_check::modules::persisted::tests -- --test-threads=1
