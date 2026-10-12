@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "base": "e1858d3b2b4c30570bae1feb3b52b3c3a7b15d51",
-  "candidateTree": "4eca6f2f32f17f328df15ad3d672333d5c004008",
+  "base": "b05b3ddc946c92f195be07ff90fe108d4f23a20d",
+  "candidateTree": "898641beb8b8d04e3aa191fc46c613779cf89e0c",
   "files": [
     {
       "path": "crates/fln/src/runtime.rs",
@@ -84,8 +84,8 @@
       "path": "crates/fln/tests/source_imported_arrays/folds.lean",
       "baselineSha": null,
       "baselineMode": null,
-      "blobSha": "b7ee8777a18e04309cdc4eb6c880f95d91dea72f",
-      "bytes": 2889
+      "blobSha": "b634c80f5d511b15abad7a12ded2689e20b8183b",
+      "bytes": 2950
     },
     {
       "path": "crates/fln/tests/source_imported_arrays/folds.rs",

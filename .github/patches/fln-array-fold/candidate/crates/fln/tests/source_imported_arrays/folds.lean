@@ -28,7 +28,7 @@ def foldLetter (x : Nat) : String :=
 -- element types deliberately differ.
 def capturedArrayFold (left right : String) :
     String -> Array Nat -> Nat -> Nat -> Id String :=
-  Array.foldlM (m := Id)
+  @Array.foldlM Nat String Id (inferInstance : Monad Id)
     (fun acc x => Pure.pure
       (String.append (String.append acc left) (String.append (foldLetter x) right)))
 
@@ -63,7 +63,7 @@ def ownedArrayFold (xs : Array String) (initial : String) : String :=
 -- FLN_EXPECT_NAT 2468
 #eval pureArrayDigits (foldInput 2 2) 0
 -- FLN_EXPECT_NAT 5234
-#eval applyArrayFold (Array.foldlM (m := Id)) (foldInput 1 1) 5
+#eval applyArrayFold (@Array.foldlM Nat Nat Id (inferInstance : Monad Id)) (foldInput 1 1) 5
 -- FLN_EXPECT_STRING !<b><c><d>
 #eval useCapturedArrayFold (capturedArrayFold "<" ">") (foldInput 1 1)
 -- FLN_EXPECT_STRING S|red|green
