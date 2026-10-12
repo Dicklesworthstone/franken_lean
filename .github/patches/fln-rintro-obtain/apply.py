@@ -20,6 +20,17 @@ def tests():
     text = text.replace('rcases_and_functions_pass_both_checkers', 'recursive_introductions_and_obtained_witnesses_pass_both_checkers')
     text = text.replace('actual_imported_core_checks_the_same_rcases', 'actual_imported_rcases_checks_introductions_and_obtained_witnesses')
     text = text.replace('RCASES', 'RINTRO_OBTAIN')
+    text = replace(text, '    verify(&engine, STACK);', '''    // The bounded seed intentionally has no Exists. Admit its ordinary
+    // polymorphic declaration for these source fixtures; imported testing
+    // below still uses the actual Reference declaration and full metadata.
+    assert!(!engine.environment().contains(&fln::Name::from_components(["Exists"])));
+    let initialized = engine.check_source_files(
+        &[b"inductive Exists.{u} {A : Sort u} (P : A -> Prop) : Prop where | intro (w : A) (h : P w)"],
+        &KVMap::new(),
+        SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK))),
+    ).expect("source existential fixture admitted by both checkers")
+        .into_complete().expect("source existential fixture completes");
+    verify(&initialized.engine, STACK);''')
     destination.write_text(text)
     cases = (PAYLOAD / 'cases.tsv').read_text()
     # Run 38306613816 shows h/this with inaccessible dagger names, while
