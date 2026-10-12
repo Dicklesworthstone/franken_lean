@@ -48,21 +48,8 @@ for attempt in range(3):
                 mismatches.append(name)
                 print('PIN_MISMATCH', name, verdict, result.returncode, result.stdout, flush=True)
             counts[verdict != 'accept'] += 1
-    if mismatches:
-        for i, source in enumerate([
-            'theorem f (p : Prop) (hp : p) : p := by obtain h : p; trace_state',
-            'theorem f (p : Prop) (hp : p) : p := by obtain h : p; exact hp; trace_state',
-            'theorem f (p : Prop) (hp : p) : p := by\n  obtain h : p\n  · exact hp\n  trace_state\n  exact h',
-            'theorem f (p : Prop) (hp : p) : p := by\n  obtain h : p\n  · exact hp\n  exact hp',
-            'theorem f (p : Prop) (hp : p) : p := by obtain : p; exact hp; trace_state',
-            'theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ : p ∧ q; exact h; trace_state',
-        ]):
-            subject = Path(os.environ['RUNNER_TEMP']) / f'obtain-scope-{i}.lean'
-            subject.write_text('import Init.RCases\n' + source + '\n')
-            result = subprocess.run([os.environ['FLN_REFERENCE_LEAN'], str(subject)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
-            print('SCOPE_PROBE', i, repr(source), result.returncode, result.stdout, flush=True)
-        raise RuntimeError(f'Reference acceptance mismatch; no production activation: {mismatches}')
-    if counts != [36, 23]: raise RuntimeError(f'unexpected oracle counts: {counts}')
+    if mismatches or counts != [36, 25]:
+        raise RuntimeError(f'Reference mismatch: {mismatches}; counts {counts}')
     print('PIN_RINTRO_OBTAIN', counts, flush=True)
     run(seed, work)
     run(['cargo', 'clippy', '--locked', '-p', 'fln-elab', '--lib', '--', '-D', 'warnings'], work)
@@ -73,7 +60,7 @@ for attempt in range(3):
     staged = run(['git', 'diff', '--cached', '--name-only'], work).splitlines()
     if set(staged) != set(FILES): raise RuntimeError(f'unexpected staged paths: {staged}')
     run(['git', 'diff', '--cached', '--check'], work)
-    run(['git', '-c', 'user.name=ChatGPT', '-c', 'user.email=noreply@openai.com', 'commit', '-m', 'feat(elab): execute recursive introductions and obtained witness proofs', '-m', 'Implement rintro nested patterns, dependent introductions and nearest type annotations using the checked rcases backend. Implement obtain with supplied values or separately checked witness goals; newly assumed witnesses remain out of scope in their own proof obligation. Preserve every live branch and refusal atomicity. The combined 59-case matrix (36 accepted, 23 refused) passes natively, with actual admitted Init.RCases, and at the authenticated Reference. This includes all 27 rcases controls from 927c0d94, whose earlier commit message omitted the four default-pattern controls. All 34 source_matching tests and strict library/target Clippy pass.', '-m', f'Validated on parent {base}; GitHub Actions run {os.environ["GITHUB_RUN_ID"]}. No kernel rules or dependencies added.'], work)
+    run(['git', '-c', 'user.name=ChatGPT', '-c', 'user.email=noreply@openai.com', 'commit', '-m', 'feat(elab): execute recursive introductions and obtained witness proofs', '-m', 'Implement rintro nested patterns, dependent introductions and nearest type annotations using the checked rcases backend. Implement obtain with supplied values or separately checked witness goals. The witness cannot prove itself, and a bare no-value witness keeps the inaccessible scope observed at the pin; destructured fields remain accessible. Preserve every live branch and refusal atomicity. All 61 combined cases (36 accepted, 25 refused) pass on the seed, actual admitted Init.RCases and the authenticated Reference. This includes all 27 rcases controls from 927c0d94, whose earlier commit message omitted four default-pattern controls. All 34 source_matching tests and strict library/target Clippy pass.', '-m', f'Validated on parent {base}; GitHub Actions run {os.environ["GITHUB_RUN_ID"]}. No kernel rules or dependencies added.'], work)
     result = subprocess.run(['git', 'push', 'origin', 'HEAD:main'], cwd=work, env=ENV, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, flush=True)
     if result.returncode == 0:
