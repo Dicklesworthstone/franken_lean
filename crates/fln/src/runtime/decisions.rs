@@ -7,6 +7,8 @@
 //! never authorizes erasure. The logical declarations remain unchanged.
 
 use super::*;
+mod text;
+pub(super) use text::Store;
 
 fn required_decision_name(candidate: &Name, carrier: &str, instance: bool) -> bool {
     ["Bool", "Eq", "Decidable", "False", "True", "Not", "decide"]
@@ -244,7 +246,8 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if callee != &name("decide") || !levels.is_empty() || arguments.len() != 2 {
+        let pinned = callee == &name("Decidable.decide");
+        if (!pinned && callee != &name("decide")) || !levels.is_empty() || arguments.len() != 2 {
             return Ok(None);
         }
 
@@ -289,6 +292,19 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
+            if pinned {
+                if !levels.is_empty() {
+                    return Ok(None);
+                }
+                let Some(mut result) = self.text_equality_decision(callee, &operands)? else {
+                    return Ok(None);
+                };
+                for (name, type_, value, nondep) in bindings.into_iter().rev() {
+                    self.tick()?;
+                    result = Expr::let_e(name, type_, value, result, nondep);
+                }
+                return Ok(Some(result));
+            }
             let (carrier, instance) = if callee == &name("Nat.decEq") {
                 ("Nat", false)
             } else if callee == &name("instDecidableEqNat") {

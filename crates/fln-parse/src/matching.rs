@@ -1083,7 +1083,7 @@ fn pattern(
                 } else if !dot
                     && matches!(
                         tokens[cursor].kind,
-                        TokenKind::Literal(LiteralKind::Nat | LiteralKind::Str)
+                        TokenKind::Literal(LiteralKind::Nat | LiteralKind::Str | LiteralKind::Char)
                     )
                 {
                     if cursor + 1 != range.end {
@@ -2284,6 +2284,8 @@ mod literal_pattern_tests {
             "def f : Nat -> Nat | 0x10 => 1 | _ => 2",
             "-- before\r\ndef f : Nat -> Nat\r\n  | 0 /- zero -/ => 7\r\n  | .succ n => n\r\n",
             r##"def f : String -> Nat | r#"\x61"# => 1 | "a" => 2 | _ => 3"##,
+            "def f : Char -> Nat | 'λ' => 1 | '\\n' => 2 | _ => 3",
+            "-- character\r\ndef f : Char -> Nat\r\n  | ('🙂') /- unicode -/ => 1\r\n  | _ => 2\r\n",
             "def f : Nat := (fun | 1, true => 7 | _, _ => 9) 1 true",
         ] {
             let parsed =
@@ -2301,6 +2303,8 @@ mod literal_pattern_tests {
             "def f : Nat -> Nat | 0 x => 1 | _ => 2",
             "def f : Nat -> Nat | .0 => 1 | _ => 2",
             "def f : String -> Nat | \"a\" x => 1 | _ => 2",
+            "def f : Char -> Nat | 'a' x => 1 | _ => 2",
+            "def f : Char -> Nat | .'a' => 1 | _ => 2",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }

@@ -11,7 +11,7 @@ fn invalid() -> NatDefinitionElabError {
     }
 }
 
-fn decode_character(spelling: &str) -> Result<char, NatDefinitionElabError> {
+pub(super) fn decode_character(spelling: &str) -> Result<char, NatDefinitionElabError> {
     use fln_syntax::literal::{LiteralKind, lex_literal, starts_literal};
     use fln_syntax::source::SourceText;
 
