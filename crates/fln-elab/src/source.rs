@@ -1639,7 +1639,7 @@ impl Context {
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordNext(record_terms::RecordBuild<'a>),
-            RecordField(record_terms::RecordBuild<'a>, Expr),
+            RecordField(record_terms::RecordBuild<'a>, record_terms::RecordTarget),
             Visit(&'a Syntax, Option<Expr>, bool),
             Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
@@ -2829,20 +2829,23 @@ impl Context {
                             record_terms::RecordStep::Field {
                                 syntax,
                                 domain,
-                                codomain,
+                                target,
                             } => {
-                                tasks.push(Task::RecordField(state, codomain));
+                                tasks.push(Task::RecordField(state, target));
                                 tasks.push(Task::Visit(syntax, Some(domain), true));
                             }
-                            record_terms::RecordStep::Copy { value, codomain } => {
-                                self.accept_record_field(&mut state, &codomain, value)?;
+                            record_terms::RecordStep::Copy { value, target } => {
+                                self.accept_record_field(&mut state, &target, value)?;
                                 tasks.push(Task::RecordNext(state));
                             }
                             record_terms::RecordStep::Complete(term) => values.push(term),
+                            record_terms::RecordStep::Continue => {
+                                tasks.push(Task::RecordNext(state))
+                            }
                         },
-                        Task::RecordField(mut state, codomain) => {
+                        Task::RecordField(mut state, target) => {
                             let value = values.pop().expect("record field visit");
-                            self.accept_record_field(&mut state, &codomain, value)?;
+                            self.accept_record_field(&mut state, &target, value)?;
                             tasks.push(Task::RecordNext(state));
                         }
                         Task::ChangeTarget(mut proof, goal) => {
