@@ -4,8 +4,7 @@ use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, SourceCheckLimits
 use fln_core::outcome::InconclusiveCause;
 use fln_elab::NatDefinitionElabError;
 use fln_elab::arithmetic::{
-    ArithmeticProvider, LinearConstraint, OmegaInconclusive, OmegaLimits, OmegaOutcome,
-    OmegaResource,
+    ArithmeticProvider, LinearConstraint, OmegaCertificate, OmegaLimits, OmegaOutcome,
 };
 use fln_elab::source::SourceInferenceError;
 use fln_elab::source::scope::SourceScope;
@@ -168,6 +167,14 @@ pub(super) fn assert_automatic_termination(base: &Engine) {
             Err(error) if format!("{error:?}").contains("Frontend(Parse(") => {
                 failures.push(format!("refusal case failed to parse: {source}\n{error:?}"));
             }
+            Err(error)
+                if matches!(
+                    error.disposition().0,
+                    "resource" | "inconclusive" | "internal-fault"
+                ) =>
+            {
+                failures.push(format!("expected a semantic refusal: {source}\n{error:?}"));
+            }
             Err(_) => {}
         }
         assert_eq!(base.logical_root(&KVMap::new()), root);
@@ -185,19 +192,22 @@ pub(super) fn assert_automatic_termination(base: &Engine) {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-fn cancelled(_: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
-    OmegaOutcome::Inconclusive {
-        reason: OmegaInconclusive::Cancelled,
-        steps_used: 1,
-    }
+fn cancelled(inputs: &[LinearConstraint], limits: OmegaLimits) -> OmegaOutcome {
+    fln_anvil::omega::solve_with_cancel(inputs, limits, &mut || true)
 }
 
-fn exhausted(_: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
-    OmegaOutcome::Inconclusive {
-        reason: OmegaInconclusive::ResourceLimit {
-            resource: OmegaResource::Rows,
-            limit: 1,
-            observed: 2,
+fn exhausted(inputs: &[LinearConstraint], mut limits: OmegaLimits) -> OmegaOutcome {
+    limits.max_steps = 0;
+    fln_anvil::omega::solve(inputs, limits)
+}
+
+fn malformed(inputs: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
+    OmegaOutcome::Unsat {
+        certificate: OmegaCertificate {
+            version: 1,
+            inputs: inputs.to_vec(),
+            steps: Vec::new(),
+            conclusion: 0,
         },
         steps_used: 1,
     }
@@ -208,12 +218,14 @@ pub(super) fn assert_search_stops(base: &Engine) {
     // assumption. An accelerator stop cannot become a successful later choice.
     let source = b"def boundary (a n : Nat) : Nat := if h : 0 < n then boundary (a + 1) 0 else a";
     let parsed = fln_parse::parse_definition(source).expect("termination boundary source parses");
-    for (provider, cancellation) in [
+    let root = base.logical_root(&KVMap::new());
+    for (provider, label) in [
         (
             cancelled as fn(&[LinearConstraint], OmegaLimits) -> OmegaOutcome,
-            true,
+            "cancelled",
         ),
-        (exhausted, false),
+        (exhausted, "resource"),
+        (malformed, "certificate"),
     ] {
         let scope = SourceScope {
             arithmetic: Some(ArithmeticProvider(provider)),
@@ -225,20 +237,37 @@ pub(super) fn assert_search_stops(base: &Engine) {
             super::limits().kernel,
             &scope,
         );
-        let Err(NatDefinitionElabError::Inference(SourceInferenceError::ArithmeticInconclusive(
-            reason,
-        ))) = result
-        else {
-            panic!("candidate search swallowed or reclassified its arithmetic stop: {result:?}");
-        };
-        if cancellation {
-            assert!(matches!(reason.cause, InconclusiveCause::Cancelled { .. }));
-        } else {
-            assert!(matches!(
-                reason.cause,
-                InconclusiveCause::ResourceExhausted { .. }
-            ));
+        match (label, result) {
+            (
+                "cancelled",
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ArithmeticInconclusive(reason),
+                )),
+            ) => {
+                assert!(matches!(reason.cause, InconclusiveCause::Cancelled { .. }));
+            }
+            (
+                "resource",
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ArithmeticInconclusive(reason),
+                )),
+            ) => {
+                assert!(
+                    matches!(reason.cause, InconclusiveCause::ResourceExhausted { usage } if usage.is_genuine_exhaustion())
+                );
+            }
+            (
+                "certificate",
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(reason))),
+            ) => {
+                assert_eq!(
+                    reason.to_string(),
+                    "native arithmetic returned an invalid certificate"
+                );
+            }
+            (_, result) => panic!("candidate search must propagate {label}: {result:?}"),
         }
+        assert_eq!(base.logical_root(&KVMap::new()), root);
     }
     base.check_source_files(
         &[source],
@@ -248,4 +277,5 @@ pub(super) fn assert_search_stops(base: &Engine) {
     .expect("the ordinary arithmetic provider permits a later valid measure")
     .into_complete()
     .expect("ordinary inference recovers after isolated provider failures");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
 }

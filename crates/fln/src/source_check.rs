@@ -377,33 +377,30 @@ pub(crate) fn apply_module_control_command(
     }
     // Global default attributes export according to each candidate's visibility,
     // including commands written in a private section or mixing both worlds.
-    if !scopes.current.exports_declaration() {
-        if let (ScopeCommand::Instance(attribute), Some(public)) = (&control, public.as_deref_mut())
+    if !scopes.current.exports_declaration()
+        && let (ScopeCommand::Instance(attribute), Some(public)) = (&control, public.as_deref_mut())
+        && attribute.is_default
+    {
+        let (file, command, offset) = position;
+        let next = instance_attributes::apply(
+            engine.environment(),
+            &scopes.current,
+            attribute.clone(),
+            file,
+            command,
+            offset,
+        )?;
+        return match public
+            .publish_default_attributes(engine, next)
+            .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
         {
-            if attribute.is_default {
-                let (file, command, offset) = position;
-                let next = instance_attributes::apply(
-                    engine.environment(),
-                    &scopes.current,
-                    attribute.clone(),
-                    file,
-                    command,
-                    offset,
-                )?;
-                return match public
-                    .publish_default_attributes(engine, next)
-                    .map_err(|error| {
-                        command_error(file, command, fln_parse::BytePos(offset), error)
-                    })? {
-                    Outcome::Complete(next) => {
-                        *engine = next;
-                        Ok(Outcome::Complete(()))
-                    }
-                    Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
-                };
+            Outcome::Complete(next) => {
+                *engine = next;
+                Ok(Outcome::Complete(()))
             }
-        }
+            Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        };
     }
     let Some(public) = public.filter(|_| scopes.current.exports_declaration()) else {
         return apply_control_command(

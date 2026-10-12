@@ -36,6 +36,40 @@ const WRAP: &str = "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
     theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n";
 
 #[test]
+fn simp_preserves_terminal_predicates_while_opening_rule_binders() {
+    let base = engine();
+    // The pin accepts the selected fact at its declared predicate and refuses
+    // to unfold that predicate just to select the fact at a different goal.
+    for opacity in ["", "attribute [irreducible] Named\n"] {
+        let declarations = format!(
+            "def Named (p : Prop) : Prop := p\n\
+             theorem namedFact (p : Prop) (h : p) : Named p := h\n{opacity}"
+        );
+        let scoped = checked(&base, &[&declarations]).engine;
+        let root = scoped.logical_root(&KVMap::new());
+        checked(
+            &scoped,
+            &["theorem selected (p : Prop) (h : p) : Named p := by simp only [namedFact p h]"],
+        );
+        let refusal = scoped
+            .check_source_files(
+                &[b"theorem unrelatedHead (p : Prop) (h : p) : p := by simp only [namedFact p h]"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("simp only must preserve the selected fact's predicate");
+        assert!(
+            !matches!(
+                refusal.disposition().0,
+                "resource" | "inconclusive" | "internal-fault"
+            ),
+            "predicate selection is a semantic refusal: {refusal:?}"
+        );
+        assert_eq!(scoped.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
 fn inline_simp_attributes_are_registered_only_after_checked_admission() {
     let base = engine();
     let result = checked(

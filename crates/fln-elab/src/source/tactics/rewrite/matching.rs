@@ -255,7 +255,18 @@ impl Context {
         let mut holes = Vec::new();
         loop {
             template.tick()?;
-            rule.type_ = template.whnf(&rule.type_)?;
+            // The pin prepares simp theorems at reducible transparency without
+            // unfolding local lets. Preserve the final proposition's head too:
+            // unfolding Nat.lt here would hide it from the occurrence matcher.
+            rule.type_ = if inside_out {
+                template.whnf_with_transparency(
+                    &rule.type_,
+                    UnificationTransparency::Abbreviations,
+                    false,
+                )?
+            } else {
+                template.whnf(&rule.type_)?
+            };
             // A refutation is a rewrite of its proposition to False, not an
             // implication whose antecedent simp must first prove. Stop before
             // consuming that final proof binder; outer parameters still infer

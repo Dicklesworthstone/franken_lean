@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 #[path = "support/omega_integer_search.rs"]
 mod integer_search;
+#[path = "support/well_founded_automatic.rs"]
+mod well_founded_automatic;
 
 const STACK: usize = 256 * 1024 * 1024;
 
@@ -873,6 +875,18 @@ fn native_omega_reifies_and_replays_checked_integer_proofs() {
                 ("provider boundary", assert_provider_boundary),
                 ("ground divisor limits", assert_ground_divisor_limits),
                 ("decreasing proof", assert_decreasing_proof),
+                (
+                    "automatic decreasing proofs",
+                    well_founded_automatic::assert_arithmetic_proofs,
+                ),
+                (
+                    "automatic decreasing refusals",
+                    well_founded_automatic::assert_refusals_and_recovery,
+                ),
+                (
+                    "automatic decreasing stops",
+                    well_founded_automatic::assert_provider_stops,
+                ),
                 ("module replay", assert_module_replay),
                 ("frontier integer proofs", integer_search::assert_proofs),
                 (

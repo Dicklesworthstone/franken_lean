@@ -313,6 +313,84 @@ fn assert_remaining_scope_limits(base: &Engine) {
     }
 }
 
+fn assert_automatic_assumptions(base: &Engine) {
+    // Preserve both former omitted-clause refusals as positive computations.
+    // The inferred comparison has two varying parameters, so inference must
+    // probe before its final proof. A semireducible measure and an explicit
+    // assumption use ordinary conversion, and the successor jump needs the
+    // preserved checked simp phase. None imports Omega.
+    let source = br#"
+def absentProof (n : Nat) : Nat := if h : 0 < n then absentProof 0 else 0
+termination_by n
+def absentMeasure (n : Nat) : Nat := if h : 0 < n then absentMeasure 0 else 0
+decreasing_by exact h
+def dropToZero (n : Nat) : Nat := if h : 0 < n then dropToZero 0 + 1 else 41
+termination_by n
+def inferredAssumptions (n acc : Nat) : Nat :=
+  if h : 0 < n then inferredAssumptions 0 (acc + 1) + 1 else 41
+def suppliedAssumption (n : Nat) : Nat :=
+  if h : 0 < n then suppliedAssumption 0 + 1 else 41
+termination_by n
+decreasing_by assumption
+@[simp] theorem zeroBelowSuccessor (k : Nat) : Nat.lt 0 (Nat.succ k) :=
+  Nat.zero_lt_succ k
+def simpJump (n : Nat) : Nat :=
+  match n with | 0 => 41 | k + 1 => simpJump 0 + 1
+termination_by n
+def measureWrap (n : Nat) : Nat := n
+def wrappedMeasure (n : Nat) : Nat :=
+  if h : 0 < n then wrappedMeasure 0 + 1 else 41
+termination_by measureWrap n
+def automaticZero : Nat := absentProof 7
+def inferredZero : Nat := absentMeasure 7
+def automaticStep : Nat := dropToZero 7
+def inferredStep : Nat := inferredAssumptions 7 0
+def suppliedStep : Nat := suppliedAssumption 7
+def simplifiedStep : Nat := simpJump 42
+def wrappedStep : Nat := wrappedMeasure 7
+"#;
+    let before = base.logical_root(&KVMap::new());
+    let result = base
+        .execute_source_definitions(
+            &[source],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .expect("retained hypotheses discharge default decreasing proofs")
+        .into_complete()
+        .expect("automatic assumption proofs pass both seats and execute");
+    let values: Vec<_> = result
+        .executions
+        .iter()
+        .filter_map(|execution| fln::closed_vm_value(&execution.exit).expect("normal VM exit"))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ClosedVmValue::Scalar(0),
+            ClosedVmValue::Scalar(0),
+            ClosedVmValue::Scalar(42),
+            ClosedVmValue::Scalar(42),
+            ClosedVmValue::Scalar(42),
+            ClosedVmValue::Scalar(42),
+            ClosedVmValue::Scalar(42),
+        ]
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+    let refusal = base.check_source_files(
+        &[b"def needsArithmetic (n : Nat) : Nat := if h : 0 < n then needsArithmetic (n - 1) + 1 else 0\ntermination_by n"],
+        &KVMap::new(), SourceCheckLimits::new(limits()),
+    ).expect_err("arithmetic search cannot invent missing checked Omega lemmas");
+    assert!(
+        !matches!(
+            refusal.disposition().0,
+            "resource" | "inconclusive" | "internal-fault"
+        ),
+        "missing arithmetic declarations are a capability refusal: {refusal:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
 #[test]
 fn native_well_founded_measures_and_checked_decreasing_proofs() {
     let Some(lib) = pinned_lib() else {
@@ -326,6 +404,7 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
             assert_computations(&base);
             assert_decreasing_refusals(&base);
             assert_remaining_scope_limits(&base);
+            assert_automatic_assumptions(&base);
             well_founded_matches::assert_match_programs(&base);
             well_founded_arguments::assert_argument_programs(&base);
             well_founded_opacity::assert_source_opacity_routes(&base);
