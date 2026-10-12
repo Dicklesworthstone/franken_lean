@@ -1,8 +1,22 @@
 {
   "version": 1,
-  "base": "39e32a105a183643c88084e6f4c9bca02969a910",
-  "candidateTree": "3964903a1fb6e5c8a819ec7285dd4e83bd329a5d",
+  "base": "1db466e8815fba0b352ae70fcfd789b56b4a8723",
+  "candidateTree": "f47cfbfbf9a4f183d23adde6c98f7f64999d1310",
   "files": [
+    {
+      "path": "crates/fln-elab/src/source/level_syntax.rs",
+      "baselineSha": "e5f663bde4f89ca86d79f7052861987152b85610",
+      "baselineMode": "100644",
+      "blobSha": "38ad06d632986ab6b58f0aa6dcf79f519cb2b26c",
+      "bytes": 19043
+    },
+    {
+      "path": "crates/fln-elab/src/source/levels/generalization.rs",
+      "baselineSha": "02c863ff34e18ae97f7726d2208fb372b525320d",
+      "baselineMode": "100644",
+      "blobSha": "9e70bebcd3b05c3fcf61e7cb0a49c3b8cc1ccb60",
+      "bytes": 11777
+    },
     {
       "path": "crates/fln-elab/src/source/matching.rs",
       "baselineSha": "88c332e550560dcea80b96efd368f4e57d5011f5",

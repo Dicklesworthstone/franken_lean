@@ -23,7 +23,6 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
       FLN_REQUIRE_REFERENCE: '1'
-      FLN_WF_RESOURCE_DIAGNOSTIC: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install pinned Rust and authenticated differential Reference

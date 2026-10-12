@@ -80,7 +80,7 @@ def index_entry(path, cwd):
 def main():
     assert MANIFEST["version"] == 1
     files = MANIFEST["files"]
-    assert len(files) == 11
+    assert len(files) == 13
     paths = [item["path"] for item in files]
     assert len(set(paths)) == len(paths)
     for path in paths:
@@ -119,21 +119,6 @@ def main():
         target.chmod(0o644)
         original[path] = data
 
-    diagnostic = ENV.get("FLN_WF_RESOURCE_DIAGNOSTIC") == "1"
-    if diagnostic:
-        # This temporary overlay diagnoses an unchanged limit. It is never a
-        # production candidate and cannot emit a successful validation result.
-        edits = json.loads((PAYLOAD / "diagnostic.json").read_text())
-        for item in edits:
-            target = worktree / item["path"]
-            data = target.read_bytes()
-            assert blob(data) == item["expectedBlob"], item["path"]
-            source = data.decode("utf-8")
-            for edit in item["edits"]:
-                assert source.count(edit["needle"]) == edit["count"], edit["needle"]
-                source = source.replace(edit["needle"], edit["replacement"])
-            target.write_text(source)
-
     # Freeze the exact formatted bytes BEFORE testing. Do not visit other modules.
     fmt = ["rustfmt", "--edition", "2024", "--config", "skip_children=true"]
     run("format-candidate", fmt + paths, worktree)
@@ -145,21 +130,27 @@ def main():
         assert index_entry(path, worktree) == ("100644", blob(frozen[path])), path
     run("diff-check", ["git", "diff", "--cached", "--check"], worktree)
 
-    command = [
-        "cargo", "test", "--offline", "--locked", "-p", "fln",
-        "--test", "source_well_founded",
-    ]
-    if diagnostic:
-        command += ["native_automatic_well_founded_termination", "--", "--exact"]
-    else:
-        command += ["--"]
-    command += ["--nocapture", "--test-threads=1"]
+    for label, test_filter, count in [
+        ("universe-generalization", "source::levels::generalization::tests", 7),
+        ("universe-declaration-levels", "source::level_syntax::tests", 2),
+    ]:
+        unit_output = run(
+            label,
+            ["cargo", "test", "--offline", "--locked", "-p", "fln-elab",
+             "--lib", test_filter, "--", "--nocapture", "--test-threads=1"],
+            worktree, {"CARGO_PROFILE_TEST_OPT_LEVEL": "0"},
+        )
+        assert re.search(
+            rf"test result: ok\. {count} passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out",
+            unit_output,
+        ), f"The complete {label} unit gate did not run"
+
     output = run(
-        "native-well-founded", command, worktree,
-        {"CARGO_PROFILE_TEST_OPT_LEVEL": "2"},
+        "native-well-founded",
+        ["cargo", "test", "--offline", "--locked", "-p", "fln",
+         "--test", "source_well_founded", "--", "--nocapture", "--test-threads=1"],
+        worktree, {"CARGO_PROFILE_TEST_OPT_LEVEL": "2"},
     )
-    if diagnostic:
-        raise SystemExit("Diagnostic-only run cannot authorize source publication")
     assert re.search(
         r"test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
         output,
@@ -182,7 +173,8 @@ def main():
     result = {
         "version": 1, "validatedBase": base,
         "candidateTree": MANIFEST["candidateTree"],
-        "gates": {"source_well_founded": "3 passed", "strictClippy": "passed"},
+        "gates": {"universeGeneralization": "7 passed", "declarationLevels": "2 passed",
+                  "source_well_founded": "3 passed", "strictClippy": "passed"},
         "files": [],
     }
     for path in paths:
