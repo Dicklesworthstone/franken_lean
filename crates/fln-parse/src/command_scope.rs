@@ -494,6 +494,7 @@ fn declaration(s: &str) -> bool {
             | "#check"
             | "#eval"
             | "#guard"
+            | "#synth"
     )
 }
 
@@ -1518,6 +1519,25 @@ mod tests {
         assert_eq!(commands[1], (BytePos(exit_at), &b"#exit"[..]));
         assert_eq!(parse(commands[1].1).unwrap(), Some(ScopeCommand::Exit));
         assert_eq!(parse(b"#exit").unwrap(), Some(ScopeCommand::Exit));
+    }
+
+    /// `#synth C` (`Lean.Parser.Command.synth`) starts a command and is read as a query.
+    #[test]
+    fn synth_starts_a_command_and_reads_as_a_query() {
+        let source = b"def x : Nat := 1\n#synth Inhabited Nat\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].1, b"#synth Inhabited Nat\n");
+        let parsed = crate::parse_source_command(commands[1].1).unwrap();
+        assert_eq!(parsed.kind(), crate::SourceCommandKind::Check);
+        assert_eq!(
+            parsed
+                .syntax()
+                .kind()
+                .map(Name::to_display_string)
+                .as_deref(),
+            Some("Lean.Parser.Command.synth")
+        );
     }
 
     #[test]

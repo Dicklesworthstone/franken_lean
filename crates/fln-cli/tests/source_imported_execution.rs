@@ -793,6 +793,39 @@ fn pinned_prelude_imports_can_publish_replayable_bytecode_and_a_verified_sidecar
     assert!(replayed.stdout.contains("\"verified\":true"));
 }
 
+/// `#synth C` prints the instance the pin's `synthInstance` finds, bare (`logInfo val`), named as
+/// the delaborator names it; an instance that cannot be found is refused, as the pin refuses
+/// it ("failed to synthesize", exit 1). The expected text is the pinned v4.32.0's stdout for
+/// the same file (2026-10-12).
+#[test]
+fn synth_prints_the_instance_it_finds() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-synth");
+    let found = workspace.write(
+        "Synth.lean",
+        "prelude\nimport Init.Core\n#synth Inhabited Nat\n#synth Inhabited (List Nat)\n\
+         #synth BEq Nat\n#synth Add Nat\n#synth Decidable (2 = 3)\n",
+    );
+    let ours = lean_door(&workspace, &found, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            "instInhabitedNat\ninstInhabitedList\ninstBEqOfDecidableEq\ninstAddNat\n\
+             instDecidableEqNat 2 3\n",
+            ""
+        ),
+        "{ours:?}"
+    );
+    let missing = workspace.write(
+        "Missing.lean",
+        "prelude\nimport Init.Core\n#synth Inhabited Empty\n",
+    );
+    let refused = lean_door(&workspace, &missing, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
 /// `#exit` is the pin's terminal command (`elabExit`, `Parser.isTerminalCommand`): it warns
 /// and the file ends there. The pinned binary beside the library is compared when present.
 #[test]

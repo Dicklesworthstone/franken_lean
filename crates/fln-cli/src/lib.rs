@@ -11713,6 +11713,35 @@ fn render_lean_source_check_line(
             4,
         ));
     }
+    // `#synth C` prints the instance it found and nothing else (`logInfo val`).
+    if checked
+        .parsed
+        .syntax()
+        .kind()
+        .map(fln::Name::to_display_string)
+        .as_deref()
+        == Some("Lean.Parser.Command.synth")
+    {
+        let fln::Declaration::Defn(definition) = &checked.declaration else {
+            return Err(source_failure(
+                "internal-fault",
+                "a #synth query did not produce a definition candidate",
+                false,
+                SourcePresentation::Lean,
+                4,
+            ));
+        };
+        return match printer.expr(&definition.value, 0) {
+            Ok(line) => Ok(format!("{line}\n")),
+            Err(fln::pretty::Unsupported(what)) => Err(source_failure(
+                "capability",
+                &format!("#synth cannot print {what} the way the pin does"),
+                false,
+                SourcePresentation::Lean,
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            )),
+        };
+    }
     // `#check c` for a constant prints its signature (`delabConstWithSignature`);
     // any other term prints as `term : type`.
     let constant = match &checked.declaration {

@@ -5369,6 +5369,25 @@ fn query_term(
             NatDefinitionElabError::InvalidGeneratedCheckName
         });
     }
+    // `#synth C` (`elabSynth`, Lean/Elab/BuiltinCommand.lean:506): `C` elaborated with no
+    // expected type, its pending instances synthesized, then an instance of `C` synthesized.
+    // The candidate is that instance at type `C`; the caller prints the instance alone.
+    let synth = parser_kind(&["Command", "synth"]);
+    if !evaluate && syntax.kind() == Some(&synth) {
+        let parts = expect_node(syntax, &synth, 2, "Lean.Parser.Command.synth")?;
+        expect_atom(&parts[0], "#synth", "synth keyword")?;
+        let class = context.term(&parts[1], None)?;
+        context.resolve_instances(true)?;
+        let class = context.instantiate(&class.value)?;
+        let hole = context.instance_hole(class.clone())?;
+        context.resolve_instances(true)?;
+        context.complete_local_functions()?;
+        let term = context.finish(Typed {
+            value: hole,
+            type_: class,
+        })?;
+        return Ok((term, Vec::new()));
+    }
     let parts = expect_node(
         syntax,
         &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),

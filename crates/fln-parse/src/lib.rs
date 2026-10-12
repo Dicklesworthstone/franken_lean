@@ -4858,13 +4858,19 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                 })
             }
             TokenKind::Symbol(symbol)
-                if symbol == "#eval" || symbol == "#check" || symbol == "#guard" =>
+                if symbol == "#eval"
+                    || symbol == "#check"
+                    || symbol == "#guard"
+                    || symbol == "#synth" =>
             {
                 // `#guard e` (`syntax (name := guardCmd) "#guard " term : command`,
                 // `Init/Guard.lean:127`) is an evaluation whose result must be `true`.
+                // `#synth C` (`Lean.Parser.Command.synth`) is a scratch query, as `#check` is:
+                // the instance it finds is printed, nothing is published.
                 let (kind, command_kind) = match symbol.as_str() {
                     "#eval" => (SourceCommandKind::Evaluation, "eval"),
                     "#guard" => (SourceCommandKind::Evaluation, "guardCmd"),
+                    "#synth" => (SourceCommandKind::Check, "synth"),
                     _ => (SourceCommandKind::Check, "check"),
                 };
                 let tokens = run
