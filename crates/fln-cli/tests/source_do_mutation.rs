@@ -3,11 +3,9 @@
 //! `continue` after a reassignment, nested loops, a `mut` local to the loop body, and branches that
 //! reassign inside and outside a loop, on `Bool` and `Prop` conditions and with `unless`. Every program was run through the pinned `lean` v4.32.0 with
 //! the same header first (2026-10-11), with the same verdict. Values are checked with `decide`;
-//! each refused theorem is the value a lost reassignment would give.
-//!
-//! Not here, because this engine still refuses it where the pin accepts: a `match` after a `let`
-//! whose numeral has not been defaulted yet. That is not about mutation: the match reverts the
-//! `let`, whose type is still a hole, and the branch's expected monad loses its `Id`.
+//! each refused theorem is the value a lost reassignment would give. A `match` that reassigns
+//! after an undefaulted `let mut x := 0` is here too: the match does not refine its unmentioned
+//! discriminant, so the join's value type, a hole made outside the match, is solved inside it.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -134,6 +132,10 @@ fn mutable_variables_have_the_pins_values() {
         (
             "typed",
             "def m19 : Nat := Id.run do\n  let mut x : Nat := 0\n  x := 5\n  return x\ntheorem t : m19 = 5 := by decide\n",
+        ),
+        (
+            "match",
+            "def m13 (o : Option Nat) : Nat := Id.run do\n  let mut x := 0\n  match o with\n  | some n => x := n\n  | none => x := 7\n  return x + 1\ntheorem t1 : m13 (some 3) = 4 := by decide\ntheorem t2 : m13 none = 8 := by decide\n",
         ),
         (
             "three",
