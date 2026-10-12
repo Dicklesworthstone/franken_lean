@@ -1629,7 +1629,7 @@ impl Context {
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
-            NomatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            NomatchDiscriminant(Arguments<'a>, Vec<Typed>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
@@ -2124,11 +2124,23 @@ impl Context {
                                     ));
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "nofun"]) {
+                                    tasks.push(Task::Proof(
+                                        self.start_empty_function(syntax, expected)?,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "nomatch"]) {
-                                    let parts = self.nomatch_parts(syntax)?;
-                                    let discriminant = parts.discriminant;
-                                    tasks.push(Task::NomatchDiscriminant(parts, expected));
-                                    tasks.push(Task::Visit(discriminant, None, true));
+                                    let items = self.nomatch_discriminants(syntax)?;
+                                    let arguments = Arguments::Separated(items, &[","]);
+                                    let (first, remaining) =
+                                        arguments.split_first().expect("nonempty discriminants");
+                                    tasks.push(Task::NomatchDiscriminant(
+                                        remaining,
+                                        Vec::new(),
+                                        expected,
+                                    ));
+                                    tasks.push(Task::Visit(first, None, true));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "match"])
@@ -2717,13 +2729,14 @@ impl Context {
                                 }
                             }
                         }
-                        Task::NomatchDiscriminant(parts, expected) => {
-                            let major = values.pop().expect("empty match discriminant visit");
-                            // Empty matches require checked branch equations, even
-                            // inside a structurally recursive definition.
-                            tasks.push(Task::Proof(
-                                self.start_refined_match(parts, major, expected, false)?,
-                            ));
+                        Task::NomatchDiscriminant(remaining, mut terms, expected) => {
+                            terms.push(values.pop().expect("empty match discriminant visit"));
+                            if let Some((next, rest)) = remaining.split_first() {
+                                tasks.push(Task::NomatchDiscriminant(rest, terms, expected));
+                                tasks.push(Task::Visit(next, None, true));
+                            } else {
+                                tasks.push(Task::Proof(self.start_empty_match(terms, expected)?));
+                            }
                         }
                         Task::MatchDiscriminant(parts, expected) => {
                             let major = values.pop().expect("match discriminant visit");

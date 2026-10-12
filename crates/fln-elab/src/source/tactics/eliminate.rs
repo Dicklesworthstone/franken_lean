@@ -24,6 +24,8 @@ pub(super) enum EliminationSyntax<'a> {
     Tactic(&'a [Syntax]),
     Match(matching::MatchParts<'a>),
     RecursiveMatch(matching::MatchParts<'a>),
+    /// Retain each live branch as another empty-matrix obligation.
+    EmptyMatrix,
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -659,6 +661,7 @@ impl Context {
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
                 (Name::anonymous(), &[][..], true, &[][..])
             }
+            EliminationSyntax::EmptyMatrix => (Name::anonymous(), &[][..], false, &[][..]),
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -797,8 +800,10 @@ impl Context {
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         if equations.is_none() {
-            if matches!(input, EliminationSyntax::Match(_))
-                && self.match_has_field_indices(&family)?
+            if matches!(
+                input,
+                EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix
+            ) && self.match_has_field_indices(&family)?
             {
                 return self.eliminate_constrained_indices(
                     proof,

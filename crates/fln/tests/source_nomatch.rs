@@ -125,7 +125,7 @@ fn live_branches_and_invalid_discriminants_are_refused_atomically() {
         "def bad (h : False) : Nat := nomatch (h : Nat)",
         "def bad (h : False) : Nat := nomatch missing",
         "def bad (h : False) : Nat := nomatch h, missing",
-        "def bad (h : False) : Nat := nomatch h, true",
+        "def bad (n : Nat) (b : Bool) : Nat := nomatch n, b",
     ] {
         let error = engine
             .check_source_files(
