@@ -7,6 +7,8 @@ pub struct SimpAttribute {
     pub declarations: Vec<Name>,
     /// `None` removes a rule; `Some` records (priority, reverse).
     pub rule: Option<(u32, bool)>,
+    /// `attribute [local simp] x`: a rule for the enclosing scope only, never registered.
+    pub local: bool,
 }
 
 /// One inline attribute list as the pin parses it, held as token indices until the leaves
@@ -866,6 +868,9 @@ pub fn parse(source: &[u8]) -> Result<Option<SimpAttribute>, DefinitionParseErro
     let mut at = 2;
     let erase = is(at, "-");
     at += usize::from(erase);
+    // `attrKind`: `local` scopes the rule to the enclosing section or namespace. Erasure takes none.
+    let local = !erase && is(at, "local");
+    at += usize::from(local);
     if !matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(n)) if *n == Name::from_components(["simp"]))
     {
         return Err(bad(at));
@@ -912,6 +917,7 @@ pub fn parse(source: &[u8]) -> Result<Option<SimpAttribute>, DefinitionParseErro
     Ok(Some(SimpAttribute {
         declarations,
         rule: (!erase).then_some((priority, reverse)),
+        local,
     }))
 }
 

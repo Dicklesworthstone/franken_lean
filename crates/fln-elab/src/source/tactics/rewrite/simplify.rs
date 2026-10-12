@@ -313,11 +313,19 @@ impl Context {
         // Even `simp []` reads the default set; `simp only` never reads it. A
         // malformed registry therefore cannot silently become an empty success.
         let mut defaults = if use_default {
-            scope::simp::read(&self.txn.env)
-                .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?
-                .into_iter()
-                .map(SimpRule::Global)
-                .collect()
+            let mut rules = scope::simp::read(&self.txn.env)
+                .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?;
+            // The enclosing scope's `attribute [local simp]` rules, after the registered ones; a
+            // rule already registered is not read twice.
+            for local in &self.source_scope.local_simp {
+                if !rules
+                    .iter()
+                    .any(|rule| rule.declaration == local.declaration)
+                {
+                    rules.push(local.clone());
+                }
+            }
+            rules.into_iter().map(SimpRule::Global).collect()
         } else {
             Vec::new()
         };
