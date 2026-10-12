@@ -33,7 +33,6 @@ fn sequential_actions_bindings_and_terminal_returns_preserve_source() {
 fn malformed_or_unsupported_do_never_drops_a_statement() {
     for value in [
         "do",
-        "do return",
         "do let",
         "do let n ←",
         "do let n ← read",
@@ -51,9 +50,11 @@ fn malformed_or_unsupported_do_never_drops_a_statement() {
     }
     // `let mut` and a reassignment are the pin's `doLet` with its `mut` slot and `doReassign`;
     // the elaborator refuses both (`mutable_do_variables_are_refused_not_dropped`, `crates/fln`).
+    // `return` with nothing after it is the pin's `doReturn` with no value (`checkLineEq`).
     for value in [
         "do let mut n := 0; return n",
         "do let mut n := 0; n := n + 1; return n",
+        "do return",
     ] {
         let source = format!("def work := {value}");
         assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
