@@ -5,19 +5,24 @@
 //! Selection prefers one-sided elimination, then a side with unit coefficients,
 //! then fewer generated pairs, with original variable ordinals breaking ties.
 //!
-//! This is not a complete integer procedure: balanced-mod equality elimination
-//! and dark/grey shadows are not implemented. Failed integer reconstruction is
-//! `IntegerSearchRequired`, never a fabricated satisfiable result. Every `Sat`
-//! witness satisfies the original input; every `Unsat` remains an untrusted DAG
-//! for the elaborator's ordinary kernel-checked proof replay. No external solver,
-//! upstream execution, global state or machine-width numeric bound is used.
+//! The explicit integer-search entry point extends failed reconstruction with
+//! exact rational reconstruction and bounded integer case splitting. Each
+//! contradiction leaf retains its linear certificate and exact assumptions.
+//! The default entry points preserve the pinned elimination coverage; extended
+//! search is a frontier capability, not full Presburger coverage. Every
+//! `Sat` witness satisfies the original input; every `Unsat` remains untrusted
+//! data for the elaborator's ordinary kernel-checked proof replay. No external
+//! solver, upstream execution, global state or machine-width numeric bound is used.
 
 use fln_bignum::{int::BigInt, nat::BigNat};
 pub use fln_elab::arithmetic::{
-    LinearConstraint, OMEGA_CERTIFICATE_VERSION, OmegaCertificate, OmegaInconclusive, OmegaLimits,
+    LinearConstraint, OMEGA_BRANCH_CERTIFICATE_VERSION, OMEGA_CERTIFICATE_VERSION,
+    OmegaBranchCertificate, OmegaBranchNode, OmegaCertificate, OmegaInconclusive, OmegaLimits,
     OmegaOutcome, OmegaResource, OmegaStep,
 };
 
+mod branch;
+pub use branch::{check_branch_certificate, decode_branch_certificate, encode_branch_certificate};
 mod certificate;
 pub use certificate::{
     CertificateError, check_certificate, decode_certificate, encode_certificate,
@@ -645,29 +650,67 @@ pub fn solve_with_cancel(
     limits: OmegaLimits,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> OmegaOutcome {
+    solve_internal(inputs, limits, cancelled, false)
+}
+
+/// Extend elimination with bounded exact integer case search. This can close
+/// goals the pinned Reference refuses, so embeddings must select it explicitly
+/// for their frontier lane rather than widening a faithful tactic silently.
+pub fn solve_with_integer_search(inputs: &[LinearConstraint], limits: OmegaLimits) -> OmegaOutcome {
+    solve_with_integer_search_and_cancel(inputs, limits, &mut || false)
+}
+
+/// As [`solve_with_integer_search`], with cancellation throughout elimination,
+/// rational reconstruction, branch construction and witness validation.
+pub fn solve_with_integer_search_and_cancel(
+    inputs: &[LinearConstraint],
+    limits: OmegaLimits,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> OmegaOutcome {
+    solve_internal(inputs, limits, cancelled, true)
+}
+
+fn solve_internal(
+    inputs: &[LinearConstraint],
+    limits: OmegaLimits,
+    cancelled: &mut dyn FnMut() -> bool,
+    integer_search: bool,
+) -> OmegaOutcome {
     let mut meter = Meter {
         limits,
         used: 0,
         bytes: 0,
         cancelled,
     };
-    let result = meter.dimensions(inputs).and_then(|dimensions| {
-        Solver {
-            meter: &mut meter,
-            inputs,
-            dimensions,
-            rows: Vec::new(),
-            active: Vec::new(),
-            eliminations: Vec::new(),
-        }
-        .run()
-    });
+    let result = if integer_search {
+        branch::solve(inputs, &mut meter)
+    } else {
+        meter.dimensions(inputs).and_then(|dimensions| {
+            Solver {
+                meter: &mut meter,
+                inputs,
+                dimensions,
+                rows: Vec::new(),
+                active: Vec::new(),
+                eliminations: Vec::new(),
+            }
+            .run()
+            .map(|result| match result {
+                Ok(certificate) => branch::Result::Linear(certificate),
+                Err(witness) => branch::Result::Sat(witness),
+            })
+        })
+    };
     match result {
-        Ok(Ok(certificate)) => OmegaOutcome::Unsat {
+        Ok(branch::Result::Linear(certificate)) => OmegaOutcome::Unsat {
             certificate,
             steps_used: meter.used,
         },
-        Ok(Err(witness)) => OmegaOutcome::Sat {
+        Ok(branch::Result::Branches(certificate)) => OmegaOutcome::UnsatBranches {
+            certificate,
+            steps_used: meter.used,
+        },
+        Ok(branch::Result::Sat(witness)) => OmegaOutcome::Sat {
             witness,
             steps_used: meter.used,
         },

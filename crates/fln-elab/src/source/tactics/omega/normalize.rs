@@ -200,6 +200,10 @@ impl Normalization {
         self.atoms.len()
     }
 
+    pub(super) fn atom_expression(&self, index: usize) -> Option<&Expr> {
+        self.atoms.get(index)
+    }
+
     fn node(
         &mut self,
         context: &mut Context,

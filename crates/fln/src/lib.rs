@@ -4535,7 +4535,11 @@ impl Engine {
         fln_elab::source::scope::SourceScope {
             frontier_recursors: self.mode.permits_frontier(),
             arithmetic: Some(fln_elab::arithmetic::ArithmeticProvider(
-                fln_anvil::omega::solve,
+                if self.mode.permits_frontier() {
+                    fln_anvil::omega::solve_with_integer_search
+                } else {
+                    fln_anvil::omega::solve
+                },
             )),
             ..fln_elab::source::scope::SourceScope::default()
         }

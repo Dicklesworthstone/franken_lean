@@ -22,6 +22,9 @@ use fln_elab::source::scope::SourceScope;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[path = "support/omega_integer_search.rs"]
+mod integer_search;
+
 const STACK: usize = 256 * 1024 * 1024;
 
 fn n(text: &str) -> Name {
@@ -49,6 +52,10 @@ fn pinned_lib() -> Option<PathBuf> {
 }
 
 fn import_closure(lib: &Path) -> Engine {
+    import_closure_in_mode(lib, fln::Mode::DEFAULT)
+}
+
+fn import_closure_in_mode(lib: &Path, mode: fln::Mode) -> Engine {
     let root = n("Init.Omega");
     let mut pending = vec![root.clone()];
     let mut seen = BTreeSet::new();
@@ -86,6 +93,7 @@ fn import_closure(lib: &Path) -> Engine {
         })
         .collect();
     Engine::builder()
+        .mode(mode)
         .build_empty()
         .import_olean_modules_for_source(
             &inputs,
@@ -866,10 +874,22 @@ fn native_omega_reifies_and_replays_checked_integer_proofs() {
                 ("ground divisor limits", assert_ground_divisor_limits),
                 ("decreasing proof", assert_decreasing_proof),
                 ("module replay", assert_module_replay),
+                ("frontier integer proofs", integer_search::assert_proofs),
+                (
+                    "frontier branch boundary",
+                    integer_search::assert_provider_boundary,
+                ),
+                (
+                    "frontier integer scopes",
+                    integer_search::assert_scoped_proofs,
+                ),
             ] {
                 eprintln!("omega phase: {label}");
                 record_case(&mut failures, label, || check(&base));
             }
+            record_case(&mut failures, "frontier integer module records", || {
+                integer_search::assert_module_replay(&base, &lib);
+            });
             assert_cases_complete(&failures);
         })
         .expect("spawn native arithmetic checking thread")

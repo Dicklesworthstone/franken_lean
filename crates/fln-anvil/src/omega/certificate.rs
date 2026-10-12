@@ -14,6 +14,8 @@ pub enum CertificateError {
     NonPositiveScale(u32),
     ZeroDivisor(u32),
     Conclusion,
+    BranchShape,
+    BranchVariable(u32),
     Encoding(&'static str),
     Inconclusive(OmegaInconclusive),
 }
@@ -42,7 +44,7 @@ fn parent(rows: &[LinearConstraint], step: usize, id: u32) -> Checked<&LinearCon
     })
 }
 
-fn check(
+pub(super) fn check(
     expected: &[LinearConstraint],
     certificate: &OmegaCertificate,
     meter: &mut Meter<'_>,
@@ -186,21 +188,21 @@ pub fn check_certificate(
 
 const MAGIC: &[u8; 8] = b"FLNOMEGA";
 
-struct Encoder<'a, 'b> {
-    output: Vec<u8>,
-    meter: &'a mut Meter<'b>,
+pub(super) struct Encoder<'a, 'b> {
+    pub(super) output: Vec<u8>,
+    pub(super) meter: &'a mut Meter<'b>,
 }
 
 impl Encoder<'_, '_> {
-    fn bytes(&mut self, bytes: &[u8]) -> Checked<()> {
+    pub(super) fn bytes(&mut self, bytes: &[u8]) -> Checked<()> {
         self.meter.reserve(&mut self.output, bytes.len())?;
         self.output.extend_from_slice(bytes);
         Ok(())
     }
-    fn u32(&mut self, n: u32) -> Checked<()> {
+    pub(super) fn u32(&mut self, n: u32) -> Checked<()> {
         self.bytes(&n.to_le_bytes())
     }
-    fn nat(&mut self, n: &BigNat) -> Checked<()> {
+    pub(super) fn nat(&mut self, n: &BigNat) -> Checked<()> {
         let limbs = n.limbs_le();
         self.meter.width(limbs.len())?;
         let len = u32::try_from(limbs.len())
@@ -211,11 +213,11 @@ impl Encoder<'_, '_> {
         }
         Ok(())
     }
-    fn int(&mut self, n: &BigInt) -> Checked<()> {
+    pub(super) fn int(&mut self, n: &BigInt) -> Checked<()> {
         self.bytes(&[u8::from(n.is_negative())])?;
         self.nat(n.magnitude())
     }
-    fn row(&mut self, row: &LinearConstraint) -> Checked<()> {
+    pub(super) fn row(&mut self, row: &LinearConstraint) -> Checked<()> {
         self.u32(
             u32::try_from(row.coeffs.len())
                 .map_err(|_| CertificateError::Encoding("coefficient count"))?,
@@ -230,9 +232,6 @@ impl Encoder<'_, '_> {
 /// Encode the V1 tagged DAG with canonical signed-magnitude integers. Encoding
 /// preserves data and does not claim that the encoded certificate is valid.
 pub fn encode_certificate(certificate: &OmegaCertificate, limits: OmegaLimits) -> Checked<Vec<u8>> {
-    if certificate.version != OMEGA_CERTIFICATE_VERSION {
-        return Err(CertificateError::UnsupportedVersion(certificate.version));
-    }
     let mut never_cancel = || false;
     let mut meter = Meter {
         limits,
@@ -240,11 +239,18 @@ pub fn encode_certificate(certificate: &OmegaCertificate, limits: OmegaLimits) -
         bytes: 0,
         cancelled: &mut never_cancel,
     };
+    encode(certificate, &mut meter)
+}
+
+pub(super) fn encode(certificate: &OmegaCertificate, meter: &mut Meter<'_>) -> Checked<Vec<u8>> {
+    if certificate.version != OMEGA_CERTIFICATE_VERSION {
+        return Err(CertificateError::UnsupportedVersion(certificate.version));
+    }
     meter.dimensions(&certificate.inputs)?;
-    row_count(certificate.steps.len(), &mut meter)?;
+    row_count(certificate.steps.len(), meter)?;
     let mut encoder = Encoder {
         output: Vec::new(),
-        meter: &mut meter,
+        meter,
     };
     encoder.bytes(MAGIC)?;
     encoder.u32(certificate.version)?;
@@ -281,15 +287,14 @@ pub fn encode_certificate(certificate: &OmegaCertificate, limits: OmegaLimits) -
     Ok(encoder.output)
 }
 
-struct Decoder<'a, 'b, 'c> {
-    input: &'a [u8],
-    position: usize,
-    meter: &'b mut Meter<'c>,
+pub(super) struct Decoder<'a, 'b, 'c> {
+    pub(super) input: &'a [u8],
+    pub(super) position: usize,
+    pub(super) meter: &'b mut Meter<'c>,
 }
 
 impl<'a> Decoder<'a, '_, '_> {
-    fn bytes(&mut self, count: usize) -> Checked<&'a [u8]> {
-        self.meter.tick(count as u64 + 1)?;
+    pub(super) fn bytes(&mut self, count: usize) -> Checked<&'a [u8]> {
         let end = self
             .position
             .checked_add(count)
@@ -298,18 +303,21 @@ impl<'a> Decoder<'a, '_, '_> {
             .input
             .get(self.position..end)
             .ok_or(CertificateError::Encoding("truncated"))?;
+        // An untrusted length does not describe work until its entire span
+        // exists. Reject missing bytes before charging or traversing them.
+        self.meter.tick(count as u64 + 1)?;
         self.position = end;
         Ok(bytes)
     }
-    fn byte(&mut self) -> Checked<u8> {
+    pub(super) fn byte(&mut self) -> Checked<u8> {
         Ok(self.bytes(1)?[0])
     }
-    fn u32(&mut self) -> Checked<u32> {
+    pub(super) fn u32(&mut self) -> Checked<u32> {
         Ok(u32::from_le_bytes(
             self.bytes(4)?.try_into().expect("four bytes"),
         ))
     }
-    fn nat(&mut self) -> Checked<BigNat> {
+    pub(super) fn nat(&mut self) -> Checked<BigNat> {
         let count = self.u32()? as usize;
         self.meter.width(count)?;
         // Validate the byte span before allocating from an untrusted prefix.
@@ -328,7 +336,7 @@ impl<'a> Decoder<'a, '_, '_> {
         }
         Ok(BigNat::from_limbs_le(limbs))
     }
-    fn int(&mut self) -> Checked<BigInt> {
+    pub(super) fn int(&mut self) -> Checked<BigInt> {
         let negative = match self.byte()? {
             0 => false,
             1 => true,
@@ -340,7 +348,7 @@ impl<'a> Decoder<'a, '_, '_> {
         }
         Ok(BigInt::from_sign_magnitude(negative, magnitude))
     }
-    fn row(&mut self) -> Checked<LinearConstraint> {
+    pub(super) fn row(&mut self) -> Checked<LinearConstraint> {
         let count = self.u32()? as usize;
         if count > self.meter.limits.max_variables {
             return Err(Meter::limit(
@@ -366,14 +374,6 @@ impl<'a> Decoder<'a, '_, '_> {
 /// integers, truncation and trailing bytes are errors. Arithmetic and exact input
 /// binding are checked separately by the certificate checker.
 pub fn decode_certificate(input: &[u8], limits: OmegaLimits) -> Checked<OmegaCertificate> {
-    if input.len() > limits.max_certificate_bytes {
-        return Err(Meter::limit(
-            OmegaResource::CertificateBytes,
-            limits.max_certificate_bytes,
-            input.len(),
-        )
-        .into());
-    }
     let mut never_cancel = || false;
     let mut meter = Meter {
         limits,
@@ -381,10 +381,32 @@ pub fn decode_certificate(input: &[u8], limits: OmegaLimits) -> Checked<OmegaCer
         bytes: 0,
         cancelled: &mut never_cancel,
     };
+    decode(input, &mut meter)
+}
+
+pub(super) fn decode(input: &[u8], meter: &mut Meter<'_>) -> Checked<OmegaCertificate> {
+    decode_after_rows(input, meter, 0)
+}
+
+/// Branch decoding carries its earlier tree/leaf rows into this prefix check,
+/// so an otherwise permitted leaf cannot allocate past the cumulative cap.
+pub(super) fn decode_after_rows(
+    input: &[u8],
+    meter: &mut Meter<'_>,
+    earlier_rows: usize,
+) -> Checked<OmegaCertificate> {
+    if input.len() > meter.limits.max_certificate_bytes {
+        return Err(Meter::limit(
+            OmegaResource::CertificateBytes,
+            meter.limits.max_certificate_bytes,
+            input.len(),
+        )
+        .into());
+    }
     let mut decoder = Decoder {
         input,
         position: 0,
-        meter: &mut meter,
+        meter,
     };
     if decoder.bytes(8)? != MAGIC {
         return Err(CertificateError::Encoding("magic"));
@@ -401,7 +423,7 @@ pub fn decode_certificate(input: &[u8], limits: OmegaLimits) -> Checked<OmegaCer
         inputs.push(decoder.row()?);
     }
     let count = decoder.u32()? as usize;
-    row_count(count, decoder.meter)?;
+    row_count(earlier_rows.saturating_add(count), decoder.meter)?;
     let mut steps = Vec::new();
     decoder.meter.reserve(&mut steps, count)?;
     for _ in 0..count {

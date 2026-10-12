@@ -5,6 +5,8 @@
 //! kernel conversion in an admitted theorem application. The provider and
 //! this data checker have no admission authority.
 
+mod branches;
+
 use super::super::*;
 use super::normalize::Normalization;
 use crate::arithmetic::{
@@ -116,10 +118,10 @@ pub(super) struct Proofs {
     max_nodes: u64,
 }
 impl Proofs {
-    fn new(limits: OmegaLimits) -> Self {
+    fn new(limits: OmegaLimits, produced_nodes: u64) -> Self {
         Self {
             bindings: Vec::new(),
-            produced_nodes: 0,
+            produced_nodes,
             max_nodes: limits.max_steps,
         }
     }
@@ -201,6 +203,51 @@ impl Proofs {
         }
         body
     }
+}
+
+/// One account covers the entire proof, including every branch leaf.
+#[derive(Default)]
+struct ReplayBudget {
+    rows: usize,
+    bytes: usize,
+    produced_nodes: u64,
+}
+impl ReplayBudget {
+    fn reserve_rows(
+        &mut self,
+        amount: usize,
+        limits: OmegaLimits,
+    ) -> Result<(), NatDefinitionElabError> {
+        let observed = self.rows.saturating_add(amount);
+        if amount > limits.max_rows.saturating_sub(self.rows) {
+            return Err(resource(OmegaResource::Rows, limits.max_rows, observed));
+        }
+        self.rows = observed;
+        Ok(())
+    }
+
+    fn precharge(
+        &mut self,
+        context: &mut Context,
+        amount: usize,
+        limits: OmegaLimits,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut proofs = Proofs::new(limits, self.produced_nodes);
+        proofs.precharge(context, amount)?;
+        self.produced_nodes = proofs.produced_nodes;
+        Ok(())
+    }
+}
+
+struct BranchInput {
+    row: LinearConstraint,
+    proof: Expr,
+}
+
+struct ReplayInputs<'a> {
+    normalization: &'a Normalization,
+    roots: &'a [LinearConstraint],
+    branches: &'a [BranchInput],
 }
 
 fn lower_constraint(bound: &BigInt) -> Expr {
@@ -395,6 +442,7 @@ impl Context {
         let outcome = provider.0(&inputs, limits);
         let steps_used = match &outcome {
             OmegaOutcome::Unsat { steps_used, .. }
+            | OmegaOutcome::UnsatBranches { steps_used, .. }
             | OmegaOutcome::Sat { steps_used, .. }
             | OmegaOutcome::Inconclusive { steps_used, .. } => *steps_used,
         };
@@ -416,6 +464,10 @@ impl Context {
                 self.tick()?;
                 self.omega_replay(normalization, inputs, certificate, limits)
             }
+            OmegaOutcome::UnsatBranches { certificate, .. } => {
+                self.tick()?;
+                self.omega_replay_branches(&normalization, &inputs, &certificate, limits)
+            }
             OmegaOutcome::Sat { .. } => Err(error(TacticError::ArithmeticNoContradiction)),
             OmegaOutcome::Inconclusive { reason, .. } => {
                 Err(failure(SourceInferenceError::ArithmeticInconclusive(
@@ -432,34 +484,54 @@ impl Context {
         certificate: OmegaCertificate,
         limits: OmegaLimits,
     ) -> Result<Expr, NatDefinitionElabError> {
+        self.omega_replay_leaf(
+            ReplayInputs {
+                normalization: &normalization,
+                roots: &inputs,
+                branches: &[],
+            },
+            &certificate,
+            limits,
+            &mut ReplayBudget::default(),
+        )
+    }
+
+    fn omega_replay_leaf(
+        &mut self,
+        inputs: ReplayInputs<'_>,
+        certificate: &OmegaCertificate,
+        limits: OmegaLimits,
+        budget: &mut ReplayBudget,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let normalization = inputs.normalization;
+        let input_count = inputs.roots.len().saturating_add(inputs.branches.len());
         if certificate.version != OMEGA_CERTIFICATE_VERSION
-            || certificate.inputs.len() != inputs.len()
+            || certificate.inputs.len() != input_count
         {
             return Err(error(TacticError::ArithmeticInvalidCertificate));
         }
-        if certificate.steps.len() > limits.max_rows {
-            return Err(resource(
-                OmegaResource::Rows,
-                limits.max_rows,
-                certificate.steps.len(),
-            ));
-        }
-        let mut bytes = 32_usize;
-        for (claimed, actual) in certificate.inputs.iter().zip(&inputs) {
+        budget.reserve_rows(certificate.steps.len(), limits)?;
+        add_bytes(&mut budget.bytes, 32, limits)?;
+        for (claimed, actual) in certificate.inputs.iter().zip(
+            inputs
+                .roots
+                .iter()
+                .chain(inputs.branches.iter().map(|input| &input.row)),
+        ) {
             self.tick()?;
-            add_bytes(&mut bytes, check_row(claimed, limits)?, limits)?;
+            add_bytes(&mut budget.bytes, check_row(claimed, limits)?, limits)?;
             if claimed != actual {
                 return Err(error(TacticError::ArithmeticInvalidCertificate));
             }
         }
-        let mut proofs = Proofs::new(limits);
+        let mut proofs = Proofs::new(limits, budget.produced_nodes);
         proofs.precharge_affines(self, normalization.atom_count())?;
         let atoms = normalization.atoms_expression();
         let normalized_proofs = normalization.proofs(self, &mut proofs, &atoms)?;
         let mut input_proofs = Vec::new();
         input_proofs
-            .try_reserve_exact(inputs.len())
-            .map_err(|_| resource(OmegaResource::Allocation, 0, inputs.len()))?;
+            .try_reserve_exact(input_count)
+            .map_err(|_| resource(OmegaResource::Allocation, 0, input_count))?;
         for (index, (root, hypothesis)) in normalization.facts.iter().enumerate() {
             self.tick()?;
             let node = &normalization.nodes[*root];
@@ -470,7 +542,7 @@ impl Context {
                     .len()
                     .saturating_add(1)
                     .saturating_mul(2)
-                    .saturating_add(inputs[index].coeffs.len().saturating_add(1)),
+                    .saturating_add(inputs.roots[index].coeffs.len().saturating_add(1)),
             )?;
             let evaluation = node.affine.evaluation(&atoms);
             let evidence = apply(
@@ -497,7 +569,15 @@ impl Context {
                     evidence,
                 ],
             );
-            input_proofs.push(proofs.push(self, row_type(&inputs[index], &atoms), value)?);
+            input_proofs.push(proofs.push(self, row_type(&inputs.roots[index], &atoms), value)?);
+        }
+        for input in inputs.branches {
+            proofs.precharge_affines(self, input.row.coeffs.len().saturating_add(1))?;
+            input_proofs.push(proofs.push(
+                self,
+                row_type(&input.row, &atoms),
+                input.proof.clone(),
+            )?);
         }
         let mut rows: Vec<LinearConstraint> = Vec::new();
         let mut handles = Vec::new();
@@ -506,12 +586,13 @@ impl Context {
         handles
             .try_reserve_exact(certificate.steps.len())
             .map_err(|_| resource(OmegaResource::Allocation, 0, certificate.steps.len()))?;
-        for step in certificate.steps {
+        for step in &certificate.steps {
             self.tick()?;
             let (row, handle) = match step {
                 OmegaStep::Input { index } => {
-                    let index = index as usize;
-                    let row = inputs
+                    let index = *index as usize;
+                    let row = certificate
+                        .inputs
                         .get(index)
                         .ok_or_else(|| error(TacticError::ArithmeticInvalidCertificate))?
                         .clone();
@@ -526,17 +607,17 @@ impl Context {
                     left_scale,
                     right_scale,
                 } => {
-                    let left = left as usize;
-                    let right = right as usize;
+                    let left = *left as usize;
+                    let right = *right as usize;
                     let x = rows
                         .get(left)
                         .ok_or_else(|| error(TacticError::ArithmeticInvalidCertificate))?;
                     let y = rows
                         .get(right)
                         .ok_or_else(|| error(TacticError::ArithmeticInvalidCertificate))?;
-                    let row = combine_rows(self, x, y, &left_scale, &right_scale, limits)?;
+                    let row = combine_rows(self, x, y, left_scale, right_scale, limits)?;
                     add_bytes(
-                        &mut bytes,
+                        &mut budget.bytes,
                         24 + 8 * left_scale.limbs_le().len() + 8 * right_scale.limbs_le().len(),
                         limits,
                     )?;
@@ -553,9 +634,9 @@ impl Context {
                         [
                             lower_constraint(&x.bound),
                             lower_constraint(&y.bound),
-                            integer(&BigInt::from_sign_magnitude(false, left_scale)),
+                            integer(&BigInt::from_sign_magnitude(false, left_scale.clone())),
                             dual_coefficients(x),
-                            integer(&BigInt::from_sign_magnitude(false, right_scale)),
+                            integer(&BigInt::from_sign_magnitude(false, right_scale.clone())),
                             dual_coefficients(y),
                             atoms.clone(),
                             proofs.reference(handles[left])?,
@@ -566,7 +647,7 @@ impl Context {
                     (row, handle)
                 }
                 OmegaStep::DivideGcd { source } => {
-                    let source = source as usize;
+                    let source = *source as usize;
                     let original = rows
                         .get(source)
                         .ok_or_else(|| error(TacticError::ArithmeticInvalidCertificate))?;
@@ -598,7 +679,7 @@ impl Context {
                     (row, handle)
                 }
             };
-            add_bytes(&mut bytes, 16 + check_row(&row, limits)?, limits)?;
+            add_bytes(&mut budget.bytes, 16 + check_row(&row, limits)?, limits)?;
             rows.push(row);
             handles.push(handle);
         }
@@ -633,6 +714,7 @@ impl Context {
                 normalized,
             ],
         );
+        budget.produced_nodes = proofs.produced_nodes;
         Ok(proofs.finish(contradiction))
     }
 }

@@ -7,6 +7,7 @@
 use fln_bignum::{int::BigInt, nat::BigNat};
 
 pub const OMEGA_CERTIFICATE_VERSION: u32 = 1;
+pub const OMEGA_BRANCH_CERTIFICATE_VERSION: u32 = 1;
 
 /// The integer inequality `sum(coeffs[i] * values[i]) <= bound`.
 /// Missing trailing coefficients denote zero.
@@ -63,6 +64,34 @@ pub struct OmegaCertificate {
     pub version: u32,
     pub inputs: Vec<LinearConstraint>,
     pub steps: Vec<OmegaStep>,
+    pub conclusion: u32,
+}
+
+/// A postorder tree of integer case splits. A split covers the disjoint,
+/// exhaustive cases `values[variable] <= cut` and `cut + 1 <= values[variable]`.
+/// Child indices must precede their parent. Each leaf binds its linear
+/// certificate to the root inputs followed by exactly its path assumptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OmegaBranchNode {
+    Leaf {
+        certificate: OmegaCertificate,
+    },
+    Split {
+        variable: u32,
+        cut: BigInt,
+        le: u32,
+        gt: u32,
+    },
+}
+
+/// Branch certificates have their own version and codec; existing linear
+/// certificates retain their V1 representation. The conclusion is the last
+/// node and every node belongs to exactly one branch of the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmegaBranchCertificate {
+    pub version: u32,
+    pub inputs: Vec<LinearConstraint>,
+    pub nodes: Vec<OmegaBranchNode>,
     pub conclusion: u32,
 }
 
@@ -125,6 +154,10 @@ impl OmegaInconclusive {
 pub enum OmegaOutcome {
     Unsat {
         certificate: OmegaCertificate,
+        steps_used: u64,
+    },
+    UnsatBranches {
+        certificate: OmegaBranchCertificate,
         steps_used: u64,
     },
     Sat {
