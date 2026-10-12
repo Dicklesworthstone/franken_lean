@@ -281,21 +281,41 @@ impl Context {
         }
         loop {
             self.tick()?;
-            let raw = self.instantiate(&goal.target)?;
-            let target = if matches!(raw.node(), ExprNode::LetE { .. }) {
+            let mut raw = self.instantiate(&goal.target)?;
+            while let ExprNode::MData { expr, .. } = raw.node() {
+                self.tick()?;
+                raw = expr.clone();
+            }
+            // Expose head lets before predicate recognition: a general head
+            // reduction would continue into the arithmetic relation itself.
+            let mut peek = raw.clone();
+            loop {
+                self.tick()?;
+                match peek.node() {
+                    ExprNode::LetE { body, value, .. } => {
+                        peek = self.substitute(body, value)?;
+                    }
+                    ExprNode::MData { expr, .. } => peek = expr.clone(),
+                    _ => break,
+                }
+            }
+            let target = self.omega_proposition(&peek)?;
+            let binder = matches!(target.node(), ExprNode::ForallE { .. })
+                || unary(&target, "Not").is_some()
+                || comparison(&target).is_some_and(|c| matches!(c.relation, Relation::Ne));
+            // Like falseOrByContra, inspect the reduced head but introduce from
+            // the original goal when a let precedes a binder. Its local value
+            // must remain opaque inside divisors. A let ending in a proposition
+            // is zeta-substituted instead, with conversion against the original
+            // goal still checked when close_proof_goal assigns its metavariable.
+            goal.target = if binder && matches!(raw.node(), ExprNode::LetE { .. }) {
                 raw
             } else {
-                self.omega_proposition(&raw)?
+                target
             };
-            let binder = matches!(
-                target.node(),
-                ExprNode::ForallE { .. } | ExprNode::LetE { .. }
-            ) || unary(&target, "Not").is_some()
-                || comparison(&target).is_some_and(|c| matches!(c.relation, Relation::Ne));
             if !binder {
                 break;
             }
-            goal.target = target;
             let name = self.fresh_name()?;
             self.introduce_proof_binder(&mut goal, name)?;
             goal.lctx = self.txn.lctx.clone();

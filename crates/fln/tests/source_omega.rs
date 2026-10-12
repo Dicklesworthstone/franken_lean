@@ -190,6 +190,142 @@ const PROOFS: &[(&str, &str)] = &[
         "doubleNegation",
         "theorem doubleNegation (n : Nat) (h : ¬¬(n ≤ 3)) : n ≤ 3 := by omega",
     ),
+    (
+        "quotientRemainderIdentity",
+        "theorem quotientRemainderIdentity (n : Nat) : 7 * (n / 7) + n % 7 = n := by omega",
+    ),
+    (
+        "quotientLowerBound",
+        "theorem quotientLowerBound (n : Nat) : 7 * (n / 7) ≤ n := by omega",
+    ),
+    (
+        "quotientUpperBound",
+        "theorem quotientUpperBound (n : Nat) : n < 7 * (n / 7) + 7 := by omega",
+    ),
+    (
+        "quotientHypBound",
+        "theorem quotientHypBound (n : Nat) (h : n < 14) : n / 7 ≤ 1 := by omega",
+    ),
+    (
+        "quotientZeroIff",
+        "theorem quotientZeroIff (n : Nat) : n / 7 = 0 ↔ n < 7 := by omega",
+    ),
+    (
+        "uniqueQuotientRemainder",
+        "theorem uniqueQuotientRemainder (n q r : Nat) (h : n = 7 * q + r) (hr : r < 7) : n / 7 = q ∧ n % 7 = r := by omega",
+    ),
+    (
+        "quotientZeroDivisor",
+        "theorem quotientZeroDivisor (n : Nat) : n / 0 = 0 := by omega",
+    ),
+    (
+        "quotientOneDivisor",
+        "theorem quotientOneDivisor (n : Nat) : n / 1 = n := by omega",
+    ),
+    (
+        "quotientCombinedDivisors",
+        "theorem quotientCombinedDivisors (n : Nat) : n / 3 + n / 4 ≤ n := by omega",
+    ),
+    (
+        "quotientNestedRemainder",
+        "theorem quotientNestedRemainder (n : Nat) : (n / 3) % 2 = (n % 6) / 3 := by omega",
+    ),
+    (
+        "remainderShift",
+        "theorem remainderShift (n : Nat) : (n + 7) % 7 = n % 7 := by omega",
+    ),
+    (
+        "remainderParity",
+        "theorem remainderParity (n : Nat) (h : n % 2 = 0) : (n + 1) % 2 = 1 := by omega",
+    ),
+    (
+        "remainderBound",
+        "theorem remainderBound (n : Nat) : n % 7 < 7 := by omega",
+    ),
+    (
+        "remainderZero",
+        "theorem remainderZero (n : Nat) : n % 0 = n := by omega",
+    ),
+    (
+        "remainderOne",
+        "theorem remainderOne (n : Nat) : n % 1 = 0 := by omega",
+    ),
+    (
+        "goalLetDivisor",
+        "theorem goalLetDivisor (n : Nat) : let k := 7; n % k < 7 := by omega",
+    ),
+    (
+        "groundArithmeticDivisor",
+        "theorem groundArithmeticDivisor (n : Nat) : n % (2 + 5) < 7 := by omega",
+    ),
+    (
+        "groundZeroDivisor",
+        "theorem groundZeroDivisor (n : Nat) : n % (2 - 2) = n := by omega",
+    ),
+    (
+        "groundMixedDivisor",
+        "theorem groundMixedDivisor (n : Nat) : n % (18 / 3 + 2 * 2) < 10 := by omega",
+    ),
+    (
+        "groundPowerDivisor",
+        "theorem groundPowerDivisor (n : Nat) : n % (2 ^ 3) < 8 := by omega",
+    ),
+    (
+        "quotientGroundArithmetic",
+        "theorem quotientGroundArithmetic (n : Nat) : n / (2 + 5) = n / 7 := by omega",
+    ),
+    (
+        "quotientGoalLet",
+        "theorem quotientGoalLet (n : Nat) : let k := 7; n / k = n / 7 := by omega",
+    ),
+    (
+        "forallThenDivisorLet",
+        "theorem forallThenDivisorLet : ∀ n : Nat, let k : Nat := 7; n % k < 7 := by omega",
+    ),
+    (
+        "nestedGoalDivisorLets",
+        "theorem nestedGoalDivisorLets (n : Nat) : let k : Nat := 2; let j : Nat := k + 5; n % j < 7 := by omega",
+    ),
+    (
+        "wideDivisor",
+        "theorem wideDivisor (n : Nat) : n % 340282366920938463463374607431768211457 < 340282366920938463463374607431768211457 := by omega",
+    ),
+    (
+        "rawNatQuotientNonnegative",
+        "theorem rawNatQuotientNonnegative (n k : Nat) : 0 ≤ Nat.div n k := by omega",
+    ),
+    (
+        "rawNatRemainderNonnegative",
+        "theorem rawNatRemainderNonnegative (n k : Nat) : 0 ≤ Nat.mod n k := by omega",
+    ),
+    (
+        "intQuotientLower",
+        "theorem intQuotientLower (x : Int) : 7 * (x / 7) ≤ x := by omega",
+    ),
+    (
+        "intRemainderBounds",
+        "theorem intRemainderBounds (x : Int) : 0 ≤ x % 7 ∧ x % 7 < 7 := by omega",
+    ),
+    (
+        "intDivisionIdentity",
+        "theorem intDivisionIdentity (x : Int) : 7 * (x / 7) + x % 7 = x := by omega",
+    ),
+    (
+        "intNegativeQuotient",
+        "theorem intNegativeQuotient : (-8 : Int) / 7 = -2 := by omega",
+    ),
+    (
+        "intNegativeRemainder",
+        "theorem intNegativeRemainder : (-8 : Int) % 7 = 6 := by omega",
+    ),
+    (
+        "intZeroQuotient",
+        "theorem intZeroQuotient (x : Int) : x / 0 = 0 := by omega",
+    ),
+    (
+        "intZeroRemainder",
+        "theorem intZeroRemainder (x : Int) : x % 0 = x := by omega",
+    ),
 ];
 
 fn record_case(failures: &mut Vec<String>, label: &str, check: impl FnOnce()) {
@@ -257,10 +393,55 @@ const REFUSALS: &[&str] = &[
     "def hiddenSuccessor (n : Nat) : Nat := n + 1\ntheorem hiddenBody (n : Nat) : n < hiddenSuccessor n := by omega",
     "def customOrder : LE Nat := ⟨fun _ _ => True⟩\ntheorem customDictionary (n : Nat) (h : @LE.le Nat customOrder (n + 1) n) : False := by omega",
     "theorem extraTactic (n : Nat) : n = n := by\n  try omega\n  rfl",
+    "theorem divisionRawConstant (n : Nat) : Nat.div n 7 ≤ n := by omega",
+    "theorem divisionRawZero (n : Nat) : Nat.div n 0 = 0 := by omega",
+    "theorem divisionVariable (n k : Nat) (h : 0 < k) : n / k ≤ n := by omega",
+    "theorem divisionIdentityVariable (n k : Nat) : k * (n / k) + n % k = n := by omega",
+    "theorem falseQuotientBound (n : Nat) : n / 7 < n := by omega",
+    "theorem falseRemainderValue (n : Nat) : n % 7 = 0 := by omega",
+    "theorem remainderVariable (n k : Nat) (h : 0 < k) : n % k < k := by omega",
+    "theorem remainderRawConstant (n : Nat) : Nat.mod n 7 < 7 := by omega",
+    "theorem remainderVariableZero (n k : Nat) (h : k = 0) : n % k = n := by omega",
+    "theorem remainderRawZero (n : Nat) : Nat.mod n 0 = n := by omega",
+    "theorem divisorAlgebraicCancellation (n k : Nat) : n % (k - k + 7) < 7 := by omega",
+    "theorem divisorZeroMultiple (n k : Nat) : n % (k * 0 + 7) < 7 := by omega",
+    "theorem divisorRawSuccessor (n : Nat) : n % (Nat.succ 6) < 7 := by omega",
+    "theorem divisorRawAddition (n : Nat) : n % (Nat.add 2 5) < 7 := by omega",
+    "def divisorSeven : Nat := 7\ntheorem divisorNamedDefinition (n : Nat) : n % divisorSeven < 7 := by omega",
+    "theorem divisorBeta (n : Nat) : n % ((fun k : Nat => k + 5) 2) < 7 := by omega",
+    "theorem nestedRemainderDivisor (n : Nat) : n % (10 % 7) < 3 := by omega",
+    "theorem rawZeroDivisor (n : Nat) : n % Nat.zero = n := by omega",
+    "theorem tacticLetDivisor (n : Nat) : n % 7 < 7 := by\n  let k : Nat := 7\n  have bound : n % k < 7 := by omega\n  exact bound",
+    "theorem tacticHaveDivisor (n : Nat) : n % 7 < 7 := by\n  have k : Nat := 7\n  have bound : n % k < 7 := by omega\n  exact bound",
+    "theorem tacticLetArithmeticDivisor (n : Nat) : n % 7 < 7 := by\n  let k : Nat := 2\n  have bound : n % (k + 5) < 7 := by omega\n  exact bound",
+    "theorem divisorLetBeforeForall : let k : Nat := 7; ∀ n : Nat, n % k < 7 := by omega",
+    "theorem divisorLetBeforeImplication (n : Nat) : let k : Nat := 7; n < 20 → n % k < 7 := by omega",
+    "theorem divisorLetBeforeNot (n : Nat) : let k : Nat := 7; ¬ (n % k ≥ 7) := by omega",
+    "theorem divisorLetBeforeNe (n : Nat) : let k : Nat := 7; n % k ≠ 7 := by omega",
+    "theorem intRawQuotient (x : Int) : 7 * Int.ediv x 7 ≤ x := by omega",
+    "theorem intRawRemainder (x : Int) : Int.emod x 7 < 7 := by omega",
+    "def customMod : Mod Nat := ⟨fun _ _ => 100⟩\ntheorem customModDictionary (n : Nat) : @HMod.hMod Nat Nat Nat (@instHMod Nat customMod) n 7 < 7 := by omega",
+    "def customDiv : Div Nat := ⟨fun _ _ => 100⟩\ntheorem customDivDictionary (n : Nat) : 7 * @HDiv.hDiv Nat Nat Nat (@instHDiv Nat customDiv) n 7 ≤ n := by omega",
 ];
 
 fn assert_refusals(base: &Engine) {
     let mut failures = Vec::new();
+    for source in [
+        "def customMod : Mod Nat := ⟨fun _ _ => 100⟩\ntheorem customModControl (n : Nat) : @HMod.hMod Nat Nat Nat (@instHMod Nat customMod) n 7 = 100 := rfl",
+        "def customDiv : Div Nat := ⟨fun _ _ => 100⟩\ntheorem customDivControl (n : Nat) : @HDiv.hDiv Nat Nat Nat (@instHDiv Nat customDiv) n 7 = 100 := rfl",
+        "theorem tacticLetDivisorControl (n : Nat) : n % 7 < 7 := by\n  let k : Nat := 7\n  have bound : n % k < 7 := Nat.mod_lt n (Nat.succ_pos 6)\n  exact bound",
+    ] {
+        record_case(&mut failures, source.lines().next().unwrap(), || {
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect("the divisor control is valid ordinary source")
+            .into_complete()
+            .expect("the written control proof passes both checker seats");
+        });
+    }
     record_case(&mut failures, "custom dictionary control", || {
         base.check_source_files(
         &["def customOrder : LE Nat := ⟨fun _ _ => True⟩\ntheorem customOrderControl (n : Nat) : @LE.le Nat customOrder (n + 1) n := True.intro".as_bytes()],
@@ -621,6 +802,49 @@ fn assert_decreasing_proof(base: &Engine) {
     assert_eq!(values, vec![ClosedVmValue::Scalar(42)]);
 }
 
+fn assert_ground_divisor_limits(base: &Engine) {
+    let before = base.logical_root(&KVMap::new());
+    let mut failures = Vec::new();
+    for source in [
+        "theorem oversizedGroundDivisor (n : Nat) : n % (2 ^ 20000) < 2 ^ 20000 := by\n  try omega",
+        "theorem oversizedGroundExponent (n : Nat) : n % (2 ^ (2 ^ 100)) < 2 ^ (2 ^ 100) := by\n  try omega",
+    ] {
+        record_case(&mut failures, source.lines().next().unwrap(), || {
+            let outcome = base
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .expect("oversized ground arithmetic returns a typed nonanswer");
+            let fln::Outcome::Inconclusive(reason) = outcome else {
+                panic!("try must not swallow the ground divisor resource stop: {outcome:?}");
+            };
+            let InconclusiveCause::ResourceExhausted { usage } = reason.cause else {
+                panic!("the divisor width must stop before exponentiation: {reason:?}");
+            };
+            assert_eq!(
+                usage.allowed,
+                OmegaLimits::default().max_coefficient_limbs as u64
+            );
+            assert!(usage.is_genuine_exhaustion());
+            assert_eq!(base.logical_root(&KVMap::new()), before);
+        });
+    }
+    record_case(&mut failures, "ground divisor recovery", || {
+        base.check_source_files(
+            &[b"theorem divisorRecovery (n : Nat) : n % 7 < 7 := by omega"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect("a later constant-divisor proof remains usable")
+        .into_complete()
+        .expect("the recovery proof passes both checker seats");
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    });
+    assert_cases_complete(&failures);
+}
+
 #[test]
 fn native_omega_reifies_and_replays_checked_integer_proofs() {
     let Some(lib) = pinned_lib() else {
@@ -639,6 +863,7 @@ fn native_omega_reifies_and_replays_checked_integer_proofs() {
                 ("scoped proofs", assert_scoped_proofs),
                 ("refusals", assert_refusals),
                 ("provider boundary", assert_provider_boundary),
+                ("ground divisor limits", assert_ground_divisor_limits),
                 ("decreasing proof", assert_decreasing_proof),
                 ("module replay", assert_module_replay),
             ] {

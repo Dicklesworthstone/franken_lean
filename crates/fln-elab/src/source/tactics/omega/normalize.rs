@@ -5,6 +5,8 @@
 //! meaning of a previously constructed coordinate proof. Definitions and
 //! arbitrary instance dictionaries are never unfolded to guess arithmetic.
 
+mod divmod;
+
 use super::super::*;
 use super::replay::{
     Proofs, apply, check_integer, coefficients, constant, equation, int_list, int_symmetry,
@@ -129,6 +131,7 @@ pub(super) struct Normalization {
     node_index: HashMap<Expr, usize>,
     atom_index: HashMap<Expr, usize>,
     nonnegative: HashSet<Expr>,
+    divmod: divmod::State,
     pending_facts: Vec<(Expr, Expr)>,
     bytes: usize,
     limits: OmegaLimits,
@@ -147,6 +150,7 @@ impl Normalization {
             node_index: HashMap::new(),
             atom_index: HashMap::new(),
             nonnegative: HashSet::new(),
+            divmod: divmod::State::default(),
             pending_facts: facts,
             bytes: 0,
             limits,
@@ -426,6 +430,11 @@ impl Normalization {
                             work.push(Work::Visit(next));
                             continue;
                         }
+                        if let Some((next, evidence)) = self.divmod_nat_cast(context, &argument)? {
+                            work.push(Work::Rewrite(expression, Some(evidence)));
+                            work.push(Work::Visit(next));
+                            continue;
+                        }
                         if let Some((operation, left, right)) = binary_expression(&argument, "Nat")
                         {
                             let (primitive, lemma) = match operation {
@@ -516,6 +525,18 @@ impl Normalization {
                             }
                             continue;
                         }
+                    }
+                    if let Some(expansion) = self.divmod_expansion(context, &expression)? {
+                        match expansion {
+                            divmod::Expansion::Rewrite(next, evidence) => {
+                                work.push(Work::Rewrite(expression, evidence));
+                                work.push(Work::Visit(next));
+                            }
+                            divmod::Expansion::Quotient => {
+                                values.push(self.atom(context, expression)?);
+                            }
+                        }
+                        continue;
                     }
                     if let Some(inner) = neg_expression(&expression) {
                         work.push(Work::Neg(expression));
