@@ -26,6 +26,8 @@ pub(super) enum EliminationSyntax<'a> {
     RecursiveMatch(matching::MatchParts<'a>),
     /// Retain each live branch as another empty-matrix obligation.
     EmptyMatrix(HashMap<Name, Vec<Name>>),
+    /// Recursive tactic patterns retain the ordinary cases removal semantics.
+    RCases(HashMap<Name, Vec<Name>>),
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -663,7 +665,9 @@ impl Context {
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
                 (Name::anonymous(), &[][..], true, &[][..])
             }
-            EliminationSyntax::EmptyMatrix(_) => (Name::anonymous(), &[][..], false, &[][..]),
+            EliminationSyntax::EmptyMatrix(_) | EliminationSyntax::RCases(_) => {
+                (Name::anonymous(), &[][..], false, &[][..])
+            }
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -1189,9 +1193,13 @@ impl Context {
                     induction,
                     equations,
                     recursive_source,
-                    source_match: !matches!(input, EliminationSyntax::Tactic(_)),
+                    source_match: !matches!(
+                        input,
+                        EliminationSyntax::Tactic(_) | EliminationSyntax::RCases(_)
+                    ),
                     empty_fields: match input {
-                        EliminationSyntax::EmptyMatrix(fields) => {
+                        EliminationSyntax::EmptyMatrix(fields)
+                        | EliminationSyntax::RCases(fields) => {
                             fields.get(&rule.ctor).map(Vec::as_slice)
                         }
                         _ => None,

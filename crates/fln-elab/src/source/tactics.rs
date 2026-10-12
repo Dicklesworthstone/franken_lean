@@ -20,6 +20,7 @@ mod equality;
 mod guard;
 mod index_equations;
 mod omega;
+mod rcases;
 mod refine;
 mod relations;
 mod rewrite;
@@ -879,6 +880,8 @@ impl Context {
                     value,
                     opaque,
                 });
+            } else if kind == &parser_kind(&["Tactic", "rcases"]) {
+                self.rcases_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "refine"]) {
                 let [keyword, term] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
