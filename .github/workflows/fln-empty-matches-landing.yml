@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - '.github/patches/fln-empty-matches/**'
+      - '.github/patches/fln-empty-matrix/**'
       - '.github/workflows/fln-empty-matches-landing.yml'
 
 permissions:
@@ -18,56 +19,25 @@ jobs:
   implement-test-land:
     if: github.repository == 'Dicklesworthstone/franken_lean'
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
+      FLN_REQUIRE_REFERENCE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 1
-      - name: Record the exact candidate base and install pinned Rust
+      - name: Install pinned Rust and authenticated Reference for differential tests
+        shell: bash
         run: |
-          git rev-parse HEAD
+          set -euo pipefail
           rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: fln-empty-matches
-          cache-on-failure: true
-      - name: Prove the new positive regression fails before implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 .github/patches/fln-empty-matches/apply.py tests
-          mkdir -p "$RUNNER_TEMP/empty-match-evidence"
-          set +e
-          cargo test --locked -p fln --test source_nomatch false_elimination_keeps_the_admitted_recursor -- --exact > "$RUNNER_TEMP/empty-match-evidence/before.log" 2>&1
-          status=$?
-          set -e
-          cat "$RUNNER_TEMP/empty-match-evidence/before.log"
-          test "$status" -ne 0
-          grep -F 'false_elimination_keeps_the_admitted_recursor ... FAILED' "$RUNNER_TEMP/empty-match-evidence/before.log"
-          grep -F 'UnexpectedSyntax { expected: "supported scalar literal or constant identifier" }' "$RUNNER_TEMP/empty-match-evidence/before.log"
-      - name: Apply native elaboration and format only changed source files
-        run: |
-          python3 .github/patches/fln-empty-matches/apply.py implementation
-          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/source.rs crates/fln-elab/src/source/matching.rs crates/fln-elab/src/source/matching/nomatch.rs crates/fln/tests/source_nomatch.rs
-          git diff --check
-      - name: Check successful elimination, contradictions and atomic refusal
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln --test source_nomatch 2>&1 | tee "$RUNNER_TEMP/empty-match-evidence/after.log"
-          cargo clippy --locked -p fln --test source_nomatch --no-deps -- -D warnings 2>&1 | tee "$RUNNER_TEMP/empty-match-evidence/clippy.log"
-      - name: Publish only the tested source changes directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          base=$(git rev-parse HEAD)
-          git fetch origin main
-          test "$(git rev-parse FETCH_HEAD)" = "$base"
-          git add crates/fln-elab/src/source.rs crates/fln-elab/src/source/matching.rs crates/fln-elab/src/source/matching/nomatch.rs crates/fln/tests/source_nomatch.rs
-          git diff --cached --stat
-          git -c user.name='ChatGPT' -c user.email='noreply@openai.com' commit -m 'feat(elab): elaborate empty matches through checked case equations' -m 'Connect single-discriminant nomatch to the existing dependent case compiler. Require retained contradiction proofs for impossible indices and preserve coverage refusal for every surviving branch. Keep computed discriminants, dependent targets and both checking engines unchanged.' -m "Validation: the new positive regression failed on the exact parent before implementation; all seven source_nomatch integration tests and target Clippy pass on pinned Rust. GitHub Actions run ${GITHUB_RUN_ID}. No new kernel rules, axioms or dependencies. Multiple discriminants and nofun remain follow-up work."
-          git push origin HEAD:main
-          git rev-parse HEAD
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+          echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Validate and commit each feature directly to current main
+        run: python3 .github/patches/fln-empty-matrix/land.py
