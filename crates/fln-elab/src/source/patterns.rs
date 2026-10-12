@@ -1260,6 +1260,7 @@ impl Context {
         let mut needed = false;
         let mut mutation = false;
         let mut nested = false;
+        let mut loops = false;
         let mut local_roots = HashSet::new();
         while let Some(node) = scan.pop() {
             self.tick()?;
@@ -1268,6 +1269,7 @@ impl Context {
             }
             mutation |= do_notation::is_mutation(node);
             nested |= node.kind() == Some(&parser_kind(&["Term", "nestedAction"]));
+            loops |= do_notation::is_while_loop(node);
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || collections::is_notation(node)
@@ -1292,6 +1294,13 @@ impl Context {
                 }
                 scan.extend(args);
             }
+        }
+        // `while` is its `for` loop first: the pin's macro expands before the element elaborates.
+        if loops {
+            let expanded = self.expand_while_loops(syntax)?;
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&expanded)?.into_owned(),
+            ));
         }
         // `(← e)` becomes `let x ← e` before its element first, as the pin expands an element's
         // nested actions before elaborating it; a reassignment's action is then the mutation's.
