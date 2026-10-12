@@ -500,7 +500,7 @@ jobs:
 
   array-iteration:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate complete imported Array execution'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): check native Array execution and replay'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -571,6 +571,22 @@ jobs:
             crates/fln-elab/src/source.rs
             crates/fln-olean/tests/reference_structure_metadata.rs
             crates/fln/tests/source_imported_structure_parents.rs
+          )
+          paths=(
+            crates/fln/src/runtime/array_iteration.rs
+            crates/fln/src/source_intrinsics/array_iteration.rs
+            crates/fln/src/runtime/implemented_by.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime.rs
+            crates/fln/src/source_intrinsics.rs
+            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
+            crates/fln/tests/source_imported_arrays.rs
+            crates/fln/tests/source_imported_arrays/programs.lean
+            crates/fln/tests/source_imported_arrays/effects.lean
+            crates/fln/tests/source_imported_arrays/execution.rs
+            crates/fln/tests/source_imported_arrays/authority.rs
+            crates/fln/tests/source_imported_arrays/check_oracle.py
+            crates/fln/src/runtime/array_iteration/tests.rs
             crates/fln-olean/src/source_extensions.rs
             crates/fln-olean/src/source_extensions/structures.rs
             scripts/extract/gen_source_extension_contract.py
@@ -590,22 +606,6 @@ jobs:
             crates/fln-olean/tests/reference_structure_metadata.rs
             crates/fln/tests/source_imported_structure_parents.lean
             crates/fln/tests/source_imported_structure_parents.rs
-          )
-          paths=(
-            crates/fln/src/runtime/array_iteration.rs
-            crates/fln/src/source_intrinsics/array_iteration.rs
-            crates/fln/src/runtime/implemented_by.rs
-            crates/fln/src/runtime/specialize.rs
-            crates/fln/src/runtime.rs
-            crates/fln/src/source_intrinsics.rs
-            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
-            crates/fln/tests/source_imported_arrays.rs
-            crates/fln/tests/source_imported_arrays/programs.lean
-            crates/fln/tests/source_imported_arrays/effects.lean
-            crates/fln/tests/source_imported_arrays/execution.rs
-            crates/fln/tests/source_imported_arrays/authority.rs
-            crates/fln/tests/source_imported_arrays/check_oracle.py
-            crates/fln/src/runtime/array_iteration/tests.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
@@ -741,7 +741,7 @@ jobs:
 
   array-iteration-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate complete imported Array execution'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): check native Array execution and replay'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
