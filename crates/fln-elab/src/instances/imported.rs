@@ -428,6 +428,7 @@ pub struct ImportActivation {
     env: Environment,
     registry: Option<(InstanceRegistry, super::Positions)>,
     defaults: Option<usize>,
+    structures: Option<crate::records::imported::Activation>,
 }
 
 /// The ordinary registry as [`InstanceRegistry::read`] would find it in `env`,
@@ -454,6 +455,7 @@ impl ImportActivation {
             env,
             registry: None,
             defaults: None,
+            structures: None,
         }
     }
 
@@ -634,6 +636,26 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain this module's original structure identities after checked
+    /// constructor/projection validation. These journals do not affect the kept
+    /// class or instance state, and no declarations are added by registration.
+    pub fn register_structures(
+        mut self,
+        rows: &[crate::records::imported::StructureEntry],
+    ) -> Result<Self, crate::records::RecordError> {
+        if rows.is_empty() {
+            return Ok(self);
+        }
+        let state = match self.structures.take() {
+            Some(state) => state,
+            None => crate::records::imported::Activation::read(&self.env)?,
+        };
+        let (state, env) = state.register(&self.env, rows)?;
+        self.structures = Some(state);
+        self.env = env;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {
@@ -642,6 +664,15 @@ impl ImportActivation {
         }
         if self.defaults.is_some() {
             super::defaults::read(&self.env)?;
+        }
+        if self.structures.is_some() {
+            crate::records::imported::ImportedStructures::read(&self.env).map_err(|error| {
+                if error == crate::records::RecordError::ResourceLimit {
+                    InstanceRegistryError::Limit
+                } else {
+                    InstanceRegistryError::Malformed
+                }
+            })?;
         }
         Ok(self.env)
     }

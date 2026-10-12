@@ -1,5 +1,5 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! protected-declaration, auxiliary-recursor, extern, implemented_by and initialization journals.
+//! protected-declaration, auxiliary-recursor, structure, extern, implemented_by and initialization journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -18,12 +18,24 @@ use std::collections::BTreeSet;
 pub use format::{
     ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
     IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION,
-    SIMP_EXTENSION,
+    SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
+mod structures;
+pub use structures::{StructureEntry, StructureField, StructureParent};
+
+/// The private extension name contains a numeric component. Parsing its display
+/// spelling as a dot-separated string would produce a different Lean Name.
+pub fn structure_extension_name() -> Name {
+    let module = Name::from_components(format::STRUCTURE_EXTENSION_MODULE.split('.'));
+    let prefix = Name::from_components([format::STRUCTURE_PRIVATE_HEADER]).append_core(&module);
+    Name::num(prefix, format::STRUCTURE_EXTENSION_PRIVATE_INDEX).append_core(
+        &Name::from_components(format::STRUCTURE_EXTENSION_DECLARATION.split('.')),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassEntry {
@@ -119,6 +131,9 @@ pub struct SourceExtensions {
     /// Generated auxiliary recursors (the pin's `auxRecExt`), recorded only by
     /// their owning module. A suffix alone never supplies this metadata.
     pub aux_recursors: Vec<Name>,
+    /// Structure fields and extends-clause metadata, still awaiting checked
+    /// constructor/projection validation by the source importer.
+    pub structures: Vec<StructureEntry>,
     /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
     pub reducibility: Vec<ReducibilityEntry>,
     /// Explicit extern bindings. Consumers must validate their declarations and
@@ -137,7 +152,7 @@ pub struct SourceExtensions {
 pub struct DecodeLimits {
     pub max_bytes: usize,
     pub max_objects: u64,
-    /// Cumulative journal rows plus nested extern list cells.
+    /// Cumulative journal rows, extern list cells, and structure array cells.
     pub max_entries: usize,
     pub max_indices: usize,
     /// Cumulative instance `DiscrTree` keys across the batch.
@@ -429,6 +444,7 @@ pub fn decode(
         name(format::AUX_RECURSOR_EXTENSION),
         name(crate::initializers::REGULAR_INIT_EXTENSION),
         name(crate::initializers::BUILTIN_INIT_EXTENSION),
+        structure_extension_name(),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -442,6 +458,7 @@ pub fn decode(
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();
     let mut aux_recursors = BTreeSet::new();
+    let mut structures = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
             return Err(shape("duplicate extension block"));
@@ -513,7 +530,14 @@ pub fn decode(
                         &mut reader.conversion,
                         &obj,
                     )?),
-                _ => unreachable!("twelve selected extension families"),
+                12 => {
+                    let row = reader.structure(&obj, &mut entries_left)?;
+                    if !structures.insert(row.name.clone()) {
+                        return Err(shape("structure metadata registered twice"));
+                    }
+                    out.structures.push(row);
+                }
+                _ => unreachable!("thirteen selected extension families"),
             }
         }
     }

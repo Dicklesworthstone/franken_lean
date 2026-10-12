@@ -4,6 +4,7 @@
 //! proposed eliminator) and each projection must pass the ordinary kernel and
 //! the caller's independent-checker policy before any successor is exposed.
 pub mod defaults;
+pub mod imported;
 pub mod inheritance;
 pub(crate) mod projection;
 

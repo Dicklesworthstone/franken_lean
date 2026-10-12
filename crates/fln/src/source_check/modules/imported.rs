@@ -12,6 +12,8 @@ use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[path = "imported/implemented_by.rs"]
 mod implemented_by;
+#[path = "imported/structures.rs"]
+mod structures;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {
@@ -69,6 +71,9 @@ pub struct SourceMetadataReport {
     /// Internal auxiliary-recursion tags (the pin's `auxRecExt`), activated
     /// only for this module's own admitted definitions.
     pub aux_recursors: usize,
+    /// Original structure fields and direct-parent metadata, validated against
+    /// this module's checked constructor and projection interfaces.
+    pub structures: usize,
     /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
     /// `instances` transparency instance selection runs at.
     pub reducibility: usize,
@@ -310,6 +315,10 @@ impl Engine {
             fln_olean::initializers::BUILTIN_INIT_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
+        let selected: Vec<_> = selected
+            .into_iter()
+            .chain([metadata::structure_extension_name()])
+            .collect();
         let mut blocks: Vec<_> = selected
             .iter()
             .map(|name| OpaqueExtensionBlock {
@@ -340,6 +349,7 @@ impl Engine {
                 aliases: 0,
                 protected: 0,
                 aux_recursors: 0,
+                structures: 0,
                 reducibility: 0,
                 externs: 0,
                 implemented_by: 0,
@@ -377,6 +387,7 @@ impl Engine {
                         8 => report.aux_recursors = block.entries.len(),
                         9 => report.regular_initializers = block.entries.len(),
                         10 => report.builtin_initializers = block.entries.len(),
+                        11 => report.structures = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -400,6 +411,9 @@ impl Engine {
             &decoded.implemented_by,
             limits.metadata.max_objects,
         )?;
+        let mut structure_scopes =
+            structures::Scopes::new(&checked, &decoded.structures, limits.metadata.max_objects)?;
+        let mut structure_rows = decoded.structures.into_iter();
         let mut classes = decoded.classes.into_iter();
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
@@ -421,6 +435,27 @@ impl Engine {
         let mut activation = R::new(engine.environment.clone());
         for (&index, report) in order.iter().zip(&mut reports) {
             let before = activation.environment().clone();
+            if report.structures != 0 {
+                cancelled!("source-olean/structure");
+                let rows = match structures::module(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    report.structures,
+                    &mut structure_rows,
+                    &mut structure_scopes,
+                    &limits,
+                    cancellation,
+                )? {
+                    Outcome::Complete(rows) => rows,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                activation = activation.register_structures(&rows).map_err(|problem| {
+                    structures::error(&report.module, &report.module, problem)
+                })?;
+            }
             for _ in 0..report.classes {
                 cancelled!("source-olean/class");
                 let row = classes.next().ok_or(SourceOleanImportError::Internal(
@@ -700,17 +735,31 @@ impl Engine {
                 (before, activation.environment().clone()),
             );
         }
-        engine.environment = activation.finish().map_err(|_| {
-            SourceOleanImportError::Internal(
-                "the activated registries disagree with their kept state",
-            )
+        engine.environment = activation.finish().map_err(|problem| {
+            if problem == InstanceRegistryError::Limit {
+                SourceOleanImportError::Limit("activated registry readback")
+            } else {
+                SourceOleanImportError::Internal(
+                    "the activated registries disagree with their kept state",
+                )
+            }
         })?;
         // Validate the complete graph once. A later registration can introduce
         // a cycle through an earlier module; no partial activation escapes it.
         implemented_by::validate_journal(&engine.environment)?;
         fln_elab::aux_recursors::AuxRecursors::read(&engine.environment)
             .map_err(|error| auxiliary_error(&roots.first().cloned().unwrap_or_default(), error))?;
-        if classes.next().is_some()
+        fln_elab::records::imported::ImportedStructures::read(&engine.environment).map_err(
+            |problem| {
+                structures::error(
+                    &roots.first().cloned().unwrap_or_default(),
+                    &roots.first().cloned().unwrap_or_default(),
+                    problem,
+                )
+            },
+        )?;
+        if structure_rows.next().is_some()
+            || classes.next().is_some()
             || instances.next().is_some()
             || defaults.next().is_some()
             || aliases.next().is_some()
@@ -860,6 +909,10 @@ trait Registrar: Sized {
         declaration: &Name,
         implementation: &Name,
     ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError>;
+    fn register_structures(
+        self,
+        rows: &[fln_elab::records::imported::StructureEntry],
+    ) -> std::result::Result<Self, fln_elab::records::RecordError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -930,6 +983,12 @@ impl Registrar for instances::imported::ImportActivation {
         implementation: &Name,
     ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
         self.register_implemented_by(declaration, implementation)
+    }
+    fn register_structures(
+        self,
+        rows: &[fln_elab::records::imported::StructureEntry],
+    ) -> std::result::Result<Self, fln_elab::records::RecordError> {
+        self.register_structures(rows)
     }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
@@ -1528,6 +1587,12 @@ pub(super) mod tests {
             implementation: &Name,
         ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
             fln_elab::implemented_by::register(&self.0, declaration, implementation).map(Sequential)
+        }
+        fn register_structures(
+            self,
+            rows: &[fln_elab::records::imported::StructureEntry],
+        ) -> std::result::Result<Self, fln_elab::records::RecordError> {
+            fln_elab::records::imported::register(&self.0, rows).map(Sequential)
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)
