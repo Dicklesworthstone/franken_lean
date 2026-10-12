@@ -1870,8 +1870,14 @@ fn finish_bounded_application(
             .0
             .kind()
             .is_some_and(extensions::is_max_prec_notation);
+    // A raw operator consumes exactly its own operands at `maxPrec`; an
+    // application after that complete leading term applies its result.
+    let elaborator_head = grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.get(*first_index).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if elaborator_operator(symbol).is_some());
     if !(grammar == DefinitionGrammar::Scalar && (dotted_head(&terms) || cdot_head))
         && !notation_head
+        && !elaborator_head
         && !matches!(
             tokens.get(*first_index).map(|token| &token.kind),
             Some(TokenKind::Ident(_))
