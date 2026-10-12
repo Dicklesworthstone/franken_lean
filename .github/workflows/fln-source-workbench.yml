@@ -594,7 +594,7 @@ jobs:
 
   array-iteration-oracle:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify Array execution after strict fixture corrections'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): compare Array control flow with the complete pinned imports'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -606,11 +606,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '275bd7863e23f4443fa1a50829513733f44596cd'
+      CANDIDATE_SHA: 'e1eef11a30ff42f8bc0c5d9cc9efb7dc55f04f1d'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '275bd7863e23f4443fa1a50829513733f44596cd'
+          ref: 'e1eef11a30ff42f8bc0c5d9cc9efb7dc55f04f1d'
           persist-credentials: false
       - name: Verify candidate and install the exact Reference
         shell: bash
@@ -621,7 +621,7 @@ jobs:
           echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
           tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
-          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control Init/Data/String/Defs; do
             for suffix in olean olean.server olean.private; do
               test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
             done
