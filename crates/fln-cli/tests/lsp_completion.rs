@@ -291,11 +291,13 @@ fn public_completion_uses_exported_imports_without_parsing_the_unfinished_body()
     let section =
         format!("{imports}@[expose] public section\ndef use (A : Type) (x : A) : A := hid");
     let query = format!("{imports}@[expose] public section\n#check hid");
+    // The wrapper's option is incidental, but it must be one the option table admits: a
+    // `maxRecDepth` below the pin's default (512) is refused, and then so is completion.
     let wrapped = format!(
-        "{imports}set_option maxRecDepth 256 in @[expose] public def use (A : Type) (x : A) : A := hid"
+        "{imports}set_option maxRecDepth 1024 in @[expose] public def use (A : Type) (x : A) : A := hid"
     );
     let wrapped_private = format!(
-        "{imports}set_option maxRecDepth 256 in private def use (A : Type) (x : A) : A := hid"
+        "{imports}set_option maxRecDepth 1024 in private def use (A : Type) (x : A) : A := hid"
     );
     let variable = format!("{imports}variable (x : hid");
     let public_variable = format!("{imports}public section\nvariable (x : hid");
@@ -373,7 +375,7 @@ fn public_theorem_completion_switches_from_public_header_to_private_proof() {
             true,
         ),
         (
-            "set_option maxRecDepth 256 in public theorem use (P : Prop) (h : P) : P := hid",
+            "set_option maxRecDepth 1024 in public theorem use (P : Prop) (h : P) : P := hid",
             true,
         ),
         ("public theorem use (P : Prop) : P -> P | h => hid", true),
