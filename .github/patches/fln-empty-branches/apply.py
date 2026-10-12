@@ -22,6 +22,22 @@ def tests():
         raise RuntimeError('test paths already exist; refusing to replace them')
     template = (ROOT / 'crates/fln/tests/source_empty_matrices.rs').read_text()
     template = replace(template, 'assert_eq!(counts, [18, 10]);', 'assert_eq!(counts, [19, 12]);')
+    # The production seed intentionally has no Exists. Exercise it by admitting
+    # the ordinary polymorphic source declaration in this test alone; the other
+    # test still uses the unmodified, actual imported Init.Core declaration.
+    template = replace(template, '    verify(&engine, STACK);\n}\n', r'''    let engine = engine
+        .check_source_files(
+            &[b"universe u\ninductive Exists {A : Sort u} (p : A -> Prop) : Prop where | intro (w : A) (h : p w)"],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK))),
+        )
+        .expect("admit the ordinary Exists declaration for the minimal-seed fixture")
+        .into_complete()
+        .expect("both checkers admit Exists")
+        .engine;
+    verify(&engine, STACK);
+}
+''')
     template = template.replace('empty_matrices', 'empty_branches').replace('EMPTY_MATRIX', 'EMPTY_BRANCH')
     target.write_text(template)
     shutil.copyfile(PAYLOAD / 'cases.tsv', fixture)
