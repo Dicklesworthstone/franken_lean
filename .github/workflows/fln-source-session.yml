@@ -1,0 +1,47 @@
+name: Native source implementation checkout
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-session.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  checkout:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Read current functional blockers
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          selected = [r for r in rows if r.get('status') in ('open', 'in_progress', 'blocked') and r.get('priority', 9) <= 1]
+          for row in sorted(selected, key=lambda r: (r.get('priority', 9), r['id'])):
+              print(json.dumps({k: row.get(k) for k in ('id', 'title', 'status', 'priority', 'description', 'acceptance_criteria')}, ensure_ascii=False))
+      - name: Prepare exact source and Rust snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-session"
+          git rev-parse HEAD > "$RUNNER_TEMP/source-session/BASE_SHA"
+          git archive HEAD | gzip -1 > "$RUNNER_TEMP/source-session/source.tar.gz"
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          rustc +nightly-2026-08-31 -Vv > "$RUNNER_TEMP/source-session/RUST_VERSION"
+          toolchain=$(rustup run nightly-2026-08-31 rustc --print sysroot)
+          tar -C "$toolchain" -czf "$RUNNER_TEMP/source-session/rust.tar.gz" bin lib libexec
+          cd "$RUNNER_TEMP/source-session"
+          sha256sum source.tar.gz rust.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-source-session
+          path: ${{ runner.temp }}/source-session
+          retention-days: 2
+          compression-level: 0
