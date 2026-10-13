@@ -1,0 +1,102 @@
+name: Native runtime reliability
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-runtime-reliability.yml']
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'fix(runtime): publish checked stack and contract fixes'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '1'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'true'
+      CARGO_PROFILE_DEV_DEBUG: '2'
+      CARGO_PROFILE_TEST_DEBUG: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate and publish the two exact runtime increments
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'runtime-reliability'
+          root.mkdir()
+          encoded = '''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'''
+          raw = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(raw).hexdigest() == '8eae4fa1f9593083ffaeb12e508db7070290535b6e50e45844c3cddc1195fa16'
+          items = json.loads(raw)
+          (root / 'prepared.json').write_bytes(raw)
+          def output(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def run(args, label):
+              print('RUN ' + ' '.join(args), flush=True)
+              with (root / (label + '.log')).open('w') as log:
+                  p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  for line in p.stdout:
+                      print(line, end='', flush=True)
+                      log.write(line)
+                  code = p.wait()
+              (root / (label + '.exit')).write_text(str(code) + '\n')
+              if code:
+                  raise subprocess.CalledProcessError(code, args)
+          for item in items:
+              for attempt in range(3):
+                  tag = str(item['stage']) + '-' + str(attempt)
+                  assert not output('git', 'status', '--porcelain'), 'dirty checkout'
+                  run(['git', 'fetch', 'origin', 'main'], tag + '-fetch')
+                  run(['git', 'switch', '--detach', 'origin/main'], tag + '-snapshot')
+                  parent = output('git', 'rev-parse', 'HEAD')
+                  for f in item['files']:
+                      assert output('git', 'rev-parse', 'HEAD:' + f['path']) == f['base_blob'], 'overlapping change: ' + f['path']
+                  patch = root / (tag + '.patch')
+                  patch.write_text(item['patch'])
+                  run(['git', 'apply', '--check', str(patch)], tag + '-apply-check')
+                  run(['git', 'apply', str(patch)], tag + '-apply')
+                  for f in item['files']:
+                      b = pathlib.Path(f['path']).read_bytes()
+                      assert output('git', 'hash-object', f['path']) == f['git_blob'], f['path']
+                      assert hashlib.sha256(b).hexdigest() == f['sha256'], f['path']
+                  run(['rustup', 'show', 'active-toolchain'], tag + '-toolchain')
+                  run(['cargo', 'test', '--locked', '-p', 'fln-elab', '--no-fail-fast'], tag + '-elab')
+                  run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', '--', 'nested_lexical_contexts_prepare_mutual_groups_on_a_small_host_stack'], tag + '-small-stack')
+                  run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', '--', 'runtime::decisions::tests'], tag + '-decisions')
+                  if item['stage'] == 2:
+                      run(['cargo', 'test', '--locked', '-p', 'fln', '--test', 'runtime_conditionals', '--test', 'runtime_logic_decisions', '--test', 'runtime_nat_decisions', '--test', 'source_equality_decisions', '--test', 'source_generic_decisions', '--test', 'source_option_decisions', '--no-fail-fast'], tag + '-runtime')
+                      run(['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_equality_decisions'], tag + '-cli')
+                  run(['cargo', 'clippy', '--locked', '-p', 'fln-elab', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings'], tag + '-clippy')
+                  run(['cargo', 'check', '--locked', '--workspace', '--all-targets'], tag + '-workspace')
+                  run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *[f['path'] for f in item['files']]], tag + '-format')
+                  run(['git', 'diff', '--check'], tag + '-whitespace')
+                  for f in item['files']:
+                      assert output('git', 'hash-object', f['path']) == f['git_blob'], 'validation changed source'
+                  paths = [f['path'] for f in item['files']]
+                  assert sorted(output('git', 'diff', '--name-only').splitlines()) == sorted(paths)
+                  run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-o', *paths, '-m', item['message'] + '\n\nRepublished from the exact prepared increment ' + item['local_commit'] + '. Fresh pinned full-debug validation: complete elaborator, small-stack and decision tests, scoped Clippy and workspace compilation passed; stage 2 also checks runtime integrations and installed equality execution. Full workspace tests and Reference parity are not claimed.'], tag + '-commit')
+                  sha = output('git', 'rev-parse', 'HEAD')
+                  result = subprocess.run(['git', 'push', 'origin', 'HEAD:main'], capture_output=True, text=True)
+                  (root / (tag + '-push.log')).write_text(result.stdout + result.stderr)
+                  print(result.stdout + result.stderr, flush=True)
+                  if result.returncode:
+                      if 'fetch first' in result.stderr or 'non-fast-forward' in result.stderr:
+                          continue
+                      raise subprocess.CalledProcessError(result.returncode, result.args)
+                  (root / (str(item['stage']) + '-published.json')).write_text(json.dumps({'commit':sha, 'parent':parent, 'files':item['files'], 'force':False, 'published':True}, indent=2))
+                  print('PUBLISHED ' + sha, flush=True)
+                  break
+              else:
+                  raise RuntimeError('main advanced on all attempts; no history overwritten')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: runtime-reliability-${{ github.sha }}
+          path: ${{ runner.temp }}/runtime-reliability
+          retention-days: 7
+          if-no-files-found: error
