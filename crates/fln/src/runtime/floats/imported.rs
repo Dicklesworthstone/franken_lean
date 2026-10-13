@@ -315,6 +315,32 @@ impl Preparation<'_> {
         Ok(constructor(&layout.logical.constructors[0], [bits]))
     }
 
+    /// The extern returns a Boolean scalar, whereas source Decidable values
+    /// retain a constructor tag and one erased proof field. Reconstruct only
+    /// this checked post-admission layout; never fabricate a logical proof.
+    fn float_unpack_decision(&mut self, value: Expr) -> Result<(Expr, Expr), IngressError> {
+        let shape = self.io_checked_shape(Expr::app(c("Decidable"), c("True")))?;
+        let [no, yes] = shape.constructors.as_slice() else {
+            return Err(unsupported("Float logical decision constructors"));
+        };
+        if no.original != name("Decidable.isFalse")
+            || no.tag != 0
+            || no.fields != [proofs::erased_type()]
+            || yes.original != name("Decidable.isTrue")
+            || yes.tag != 1
+            || yes.fields != [proofs::erased_type()]
+        {
+            return Err(unsupported("Float logical decision layout"));
+        }
+        let body = io_result::choose(
+            shape.source.clone(),
+            value,
+            constructor(no, [proofs::erased_value()]),
+            constructor(yes, [proofs::erased_value()]),
+        );
+        Ok((shape.source, body))
+    }
+
     fn float_pack_int(&mut self, value: Expr) -> Result<Expr, IngressError> {
         let shape = self.io_checked_shape(c("Int"))?;
         let [positive, negative] = shape.constructors.as_slice() else {
@@ -374,16 +400,24 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let primitive = self.float_bind_primitive(requested)?;
-        let needs_adapter = binding
-            .arguments
-            .iter()
-            .chain(std::iter::once(&binding.result))
-            .any(|value| {
-                matches!(
-                    value,
-                    ValueType::UInt32 | ValueType::UInt64 | ValueType::Abi
-                )
-            });
+        let decision = matches!(
+            requested.leaf_view(),
+            fln_core::name::LeafView::Str("decLt" | "decLe")
+        );
+        if decision && binding.result != ValueType::Bool {
+            return Err(unsupported("Float native decision result contract"));
+        }
+        let needs_adapter = decision
+            || binding
+                .arguments
+                .iter()
+                .chain(std::iter::once(&binding.result))
+                .any(|value| {
+                    matches!(
+                        value,
+                        ValueType::UInt32 | ValueType::UInt64 | ValueType::Abi
+                    )
+                });
         if !needs_adapter {
             return Ok(Some(apply(
                 Expr::const_(primitive, Vec::new()),
@@ -412,7 +446,14 @@ impl Preparation<'_> {
         if matches!(binding.result, ValueType::UInt32 | ValueType::UInt64) {
             body = self.float_unpack_word(binding.result, body)?;
         }
-        let type_ = function(&domains, source_type(binding.result)?);
+        let result_type = if decision {
+            let (type_, decision_body) = self.float_unpack_decision(body)?;
+            body = decision_body;
+            type_
+        } else {
+            source_type(binding.result)?
+        };
+        let type_ = function(&domains, result_type);
         for domain in domains.into_iter().rev() {
             body = Expr::lam(Name::anonymous(), domain, body, BinderInfo::Default);
         }

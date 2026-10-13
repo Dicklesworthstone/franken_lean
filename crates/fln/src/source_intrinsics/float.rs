@@ -7,13 +7,18 @@
 use super::*;
 use fln_elab::implemented_by::{ImplementedByError, ImplementedByReadError, ImplementedByTable};
 
-const DEPENDENCIES: &str = include_str!("float/dependencies.txt");
+// Keep the established inventory byte-identical; the comparison extension is
+// extracted from the same pin and checked by the same complete-model walk.
+const DEPENDENCIES: &str = concat!(
+    include_str!("float/dependencies.txt"),
+    include_str!("float/comparison_dependencies.txt"),
+);
 
 const FLOAT_OPERATIONS: &[&str] = &[
     "ofBits", "toBits", "add", "sub", "mul", "div", "neg", "abs", "sqrt", "ceil", "floor", "round",
     "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
     "exp", "exp2", "log", "log2", "log10", "cbrt", "pow", "atan2", "beq", "isNaN", "isFinite",
-    "isInf", "toString", "toUInt32", "toUInt64", "scaleB",
+    "isInf", "toString", "toUInt32", "toUInt64", "scaleB", "decLt", "decLe",
 ];
 
 fn name(label: &str) -> Name {
