@@ -1,0 +1,56 @@
+name: Native loop integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-loop-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Retain the exact source revision for offline loop debugging
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/loop-source"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/loop-source/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/loop-source/commit.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/loop-source/files.txt"
+          cd "$RUNNER_TEMP/loop-source"
+          sha256sum source.tar.gz commit.txt files.txt > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: loop-source-${{ github.sha }}
+          path: ${{ runner.temp }}/loop-source
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
+      - name: Fetch the pinned oracle and actual Init artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=15bccb750e9d73cd2a40f488bec389504a87896c' SUITE.lock
+          mkdir -p "$RUNNER_TEMP/loop-reference"
+          archive="$RUNNER_TEMP/loop-reference/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 3 --silent --show-error --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --output "$archive" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          printf '%s  %s\n' fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 "$archive" | sha256sum --check --strict
+          cp SUITE.lock "$RUNNER_TEMP/loop-reference/SUITE.lock"
+          cd "$RUNNER_TEMP/loop-reference"
+          sha256sum lean-4.32.0-linux.tar.zst SUITE.lock > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: loop-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/loop-reference
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
