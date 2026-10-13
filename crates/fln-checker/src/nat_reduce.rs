@@ -10,6 +10,10 @@
 //! This is not a general normalizer. Native and String reduction, recursors,
 //! typing, declaration admission, and consensus remain outside this module.
 
+mod memo;
+
+use std::sync::Arc;
+
 use crate::numeric::{
     self, NatBudget, NatComparison, NatFault, NatOperation, NatOutcome, NatProgress, NatRefusal,
     NatStop, NatValue,
@@ -334,7 +338,7 @@ impl Halt {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ArenaSource {
     Candidate,
     Generated(usize),
@@ -349,7 +353,7 @@ impl ArenaSource {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Cursor {
     source: ArenaSource,
     root: ExprId,
@@ -365,7 +369,7 @@ struct EvalFrame {
     cursor: Cursor,
     operation: NatReductionOperation,
     operands: [Option<ExprId>; 2],
-    values: [Option<NatValue>; 2],
+    values: [Option<Arc<NatValue>>; 2],
     next_operand: u8,
     top_level: bool,
 }
@@ -376,7 +380,7 @@ enum EvalState {
         core_normalized: bool,
     },
     ForceDelta(Cursor),
-    Natural(NatValue),
+    Natural(Arc<NatValue>),
     NonNatural,
 }
 
@@ -1542,6 +1546,7 @@ fn reduce_inner(
     };
     let mut generated = Vec::new();
     let mut context_validated = false;
+    let mut memo = memo::NaturalMemo::default();
 
     loop {
         state = match state {
@@ -1549,11 +1554,13 @@ fn reduce_inner(
                 cursor,
                 core_normalized,
             } => {
-                if context_validated
+                if context_validated && let Some(value) = memo.recall(cursor, &mut control)? {
+                    EvalState::Natural(value)
+                } else if context_validated
                     && let Some(value) =
                         direct_natural(cursor, candidate, &generated, &mut control)?
                 {
-                    EvalState::Natural(value)
+                    EvalState::Natural(Arc::new(value))
                 } else {
                     let nested = {
                         let term = source_term(cursor.source, candidate, &generated)?;
@@ -1589,7 +1596,7 @@ fn reduce_inner(
                     } else if let Some(value) =
                         direct_natural(cursor, candidate, &generated, &mut control)?
                     {
-                        EvalState::Natural(value)
+                        EvalState::Natural(Arc::new(value))
                     } else {
                         EvalState::ForceDelta(cursor)
                     }
@@ -1667,7 +1674,11 @@ fn reduce_inner(
                                 progress: control.progress,
                             });
                         }
-                        Executed::Natural(value) => EvalState::Natural(value),
+                        Executed::Natural(value) => {
+                            let value = Arc::new(value);
+                            memo.remember(frame.cursor, &value, &mut control)?;
+                            EvalState::Natural(value)
+                        }
                         Executed::Boolean(_) => EvalState::NonNatural,
                     }
                 }
