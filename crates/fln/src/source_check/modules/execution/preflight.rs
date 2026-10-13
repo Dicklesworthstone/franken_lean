@@ -155,6 +155,14 @@ fn check_command(
                 Some((ScopeCommand::SetOption { name, value }, body))
             }
             Some(ScopeCommand::GuardMsgs { body, .. }) => {
+                // The scope parser locates a balanced specification but does not
+                // validate its contents. Do that before admitting any external
+                // imports, in the same grammar and original coordinate system.
+                // This is syntax only: capture capabilities and message matching
+                // remain decisions of execution and the presentation's judge.
+                grammar
+                    .enter(|| fln_parse::command_scope::guard_spec::parse(source, body))
+                    .map_err(|error| parse_error(module, index, at, error))?;
                 queue.push_front(SourceStep::Command((
                     fln_parse::BytePos(at.0 + body),
                     &source[body..],
@@ -207,4 +215,113 @@ fn check_command(
             .map_err(|error| parse_error(module, index, at, error))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preflight(source: &str, implicit_init: bool) -> Result<(), SourceModuleCheckError> {
+        let name = Name::from_components(["Main"]);
+        let input = SourceModuleInput {
+            name: &name,
+            source: source.as_bytes(),
+        };
+        let admission = crate::EngineAdmissionLimits::new(crate::Budget::for_stack_bytes(
+            2 * 1024 * 1024,
+        ));
+        check(
+            &[input],
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(admission)),
+            implicit_init,
+        )
+    }
+
+    #[test]
+    fn guard_preflight_rejects_malformed_policies_before_import_admission() {
+        for implicit_init in [false, true] {
+            for spec in [
+                "whitespace := invalidGuardMode",
+                "ordering := invalidGuardMode",
+                "substring := invalidGuardMode",
+                "positions := invalidGuardMode",
+                "drop invalidGuardMode",
+                "unknownGuardOption := true",
+                "whitespace := exact, whitespace := invalidGuardMode",
+                "info,",
+            ] {
+                let source = format!(
+                    "import UnavailableGuardDependency\n#guard_msgs ({spec}) in\n#check 1\n"
+                );
+                let error = preflight(&source, implicit_init).unwrap_err();
+                assert!(matches!(
+                    error,
+                    SourceModuleCheckError::Source {
+                        error: SourceCheckError::Command { .. },
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn guard_preflight_is_syntax_only_not_a_message_judge() {
+        for spec in [
+            "",
+            "info",
+            "drop info",
+            "pass error, drop all",
+            "positions := true",
+            "drop error",
+            "ordering := sorted, substring := true, whitespace := lax",
+        ] {
+            let source = format!(
+                "prelude\n/-- intentionally not the generated message -/\n\
+                 #guard_msgs ({spec}) in\n#check 1\n"
+            );
+            preflight(&source, false).unwrap();
+        }
+        preflight("prelude\n#guard_msgs in\n#check 1\n", false).unwrap();
+    }
+
+    #[test]
+    fn guard_preflight_retains_original_offsets_inside_temporary_wrappers() {
+        let source = concat!(
+            "prelude\r\n",
+            "set_option pp.universes true in\r\n",
+            "/-- Unicode λ before the error -/\r\n",
+            "#guard_msgs (whitespace := invalidGuardMode) in\r\n",
+            "#check 1\r\n",
+        );
+        let error = preflight(source, false).unwrap_err();
+        let SourceModuleCheckError::Source {
+            error: SourceCheckError::Command { error, .. },
+            ..
+        } = error
+        else {
+            panic!("expected a positioned command parse error: {error:?}");
+        };
+        assert_eq!(
+            error.primary_source_offset(),
+            Some(fln_parse::BytePos(source.find("invalidGuardMode").unwrap()))
+        );
+    }
+
+    #[test]
+    fn guard_preflight_validates_nested_headers_and_still_checks_the_body() {
+        let source = concat!(
+            "prelude\n#guard_msgs in\n",
+            "#guard_msgs (positions := invalidGuardMode) in\n#check 1\n",
+        );
+        assert!(preflight(source, false).is_err());
+        assert!(preflight("prelude\n#guard_msgs (drop info) in\n#check (\n", false).is_err());
+        // Nested guards may be refused by execution, but well-formed syntax is
+        // not an execution-capability failure in this pre-import pass.
+        preflight(
+            "prelude\n#guard_msgs in\n#guard_msgs (drop info) in\n#check 1\n",
+            false,
+        )
+        .unwrap();
+    }
 }
