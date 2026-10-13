@@ -1,0 +1,134 @@
+diff --git a/crates/fln-elab/src/source/partial.rs b/crates/fln-elab/src/source/partial.rs
+index 000593dd131aaf5eaf2c16f82382a783ef6bec26..8d7f29ecc0b5deb81f07fc2026bf9f5724dbc33a 100644
+--- a/crates/fln-elab/src/source/partial.rs
++++ b/crates/fln-elab/src/source/partial.rs
+@@ -141,32 +141,41 @@ impl Context {
+         syntax: &Syntax,
+         expected: Option<Expr>,
+     ) -> Result<Typed, NatDefinitionElabError> {
+-        let mut type_ = expected.clone().ok_or_else(|| {
+-            failure(SourceInferenceError::Recursion(
+-                recursion::RecursionError::ResultTypeRequired,
+-            ))
+-        })?;
+-        for parameter in parameters.iter().rev() {
++        // A written result type supplies the whole recursive signature. Only
++        // inferred results require opening the actual leading lambda telescope;
++        // do not move lambdas through lets, applications, or effects.
++        let mut recursive_parameters = parameters.to_vec();
++        let (syntax, expected, lambdas) = if expected.is_none() {
++            self.open_recursive_lambdas(syntax, expected, &mut recursive_parameters)?
++        } else {
++            (syntax, expected, Vec::new())
++        };
++        let expected = match expected {
++            Some(expected) => expected,
++            None => {
++                // Allocate the result hole before the self local. Its scope
++                // cannot accidentally capture that private recursive reference.
++                let sort = self.type_expected()?;
++                self.hole(sort)?
++            }
++        };
++        let mut type_ = self.instantiate(&expected)?;
++        for parameter in recursive_parameters.iter().rev() {
+             self.tick()?;
+             type_ = type_
+                 .abstract_fvar(&parameter.id, 0)
+                 .map_err(|_| failure(SourceInferenceError::Scope))?;
+             type_ = Expr::forall_e(
+                 parameter.user_name.clone(),
+-                parameter.type_.clone(),
++                self.instantiate(&parameter.type_)?,
+                 type_,
+                 parameter.binder_info,
+             );
+         }
+-        if !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. }) {
+-            return Err(NatDefinitionElabError::UnexpectedSyntax {
+-                expected: "a function type for recursive partial def",
+-            });
+-        }
+         let marker = FVarId(self.fresh_name()?);
+         self.txn.lctx.add_param(
+             marker.clone(),
+-            name.clone(),
++            Name::anonymous(),
+             type_.clone(),
+             BinderInfo::Default,
+         );
+@@ -177,11 +186,43 @@ impl Context {
+             name: name.clone(),
+             marker: marker.clone(),
+             term: Typed {
+-                value: Expr::fvar(marker),
+-                type_,
++                value: Expr::fvar(marker.clone()),
++                type_: type_.clone(),
+             },
+         });
+-        self.term(syntax, expected)
++        let body = self.term(syntax, Some(expected))?;
++        let body = self.finish_open_universes(body)?;
++        let body = self.close_recursive_lambdas(&lambdas, body)?;
++        // A failed tactic alternative can discard its recursive reference.
++        // Judge the surviving checked term, not whether a trial mentioned self.
++        if !body
++            .value
++            .abstract_fvar(&marker, 0)
++            .map_err(|_| failure(SourceInferenceError::Scope))?
++            .has_loose_bvar(0)
++        {
++            self.partial
++                .as_mut()
++                .ok_or_else(|| failure(SourceInferenceError::Scope))?
++                .reference = None;
++            return Ok(body);
++        }
++        // The pin permits nonrecursive partial constants. Only a surviving
++        // recursive edge imposes this restriction on the function signature.
++        if !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. }) {
++            return Err(NatDefinitionElabError::UnexpectedSyntax {
++                expected: "a function type for recursive partial def",
++            });
++        }
++        // Closing written lambdas restores their original lexical scope. Keep
++        // the private header until ordinary declaration closure substitutes the
++        // checked executable companion and captures its section parameters.
++        if self.txn.lctx.find(&marker).is_none() {
++            self.txn
++                .lctx
++                .add_param(marker, Name::anonymous(), type_, BinderInfo::Default);
++        }
++        Ok(body)
+     }
+ 
+     pub(super) fn close_partial_reference(
+diff --git a/crates/fln-elab/src/source/recursion.rs b/crates/fln-elab/src/source/recursion.rs
+index 4996b84ea600232071122b6fa6449cf72e464248..931d6b2954af6299797d06cc6307f1e986f91880 100644
+--- a/crates/fln-elab/src/source/recursion.rs
++++ b/crates/fln-elab/src/source/recursion.rs
+@@ -569,6 +569,23 @@ impl Context {
+     ) -> Result<Typed, NatDefinitionElabError> {
+         self.defining = Some(name.clone());
+         let snapshot = self.clone();
++        if self
++            .partial
++            .as_ref()
++            .is_some_and(|state| state.group.is_none())
++        {
++            // Partial self references must be in scope before tactics select
++            // alternatives. An initial unknown-self trial can otherwise choose
++            // a different successful branch and silently change the program.
++            // Mutual groups already register all peer headers before bodies.
++            let result = self.partial_definition_body(name, parameters, syntax, expected);
++            if result.is_err() {
++                let spent = self.txn.budget.heartbeats_consumed;
++                *self = snapshot;
++                self.txn.budget.heartbeats_consumed = spent;
++            }
++            return result;
++        }
+         match self.term(syntax, expected.clone()) {
+             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
+                 found,

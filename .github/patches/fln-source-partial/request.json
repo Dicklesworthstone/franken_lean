@@ -1,45 +1,18 @@
 {
   "schema": "fln-readable-source-v1",
   "files": {
-    "crates/fln-elab/src/source.rs": {
-      "before": "369d950c76115907c4489a569f656a734c589abb",
-      "after": "52724471e6dda2c76e53b2a6b9903efb5ba1d688"
-    },
     "crates/fln-elab/src/source/partial.rs": {
-      "before": null,
-      "after": "180ff32b5acc776baeab65712b9673d2942ab0df"
-    },
-    "crates/fln-elab/src/source/partial/inhabitant.rs": {
-      "before": null,
-      "after": "94598c04bae3aff82497ccc6be297c3983333cf9"
+      "before": "000593dd131aaf5eaf2c16f82382a783ef6bec26",
+      "after": "8d7f29ecc0b5deb81f07fc2026bf9f5724dbc33a"
     },
     "crates/fln-elab/src/source/recursion.rs": {
-      "before": "9e287aeb5f36895e107ba8c0604880bf1b65e932",
-      "after": "20f30d596b8008597e278813bf72a25826fbe2fd"
+      "before": "4996b84ea600232071122b6fa6449cf72e464248",
+      "after": "931d6b2954af6299797d06cc6307f1e986f91880"
     },
-    "crates/fln-elab/src/source/scope.rs": {
-      "before": "6deb294fb1277fd204add140d577b2007ebe8b68",
-      "after": "86b45597a11465c2b962e2ce6d04e770b127cc05"
-    },
-    "crates/fln/src/lib.rs": {
-      "before": "9b7abcf9c36ec4a7180b61602f42ce2c953ae4b8",
-      "after": "fc0f7471862e2092c08a89a7287f10c5d7f36c16"
-    },
-    "crates/fln/src/source_records.rs": {
-      "before": "3767b62b6f81ed7b0b7026a5bc313a8aa5243738",
-      "after": "9bacc5e92fde4db3ee13da3b8a7f31b65da0a4c6"
-    },
-    "crates/fln/tests/source_partial.rs": {
+    "crates/fln/tests/source_partial_inference.rs": {
       "before": null,
-      "after": "51d8417e0db0edad0ba9802fcf0e40cf959cdc6a"
-    },
-    "crates/fln/tests/source_partial_modules.rs": {
-      "before": null,
-      "after": "2f292f9ee3b1edc192c66429e86d2e92a8f42c68"
+      "after": "1376663994602eec452813383eafc9df4d98dbd4"
     }
   },
-  "patches": [
-    "34c9dd30b3efc1443117e2c5e97335fd82de6afc",
-    "510c554dfdb9c14a082da6e72701c541c97b4396"
-  ]
+  "patches": ["d4edc47f9456d2d418568d3f916dc776a4920841"]
 }

@@ -2,7 +2,7 @@ name: Prepare partial definition source
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/partial-source-transfer.yml']
+    paths: ['.github/workflows/partial-source-transfer.yml', '.github/patches/fln-source-partial/request.json']
 permissions:
   contents: read
 jobs:
