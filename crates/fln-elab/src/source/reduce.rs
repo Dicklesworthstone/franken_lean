@@ -8,6 +8,8 @@ mod imported_smart;
 #[cfg(test)]
 mod projection_tests;
 mod quotient;
+#[cfg(test)]
+mod selected_k_tests;
 
 use super::*;
 use fln_env::constants::{ConstantInfo, DefinitionVal, RecursorVal};
@@ -33,6 +35,14 @@ enum Continuation {
         recursor: RecursorVal,
         arguments: Vec<Expr>,
     },
+}
+
+/// Ordinary WHNF keeps its syntactic K gate. Explicitly selected unfolding
+/// may check closed endpoint equations to traverse dependent branch transports.
+#[derive(Clone, Copy)]
+enum KEndpointCheck {
+    Syntactic,
+    Kernel,
 }
 
 /// [`Context::smart_unfolding`]'s verdict on one delta step.
@@ -215,6 +225,7 @@ impl Context {
                                 &arguments,
                                 transparency,
                                 zeta_delta,
+                                KEndpointCheck::Syntactic,
                             )? {
                                 SmartUnfolding::Plain => {}
                                 SmartUnfolding::Folded => break,
@@ -399,6 +410,7 @@ impl Context {
             &arguments,
             UnificationTransparency::None,
             false,
+            KEndpointCheck::Kernel,
         )?;
         let unfolding = match unfolding {
             SmartUnfolding::Plain => {
@@ -430,6 +442,10 @@ impl Context {
     /// structural definition carries that body as its original-body obligation
     /// (`recursion::structural_obligation_name`). A `match` compiles to recursor applications,
     /// so each fully applied recursor met at the head before an alternative is one of them.
+    /// Dependent index matching also inserts equality transports. During selected
+    /// unfolding, the kernel may establish their closed endpoint equations;
+    /// otherwise a known constructor branch could be discarded as a stuck match.
+    /// Ordinary WHNF does not gain this conversion step.
     fn smart_unfolding(
         &mut self,
         definition: &DefinitionVal,
@@ -437,6 +453,7 @@ impl Context {
         arguments: &[Expr],
         transparency: UnificationTransparency,
         zeta_delta: bool,
+        endpoints: KEndpointCheck,
     ) -> Result<SmartUnfolding, NatDefinitionElabError> {
         let mut body = &definition.value;
         let mut lambdas = 0usize;
@@ -537,7 +554,7 @@ impl Context {
                         &major_arguments,
                     )? {
                         Some(reduced) => Some(reduced),
-                        None => self.source_k_iota(&head, &recursor, &spine)?,
+                        None => self.source_k_iota_checked(&head, &recursor, &spine, endpoints)?,
                     };
                     let Some(reduced) = reduced else {
                         return Ok(SmartUnfolding::Folded);
@@ -563,6 +580,20 @@ impl Context {
         head: &Expr,
         recursor: &RecursorVal,
         arguments: &[Expr],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.source_k_iota_checked(head, recursor, arguments, KEndpointCheck::Syntactic)
+    }
+
+    /// Selected unfolding may encounter dependent equality transports after the
+    /// constructor branch is known. Their endpoints need not be syntactically
+    /// identical. Validate that equation without assigning holes; ordinary
+    /// reduction retains its narrower syntactic gate.
+    fn source_k_iota_checked(
+        &mut self,
+        head: &Expr,
+        recursor: &RecursorVal,
+        arguments: &[Expr],
+        endpoints: KEndpointCheck,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         if !recursor.k
             || recursor.all.len() != 1
@@ -632,7 +663,12 @@ impl Context {
             result = self.substitute(body, parameter)?;
         }
         self.tick()?;
-        if result != *binder_type {
+        if result != *binder_type
+            && (matches!(endpoints, KEndpointCheck::Syntactic)
+                || result.has_loose_bvars()
+                || binder_type.has_loose_bvars()
+                || !self.coercion_kernel_eq(result, binder_type.clone())?)
+        {
             return Ok(None);
         }
         let mut value = self.instantiate_params(&rule.rhs, &recursor.base.level_params, levels)?;
@@ -1086,7 +1122,7 @@ mod source_k_tests {
     use fln_kernel::capability::{Published, admit};
     use fln_kernel::council::{Council, CouncilOutcome, convene};
 
-    fn environment() -> Environment {
+    pub(super) fn environment() -> Environment {
         let budget = Budget::for_stack_bytes(1024 * 1024);
         let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
         let declaration = crate::seed::equality::eq_seed_declaration();
@@ -1106,13 +1142,13 @@ mod source_k_tests {
         };
         publication.environment
     }
-    fn nat() -> Expr {
+    pub(super) fn nat() -> Expr {
         Expr::const_(Name::from_components(["Nat"]), vec![])
     }
-    fn number(value: u64) -> Expr {
+    pub(super) fn number(value: u64) -> Expr {
         Expr::lit(Literal::Nat(NatLit::from_u64(value)))
     }
-    fn cast(left: Expr, right: Expr, value: Expr) -> Expr {
+    pub(super) fn cast(left: Expr, right: Expr, value: Expr) -> Expr {
         let equality = [nat(), left.clone(), Expr::bvar(0).unwrap()]
             .into_iter()
             .fold(
