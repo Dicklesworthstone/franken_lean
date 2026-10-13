@@ -71,14 +71,12 @@ impl Engine<'_> {
             let ExprNode::App { f, a } = candidate.node() else {
                 return Ok(false);
             };
-            if !same_terms(argument, a, &mut self.meter)? {
-                // Reduction is conversion only, under the caller's existing
-                // transparency and local-let policy. It does not solve holes.
-                let left = self.whnf(argument, locals)?;
-                let right = self.whnf(a, locals)?;
-                if !same_terms(&left, &right, &mut self.meter)? {
-                    return Ok(false);
-                }
+            // Reduction is conversion only, under the caller's existing
+            // transparency and local-let policy. It does not solve holes.
+            if !same_terms(argument, a, &mut self.meter)?
+                && !self.application_suffix_convertible(argument, a, locals)?
+            {
+                return Ok(false);
             }
             candidate = f;
         }
@@ -105,5 +103,91 @@ impl Engine<'_> {
             }
             result => result,
         }
+    }
+
+    /// A sufficient conversion test, never an argument-unification problem.
+    /// In particular, no argument hole may be assigned to choose a head.
+    /// WHNF alone misses `h (id x) = h x` when `h` is neutral: descend through
+    /// congruent applications/projections under the caller's reduction policy.
+    fn application_suffix_convertible(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        let mut pending = vec![(left.clone(), right.clone())];
+        // Own the keyed operands. Reduction allocates temporary expressions;
+        // an address-only set could confuse a reused allocation with a proved
+        // pair. The retained roots also make shared DAGs safe to memoize.
+        let mut seen = HashMap::new();
+        while let Some((left, right)) = pending.pop() {
+            self.meter.node()?;
+            let key = (
+                std::ptr::from_ref(left.node()),
+                std::ptr::from_ref(right.node()),
+            );
+            if seen.insert(key, (left.clone(), right.clone())).is_some() {
+                continue;
+            }
+            let left = self.whnf(&left, locals)?;
+            let right = self.whnf(&right, locals)?;
+            if std::ptr::eq(left.node(), right.node()) {
+                continue;
+            }
+            match (left.node(), right.node()) {
+                (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
+                (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) if a == b => {}
+                (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) if a == b => {}
+                (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) if a == b => {}
+                (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
+                    if !same_levels(a, b, &mut self.meter)? {
+                        return Ok(false);
+                    }
+                }
+                (
+                    ExprNode::Const {
+                        name: a,
+                        levels: ua,
+                    },
+                    ExprNode::Const {
+                        name: b,
+                        levels: ub,
+                    },
+                ) if a == b && ua.len() == ub.len() => {
+                    for (a, b) in ua.iter().zip(ub) {
+                        if !same_levels(a, b, &mut self.meter)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
+                    pending.push((b.clone(), d.clone()));
+                    pending.push((a.clone(), c.clone()));
+                }
+                (
+                    ExprNode::Proj {
+                        struct_name: a,
+                        idx: i,
+                        expr: x,
+                    },
+                    ExprNode::Proj {
+                        struct_name: b,
+                        idx: j,
+                        expr: y,
+                    },
+                ) if a == b && i == j => pending.push((x.clone(), y.clone())),
+                // Preserve reflexivity below a reduced binder. Conversion
+                // under binders additionally needs a shared, opened context.
+                (ExprNode::Lam { .. }, ExprNode::Lam { .. })
+                | (ExprNode::ForallE { .. }, ExprNode::ForallE { .. })
+                | (ExprNode::LetE { .. }, ExprNode::LetE { .. }) => {
+                    if !same_terms(&left, &right, &mut self.meter)? {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 }
