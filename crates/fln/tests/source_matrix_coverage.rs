@@ -177,12 +177,22 @@ fn recursive_literal_matrices_execute_after_checked_admission() {
       #eval foo 0 9 4
       #eval foo 3 9 4";
     let output = engine
-        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits)
+        .execute_source_commands_with_checks(source.as_bytes(), &KVMap::new(), limits)
         .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
         .into_complete()
         .expect("matrix admission and native execution must complete");
-    assert_eq!(output.executions.len(), 3);
-    for (execution, expected) in output.executions.iter().zip(["1", "9", "1"]) {
+    assert_eq!(output.command_count, 4);
+    assert_eq!(output.outputs.len(), 3);
+    for (index, (event, expected)) in output.outputs.iter().zip(["1", "9", "1"]).enumerate() {
+        let fln::SourceCommandOutput::Evaluation {
+            command_index,
+            execution_index,
+        } = event
+        else {
+            panic!("every output must come from a written #eval");
+        };
+        assert_eq!(*command_index, index + 1);
+        let execution = &output.batch.executions[*execution_index];
         let VmExit::Returned(value) = &execution.exit else {
             panic!("recursive matrix execution must return");
         };

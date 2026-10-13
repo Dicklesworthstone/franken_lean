@@ -7,6 +7,7 @@
 //! cannot hide an ill-typed body when a generated fallback is unnecessary.
 use super::*;
 mod coverage;
+mod functions;
 mod literals;
 use fln_env::constants::ConstantInfo;
 use fln_syntax::source::{ByteSpan, SourceInfo};
@@ -413,77 +414,9 @@ fn expand_assumption(mut syntax: Syntax, pattern: bool) -> Syntax {
     )
 }
 
-/// Whether `syntax` is a lambda with an anonymous-constructor binder, which
-/// [`expand_fun_patterns`] rewrites.
+/// Whether the lambda has destructuring binders requiring native expansion.
 fn fun_patterns(syntax: &Syntax) -> bool {
-    matches!(syntax, Syntax::Node { kind, args, .. }
-        if kind == &parser_kind(&["Term", "fun"])
-            && matches!(args.get(1), Some(Syntax::Node { kind, args: basic, .. })
-                if kind == &parser_kind(&["Term", "basicFun"])
-                    && matches!(basic.first(), Some(Syntax::Node { args: binders, .. })
-                        if binders.iter().any(pattern_binder))))
-}
-
-/// An anonymous-constructor (`⟨a, b⟩`) or tuple (`(a, b)`) lambda binder. A binder is lowered as
-/// a term before its lambda is rebuilt, so a tuple arrives here as its macro's
-/// `_root_.Prod.mk a b` (`expandTuple`), itself the pattern the tuple stands for.
-fn pattern_binder(binder: &Syntax) -> bool {
-    binder.kind() == Some(&parser_kind(&["Term", "anonymousCtor"]))
-        || binder.kind() == Some(&parser_kind(&["Term", "tuple"]))
-        || matches!(binder, Syntax::Node { kind, args, .. }
-            if kind == &parser_kind(&["Term", "app"])
-                && matches!(args.first(), Some(Syntax::Ident { val, .. })
-                    if *val == Name::from_components(["_root_", "Prod", "mk"])))
-}
-
-/// `fun ⟨a, b⟩ c => e`, a lambda with an anonymous-constructor binder, is the pattern lambda
-/// `fun | ⟨a, b⟩, c => e`: the pin's `expandFunBinders` matches every written binder against a
-/// fresh local the same way, and a name or `_` binds as a pattern does. With a typed binder
-/// group or a result annotation the lambda is left as written, and refused.
-fn expand_fun_patterns(mut syntax: Syntax, pattern: bool) -> Syntax {
-    let rewrite = !pattern
-        && matches!(&syntax, Syntax::Node { kind, args, .. }
-        if kind == &parser_kind(&["Term", "fun"])
-            && matches!(args.get(1), Some(Syntax::Node { kind, args: basic, .. })
-                if kind == &parser_kind(&["Term", "basicFun"])
-                    && basic.len() == 4
-                    && matches!(&basic[1], Syntax::Node { args, .. } if args.is_empty())
-                    && matches!(&basic[0], Syntax::Node { args: binders, .. }
-                        if binders.iter().any(pattern_binder)
-                            && binders.iter().all(|b| {
-                                pattern_binder(b)
-                                    || matches!(b, Syntax::Ident { .. })
-                                    || b.kind() == Some(&parser_kind(&["Term", "hole"]))
-                            }))));
-    if !rewrite {
-        return syntax;
-    }
-    let Syntax::Node { args, .. } = &mut syntax else {
-        unreachable!("checked lambda");
-    };
-    let Syntax::Node { args: basic, .. } = &mut args[1] else {
-        unreachable!("checked basicFun");
-    };
-    let body = std::mem::replace(&mut basic[3], null(vec![]));
-    let arrow = std::mem::replace(&mut basic[2], null(vec![]));
-    let Syntax::Node { args: binders, .. } = &mut basic[0] else {
-        unreachable!("checked binders");
-    };
-    let mut patterns = Vec::new();
-    for (index, binder) in std::mem::take(binders).into_iter().enumerate() {
-        if index != 0 {
-            patterns.push(atom(","));
-        }
-        patterns.push(binder);
-    }
-    args[1] = Syntax::node(
-        parser_kind(&["Term", "matchAlts"]),
-        vec![null(vec![Syntax::node(
-            parser_kind(&["Term", "matchAlt"]),
-            vec![atom("|"), null(vec![null(patterns)]), arrow, body],
-        )])],
-    );
-    syntax
+    functions::needs_expansion(syntax)
 }
 
 /// A field defined by equations, `toString | true => "t" | false => "f"`, is the field
@@ -1393,7 +1326,7 @@ impl Context {
                     let node = self.expand_exists_node(node, pattern)?;
                     let node = self.expand_record_field_node(node, pattern)?;
                     let node = self.expand_offset_pattern(node, pattern)?;
-                    let node = expand_fun_patterns(node, pattern);
+                    let node = self.expand_fun_patterns(node, pattern)?;
                     let node = expand_field_equations(node, pattern);
                     let node = expand_assumption(node, pattern);
                     let node = expand_if_let(node, pattern);
