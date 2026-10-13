@@ -17,7 +17,8 @@ use fln_env::extensions::{
 use std::collections::BTreeSet;
 
 const MAGIC: &[u8] = b"FLNNONC\x01";
-const MAX_ROWS: usize = 65_536;
+/// Native tag journal row capacity; exported errors retain this exact bound.
+pub const MAX_ROWS: usize = 65_536;
 const MAX_ENTRY_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,11 @@ fn descriptor() -> ExtensionDescriptor {
         checkpoint: CheckpointSemantics::FullJournal,
         provenance: PayloadProvenance::Understood,
     }
+}
+
+/// Exact native journal supported by the pinned-format noncomputable tag writer.
+pub fn supports(candidate: &ExtensionDescriptor) -> bool {
+    *candidate == descriptor()
 }
 
 /// Tag one admitted source declaration noncomputable.

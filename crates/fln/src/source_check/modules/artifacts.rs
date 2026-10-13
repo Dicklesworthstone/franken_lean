@@ -352,6 +352,44 @@ impl PendingArtifact {
                 metadata.aux_recursors.push(tagged.clone());
             }
         }
+        // Compilation effects belong only to their declaring module. Preserve
+        // explicit tags and generated partial-companion tags without copying
+        // dependencies' journals or changing their executable interpretation.
+        let noncomputable = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::noncomputable::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::noncomputable::read(env).map_err(|error| match error {
+                fln_elab::noncomputable::NoncomputableError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "native noncomputable tags",
+                        limit: fln_elab::noncomputable::MAX_ROWS,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::noncomputable::journal_name(),
+                    reason: "invalid noncomputable-declaration journal",
+                },
+            })
+        };
+        let inherited = noncomputable(base, meter)?;
+        for tagged in noncomputable(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::noncomputable::journal_name(),
+                        reason: "a module cannot tag an imported noncomputable declaration",
+                    });
+                }
+                metadata.noncomputable.push(tagged);
+            }
+        }
         Ok(Self {
             name: name.clone(),
             imports,

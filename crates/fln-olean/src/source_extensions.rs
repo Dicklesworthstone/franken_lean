@@ -17,8 +17,8 @@ use std::collections::BTreeSet;
 
 pub use format::{
     ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
-    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION,
-    SIMP_EXTENSION, STRUCTURE_EXTENSION,
+    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION, PROTECTED_EXTENSION,
+    REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
@@ -131,6 +131,8 @@ pub struct SourceExtensions {
     /// Generated auxiliary recursors (the pin's `auxRecExt`), recorded only by
     /// their owning module. A suffix alone never supplies this metadata.
     pub aux_recursors: Vec<Name>,
+    /// Noncomputable tags, interpreted only after checking their owning module.
+    pub noncomputable: Vec<Name>,
     /// Structure fields and extends-clause metadata, still awaiting checked
     /// constructor/projection validation by the source importer.
     pub structures: Vec<StructureEntry>,
@@ -445,6 +447,7 @@ pub fn decode(
         name(crate::initializers::REGULAR_INIT_EXTENSION),
         name(crate::initializers::BUILTIN_INIT_EXTENSION),
         structure_extension_name(),
+        name(format::NONCOMPUTABLE_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -458,6 +461,7 @@ pub fn decode(
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();
     let mut aux_recursors = BTreeSet::new();
+    let mut noncomputable = BTreeSet::new();
     let mut structures = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
@@ -537,7 +541,14 @@ pub fn decode(
                     }
                     out.structures.push(row);
                 }
-                _ => unreachable!("thirteen selected extension families"),
+                13 => {
+                    let declaration = reader.name(&obj)?;
+                    if declaration.is_anonymous() || !noncomputable.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated noncomputable declaration"));
+                    }
+                    out.noncomputable.push(declaration);
+                }
+                _ => unreachable!("fourteen selected extension families"),
             }
         }
     }

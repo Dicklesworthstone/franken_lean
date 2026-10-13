@@ -71,6 +71,8 @@ pub struct SourceMetadataReport {
     /// Internal auxiliary-recursion tags (the pin's `auxRecExt`), activated
     /// only for this module's own admitted definitions.
     pub aux_recursors: usize,
+    /// Compilation restrictions owned by this module, including partial companions.
+    pub noncomputable: usize,
     /// Original structure fields and direct-parent metadata, validated against
     /// this module's checked constructor and projection interfaces.
     pub structures: usize,
@@ -317,7 +319,10 @@ impl Engine {
         .map(|name| Name::from_components(name.split('.')));
         let selected: Vec<_> = selected
             .into_iter()
-            .chain([metadata::structure_extension_name()])
+            .chain([
+                metadata::structure_extension_name(),
+                Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
+            ])
             .collect();
         let mut blocks: Vec<_> = selected
             .iter()
@@ -349,6 +354,7 @@ impl Engine {
                 aliases: 0,
                 protected: 0,
                 aux_recursors: 0,
+                noncomputable: 0,
                 structures: 0,
                 reducibility: 0,
                 externs: 0,
@@ -388,6 +394,7 @@ impl Engine {
                         9 => report.regular_initializers = block.entries.len(),
                         10 => report.builtin_initializers = block.entries.len(),
                         11 => report.structures = block.entries.len(),
+                        12 => report.noncomputable = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -420,6 +427,7 @@ impl Engine {
         let mut aliases = decoded.aliases.into_iter();
         let mut protected = decoded.protected.into_iter();
         let mut aux_recursors = decoded.aux_recursors.into_iter();
+        let mut noncomputable = decoded.noncomputable.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
@@ -613,6 +621,27 @@ impl Engine {
                     .register_aux_recursors(&tagged)
                     .map_err(|error| auxiliary_error(&report.module, error))?;
             }
+            if report.noncomputable != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.noncomputable,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.noncomputable {
+                    cancelled!("source-olean/noncomputable");
+                    let declaration =
+                        noncomputable
+                            .next()
+                            .ok_or(SourceOleanImportError::Internal(
+                                "noncomputable count changed during decode",
+                            ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation
+                        .register_noncomputable(&declaration)
+                        .map_err(|error| noncomputable_error(&report.module, error))?;
+                }
+            }
             for _ in 0..report.reducibility {
                 cancelled!("source-olean/reducibility");
                 let row = reducibility.next().ok_or(SourceOleanImportError::Internal(
@@ -749,6 +778,9 @@ impl Engine {
         implemented_by::validate_journal(&engine.environment)?;
         fln_elab::aux_recursors::AuxRecursors::read(&engine.environment)
             .map_err(|error| auxiliary_error(&roots.first().cloned().unwrap_or_default(), error))?;
+        fln_elab::noncomputable::read(&engine.environment).map_err(|error| {
+            noncomputable_error(&roots.first().cloned().unwrap_or_default(), error)
+        })?;
         fln_elab::records::imported::ImportedStructures::read(&engine.environment).map_err(
             |problem| {
                 structures::error(
@@ -765,6 +797,7 @@ impl Engine {
             || aliases.next().is_some()
             || protected.next().is_some()
             || aux_recursors.next().is_some()
+            || noncomputable.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
@@ -894,6 +927,10 @@ trait Registrar: Sized {
         self,
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError>;
+    fn register_noncomputable(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError>;
     fn register_reducibility(
         self,
         declaration: &Name,
@@ -962,6 +999,12 @@ impl Registrar for instances::imported::ImportActivation {
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
         self.register_aux_recursors(declarations)
+    }
+    fn register_noncomputable(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
+        self.register_noncomputable(declaration)
     }
     fn register_reducibility(
         self,
@@ -1185,6 +1228,28 @@ fn auxiliary_error(
             "a definition is tagged as an auxiliary recursor twice",
         ),
         AuxRecursorError::Malformed => (module.clone(), "malformed auxiliary-recursor journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
+        reason,
+    }
+}
+
+fn noncomputable_error(
+    module: &Name,
+    error: fln_elab::noncomputable::NoncomputableError,
+) -> SourceOleanImportError {
+    use fln_elab::noncomputable::NoncomputableError;
+    let (declaration, reason) = match error {
+        NoncomputableError::Limit => return SourceOleanImportError::Limit("noncomputable journal"),
+        NoncomputableError::UnknownDeclaration(name) => {
+            (name, "a noncomputable tag names no admitted declaration")
+        }
+        NoncomputableError::Duplicate(name) => {
+            (name, "a declaration is tagged noncomputable twice")
+        }
+        NoncomputableError::Malformed => (module.clone(), "malformed noncomputable journal"),
     };
     SourceOleanImportError::Metadata {
         module: module.clone(),
@@ -1566,6 +1631,12 @@ pub(super) mod tests {
             declarations: &[Name],
         ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
             fln_elab::aux_recursors::register_module(&self.0, declarations).map(Sequential)
+        }
+        fn register_noncomputable(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
+            fln_elab::noncomputable::register(&self.0, declaration).map(Sequential)
         }
         fn register_reducibility(
             self,

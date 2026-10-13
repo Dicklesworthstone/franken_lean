@@ -601,6 +601,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record a checked owning module's noncomputable tag. This changes no
+    /// instance candidate or cached typeclass metadata.
+    pub fn register_noncomputable(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::noncomputable::NoncomputableError> {
+        self.env = crate::noncomputable::register(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Record one imported reducibility status in the environment being
     /// activated ([`crate::reducibility::register`]). The reducibility journal is
     /// not one this activation keeps or reads, so the kept class and instance

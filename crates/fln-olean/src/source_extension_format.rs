@@ -18,6 +18,7 @@
 //! src/Lean/AuxRecursor.lean: sha256 c004ddcbd0d6475550e701e30b8035e146132f8f7c8d3d5c8486c1f465a6ff9f
 //! src/Lean/Structure.lean: sha256 efb642c4ba81cda9af92374cc48e776ebad991faf16161ca71b6c1bda3b82671
 //! src/Lean/PrivateName.lean: sha256 f40339a7ed3fa6d741b26d9fe3e5c3c16c4ab8f283604e756dc6d0d43e399ae1
+//! src/Lean/Compiler/NoncomputableAttr.lean: sha256 8d1ba44757e2a2b4d1916ee97b8c0dd54171ff1890db8a1452f0346119d65859
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -101,6 +102,7 @@ pub const PROD_POINTERS: usize = 2;
 pub const PROD_SCALAR_BYTES: usize = 0;
 pub const PROTECTED_EXTENSION: &str = "Lean.protectedExt";
 pub const AUX_RECURSOR_EXTENSION: &str = "Lean.auxRecExt";
+pub const NONCOMPUTABLE_EXTENSION: &str = "Lean.noncomputableExt";
 pub const BINDER_DEFAULT: u8 = 0;
 pub const BINDER_IMPLICIT: u8 = 1;
 pub const BINDER_STRICT_IMPLICIT: u8 = 2;
