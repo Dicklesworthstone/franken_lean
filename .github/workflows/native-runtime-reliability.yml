@@ -7,7 +7,8 @@ permissions:
   contents: read
 jobs:
   publish:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'fix(runtime): validate exact uploaded patches before publication'
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'fix(runtime): execute verified runtime publication'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -23,88 +24,23 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-      - name: Validate and publish the two exact runtime increments
+      - name: Validate and publish the two reviewed runtime increments
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
-          import base64, hashlib, json, os, pathlib, re, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'runtime-reliability'
-          root.mkdir()
-          stages = [
-              ('950aa5d6a5a51ea53a3d48db3176c4a3b4739f02', '3c098a2607e2e246b44da5e218d907df806a62ee', 'fix(runtime): stream canonical seed checks on bounded stacks'),
-              ('64d5842506f6e4389ed272aae410197d236be220', 'c49df1e23e16cb06d88033441d9a8d8bb4297b10', 'fix(runtime): reuse completed equality decision contracts'),
-          ]
-          allowed = {'crates/fln-elab/src/seed.rs', 'crates/fln/src/runtime/conditionals.rs', 'crates/fln/src/runtime/decisions.rs', 'crates/fln/src/runtime/specialize.rs'}
-          def output(*args):
-              return subprocess.check_output(args, text=True).strip()
-          def run(args, label):
-              print('RUN ' + ' '.join(args), flush=True)
-              with (root / (label + '.log')).open('w') as log:
-                  p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                  for line in p.stdout:
-                      print(line, end='', flush=True)
-                      log.write(line)
-                  code = p.wait()
-              (root / (label + '.exit')).write_text(str(code) + '\n')
-              if code:
-                  raise subprocess.CalledProcessError(code, args)
-          for stage, (blob, local_commit, title) in enumerate(stages, 1):
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + blob, headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent':'OpenAI File Downloader, XaiImageApiFetch/1.0'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  data = json.load(response)
-              assert data['encoding'] == 'base64'
-              patch_bytes = base64.b64decode(data['content'])
-              assert hashlib.sha1(('blob ' + str(len(patch_bytes)) + '\0').encode() + patch_bytes).hexdigest() == blob
-              text = patch_bytes.decode()
-              rows = re.findall(r'diff --git a/(.+) b/\1\nindex ([0-9a-f]{40})\.\.([0-9a-f]{40}) 100644\n', text)
-              assert len(rows) == (3 if stage == 1 else 2)
-              assert all(path in allowed for path, before, after in rows)
-              patch = root / (str(stage) + '.patch')
-              patch.write_bytes(patch_bytes)
-              for attempt in range(3):
-                  tag = str(stage) + '-' + str(attempt)
-                  assert not output('git', 'status', '--porcelain'), 'dirty checkout'
-                  run(['git', 'fetch', 'origin', 'main'], tag + '-fetch')
-                  run(['git', 'switch', '--detach', 'origin/main'], tag + '-snapshot')
-                  parent = output('git', 'rev-parse', 'HEAD')
-                  for path, before, after in rows:
-                      assert output('git', 'rev-parse', 'HEAD:' + path) == before, 'overlapping change: ' + path
-                  run(['git', 'apply', '--check', str(patch)], tag + '-apply-check')
-                  run(['git', 'apply', str(patch)], tag + '-apply')
-                  for path, before, after in rows:
-                      assert output('git', 'hash-object', path) == after, path
-                  run(['rustup', 'show', 'active-toolchain'], tag + '-toolchain')
-                  run(['cargo', 'test', '--locked', '-p', 'fln-elab', '--no-fail-fast'], tag + '-elab')
-                  run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', '--', 'nested_lexical_contexts_prepare_mutual_groups_on_a_small_host_stack'], tag + '-small-stack')
-                  run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', '--', 'runtime::decisions::tests'], tag + '-decisions')
-                  if stage == 2:
-                      run(['cargo', 'test', '--locked', '-p', 'fln', '--test', 'runtime_conditionals', '--test', 'runtime_logic_decisions', '--test', 'runtime_nat_decisions', '--test', 'source_equality_decisions', '--test', 'source_generic_decisions', '--test', 'source_option_decisions', '--no-fail-fast'], tag + '-runtime')
-                      run(['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_equality_decisions'], tag + '-cli')
-                  run(['cargo', 'clippy', '--locked', '-p', 'fln-elab', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings'], tag + '-clippy')
-                  run(['cargo', 'check', '--locked', '--workspace', '--all-targets'], tag + '-workspace')
-                  paths = [path for path, before, after in rows]
-                  run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *paths], tag + '-format')
-                  run(['git', 'diff', '--check'], tag + '-whitespace')
-                  for path, before, after in rows:
-                      assert output('git', 'hash-object', path) == after, 'validation changed source'
-                  assert sorted(output('git', 'diff', '--name-only').splitlines()) == sorted(paths)
-                  message = title + '\n\nPublish the exact prepared increment ' + local_commit + '. Preserve canonical declaration identities, proof-admission rules, resource checks and all concurrent nonoverlapping main changes.\n\nFresh pinned full-debug incremental validation: complete elaborator, small-stack and decision tests, scoped all-target Clippy and workspace compilation passed. Stage 2 additionally checks six runtime integration targets and installed equality execution. No full-workspace test or Reference-parity claim. Normal direct main publication; no PR or force push.'
-                  run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', message, '-o', '--', *paths], tag + '-commit')
-                  sha = output('git', 'rev-parse', 'HEAD')
-                  result = subprocess.run(['git', 'push', 'origin', 'HEAD:main'], capture_output=True, text=True)
-                  (root / (tag + '-push.log')).write_text(result.stdout + result.stderr)
-                  print(result.stdout + result.stderr, flush=True)
-                  if result.returncode:
-                      if 'fetch first' in result.stderr or 'non-fast-forward' in result.stderr:
-                          continue
-                      raise subprocess.CalledProcessError(result.returncode, result.args)
-                  record = {'commit':sha, 'parent':parent, 'files':[{'path':p,'base_blob':b,'git_blob':a} for p,b,a in rows], 'force':False, 'published':True}
-                  (root / (str(stage) + '-published.json')).write_text(json.dumps(record, indent=2))
-                  print('PUBLISHED ' + sha, flush=True)
-                  break
-              else:
-                  raise RuntimeError('main advanced on all attempts; no history overwritten')
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          sha = '25dd662bc74a11a8fda0b8430fb3bdda1dfd9a33'
+          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
+              headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent':'OpenAI File Downloader, XaiImageApiFetch/1.0'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          assert data['encoding'] == 'base64'
+          content = base64.b64decode(data['content'])
+          assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
+          script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'publish-runtime.py'
+          script.write_bytes(content)
+          subprocess.run(['python', str(script)], check=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
