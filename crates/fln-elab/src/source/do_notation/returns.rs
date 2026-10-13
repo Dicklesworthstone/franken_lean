@@ -239,7 +239,7 @@ impl Context {
     }
 
     #[inline(never)]
-    fn finish_returning_nested(
+    pub(super) fn finish_returning_nested(
         &mut self,
         join: Option<(Syntax, Syntax)>,
         values: &mut Vec<Syntax>,

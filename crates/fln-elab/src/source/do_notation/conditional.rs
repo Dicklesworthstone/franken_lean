@@ -85,6 +85,7 @@ pub(super) fn is_compound(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", "doIf"]))
         || syntax.kind() == Some(&parser_kind(&["Term", "doMatch"]))
         || syntax.kind() == Some(&parser_kind(&["Term", "doNested"]))
+        || nested::sequence(syntax).is_some()
         || fallback::is_binding(syntax)
 }
 
@@ -171,6 +172,7 @@ struct Block<'a> {
     result: Option<Syntax>,
     scope: SequenceScope<'a>,
     terminal: bool,
+    completion: Option<Syntax>,
 }
 impl<'a> Block<'a> {
     fn new(sequence: Syntax, scope: SequenceScope<'a>) -> Result<Self, NatDefinitionElabError> {
@@ -183,6 +185,7 @@ impl<'a> Block<'a> {
             result: scope.targets.map(|targets| targets.signal(None)),
             scope,
             terminal: true,
+            completion: None,
         })
     }
 }
@@ -210,8 +213,9 @@ impl Context {
         scope: SequenceScope<'_>,
     ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task<'a> {
-            Conditional(Syntax, Option<Syntax>, SequenceScope<'a>),
+            Conditional(Syntax, Option<Syntax>, SequenceScope<'a>, Option<Syntax>),
             Finish(Header, usize, Option<Syntax>, SequenceScope<'a>),
+            FinishNested(Option<(Syntax, Syntax)>),
             Block(Block<'a>),
             Resume(Block<'a>),
             Value(Syntax),
@@ -219,17 +223,51 @@ impl Context {
         if scope.targets.is_some() && suffix.is_none() {
             return Err(invalid());
         }
-        let mut tasks = vec![Task::Conditional(syntax, suffix, scope)];
+        let mut tasks = vec![Task::Conditional(syntax, suffix, scope, None)];
         let mut values = Vec::new();
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
                 Task::Value(value) => values.push(value),
-                Task::Conditional(syntax, suffix, scope) => {
+                Task::FinishNested(join) => self.finish_returning_nested(join, &mut values)?,
+                Task::Conditional(syntax, suffix, scope, completion) => {
+                    if syntax.kind() == Some(&parser_kind(&["Term", "doLetArrow"]))
+                        && nested::sequence(&syntax).is_some()
+                    {
+                        // The normal value calls a typed continuation in the
+                        // binder's original lexical scope. Loop exits bypass
+                        // it and retain this region's exact signal depth.
+                        let nested = self.prepare_nested_do(syntax, suffix, completion, scope)?;
+                        let mut inner = Block::new(
+                            nested.sequence,
+                            SequenceScope {
+                                require_unit: false,
+                                ..scope
+                            },
+                        )?;
+                        inner.result = None;
+                        inner.completion = nested.completion;
+                        tasks.push(Task::FinishNested(nested.join));
+                        tasks.push(Task::Block(inner));
+                        continue;
+                    }
+                    if completion.is_some()
+                        && syntax.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
+                    {
+                        // As in the returning worklist, a terminal exception
+                        // region with a value completion needs a distinct
+                        // normal payload. Never run the continuation inside
+                        // that handler/finalizer just to make its type fit.
+                        return Err(invalid());
+                    }
                     let branches = split(self, syntax)?;
                     let branch_scope = SequenceScope {
                         targets: scope.targets,
-                        signal: scope.targets.is_some(),
+                        signal: if completion.is_some() {
+                            scope.signal
+                        } else {
+                            scope.targets.is_some()
+                        },
                         require_unit: scope.require_unit || suffix.is_some(),
                         allow_return: scope.allow_return
                             && (scope.targets.is_some() || suffix.is_none()),
@@ -238,10 +276,20 @@ impl Context {
                     for arm in branches.arms.into_iter().rev() {
                         self.tick()?;
                         tasks.push(match arm {
-                            Some(sequence) => Task::Block(Block::new(sequence, branch_scope)?),
-                            None => Task::Value(match scope.targets {
-                                Some(targets) => targets.signal(None),
-                                None => skip(),
+                            Some(sequence) => {
+                                let mut block = Block::new(sequence, branch_scope)?;
+                                if completion.is_some() {
+                                    block.result = None;
+                                    block.completion = completion.clone();
+                                }
+                                Task::Block(block)
+                            }
+                            None => Task::Value(match &completion {
+                                Some(completion) => nested::complete(skip(), completion.clone()),
+                                None => match scope.targets {
+                                    Some(targets) => targets.signal(None),
+                                    None => skip(),
+                                },
                             }),
                         });
                     }
@@ -267,15 +315,27 @@ impl Context {
                             block.result.take()
                         };
                         let scope = block.scope;
+                        let completion = if suffix.is_none() {
+                            block.completion.clone()
+                        } else {
+                            None
+                        };
                         tasks.push(Task::Resume(block));
-                        tasks.push(Task::Conditional(element, suffix, scope));
+                        tasks.push(Task::Conditional(element, suffix, scope, completion));
                     } else {
-                        block.result = Some(self.prepend_do_element(
-                            element,
-                            block.result,
-                            block.scope,
-                            terminal,
-                        )?);
+                        let completes = terminal
+                            && block.result.is_none()
+                            && element.kind() == Some(&parser_kind(&["Term", "doExpr"]));
+                        let value =
+                            self.prepend_do_element(element, block.result, block.scope, terminal)?;
+                        block.result = Some(if completes {
+                            match &block.completion {
+                                Some(completion) => nested::complete(value, completion.clone()),
+                                None => value,
+                            }
+                        } else {
+                            value
+                        });
                         tasks.push(Task::Block(block));
                     }
                 }
@@ -686,6 +746,78 @@ mod tests {
                     ),
                 ],
             )
+        }
+    }
+
+    fn bound_sequence(body: Syntax) -> Syntax {
+        term(
+            "doLetArrow",
+            vec![
+                atom("let"),
+                null(vec![]),
+                term("letConfig", vec![null(vec![])]),
+                term(
+                    "doIdDecl",
+                    vec![
+                        named("value"),
+                        null(vec![]),
+                        atom("←"),
+                        term("doNested", vec![atom("do"), body]),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn nested_value_blocks_are_metered_and_use_heap_continuations() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut body = sequence(action("leaf"));
+                for _ in 0..256 {
+                    body = block(vec![bound_sequence(body), action("next")], false);
+                }
+                let input = bound_sequence(body);
+                let targets = control::LoopTargets::new(&normal()).unwrap();
+                let mut stopped = context();
+                stopped.txn.budget.max_heartbeats = 10;
+                assert!(matches!(
+                    stopped.expand_do_conditional(
+                        input.clone(),
+                        Some(named("suffix")),
+                        Some(&targets)
+                    ),
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::ResourceLimit
+                    ))
+                ));
+                let output = context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .unwrap();
+                assert_eq!(count(&output, &Name::from_components(["leaf"])), 1);
+                assert_eq!(count(&output, &Name::from_components(["next"])), 256);
+                assert_eq!(count(&output, &Name::from_components(["suffix"])), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_nested_binding_headers_cannot_discard_source_fields() {
+        let targets = control::LoopTargets::new(&normal()).unwrap();
+        for slot in 0..4 {
+            let mut input = bound_sequence(sequence(action("body")));
+            let Syntax::Node { args, .. } = &mut input else {
+                unreachable!()
+            };
+            args[slot] = Syntax::Missing;
+            assert!(
+                context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .is_err()
+            );
         }
     }
 
