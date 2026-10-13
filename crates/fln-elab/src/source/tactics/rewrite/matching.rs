@@ -112,7 +112,12 @@ impl Context {
         let ExprNode::Const { name, .. } = expression.node() else {
             return Ok(None);
         };
-        let Some(type_) = self.txn.env.find(name).map(|c| c.constant_val().type_.clone()) else {
+        let Some(type_) = self
+            .txn
+            .env
+            .find(name)
+            .map(|c| c.constant_val().type_.clone())
+        else {
             return Ok(None);
         };
         let mut result = type_;
@@ -161,9 +166,29 @@ impl Context {
         }
     }
 
-    /// Match both the term and its type. `constrain` contributes universe
-    /// equations and concrete closed conversion refusals. Explicit equations
-    /// retain the same obligations through the transactional selection batch.
+    /// Queue a selection equation and its universe-typing obligations without
+    /// first running ordinary source inference. `constrain` flushes immediately
+    /// and may retry at Default transparency before a selection marker exists.
+    /// That can unfold an irrelevant rule or change which occurrence it matches.
+    fn queue_rewrite_selection(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.tick()?;
+        let left = self.instantiate(left)?;
+        let right = self.instantiate(right)?;
+        if let (Some(a), Some(b)) = (self.known_type(&left)?, self.known_type(&right)?)
+            && (a.has_level_mvar() || b.has_level_mvar())
+        {
+            self.equations.push(SourceEquation::selection(a, b));
+        }
+        self.equations.push(SourceEquation::selection(left, right));
+        Ok(())
+    }
+
+    /// Match the term and its type in ONE selection-policy transaction. Even
+    /// ground equations must be established before a rule can be selected.
     fn match_rewrite_occurrence(
         &mut self,
         pattern: &Expr,
@@ -193,14 +218,8 @@ impl Context {
         if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
         }
-        self.constrain(&type_, alpha)?;
-        self.constrain(occurrence, pattern)?;
-        self.equations
-            .push(SourceEquation::selection(type_, alpha.clone()));
-        self.equations.push(SourceEquation::selection(
-            occurrence.clone(),
-            pattern.clone(),
-        ));
+        self.queue_rewrite_selection(&type_, alpha)?;
+        self.queue_rewrite_selection(occurrence, pattern)?;
         self.flush(true)?;
         Ok(true)
     }
@@ -614,7 +633,14 @@ mod outcome_tests {
             expanded = Expr::app(succ.clone(), expanded);
         }
         ctx.constrain(&pattern, &expanded).unwrap();
-        assert_eq!(ctx.instantiate(&hole).unwrap(), zero);
+        // Delta/Nat reduction returns a literal, unlike the same-head match
+        // above. The independent control below pins this pre-existing result.
+        assert_eq!(
+            ctx.instantiate(&hole).unwrap(),
+            Expr::lit(fln_core::expr::Literal::Nat(
+                fln_core::expr::NatLit::from_u64(0)
+            ))
+        );
     }
 
     #[test]
@@ -748,5 +774,110 @@ mod outcome_tests {
             assert!(!crate::source::instances::nonmatch(&problem));
             assert!(!Context::rewrite_nonmatch(&problem));
         }
+    }
+
+    #[test]
+    fn failed_occurrence_does_not_commit_its_carrier_assignment() {
+        let mut ctx = context();
+        let carrier = ctx.hole(Expr::sort(Level::one())).unwrap();
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let one = Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            zero.clone(),
+        );
+        let before = ctx.txn.clone();
+        let problem = ctx
+            .match_rewrite_occurrence(&zero, &carrier, &one)
+            .unwrap_err();
+        assert!(Context::rewrite_nonmatch(&problem), "{problem:?}");
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+        assert!(ctx.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+        // A fresh trial from the original context must still match a real occurrence.
+        let mut recovery = Context::new(&before.env, ctx.kernel);
+        let carrier = recovery.hole(Expr::sort(Level::one())).unwrap();
+        assert!(
+            recovery
+                .match_rewrite_occurrence(&zero, &carrier, &zero)
+                .unwrap()
+        );
+        assert_eq!(
+            recovery.instantiate(&carrier).unwrap(),
+            Expr::const_(Name::from_components(["Nat"]), vec![])
+        );
+    }
+
+    #[test]
+    fn selection_retains_polymorphic_carrier_and_value_obligations() {
+        let mut ctx = context();
+        let level = ctx.level().unwrap();
+        let carrier = ctx.hole(Expr::sort(level)).unwrap();
+        let pattern = ctx.hole(carrier.clone()).unwrap();
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        assert!(
+            ctx.match_rewrite_occurrence(&pattern, &carrier, &zero)
+                .unwrap()
+        );
+        assert_eq!(
+            ctx.instantiate(&carrier).unwrap(),
+            Expr::const_(Name::from_components(["Nat"]), vec![])
+        );
+        assert_eq!(ctx.instantiate(&pattern).unwrap(), zero);
+        assert!(ctx.equations.is_empty());
+    }
+
+    #[test]
+    fn ordinary_delta_inference_returns_canonical_nat_zero() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        let source = format!(
+            "def costly (n : Nat) : Nat := {}n{}",
+            "Nat.succ (".repeat(128),
+            ")".repeat(128)
+        );
+        let declaration =
+            crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                .unwrap()
+                .declaration;
+        let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+            panic!("definition admission did not complete");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("definition was rejected");
+        };
+        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+            checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+        else {
+            panic!("definition publication did not complete");
+        };
+        ctx.txn.env = publication.environment;
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let costly = Expr::const_(Name::from_components(["costly"]), vec![]);
+        let hole = ctx.hole(nat.clone()).unwrap();
+        let pattern = Expr::app(costly.clone(), hole.clone());
+
+        let mut expanded = zero;
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            expanded = Expr::app(succ.clone(), expanded);
+        }
+        ctx.constrain(&pattern, &expanded).unwrap();
+        assert_eq!(
+            ctx.instantiate(&hole).unwrap(),
+            Expr::lit(fln_core::expr::Literal::Nat(
+                fln_core::expr::NatLit::from_u64(0)
+            ))
+        );
     }
 }
