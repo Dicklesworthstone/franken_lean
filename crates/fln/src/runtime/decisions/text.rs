@@ -221,18 +221,17 @@ mod tests {
                 .import_olean_modules_for_source(
                     &[OleanModuleInput {
                         name: &module,
-                        artifact: include_bytes!(concat!(
-                            env!("CARGO_MANIFEST_DIR"),
-                            "/../fln-conformance/fixtures/tag_attributes/prelude.olean"
+                        // File-relative, as fln-olean's source_extensions test includes the
+                        // same fixture: compile-time bytes need no compile-time tree root.
+                        artifact: include_bytes!(
+                            "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean"
+                        ),
+                        server_artifact: Some(include_bytes!(
+                            "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
                         )),
-                        server_artifact: Some(include_bytes!(concat!(
-                            env!("CARGO_MANIFEST_DIR"),
-                            "/../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
-                        ))),
-                        private_artifact: Some(include_bytes!(concat!(
-                            env!("CARGO_MANIFEST_DIR"),
-                            "/../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
-                        ))),
+                        private_artifact: Some(include_bytes!(
+                            "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
+                        )),
                     }],
                     std::slice::from_ref(&module),
                     &KVMap::new(),

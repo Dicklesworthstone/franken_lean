@@ -268,10 +268,8 @@ fn actual_imported_scientific_floats_execute_and_replay_the_regression() {
             let root = engine.logical_root(&options);
             let executed = engine
                 .execute_source_commands_with_checks(
-                    include_bytes!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../examples/native_float_runtime.lean"
-                    )),
+                    // File-relative: compile-time bytes need no compile-time tree root.
+                    include_bytes!("../../../examples/native_float_runtime.lean"),
                     &options,
                     EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
                 )
