@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 mod descriptions;
 
-const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x03";
+const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x04";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
@@ -229,6 +229,43 @@ fn decode_case(row: &Syntax) -> Result<NotationRule, EngineExecutionError> {
     })
 }
 
+fn encode_rules(
+    rule: Option<&Arc<NotationRule>>,
+    source: Option<&Arc<[u8]>>,
+) -> Result<Syntax, EngineExecutionError> {
+    let mut rules = Vec::new();
+    let mut total = 0usize;
+    if let Some(rule) = rule {
+        for case in rule.cases() {
+            let source = case
+                .source
+                .as_deref()
+                .or_else(|| source.map(AsRef::as_ref))
+                .unwrap_or(&[]);
+            let (row, bytes) = encode_case(case, source)?;
+            total = total
+                .checked_add(bytes)
+                .filter(|bytes| *bytes <= MAX_ROW_BYTES)
+                .ok_or_else(|| limit("native grammar rule bytes", MAX_ROW_BYTES))?;
+            rules.push(row);
+        }
+    }
+    Ok(node("rules", rules))
+}
+
+fn decode_rules(rules: &Syntax) -> Result<Option<Arc<NotationRule>>, EngineExecutionError> {
+    let mut cases = children(rules, "rules")?
+        .iter()
+        .map(decode_case)
+        .collect::<Result<Vec<_>, _>>()?;
+    if cases.is_empty() {
+        return Ok(None);
+    }
+    let mut head = cases.remove(0);
+    head.fallbacks = cases;
+    Ok(Some(Arc::new(head)))
+}
+
 pub(super) fn publish(
     environment: &Environment,
     module: &NativeSyntaxModule,
@@ -243,6 +280,13 @@ pub(super) fn publish(
         .categories
         .len()
         .saturating_add(module.declarations.len())
+        .saturating_add(
+            module
+                .rules
+                .keys()
+                .filter(|kind| !module.declarations.iter().any(|decl| decl.decl == **kind))
+                .count(),
+        )
         .saturating_add(1);
     if environment
         .extension(&name())
@@ -265,23 +309,7 @@ pub(super) fn publish(
     }
     for decl in &module.declarations {
         let descr = descriptions::encode(&decl.descr)?;
-        let mut rules = Vec::new();
-        let mut rule_bytes = 0usize;
-        if let Some(rule) = module.rules.get(&decl.decl) {
-            for case in rule.cases() {
-                let source = case
-                    .source
-                    .as_deref()
-                    .or_else(|| sources.get(&decl.decl).map(AsRef::as_ref))
-                    .unwrap_or(&[]);
-                let (row, bytes) = encode_case(case, source)?;
-                rule_bytes = rule_bytes
-                    .checked_add(bytes)
-                    .filter(|bytes| *bytes <= MAX_ROW_BYTES)
-                    .ok_or_else(|| limit("native grammar rule bytes", MAX_ROW_BYTES))?;
-                rules.push(row);
-            }
-        }
+        let rules = encode_rules(module.rules.get(&decl.decl), sources.get(&decl.decl))?;
         let header = node(
             "declaration",
             vec![
@@ -292,10 +320,23 @@ pub(super) fn publish(
                 atom(decl.priority),
                 optional_name(decl.scope.as_ref()),
                 descr,
-                node("rules", rules),
+                rules,
             ],
         );
         payloads.push(encode(header, &[], &[])?);
+    }
+    // Rule-only modules are real grammar effects. Emit their own clauses, not
+    // declarations or fallback rules copied from their predecessor modules.
+    for (kind, rule) in &module.rules {
+        if module.declarations.iter().any(|decl| decl.decl == *kind) {
+            continue;
+        }
+        let rules = encode_rules(Some(rule), sources.get(kind))?;
+        payloads.push(encode(
+            node("macroRules", vec![ident(kind), rules]),
+            &[],
+            &[],
+        )?);
     }
     let mut result = environment.clone();
     if result.extension(&name()).is_none() {
@@ -382,6 +423,12 @@ pub(super) fn load(
                 _ => return Err(malformed()),
             };
             module.categories.insert(as_name(category)?, behavior);
+        } else if let Ok([kind, rules]) = children(&trees.header, "macroRules") {
+            if !trees.commands.is_empty() {
+                return Err(malformed());
+            }
+            let rule = decode_rules(rules)?.ok_or_else(malformed)?;
+            module.rules.insert(as_name(kind)?, rule);
         } else {
             let [
                 owner,
@@ -409,14 +456,8 @@ pub(super) fn load(
             if !trees.commands.is_empty() {
                 return Err(malformed());
             }
-            let mut cases = children(rules, "rules")?
-                .iter()
-                .map(decode_case)
-                .collect::<Result<Vec<_>, _>>()?;
-            if !cases.is_empty() {
-                let mut head = cases.remove(0);
-                head.fallbacks = cases;
-                module.rules.insert(name, Arc::new(head));
+            if let Some(rule) = decode_rules(rules)? {
+                module.rules.insert(name, rule);
             }
         }
         file.import_native(&module)
@@ -567,6 +608,7 @@ mod tests {
             Arc::from([MAGIC, &[255; 8]].concat()),
             Arc::from(b"FLNSOURCEGRAMMAR\x01".as_slice()),
             Arc::from(b"FLNSOURCEGRAMMAR\x02".as_slice()),
+            Arc::from(b"FLNSOURCEGRAMMAR\x03".as_slice()),
         ] {
             let env = Environment::new()
                 .register_extension(descriptor())

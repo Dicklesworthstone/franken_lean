@@ -13,7 +13,7 @@ pub struct NativeSyntaxModule {
 
 impl NativeSyntaxModule {
     pub fn is_empty(&self) -> bool {
-        self.declarations.is_empty() && self.categories.is_empty()
+        self.declarations.is_empty() && self.categories.is_empty() && self.rules.is_empty()
     }
 }
 
@@ -30,14 +30,22 @@ impl FileGrammar {
             .filter(|decl| !self.local_declared.contains(&decl.decl))
             .cloned()
             .collect();
-        let rules = declarations
-            .iter()
-            .filter_map(|decl| {
-                self.rules
-                    .get(&decl.decl)
-                    .map(|rule| (decl.decl.clone(), Arc::clone(rule)))
-            })
-            .collect();
+        let exported_names: BTreeSet<_> = declarations.iter().map(|decl| &decl.decl).collect();
+        let mut rules = BTreeMap::new();
+        for (kind, rule) in self.rules.iter() {
+            let inherited = self.native_rule_counts.get(kind).copied();
+            if !exported_names.contains(kind) && inherited.is_none() {
+                continue;
+            }
+            let count = rule
+                .cases()
+                .count()
+                .checked_sub(inherited.unwrap_or(0))
+                .ok_or("native macro rule inheritance exceeds its chain")?;
+            if count != 0 {
+                rules.insert(kind.clone(), Arc::new(rule_prefix(rule, count)));
+            }
+        }
         Ok(NativeSyntaxModule {
             declarations,
             categories: self.declared_categories.clone(),
@@ -68,8 +76,12 @@ impl FileGrammar {
                 return Err("an imported syntax declaration names an unavailable category");
             }
         }
-        if module.rules.keys().any(|kind| !names.contains(kind)) {
-            return Err("an imported macro rule has no syntax declaration in its module");
+        if module
+            .rules
+            .keys()
+            .any(|kind| !names.contains(kind) && !self.native_rule_counts.contains_key(kind))
+        {
+            return Err("an imported macro rule has no native syntax declaration");
         }
         for (kind, rule) in &module.rules {
             if rule.fallbacks.len() >= MAX_TEMPLATE_NODES
@@ -93,6 +105,33 @@ impl FileGrammar {
                 }
             }
         }
+        // Prepare all chains before mutation. Imports arrive in dependency
+        // order, so later imports precede earlier ones, but never a declaration
+        // the caller has already made in this source file.
+        let mut merged_rules = Vec::new();
+        for (kind, incoming) in &module.rules {
+            let previous = self.rules.get(kind);
+            let inherited = self.native_rule_counts.get(kind).copied().unwrap_or(0);
+            let previous_count = previous.map_or(0, |rule| rule.cases().count());
+            let own = previous_count
+                .checked_sub(inherited)
+                .ok_or("native macro rule inheritance exceeds its chain")?;
+            let total = previous_count
+                .checked_add(incoming.cases().count())
+                .filter(|count| *count <= MAX_TEMPLATE_NODES)
+                .ok_or("native macro rule alternatives past the budget")?;
+            let mut cases = Vec::with_capacity(total);
+            if let Some(previous) = previous {
+                cases.extend(previous.cases().take(own).map(flat_case));
+            }
+            cases.extend(incoming.cases().map(flat_case));
+            if let Some(previous) = previous {
+                cases.extend(previous.cases().skip(own).map(flat_case));
+            }
+            let mut head = cases.remove(0);
+            head.fallbacks = cases;
+            merged_rules.push((kind.clone(), Arc::new(head), total - own));
+        }
         for (name, behavior) in &module.categories {
             self.categories.insert(name.clone(), *behavior);
             let LeafView::Str(suffix) = name.leaf_view() else {
@@ -101,6 +140,11 @@ impl FileGrammar {
             self.base_tokens.insert(format!("`({suffix}|"));
         }
         for decl in &module.declarations {
+            if decl.category.is_some() {
+                self.native_rule_counts
+                    .entry(decl.decl.clone())
+                    .or_insert(0);
+            }
             self.constants.insert(decl.decl.clone());
             if decl.category.is_none() {
                 self.native_abbreviations.insert(decl.decl.clone());
@@ -116,12 +160,10 @@ impl FileGrammar {
                 self.native_imported.push(Arc::clone(decl));
             }
         }
-        Arc::make_mut(&mut self.rules).extend(
-            module
-                .rules
-                .iter()
-                .map(|(kind, rule)| (kind.clone(), Arc::clone(rule))),
-        );
+        for (kind, rule, inherited) in merged_rules {
+            self.native_rule_counts.insert(kind.clone(), inherited);
+            Arc::make_mut(&mut self.rules).insert(kind, rule);
+        }
         self.generation += 1;
         self.cache.borrow_mut().clear();
         Ok(())
@@ -140,17 +182,44 @@ impl FileGrammar {
     }
 }
 
+/// Clone only a clause, never its already-flat sibling list.
+fn flat_case(rule: &NotationRule) -> NotationRule {
+    NotationRule {
+        variables: rule.variables.clone(),
+        rhs: rule.rhs.clone(),
+        prechecked: rule.prechecked,
+        pattern: rule.pattern.clone(),
+        source: rule.source.clone(),
+        fallbacks: Vec::new(),
+    }
+}
+
+fn rule_prefix(rule: &NotationRule, count: usize) -> NotationRule {
+    debug_assert!(count > 0);
+    let mut head = flat_case(rule);
+    head.fallbacks = rule
+        .fallbacks
+        .iter()
+        .take(count - 1)
+        .map(flat_case)
+        .collect();
+    head
+}
+
+#[cfg(test)]
+mod imported_rules_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn grammar(module: &str) -> FileGrammar {
+    pub(super) fn grammar(module: &str) -> FileGrammar {
         FileGrammar::new(false, &[], Some(Name::from_components([module])))
             .unwrap()
             .own_syntax_only()
     }
 
-    fn declare(grammar: &mut FileGrammar, source: &str) {
+    pub(super) fn declare(grammar: &mut FileGrammar, source: &str) {
         let control = with_grammar(&grammar.grammar(), || {
             crate::command_scope::parse(source.as_bytes())
         })
@@ -166,7 +235,7 @@ mod tests {
         }
     }
 
-    fn parses(grammar: &FileGrammar, source: &str) -> bool {
+    pub(super) fn parses(grammar: &FileGrammar, source: &str) -> bool {
         with_grammar(&grammar.grammar(), || {
             crate::parse_source_command(source.as_bytes())
         })
@@ -276,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_local_rules_and_imported_rule_overrides_refuse_module_export() {
+    fn imported_rule_extensions_export_but_local_rules_still_refuse() {
         let mut library = grammar("Lib");
         declare(&mut library, "syntax \"wrap \" term:max : term");
         let mut consumer = grammar("Main");
@@ -284,7 +353,10 @@ mod tests {
             .import_native(&library.export_native().unwrap())
             .unwrap();
         declare(&mut consumer, "macro_rules | `(wrap $x) => `($x)");
-        assert!(consumer.export_native().is_err());
+        let exported = consumer.export_native().unwrap();
+        assert!(exported.declarations.is_empty());
+        assert_eq!(exported.rules.len(), 1);
+        assert!(!exported.is_empty());
         declare(&mut library, "local macro_rules | `(wrap $x) => `($x)");
         assert!(library.export_native().is_err());
     }

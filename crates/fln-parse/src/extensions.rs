@@ -1107,6 +1107,10 @@ pub struct FileGrammar {
     native_imported: Vec<Arc<SyntaxDecl>>,
     native_scoped: BTreeMap<Name, Vec<Arc<SyntaxDecl>>>,
     native_abbreviations: BTreeSet<Name>,
+    /// Inherited suffix length per native syntax kind. Source registrations
+    /// prepend to it; exports retain only the file's own prefix, so diamond
+    /// imports do not replay a dependency's macros as new registrations.
+    native_rule_counts: BTreeMap<Name, usize>,
     scoped: BTreeMap<Name, Vec<Arc<SyntaxDecl>>>,
     scoped_tokens: BTreeMap<Name, BTreeSet<String>>,
     /// The file's own `scoped` declarations, by namespace, indices into `declared`.
@@ -1209,6 +1213,7 @@ impl FileGrammar {
             native_imported: Vec::new(),
             native_scoped: BTreeMap::new(),
             native_abbreviations: BTreeSet::new(),
+            native_rule_counts: BTreeMap::new(),
             scoped,
             scoped_tokens,
             scoped_declared: BTreeMap::new(),

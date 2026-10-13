@@ -97,14 +97,22 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
     for kind in affected {
         let interpolation = Arc::make_mut(&mut file.interpolation_kinds).remove(&kind);
         let owned = file.declared.iter().any(|decl| decl.decl == kind);
-        if interpolation || (!owned && file.constants.contains(&kind)) {
+        let native = file.native_rule_counts.contains_key(&kind);
+        if interpolation || (!owned && !native && file.constants.contains(&kind)) {
             file.native_export_refusal =
                 Some("source module export of macro_rules for imported syntax");
         }
         let rules = Arc::make_mut(&mut file.rules);
         // Without an executable translation for a registration, a previous rule
         // is not a sound fallback: that registration may match and do anything.
-        if !owned || scoped || refused.contains(&kind) {
+        if (!owned && !native) || scoped || refused.contains(&kind) {
+            if native {
+                // Removing an inherited rule cannot be represented as an empty
+                // export: that would resurrect it in the next module. Unknown
+                // registrations remain fail-closed until MacroM is supported.
+                file.native_export_refusal =
+                    Some("source module export of unsupported imported macro_rules");
+            }
             rules.remove(&kind);
             file.generation += 1;
             continue;
