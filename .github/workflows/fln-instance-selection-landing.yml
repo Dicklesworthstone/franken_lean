@@ -44,6 +44,17 @@ jobs:
           retention-days: 3
       - name: Install repository-pinned Rust
         run: rustup show active-toolchain
+      - name: Retain the pinned compiler for offline implementation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysroot=$(rustc --print sysroot)
+          tar -C "$sysroot" -czf "$RUNNER_TEMP/pinned-rust.tar.gz" bin lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instance-selection-pinned-compiler
+          path: ${{ runner.temp }}/pinned-rust.tar.gz
+          retention-days: 1
       - name: Compile, test, and publish each complete implementation stage
         shell: bash
         run: |
