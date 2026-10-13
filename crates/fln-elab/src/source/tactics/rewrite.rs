@@ -2,6 +2,7 @@
 //! never an unchecked change of the goal's type or a new equality axiom.
 mod locations;
 mod matching;
+mod offset;
 mod simplify;
 use simplify::SimpRule;
 
@@ -136,6 +137,7 @@ impl Context {
         let mut budget = UnificationBudget::new(self.kernel);
         budget.zeta_delta = zeta_delta;
         if !self.proof_types_match_with_budget(&left_nf, &right_nf, budget)?
+            && !self.automatic_nat_offset_reflexivity(&alpha, &left, &right, zeta_delta)?
             && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
         {
             return Ok(None);
