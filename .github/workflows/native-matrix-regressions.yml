@@ -13,6 +13,8 @@ on:
       - 'crates/fln/src/**'
       - 'crates/fln/tests/source_matrix*.rs'
       - 'crates/fln/tests/source_pattern*.rs'
+      - 'crates/fln/tests/source_named_match_hints.rs'
+      - 'crates/fln/tests/fixtures/named_monad_match.lean'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
@@ -33,7 +35,7 @@ jobs:
           persist-credentials: false
       - name: Check native coverage, recursion, row priority and pattern binders
         run: |
-          cargo test --locked -p fln --test source_matrix_coverage --test source_matrix_recursion --test source_pattern_matrices --test source_pattern_binders --no-fail-fast
+          cargo test --locked -p fln --test source_matrix_coverage --test source_matrix_recursion --test source_pattern_matrices --test source_pattern_binders --test source_named_match_hints --no-fail-fast
       - name: Check modified compiler paths
         run: |
           cargo clippy --locked -p fln-elab -p fln --all-targets -- -D warnings
@@ -68,3 +70,32 @@ jobs:
           path: ${{ runner.temp }}/matrix-reproduction
           retention-days: 1
           if-no-files-found: error
+  named-monad-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the shared source with the checksum-verified pinned Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 -o "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          reference="$RUNNER_TEMP/lean-4.32.0-linux/bin/lean"
+          test "$("$reference" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          "$reference" crates/fln/tests/fixtures/named_monad_match.lean
+          python3 -I - "$RUNNER_TEMP" <<'PY'
+          import pathlib, sys
+          source = pathlib.Path('crates/fln/tests/fixtures/named_monad_match.lean').read_text()
+          assert source.count('chooseNamed (some 42) = (42 : Nat)') == 1
+          (pathlib.Path(sys.argv[1]) / 'FalseNamed.lean').write_text(source.replace('chooseNamed (some 42) = (42 : Nat)', 'chooseNamed (some 42) = (43 : Nat)'))
+          PY
+          if "$reference" "$RUNNER_TEMP/FalseNamed.lean" > "$RUNNER_TEMP/false-named.log" 2>&1; then
+            echo 'The negative reference control unexpectedly succeeded' >&2
+            exit 1
+          fi
+          grep -F 'error:' "$RUNNER_TEMP/false-named.log"
