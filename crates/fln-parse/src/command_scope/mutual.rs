@@ -69,97 +69,91 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
         return Ok(None);
     }
     let end = block_end(&view, &tokens, 0)?;
-    if end + 1 == tokens.len() && end > 1 && !word(&view, &tokens[1], "inductive") {
-        // Retain the first member's indentation. Starting at its first token
-        // would make it column zero and absorb later indented declarations.
-        let start = view.to_original(tokens[0].extent.end());
-        let stop = view.to_original(tokens[end].extent.start());
-        let commands = super::partition(&source[start.0..stop.0])
-            .map_err(|error| error.with_original_offset(start))?;
-        if commands.is_empty() || commands.len() > 8 {
-            return Err(refusal(&view, &tokens, end));
-        }
-        let mut members = Vec::new();
-        for (offset, bytes) in commands {
-            // Classify the ordinary parser's canonical modifier slots, not
-            // the first two tokens. A doc comment or visibility modifier may
-            // precede `partial def`; neither may be dropped to expose it.
-            let parsed = parse_definition(bytes)
-                .map_err(|error| error.with_original_offset(BytePos(start.0 + offset.0)))?;
-            if !partial_definition(&parsed.syntax) {
-                return Err(refusal(&view, &tokens, end));
-            }
-            members.push(parsed.syntax);
-        }
-        return Ok(Some(members));
-    }
-    if end + 1 != tokens.len() || end == 1 || !word(&view, &tokens[1], "inductive") {
+    if end + 1 != tokens.len() || end == 1 {
         return Err(refusal(&view, &tokens, end));
     }
-    let mut starts = Vec::new();
-    let mut depth = 0_usize;
-    for (index, token) in tokens.iter().enumerate().take(end).skip(1) {
-        if depth == 0 && word(&view, token, "inductive") {
-            if starts.len() == 8 {
-                return Err(refusal(&view, &tokens, index));
-            }
-            starts.push(index);
-        }
-        if let TokenKind::Symbol(symbol) = &token.kind {
-            match crate::canonical_bracket(symbol.as_str()) {
-                "(" | "{" | ".{" | "[" | "@[" | "⦃" | "⟨" => depth += 1,
-                ")" | "}" | "]" | "⦄" | "⟩" => depth -= 1, // block_end checked balance
-                _ => {}
-            }
-        }
+    // Keep indentation, documentation and visibility in each original member.
+    // The ordinary command partitioner also splits same-line inductive members;
+    // a second keyword-only splitter would drop prefixes from later members.
+    let start = view.to_original(tokens[0].extent.end());
+    let stop = view.to_original(tokens[end].extent.start());
+    let commands = super::partition(&source[start.0..stop.0])
+        .map_err(|error| error.with_original_offset(start))?;
+    if commands.is_empty() || commands.len() > 8 {
+        return Err(refusal(&view, &tokens, end));
     }
-    starts.push(end);
     let mut members = Vec::new();
-    for pair in starts.windows(2) {
-        let start = view.to_original(tokens[pair[0]].extent.start());
-        let end = view.to_original(tokens[pair[1]].extent.start());
-        let parsed = parse_definition(&source[start.0..end.0])
-            .map_err(|error| error.with_original_offset(start))?;
+    let mut group_kind = None;
+    for (offset, bytes) in commands {
+        let parsed = parse_definition(bytes)
+            .map_err(|error| error.with_original_offset(BytePos(start.0 + offset.0)))?;
+        let Some(kind) = member_kind(&parsed.syntax) else {
+            return Err(refusal(&view, &tokens, end));
+        };
+        if group_kind.is_some_and(|previous| previous != kind) {
+            return Err(refusal(&view, &tokens, end));
+        }
+        group_kind = Some(kind);
         members.push(parsed.syntax);
     }
     Ok(Some(members))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberKind {
+    Inductive,
+    PartialDefinition,
+}
+
 /// This is only group classification. Preserve the complete declaration and
 /// every modifier for the elaborator's visibility and effect checks.
-fn partial_definition(syntax: &Syntax) -> bool {
+fn member_kind(syntax: &Syntax) -> Option<MemberKind> {
     let Syntax::Node { kind, args, .. } = syntax else {
-        return false;
+        return None;
     };
     if kind != &Name::from_components(["Lean", "Parser", "Command", "declaration"])
         || args.len() != 2
-        || args[1].kind()
-            != Some(&Name::from_components([
-                "Lean",
-                "Parser",
-                "Command",
-                "definition",
-            ]))
     {
-        return false;
+        return None;
+    }
+    if args[1].kind()
+        == Some(&Name::from_components([
+            "Lean",
+            "Parser",
+            "Command",
+            "inductive",
+        ]))
+    {
+        return Some(MemberKind::Inductive);
+    }
+    if args[1].kind()
+        != Some(&Name::from_components([
+            "Lean",
+            "Parser",
+            "Command",
+            "definition",
+        ]))
+    {
+        return None;
     }
     let Syntax::Node { kind, args, .. } = &args[0] else {
-        return false;
+        return None;
     };
     if kind != &Name::from_components(["Lean", "Parser", "Command", "declModifiers"])
         || args.len() != 7
     {
-        return false;
+        return None;
     }
     let Syntax::Node { kind, args, .. } = &args[6] else {
-        return false;
+        return None;
     };
-    kind == &Name::from_components(["null"])
+    (kind == &Name::from_components(["null"])
         && args.len() == 1
         && args[0].kind()
             == Some(&Name::from_components([
                 "Lean", "Parser", "Command", "partial",
-            ]))
+            ])))
+    .then_some(MemberKind::PartialDefinition)
 }
 
 #[cfg(test)]
