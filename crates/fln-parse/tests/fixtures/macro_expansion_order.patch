@@ -1,0 +1,348 @@
+diff --git a/crates/fln-parse/src/extensions.rs b/crates/fln-parse/src/extensions.rs
+--- a/crates/fln-parse/src/extensions.rs
++++ b/crates/fln-parse/src/extensions.rs
+@@ -73,6 +73,8 @@
+ use std::rc::Rc;
+ use std::sync::{Arc, OnceLock};
+ 
++#[cfg(test)]
++mod expansion_order_tests;
+ mod modules;
+ pub use modules::NativeSyntaxModule;
+ 
+@@ -2332,7 +2334,12 @@
+         if depth > MAX_EXPANSION_DEPTH {
+             return Err("notation expands past the expansion depth");
+         }
+-        // Children first, by an explicit stack: a term's depth is the user's.
++        // The pin expands a macro on the original node before visiting its
++        // arguments (TermElabM.elabTermAux). An argument is syntax: the outer
++        // macro may discard it, duplicate it, or move it into another context.
++        // Expanding children first both evaluates unused recursive macros and
++        // shares one fresh macro scope across copies that need independent ones.
++        // Ordinary syntax is still traversed with an explicit heap stack.
+         enum Task<'a> {
+             Visit(&'a Syntax),
+             Build(fln_syntax::source::SourceInfo, &'a Name, usize),
+@@ -2341,6 +2348,17 @@
+         let mut built: Vec<Syntax> = Vec::new();
+         while let Some(task) = tasks.pop() {
+             match task {
++                Task::Visit(Syntax::Node { kind, args, .. }) if self.rules.contains_key(kind) => {
++                    let rule = &self.rules[kind];
++                    let expansion = self.instantiate(rule, args)?;
++                    built.push(self.expand_at(&expansion, depth + 1)?);
++                }
++                Task::Visit(Syntax::Node { kind, args, .. })
++                    if self.interpolation_kinds.contains(kind) =>
++                {
++                    let expansion = self.expand_interpolation(args)?;
++                    built.push(self.expand_at(&expansion, depth + 1)?);
++                }
+                 Task::Visit(Syntax::Node { info, kind, args }) => {
+                     tasks.push(Task::Build(*info, kind, args.len()));
+                     tasks.extend(args.iter().rev().map(Task::Visit));
+@@ -2348,22 +2366,11 @@
+                 Task::Visit(leaf) => built.push(leaf.clone()),
+                 Task::Build(info, kind, count) => {
+                     let args = built.split_off(built.len() - count);
+-                    let node = match self.rules.get(kind).cloned() {
+-                        Some(rule) => {
+-                            let expansion = self.instantiate(&rule, &args)?;
+-                            self.expand_at(&expansion, depth + 1)?
+-                        }
+-                        None if self.interpolation_kinds.contains(kind) => {
+-                            let expansion = self.expand_interpolation(&args)?;
+-                            self.expand_at(&expansion, depth + 1)?
+-                        }
+-                        None => Syntax::Node {
+-                            info,
+-                            kind: kind.clone(),
+-                            args,
+-                        },
+-                    };
+-                    built.push(node);
++                    built.push(Syntax::Node {
++                        info,
++                        kind: kind.clone(),
++                        args,
++                    });
+                 }
+             }
+         }
+@@ -2456,7 +2463,11 @@
+     /// One use of `rule`: its template with `args` (the node's children) in place of the
+     /// variables, under a fresh macro scope.
+     fn instantiate(&self, rule: &NotationRule, args: &[Syntax]) -> Result<Syntax, &'static str> {
+-        let scope = self.expansions.get() + 1;
++        let scope = self
++            .expansions
++            .get()
++            .checked_add(1)
++            .ok_or("macro scope limit")?;
+         self.expansions.set(scope);
+         let context = &self.context;
+         let bound: BTreeMap<&Name, &Syntax> = rule
+ diff --git a/crates/fln-parse/src/extensions/expansion_order_tests.rs b/crates/fln-parse/src/extensions/expansion_order_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/fln-parse/src/extensions/expansion_order_tests.rs
+@@ -0,0 +1,150 @@
++//! Direct expansion regressions: raw-argument order, hygiene and termination.
++use super::*;
++
++fn n(text: &str) -> Name {
++    Name::from_components([text])
++}
++fn atom(text: &str) -> Syntax {
++    Syntax::atom(SourceInfo::None, text)
++}
++fn ident(name: Name) -> Syntax {
++    Syntax::Ident {
++        info: SourceInfo::None,
++        raw_val: ByteSpan::empty_at(BytePos(0)),
++        val: name,
++        preresolved: Vec::new(),
++    }
++}
++fn rule(variables: Vec<(usize, Name)>, rhs: Syntax) -> Arc<NotationRule> {
++    Arc::new(NotationRule {
++        variables,
++        rhs,
++        prechecked: false,
++    })
++}
++fn expander(rules: Vec<(&str, Arc<NotationRule>)>) -> Expander {
++    Expander {
++        rules: Arc::new(
++            rules
++                .into_iter()
++                .map(|(kind, rule)| (n(kind), rule))
++                .collect(),
++        ),
++        interpolation_kinds: Arc::default(),
++        expansions: Rc::new(Cell::new(0)),
++        context: n("OrderTest"),
++    }
++}
++
++#[test]
++fn discarded_arguments_take_no_macro_scope_and_do_not_recurse() {
++    let recursive = Syntax::node(n("loop"), Vec::new());
++    let expander = expander(vec![
++        ("ignore", rule(Vec::new(), atom("42"))),
++        ("loop", rule(Vec::new(), recursive.clone())),
++    ]);
++    assert_eq!(
++        expander
++            .expand(&Syntax::node(n("ignore"), vec![recursive]))
++            .unwrap(),
++        atom("42")
++    );
++    assert_eq!(expander.expansions.get(), 1, "only the outer macro ran");
++}
++
++#[test]
++fn each_copy_of_an_argument_expands_under_its_own_fresh_scope() {
++    let x = macro_variable(&n("x"));
++    let expander = expander(vec![
++        (
++            "duplicate",
++            rule(
++                vec![(0, x.clone())],
++                Syntax::node(n("pair"), vec![ident(x.clone()), ident(x)]),
++            ),
++        ),
++        ("fresh", rule(Vec::new(), ident(n("introduced")))),
++    ]);
++    let output = expander
++        .expand(&Syntax::node(
++            n("duplicate"),
++            vec![Syntax::node(n("fresh"), Vec::new())],
++        ))
++        .unwrap();
++    let Syntax::Node { args, .. } = &output else {
++        panic!("pair expected")
++    };
++    let [
++        Syntax::Ident { val: left, .. },
++        Syntax::Ident { val: right, .. },
++    ] = args.as_slice()
++    else {
++        panic!("each macro introduces one identifier")
++    };
++    assert_ne!(
++        left, right,
++        "duplicated input must not share an already expanded macro"
++    );
++    assert_eq!(left.erase_macro_scopes(), n("introduced"));
++    assert_eq!(right.erase_macro_scopes(), n("introduced"));
++    assert_eq!(
++        expander.expansions.get(),
++        3,
++        "outer macro then two inner expansions"
++    );
++}
++
++#[test]
++fn a_forwarded_recursive_argument_still_reaches_the_depth_refusal() {
++    let x = macro_variable(&n("x"));
++    let recursive = Syntax::node(n("loop"), Vec::new());
++    let expander = expander(vec![
++        ("forward", rule(vec![(0, x.clone())], ident(x))),
++        ("loop", rule(Vec::new(), recursive.clone())),
++    ]);
++    assert_eq!(
++        expander.expand(&Syntax::node(n("forward"), vec![recursive])),
++        Err("notation expands past the expansion depth")
++    );
++}
++
++#[test]
++fn exhausting_fresh_macro_scopes_is_a_refusal_not_an_overflow() {
++    let expander = expander(vec![("constant", rule(Vec::new(), atom("42")))]);
++    expander.expansions.set(u64::MAX);
++    for _ in 0..2 {
++        assert_eq!(
++            expander.expand(&Syntax::node(n("constant"), Vec::new())),
++            Err("macro scope limit")
++        );
++        assert_eq!(expander.expansions.get(), u64::MAX);
++    }
++}
++
++#[test]
++fn ordinary_syntax_depth_uses_the_heap_not_macro_recursion_depth() {
++    std::thread::Builder::new()
++        .stack_size(256 * 1024)
++        .spawn(|| {
++            let expander = expander(vec![("constant", rule(Vec::new(), atom("42")))]);
++            let mut input = Syntax::node(n("constant"), Vec::new());
++            for _ in 0..4000 {
++                input = Syntax::node(n("wrapper"), vec![input]);
++            }
++            let output = expander.expand(&input).unwrap();
++            let mut cursor = &output;
++            for _ in 0..4000 {
++                let Syntax::Node { kind, args, .. } = cursor else {
++                    panic!("wrapper expected")
++                };
++                assert_eq!(kind, &n("wrapper"));
++                assert_eq!(args.len(), 1);
++                cursor = &args[0];
++            }
++            assert_eq!(cursor, &atom("42"));
++            assert_eq!(expander.expansions.get(), 1);
++        })
++        .unwrap()
++        .join()
++        .unwrap();
++}
+diff --git a/crates/fln/tests/source_macro_expansion_order.rs b/crates/fln/tests/source_macro_expansion_order.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/fln/tests/source_macro_expansion_order.rs
+@@ -0,0 +1,103 @@
++//! Native quoted macros receive syntax, not pre-expanded arguments.
++//! The pinned TermElabM.elabTermAux expands the outer node before elaborating
++//! its replacement. These cells exercise that order through both checkers.
++#![forbid(unsafe_code)]
++use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
++
++fn check(source: &str) -> Result<fln::Outcome<fln::SourceFileCheck>, fln::SourceCheckError> {
++    let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 << 20));
++    Engine::with_source_seed(admission)
++        .unwrap()
++        .into_complete()
++        .unwrap()
++        .check_source_files(
++            &[source.as_bytes()],
++            &KVMap::new(),
++            SourceCheckLimits::new(admission),
++        )
++}
++
++const RECURSIVE: &str = "syntax \"forever\" : term\nmacro_rules | `(forever) => `(forever)\n";
++
++#[test]
++fn a_macro_can_discard_a_recursive_syntax_argument() {
++    let source = format!(
++        "{RECURSIVE}macro \"discard \" x:term:max : term => `(42)\n\
++        theorem ignored : discard forever = 42 := rfl\n"
++    );
++    let checked = check(&source)
++        .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
++        .into_complete()
++        .expect("the council completes");
++    assert_eq!(checked.theorems, 1);
++}
++
++#[test]
++fn forwarding_a_recursive_argument_still_refuses_and_never_admits_a_proof() {
++    let source = format!(
++        "{RECURSIVE}macro \"forward \" x:term:max : term => `($x)\n\
++        theorem required : forward forever = 42 := rfl\n"
++    );
++    assert!(check(&source).is_err());
++}
++
++#[test]
++fn a_macro_can_discard_one_argument_and_expand_the_other() {
++    let source = format!(
++        "{RECURSIVE}macro \"choose(\" x:term \", \" y:term \")\" : term => `($y)\n\
++        macro \"answer\" : term => `(42)\n\
++        theorem selected : choose(forever, answer) = 42 := rfl\n"
++    );
++    assert_eq!(
++        check(&source)
++            .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
++            .into_complete()
++            .unwrap()
++            .theorems,
++        1
++    );
++}
++
++#[test]
++fn a_tactic_macro_can_discard_an_unused_recursive_tactic() {
++    let source = "syntax \"forever_tac\" : tactic\n\
++        macro_rules | `(tactic| forever_tac) => `(tactic| forever_tac)\n\
++        macro \"discard_tac \" t:tactic : tactic => `(tactic| rfl)\n\
++        theorem ignored : (42 : Nat) = 42 := by discard_tac forever_tac\n";
++    assert_eq!(
++        check(source)
++            .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
++            .into_complete()
++            .unwrap()
++            .theorems,
++        1
++    );
++}
++
++#[test]
++fn discarded_macro_arguments_are_not_executed_by_the_vm_path() {
++    let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 << 20));
++    let engine = Engine::with_source_seed(admission)
++        .unwrap()
++        .into_complete()
++        .unwrap();
++    let source = format!(
++        "{RECURSIVE}macro \"discard \" x:term:max : term => `(42)\n#eval discard forever\n"
++    );
++    let completed = engine
++        .execute_source_commands_with_checks(
++            source.as_bytes(),
++            &KVMap::new(),
++            fln::EngineExecutionLimits::new(admission.kernel),
++        )
++        .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
++        .into_complete()
++        .unwrap();
++    let fln::VmExit::Returned(returned) = &completed.batch.executions.last().unwrap().exit else {
++        panic!("the native VM returns the expansion's value");
++    };
++    assert_eq!(
++        fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
++        Some("42")
++    );
++}
