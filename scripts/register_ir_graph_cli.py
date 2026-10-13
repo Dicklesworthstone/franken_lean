@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Install the reviewed IR graph command increment in an isolated test checkout.
 
 The live command is changed only after the codec exports exist. Conflicting

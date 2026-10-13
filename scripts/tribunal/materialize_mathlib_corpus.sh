@@ -95,7 +95,7 @@ read -r modules oleans bytes <<< "$facts"
 
 lean_sha="$(sha256sum "$TOOLCHAIN/bin/lean" | cut -d' ' -f1)"
 script_sha="$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
-packages="$(cd "$STAGING" && python3 -c 'import json; m = json.load(open("lake-manifest.json")); print(json.dumps({p["name"]: p.get("rev") for p in m.get("packages", [])}, sort_keys=True))')" \
+packages="$(cd "$STAGING" && python3 -I -S -c 'import json; m = json.load(open("lake-manifest.json")); print(json.dumps({p["name"]: p.get("rev") for p in m.get("packages", [])}, sort_keys=True))')" \
   || fail "cannot read lake-manifest.json"
 cache_archives="$(find "${MATHLIB_CACHE_DIR:-$HOME/.cache/mathlib}" -maxdepth 1 -name '*.ltar' 2>/dev/null | wc -l)"
 receipt="$(printf '{"schema":"fln-mathlib-corpus/1","corpus_repository":"%s","corpus_tag":"%s","corpus_commit":"%s","reference_tag":"%s","lean_sha256":"%s","root":"%s","library_subpath":"%s","source_modules":%s,"oleans":%s,"olean_bytes":%s,"packages":%s,"cache_archives_on_host":%s,"hydration_seconds":%s,"host":"%s","materialized_at":"%s","script_sha256":"%s"}' \

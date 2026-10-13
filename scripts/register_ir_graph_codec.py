@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """One-time, guarded registration of the IR graph codec.
 
 This runs only in an isolated checkout. It never rewrites historical vectors or

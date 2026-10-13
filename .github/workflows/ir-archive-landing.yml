@@ -1,15 +1,12 @@
 name: IR graph archive activation
+# Manual only. The activation this workflow performs landed at 30db4f97
+# (2026-10-13): codec registered, commands installed, both scripts now report
+# "already-registered" and "already-installed". Its former push trigger covered the
+# codec sources themselves, so every later edit to ir_graph.rs or ir_archive.rs, or to
+# either registration script, would have re-run a finished activation with
+# `contents: write` and a publish step.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/fln-hash/src/ir_graph.rs'
-      - 'crates/fln-olean/src/ir_archive.rs'
-      - 'scripts/register_ir_graph_codec.py'
-      - 'scripts/register_ir_graph_cli.py'
-      - '.github/patches/ir-graph-cli/**'
-      - '.github/workflows/ir-archive-landing.yml'
 permissions:
   contents: write
 concurrency:
