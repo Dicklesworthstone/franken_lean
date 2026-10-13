@@ -1,0 +1,62 @@
+name: Native guard specification integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/guard-spec-landing.yml
+      - .github/patches/apply_guard_spec.py
+      - crates/fln-parse/src/command_scope/guard_spec.rs
+      - crates/fln-cli/src/guard_spec_tests.rs
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-guard-spec-landing
+  cancel-in-progress: false
+
+jobs:
+  integrate-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install the repository's pinned toolchain
+        run: rustup show active-toolchain
+      - name: Apply native source integration
+        run: python3 -I .github/patches/apply_guard_spec.py
+      - name: Format only the changed Rust files
+        run: |
+          rustfmt --edition 2024 --config skip_children=true \
+            crates/fln-parse/src/command_scope.rs \
+            crates/fln-parse/src/command_scope/guard_spec.rs \
+            crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
+            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs
+          git diff --check
+      - name: Test native specification policies
+        run: cargo test -p fln-parse --lib guard_spec::tests
+      - name: Test engine guard and refusal boundaries
+        run: cargo test -p fln --test source_guard_msgs
+      - name: Test real command rendering with specifications
+        run: cargo test -p fln-cli --lib guard_spec_tests
+      - name: Commit tested integration directly to main
+        run: |
+          set -euo pipefail
+          git add crates/fln-parse/src/command_scope.rs \
+            crates/fln-parse/src/command_scope/guard_spec.rs \
+            crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
+            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs
+          if git diff --cached --quiet; then
+            echo 'The tested integration is already on main.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(lean): integrate tested native guard comparison specifications'
+          git push origin HEAD:main
