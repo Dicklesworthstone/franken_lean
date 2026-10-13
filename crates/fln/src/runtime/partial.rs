@@ -41,6 +41,26 @@ impl Preparation<'_> {
     ) -> Result<Option<DefinitionVal>, IngressError> {
         self.tick()?;
         let environment = self.environment;
+        if let Some(ConstantInfo::Defn(definition)) = environment.find(requested)
+            && definition.safety == DefinitionSafety::Unsafe
+        {
+            // An explicitly unsafe definition is already its own executable
+            // body, not a logical header that authorizes an `_unsafe_rec`
+            // sibling. This lookup runs only after ordinary council admission;
+            // safe type reduction and companion-link validation stay unchanged.
+            // Do not turn a malformed companion relationship into an unsafe
+            // fallback. Existing linked names retain the same validation door.
+            if environment.contains(&Name::str(requested.clone(), "_unsafe_rec"))
+                || (matches!(requested.leaf_view(), LeafView::Str("_unsafe_rec"))
+                    && environment.contains(&requested.parent()))
+            {
+                return Ok(None);
+            }
+            return Ok((!self
+                .runtime_initializers
+                .is_some_and(|names| names.contains(requested)))
+            .then(|| definition.clone()));
+        }
         let (logical, fallback, opaque) = match environment.find(requested) {
             Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
                 (requested.clone(), Some(definition), None)
@@ -304,3 +324,6 @@ mod tests;
 
 #[cfg(test)]
 mod total_tests;
+
+#[cfg(test)]
+mod unsafe_tests;
