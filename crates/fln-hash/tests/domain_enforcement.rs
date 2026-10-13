@@ -441,11 +441,12 @@ fn blanking_a_string_preserves_the_length_of_the_line() {
 // `cartridge`, `certificate`, `product`, and `shadow` are reviewed candidate/codec surfaces.
 // They hash only through the public domain registry and do not re-export or name the
 // crate-private BLAKE3 core.
-const PUBLIC_MODULES: [&str; 7] = [
+const PUBLIC_MODULES: [&str; 8] = [
     "canon",
     "cartridge",
     "certificate",
     "domain",
+    "ir_graph",
     "product",
     "root",
     "shadow",

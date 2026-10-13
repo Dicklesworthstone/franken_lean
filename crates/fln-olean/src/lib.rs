@@ -42,6 +42,7 @@ pub mod format;
 pub mod ilean;
 pub mod initializers;
 pub mod ir;
+pub mod ir_archive;
 pub mod ir_files;
 mod ir_format;
 pub mod ir_types;

@@ -92,6 +92,12 @@ pub const SCHEMA_FLBC_PRODUCT_SIDECAR: SchemaId = SchemaId {
     version: 1,
 };
 
+/// Canonical data-only IR call graph, including classification provenance.
+pub const SCHEMA_IR_CALL_GRAPH: SchemaId = SchemaId {
+    name: "fln.canon.ir-call-graph",
+    version: 1,
+};
+
 /// The crate that defines a durable format's codec.
 ///
 /// Formats live in the crate that encodes them — the registry does not centralize the
@@ -170,7 +176,12 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 20] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 21] = [
+    SchemaRow {
+        id: SCHEMA_IR_CALL_GRAPH,
+        owner: SchemaOwner::Hash,
+        covers: "a static IR call graph with exact names and census annotations; no execution authority",
+    },
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -2282,6 +2293,7 @@ mod tests {
             (SCHEMA_WARM_DEFEQ_CACHE, "fln.canon.warm-defeq-cache"),
             (SCHEMA_CARTRIDGE_MANIFEST, "fln.canon.cartridge-manifest"),
             (SCHEMA_CARTRIDGE_ARCHIVE, "fln.canon.cartridge-archive"),
+            (SCHEMA_IR_CALL_GRAPH, "fln.canon.ir-call-graph"),
             (
                 SCHEMA_FLBC_PRODUCT_SIDECAR,
                 "fln.canon.flbc-product-sidecar",
@@ -2303,7 +2315,7 @@ mod tests {
             .filter(|row| row.owner == SchemaOwner::Hash)
             .count();
         assert_eq!(
-            hash_rows, 14,
+            hash_rows, 15,
             "fln-hash owns a schema the constant join above does not cover"
         );
     }

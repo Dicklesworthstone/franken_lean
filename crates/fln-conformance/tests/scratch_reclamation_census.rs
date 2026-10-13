@@ -70,6 +70,9 @@ const SELF_CLEANING: &[(&str, &str)] = &[
         "crates/fln-olean/tests/chain_audit_cli.rs",
         "remove_dir_all",
     ),
+    // The IR graph command tests' per-test directories, removed in `Drop` (bead
+    // fln-ir-decoder-call-graph-sjzl; the activation of 4065cdae and e8459152).
+    ("crates/fln-olean/tests/ir_archive_cli.rs", "remove_dir_all"),
     (
         "tools/structure-guard/tests/agent_anchor_cli.rs",
         "remove_dir_all",
