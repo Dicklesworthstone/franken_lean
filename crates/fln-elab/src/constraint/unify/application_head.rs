@@ -108,27 +108,33 @@ impl Engine<'_> {
     /// A sufficient conversion test, never an argument-unification problem.
     /// In particular, no argument hole may be assigned to choose a head.
     /// WHNF alone misses `h (id x) = h x` when `h` is neutral: descend through
-    /// congruent applications/projections under the caller's reduction policy.
+    /// congruent applications, projections and binders under that policy.
     fn application_suffix_convertible(
         &mut self,
         left: &Expr,
         right: &Expr,
         locals: &LocalContext,
     ) -> Result<bool, UnificationError> {
-        let mut pending = vec![(left.clone(), right.clone())];
+        for _ in locals.decls() {
+            self.meter.node()?;
+        }
+        let mut contexts = vec![locals.clone()];
+        let mut pending = vec![(left.clone(), right.clone(), 0_usize)];
         // Own the keyed operands. Reduction allocates temporary expressions;
-        // an address-only set could confuse a reused allocation with a proved
+        // an address-only set could confuse a reused allocation with a visited
         // pair. The retained roots also make shared DAGs safe to memoize.
         let mut seen = HashMap::new();
-        while let Some((left, right)) = pending.pop() {
+        while let Some((left, right, scope)) = pending.pop() {
             self.meter.node()?;
             let key = (
                 std::ptr::from_ref(left.node()),
                 std::ptr::from_ref(right.node()),
+                scope,
             );
             if seen.insert(key, (left.clone(), right.clone())).is_some() {
                 continue;
             }
+            let locals = &contexts[scope];
             let left = self.whnf(&left, locals)?;
             let right = self.whnf(&right, locals)?;
             if std::ptr::eq(left.node(), right.node()) {
@@ -140,7 +146,7 @@ impl Engine<'_> {
                 (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) if a == b => {}
                 (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) if a == b => {}
                 (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
-                    if !same_levels(a, b, &mut self.meter)? {
+                    if !self.application_suffix_levels_equal(a, b)? {
                         return Ok(false);
                     }
                 }
@@ -155,14 +161,14 @@ impl Engine<'_> {
                     },
                 ) if a == b && ua.len() == ub.len() => {
                     for (a, b) in ua.iter().zip(ub) {
-                        if !same_levels(a, b, &mut self.meter)? {
+                        if !self.application_suffix_levels_equal(a, b)? {
                             return Ok(false);
                         }
                     }
                 }
                 (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
-                    pending.push((b.clone(), d.clone()));
-                    pending.push((a.clone(), c.clone()));
+                    pending.push((b.clone(), d.clone(), scope));
+                    pending.push((a.clone(), c.clone(), scope));
                 }
                 (
                     ExprNode::Proj {
@@ -175,12 +181,51 @@ impl Engine<'_> {
                         idx: j,
                         expr: y,
                     },
-                ) if a == b && i == j => pending.push((x.clone(), y.clone())),
-                // Preserve reflexivity below a reduced binder. Conversion
-                // under binders additionally needs a shared, opened context.
-                (ExprNode::Lam { .. }, ExprNode::Lam { .. })
-                | (ExprNode::ForallE { .. }, ExprNode::ForallE { .. })
-                | (ExprNode::LetE { .. }, ExprNode::LetE { .. }) => {
+                ) if a == b && i == j => pending.push((x.clone(), y.clone(), scope)),
+                (
+                    ExprNode::Lam {
+                        binder_type: a,
+                        body: b,
+                        binder_info,
+                        ..
+                    },
+                    ExprNode::Lam {
+                        binder_type: c,
+                        body: d,
+                        ..
+                    },
+                )
+                | (
+                    ExprNode::ForallE {
+                        binder_type: a,
+                        body: b,
+                        binder_info,
+                        ..
+                    },
+                    ExprNode::ForallE {
+                        binder_type: c,
+                        body: d,
+                        ..
+                    },
+                ) => {
+                    // Open BOTH bodies with one fresh local, not by comparing
+                    // raw de Bruijn indices at different depths. Compare the
+                    // domains too, even when neither body uses its parameter.
+                    let id = self.fresh()?;
+                    let argument = Expr::fvar(id.clone());
+                    let left_body = self.substitute(b, &argument)?;
+                    let right_body = self.substitute(d, &argument)?;
+                    for _ in locals.decls() {
+                        self.meter.node()?;
+                    }
+                    let mut inner = locals.clone();
+                    inner.add_param(id.clone(), id.0, a.clone(), *binder_info);
+                    let body_scope = contexts.len();
+                    contexts.push(inner);
+                    pending.push((left_body, right_body, body_scope));
+                    pending.push((a.clone(), c.clone(), scope));
+                }
+                (ExprNode::LetE { .. }, ExprNode::LetE { .. }) => {
                     if !same_terms(&left, &right, &mut self.meter)? {
                         return Ok(false);
                     }
@@ -189,5 +234,20 @@ impl Engine<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Normalize identities only. In particular, `max ?u 0 = ?u` may succeed
+    /// without choosing ?u, whereas two distinct universe holes stay distinct.
+    fn application_suffix_levels_equal(
+        &mut self,
+        left: &Level,
+        right: &Level,
+    ) -> Result<bool, UnificationError> {
+        if same_levels(left, right, &mut self.meter)? {
+            return Ok(true);
+        }
+        let left = simplify_level(left, &mut self.meter)?;
+        let right = simplify_level(right, &mut self.meter)?;
+        same_levels(&left, &right, &mut self.meter)
     }
 }
