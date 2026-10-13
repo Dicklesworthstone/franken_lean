@@ -69,7 +69,7 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
         return Ok(None);
     }
     let end = block_end(&view, &tokens, 0)?;
-    if end + 1 == tokens.len() && end > 1 && word(&view, &tokens[1], "partial") {
+    if end + 1 == tokens.len() && end > 1 && !word(&view, &tokens[1], "inductive") {
         // Retain the first member's indentation. Starting at its first token
         // would make it column zero and absorb later indented declarations.
         let start = view.to_original(tokens[0].extent.end());
@@ -81,18 +81,14 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
         }
         let mut members = Vec::new();
         for (offset, bytes) in commands {
-            let member_view = SourceView::of(
-                &SourceText::from_utf8(bytes).map_err(NatDefinitionParseError::Source)?,
-            );
-            let member_tokens = super::tokens(&member_view)?;
-            if member_tokens.len() < 2
-                || !word(&member_view, &member_tokens[0], "partial")
-                || !word(&member_view, &member_tokens[1], "def")
-            {
-                return Err(refusal(&view, &tokens, end));
-            }
+            // Classify the ordinary parser's canonical modifier slots, not
+            // the first two tokens. A doc comment or visibility modifier may
+            // precede `partial def`; neither may be dropped to expose it.
             let parsed = parse_definition(bytes)
                 .map_err(|error| error.with_original_offset(BytePos(start.0 + offset.0)))?;
+            if !partial_definition(&parsed.syntax) {
+                return Err(refusal(&view, &tokens, end));
+            }
             members.push(parsed.syntax);
         }
         return Ok(Some(members));
@@ -127,6 +123,43 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
         members.push(parsed.syntax);
     }
     Ok(Some(members))
+}
+
+/// This is only group classification. Preserve the complete declaration and
+/// every modifier for the elaborator's visibility and effect checks.
+fn partial_definition(syntax: &Syntax) -> bool {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return false;
+    };
+    if kind != &Name::from_components(["Lean", "Parser", "Command", "declaration"])
+        || args.len() != 2
+        || args[1].kind()
+            != Some(&Name::from_components([
+                "Lean",
+                "Parser",
+                "Command",
+                "definition",
+            ]))
+    {
+        return false;
+    }
+    let Syntax::Node { kind, args, .. } = &args[0] else {
+        return false;
+    };
+    if kind != &Name::from_components(["Lean", "Parser", "Command", "declModifiers"])
+        || args.len() != 7
+    {
+        return false;
+    }
+    let Syntax::Node { kind, args, .. } = &args[6] else {
+        return false;
+    };
+    kind == &Name::from_components(["null"])
+        && args.len() == 1
+        && args[0].kind()
+            == Some(&Name::from_components([
+                "Lean", "Parser", "Command", "partial",
+            ]))
 }
 
 #[cfg(test)]
