@@ -1,0 +1,48 @@
+name: checker instantiation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/fln-checker/src/instantiate.rs
+      - crates/fln-checker/src/instantiate/**
+      - scripts/check_checker_instantiation.sh
+      - .github/workflows/checker-instantiation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+          channel = tomllib.loads(pathlib.Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          if not re.fullmatch(r'nightly-\d{4}-\d{2}-\d{2}', channel):
+              raise SystemExit('expected an exact nightly pin')
+          print(channel)
+          PY
+          )"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - name: Compile and exercise the independent checker
+        shell: bash
+        run: bash scripts/check_checker_instantiation.sh "$RUNNER_TEMP/checker-instantiation"
+      - name: Retain exact tested source and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checker-instantiation-${{ github.sha }}
+          path: ${{ runner.temp }}/checker-instantiation
+          if-no-files-found: error

@@ -6,8 +6,11 @@
 //! decoding owns validation of the input representation; this transformation is
 //! not an admission shortcut and does not confer authority on any declaration.
 
+mod replacements;
+
 use std::collections::BTreeSet;
 
+use replacements::ReplacementCopies;
 use super::*;
 
 fn level_children(node: &LevelNode) -> [Option<LevelId>; 2] {
@@ -52,6 +55,16 @@ impl Instantiator<'_, '_> {
         root: LevelId,
         mapping: &mut BTreeMap<usize, MappedLevel>,
     ) -> Result<LevelId, Halt> {
+        self.map_subject_root_cached(source, root, mapping, &mut ReplacementCopies::default())
+    }
+
+    fn map_subject_root_cached(
+        &mut self,
+        source: &[LevelNode],
+        root: LevelId,
+        mapping: &mut BTreeMap<usize, MappedLevel>,
+        replacements: &mut ReplacementCopies,
+    ) -> Result<LevelId, Halt> {
         let input = InstantiationInput::Subject;
         let missing = |index| Halt::Fault(InstantiationFault::MissingLevel { input, index });
         if let Some(mapped) = mapping.get(&root.index()) {
@@ -82,6 +95,9 @@ impl Instantiator<'_, '_> {
         // Backward edges make ascending source IDs a deterministic topological
         // order. Only this root's missing nodes are sorted, not the whole arena.
         for index in needed {
+            // Smart constructors can reuse every ancestor without allocating.
+            // Those iterations still need a cancellation checkpoint.
+            self.control.poll(index)?;
             let node = source.get(index).ok_or_else(|| missing(index))?;
             if let LevelNode::Parameter(name) = node
                 && let Some(value_index) = self.parameters.get(name).copied()
@@ -89,7 +105,7 @@ impl Instantiator<'_, '_> {
                 mapping.insert(
                     index,
                     MappedLevel {
-                        root: self.copy_replacement(value_index)?,
+                        root: replacements.root(self, value_index)?,
                         // Substitution is simultaneous. The replacement is
                         // copied literally and never enters subject traversal.
                         changed: true,
@@ -171,6 +187,9 @@ impl Instantiator<'_, '_> {
 
         let mut mapping = BTreeMap::<usize, ExprId>::new();
         let mut level_map = BTreeMap::new();
+        // One cache spans every universe-bearing expression in this subject,
+        // but never outlives the instantiation or crosses source arenas.
+        let mut replacements = ReplacementCopies::default();
         let mut nodes = Vec::new();
         for index in needed {
             let source = term.nodes().get(index).ok_or_else(|| missing(index))?;
@@ -211,11 +230,15 @@ impl Instantiator<'_, '_> {
                     *expression = mapped(expression)?;
                 }
                 ExprNode::Sort { level } => {
-                    *level = self.map_subject_root(term.levels(), *level, &mut level_map)?;
+                    *level = self.map_subject_root_cached(
+                        term.levels(), *level, &mut level_map, &mut replacements,
+                    )?;
                 }
                 ExprNode::Constant { levels, .. } => {
                     for level in levels {
-                        *level = self.map_subject_root(term.levels(), *level, &mut level_map)?;
+                        *level = self.map_subject_root_cached(
+                            term.levels(), *level, &mut level_map, &mut replacements,
+                        )?;
                     }
                 }
                 ExprNode::Bound { .. }
