@@ -175,6 +175,20 @@ impl Engine<'_> {
                 pending.push((eta.domains.0, eta.domains.1, scope));
                 continue;
             }
+            if let Some(eta) = self.record_eta_equations(&left, &right, locals)? {
+                // Only decompose here: the ordinary record_eta entry also
+                // solves fields and inverts singleton projections. Doing that
+                // in this suffix check could choose a head by solving its
+                // arguments. Keep the full type equation, even for empty
+                // records, followed by every field in declaration order.
+                // All these equations retain this exact context. Reuse its
+                // scope key so shared fields stay shared in the memo table.
+                for (a, b, _) in eta.children.into_iter().rev() {
+                    self.meter.node()?;
+                    pending.push((a, b, scope));
+                }
+                continue;
+            }
             match (left.node(), right.node()) {
                 (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
                 (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) if a == b => {}

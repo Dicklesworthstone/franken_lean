@@ -27,6 +27,15 @@ struct RecordApplication {
     fields: Vec<Expr>,
 }
 
+/// Read-only eta decomposition. Keeping candidate construction separate from
+/// solving lets head recovery compare these equations without assigning fields
+/// or inverting singleton projections in its argument suffix.
+pub(super) struct RecordEtaEquations {
+    pub(super) constructor: Expr,
+    pub(super) neutral: Expr,
+    pub(super) children: Vec<Equation>,
+}
+
 /// Neutral type synthesis uses heap continuations even for nested projections
 /// and applications of projected, function-valued fields.
 enum NeutralTypeFrame {
@@ -51,6 +60,33 @@ impl Engine<'_> {
         {
             return Ok(true);
         }
+        let Some(eta) = self.record_eta_equations(left, right, locals)? else {
+            return Ok(false);
+        };
+        if self.preserve_pending_record_eta(
+            &eta.constructor,
+            &eta.neutral,
+            locals,
+            &eta.children,
+        )? {
+            return Ok(true);
+        }
+        // Full type first, then fields in declaration order. This order matters
+        // when a later field's type depends on a parameter or an earlier field.
+        for child in eta.children.into_iter().rev() {
+            pending.push_front(child);
+        }
+        Ok(true)
+    }
+
+    /// Select only the existing safe, saturated Type-valued record fragment.
+    /// This method meters work but never solves an equation or changes a store.
+    pub(super) fn record_eta_equations(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<RecordEtaEquations>, UnificationError> {
         let (left_head, left_args) = self.eta_spine(left)?;
         let (right_head, right_args) = self.eta_spine(right)?;
         // Constructor/constructor congruence is already handled by the caller.
@@ -60,7 +96,7 @@ impl Engine<'_> {
         let right_constructor = matches!(right_head.node(), ExprNode::Const { name, .. }
             if matches!(self.work.env.find(name), Some(ConstantInfo::Ctor(_))));
         if left_constructor == right_constructor {
-            return Ok(false);
+            return Ok(None);
         }
         let (head, arguments, neutral, reversed) = if left_constructor {
             (left_head, left_args, right, false)
@@ -68,21 +104,21 @@ impl Engine<'_> {
             (right_head, right_args, left, true)
         };
         let Some(record) = self.eta_constructor(&head, arguments, locals)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(neutral_type) = self.eta_neutral_type(neutral, locals)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let (type_head, parameters) = self.eta_spine(&neutral_type)?;
         let ExprNode::Const { name, levels } = type_head.node() else {
             // A later equation can reveal this type. Do not guess it now.
-            return Ok(false);
+            return Ok(None);
         };
         if name != &record.shape.name
             || levels.len() != record.shape.level_params.len()
             || parameters.len() != record.shape.parameters
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Stage every child before changing the queue. In particular, a stop
@@ -107,15 +143,11 @@ impl Engine<'_> {
             children.push((pair.0, pair.1, locals.clone()));
         }
         let constructor = if reversed { right } else { left };
-        if self.preserve_pending_record_eta(constructor, neutral, locals, &children)? {
-            return Ok(true);
-        }
-        // Full type first, then fields in declaration order. This order matters
-        // when a later field's type depends on a parameter or an earlier field.
-        for child in children.into_iter().rev() {
-            pending.push_front(child);
-        }
-        Ok(true)
+        Ok(Some(RecordEtaEquations {
+            constructor: constructor.clone(),
+            neutral: neutral.clone(),
+            children,
+        }))
     }
 
     /// Arguments are returned in application order. Traversal is iterative;

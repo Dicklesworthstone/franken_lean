@@ -70,3 +70,57 @@ fn source_refusal_does_not_publish_a_bad_family_or_break_recovery() {
     );
     checked(&base, ETA, "recoveredFamily");
 }
+
+const RECORD_SUFFIX: &str = r#"
+structure PairN where
+  left : Nat
+  right : Nat
+def consumeRecord {F : PairN → Type} (p : PairN)
+    (x : F (PairN.mk p.left p.right)) : Nat := 7
+def inferRecordFamily (F : PairN → Type) (p : PairN) (x : F p) : Nat :=
+  consumeRecord p x
+"#;
+
+#[test]
+fn source_infers_a_record_family_from_an_argument_without_a_result_type_hint() {
+    checked(&engine(), RECORD_SUFFIX, "inferRecordFamily");
+}
+
+#[test]
+fn source_infers_a_dependent_record_family_from_a_reconstruction() {
+    checked(
+        &engine(),
+        r#"
+structure Dependent where
+  type : Type
+  value : type
+def consumeDependent {F : Dependent → Type} (p : Dependent)
+    (x : F (Dependent.mk p.type p.value)) : Nat := 7
+def inferDependentFamily (F : Dependent → Type) (p : Dependent) (x : F p) : Nat :=
+  consumeDependent p x
+"#,
+        "inferDependentFamily",
+    );
+}
+
+#[test]
+fn source_record_suffix_refusal_is_atomic_and_does_not_guess_a_field() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let invalid = format!(
+        r#"{RECORD_SUFFIX}
+def badRecord (F : PairN → Type) (p q : PairN) (x : F q) : Nat :=
+  consumeRecord (F := F) p x"#
+    );
+    assert!(
+        base.check_source_files(&[invalid.as_bytes()], &KVMap::new(), limits())
+            .is_err()
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["PairN"]))
+    );
+    checked(&base, RECORD_SUFFIX, "inferRecordFamily");
+}
