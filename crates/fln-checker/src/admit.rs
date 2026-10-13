@@ -96,6 +96,8 @@
 //! entry points and never joins their recursion.
 
 mod uniform;
+mod universes;
+use universes::ReconstructionMode;
 
 // Motives and all constructor minors are shared by each mutual recursor.
 // Keep their quadratic reconstruction independently bounded. The pinned
@@ -1897,7 +1899,7 @@ fn structural_expression_equal(
     left: &WireExpr,
     right: &WireExpr,
     control: &mut StructuralComparisonControl,
-    compare_binder_styles: bool,
+    mode: ReconstructionMode,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Result<bool, QuickDefEqStop>, QuickDefEqFault> {
     if let Err(stop) = control.poll(cancelled) {
@@ -1964,13 +1966,14 @@ fn structural_expression_equal(
             (ExprNode::Free { name: left }, ExprNode::Free { name: right }) if left == right => {}
             (ExprNode::Meta { name: left }, ExprNode::Meta { name: right }) if left == right => {}
             (ExprNode::Sort { level: left_level }, ExprNode::Sort { level: right_level }) => {
-                match structural_level_equal(
+                match universes::reconstruction_level_equal(
                     left,
                     *left_level,
                     right,
                     *right_level,
                     control,
                     &mut seen_levels,
+                    mode,
                     cancelled,
                 )? {
                     Ok(true) => {}
@@ -1989,13 +1992,14 @@ fn structural_expression_equal(
                 },
             ) if left_name == right_name && left_levels.len() == right_levels.len() => {
                 for (left_level, right_level) in left_levels.iter().zip(right_levels) {
-                    match structural_level_equal(
+                    match universes::reconstruction_level_equal(
                         left,
                         *left_level,
                         right,
                         *right_level,
                         control,
                         &mut seen_levels,
+                        mode,
                         cancelled,
                     )? {
                         Ok(true) => {}
@@ -2030,7 +2034,7 @@ fn structural_expression_equal(
                     style: right_style,
                     ..
                 },
-            ) if !compare_binder_styles || left_style == right_style => {
+            ) if mode == ReconstructionMode::Quotient || left_style == right_style => {
                 push(*left_body, *right_body)?;
                 push(*left_type, *right_type)?;
             }
@@ -2047,7 +2051,7 @@ fn structural_expression_equal(
                     style: right_style,
                     ..
                 },
-            ) if !compare_binder_styles || left_style == right_style => {
+            ) if mode == ReconstructionMode::Quotient || left_style == right_style => {
                 push(*left_body, *right_body)?;
                 push(*left_type, *right_type)?;
             }
@@ -3716,7 +3720,13 @@ fn compare_inductive_expression(
     comparison: &mut StructuralComparisonControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, InductiveVerdict> {
-    match structural_expression_equal(actual, expected, comparison, true, cancelled) {
+    match structural_expression_equal(
+        actual,
+        expected,
+        comparison,
+        ReconstructionMode::Inductive,
+        cancelled,
+    ) {
         Ok(Ok(equal)) => Ok(equal),
         Ok(Err(stop)) => Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
             stop,
@@ -9796,7 +9806,13 @@ fn compare_or_verdict(
     // and binder annotations are presentation metadata at this authority
     // boundary. Keeping this policy separate from inductive recursor
     // regeneration prevents the two structural contracts from being conflated.
-    match structural_expression_equal(actual, expected, control, false, cancelled) {
+    match structural_expression_equal(
+        actual,
+        expected,
+        control,
+        ReconstructionMode::Quotient,
+        cancelled,
+    ) {
         Ok(Ok(equal)) => Ok(equal),
         Ok(Err(stop)) => Err(QuotientVerdict::Inconclusive(stop)),
         Err(fault) => Err(QuotientVerdict::InternalFault(QuotientFault::Structural(
