@@ -25,6 +25,9 @@ struct NormalizedDefinition {
 pub(super) struct Store {
     // Cached only after the complete immutable decision-family contract checks.
     pub(super) decision_family_checked: bool,
+    // A direct equality function and its instance wrapper have different
+    // dependency contracts. Cache each carrier/form only after its full check.
+    pub(super) equality_decisions_checked: [[bool; 2]; 2],
     list_recursion_checked: bool,
     nat_recursion_checked: bool,
     definitions: BTreeMap<Name, DefinitionVal>,
