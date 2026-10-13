@@ -18,7 +18,7 @@ use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonHasher, CanonWriter, Canonical, ExprMerkle};
 use fln_hash::domain::{Digest, Domain, hash};
-use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
+use fln_hash::root::LogicalRoot;
 
 use crate::constants::{ConstantInfo, DefinitionSafety, QuotKind, ReducibilityHints};
 use crate::extensions::{
@@ -300,7 +300,10 @@ impl PreparedDeclarationAdmission {
         // `CollisionBudget::max_expanded_weight` is now a `u64` limit and the numbers fit by
         // construction (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`). Deleting it
         // is how that bead proves it closed the gap instead of papering it.
-        let digests = env.digests.insert(name.clone(), self.provisional_digest);
+        let digests = env.digests.insert(
+            name.clone(),
+            NamedDigest::new(&name, self.provisional_digest),
+        );
         env.constants
             .try_insert_with_budget(
                 name,
@@ -951,6 +954,24 @@ impl EnvironmentEntry {
     }
 }
 
+/// A constant's content digest with its name's canonical bytes, both computed once when the
+/// constant is inserted. [`Environment::logical_root`] sorts and streams these; building a
+/// map of freshly encoded names on every call was most of its cost.
+#[derive(Debug, Clone, PartialEq)]
+struct NamedDigest {
+    digest: Digest,
+    canonical: Arc<[u8]>,
+}
+
+impl NamedDigest {
+    fn new(name: &Name, digest: Digest) -> Self {
+        NamedDigest {
+            digest,
+            canonical: name.to_canonical_bytes().into(),
+        }
+    }
+}
+
 /// The environment. `Clone` IS `snapshot`: O(1), fully isolated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
@@ -958,7 +979,7 @@ pub struct Environment {
     /// `decl_content_digest` of every constant, computed once when it is inserted.
     /// `logical_root` combines these instead of re-serializing every constant on
     /// every call, which made admitting n declarations O(n^2) in hashing.
-    digests: PMap<Name, Digest>,
+    digests: PMap<Name, NamedDigest>,
     extensions: PMap<Name, Arc<ExtensionState>>,
 }
 
@@ -989,7 +1010,7 @@ impl Environment {
     pub fn entry(&self, name: &Name) -> Option<EnvironmentEntry> {
         Some(EnvironmentEntry {
             info: Arc::clone(self.constants.get(name)?),
-            digest: *self.digests.get(name)?,
+            digest: self.digests.get(name)?.digest,
         })
     }
 
@@ -1004,7 +1025,9 @@ impl Environment {
             return Err(EnvError::DuplicateDeclaration { name });
         }
         Ok(Environment {
-            digests: self.digests.insert(name.clone(), entry.digest),
+            digests: self
+                .digests
+                .insert(name.clone(), NamedDigest::new(&name, entry.digest)),
             constants: self.constants.insert(name, entry.info),
             extensions: self.extensions.clone(),
         })
@@ -1128,7 +1151,9 @@ impl Environment {
         }
         let digest = Environment::decl_content_digest(&info);
         Ok(Environment {
-            digests: self.digests.insert(name.clone(), digest),
+            digests: self
+                .digests
+                .insert(name.clone(), NamedDigest::new(&name, digest)),
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
         })
@@ -1183,9 +1208,10 @@ impl Environment {
         // into local ones. There is no arm here that could launder a fault into "this
         // declaration is inadmissible" or report it as a budget stop, because there is no
         // longer anywhere local for either to go.
-        let digests = self
-            .digests
-            .insert(name.clone(), Environment::decl_content_digest(&info));
+        let digests = self.digests.insert(
+            name.clone(),
+            NamedDigest::new(&name, Environment::decl_content_digest(&info)),
+        );
         self.constants
             .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
             .map_complete(|constants| {
@@ -1588,16 +1614,32 @@ impl Environment {
 
     /// The logical root of this commit: declarations + extension deltas + options —
     /// and nothing else (wall-clock, paths, and schedule have no way in).
+    ///
+    /// The same root as a [`fln_hash::root::LogicalRootBuilder`] given every declaration and
+    /// extension: both streams sorted by canonical name bytes, which every declaration carries
+    /// from its insertion, so no name is encoded and no map is built here.
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
-        let mut builder = LogicalRootBuilder::new();
-        for (name, digest) in self.digests.iter() {
-            builder.add_decl(name, *digest);
-        }
-        for (name, state) in self.extensions.iter() {
-            builder.add_extension_delta(name, state.content_digest());
-        }
-        builder.set_options(options);
-        builder.finalize()
+        let mut decls: Vec<(&[u8], &Digest)> = self
+            .digests
+            .iter()
+            .map(|(_, named)| (&*named.canonical, &named.digest))
+            .collect();
+        decls.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut extensions: Vec<(Vec<u8>, Digest)> = self
+            .extensions
+            .iter()
+            .map(|(name, state)| (name.to_canonical_bytes(), state.content_digest()))
+            .collect();
+        extensions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        fln_hash::root::sorted_logical_root(
+            decls.len(),
+            decls,
+            extensions.len(),
+            extensions
+                .iter()
+                .map(|(name, digest)| (name.as_slice(), digest)),
+            options,
+        )
     }
 
     /// The operational-metadata root: host facts, paths, timings — everything the
@@ -1620,6 +1662,7 @@ mod tests {
     use fln_core::level::Level;
     use fln_core::options::DataValue;
     use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
+    use fln_hash::root::LogicalRootBuilder;
     use std::collections::HashSet;
 
     fn n(s: &str) -> Name {
