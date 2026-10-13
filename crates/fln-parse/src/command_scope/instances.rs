@@ -1,7 +1,9 @@
 //! Global, namespace-scoped and local instance attributes, and global default candidates. A local
-//! instance is never a persistent registration: it holds until the enclosing scope ends. Erasure
-//! is not read.
+//! instance is never a persistent registration: it holds until the enclosing scope ends.
+//! Erasure is a separate state-only operation and never exports a registration change.
 use super::*;
+
+mod erasure;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceAttribute {
@@ -11,6 +13,9 @@ pub struct InstanceAttribute {
     pub is_default: bool,
     /// `attribute [local instance] x`: selected until the enclosing `section`/`namespace` ends.
     pub local: bool,
+    /// `attribute [-instance] x`: remove a currently active instance in this lexical scope.
+    /// Priority and registration-kind fields do not describe this operation.
+    pub erase: bool,
 }
 
 /// Inspect the existing scope-command token stream, preserving original source
@@ -19,6 +24,9 @@ pub(super) fn parse(
     view: &SourceView,
     tokens: &[LexedToken],
 ) -> Result<Option<InstanceAttribute>, DefinitionParseError> {
+    if let Some(attribute) = erasure::parse(view, tokens)? {
+        return Ok(Some(attribute));
+    }
     let is = |at: usize, text: &str| {
         tokens.get(at).is_some_and(|token| {
             matches!(&token.kind, TokenKind::Symbol(_) | TokenKind::Ident(_))
@@ -104,6 +112,7 @@ pub(super) fn parse(
         scoped,
         is_default,
         local,
+        erase: false,
     }))
 }
 
@@ -227,7 +236,6 @@ mod tests {
             "attribute [scoped instance 4294967296] d",
             "attribute [scoped instance, simp] d",
             "attribute [scoped local instance] d",
-            "attribute [-instance] d",
             "attribute [«instance»] d",
         ] {
             assert!(parse_command(source.as_bytes()).is_err(), "{source}");
