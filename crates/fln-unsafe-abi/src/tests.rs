@@ -61,8 +61,23 @@ fn fallible_constructor_scalar_reads_check_width_and_offset() {
     )));
 }
 
-pub(crate) fn lock() -> MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// The serialization every shadow-observing test holds. Dropping it first releases this
+/// thread's current stdio streams, then the mutex: libtest runs each test on its own thread,
+/// and the thread-exit release of those slots would otherwise run after the lock is gone,
+/// inside whichever test holds the shadow next, as a `ForeignPointer` that is not its traffic.
+/// Measured: with that release outside the lock, 2 to 4 shadow tests failed in every parallel
+/// run of this crate, and none with `--test-threads=1`, where every test shares the main thread.
+pub(crate) struct TestLock(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+impl Drop for TestLock {
+    fn drop(&mut self) {
+        // Runs before the field's MutexGuard drops, so still inside the critical section.
+        crate::stdio::settle_current_streams();
+    }
+}
+
+pub(crate) fn lock() -> TestLock {
+    TestLock(TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 // ================================================================ layout law

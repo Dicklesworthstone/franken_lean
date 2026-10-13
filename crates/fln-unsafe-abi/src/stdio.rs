@@ -1913,6 +1913,24 @@ thread_local! {
 
 struct CurrentStreams([*mut LeanObject; 3]);
 
+/// Release this thread's current streams now, rather than at thread exit.
+///
+/// Tests only. libtest runs each test on its own thread, so the thread-exit `dec_ref` of
+/// these slots otherwise runs after the test's lock guard is gone, while another test may
+/// have the allocation shadow enabled; there it records a `ForeignPointer` on the persistent
+/// initial streams, which is not that test's traffic. The test lock calls this while it is
+/// still held. No new unsafe: the swapped-out value drops through the ledgered `Drop` below.
+#[cfg(test)]
+pub(crate) fn settle_current_streams() {
+    let released = CURRENT.with(|current| {
+        std::mem::replace(
+            &mut *current.borrow_mut(),
+            CurrentStreams([core::ptr::null_mut(); 3]),
+        )
+    });
+    drop(released);
+}
+
 impl Drop for CurrentStreams {
     fn drop(&mut self) {
         for &p in &self.0 {
