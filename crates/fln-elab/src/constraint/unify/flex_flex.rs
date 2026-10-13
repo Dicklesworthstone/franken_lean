@@ -354,12 +354,29 @@ impl Engine<'_> {
         for (id, declaration) in self.work.mvars.decls() {
             self.meter.node()?;
             reserved.insert(id.clone());
+            roots.push(declaration.type_.clone());
+            for local in declaration.lctx.decls() {
+                self.meter.node()?;
+                roots.push(local.type_.clone());
+                roots.extend(local.value.iter().cloned());
+            }
             if let Some(delayed) = &declaration.delayed {
                 roots.push(delayed.val.clone());
             }
         }
-        // `solve` scans all input equations, metavariable types/assignments and
-        // local types/values before reaching this rung. The cache pins the roots.
+        for assignment in self.work.mvars.assignments().values() {
+            self.meter.node()?;
+            roots.push(assignment.expr.clone());
+        }
+        for local in self.work.lctx.decls() {
+            self.meter.node()?;
+            roots.push(local.type_.clone());
+            roots.extend(local.value.iter().cloned());
+        }
+        // `solve` scans active equations and saved contexts, not the whole
+        // metavariable store. Its cache is only an additional set of roots:
+        // an unrelated declaration can still contain a dangling input identity
+        // that declaring this residual must not silently adopt.
         for (expr, _) in self.fact_cache.values() {
             self.meter.node()?;
             roots.push(expr.clone());
@@ -372,6 +389,13 @@ impl Engine<'_> {
             .chain(self.awakened.iter())
         {
             self.meter.node()?;
+            if let Some(locals) = &constraint.local_context {
+                for local in locals.decls() {
+                    self.meter.node()?;
+                    roots.push(local.type_.clone());
+                    roots.extend(local.value.iter().cloned());
+                }
+            }
             for id in &constraint.reads_mvars {
                 self.meter.node()?;
                 reserved.insert(id.clone());
@@ -403,7 +427,9 @@ impl Engine<'_> {
         let mut pending: Vec<_> = roots.iter().collect();
         while let Some(expr) = pending.pop() {
             self.meter.tick()?;
-            if !seen.insert(expr.allocation_identity()) {
+            if !seen.insert(expr.allocation_identity()) || !expr.has_expr_mvar() {
+                // Cached syntax flags let large closed subgraphs stay opaque.
+                // Identity reservation does not need their types or reduction.
                 continue;
             }
             self.meter.node()?;
