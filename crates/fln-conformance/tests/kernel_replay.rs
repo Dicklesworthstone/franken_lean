@@ -1370,6 +1370,455 @@ fn decode_prelude() -> Option<(Vec<u8>, Vec<ConstantInfo>)> {
 const PINNED_PRESENT_OLEAN_FLOOR: u64 = 2_433;
 const PINNED_DECODED_DECL_FLOOR: u64 = 215_136;
 const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 211_524;
+/// The rows of the pinned present-olean corpus that the inventory counts
+/// oracle-applicable but the differential cannot compare, as
+/// `(module, declaration, reason)`. Every one is an auto-generated theorem
+/// (`eq_N`, `eq_def`, `congr_simp`, `induct_unfolding`) that a second module
+/// declares again; the Reference's replay keeps it once, so the repeat gets no
+/// verdict (`reference_replay_duplicate_theorem`, the typing that closed
+/// `franken_lean-sxsk`). Measured at `c43130c9`: 211,462 compared + these 62 =
+/// the inventory's 211,524 (bead `fln-hvrk`, comment 3229).
+///
+/// The differential checks this set EXACTLY and checks that conservation (see
+/// [`check_context_skip_census`]), so its compared floor is not a lowered
+/// number: a new non-comparable row, a row that stops being one, and a row
+/// silently dropped from comparison each fail.
+const PINNED_REPLAY_DUPLICATE_THEOREM_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "Init.Data.Array.Int",
+        "List.max.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.Int",
+        "List.min.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.Nat",
+        "List.max.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.Nat",
+        "List.min.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Array.OfFn",
+        "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Iterators.Lemmas.Combinators.FlatMap",
+        "Std.Iter.step.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_3",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "List.eraseIdx.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Erase",
+        "Option.guard.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_3",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.take.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.takeWhile.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.takeWhile.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Impl",
+        "List.takeWhile.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Nat.InsertIdx",
+        "List.insertIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Nat.Modify",
+        "List.modify.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Perm",
+        "List.insertIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Sort.Lemmas",
+        "List.zipIdx.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Sort.Lemmas",
+        "List.zipIdx.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.Sort.Lemmas",
+        "List.zipIdx.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_3",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.TakeDrop",
+        "List.drop.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.ToArray",
+        "List.find?.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.ToArray",
+        "List.find?.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.List.ToArray",
+        "List.find?.eq_def",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Nat.Sqrt.Basic",
+        "dite.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Option.Attach",
+        "Option.toList.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Option.Attach",
+        "Option.toList.eq_2",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.Range.Polymorphic.UInt",
+        "BitVec.ofNatLT.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Basic",
+        "False.elim.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.revSkipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.revSkipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.skipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Char",
+        "String.Slice.Pos.skipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Split.Char",
+        "String.Slice.Pattern.Model.split._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.Split.Char",
+        "String.Slice.Pattern.Model.split.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.revSkipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.revSkipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.skipWhile._unary.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Lemmas.Pattern.String.ForwardPattern",
+        "String.Slice.Pos.skipWhile.induct_unfolding",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Modify",
+        "String.Pos.byte.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Search",
+        "String.pos.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Data.String.Substring",
+        "String.pos.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.GetElem",
+        "dite.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Internal.Order.Lemmas",
+        "Array.anyM.loop.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Internal.Order.Lemmas",
+        "Array.foldlM.loop.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Init.Internal.Order.Lemmas",
+        "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Lake.Util.Version",
+        "String.Slice.mk.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Lean.Compiler.NameMangling",
+        "Eq.ndrec_symm.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Lean.Elab.Tactic.Omega.MinNatAbs",
+        "Ne.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.DTreeMap.Internal.Balancing",
+        "False.elim.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.DTreeMap.Internal.Operations",
+        "cast.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.DTreeMap.Internal.Zipper",
+        "Std.IterM.step.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.Internal.List.Associative",
+        "cast.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.Iterators.Lemmas.Combinators.Monadic.TakeWhile",
+        "Std.IterM.step.eq_1",
+        "reference_replay_duplicate_theorem",
+    ),
+    (
+        "Std.Data.Iterators.Lemmas.Equivalence.StepCongr",
+        "Quot.lift.congr_simp",
+        "reference_replay_duplicate_theorem",
+    ),
+];
+
+/// The rows a lane could not compare although its inventory counts them
+/// oracle-applicable, against the lane's declared set: the two sets must be
+/// equal, and `compared` plus the declared rows must equal `applicable`. A row
+/// dropped from comparison for any other reason breaks the second law, so it
+/// cannot hide behind the first. The error names every row on either side.
+fn check_context_skip_census(
+    expected: &[(&str, &str, &str)],
+    observed: &[(String, String, &'static str)],
+    compared: u64,
+    applicable: u64,
+) -> Result<(), String> {
+    let expected = expected
+        .iter()
+        .map(|(module, declaration, reason)| {
+            (
+                (*module).to_string(),
+                (*declaration).to_string(),
+                (*reason).to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let observed_set = observed
+        .iter()
+        .map(|(module, declaration, reason)| {
+            (module.clone(), declaration.clone(), (*reason).to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut findings = Vec::new();
+    if observed_set.len() != observed.len() {
+        findings.push(format!(
+            "{} observed rows are repeats of another observed row",
+            observed.len() - observed_set.len()
+        ));
+    }
+    let unexpected = observed_set.difference(&expected).collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        findings.push(format!(
+            "{} rows the run could not compare are not declared: {unexpected:?}",
+            unexpected.len()
+        ));
+    }
+    let missing = expected.difference(&observed_set).collect::<Vec<_>>();
+    if !missing.is_empty() {
+        findings.push(format!(
+            "{} declared rows were not among those the run could not compare: {missing:?}",
+            missing.len()
+        ));
+    }
+    let declared = expected.len() as u64;
+    if compared.checked_add(declared) != Some(applicable) {
+        findings.push(format!(
+            "compared {compared} + declared non-comparable {declared} != applicable \
+             {applicable}: rows left comparison for an undeclared reason"
+        ));
+    }
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(findings.join("; "))
+    }
+}
+
+#[test]
+fn the_context_skip_census_accepts_exactly_its_declared_rows() {
+    let declared: &[(&str, &str, &str)] = &[
+        ("M", "a.eq_1", "reference_replay_duplicate_theorem"),
+        ("N", "b.congr_simp", "reference_replay_duplicate_theorem"),
+    ];
+    let observed = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .map(|(module, declaration)| {
+                (
+                    (*module).to_string(),
+                    (*declaration).to_string(),
+                    "reference_replay_duplicate_theorem",
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let both = observed(&[("M", "a.eq_1"), ("N", "b.congr_simp")]);
+    assert_eq!(check_context_skip_census(declared, &both, 98, 100), Ok(()));
+    // A row dropped from comparison for an undeclared reason.
+    let finding = check_context_skip_census(declared, &both, 97, 100)
+        .expect_err("a compared row lost elsewhere must fail");
+    assert!(
+        finding.contains("97 + declared non-comparable 2 != applicable 100"),
+        "{finding}"
+    );
+    // A new non-comparable row the lane has not declared.
+    let extra = observed(&[("M", "a.eq_1"), ("N", "b.congr_simp"), ("O", "c.eq_def")]);
+    let finding = check_context_skip_census(declared, &extra, 97, 100)
+        .expect_err("an undeclared non-comparable row must fail");
+    assert!(
+        finding.contains("c.eq_def") && finding.contains("not declared"),
+        "{finding}"
+    );
+    // A declared row the run compared after all (the set shrank).
+    let fewer = observed(&[("M", "a.eq_1")]);
+    let finding = check_context_skip_census(declared, &fewer, 99, 100)
+        .expect_err("a declared row that stopped being non-comparable must fail");
+    assert!(
+        finding.contains("b.congr_simp") && finding.contains("were not among"),
+        "{finding}"
+    );
+    // The same name in another module is another row.
+    let moved = observed(&[("M", "a.eq_1"), ("O", "b.congr_simp")]);
+    assert!(check_context_skip_census(declared, &moved, 98, 100).is_err());
+}
+
+/// The declared rows are the measured ones: 62, all typed as replay
+/// duplicates, none listed twice, and their count closes the gap between the
+/// inventory's applicable floor and the differential's compared floor.
+#[test]
+fn the_declared_replay_duplicate_rows_are_well_formed() {
+    let rows = PINNED_REPLAY_DUPLICATE_THEOREM_ROWS;
+    assert_eq!(rows.len(), 62, "the measured set at c43130c9 has 62 rows");
+    assert!(
+        rows.iter()
+            .all(|(_, _, reason)| *reason == "reference_replay_duplicate_theorem")
+    );
+    let distinct = rows.iter().collect::<BTreeSet<_>>();
+    assert_eq!(distinct.len(), rows.len(), "a row is declared twice");
+}
 /// Anti-vacuity floor for the retained v1 matrix observation. That observation
 /// predates module-part decoding and therefore measured the 158,608 declarations
 /// visible in public `.olean` regions. It remains historical bounded-model evidence,
@@ -3720,7 +4169,7 @@ fn score_accepted_reference_module(
     shadowed: &HashSet<usize>,
     prep: &PreparedReplay,
     run: &MatrixRun,
-) -> CorpusCounts {
+) -> (CorpusCounts, Vec<(String, String, &'static str)>) {
     assert_eq!(
         prep.items.len(),
         run.outcomes.len(),
@@ -3862,6 +4311,10 @@ fn score_accepted_reference_module(
             oracle_omitted.iter().take(5).collect::<Vec<_>>()
         );
     }
+    let oracle_context_skips = oracle_omitted
+        .iter()
+        .map(|(declaration, reason)| (module.name.clone(), declaration.clone(), *reason))
+        .collect();
     if !subject_omitted.is_empty() {
         counts.unscorable += subject_omitted.len() as u64;
         counts.subject_no_answer += subject_omitted.len() as u64;
@@ -3883,7 +4336,7 @@ fn score_accepted_reference_module(
         );
     }
     counts.assert_conservation(&module.name);
-    counts
+    (counts, oracle_context_skips)
 }
 
 #[test]
@@ -5280,6 +5733,341 @@ fn mathlib_corpus_root() -> PathBuf {
 /// independently or the check is a mirror.
 const DEFAULT_MATHLIB_CORPUS_ROOT: &str = "/data/tmp/mathlib4-corpus";
 const MATHLIB_CORPUS_ROOT_ENV: &str = "FLN_MATHLIB_CORPUS";
+
+/// Where the corpus's materialization receipt is retained, per Reference pin
+/// (`scripts/tribunal/materialize_mathlib_corpus.sh`, bead franken_lean-z8j.1.15).
+/// The script leaves the same receipt in the corpus root as
+/// [`MATHLIB_CORPUS_RECEIPT_IN_ROOT`].
+fn mathlib_corpus_receipt_path(pin: &str) -> PathBuf {
+    fln_conformance::checked_manifest_dir!()
+        .join("evidence/mathlib_corpus")
+        .join(format!("{pin}.json"))
+}
+
+const MATHLIB_CORPUS_RECEIPT_IN_ROOT: &str = ".fln-corpus-receipt.json";
+
+/// The identity and counts a corpus materialization receipt states (schema
+/// `fln-mathlib-corpus/1`).
+#[derive(Debug, Clone, PartialEq)]
+struct MathlibCorpusReceipt {
+    corpus_repository: String,
+    corpus_tag: String,
+    corpus_commit: String,
+    reference_tag: String,
+    library_subpath: String,
+    source_modules: u64,
+    oleans: u64,
+    olean_bytes: u64,
+}
+
+impl MathlibCorpusReceipt {
+    fn from_row(row: &str) -> Result<MathlibCorpusReceipt, String> {
+        fn text(row: &str, key: &str) -> Result<String, String> {
+            let needle = format!("\"{key}\":\"");
+            assert_field_once(row, key, &needle)?;
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing string field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find('"')
+                .ok_or_else(|| format!("unterminated string field `{key}`"))?;
+            let value = &rest[..end];
+            assert_no_escape(key, value)?;
+            assert_string_terminator(key, rest, end)?;
+            Ok(value.to_string())
+        }
+        fn number(row: &str, key: &str) -> Result<u64, String> {
+            let needle = format!("\"{key}\":");
+            assert_field_once(row, key, &needle)?;
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing numeric field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            assert_number_terminator(key, rest, end)?;
+            rest[..end]
+                .parse()
+                .map_err(|_| format!("field `{key}` is not a u64"))
+        }
+        let row = row.trim();
+        let schema = text(row, "schema")?;
+        if schema != "fln-mathlib-corpus/1" {
+            return Err(format!("schema `{schema}` is not `fln-mathlib-corpus/1`"));
+        }
+        Ok(MathlibCorpusReceipt {
+            corpus_repository: text(row, "corpus_repository")?,
+            corpus_tag: text(row, "corpus_tag")?,
+            corpus_commit: text(row, "corpus_commit")?,
+            reference_tag: text(row, "reference_tag")?,
+            library_subpath: text(row, "library_subpath")?,
+            source_modules: number(row, "source_modules")?,
+            oleans: number(row, "oleans")?,
+            olean_bytes: number(row, "olean_bytes")?,
+        })
+    }
+
+    /// The receipt names SUITE.lock's corpus row and Reference pin, and a complete corpus: an
+    /// olean for every source module, at least the whole-Mathlib floor of them, holding bytes.
+    fn validate(&self, corpus_row: &str, pin: &str) -> Result<(), String> {
+        let mut fields = corpus_row.split_whitespace();
+        let (Some("corpus"), Some(repository)) = (fields.next(), fields.next()) else {
+            return Err(format!("`{corpus_row}` is not a corpus row"));
+        };
+        let field = |name: &str| {
+            corpus_row
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix(name))
+                .unwrap_or_default()
+                .to_string()
+        };
+        for (name, stated, pinned) in [
+            (
+                "corpus_repository",
+                &self.corpus_repository,
+                repository.to_string(),
+            ),
+            ("corpus_tag", &self.corpus_tag, field("tag=")),
+            ("corpus_commit", &self.corpus_commit, field("commit=")),
+            ("reference_tag", &self.reference_tag, pin.to_string()),
+        ] {
+            if *stated != pinned {
+                return Err(format!("{name} `{stated}` is not the pinned `{pinned}`"));
+            }
+        }
+        if self.library_subpath != ".lake/build/lib/lean/Mathlib" {
+            return Err(format!(
+                "library_subpath `{}` is not the lanes' `.lake/build/lib/lean/Mathlib`",
+                self.library_subpath
+            ));
+        }
+        if self.oleans != self.source_modules {
+            return Err(format!(
+                "{} oleans for {} source modules: the corpus is not complete",
+                self.oleans, self.source_modules
+            ));
+        }
+        if self.source_modules < WHOLE_MATHLIB_SEED_FLOOR {
+            return Err(format!(
+                "{} modules is below the whole-Mathlib floor of {WHOLE_MATHLIB_SEED_FLOOR}",
+                self.source_modules
+            ));
+        }
+        if self.olean_bytes < self.oleans {
+            return Err(format!(
+                "{} olean bytes for {} oleans: the oleans are empty",
+                self.olean_bytes, self.oleans
+            ));
+        }
+        Ok(())
+    }
+
+    /// A materialized root agrees with this receipt: the copy the script left in it states the
+    /// same corpus, and its built tree holds exactly the oleans the receipt counted.
+    fn check_root(&self, root: &Path) -> Result<(), String> {
+        let copy = fs::read_to_string(root.join(MATHLIB_CORPUS_RECEIPT_IN_ROOT))
+            .map_err(|error| format!("the root holds no readable receipt: {error}"))?;
+        let copy = MathlibCorpusReceipt::from_row(&copy)
+            .map_err(|reason| format!("the root's receipt does not read: {reason}"))?;
+        if copy != *self {
+            return Err(format!(
+                "the root's receipt {copy:?} is not the retained {self:?}"
+            ));
+        }
+        let OleanInventory { oleans, .. } =
+            walk_olean_inventory(&root.join(&self.library_subpath), Some("Mathlib"))?;
+        if oleans.len() as u64 != self.oleans {
+            return Err(format!(
+                "the built tree holds {} oleans where the receipt counted {}",
+                oleans.len(),
+                self.oleans
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn suite_lock_corpus_row() -> &'static str {
+    const SUITE_LOCK: &str = include_str!("../../../SUITE.lock");
+    SUITE_LOCK
+        .lines()
+        .find(|line| line.starts_with("corpus "))
+        .expect("SUITE.lock must have a corpus row")
+}
+
+#[test]
+fn the_mathlib_corpus_receipt_is_retained_and_bound_to_the_current_pin() {
+    let pin = suite_lock_reference_pin();
+    let path = mathlib_corpus_receipt_path(&pin);
+    let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "no materialization receipt for pin {pin} at {}: {error}. Run \
+             scripts/tribunal/materialize_mathlib_corpus.sh on a measurement host and commit the \
+             receipt it writes",
+            path.display()
+        )
+    });
+    let receipt = MathlibCorpusReceipt::from_row(&text)
+        .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+    receipt
+        .validate(suite_lock_corpus_row(), &pin)
+        .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+}
+
+#[test]
+fn a_tampered_mathlib_corpus_receipt_is_refused() {
+    let pin = suite_lock_reference_pin();
+    let retained = fs::read_to_string(mathlib_corpus_receipt_path(&pin))
+        .expect("the retained receipt (see the_mathlib_corpus_receipt_is_retained_and_bound_to_the_current_pin)");
+    let receipt = MathlibCorpusReceipt::from_row(&retained).expect("the retained receipt reads");
+    let commit = format!("\"corpus_commit\":\"{}\"", receipt.corpus_commit);
+    let oleans = format!("\"oleans\":{}", receipt.oleans);
+    let modules = format!("\"source_modules\":{}", receipt.source_modules);
+    let cases = [
+        (
+            retained.replace(
+                &commit,
+                "\"corpus_commit\":\"0000000000000000000000000000000000000000\"",
+            ),
+            "corpus_commit",
+        ),
+        (
+            retained.replace(
+                &format!("\"reference_tag\":\"{pin}\""),
+                "\"reference_tag\":\"v0.0.0\"",
+            ),
+            "reference_tag",
+        ),
+        (
+            retained.replace(&oleans, &format!("\"oleans\":{}", receipt.oleans - 1)),
+            "not complete",
+        ),
+        (
+            retained
+                .replace(&oleans, "\"oleans\":12")
+                .replace(&modules, "\"source_modules\":12"),
+            "floor",
+        ),
+        (
+            retained.replace("\"fln-mathlib-corpus/1\"", "\"fln-mathlib-corpus/0\""),
+            "schema",
+        ),
+        (
+            retained.replacen(&commit, &format!("{commit},{commit}"), 1),
+            "more than once",
+        ),
+    ];
+    for (tampered, expected) in cases {
+        assert_ne!(
+            tampered, retained,
+            "the tamper for `{expected}` changed nothing"
+        );
+        let refusal = MathlibCorpusReceipt::from_row(&tampered)
+            .and_then(|receipt| receipt.validate(suite_lock_corpus_row(), &pin))
+            .expect_err(expected);
+        assert!(
+            refusal.contains(expected),
+            "`{expected}` refused for another reason: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_materialized_root_that_disagrees_with_its_receipt_is_refused() {
+    let root = write_inventory_fixture(
+        "z8j115-corpus-root-v1",
+        &[
+            MATHLIB_CORPUS_RECEIPT_IN_ROOT,
+            "Mathlib/A.olean",
+            "Mathlib/B/C.olean",
+            "Mathlib/B/D.olean",
+        ],
+    );
+    let receipt = MathlibCorpusReceipt {
+        corpus_repository: "leanprover-community/mathlib4".to_string(),
+        corpus_tag: "v0.0.0".to_string(),
+        corpus_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        reference_tag: "v0.0.0".to_string(),
+        library_subpath: "Mathlib".to_string(),
+        source_modules: 3,
+        oleans: 3,
+        olean_bytes: 3,
+    };
+    let row = |receipt: &MathlibCorpusReceipt| {
+        format!(
+            "{{\"schema\":\"fln-mathlib-corpus/1\",\"corpus_repository\":\"{}\",\"corpus_tag\":\"{}\",\
+             \"corpus_commit\":\"{}\",\"reference_tag\":\"{}\",\"library_subpath\":\"{}\",\
+             \"source_modules\":{},\"oleans\":{},\"olean_bytes\":{}}}\n",
+            receipt.corpus_repository,
+            receipt.corpus_tag,
+            receipt.corpus_commit,
+            receipt.reference_tag,
+            receipt.library_subpath,
+            receipt.source_modules,
+            receipt.oleans,
+            receipt.olean_bytes
+        )
+    };
+    fs::write(root.join(MATHLIB_CORPUS_RECEIPT_IN_ROOT), row(&receipt))
+        .expect("the root's receipt");
+    receipt
+        .check_root(&root)
+        .unwrap_or_else(|reason| panic!("an agreeing root must be accepted: {reason}"));
+
+    // The retained receipt counts an olean the root's own copy does not.
+    let short = MathlibCorpusReceipt {
+        oleans: 4,
+        source_modules: 4,
+        ..receipt.clone()
+    };
+    let refusal = short
+        .check_root(&root)
+        .expect_err("a receipt the root's copy does not state");
+    assert!(refusal.contains("is not the retained"), "{refusal}");
+    // A copy tampered to match it, over a tree that holds fewer oleans than both count.
+    fs::write(root.join(MATHLIB_CORPUS_RECEIPT_IN_ROOT), row(&short)).expect("a tampered copy");
+    let refusal = short
+        .check_root(&root)
+        .expect_err("a tree with fewer oleans than counted");
+    assert!(
+        refusal.contains("holds 3 oleans where the receipt counted 4"),
+        "{refusal}"
+    );
+}
+
+/// When the corpus is on this host, it is the one the retained receipt describes.
+#[test]
+fn the_materialized_mathlib_corpus_matches_its_retained_receipt() {
+    match classify_mathlib_corpus_input() {
+        MathlibCorpusInput::Absent { root, .. } => {
+            println!(
+                "{{\"schema\":\"fln-z8j115-corpus-receipt/1\",\"status\":\"skipped_absent_host_input\",\"root\":{}}}",
+                json_string(&root.display().to_string())
+            );
+        }
+        MathlibCorpusInput::Misprovisioned { root, reason } => {
+            panic!(
+                "the corpus root {} is misprovisioned: {reason}",
+                root.display()
+            )
+        }
+        MathlibCorpusInput::Present { root, .. } => {
+            let pin = suite_lock_reference_pin();
+            let path = mathlib_corpus_receipt_path(&pin);
+            let receipt = fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| MathlibCorpusReceipt::from_row(&text))
+                .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+            receipt
+                .check_root(&root)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", root.display()));
+        }
+    }
+}
 
 /// Refuse before an expensive whole-corpus run when its external input cannot
 /// identify itself. This is intentionally stronger than `is_dir()`: a different
@@ -15301,6 +16089,7 @@ fn whole_mathlib_kernel_differential() {
                 seed_modules,
                 receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
             }),
+            expected_context_skips: None,
         },
     );
 }
@@ -15308,14 +16097,20 @@ fn whole_mathlib_kernel_differential() {
 /// The executable corpus obligation. Oracle-skipped unsafe/partial rows are a
 /// 7odd-classified bound on the Reference replay filter, not a harness
 /// failure; they are named per declaration and excluded from the compared
-/// denominator. The remaining `subject_no_answer` rows are owned by
-/// `fln-4hol`. Enabling this gate while those remain would make every
-/// ordinary `cargo test` unusable. Run explicitly:
+/// denominator. The rows the run cannot compare beyond those are declared
+/// exactly in [`PINNED_REPLAY_DUPLICATE_THEOREM_ROWS`].
 ///
-/// `cargo test -p fln-conformance --test kernel_replay \
+/// At `c43130c9` K1 answered every compared row (`subject_no_answer=0`, 0
+/// disagreements; bead `fln-hvrk`, comment 3229), so it is no longer ignored for
+/// `fln-4hol`'s non-answers. It stays ignored for its cost: about 23 minutes in
+/// a release build on a 64-way host, the pinned Reference library is required,
+/// and the leanchecker oracle alone takes about 260 s of its 300 s budget. Run
+/// explicitly:
+///
+/// `cargo test --release -p fln-conformance --test kernel_replay \
 ///  pinned_present_olean_kernel_differential -- --ignored --exact --nocapture`
 #[test]
-#[ignore = "remaining subject_no_answer rows are owned by fln-4hol; 7odd-classified oracle skips are reported per declaration and are not a gate failure"]
+#[ignore = "costs about 23 minutes (release) and needs the pinned Reference library; 7odd-classified oracle skips are reported per declaration and are not a gate failure"]
 fn pinned_present_olean_kernel_differential() {
     let reference_lib =
         reference_lib().expect("pinned Reference stdlib required for the live corpus differential");
@@ -15331,12 +16126,14 @@ fn pinned_present_olean_kernel_differential() {
         CorpusDifferentialScope {
             module_floor: PINNED_PRESENT_OLEAN_FLOOR,
             decoded_floor: PINNED_DECODED_DECL_FLOOR,
-            compared_floor: PINNED_ORACLE_APPLICABLE_FLOOR,
+            compared_floor: PINNED_ORACLE_APPLICABLE_FLOOR
+                - PINNED_REPLAY_DUPLICATE_THEOREM_ROWS.len() as u64,
             oracle_total_timeout: DEFAULT_LEANCHECKER_TIMEOUT,
             oracle_process_timeout: DEFAULT_LEANCHECKER_TIMEOUT,
             oracle_modules_per_process: usize::MAX,
             label: "pinned-reference-library",
             receipt: None,
+            expected_context_skips: Some(PINNED_REPLAY_DUPLICATE_THEOREM_ROWS),
         },
     );
 }
@@ -15354,6 +16151,10 @@ struct CorpusDifferentialScope {
     /// `SUITE.lock`'s corpus commit would name a revision it never read, and a
     /// receipt whose provenance field is about another input is worse than none.
     receipt: Option<CorpusReceiptSpec>,
+    /// `Some` for a lane that declares, by module and declaration, every row its
+    /// inventory counts oracle-applicable but the run cannot compare; see
+    /// [`check_context_skip_census`].
+    expected_context_skips: Option<&'static [(&'static str, &'static str, &'static str)]>,
 }
 
 /// What a receipt-retaining lane must name about itself before it may file a row.
@@ -15387,6 +16188,7 @@ fn run_accepted_corpus_kernel_differential(
         oracle_modules_per_process,
         label: corpus_label,
         receipt: receipt_spec,
+        expected_context_skips,
     } = scope;
     let started = Instant::now();
     assert!(
@@ -15480,6 +16282,7 @@ fn run_accepted_corpus_kernel_differential(
         .collect::<HashMap<_, _>>();
     let mut states = BTreeMap::<String, CorpusFixtureState>::new();
     let mut total = CorpusCounts::default();
+    let mut oracle_context_skips = Vec::new();
     for (index, module_name) in order.iter().enumerate() {
         let module = &inventory.modules[module_name];
         let decoded_module = decode_corpus_module(&module.path, &module.name)
@@ -15552,18 +16355,17 @@ fn run_accepted_corpus_kernel_differential(
             // CLAIM-CLASS row below and in the matrix test's own census.
             let threads = CORPUS_CENSUS_WIDTH;
             let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
-            (
-                score_accepted_reference_module(
-                    module,
-                    &infos,
-                    &active_infos,
-                    &active_to_decoded,
-                    &shadowed,
-                    &prep,
-                    &run,
-                ),
-                run.stream_digest,
-            )
+            let (counts, context_skips) = score_accepted_reference_module(
+                module,
+                &infos,
+                &active_infos,
+                &active_to_decoded,
+                &shadowed,
+                &prep,
+                &run,
+            );
+            oracle_context_skips.extend(context_skips);
+            (counts, run.stream_digest)
         } else {
             let dynamic_oracle_skips = shadowed
                 .iter()
@@ -15739,6 +16541,14 @@ fn run_accepted_corpus_kernel_differential(
         }
     }
 
+    if let Some(expected) = expected_context_skips {
+        let applicable = inventory.decoded - inventory.oracle_skipped;
+        if let Err(finding) =
+            check_context_skip_census(expected, &oracle_context_skips, total.compared, applicable)
+        {
+            panic!("{corpus_label}: {finding}");
+        }
+    }
     assert!(
         total.compared >= compared_floor,
         "kernel differential coverage silently stopped: {} < {} scoreable declarations",
@@ -15775,8 +16585,8 @@ fn run_accepted_corpus_kernel_differential(
 ///
 /// **No oracle is involved, deliberately.** Comparing our own stream digests across widths
 /// needs no Reference verdict at all, so this lane is reachable while
-/// `pinned_present_olean_kernel_differential` stays ignored for `fln-4hol`'s
-/// remaining subject non-answers. Removing that attribute to get a
+/// `pinned_present_olean_kernel_differential` stays ignored for its cost. Removing that
+/// attribute to get a
 /// matrix running would have coupled the matrix half to the oracle half for no reason.
 ///
 /// **What a green run earns, stated because the whole bead is about not overclaiming.**
@@ -19887,6 +20697,19 @@ fn chosen_set_roots(reference_lib: &Path) -> Vec<(String, PathBuf)> {
     ]
 }
 
+/// The reject-side mutant root (bead `fln-kernel-reject-side-at-scale-bemc`):
+/// when `FLN_BEMC_ROOT` names a directory, synthetic `Bemc.*` modules written
+/// by `scripts/tribunal/bemc_mutant_generator.lean` become routable through
+/// the same inventory machinery as every provisioned root. Host provisioning,
+/// never a repository input, exactly like `FLN_MATHLIB_CORPUS` above.
+fn chosen_set_roots_with_bemc(reference_lib: &Path) -> Vec<(String, PathBuf)> {
+    let mut roots = chosen_set_roots(reference_lib);
+    if let Ok(root) = std::env::var("FLN_BEMC_ROOT") {
+        roots.push(("Bemc".to_string(), PathBuf::from(root)));
+    }
+    roots
+}
+
 #[test]
 fn chosen_set_routes_every_reference_top_level() {
     let reference_lib = PathBuf::from("/pinned-reference/lib/lean");
@@ -20322,6 +21145,358 @@ fn selected_real_module_resource_probe() {
     assert!(
         !matches!(verdict, Outcome::InternalFault(_)),
         "{chosen}:{selector}: an internal fault is never a resource observation"
+    );
+}
+
+/// The two `fln-4hol` admission units stay within their measured step ceilings
+/// at `Budget::DEFAULT` (bead `franken_lean-z8j.1.13`, acceptance criterion 1).
+///
+/// After `e7cdcbbc` (theorem unfolding in the delta gate) both units exhausted
+/// even a 200,000,000-step measurement budget, while the pinned leanchecker
+/// accepts both. The `fln-hvrk` lazy-delta chain plus `68429a1a` returned them
+/// to the parent cell's order of magnitude, measured 2026-10-07 at `247bfe8b`
+/// (release, `Budget::DEFAULT`): `Vector.swap_swap` 17,428 steps and
+/// `ByteArray.utf8DecodeChar?_utf8EncodeChar_append` 525,319.
+///
+/// The ceilings are deliberately bands, not exact pins: roughly ten times the
+/// measured consumption, far below both `Budget::DEFAULT` and the measured
+/// blowup (which sits more than 380x over the looser ceiling), so ordinary
+/// kernel drift passes while a recurrence of the unfolding pathology fails by
+/// margin rather than by budget exhaustion. The whole-stdlib differential
+/// already answers accepted-or-not on demand; this lane adds the consumption
+/// bound for the two named units in one command any kernel change can re-run.
+#[ignore = "cost: two ~26K-declaration closure decodes (about 25 s release, minutes in debug); on-demand regression lane for the fln-4hol units (bead franken_lean-z8j.1.13)"]
+#[test]
+fn fln_4hol_units_accept_within_their_step_ceilings() {
+    let reference_lib =
+        reference_lib().expect("pinned toolchain required for the fln-4hol unit regression");
+    let roots = chosen_set_roots(&reference_lib);
+    for (chosen, selector, ceiling) in [
+        ("Init.Data.Vector.Lemmas", "Vector.swap_swap", 175_000u64),
+        (
+            "Init.Data.String.Decode",
+            "ByteArray.utf8DecodeChar?_utf8EncodeChar_append",
+            4_000_000u64,
+        ),
+    ] {
+        let inventory = closure_inventory(&roots, chosen)
+            .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+        assert!(
+            inventory.missing_imports.is_empty(),
+            "{chosen}: closure has unresolved imports: {:?}",
+            inventory.missing_imports
+        );
+        let PreparedChosenModule {
+            prep,
+            collision_count,
+        } = prepare_chosen_module(&inventory, chosen)
+            .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+        assert_eq!(
+            collision_count, 0,
+            "{chosen}: a colliding closure is not the measured fixture"
+        );
+        let matches = prep
+            .items
+            .iter()
+            .filter(|item| {
+                item.member_names
+                    .iter()
+                    .any(|name| name.to_display_string() == selector)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches.len() == 1,
+            "{chosen}: selector `{selector}` matched {} admission units; expected exactly one",
+            matches.len()
+        );
+        let item = matches[0];
+        let verdict =
+            check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
+        let outcome = unit_outcome(item, &verdict);
+        assert!(
+            outcome.outcome == "accepted",
+            "{chosen}: `{selector}` produced `{}` ({}); the fln-4hol unit must accept at \
+             Budget::DEFAULT",
+            outcome.outcome,
+            outcome.message
+        );
+        assert!(
+            outcome.steps_used <= ceiling,
+            "{chosen}: `{selector}` consumed {} steps against a {ceiling}-step ceiling; the \
+             fln-4hol unfolding pathology (or a cost regression of its class) is back",
+            outcome.steps_used
+        );
+        assert!(
+            outcome.steps_used > 0,
+            "{chosen}: `{selector}` reported zero steps; an accepted unit cannot be free, so \
+             this measurement is broken"
+        );
+    }
+}
+
+/// One judged mutant row on the FrankenLean side, ready for the verdict join.
+struct BemcJudgedRow {
+    lead: String,
+    outcome: String,
+    message: String,
+}
+
+/// The four-cell join, pure over its inputs so hand-written tables exercise
+/// every cell and the rig's own mutants die in a per-commit unit test
+/// (bead `fln-kernel-reject-side-at-scale-bemc`, the "mutants of the rig"
+/// list). The join is BY NAME, never by position; an unjoined name is an
+/// error, not a skip; inconclusive is its own cell, never agreement and never
+/// a rejection; and the caller must separately require `joined` to equal the
+/// table's size (conservation), because a dropped mutant is missing coverage.
+struct BemcJoinCells {
+    joined: u64,
+    agree_reject: u64,
+    agree_accept: u64,
+    fatal: Vec<String>,
+    inconclusive: Vec<String>,
+    other: Vec<String>,
+}
+
+fn join_bemc_rows(
+    judged: &[BemcJudgedRow],
+    pin_verdicts: &HashMap<String, (String, String)>,
+) -> Result<BemcJoinCells, String> {
+    let mut cells = BemcJoinCells {
+        joined: 0,
+        agree_reject: 0,
+        agree_accept: 0,
+        fatal: Vec::new(),
+        inconclusive: Vec::new(),
+        other: Vec::new(),
+    };
+    for row in judged {
+        let Some((pin_verdict, pin_class)) = pin_verdicts.get(&row.lead) else {
+            return Err(format!(
+                "{}: judged unit has no row in the pin verdict table; the join is by name \
+                 and this name is unjoined",
+                row.lead
+            ));
+        };
+        cells.joined += 1;
+        let rendered = format!(
+            "unit={} pin={pin_verdict}:{pin_class} fln={}:{}",
+            row.lead, row.outcome, row.message
+        );
+        match (pin_verdict.as_str(), row.outcome.as_str()) {
+            ("reject", fln) if fln.starts_with("rejected") => cells.agree_reject += 1,
+            ("accept", "accepted") => cells.agree_accept += 1,
+            ("reject", "accepted") => cells.fatal.push(rendered),
+            (_, fln) if fln.starts_with("inconclusive") => cells.inconclusive.push(rendered),
+            _ => cells.other.push(rendered),
+        }
+    }
+    Ok(cells)
+}
+
+/// The join's own behavior under hand-written tables: every cell reachable,
+/// an unjoined name an error, inconclusive never agreement, and the
+/// classification independent of row order (the join is by name). This is the
+/// per-commit test the rig's four mutants die in.
+#[test]
+fn bemc_join_cells_classify_and_conserve() {
+    let table: HashMap<String, (String, String)> = [
+        ("a".into(), ("reject".into(), "appTypeMismatch".into())),
+        ("b".into(), ("accept".into(), String::new())),
+        ("c".into(), ("reject".into(), "declTypeMismatch".into())),
+        ("d".into(), ("accept".into(), String::new())),
+        ("e".into(), ("reject".into(), "invalidProj".into())),
+    ]
+    .into_iter()
+    .collect();
+    let judged = vec![
+        // deliberately NOT in table order: a position join classifies `e`
+        // with `a`'s pin row and dies here.
+        BemcJudgedRow {
+            lead: "e".into(),
+            outcome: "accepted".into(),
+            message: String::new(),
+        },
+        BemcJudgedRow {
+            lead: "a".into(),
+            outcome: "rejected:TypeMismatch".into(),
+            message: "application type mismatch".into(),
+        },
+        BemcJudgedRow {
+            lead: "b".into(),
+            outcome: "accepted".into(),
+            message: String::new(),
+        },
+        BemcJudgedRow {
+            lead: "c".into(),
+            outcome: "inconclusive:Steps".into(),
+            message: String::new(),
+        },
+        BemcJudgedRow {
+            lead: "d".into(),
+            outcome: "rejected:TypeMismatch".into(),
+            message: "false rejection".into(),
+        },
+    ];
+    let cells = join_bemc_rows(&judged, &table).expect("every name joins");
+    assert_eq!(cells.joined, 5, "five judged rows join five table rows");
+    assert_eq!(cells.agree_reject, 1, "only `a` is reject/reject");
+    assert_eq!(cells.agree_accept, 1, "only `b` is accept/accept");
+    assert_eq!(
+        cells.fatal,
+        vec!["unit=e pin=reject:invalidProj fln=accepted:".to_string()],
+        "exactly the pin-rejected-but-accepted row is fatal"
+    );
+    assert_eq!(
+        cells.inconclusive.len(),
+        1,
+        "the inconclusive row is its own cell: never agreement, never a rejection"
+    );
+    assert!(
+        cells.inconclusive[0].starts_with("unit=c "),
+        "and it is `c`, the pin-rejected inconclusive"
+    );
+    assert_eq!(
+        cells.other.len(),
+        1,
+        "the pin-accepted-but-rejected row is a finding, not agreement"
+    );
+    assert!(cells.other[0].starts_with("unit=d "));
+
+    let missing = vec![BemcJudgedRow {
+        lead: "zz".into(),
+        outcome: "accepted".into(),
+        message: String::new(),
+    }];
+    assert!(
+        join_bemc_rows(&missing, &table).is_err(),
+        "an unjoined name is an error, never a skip"
+    );
+}
+
+/// The reject-side join (bead `fln-kernel-reject-side-at-scale-bemc`): every
+/// mutant of a synthetic `Bemc.*` module is judged by K1 PER DECLARATION —
+/// each admission unit carries its own prepared environment, so no mutant's
+/// fate can affect the next and no rejection stops the walk — and the verdict
+/// is joined by FRESH NAME against the pin's verdict table written beside the
+/// olean by the generator. The one fatal cell is pin=reject joined with
+/// FrankenLean=accepted: a soundness-side divergence, reported with the full
+/// row before the assertion fires (plan R7 stop-ship). An
+/// inconclusive is never counted as a rejection: it lands in its own cell and
+/// fails the run as unattributed coverage, not as agreement.
+///
+/// Run with:
+///   FLN_BEMC_ROOT=<dir holding Bemc/...> \
+///   FLN_BEMC_MODULE=Bemc.Init.Data.Nat.Basic \
+///   cargo test -p fln-conformance --test kernel_replay \
+///     bemc_synthetic_module_pin_and_kernel_verdicts_join -- --ignored --exact --nocapture
+#[ignore = "cost: decodes the synthetic module's real import closure; on-demand reject-side join lane (bead fln-kernel-reject-side-at-scale-bemc)"]
+#[test]
+fn bemc_synthetic_module_pin_and_kernel_verdicts_join() {
+    let chosen = std::env::var("FLN_BEMC_MODULE")
+        .expect("FLN_BEMC_MODULE must name one synthetic Bemc.* module");
+    let bemc_root = std::env::var("FLN_BEMC_ROOT")
+        .expect("FLN_BEMC_ROOT must name the generator's output root");
+    let reference_lib =
+        reference_lib().expect("pinned toolchain required for the reject-side join");
+    let roots = chosen_set_roots_with_bemc(&reference_lib);
+    let inventory = closure_inventory(&roots, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+    assert!(
+        inventory.missing_imports.is_empty(),
+        "{chosen}: closure has unresolved imports: {:?}",
+        inventory.missing_imports
+    );
+    let PreparedChosenModule { prep, .. } = prepare_chosen_module(&inventory, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+
+    let tsv_path = PathBuf::from(&bemc_root)
+        .join(chosen.replace('.', "/"))
+        .with_extension("tsv");
+    let table = std::fs::read_to_string(&tsv_path).unwrap_or_else(|error| {
+        panic!("read the pin verdict table {}: {error}", tsv_path.display())
+    });
+    let mut pin_verdicts: HashMap<String, (String, String)> = HashMap::new();
+    for line in table.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert!(
+            fields.len() == 5,
+            "verdict table row must have five fields, got {}: {line:?}",
+            fields.len()
+        );
+        pin_verdicts.insert(
+            fields[1].to_string(),
+            (fields[3].to_string(), fields[4].to_string()),
+        );
+    }
+    assert!(
+        !pin_verdicts.is_empty(),
+        "an empty verdict table is a broken generator run, not a clean join"
+    );
+
+    let mut judged: Vec<BemcJudgedRow> = Vec::new();
+    for item in &prep.items {
+        let lead = item.lead.to_display_string();
+        if !lead.contains("_bemc_") {
+            continue;
+        }
+        let verdict =
+            check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
+        let outcome = unit_outcome(item, &verdict);
+        judged.push(BemcJudgedRow {
+            lead,
+            outcome: outcome.outcome,
+            message: outcome.message,
+        });
+    }
+    let BemcJoinCells {
+        joined,
+        agree_reject,
+        agree_accept,
+        fatal: fatal_rows,
+        inconclusive: inconclusive_rows,
+        other: pin_accept_fln_other,
+    } = join_bemc_rows(&judged, &pin_verdicts).unwrap_or_else(|unjoined| panic!("{unjoined}"));
+    assert!(
+        joined == pin_verdicts.len() as u64,
+        "the synthetic module judged {joined} mutant units against {} table rows; a mutant \
+         the transport dropped or the decode lost is missing coverage, not agreement",
+        pin_verdicts.len()
+    );
+    eprintln!(
+        "bemc-join module={chosen} joined={joined} agree_reject={agree_reject} \
+         agree_accept={agree_accept} pin_accept_fln_other={} inconclusive={} fatal={}",
+        pin_accept_fln_other.len(),
+        inconclusive_rows.len(),
+        fatal_rows.len()
+    );
+    for row in &pin_accept_fln_other {
+        eprintln!("bemc-row false-rejection-or-divergence {row}");
+    }
+    for row in &inconclusive_rows {
+        eprintln!("bemc-row inconclusive {row}");
+    }
+    for row in &fatal_rows {
+        eprintln!("bemc-row FATAL {row}");
+    }
+    assert!(
+        fatal_rows.is_empty(),
+        "pin-rejected mutants ACCEPTED by FrankenLean — a soundness-side divergence, \
+         stop-ship (plan R7): {} row(s), first: {}",
+        fatal_rows.len(),
+        fatal_rows[0]
+    );
+    assert!(
+        inconclusive_rows.is_empty(),
+        "{} mutant unit(s) inconclusive: unattributed coverage, not agreement; first: {}",
+        inconclusive_rows.len(),
+        inconclusive_rows[0]
+    );
+    assert!(
+        pin_accept_fln_other.is_empty(),
+        "{} unit(s) where the engines disagree without a soundness fatal (false rejection \
+         or class drift); first: {}",
+        pin_accept_fln_other.len(),
+        pin_accept_fln_other[0]
     );
 }
 

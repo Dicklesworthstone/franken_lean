@@ -267,6 +267,8 @@ fn dependent_proof_fields_and_method_shadowing_preserve_local_identity() {
             .level_params,
         [n("v")]
     );
+    // `proof : P := by rfl` is the pin's `binderTactic`, an `autoParam` field; the omitted field is
+    // filled by its tactic.
     checked(
         &engine(),
         "section

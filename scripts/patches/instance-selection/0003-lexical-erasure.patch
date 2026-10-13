@@ -1,0 +1,357 @@
+diff --git a/crates/fln-elab/src/instances.rs b/crates/fln-elab/src/instances.rs
+index bdbdb28..48d9956 100644
+--- a/crates/fln-elab/src/instances.rs
++++ b/crates/fln-elab/src/instances.rs
+@@ -42,6 +42,8 @@ pub enum InstanceRegistryError {
+     UnknownClass(Name),
+     InvalidInstance(Name),
+     DuplicateInstance(Name),
++    /// Erasure requires an instance active in the current lexical view.
++    NotAnInstance(Name),
+ }
+ 
+ impl std::fmt::Display for InstanceRegistryError {
+@@ -69,6 +71,11 @@ impl std::fmt::Display for InstanceRegistryError {
+             Self::InvalidInstance(n) => {
+                 write!(f, "{} is not a safe class instance", n.to_display_string())
+             }
++            Self::NotAnInstance(n) => write!(
++                f,
++                "`{}` does not have [instance] attribute",
++                n.to_display_string()
++            ),
+             Self::DuplicateInstance(n) => write!(
+                 f,
+                 "instance {} is already registered",
+@@ -99,6 +106,13 @@ pub struct InstanceRegistry {
+     imported: imported::Metadata,
+     /// Dormant namespace registrations, in their original journal order.
+     scoped: BTreeMap<Name, BTreeMap<Name, Vec<InstanceEntry>>>,
++    /// Last registration event and persistent scope of each journal instance.
++    /// Priority updates preserve search order but still clear a prior lexical
++    /// erasure, so their event position is distinct from `InstanceEntry::order`.
++    updates: BTreeMap<Name, (usize, Option<Name>)>,
++    /// Erased global/local rows retained only for `native_instances`: erasure
++    /// changes candidate availability, never a declaration's reducibility.
++    inactive: Vec<InstanceEntry>,
+     /// The pin's discrimination tree over `imported`, built on first use.
+     index: discr_tree::IndexCell,
+ }
+@@ -314,6 +328,8 @@ impl InstanceRegistry {
+                         .or_default(),
+                     None => self.instances.entry(class).or_default(),
+                 };
++                self.updates
++                    .insert(declaration.clone(), (order, scope.clone()));
+                 if let Some((previous_scope, slot)) = positions.get(&declaration) {
+                     if tag == 1 || previous_scope != &scope {
+                         return Err(InstanceRegistryError::Malformed);
+@@ -344,6 +360,16 @@ impl InstanceRegistry {
+     pub fn is_class(&self, name: &Name) -> bool {
+         self.classes.contains(name)
+     }
++    /// Whether this already validated view currently offers the declaration.
++    /// Dormant scoped registrations, erased instances, and default-only
++    /// candidates are not active ordinary instances.
++    pub fn is_instance(&self, declaration: &Name) -> bool {
++        self.instances
++            .values()
++            .flatten()
++            .any(|row| &row.declaration == declaration)
++    }
++
+     pub fn candidates(&self, class: &Name) -> &[InstanceEntry] {
+         self.instances.get(class).map_or(&[], Vec::as_slice)
+     }
+@@ -376,6 +402,7 @@ impl InstanceRegistry {
+             .values()
+             .chain(self.scoped.values().flat_map(|classes| classes.values()))
+             .flatten()
++            .chain(self.inactive.iter())
+             .map(|entry| &entry.declaration)
+             .filter(|name| !self.imported.instances.contains_key(*name))
+     }
+diff --git a/crates/fln-elab/src/instances/scoped.rs b/crates/fln-elab/src/instances/scoped.rs
+index f37fb01..d631e03 100644
+--- a/crates/fln-elab/src/instances/scoped.rs
++++ b/crates/fln-elab/src/instances/scoped.rs
+@@ -25,6 +25,9 @@ enum ActivationKind {
+         declaration: Name,
+         priority: u32,
+     },
++    /// A state-only removal, as at the pin's `instanceExtension.modifyState`.
++    /// It is never appended to the environment's export journal.
++    Erase(Name),
+ }
+ 
+ /// Immutable-snapshot-friendly lexical state. Its private journal anchor binds
+@@ -101,6 +104,32 @@ impl ActiveScopes {
+         )
+     }
+ 
++    /// Remove an active instance until this lexical snapshot is restored.
++    ///
++    /// Like the Reference's `Instances.erase`, this fails for a declaration
++    /// without an active instance attribute. The registration journal, the
++    /// declaration, and its reducibility metadata are unchanged. Re-registering
++    /// the same name later clears its erasure; merely reopening an already
++    /// active namespace does not. No failed validation or limit check publishes
++    /// a partial state.
++    pub fn erase(
++        &mut self,
++        env: &Environment,
++        declaration: &Name,
++    ) -> Result<(), InstanceRegistryError> {
++        self.validate_prefix(env)?;
++        let registry = InstanceRegistry::read_with_scopes(env, self)?;
++        if !env.contains(declaration) {
++            return Err(InstanceRegistryError::UnknownDeclaration(declaration.clone()));
++        }
++        if !registry.is_instance(declaration) {
++            return Err(InstanceRegistryError::NotAnInstance(declaration.clone()));
++        }
++        let mut encoded = Vec::new();
++        write_name(declaration, &mut encoded)?;
++        self.push(env, ActivationKind::Erase(declaration.clone()), encoded.len())
++    }
++
+     fn push(
+         &mut self,
+         env: &Environment,
+@@ -182,13 +211,28 @@ impl InstanceRegistry {
+         // Event keys are (journal boundary, before/at row, activation-local
+         // registration order). One first activation per namespace is retained.
+         let mut events = Vec::new();
++        // Availability has a separate clock from candidate preference. The pin
++        // updates an existing tree entry in place, preserving its search order,
++        // but addInstanceEntry still clears the name from the erased set.
++        type Clock = (usize, u8, usize);
++        let mut restored: BTreeMap<Name, Clock> = BTreeMap::new();
++        let mut erased: BTreeMap<Name, Clock> = BTreeMap::new();
+         for (class, rows) in &registry.instances {
+             for row in rows {
++                let updated = registry
++                    .updates
++                    .get(&row.declaration)
++                    .map_or(row.order, |(at, _)| *at);
++                restored.insert(row.declaration.clone(), (updated, 1, 0));
+                 events.push(((row.order, 1u8, 0usize), class.clone(), row.clone()));
+             }
+         }
+         for (activation_index, activation) in scopes.activations.iter().enumerate() {
+             let namespace = match &activation.kind {
++                ActivationKind::Erase(declaration) => {
++                    erased.insert(declaration.clone(), (activation.at, 0, activation_index));
++                    continue;
++                }
+                 ActivationKind::Namespace(namespace) => namespace,
+                 ActivationKind::Local {
+                     class,
+@@ -198,6 +242,10 @@ impl InstanceRegistry {
+                     if validate_instance(env, declaration)? != *class || !registry.is_class(class) {
+                         return Err(InstanceRegistryError::Malformed);
+                     }
++                    restored
++                        .entry(declaration.clone())
++                        .and_modify(|at| *at = (*at).max((activation.at, 0, activation_index)))
++                        .or_insert((activation.at, 0, activation_index));
+                     events.push((
+                         (activation.at, 0u8, activation_index * (MAX_ROWS + 1)),
+                         class.clone(),
+@@ -215,6 +263,15 @@ impl InstanceRegistry {
+             };
+             for (class, rows) in classes {
+                 for row in rows {
++                    let updated = registry
++                        .updates
++                        .get(&row.declaration)
++                        .map_or(row.order, |(at, _)| *at);
++                    let effect = (updated, 1, 0).max((activation.at, 0, activation_index));
++                    restored
++                        .entry(row.declaration.clone())
++                        .and_modify(|at| *at = (*at).max(effect))
++                        .or_insert(effect);
+                     let key = if row.order < activation.at {
+                         // Distinct namespaces may be opened at the same journal
+                         // boundary. Preserve the user's activation order, then
+@@ -246,6 +303,20 @@ impl InstanceRegistry {
+                 continue;
+             }
+             row.order = order;
++            if erased.get(&row.declaration).is_some_and(|removed| {
++                restored.get(&row.declaration).is_some_and(|added| removed > added)
++            }) {
++                // Dormant scoped rows remain in `registry.scoped`; retaining
++                // them again would duplicate `native_instances` metadata.
++                if !registry
++                    .updates
++                    .get(&row.declaration)
++                    .is_some_and(|(_, scope)| scope.is_some())
++                {
++                    registry.inactive.push(row);
++                }
++                continue;
++            }
+             registry.instances.entry(class).or_default().push(row);
+         }
+         for rows in registry.instances.values_mut() {
+@@ -489,6 +560,159 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn erasure_changes_selection_without_changing_registration_or_reducibility() {
++        let env = cache_fixture(true);
++        let saved_env = env.clone();
++        let global = Name::from_components(["global"]);
++        let mut scopes = ActiveScopes::default();
++        let saved_scope = scopes.clone();
++        let before = InstanceRegistry::read_with_scopes(&env, &scopes).unwrap();
++        let names_before: BTreeSet<_> = before.native_instances().cloned().collect();
++        assert!(before.is_instance(&global));
++
++        scopes.erase(&env, &global).unwrap();
++        let after = InstanceRegistry::read_with_scopes(&env, &scopes).unwrap();
++        assert!(!after.is_instance(&global));
++        assert!(candidate_names(&after).is_empty());
++        assert_eq!(env, saved_env, "erasure writes no persistent metadata");
++        assert_eq!(after.native_instances().cloned().collect::<BTreeSet<_>>(), names_before);
++        assert_eq!(after.native_instances().count(), names_before.len(), "no metadata duplicates");
++        assert!(InstanceRegistry::read(&env).unwrap().is_instance(&global),
++            "the exported registration survives");
++        assert!(InstanceRegistry::read_with_scopes(&env, &saved_scope).unwrap().is_instance(&global),
++            "restoring a scope restores selection");
++    }
++
++    #[test]
++    fn only_an_active_instance_can_be_erased_and_failures_are_atomic() {
++        let env = cache_fixture(true);
++        let mut scopes = ActiveScopes::default();
++        for (name, error) in [
++            ("missing", InstanceRegistryError::UnknownDeclaration(Name::from_components(["missing"]))),
++            ("local", InstanceRegistryError::NotAnInstance(Name::from_components(["local"]))),
++            ("scoped", InstanceRegistryError::NotAnInstance(Name::from_components(["scoped"]))),
++        ] {
++            let saved = scopes.clone();
++            assert_eq!(scopes.erase(&env, &Name::from_components([name])), Err(error));
++            assert_eq!(scopes, saved);
++        }
++        let global = Name::from_components(["global"]);
++        scopes.erase(&env, &global).unwrap();
++        let saved = scopes.clone();
++        let error = scopes.erase(&env, &global).unwrap_err();
++        assert_eq!(error, InstanceRegistryError::NotAnInstance(global));
++        assert_eq!(error.to_string(), "`global` does not have [instance] attribute");
++        assert_eq!(scopes, saved);
++    }
++
++    #[test]
++    fn global_reregistration_clears_erasure_without_moving_equal_priority_order() {
++        let global = Name::from_components(["global"]);
++        let env = register_instance(&cache_fixture(true), &Name::from_components(["later"]), 1000).unwrap();
++        let mut scopes = ActiveScopes::default();
++        scopes.erase(&env, &global).unwrap();
++        assert_eq!(candidate_names(&InstanceRegistry::read_with_scopes(&env, &scopes).unwrap()),
++            [Name::from_components(["later"])]);
++
++        // set_instance updates the original slot, but addInstanceEntry clears
++        // erasure even when neither priority nor preference position changes.
++        let restored = set_instance(&env, &global, 1000).unwrap();
++        assert_eq!(candidate_names(&InstanceRegistry::read_with_scopes(&restored, &scopes).unwrap()),
++            ["later", "global"].map(|name| Name::from_components([name])));
++        // A subsequent erasure wins over that update, and the next update wins
++        // again: the clocks must distinguish every journal boundary.
++        scopes.erase(&restored, &global).unwrap();
++        let promoted = set_instance(&restored, &global, 2000).unwrap();
++        assert_eq!(candidate_names(&InstanceRegistry::read_with_scopes(&promoted, &scopes).unwrap()),
++            ["global", "later"].map(|name| Name::from_components([name])));
++    }
++
++    #[test]
++    fn scoped_reregistration_clears_erasure_but_reopening_does_not() {
++        let env = cache_fixture(true);
++        let namespace = Name::from_components(["N"]);
++        let scoped = Name::from_components(["scoped"]);
++        let mut scopes = ActiveScopes::default();
++        scopes.activate(&env, &namespace).unwrap();
++        scopes.erase(&env, &scoped).unwrap();
++        let erased = scopes.clone();
++        scopes.activate(&env, &namespace).unwrap();
++        assert_eq!(scopes, erased, "an already open namespace adds no event");
++        let hidden = InstanceRegistry::read_with_scopes(&env, &scopes).unwrap();
++        assert_eq!(candidate_names(&hidden), [Name::from_components(["global"])]);
++        assert_eq!(hidden.native_instances().filter(|name| *name == &scoped).count(), 1);
++        let restored = register(&env, &namespace, &scoped, 1000).unwrap();
++        assert_eq!(candidate_names(&InstanceRegistry::read_with_scopes(&restored, &scopes).unwrap()),
++            ["scoped", "global"].map(|name| Name::from_components([name])));
++    }
++
++    #[test]
++    fn erasures_interleave_with_local_activations_at_the_same_journal_boundary() {
++        let env = cache_fixture(true);
++        let mut scopes = ActiveScopes::default();
++        scopes.activate(&env, &Name::from_components(["N"])).unwrap();
++        scopes.erase(&env, &Name::from_components(["scoped"])).unwrap();
++        scopes.register_local(&env, &Name::from_components(["local"]), 2000).unwrap();
++        let outer = scopes.clone();
++        scopes.erase(&env, &Name::from_components(["local"])).unwrap();
++        let hidden = InstanceRegistry::read_with_scopes(&env, &scopes).unwrap();
++        assert_eq!(candidate_names(&hidden), [Name::from_components(["global"])]);
++        assert!(hidden.native_instances().any(|name| name == &Name::from_components(["local"])));
++        assert_eq!(candidate_names(&InstanceRegistry::read_with_scopes(&env, &outer).unwrap()),
++            ["local", "global"].map(|name| Name::from_components([name])));
++        let promoted = set_instance(&env, &Name::from_components(["local"]), 500).unwrap();
++        assert_eq!(candidate_names(&InstanceRegistry::read_with_scopes(&promoted, &scopes).unwrap()),
++            ["global", "local"].map(|name| Name::from_components([name])));
++    }
++
++    #[test]
++    fn erasure_is_bound_to_its_original_journal_prefix() {
++        let env = cache_fixture(true);
++        let mut scopes = ActiveScopes::default();
++        scopes.erase(&env, &Name::from_components(["global"])).unwrap();
++        let saved = scopes.clone();
++        assert_eq!(scopes.erase(&Environment::new(), &Name::from_components(["global"])),
++            Err(InstanceRegistryError::Malformed));
++        assert_eq!(scopes, saved);
++        assert!(matches!(InstanceRegistry::read_with_scopes(&Environment::new(), &scopes),
++            Err(InstanceRegistryError::Malformed)));
++    }
++
++    #[test]
++    fn erasure_respects_the_scope_event_limit_without_losing_the_active_instance() {
++        let env = cache_fixture(true);
++        let mut scopes = ActiveScopes::default();
++        // Exercise the same frozen boundary as public activation without doing
++        // thousands of unrelated full registry reads in this focused test.
++        scopes.activations = Arc::new(vec![Activation {
++            kind: ActivationKind::Namespace(Name::from_components(["unused"])),
++            at: 0,
++        }; MAX_SCOPES]);
++        let saved = scopes.clone();
++        assert_eq!(scopes.erase(&env, &Name::from_components(["global"])),
++            Err(InstanceRegistryError::Limit));
++        assert_eq!(scopes, saved);
++        assert!(InstanceRegistry::read_with_scopes(&env, &scopes).unwrap()
++            .is_instance(&Name::from_components(["global"])));
++    }
++
++    #[test]
++    fn cached_erasure_views_do_not_poison_the_dormant_or_restored_scope() {
++        let env = cache_fixture(true);
++        let cache = RegistryCache::default();
++        let before = ActiveScopes::default();
++        let dormant = cache.read_with_scopes(&env, &before).unwrap();
++        let mut scopes = before.clone();
++        scopes.erase(&env, &Name::from_components(["global"])).unwrap();
++        let erased = cache.read_with_scopes(&env, &scopes).unwrap();
++        assert!(!Arc::ptr_eq(&dormant, &erased));
++        assert!(candidate_names(&erased).is_empty());
++        assert!(Arc::ptr_eq(&erased, &cache.read_with_scopes(&env, &scopes).unwrap()));
++        assert!(Arc::ptr_eq(&dormant, &cache.read(&env).unwrap()));
++        assert!(Arc::ptr_eq(&dormant, &cache.read_with_scopes(&env, &before).unwrap()));
++    }
++
+     #[test]
+     fn activation_limits_are_failure_atomic_and_snapshots_share_their_history() {
+         let env = Environment::new();

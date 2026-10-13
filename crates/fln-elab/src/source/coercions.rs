@@ -3,12 +3,23 @@
 //! grants proof authority: the final declaration still needs kernel admission.
 use super::instances::{nonmatch, registry_error};
 use super::*;
-use crate::instances::InstanceRegistry;
 use fln_env::constants::ConstantInfo;
 
 mod expand;
 mod function;
 mod monad;
+mod postponed;
+mod result_hint;
+
+pub(super) use postponed::PostponedCoercion;
+
+/// A native probe can be blocked before a closed kernel query is possible.
+/// Keep that distinct from a completed query's concrete conversion refusal.
+pub(super) enum Conversion {
+    Equal,
+    Refuted(Verdict),
+    Deferred,
+}
 
 impl Context {
     /// Expected function types expose domain/codomain universe constraints that
@@ -41,34 +52,51 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        Ok(matches!(
+            self.coercion_conversion(actual, expected)?,
+            Conversion::Equal
+        ))
+    }
+
+    pub(super) fn coercion_conversion(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<Conversion, NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
-        // Keep named types when an unknown is assigned, just as constrain_type
-        // does. Eager alias unfolding here would change later class selection.
-        let actual = if matches!(expected.node(), ExprNode::MVar { .. })
-            && matches!(
-                actual.node(),
-                ExprNode::Const { .. } | ExprNode::FVar { .. }
-            ) {
-            actual
-        } else {
-            self.whnf(&actual)?
-        };
-        let expected = if matches!(actual.node(), ExprNode::MVar { .. }) {
-            expected
-        } else {
-            self.whnf(&expected)?
-        };
+        // Ground equations need no assignments. Use the existing query under
+        // Default's unfolding policy before entering the metavariable solver:
+        // dependent recursor telescopes can otherwise be repeatedly rebuilt
+        // by native conversion's type hints. The query sees original terms,
+        // including native Nat operations, and retains the caller's budget.
+        // A closure still mentioning a local type hole has not run a kernel
+        // query; only that Deferred case proceeds to ordinary unification.
+        if !actual.has_expr_mvar()
+            && !actual.has_level_mvar()
+            && !expected.has_expr_mvar()
+            && !expected.has_level_mvar()
+        {
+            match self.coercion_kernel_conversion(actual.clone(), expected.clone())? {
+                Conversion::Deferred => {}
+                result => return Ok(result),
+            }
+        }
+        // Compare the original terms with the ordinary Default reducer. Its
+        // quick assignments preserve named carriers, and its native Nat rung
+        // runs before delta (the pin's WHNF.lean). Source WHNF here would first
+        // expand Nat.add's course-of-values body, hiding arithmetic from that
+        // bounded evaluator and exhausting small nested reflexivity proofs.
         let mut budget = UnificationBudget::new(self.kernel);
-        budget.transparency = UnificationTransparency::SafeDefinitions;
+        budget.transparency = UnificationTransparency::Default;
         // The pin's `isDefEq` here synthesizes an instance its unification has
         // determined (`change 5 = 5` meets `(2 : Int) + 3 = 5` with `?α := Int`).
         match self.unify_pending(&[(actual.clone(), expected.clone())], budget)? {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(Conversion::Equal),
             Err(error) => {
                 let error = failure(SourceInferenceError::Unification(Box::new(error)));
                 if nonmatch(&error) {
-                    self.coercion_kernel_eq(actual, expected)
+                    self.coercion_kernel_conversion(actual, expected)
                 } else {
                     Err(error)
                 }
@@ -76,21 +104,32 @@ impl Context {
         }
     }
 
-    /// The pattern unifier does not implement full arithmetic, proof
-    /// irrelevance or polymorphic conversion. Before inserting a potentially
-    /// observable conversion, ask the existing kernel equality query on closed
-    /// terms. This grants no declaration authority and retains spent work.
+    /// Complete a closed conversion with the kernel's equality machinery under
+    /// the same Default delta restrictions. Theorem bodies stay opaque too,
+    /// matching Meta/GetUnfoldableConst.lean. This grants no declaration
+    /// authority and retains spent work, including inconclusive outcomes.
     pub(in crate::source) fn coercion_kernel_eq(
+        &mut self,
+        left: Expr,
+        right: Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(matches!(
+            self.coercion_kernel_conversion(left, right)?,
+            Conversion::Equal
+        ))
+    }
+
+    fn coercion_kernel_conversion(
         &mut self,
         mut left: Expr,
         mut right: Expr,
-    ) -> Result<bool, NatDefinitionElabError> {
+    ) -> Result<Conversion, NatDefinitionElabError> {
         if left.has_expr_mvar()
             || left.has_level_mvar()
             || right.has_expr_mvar()
             || right.has_level_mvar()
         {
-            return Ok(false);
+            return Ok(Conversion::Deferred);
         }
         let mut needed = self.elimination_reads(&left)?;
         needed.extend(self.elimination_reads(&right)?);
@@ -111,7 +150,7 @@ impl Context {
                     .as_ref()
                     .is_some_and(|v| v.has_expr_mvar() || v.has_level_mvar())
             {
-                return Ok(false);
+                return Ok(Conversion::Deferred);
             }
             needed.extend(self.elimination_reads(&domain)?);
             if let Some(value) = &value {
@@ -198,12 +237,21 @@ impl Context {
         let kernel = self
             .kernel
             .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
-        match fln_kernel::check_def_eq(
+        let reducibility = crate::reducibility::table(&self.txn.env).map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        match fln_kernel::check_def_eq_with_unfolding(
             &self.txn.env,
             &params.into_iter().collect::<Vec<_>>(),
             &left,
             &right,
             kernel,
+            fln_kernel::DefEqUnfolding {
+                opaque_definitions: reducibility.opaque_definitions(),
+                unfold_theorems: false,
+            },
         ) {
             Outcome::Complete(verdict) => {
                 let consumed = match &verdict {
@@ -218,7 +266,10 @@ impl Context {
                     .checked_add(consumed)
                     .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
                 self.tick()?;
-                Ok(verdict.is_accepted())
+                Ok(match verdict {
+                    Verdict::Accepted { .. } => Conversion::Equal,
+                    rejected @ Verdict::Rejected { .. } => Conversion::Refuted(rejected),
+                })
             }
             outcome => Err(failure(SourceInferenceError::TypeObligation(Box::new(
                 outcome,
@@ -236,10 +287,31 @@ impl Context {
         if !self.has_coercion_class("CoeT")?
             && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
+            && !self.has_coercion_class("Monad")?
         {
-            return self.constrain_type(actual, expected);
+            // Keep the written applications for ordinary unification. Reducing
+            // `Id ?A` first exposes its hole and can assign the entire expected
+            // `Id Nat` to it, changing later numeral/instance selection. The
+            // original equation chooses `?A := Nat` before any delta retry.
+            //
+            // A result HINT runs before the remaining argument elaborates, so a
+            // concrete refutation here must stay advisory: making it fatal
+            // masked the argument's own diagnostic — `Nat.succ ·` reported a
+            // NotDefEq conversion instead of the pin's "invalid occurrence of
+            // `·` notation" (fln-ffce comment 3297) — and the coercion branch
+            // below already drops a false equality. The equation is still
+            // checked for real where the application completes and at the
+            // declaration's ordinary K1 admission.
+            match self.constrain(actual, expected) {
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ConversionRefused(_),
+                )) => Ok(()),
+                other => other,
+            }?;
+        } else if self.coercion_eq(actual, expected)? {
+            return Ok(());
         }
-        self.coercion_eq(actual, expected).map(|_| ())
+        self.first_order_result_hint(actual, expected)
     }
 
     fn coercion_level(&mut self, type_: &Expr) -> Result<Option<Level>, NatDefinitionElabError> {
@@ -259,9 +331,10 @@ impl Context {
         &mut self,
         target: Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         let saved = self.txn.lctx.clone();
         let suspended = std::mem::take(&mut self.equations);
         let hole = self.instance_hole(target)?;
@@ -271,7 +344,7 @@ impl Context {
         let result = self.search_instance(id.clone(), &registry);
         self.txn.lctx = saved;
         self.equations = suspended;
-        if result? {
+        if result? == instances::SearchResult::Solved {
             self.instantiate(&hole).map(Some)
         } else {
             Ok(None)
@@ -381,6 +454,17 @@ impl Context {
         if matches!(term.type_.node(), ExprNode::ForallE { .. }) {
             return Ok(term);
         }
+        // A later application argument may determine this carrier, including
+        // a bundled value with its own CoeFun dictionary. Do not select that
+        // carrier by coercion search before it is known.
+        let mut head = &term.type_;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            head = f;
+        }
+        if matches!(head.node(), ExprNode::MVar { .. }) {
+            return Err(failure(SourceInferenceError::ExpectedFunction));
+        }
         let mut trial = self.clone();
         let result = trial.coerce_shape(&term, true);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
@@ -393,6 +477,74 @@ impl Context {
         }
     }
 
+    /// The pin's application loop distinguishes an unavailable *initial*
+    /// function type (`elabAppArgs.tryPostponeIfMVar`) from a telescope that
+    /// runs out during argument processing. The latter first synthesizes
+    /// pending instances, then calls `coerceToFunction?` and fails if it cannot
+    /// produce a function (`App.synthesizePendingAndNormalizeFunType`).
+    ///
+    /// Unknown inputs alone are NOT failure evidence: a generic CoeFun provider
+    /// can match without assigning them. Only an empty provider population is
+    /// decisive here. Read active scoped registrations too; a possible local
+    /// instance or an unknown local type vetoes the proof. A seed class, a rigid
+    /// carrier and every nonempty/unsupported coercion search give no evidence.
+    /// Pending arguments (including a caller's queue), eliminators or equations
+    /// also veto it: the pin synthesizes those before trying CoeFun, and they
+    /// may still reveal a function without any coercion.
+    /// Call only after ordinary synthesis/coercion failed, and never for the
+    /// initial application postponement.
+    pub(in crate::source) fn function_coercion_is_absent(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.pending_source_arguments
+            || !self.postponed_eliminators.is_empty()
+            || !self.postponed_coercions.is_empty()
+            || !self.equations.is_empty()
+            || self.application_type_unavailable(type_)?.is_none()
+        {
+            return Ok(false);
+        }
+        let class = Name::from_components(["CoeFun"]);
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
+        if !self.txn.env.contains(&class)
+            || registry.imported_class_parameters(&class).is_none()
+            || !registry.candidates(&class).is_empty()
+        {
+            return Ok(false);
+        }
+        for local in self.txn.lctx.decls().to_vec() {
+            self.tick()?;
+            if local.binder_info == BinderInfo::InstImplicit {
+                return Ok(false);
+            }
+            let type_ = self.whnf_with_transparency(
+                &local.type_,
+                UnificationTransparency::Abbreviations,
+                false,
+            )?;
+            if type_.has_expr_mvar() || type_.has_level_mvar() {
+                return Ok(false);
+            }
+            // Ordinary function parameters are not local instances. Every
+            // other local must have a known head outside the CoeFun class.
+            if matches!(
+                type_.node(),
+                ExprNode::ForallE { .. } | ExprNode::Sort { .. }
+            ) {
+                continue;
+            }
+            match operators::spine(&type_).0.node() {
+                ExprNode::Const { name, .. } if name != &class => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     pub(in crate::source) fn coerce_expected(
         &mut self,
         term: Typed,
@@ -402,6 +554,7 @@ impl Context {
             && !self.has_coercion_class("CoeSort")?
             && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
+            && !self.has_coercion_class("Monad")?
         {
             // No coercion can exist: a rigid mismatch is final here.
             self.refute_rigid_mismatch(&term.type_, expected)?;
@@ -414,20 +567,43 @@ impl Context {
             trial.resolve_instances(false)?;
             let actual = trial.instantiate(&term.type_)?;
             let target = trial.instantiate(expected)?;
-            // Never guess an unknown target by asking for a coercion.
-            // Preserve normal postponement of expression constraints.
+            // Preserve normal postponement instead of repeatedly solving an
+            // open equation. A known monad lift gets its own isolated attempt
+            // below; unrelated holes must not start broader conversion work.
             if actual.has_expr_mvar() || target.has_expr_mvar() {
-                return Ok(true);
+                return Ok(None);
             }
-            trial.coercion_eq(&actual, &target)
+            trial.coercion_eq(&actual, &target).map(Some)
         })();
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
         match normal {
-            Ok(true) => {
+            Ok(Some(true)) => {
                 *self = trial;
                 return Ok(term);
             }
-            Ok(false) => {}
+            Ok(None) => {
+                // A known MonadLiftT m n can determine the result element in
+                // n ?A even though direct equality with m A is stuck. The pin's
+                // coerceMonadLift? deliberately handles this case before an
+                // ordinary coercion search (Lean/Meta/Coe.lean). Start from the
+                // original context, not the failed direct-typing equations.
+                if let Some(lifted) = self.try_monad_lift(&term, expected)? {
+                    return Ok(lifted);
+                }
+                // A CoeFun dictionary can likewise determine holes in an
+                // expected Pi type. Its own shape/type probe is transactional;
+                // a failed attempt must retain the original deferred equation.
+                if let Some(function) = self.try_expected_function(&term, expected)? {
+                    return Ok(function);
+                }
+                // No coercion: retain the original postponed typing obligations.
+                // In particular, never select an unknown monad by search and
+                // never refund the failed alternative's work.
+                trial.txn.budget.heartbeats_consumed = self.txn.budget.heartbeats_consumed;
+                *self = trial;
+                return Ok(term);
+            }
+            Ok(Some(false)) => {}
             Err(error) if nonmatch(&error) => {}
             Err(error) => return Err(error),
         }
@@ -460,6 +636,11 @@ impl Context {
         if let Some(candidate) = result? {
             *self = trial;
             return Ok(candidate);
+        }
+        // No path yet. While the value is open, the pin postpones a coercion
+        // (`mkCoe`'s `.undef`); instance synthesis resumes it.
+        if let Some(postponed) = self.postpone_coercion(&term, expected)? {
+            return Ok(postponed);
         }
         // No path. A rigid mismatch is the pin's elaboration-time `Type mismatch`; any
         // other closed mismatch still reaches K1, while an unification/resource

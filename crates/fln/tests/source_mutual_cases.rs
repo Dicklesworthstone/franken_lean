@@ -40,7 +40,7 @@ fn engine(families: &[&str]) -> (Engine, EngineAdmissionLimits) {
 }
 const FAMILIES: &[&str] = &[
     "inductive Tree (A : Type) where | node (value : A) (children : Forest A)",
-    "inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)",
+    "inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)",
 ];
 fn check(families: &[&str], source: &str) {
     let (engine, limits) = engine(families);
@@ -65,7 +65,7 @@ fn tactic_cases_return_real_constructor_fields_and_compute() {
 fn dependent_hypotheses_are_specialized_and_original_inputs_are_not_exposed() {
     check(
         FAMILIES,
-        "theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by cases t with | node n xs => exact h\ndef payload (t : Tree Nat) : Type := match t with | .node n xs => Nat\ndef unpack (t : Tree Nat) : payload t := by cases t with | node n xs => exact n\ntheorem unpackComputes : unpack (Tree.node 8 (@Forest.nil Nat)) = 8 := by rfl",
+        "theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by cases t with | node n xs => exact h\ndef payload (t : Tree Nat) : Type := match t with | .node n xs => Nat\ndef unpack (t : Tree Nat) : payload t := by cases t with | node n xs => exact n\ntheorem unpackComputes : unpack (Tree.node 8 (@Forest.nil Nat)) = (8 : Nat) := by rfl",
     );
 }
 #[test]
@@ -87,12 +87,24 @@ fn computed_scrutinees_and_named_equations_preserve_case_identity() {
 }
 #[test]
 fn indexed_mutual_matches_keep_destination_indices_in_the_motive() {
+    // `F.first`, whose first field is not its index, keeps the block's index an index
+    // (the pin: `number of parameters: 1`, `A` alone), and the pin accepts this program.
     check(
         &[
             "inductive T (A : Type) : A -> Type where | node (x : A) (children : F A x) : T A x",
-            "inductive F (B : Type) : B -> Type where | nil (x : B) : F B x | cons (x : B) (t : T B x) : F B x",
+            "inductive F (A : Type) : A -> Type where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x | first (y : A) (x : A) : F A x",
         ],
         "theorem keep (A : Type) (x : A) (t : T A x) (P : (y : A) -> T A y -> Prop) (h : P x t) : P x t := by cases t with | node y children => exact h\ndef read (A : Type) (x : A) (t : T A x) : A := match t with | .node y children => y\ntheorem readComputes : read Nat 7 (T.node 7 (F.nil 7)) = 7 := by rfl",
+    );
+    // Without it the pin promotes `x` (`number of parameters: 2`), so `T.node` has one
+    // field: it refuses `node y children` ("Too many variable names provided") and `.node y
+    // children` (Type mismatch), and accepts this program.
+    check(
+        &[
+            "inductive T (A : Type) : A -> Type where | node (x : A) (children : F A x) : T A x",
+            "inductive F (A : Type) : A -> Type where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x",
+        ],
+        "theorem keep (A : Type) (x : A) (t : T A x) (P : (y : A) -> T A y -> Prop) (h : P x t) : P x t := by cases t with | node children => exact h\ndef read (A : Type) (x : A) (t : T A x) : A := match t with | .node _ children => x\ntheorem readComputes : read Nat 7 (T.node 7 (F.nil 7)) = 7 := by rfl",
     );
 }
 #[test]

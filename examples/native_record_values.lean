@@ -4,8 +4,8 @@ structure Package where
 
 def wrapped : Package := { value := 23, carrier := Nat }
 def unpack (p : Package) : p.carrier := p.value
-theorem wrapped_ok : wrapped.value = 23 := by rfl
-theorem unpack_ok : unpack wrapped = 23 := by rfl
+theorem wrapped_ok : wrapped.value = (23 : Nat) := by rfl
+theorem unpack_ok : unpack wrapped = (23 : Nat) := by rfl
 
 class Choice (A : Type) where
   value : A

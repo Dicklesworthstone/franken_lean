@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "base": "82b12f2450cb24a261b11ca90516758f9395353b",
+  "candidateTree": "dc2b0ae62e70ba53aa3fa1124045f2c13994713f",
+  "files": [
+    {
+      "path": "crates/fln/src/runtime.rs",
+      "baselineSha": "d5b56dc2696cc8330f03d7411e3635c0b2ab6d5e",
+      "baselineMode": "100644",
+      "blobSha": "6d0377820d9d93c91f368c26d5ad1f66a4705577",
+      "bytes": 61039
+    },
+    {
+      "path": "crates/fln/src/runtime/array_fold.rs",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "e489fef102f2864df72263b24d452e10684ed3b9",
+      "bytes": 7034
+    },
+    {
+      "path": "crates/fln/src/runtime/array_fold/tests.rs",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "84f78b5f4c22fe59aa53dfedf9349b23c8ad3c9a",
+      "bytes": 24373
+    },
+    {
+      "path": "crates/fln/src/runtime/global/partial/callbacks.rs",
+      "baselineSha": "744edc108d88fcc52da66a924182f52539f4ed17",
+      "baselineMode": "100644",
+      "blobSha": "c6944f7ce2a80ae90b1a93a05a28b6756681c9a6",
+      "bytes": 20355
+    },
+    {
+      "path": "crates/fln/src/runtime/global/partial/tests.rs",
+      "baselineSha": "079e670d4ce12e75ad57877581a6460bfbab5f3f",
+      "baselineMode": "100644",
+      "blobSha": "d97b17e931b97efecfdb963eaee5c3459e57172f",
+      "bytes": 13954
+    },
+    {
+      "path": "crates/fln/src/runtime/global/partial/tests/matcher_callbacks.rs",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "340da43b16caecf97497be901d89c53fb075fc83",
+      "bytes": 7702
+    },
+    {
+      "path": "crates/fln/src/runtime/implemented_by.rs",
+      "baselineSha": "9cc5ba200b4f466bc008941b6d543817c8465c8a",
+      "baselineMode": "100644",
+      "blobSha": "b6ee5d74f0e79292cff8910e41a0e5a0ee55fa59",
+      "bytes": 9728
+    },
+    {
+      "path": "crates/fln/src/runtime/specialize.rs",
+      "baselineSha": "be9a9ad2ca046a888e11831f7b1c9a89b09bbdb1",
+      "baselineMode": "100644",
+      "blobSha": "aa78e8782900b3c7cf3f30ad1985d70177bb24d0",
+      "bytes": 59103
+    },
+    {
+      "path": "crates/fln/src/source_intrinsics.rs",
+      "baselineSha": "d614948ea2ed34f52ff0144b75d96513b3e5f3a9",
+      "baselineMode": "100644",
+      "blobSha": "68425a755dbc75151d1aa29314d0d76c14cee5a1",
+      "bytes": 16498
+    },
+    {
+      "path": "crates/fln/src/source_intrinsics/array_fold.rs",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "2ca0ebbd21a3453ff2b4ef19cd3f45b6ad27b67b",
+      "bytes": 4935
+    },
+    {
+      "path": "crates/fln/src/source_intrinsics/array_fold/dependencies.txt",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "34e324013a95bdaf844eb9293edb40d75cc9b6f7",
+      "bytes": 35760
+    },
+    {
+      "path": "crates/fln/tests/source_imported_arrays.rs",
+      "baselineSha": "081ceb479e29af90856bb61a209c45d3c9e45e56",
+      "baselineMode": "100644",
+      "blobSha": "97d17b96582bf84f7a2a64df01c8fdd554e4f3ee",
+      "bytes": 23568
+    },
+    {
+      "path": "crates/fln/tests/source_imported_arrays/check_oracle.py",
+      "baselineSha": "9d4aa278f8479ee2ffe834fd5b43057374257079",
+      "baselineMode": "100644",
+      "blobSha": "8ababf9ac6771c3d023a9af4667320d64c0a85fe",
+      "bytes": 3909
+    },
+    {
+      "path": "crates/fln/tests/source_imported_arrays/fold_effects.lean",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "4f467ecbbeb703e80fc2415ee50a6bc47a721541",
+      "bytes": 3759
+    },
+    {
+      "path": "crates/fln/tests/source_imported_arrays/folds.lean",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "b634c80f5d511b15abad7a12ded2689e20b8183b",
+      "bytes": 2950
+    },
+    {
+      "path": "crates/fln/tests/source_imported_arrays/folds.rs",
+      "baselineSha": null,
+      "baselineMode": null,
+      "blobSha": "9780dfa3141a77382066d25a1e991d392959c2b9",
+      "bytes": 9535
+    }
+  ]
+}

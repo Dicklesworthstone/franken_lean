@@ -25,6 +25,43 @@ fn value(result: &DefinitionBatchExecution, expected: &str) {
 const POINT: &str = "structure Point where\n  x : Nat\n  y : Nat\n";
 
 #[test]
+fn nullary_proof_definitions_are_checked_without_becoming_runtime_entries() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let proof = Name::from_components(["ordinaryProof"]);
+    let completed = base
+        .execute_source_commands_with_checks(
+            b"def ordinaryProof : True := True.intro\ndef answer := 42\n#eval answer",
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    value(&completed.batch, "42");
+    assert_eq!(completed.execution_command_indices, [1, 2]);
+    assert_eq!(completed.batch.source_admissions.len(), 1);
+    let receipt = &completed.batch.source_admissions[0];
+    assert_eq!(receipt.command_index, 0);
+    assert!(matches!(receipt.admission.admissions.as_slice(),
+        [checked] if matches!(&checked.declaration,
+            fln::Declaration::Defn(definition) if definition.base.name == proof)));
+    assert!(matches!(
+        completed.batch.engine.environment().find(&proof),
+        Some(fln::ConstantInfo::Defn(_))
+    ));
+    let failed = base.execute_source_commands_with_checks(
+        b"def answer := 42\ndef ordinaryProof : 0 = 1 := by rfl\n#eval answer",
+        &options,
+        limits(),
+    );
+    assert!(!matches!(failed, Ok(Outcome::Complete(_))));
+    assert_eq!(base.logical_root(&options), root);
+    assert!(!base.environment().contains(&proof));
+}
+
+#[test]
 fn anonymous_examples_are_silent_checked_commands_between_executions() {
     let base = engine();
     let options = KVMap::new();
@@ -212,6 +249,48 @@ fn declaration_only_streams_and_scratch_checks_do_not_fabricate_executions() {
     assert_eq!(batch.source_admissions.len(), 1);
 }
 
+/// The executing stream admits an inline `@[simp]` the way `check_source_files` does: the
+/// lemma is registered, so a later `by simp` can use it, and an attributed example is refused.
+#[test]
+fn inline_simp_lemmas_are_registered_in_an_executing_source_stream() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let completed = base
+        .execute_source_commands_with_checks(
+            b"def wrap (n : Nat) : Nat := n\n@[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp\n#eval wrap 42",
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    value(&completed.batch, "42");
+    assert_eq!(
+        fln_elab::source::scope::simp::read(completed.batch.engine.environment())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        completed
+            .batch
+            .engine
+            .environment()
+            .contains(&Name::from_components(["use"]))
+    );
+    let attributed_example = base.execute_source_commands_with_checks(
+        b"@[simp] example : 0 = 0 := by rfl\n#eval 1",
+        &options,
+        limits(),
+    );
+    assert!(
+        !matches!(attributed_example, Ok(Outcome::Complete(_))),
+        "{attributed_example:?}"
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
 #[test]
 fn single_constructor_inductives_are_usable_in_ordinary_source_files() {
     let batch = engine().execute_source_definitions(&[b"inductive Item where\n  | mk (value : Nat)\ndef get (p : Item) : Nat := match p with | .mk n => n\n#eval get (Item.mk 42)"], &KVMap::new(), limits())
@@ -288,7 +367,7 @@ fn unimported_sibling_types_constructors_projections_defaults_and_proofs_are_ref
         let modules = [
             SourceModuleInput {
                 name: &entry,
-                source: b"import A B\n#eval 42",
+                source: b"import A\nimport B\n#eval 42",
             },
             SourceModuleInput {
                 name: &b,

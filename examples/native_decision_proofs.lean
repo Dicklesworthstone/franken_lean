@@ -1,5 +1,5 @@
 theorem true_proof : True := by decide
-theorem not_false : Not False := by decide
+theorem false_refuted : Not False := by decide
 theorem double_negation : Not (Not True) := by decide
 
 inductive Holds : Prop where
@@ -13,7 +13,7 @@ theorem supplied (p : Prop) [Decidable p] (computed : decide p = true) : p :=
 
 theorem available (p : Prop) (hp : p) : p := by
   let witness : Decidable p := Decidable.isTrue hp
-  decide
+  exact of_decide_eq_true rfl
 
 theorem generated : True := by
   have h : Not False := by decide

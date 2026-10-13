@@ -6,17 +6,38 @@ use super::*;
 pub(super) struct Prefix {
     keyword: usize,
     lambda: bool,
+    record_field: bool,
+    /// `∃ binders, body`: forall's binder grammar (the pin's explicitBinders are a
+    /// sublanguage of it), built as the pin's `«term∃_,_»` node. The elaborator's
+    /// expansion pass rewrites it to nested `Exists fun x => ...`, as the pin's macro.
+    exists: bool,
+    /// `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`): `∃`'s `explicitBinders` grammar under
+    /// their own node kinds, `«termΣ_,_»` and `«termΣ'_,_»`, with no binder predicate.
+    sigma: Option<&'static str>,
     dependent_arrow: bool,
     binders: Vec<Syntax>,
     annotation: Option<(usize, Syntax)>,
+    /// `∀ x ∈ s, p` and `∃ x < n, p` (`Init/BinderPredicates.lean`): the operator and its term.
+    predicate: Option<(usize, Syntax)>,
     separator: Option<usize>,
+    /// A record field's `:= private v`: the `private` (`structInstFieldDef`'s optional slot).
+    private: Option<usize>,
     phase: Phase,
 }
 
 enum Phase {
     Group(Group),
     SharedType(usize),
+    /// A binder predicate's term, ended by the quantifier's comma.
+    Predicate(usize),
     Body,
+}
+
+/// The binder predicates `Init/BinderPredicates.lean` declares: `syntax "∈ " term : binderPred`
+/// and the like, each its own `Lean.binderPred<op>_` kind.
+fn predicate_operator(tokens: &[LexedToken], at: usize) -> bool {
+    matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s))
+        if matches!(s.as_str(), "∈" | "∉" | "⊆" | "⊂" | "⊇" | "⊃" | "<" | "≤" | ">" | "≥" | "≠"))
 }
 
 struct Group {
@@ -86,10 +107,51 @@ impl Prefix {
         let mut prefix = Self {
             keyword,
             lambda: symbol(tokens, keyword, "fun") || symbol(tokens, keyword, "λ"),
+            record_field: false,
+            exists: ["∃", "Σ", "Σ'"]
+                .into_iter()
+                .any(|word| symbol(tokens, keyword, word)),
+            sigma: if symbol(tokens, keyword, "Σ") {
+                Some("termΣ_,_")
+            } else if symbol(tokens, keyword, "Σ'") {
+                Some("termΣ'_,_")
+            } else {
+                None
+            },
             dependent_arrow,
             binders: Vec::new(),
             annotation: None,
+            predicate: None,
             separator: None,
+            private: None,
+            phase: Phase::Body,
+        };
+        prefix.header(leaves, view, tokens, cursor, end)?;
+        Ok(prefix)
+    }
+
+    /// A structure field uses the same heap phases as a telescope, with `:=`
+    /// ending its header. Its optional type annotates the result of the method.
+    pub(super) fn field(
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        name: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let mut prefix = Self {
+            keyword: name,
+            lambda: false,
+            record_field: true,
+            exists: false,
+            sigma: None,
+            dependent_arrow: false,
+            binders: Vec::new(),
+            annotation: None,
+            predicate: None,
+            separator: None,
+            private: None,
             phase: Phase::Body,
         };
         prefix.header(leaves, view, tokens, cursor, end)?;
@@ -97,7 +159,9 @@ impl Prefix {
     }
 
     fn separator(&self, tokens: &[LexedToken], at: usize) -> bool {
-        if self.dependent_arrow {
+        if self.record_field {
+            symbol(tokens, at, ":=")
+        } else if self.dependent_arrow {
             symbol(tokens, at, "->") || symbol(tokens, at, "→")
         } else if self.lambda {
             symbol(tokens, at, "=>") || symbol(tokens, at, "↦")
@@ -110,10 +174,28 @@ impl Prefix {
         matches!(self.phase, Phase::Body)
     }
 
+    /// Whether `at` is a record field's `private` right after its `:=`, which the value does not
+    /// read (`structInstFieldDef := " := " optional("private") term`).
+    pub(super) fn reads_private(&self, tokens: &[LexedToken], at: usize) -> bool {
+        self.record_field
+            && self.private.is_none()
+            && at > 0
+            && self.separator == Some(at - 1)
+            && symbol(tokens, at, "private")
+    }
+
+    pub(super) fn take_private(&mut self, at: usize) {
+        self.private = Some(at);
+    }
+
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match &self.phase {
-            Phase::Group(group) => symbol(tokens, at, group.close),
-            Phase::SharedType(_) => self.separator(tokens, at),
+            // `(h : T := v)`: `explicitBinder`'s `binderDefault <|> binderTactic` follows the type.
+            Phase::Group(group) => {
+                symbol(tokens, at, group.close)
+                    || (group.kind == "explicitBinder" && !self.lambda && symbol(tokens, at, ":="))
+            }
+            Phase::SharedType(_) | Phase::Predicate(_) => self.separator(tokens, at),
             Phase::Body => false,
         }
     }
@@ -139,8 +221,57 @@ impl Prefix {
                 return Ok(());
             }
             if name(tokens, *cursor) {
+                // `explicitBinders` is all-bracketed or all-bare, never mixed.
+                if self.exists && self.binders.iter().any(|b| !is_bare(b)) {
+                    return Err(refuse(view, tokens, *cursor));
+                }
                 self.binders.push(binder_name(leaves, tokens, *cursor)?);
                 *cursor += 1;
+                // `"∀ " binderIdent binderPred ", " term`: one name, then the predicate.
+                if self.binders.len() == 1
+                    && !self.lambda
+                    && !self.record_field
+                    && self.sigma.is_none()
+                    && predicate_operator(tokens, *cursor)
+                {
+                    self.phase = Phase::Predicate(*cursor);
+                    *cursor += 1;
+                    return Ok(());
+                }
+                continue;
+            }
+            // Inside a quotation, a binder that is one antiquotation (`fun $x => …`).
+            if self.lambda
+                && let Some((antiquotation, next)) = crate::quotations::antiquotation(
+                    leaves,
+                    view,
+                    tokens,
+                    *cursor,
+                    end,
+                    crate::quotations::Position::FunBinder,
+                )?
+            {
+                self.binders.push(antiquotation);
+                *cursor = next;
+                continue;
+            }
+            // `funBinder` admits a term (`Lean/Parser/Term.lean`): an anonymous-constructor
+            // pattern `⟨x, _⟩`, which the elaborator destructures or refuses.
+            // A tuple pattern `(a, b)` likewise: a parenthesis holding a top-level comma.
+            let tuple = self.lambda
+                && symbol(tokens, *cursor, "(")
+                && pattern_close(tokens, *cursor, end)
+                    .is_some_and(|close| top_level_comma(tokens, *cursor + 1, close));
+            if self.lambda && (symbol(tokens, *cursor, "⟨") || tuple) {
+                let close = pattern_close(tokens, *cursor, end)
+                    .ok_or_else(|| refuse(view, tokens, *cursor))?;
+                self.binders.push(crate::nested_term(
+                    leaves,
+                    view,
+                    tokens,
+                    *cursor..close + 1,
+                )?);
+                *cursor = close + 1;
                 continue;
             }
             let kind = match tokens.get(*cursor).map(|t| &t.kind) {
@@ -154,6 +285,10 @@ impl Prefix {
                 _ => None,
             };
             if let Some((kind, close)) = kind {
+                // `bracketedExplicitBinders` is `(` names `:` type `)` only.
+                if self.exists && (kind != "explicitBinder" || self.binders.iter().any(is_bare)) {
+                    return Err(refuse(view, tokens, *cursor));
+                }
                 let open = *cursor;
                 *cursor += 1;
                 let start = *cursor;
@@ -190,7 +325,7 @@ impl Prefix {
                     *cursor += 1;
                     return Ok(());
                 }
-                if *cursor < end && symbol(tokens, *cursor, close) {
+                if *cursor < end && symbol(tokens, *cursor, close) && !self.exists {
                     let group = Group {
                         open,
                         names,
@@ -199,16 +334,19 @@ impl Prefix {
                         close,
                     };
                     self.binders
-                        .push(self.group_syntax(leaves, tokens, group, *cursor, None)?);
+                        .push(self.group_syntax(leaves, tokens, group, *cursor, None, None)?);
                     *cursor += 1;
                     continue;
                 }
                 return Err(refuse(view, tokens, *cursor));
             }
-            if self.binders.is_empty() {
+            if self.binders.is_empty() && !self.record_field {
                 return Err(refuse(view, tokens, *cursor));
             }
             if symbol(tokens, *cursor, ":") {
+                if self.exists && self.binders.iter().any(|b| !is_bare(b)) {
+                    return Err(refuse(view, tokens, *cursor));
+                }
                 self.phase = Phase::SharedType(*cursor);
                 *cursor += 1;
                 return Ok(());
@@ -231,6 +369,7 @@ impl Prefix {
         group: Group,
         at: usize,
         domain: Option<Syntax>,
+        default: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionParseError> {
         let names = group
             .names
@@ -293,7 +432,7 @@ impl Prefix {
         };
         let mut parts = vec![leaves.leaf(group.open)?, null_node(names), type_];
         if group.kind == "explicitBinder" {
-            parts.push(null_node(vec![]));
+            parts.push(null_node(default.into_iter().collect()));
         }
         parts.push(leaves.leaf(at)?);
         Ok(Syntax::node(parser_kind(&["Term", group.kind]), parts))
@@ -311,12 +450,55 @@ impl Prefix {
         let mut cursor = at + 1;
         match std::mem::replace(&mut self.phase, Phase::Body) {
             Phase::Group(group) => {
-                self.binders
-                    .push(self.group_syntax(leaves, tokens, group, at, Some(domain))?);
+                // The type ended at `:=`: the default runs to the group's own closing bracket.
+                let (close, default) = if symbol(tokens, at, ":=") {
+                    let mut depth = 0usize;
+                    let mut close = None;
+                    for (index, token) in tokens.iter().enumerate().take(end).skip(at + 1) {
+                        if let TokenKind::Symbol(s) = &token.kind {
+                            match crate::canonical_bracket(s.as_str()) {
+                                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                                ")" | "]" | "}" | "⦄" | "⟩" if depth == 0 => {
+                                    close = Some(index);
+                                    break;
+                                }
+                                ")" | "]" | "}" | "⦄" | "⟩" => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    let close = close
+                        .filter(|close| symbol(tokens, *close, group.close) && *close > at + 1)
+                        .ok_or_else(|| refuse(view, tokens, at))?;
+                    let default = crate::binder_default(
+                        leaves,
+                        view,
+                        tokens,
+                        at,
+                        close,
+                        DefinitionGrammar::Scalar,
+                    )?;
+                    (close, Some(default))
+                } else {
+                    (at, None)
+                };
+                cursor = close + 1;
+                self.binders.push(self.group_syntax(
+                    leaves,
+                    tokens,
+                    group,
+                    close,
+                    Some(domain),
+                    default,
+                )?);
                 self.header(leaves, view, tokens, &mut cursor, end)?;
             }
             Phase::SharedType(colon) => {
                 self.annotation = Some((colon, domain));
+                self.separator = Some(at);
+            }
+            Phase::Predicate(operator) => {
+                self.predicate = Some((operator, domain));
                 self.separator = Some(at);
             }
             Phase::Body => unreachable!("only a header can finish here"),
@@ -329,6 +511,46 @@ impl Prefix {
         leaves: &Leaves,
         body: Syntax,
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
+        if let Some((operator, term)) = self.predicate {
+            let operator = leaves.leaf(operator)?;
+            let predicate = match &operator {
+                Syntax::Atom { val, .. } => lean_kind(&format!("binderPred{val}_")),
+                _ => unreachable!("a predicate operator is a symbol"),
+            };
+            let binder = self
+                .binders
+                .into_iter()
+                .next()
+                .expect("one predicate binder");
+            let syntax = Syntax::node(
+                lean_kind(if self.exists {
+                    "term∃__,_"
+                } else {
+                    "term∀__,_"
+                }),
+                vec![
+                    leaves.leaf(self.keyword)?,
+                    Syntax::node(lean_kind("binderIdent"), vec![binder]),
+                    Syntax::node(predicate, vec![operator, term]),
+                    leaves.leaf(self.separator.expect("completed prefix separator"))?,
+                    body,
+                ],
+            );
+            return Ok((syntax, self.keyword));
+        }
+        if self.exists {
+            let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
+            let syntax = Syntax::node(
+                Name::str(Name::anonymous(), self.sigma.unwrap_or("term∃_,_")),
+                vec![
+                    leaves.leaf(self.keyword)?,
+                    explicit_binders(self.binders, self.annotation, leaves)?,
+                    separator,
+                    body,
+                ],
+            );
+            return Ok((syntax, self.keyword));
+        }
         let annotation = match self.annotation {
             Some((colon, type_)) => null_node(vec![Syntax::node(
                 parser_kind(&["Term", "typeSpec"]),
@@ -337,7 +559,32 @@ impl Prefix {
             None => null_node(vec![]),
         };
         let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
-        let syntax = if self.dependent_arrow {
+        let syntax = if self.record_field {
+            Syntax::node(
+                parser_kind(&["Term", "structInstField"]),
+                vec![
+                    Syntax::node(
+                        parser_kind(&["Term", "structInstLVal"]),
+                        vec![leaves.leaf(self.keyword)?, null_node(Vec::new())],
+                    ),
+                    null_node(vec![
+                        null_node(self.binders),
+                        annotation,
+                        Syntax::node(
+                            parser_kind(&["Term", "structInstFieldDef"]),
+                            vec![
+                                separator,
+                                null_node(match self.private {
+                                    Some(at) => vec![leaves.leaf(at)?],
+                                    None => Vec::new(),
+                                }),
+                                body,
+                            ],
+                        ),
+                    ]),
+                ],
+            )
+        } else if self.dependent_arrow {
             Syntax::node(
                 parser_kind(&["Term", "depArrow"]),
                 vec![
@@ -374,6 +621,82 @@ impl Prefix {
     }
 }
 
+/// A bare binder: an identifier or `_`, as opposed to a bracketed group.
+fn is_bare(binder: &Syntax) -> bool {
+    matches!(binder, Syntax::Ident { .. }) || binder.kind() == Some(&parser_kind(&["Term", "hole"]))
+}
+
+fn lean_kind(name: &str) -> Name {
+    Name::from_components(["Lean", name])
+}
+
+/// The pin's `explicitBinders` (`Init/NotationExtra.lean`): bare names with an optional
+/// shared type (`unbracketedExplicitBinders`), or one `bracketedExplicitBinders` per
+/// `(names : type)` group. `header` admitted only those two shapes.
+fn explicit_binders(
+    binders: Vec<Syntax>,
+    annotation: Option<(usize, Syntax)>,
+    leaves: &Leaves,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let binder_ident = |name: Syntax| Syntax::node(lean_kind("binderIdent"), vec![name]);
+    let inner = if binders.iter().all(is_bare) {
+        let type_ = match annotation {
+            Some((colon, type_)) => null_node(vec![leaves.leaf(colon)?, type_]),
+            None => null_node(vec![]),
+        };
+        Syntax::node(
+            lean_kind("unbracketedExplicitBinders"),
+            vec![
+                null_node(binders.into_iter().map(binder_ident).collect()),
+                type_,
+            ],
+        )
+    } else {
+        let mut groups = Vec::with_capacity(binders.len());
+        for group in binders {
+            // `[open, names, [colon, type], [], close]`, as `group_syntax` built it.
+            let Syntax::Node { args, .. } = &group else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            let [open, names, typed, _default, close] = args.as_slice() else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            let (Syntax::Node { args: names, .. }, Syntax::Node { args: typed, .. }) =
+                (names, typed)
+            else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            let [colon, type_] = typed.as_slice() else {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: BytePos(0),
+                    expected: NatDefinitionExpectation::ParameterTypeAscription,
+                });
+            };
+            groups.push(Syntax::node(
+                lean_kind("bracketedExplicitBinders"),
+                vec![
+                    open.clone(),
+                    null_node(names.iter().cloned().map(binder_ident).collect()),
+                    colon.clone(),
+                    type_.clone(),
+                    close.clone(),
+                ],
+            ));
+        }
+        null_node(groups)
+    };
+    Ok(Syntax::node(lean_kind("explicitBinders"), vec![inner]))
+}
+
 /// Resolve the bracket/term ambiguity once per input range, without repeated
 /// scans of nested domains. A typed group immediately before an arrow is a Pi.
 pub(super) fn arrow_openers(
@@ -387,19 +710,22 @@ pub(super) fn arrow_openers(
         let TokenKind::Symbol(s) = &tokens[at].kind else {
             continue;
         };
-        match s.as_str() {
-            "(" | "{" | "[" | "⦃" | ".{" => {
+        // Every bracket is balanced (`#[]`, `⟨…⟩`, a quotation inside a binder); only a
+        // binder's own bracket can open a dependent arrow.
+        match crate::canonical_bracket(s.as_str()) {
+            opener @ ("(" | "{" | "[" | "⦃" | ".{" | "⟨") => {
+                let binder = matches!(s.as_str(), "(" | "{" | "[" | "⦃" | ".{");
                 let mut next = at + 1;
                 while next < end && name(tokens, next) {
                     next += 1;
                 }
                 let typed = s == "[" || (next > at + 1 && next < end && symbol(tokens, next, ":"));
-                stack.push((at, s.as_str(), typed));
+                stack.push((at, if binder { opener } else { "" }, binder && typed));
             }
-            ")" | "}" | "]" | "⦄" => {
+            closer @ (")" | "}" | "]" | "⦄" | "⟩") => {
                 if let Some((open, opener, typed)) = stack.pop() {
                     let matches = matches!(
-                        (opener, s.as_str()),
+                        (opener, closer),
                         ("(", ")") | ("{", "}") | ("[", "]") | ("⦃", "⦄")
                     );
                     if matches
@@ -415,6 +741,42 @@ pub(super) fn arrow_openers(
         }
     }
     result
+}
+
+/// Whether a comma sits at bracket depth 0 in `tokens[from..to]`.
+fn top_level_comma(tokens: &[LexedToken], from: usize, to: usize) -> bool {
+    let mut depth = 0usize;
+    for token in &tokens[from..to] {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                "," if depth == 0 => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// The bracket closing the one opened at `open` (`⟩` or `)`), before `end`.
+fn pattern_close(tokens: &[LexedToken], open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, token) in tokens.iter().enumerate().take(end).skip(open) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return (s == "⟩" || s == ")").then_some(at);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -499,5 +861,62 @@ mod tests {
     fn nat_only_door_does_not_gain_term_binders() {
         assert!(parse_nat_definition(b"def f := fun (x : Nat) => x").is_err());
         assert!(parse_nat_definition(b"def f : (x : Nat) -> Nat := 0").is_err());
+    }
+
+    /// `∃` uses forall's binder grammar and builds the pin's `«term∃_,_»` node, and the
+    /// relation and Boolean operators build the pin's `term_>_`-style nodes. Every byte of
+    /// the source survives.
+    #[test]
+    fn existentials_and_relations_build_the_pins_nodes() {
+        let kinds = |source: &str| {
+            let parsed = parse_source_command(source.as_bytes())
+                .unwrap_or_else(|e| panic!("{source}: {e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            let mut pending = vec![parsed.syntax.clone()];
+            let mut kinds = Vec::new();
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = &syntax {
+                    kinds.push(kind.to_display_string());
+                    pending.extend(args.iter().cloned());
+                }
+            }
+            kinds
+        };
+        let exists = Name::str(Name::anonymous(), "term∃_,_").to_display_string();
+        for source in [
+            "theorem t : ∃ n : Nat, n = 1 := _",
+            "theorem t : ∃ x y : Nat, x = y := _",
+            "theorem t : ∃ (n : Nat) (m : Nat), n = m := _",
+            "theorem t (p : Nat -> Prop) : ∃ n, p n := _",
+        ] {
+            assert_eq!(
+                kinds(source).iter().filter(|k| **k == exists).count(),
+                1,
+                "{source}"
+            );
+        }
+        for (spelling, kind) in [
+            (">", "term_>_"),
+            // The ASCII spelling of `unicode(" ≥ ", " >= ")` is the same syntax.
+            (">=", "term_≥_"),
+            ("<=", "term_≤_"),
+            ("≥", "term_≥_"),
+            ("≤", "term_≤_"),
+            ("≠", "term_≠_"),
+            ("!=", "term_!=_"),
+            ("&&", "term_&&_"),
+            ("||", "term_||_"),
+        ] {
+            let source = format!("def t := a {spelling} b");
+            let expected = Name::str(Name::anonymous(), kind).to_display_string();
+            assert!(kinds(&source).contains(&expected), "{source}");
+        }
+        // The relations are non-associative, as the pin's `infix:50`.
+        assert!(parse_source_command(b"def t := a > b > c").is_err());
+        // `&&` binds tighter than `||`: `a || (b && c)`.
+        let kinds_of_mixed = kinds("def t := a || b && c");
+        let or = kinds_of_mixed.iter().position(|k| k == "term_||_");
+        let and = kinds_of_mixed.iter().position(|k| k == "term_&&_");
+        assert!(or < and, "{kinds_of_mixed:?}");
     }
 }

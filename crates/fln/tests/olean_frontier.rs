@@ -104,6 +104,9 @@ fn a_failing_module_blocks_only_its_dependents() {
                         OleanFrontierEvent::Settled { position, row, .. } => {
                             arrivals.push((position, false, row.name.clone()));
                         }
+                        OleanFrontierEvent::Retrying { .. } => {
+                            panic!("this fixture did not refuse host memory")
+                        }
                         OleanFrontierEvent::Decided {
                             position,
                             total,

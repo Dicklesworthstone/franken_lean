@@ -7,6 +7,7 @@
 use super::*;
 use fln_core::expr::Literal;
 use fln_core::level::Level;
+pub(super) mod query;
 
 // Types here are relative to the context *before* their binder was introduced.
 // Lifting by index + 1 reopens a selected domain in the current context.
@@ -15,6 +16,21 @@ enum TypeFrame {
     Projection(Name, u64, Expr),
     Lambda(Name, Expr, BinderInfo),
     Let(Expr),
+}
+
+/// The inference worklist owns only its newly introduced domains. The two
+/// borrowed prefixes are the caller's context and any Pi domains a surrounding
+/// proposition query already opened. Indices still count from the end of the
+/// complete telescope, independently of where its slices are stored.
+fn type_local(index: u32, scopes: [&[Expr]; 3]) -> Option<&Expr> {
+    let mut index = usize::try_from(index).ok()?;
+    for scope in scopes {
+        if index < scope.len() {
+            return scope.get(scope.len() - 1 - index);
+        }
+        index -= scope.len();
+    }
+    None
 }
 
 enum ProjectionFrame {
@@ -35,6 +51,9 @@ impl Preparation<'_> {
         head: &Expr,
         arguments: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, arguments)? {
+            return Ok(Some(replacement));
+        }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
@@ -104,17 +123,17 @@ impl Preparation<'_> {
                 arguments[arity..].iter().cloned().fold(field, Expr::app),
             ));
         }
-        // A boxed slot's projection function has a dependent result type, so
-        // it is never compiled as a function. Select the field from the
-        // receiver's closed layout instead; the receiver still occurs once.
+        // A hidden-type field's projection function may have a dependent
+        // result type. Select its checked runtime field interface from the
+        // receiver's closed layout; the receiver still occurs exactly once.
         let Some(receiver_type) = receiver_type.filter(|type_| !type_.has_loose_bvars()) else {
             return Ok(None);
         };
         let Some((shape, field)) = self.projection_slot(&receiver_type, struct_name, *idx)? else {
             return Ok(None);
         };
-        if field != records::boxed_slot_type()
-            || self.value_type(&shape.source)? != Some(ValueType::Constructor)
+        if self.value_type(&shape.source)? != Some(ValueType::Constructor)
+            || self.value_type(&field)?.is_none()
         {
             return Ok(None);
         }
@@ -136,6 +155,14 @@ impl Preparation<'_> {
         index: u64,
         receiver: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
+        self.tick()?;
+        let key = specialize::closed(receiver).then(|| (family.clone(), index, receiver.clone()));
+        if let Some(value) = key
+            .as_ref()
+            .and_then(|key| self.specializations.executable_projections.get(key))
+        {
+            return Ok(Some(value.clone()));
+        }
         let Some(field) = self.static_projection(family, index, receiver)? else {
             return Ok(None);
         };
@@ -146,7 +173,34 @@ impl Preparation<'_> {
         // receiver supplies the complete lexical context; no runtime receiver
         // is evaluated, duplicated or discarded by this step.
         let field = self.erase_proofs(&field, None)?;
-        self.lower_projections(&field).map(Some)
+        let field = self.lower_projections(&field)?;
+        if let Some(key) = key
+            && specialize::closed(&field)
+        {
+            self.tick()?;
+            let entries = &mut self.specializations.executable_projections;
+            let additional = usize::from(!entries.contains_key(&key));
+            let observed = entries.len().saturating_add(additional);
+            if observed > self.limits.max_nodes {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::Nodes,
+                    limit: self.limits.max_nodes,
+                    observed,
+                });
+            }
+            entries
+                .try_reserve(additional)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::Nodes,
+                    requested: observed,
+                })?;
+            // The key includes even the receiver fields that selection drops.
+            // Only completed, closed preparation is reusable. Runtime field
+            // computations stay in the result at each original occurrence;
+            // later layout discovery cannot roll back this completed prefix.
+            entries.insert(key, field.clone());
+        }
+        Ok(Some(field))
     }
 
     /// Reconstruct a source type using explicit continuations. In particular,
@@ -157,12 +211,40 @@ impl Preparation<'_> {
         source: &Expr,
         context: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        self.projection_receiver_type_in(source, context, &[], 0)
+    }
+
+    /// `omitted_depth` retains the lexical size of an unrelated outer context
+    /// which a closed enclosing query did not copy. No expression in this
+    /// query can refer to those omitted locals, but new binders still count.
+    pub(super) fn projection_receiver_type_in(
+        &mut self,
+        source: &Expr,
+        context: &[Expr],
+        suffix: &[Expr],
+        omitted_depth: usize,
+    ) -> Result<Option<Expr>, IngressError> {
+        query::receiver_type(self, source, context, suffix, omitted_depth)
+    }
+
+    fn infer_receiver_type(
+        &mut self,
+        source: &Expr,
+        context: &[Expr],
+        suffix: &[Expr],
+        omitted_depth: usize,
+        dependency: &mut Option<query::Local>,
+    ) -> Result<Option<Expr>, IngressError> {
+        let depth = omitted_depth
+            .saturating_add(context.len())
+            .saturating_add(suffix.len());
+        self.proof_context_depth(depth)?;
+        let (context, suffix) = if specialize::closed(source) {
+            (&[][..], &[][..])
+        } else {
+            (context, suffix)
+        };
         let mut locals = Vec::new();
-        for local in context {
-            self.tick()?;
-            reserve(&mut locals, self.limits.max_context_depth)?;
-            locals.push(local.clone());
-        }
         let mut frames = Vec::new();
         let mut head = source.clone();
         let mut type_ = loop {
@@ -174,13 +256,27 @@ impl Preparation<'_> {
                     );
                 }
                 ExprNode::BVar { idx } => {
-                    let Some(position) = locals.len().checked_sub(*idx as usize + 1) else {
+                    let Some(domain) = type_local(*idx, [&locals, suffix, context]) else {
                         return Ok(None);
                     };
+                    // This walk follows one head path. Its only possible
+                    // read of the caller's telescope is this terminal slot;
+                    // domains introduced along the path are already part of
+                    // the exact source expression. Subsequent unwinding uses
+                    // context-free type reduction and substitution only.
+                    if let Some(index) = usize::try_from(*idx)
+                        .ok()
+                        .and_then(|index| index.checked_sub(locals.len()))
+                    {
+                        *dependency = Some(query::Local {
+                            index,
+                            domain: domain.clone(),
+                        });
+                    }
                     let amount = idx
                         .checked_add(1)
                         .ok_or_else(|| unsupported("projection local depth"))?;
-                    break self.lift(&locals[position], amount)?;
+                    break self.lift(domain, amount)?;
                 }
                 ExprNode::Const { name, levels } => {
                     let base = if let Some(info) = self.environment.find(name) {
@@ -225,6 +321,7 @@ impl Preparation<'_> {
                     body,
                     binder_info,
                 } => {
+                    self.proof_context_depth(depth.saturating_add(locals.len()).saturating_add(1))?;
                     reserve(&mut locals, self.limits.max_context_depth)?;
                     locals.push(binder_type.clone());
                     let frame =
@@ -235,6 +332,7 @@ impl Preparation<'_> {
                 ExprNode::LetE {
                     type_, value, body, ..
                 } => {
+                    self.proof_context_depth(depth.saturating_add(locals.len()).saturating_add(1))?;
                     reserve(&mut locals, self.limits.max_context_depth)?;
                     locals.push(type_.clone());
                     let frame = TypeFrame::Let(value.clone());
@@ -250,7 +348,11 @@ impl Preparation<'_> {
             self.tick()?;
             type_ = match frame {
                 TypeFrame::Apply(argument) => {
-                    let normal = self.normalize_type(&type_)?;
+                    // Recover only the next domain/codomain. Normalizing every
+                    // descendant here also unfolds value indices and predicate
+                    // bodies that proof erasure will discard, once per argument.
+                    // Ground layout decisions normalize their selected type.
+                    let normal = self.type_head(&type_)?;
                     let ExprNode::ForallE { body, .. } = normal.node() else {
                         return Ok(None);
                     };
@@ -277,7 +379,7 @@ impl Preparation<'_> {
         Ok(Some(type_))
     }
 
-    fn projection_slot(
+    pub(super) fn projection_slot(
         &mut self,
         receiver_type: &Expr,
         structure: &Name,
@@ -497,6 +599,9 @@ impl Preparation<'_> {
 }
 
 #[cfg(test)]
+mod cache_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn record_engine() -> Engine {
@@ -643,6 +748,91 @@ instance computed : Action computedToken := { call := fun n => n }
             );
         }
         assert!(prep.projection_slot(&t, &name("Missing"), 0).is_err());
+    }
+
+    #[test]
+    fn application_type_inference_does_not_normalize_irrelevant_proof_indices() {
+        let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = Engine::with_source_seed(admission)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let nat = Expr::const_(name("Nat"), vec![]);
+        let successor = Expr::const_(name("Nat.succ"), vec![]);
+        let equality = |value: Expr| {
+            [nat.clone(), value.clone(), value].into_iter().fold(
+                Expr::const_(name("Eq"), vec![Level::succ(Level::zero()).unwrap()]),
+                Expr::app,
+            )
+        };
+        let mut index = nat::literal(0);
+        for _ in 0..256 {
+            index = Expr::app(successor.clone(), index);
+        }
+        let predicate = equality(index);
+        let function_type = Expr::forall_e(
+            name("proof"),
+            predicate.clone(),
+            nat.clone(),
+            BinderInfo::Default,
+        );
+        // These are valid local assumptions h : predicate and f : predicate -> Nat.
+        // The result type of f h does not depend on normalizing the proof's index.
+        let context = [predicate, function_type.clone()];
+        let application = Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap());
+        let limits = IngressLimits {
+            max_nodes: 128,
+            ..IngressLimits::default()
+        };
+        let mut prep = Preparation::new(&engine.environment, limits);
+        assert_eq!(
+            prep.projection_receiver_type(&application, &context)
+                .unwrap(),
+            Some(nat.clone())
+        );
+        // The control traverses the same telescope's irrelevant descendants.
+        // It establishes that the finite budget really excludes that work.
+        let mut full = Preparation::new(&engine.environment, limits);
+        assert!(matches!(
+            full.normalize_type(&function_type),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit: 128,
+                observed: 129,
+            })
+        ));
+
+        // Opening only the outer binder must still substitute its argument in
+        // a dependent result, and actual exhaustion must remain a refusal.
+        let dependent = Expr::forall_e(
+            name("n"),
+            nat.clone(),
+            equality(Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        );
+        let argument = nat::literal(42);
+        let application = Expr::app(Expr::bvar(0).unwrap(), argument.clone());
+        let mut prep = Preparation::new(&engine.environment, limits);
+        assert_eq!(
+            prep.projection_receiver_type(&application, std::slice::from_ref(&dependent))
+                .unwrap(),
+            Some(equality(argument))
+        );
+        let mut exhausted = Preparation::new(
+            &engine.environment,
+            IngressLimits {
+                max_nodes: 0,
+                ..limits
+            },
+        );
+        assert!(matches!(
+            exhausted.projection_receiver_type(&application, &[dependent]),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit: 0,
+                observed: 1,
+            })
+        ));
     }
 
     #[test]

@@ -94,7 +94,7 @@ fn a_lambda_determines_its_missing_type_in_both_orientations() {
             (left, right)
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert!(report.residual_metavariables.is_empty());
         txn.unify(&Expr::mvar(type_), &pi(nat(), nat()), budget())
             .unwrap();
@@ -133,7 +133,7 @@ fn dependent_lambdas_rebind_domains_and_results_without_capture() {
     let candidate = lam(Expr::sort(u.clone()), lam(bvar(0), bvar(0)));
     let expected = pi(Expr::sort(u), pi(bvar(0), bvar(1)));
     let report = txn.unify(&Expr::mvar(value), &candidate, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert!(report.residual_metavariables.is_empty());
     txn.unify(&Expr::mvar(type_.clone()), &expected, budget())
         .unwrap();
@@ -151,7 +151,7 @@ fn an_inferred_function_type_also_determines_its_missing_universe() {
     let report = txn
         .unify(&Expr::mvar(value), &identity(), budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(report.universe_assignments, vec![u.clone()]);
     assert_eq!(
         txn.universes.instantiate(&Level::mvar(u)).unwrap(),

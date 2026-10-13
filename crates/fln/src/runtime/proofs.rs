@@ -6,6 +6,7 @@ use super::*;
 use fln_core::level::Level;
 mod locals;
 mod projections;
+pub(super) mod query;
 
 // Bool.false is the existing, checked scalar-zero binding. Source typing forbids
 // observing a proof as a Bool; this representation exists only after admission.
@@ -19,6 +20,7 @@ pub(super) fn erased_value() -> Expr {
 
 enum Frame {
     Visit(Expr, Option<Expr>),
+    Remember((Expr, Option<Expr>), usize),
     Keep(Expr),
     Apply(usize, Vec<Option<Expr>>),
     Lambda(Name, Expr, BinderInfo),
@@ -32,13 +34,7 @@ impl Preparation<'_> {
         source_scalar_constructor_binding(self.environment, &name("Bool.false")).is_some()
     }
 
-    fn push_proof_local(
-        &mut self,
-        locals: &mut Vec<Expr>,
-        type_: Expr,
-    ) -> Result<(), IngressError> {
-        self.tick()?;
-        let observed = locals.len().saturating_add(1);
+    pub(super) fn proof_context_depth(&self, observed: usize) -> Result<(), IngressError> {
         if observed > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
                 resource: IngressResource::ContextDepth,
@@ -46,6 +42,17 @@ impl Preparation<'_> {
                 observed,
             });
         }
+        Ok(())
+    }
+
+    fn push_proof_local(
+        &mut self,
+        locals: &mut Vec<Expr>,
+        type_: Expr,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let observed = locals.len().saturating_add(1);
+        self.proof_context_depth(observed)?;
         locals
             .try_reserve(1)
             .map_err(|_| IngressError::AllocationFailure {
@@ -71,29 +78,7 @@ impl Preparation<'_> {
         input: &Expr,
         context: &[Expr],
     ) -> Result<bool, IngressError> {
-        let mut locals = self.copy_proof_context(context)?;
-        let mut type_ = input.clone();
-        loop {
-            self.tick()?;
-            match type_.node() {
-                ExprNode::Sort { .. } => return Ok(false),
-                ExprNode::ForallE {
-                    binder_type, body, ..
-                } => {
-                    self.push_proof_local(&mut locals, binder_type.clone())?;
-                    type_ = body.clone();
-                }
-                _ => {
-                    let Some(sort) = self.projection_receiver_type(&type_, &locals)? else {
-                        return Ok(false);
-                    };
-                    let sort = self.type_head(&sort)?;
-                    return Ok(
-                        matches!(sort.node(), ExprNode::Sort { level } if level == &Level::zero()),
-                    );
-                }
-            }
-        }
+        query::proposition_type(self, input, context)
     }
 
     /// Only runtime domains/results are replaced. Type arguments to a family
@@ -103,6 +88,52 @@ impl Preparation<'_> {
             return self.erase_data_indices(input);
         }
         self.erase_type_in(input, &[])
+    }
+
+    /// A static type function may capture runtime values only in proof domains,
+    /// for example `fun b => Nat.beq n m = b -> Bool`. Erase its returned TYPE
+    /// under the original lambda context before deciding whether the argument
+    /// is closed enough for specialization. It is never an executable closure.
+    /// Ordinary propositions and proposition-valued predicates keep their
+    /// logical type-plane identity; only returned runtime types are erased.
+    pub(in crate::runtime) fn erase_type_argument(
+        &mut self,
+        input: &Expr,
+        context: &[Expr],
+    ) -> Result<Expr, IngressError> {
+        if !self.proof_erasure_available() {
+            return self.erase_hidden_types(input, context);
+        }
+        let mut locals = self.copy_proof_context(context)?;
+        let mut binders = Vec::new();
+        let mut body = input.clone();
+        loop {
+            self.tick()?;
+            let normal = self.type_head(&body)?;
+            let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body: next,
+                binder_info,
+            } = normal.node()
+            else {
+                if binders.is_empty() || self.proposition_type(&normal, &locals)? {
+                    return self.erase_hidden_types(input, context);
+                }
+                body = self.erase_type_in(&normal, &locals)?;
+                break;
+            };
+            let domain = self.erase_type_in(binder_type, &locals)?;
+            self.push_proof_local(&mut locals, binder_type.clone())?;
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), domain, *binder_info));
+            body = next.clone();
+        }
+        for (name, domain, info) in binders.into_iter().rev() {
+            self.tick()?;
+            body = Expr::lam(name, domain, body, info);
+        }
+        Ok(body)
     }
 
     fn erase_type_in(&mut self, input: &Expr, context: &[Expr]) -> Result<Expr, IngressError> {
@@ -146,7 +177,7 @@ impl Preparation<'_> {
                         work.push(Work::Visit(binder_type.clone()));
                     } else {
                         reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(self.erase_data_indices(&normal)?);
+                        values.push(self.erase_hidden_types(&normal, &locals)?);
                     }
                 }
                 Work::Domain(name, original, body, info) => {
@@ -180,10 +211,29 @@ impl Preparation<'_> {
         let mut context = Vec::new();
         let mut work = vec![Frame::Visit(input.clone(), expected)];
         let mut values = Vec::new();
+        // Closed inputs and closed expected types cannot depend on the caller's
+        // lexical telescope. Reuse only completed closed output, keeping each
+        // original occurrence in place: this shares analysis, never execution.
+        // Exact syntax keys preserve the same work for shared and independently
+        // allocated trees. A fresh table per pass cannot outlive later private
+        // definition registration, and failed/partial work is never inserted.
+        let mut closed = std::collections::HashMap::<(Expr, Option<Expr>), Expr>::new();
         while let Some(task) = work.pop() {
             self.tick()?;
             match task {
                 Frame::Visit(expr, expected) => {
+                    if specialize::closed(&expr) && expected.as_ref().is_none_or(specialize::closed)
+                    {
+                        self.tick()?;
+                        let key = (expr.clone(), expected.clone());
+                        if let Some(value) = closed.get(&key) {
+                            reserve(&mut values, self.limits.max_nodes)?;
+                            values.push(value.clone());
+                            continue;
+                        }
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Frame::Remember(key, values.len()));
+                    }
                     let expected = match expected {
                         Some(type_) => Some(type_),
                         // Typed parents classify proof-producing binders. Do
@@ -204,15 +254,30 @@ impl Preparation<'_> {
                         values.push(erased_value());
                         continue;
                     }
+                    // Proof classification and source types use the logical
+                    // declaration. Only a remaining executable value may select
+                    // its implemented_by replacement before any inlining.
+                    if let Some(replacement) = self.implemented_by_call(&expr, &[])? {
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Frame::Visit(replacement, expected));
+                        continue;
+                    }
                     match expr.node() {
                         ExprNode::App { .. } => {
                             let (head, args) = self.spine(&expr)?;
+                            if let Some(replacement) = self.implemented_by_call(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(replacement, expected));
+                                continue;
+                            }
+                            if let Some(inlined) = self.lazy_conditional(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(inlined, expected));
+                                continue;
+                            }
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
-                            let local_callbacks = matches!(head.node(), ExprNode::BVar { .. })
-                                && args
-                                    .iter()
-                                    .any(|arg| matches!(arg.node(), ExprNode::Lam { .. }));
+                            let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
                             let mut callback_types = Vec::new();
                             for arg in &args {
                                 self.tick()?;
@@ -234,20 +299,22 @@ impl Preparation<'_> {
                                 // Preserve motives and type arguments verbatim.
                                 // They are inputs to checked-family recognition,
                                 // not runtime proof computations.
-                                let static_type = match &domain {
-                                    Some(domain) => self.type_parameter(domain)?,
-                                    None => false,
+                                let static_sort = match &domain {
+                                    Some(domain) => self.type_parameter_sort(domain)?,
+                                    None => None,
                                 };
+                                let static_type = static_sort.is_some();
                                 if local_callbacks {
                                     // The checked local telescope is available here,
                                     // before proof erasure removes its dependent domains.
-                                    // Keep the runtime type of literal callback operands:
+                                    // Keep the runtime type of callback operands ending
+                                    // in a literal lambda, including leading strict lets:
                                     // later global-call annotation cannot recover a BVar's
                                     // type without this original local context.
                                     let callback_type = match &domain {
                                         Some(domain)
                                             if !static_type
-                                                && matches!(arg.node(), ExprNode::Lam { .. }) =>
+                                                && self.has_literal_callable_tail(arg)? =>
                                         {
                                             Some(self.erase_type_in(domain, &context)?)
                                         }
@@ -258,7 +325,26 @@ impl Preparation<'_> {
                                 }
                                 reserve(&mut arguments, self.limits.max_application_args)?;
                                 arguments.push(if static_type {
-                                    Frame::Keep(arg.clone())
+                                    // Select hidden carriers while the original
+                                    // receiver telescope is still available.
+                                    // Closed concrete carrier arguments stay
+                                    // intact for constructor callback adapters.
+                                    // A checked Prop/predicate parameter is logical
+                                    // metadata. Its captured value indices do not
+                                    // need runtime carrier discovery; traversing
+                                    // them repeatedly also expands shared dictionary
+                                    // syntax that specialization will discard.
+                                    // Type-valued motives still use their original
+                                    // context to erase returned proof dependencies.
+                                    Frame::Keep(
+                                        if arg.has_loose_bvars()
+                                            && !static_sort.as_ref().is_some_and(Level::is_zero)
+                                        {
+                                            self.erase_type_argument(arg, &context)?
+                                        } else {
+                                            arg.clone()
+                                        },
+                                    )
                                 } else {
                                     Frame::Visit(arg.clone(), domain)
                                 });
@@ -357,6 +443,30 @@ impl Preparation<'_> {
                         }
                     }
                 }
+                Frame::Remember(key, position) => {
+                    if values.len() != position.saturating_add(1) {
+                        return Err(unsupported("closed proof erasure result"));
+                    }
+                    let value = &values[position];
+                    if specialize::closed(value) {
+                        self.tick()?;
+                        let observed = closed.len().saturating_add(1);
+                        if observed > self.limits.max_nodes {
+                            return Err(IngressError::ResourceLimit {
+                                resource: IngressResource::Nodes,
+                                limit: self.limits.max_nodes,
+                                observed,
+                            });
+                        }
+                        closed
+                            .try_reserve(1)
+                            .map_err(|_| IngressError::AllocationFailure {
+                                resource: IngressResource::Nodes,
+                                requested: observed,
+                            })?;
+                        closed.insert(key, value.clone());
+                    }
+                }
                 Frame::Keep(expr) => {
                     reserve(&mut values, self.limits.max_nodes)?;
                     values.push(expr);
@@ -371,13 +481,13 @@ impl Preparation<'_> {
                         .next()
                         .ok_or_else(|| unsupported("proof application head"))?;
                     for (index, mut arg) in args.enumerate() {
-                        if matches!(arg.node(), ExprNode::Lam { .. })
-                            && let Some(Some(type_)) = callback_types.get(index)
+                        if let Some(Some(type_)) = callback_types.get(index)
                             && let Some(result @ ValueType::Closure(_)) = self.value_type(type_)?
                         {
                             // Proof operands have already become inert scalars. Only
-                            // executable lambdas receive ordinary typed let bindings,
-                            // preserving captures and left-to-right argument evaluation.
+                            // checked callable tails receive ordinary typed bindings.
+                            // Leading strict lets stay outside the closure, preserving
+                            // captures and left-to-right argument evaluation.
                             arg = self.typed_callable_result(arg, type_.clone(), result)?;
                         }
                         expr = Expr::app(expr, arg);
@@ -421,3 +531,6 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod context_tests;

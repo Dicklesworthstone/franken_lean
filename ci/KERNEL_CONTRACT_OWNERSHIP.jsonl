@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":631,"projection_hash":"4ba2f90b99e7b17aa235087e484c17827c84b36c8d059d74c38868d33e0de676"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":638,"projection_hash":"16df1ecab9c8c42b6b0f6aaa36ffb544551469c75167c91746bf316ee5099302"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -92,6 +92,7 @@
 {"id":"fln-azxg"}
 {"id":"fln-b65e"}
 {"id":"fln-bench-apparatus-empty-referent-bkw6"}
+{"id":"fln-bot-publication-bypasses-gates-svj2"}
 {"id":"fln-boundary-api-no-admission-argument-discarded-ez07"}
 {"id":"fln-bz4h"}
 {"id":"fln-c78c"}
@@ -101,6 +102,7 @@
 {"id":"fln-checker-exhaustion-roots-1mr1"}
 {"id":"fln-checker-free-binding-cycle-false-reject-u1vk"}
 {"id":"fln-checker-mathlib-shapes-qne9"}
+{"id":"fln-ci-fixture-root-dev-host-path-8gdb"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
 {"id":"fln-d18-product-half-rgsg"}
@@ -112,6 +114,7 @@
 {"id":"fln-dcv"}
 {"id":"fln-decision-check-stack-lq8u"}
 {"id":"fln-default-instance-commit-rule-2709"}
+{"id":"fln-default-linters-unused-variables-mtnt"}
 {"id":"fln-derived-declaration-frontier-cj7s"}
 {"id":"fln-dyfz"}
 {"id":"fln-e44s"}
@@ -145,6 +148,7 @@
 {"id":"fln-fln-main-red-three-unowned-h823"}
 {"id":"fln-fln-outparam-false-accept-zad2"}
 {"id":"fln-fln-partial-def-hh4j"}
+{"id":"fln-fmt-check-at-commit-time-ofo5"}
 {"id":"fln-freeze-gate-blind-spot-bi3q"}
 {"id":"fln-front-door-residuals-0f6x"}
 {"id":"fln-frontier-oom-abort-w9dx"}
@@ -185,6 +189,7 @@
 {"id":"fln-init-control-council-4698-1yyb"}
 {"id":"fln-init-core-council-4442-aiwk"}
 {"id":"fln-init-sizeof-council-3290-w4xk"}
+{"id":"fln-invalid-yaml-landing-workflows-waaq"}
 {"id":"fln-ir-decoder-call-graph-sjzl"}
 {"id":"fln-ir-on-golem-decision-5wfx"}
 {"id":"fln-ir-to-flbc-lowering-7wwf"}
@@ -267,6 +272,7 @@
 {"id":"fln-r15-decision-vgwl"}
 {"id":"fln-reality-check-1004-y7ba"}
 {"id":"fln-reality-check-1007-kzz9"}
+{"id":"fln-reality-check-1013-wzr5"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-rfl-for-step-limit-63a9"}
@@ -302,6 +308,7 @@
 {"id":"fln-uc44"}
 {"id":"fln-um4a"}
 {"id":"fln-upstream-suite-scoreboard-n04o"}
+{"id":"fln-user-partial-unsafe-def-c3hh"}
 {"id":"fln-uuuz"}
 {"id":"fln-uyuz"}
 {"id":"fln-vm35"}

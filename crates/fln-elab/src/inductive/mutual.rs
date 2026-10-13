@@ -1,4 +1,4 @@
-//! Native construction of one complete mutual data-inductive block.
+//! Native construction of one complete mutual inductive block.
 //!
 //! Sibling occurrences are allowed only as uniform strictly-positive children.
 //! Each child uses its destination's motive, indices and recursor. The result
@@ -79,7 +79,7 @@ fn child(
     Ok(None)
 }
 
-/// Construct two to eight safe data families with one shared parameter and
+/// Construct two to eight safe families with one shared parameter and
 /// universe telescope. Parameter identities and types must agree across specs;
 /// each index/constructor telescope is otherwise scoped independently. Both
 /// admission engines still check all signatures, universes, types and rules.
@@ -87,10 +87,49 @@ pub fn mutual_inductive_declaration(
     specs: &[InductiveSpec],
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
+    build_mutual(specs, budget, None)
+}
+
+/// [`mutual_inductive_declaration`] for a block whose trailing parameters were
+/// written as indices and promoted (the Reference's `fixedIndicesToParams`).
+/// `promoted[f][c]` holds constructor `c` of family `f`'s own binders for those
+/// parameters, as in `inductive_with_promoted_parameters`: only the constructor
+/// types read them; each family type binds the promoted parameters by its own
+/// index binders, and the recursors by the first family's.
+pub(crate) fn mutual_inductive_with_promoted_parameters(
+    specs: &[InductiveSpec],
+    budget: RecordBudget,
+    promoted: &[Vec<Vec<LocalDecl>>],
+) -> Result<Declaration, InductiveError> {
+    build_mutual(specs, budget, Some(promoted))
+}
+
+fn build_mutual(
+    specs: &[InductiveSpec],
+    budget: RecordBudget,
+    promoted: Option<&[Vec<Vec<LocalDecl>>]>,
+) -> Result<Declaration, InductiveError> {
     if !(2..=8).contains(&specs.len()) {
         return Err(InductiveError::InvalidTelescope);
     }
     let first = &specs[0];
+    if let Some(promoted) = promoted
+        && (promoted.len() != specs.len()
+            || promoted.iter().zip(specs).any(|(family, spec)| {
+                family.len() != spec.constructors.len()
+                    || family.iter().any(|own| {
+                        own.len() > first.parameters.len()
+                            || own
+                                .iter()
+                                .zip(&first.parameters[first.parameters.len() - own.len()..])
+                                .any(|(binder, parameter)| {
+                                    binder.id != parameter.id || binder.is_let()
+                                })
+                    })
+            }))
+    {
+        return Err(InductiveError::InvalidTelescope);
+    }
     let mut builder = Builder {
         remaining: budget.max_nodes,
     };
@@ -107,7 +146,7 @@ pub fn mutual_inductive_declaration(
             return Err(InductiveError::InvalidTelescope);
         }
     }
-    if first.result_level.has_mvar() || !first.result_level.is_never_zero() {
+    if first.result_level.has_mvar() {
         return Err(InductiveError::UnsupportedSort);
     }
     let result_level = first.result_level.normalize_fixpoint();
@@ -176,12 +215,23 @@ pub fn mutual_inductive_declaration(
     let mut constructor_names = Vec::new();
     let mut family_constructors = vec![Vec::new(); specs.len()];
     for (family, spec) in specs.iter().enumerate() {
-        for ctor in &spec.constructors {
+        for (position, ctor) in spec.constructors.iter().enumerate() {
             builder.tick()?;
             if !matches!(ctor.name.leaf_view(), LeafView::Str(s) if !s.is_empty())
                 || !ctor.name.parent().is_anonymous()
             {
                 return Err(InductiveError::InvalidName);
+            }
+            if let Some(promoted) = promoted {
+                let own = &promoted[family][position];
+                let shared = first.parameters.len() - own.len();
+                for (offset, binder) in own.iter().enumerate() {
+                    let scope: HashSet<_> = first.parameters[..shared + offset]
+                        .iter()
+                        .map(|p| p.id.clone())
+                        .collect();
+                    scan(&mut builder, &binder.type_, &scope, specs)?;
+                }
             }
             let name = spec.name.append_core(&ctor.name);
             if !names.insert(name.clone()) {
@@ -219,13 +269,27 @@ pub fn mutual_inductive_declaration(
             });
         }
     }
-    let mut elim = Name::from_components(["u"]);
-    let mut ordinal = 0usize;
-    while universe_names.contains(&elim) {
-        builder.tick()?;
-        ordinal += 1;
-        elim = Name::from_components([format!("u_{ordinal}").as_str()]);
-    }
+    // The pin's `elim_only_at_universe_zero` (kernel/inductive.cpp) restricts
+    // every mutual family whose result universe may be zero to Prop. This
+    // includes a universe parameter, even at its nonzero instantiations. Such
+    // recursors have no fresh elimination-universe parameter, including in
+    // the recursive calls stored in their computation rules.
+    let elim = if result_level.is_never_zero() {
+        let mut name = Name::from_components(["u"]);
+        let mut ordinal = 0usize;
+        while universe_names.contains(&name) {
+            builder.tick()?;
+            ordinal += 1;
+            name = Name::from_components([format!("u_{ordinal}").as_str()]);
+        }
+        Some(name)
+    } else {
+        None
+    };
+    let elim_level = elim
+        .as_ref()
+        .map_or_else(Level::zero, |name| Level::param(name.clone()));
+    let rec_params: Vec<_> = elim.iter().chain(&first.level_params).cloned().collect();
     let mut majors = Vec::new();
     let mut motives = Vec::new();
     let prefixes: Vec<_> = specs
@@ -246,7 +310,7 @@ pub fn mutual_inductive_declaration(
         );
         let ty = builder.close(
             std::slice::from_ref(&major),
-            Expr::sort(Level::param(elim.clone())),
+            Expr::sort(elim_level.clone()),
             false,
             false,
         )?;
@@ -302,7 +366,12 @@ pub fn mutual_inductive_declaration(
             ctor.result_indices.iter().cloned(),
         );
         let ty = builder.close(&ctor.fields, ty, false, false)?;
-        let ty = builder.close(&first.parameters, ty, false, true)?;
+        let own = promoted.map_or(&[][..], |promoted| {
+            promoted[entry.family][cidx[entry.family] as usize].as_slice()
+        });
+        let ty = builder.close(own, ty, false, false)?;
+        let shared = &first.parameters[..first.parameters.len() - own.len()];
+        let ty = builder.close(shared, ty, false, true)?;
         constructors.push(ConstructorVal {
             base: ConstantVal {
                 name: constructor_names[index].clone(),
@@ -318,8 +387,7 @@ pub fn mutual_inductive_declaration(
         });
         cidx[entry.family] += 1;
     }
-    let mut rec_levels = vec![Level::param(elim.clone())];
-    rec_levels.extend(levels);
+    let rec_levels: Vec<_> = rec_params.iter().cloned().map(Level::param).collect();
     let rec_prefixes: Vec<_> = rec_names
         .iter()
         .map(|n| {
@@ -389,8 +457,6 @@ pub fn mutual_inductive_declaration(
         .any(|c| !c.telescope.arguments.is_empty());
     let mut types = Vec::new();
     let mut recursors = Vec::new();
-    let mut rec_params = vec![elim];
-    rec_params.extend(first.level_params.iter().cloned());
     for (family, spec) in specs.iter().enumerate() {
         let ty = builder.close(
             &spec.indices,
@@ -398,7 +464,9 @@ pub fn mutual_inductive_declaration(
             false,
             false,
         )?;
-        let ty = builder.close(&first.parameters, ty, false, false)?;
+        // A family type keeps its own parameter binder names (they differ only
+        // for promoted indices; identities, domains and styles are checked equal).
+        let ty = builder.close(&spec.parameters, ty, false, false)?;
         let indices =
             u32::try_from(spec.indices.len()).map_err(|_| InductiveError::ResourceLimit)?;
         types.push(InductiveVal {

@@ -9,9 +9,17 @@
 //!
 //! A remembered result is the result a recomputation would return, charges
 //! included:
-//! - it is used only while the context has no let-bound locals. Reduction then
-//!   reads nothing but its input, the constants and the projection rules, and a
-//!   context never changes those; a clone, which shares the memo, has the same;
+//! - reduction reads nothing but its input, the constants, the projection rules
+//!   and the let-bound locals in scope. A context never changes the first three,
+//!   and a clone, which shares the memo, has the same;
+//! - the let-bound locals do change, as scopes open and close, and a local's name
+//!   may come back bound to another value. So an entry records the bindings it
+//!   was computed under and matches only the same names, in the same order,
+//!   bound to structurally equal values; the fingerprint carries only the names,
+//!   so the values are always compared exactly. Before this, the memo was not
+//!   used at all under a let-bound local: in Mathlib's Ring.Limits five of them
+//!   are in scope for all but 656 of `CommRingCat.instCreatesLimit…`'s 740,000
+//!   normalizations;
 //! - an entry matches only an exactly equal materialized input, under the same
 //!   delta mode and the same materialization budget;
 //! - reduction never branches on its budget: a smaller budget only stops it
@@ -30,6 +38,8 @@ struct Entry {
     input: Arc<WireExpr>,
     delta_mode: DeltaMode,
     materialization: TermBudget,
+    /// The let-bound locals in scope when `result` was computed.
+    bindings: Vec<FreeBinding>,
     result: WhnfResult,
     /// Whether `result`'s term is the module's own copy of a term (`WhnfInput`).
     copied: bool,
@@ -41,11 +51,23 @@ impl Entry {
         input: &WireExpr,
         delta_mode: DeltaMode,
         materialization: TermBudget,
+        bindings: &[FreeBinding],
     ) -> bool {
         self.delta_mode == delta_mode
             && self.materialization == materialization
+            && same_bindings(&self.bindings, bindings)
             && *self.input == *input
     }
+}
+
+/// The same names in the same order, bound to structurally equal values. A
+/// shared value is equal without a walk.
+fn same_bindings(left: &[FreeBinding], right: &[FreeBinding]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name
+                && (Arc::ptr_eq(&left.value, &right.value) || *left.value == *right.value)
+        })
 }
 
 /// Whether a bucket takes a new entry: it is not full, and holds no equal one.
@@ -54,11 +76,12 @@ fn admits(
     input: &WireExpr,
     delta_mode: DeltaMode,
     materialization: TermBudget,
+    bindings: &[FreeBinding],
 ) -> bool {
     bucket.len() < MAX_BUCKET_ENTRIES
         && !bucket
             .iter()
-            .any(|entry| entry.matches(input, delta_mode, materialization))
+            .any(|entry| entry.matches(input, delta_mode, materialization, bindings))
 }
 
 /// Past either bound the memo stops growing; lookups continue. A memo lives as
@@ -160,11 +183,21 @@ impl Hasher for Fingerprinter {
     }
 }
 
-fn fingerprint(input: &WireExpr, delta_mode: DeltaMode, materialization: TermBudget) -> u64 {
+/// The bindings enter by name only: hashing their values on every lookup would
+/// cost a walk of each, and `Entry::matches` compares the values exactly anyway.
+fn fingerprint(
+    input: &WireExpr,
+    delta_mode: DeltaMode,
+    materialization: TermBudget,
+    bindings: &[FreeBinding],
+) -> u64 {
     let mut hasher = Fingerprinter::default();
     input.hash(&mut hasher);
     delta_mode.hash(&mut hasher);
     materialization.hash(&mut hasher);
+    for binding in bindings {
+        binding.name.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -186,13 +219,19 @@ impl WhnfMemo {
         input: &WireExpr,
         delta_mode: DeltaMode,
         budget: &WhnfBudget,
+        bindings: &[FreeBinding],
     ) -> Option<(WhnfResult, bool)> {
         let table = self.0.lock().ok()?;
         table
             .buckets
-            .get(&fingerprint(input, delta_mode, budget.materialization))?
+            .get(&fingerprint(
+                input,
+                delta_mode,
+                budget.materialization,
+                bindings,
+            ))?
             .iter()
-            .find(|entry| entry.matches(input, delta_mode, budget.materialization))
+            .find(|entry| entry.matches(input, delta_mode, budget.materialization, bindings))
             .filter(|entry| covers(budget, &entry.result))
             .map(|entry| (entry.result.clone(), entry.copied))
     }
@@ -204,6 +243,7 @@ impl WhnfMemo {
         input: Arc<WireExpr>,
         delta_mode: DeltaMode,
         materialization: TermBudget,
+        bindings: &[FreeBinding],
         result: &WhnfResult,
         copied: bool,
     ) {
@@ -224,15 +264,16 @@ impl WhnfMemo {
         }
         let bucket = table
             .buckets
-            .entry(fingerprint(&input, delta_mode, materialization))
+            .entry(fingerprint(&input, delta_mode, materialization, bindings))
             .or_default();
-        if !admits(bucket, &input, delta_mode, materialization) {
+        if !admits(bucket, &input, delta_mode, materialization, bindings) {
             return;
         }
         bucket.push(Entry {
             input,
             delta_mode,
             materialization,
+            bindings: bindings.to_vec(),
             result: result.clone(),
             copied,
         });
@@ -421,6 +462,7 @@ mod tests {
             input: Arc::new(constant(&format!("c{index}"))),
             delta_mode: DeltaMode::Eager,
             materialization: TermBudget::unlimited(),
+            bindings: Vec::new(),
             result: WhnfResult {
                 term: constant("done"),
                 steps: 1,
@@ -437,6 +479,7 @@ mod tests {
                 &constant("fresh"),
                 DeltaMode::Eager,
                 TermBudget::unlimited(),
+                &[],
             )
         };
         let mut bucket: Vec<Entry> = (1..MAX_BUCKET_ENTRIES).map(entry).collect();
@@ -449,7 +492,8 @@ mod tests {
                 &bucket,
                 &constant("c1"),
                 DeltaMode::Eager,
-                TermBudget::unlimited()
+                TermBudget::unlimited(),
+                &[],
             ),
             "an input already present is not added twice"
         );
@@ -480,5 +524,41 @@ mod tests {
             normal_form(&term, &context),
             ExprNode::Free { name: name("x") }
         );
+    }
+
+    fn remembered(context: &WhnfContext) -> usize {
+        context.memo.0.lock().expect("the memo lock").entries
+    }
+
+    /// Under a let-bound local the memo is used: the result is recorded with
+    /// the binding it was computed under.
+    #[test]
+    fn a_result_under_a_let_bound_local_is_remembered() {
+        let mut context = WhnfContext::default();
+        context.push_scoped_binding(FreeBinding::new(name("x"), constant("a")));
+        assert_eq!(
+            normal_form(&identity_at_x(), &context),
+            constant("a").nodes()[0]
+        );
+        assert_eq!(remembered(&context), 1);
+    }
+
+    /// The same name bound to another value is another binding set: the result
+    /// remembered under `x := a` must not answer for `x := b`, though the input
+    /// and the binding names are the same.
+    #[test]
+    fn a_remembered_result_belongs_to_its_let_values_not_their_names() {
+        let term = identity_at_x();
+        let mut context = WhnfContext::default();
+        context.push_scoped_binding(FreeBinding::new(name("x"), constant("a")));
+        assert_eq!(normal_form(&term, &context), constant("a").nodes()[0]);
+        assert!(context.pop_scoped_binding(&name("x")));
+        context.push_scoped_binding(FreeBinding::new(name("x"), constant("b")));
+        assert_eq!(normal_form(&term, &context), constant("b").nodes()[0]);
+        // Bound to `a` again, the first result answers without a new entry.
+        assert!(context.pop_scoped_binding(&name("x")));
+        context.push_scoped_binding(FreeBinding::new(name("x"), constant("a")));
+        assert_eq!(normal_form(&term, &context), constant("a").nodes()[0]);
+        assert_eq!(remembered(&context), 2);
     }
 }

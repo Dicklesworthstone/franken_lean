@@ -15,7 +15,7 @@ use fln_core::name::Name;
 use std::collections::BTreeSet;
 
 const TABLE: &str = include_str!("protected.tsv");
-const SCHEMA: &str = "schema fln-seed-protected/1";
+const SCHEMA: &str = "schema fln-seed-protected/2";
 
 /// A seed constant's status at the pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,7 +24,10 @@ pub enum PinStatus {
     Protected,
     /// The pin has the constant, unprotected.
     Unprotected,
-    /// The pin has no constant of that name.
+    /// The pin has no constant of that name, but the name still resolves there
+    /// through an `export` alias (`decide` names `Decidable.decide`).
+    Alias,
+    /// The pin has no constant of that name and the name resolves to nothing there.
     Absent,
 }
 
@@ -69,6 +72,30 @@ pub fn seed_protected_names() -> Result<Vec<Name>, ProtectedTableError> {
         .collect())
 }
 
+/// Whether source name resolution must refuse `name`: a seed constant the pin does
+/// not have, under a name that resolves to nothing there (status `absent`). Naming one
+/// is the pin's "Unknown identifier", so a file that does is refused as there, not
+/// accepted on the strength of a constant only FrankenLean's seed defines. The seed
+/// still uses such a constant internally: instance search finds it by its registration,
+/// never by a source name. The table is read once. If it does not read, this refuses
+/// nothing, but no source-seeded engine is built from it either:
+/// `fln::EngineBuilder::build_with_source_seed` refuses a malformed table first.
+pub fn source_unreachable(name: &Name) -> bool {
+    static ABSENT: std::sync::OnceLock<BTreeSet<Name>> = std::sync::OnceLock::new();
+    ABSENT
+        .get_or_init(|| {
+            seed_pin_statuses()
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter(|(_, status)| *status == PinStatus::Absent)
+                        .map(|(name, _)| name)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .contains(name)
+}
+
 /// The table's spelling of a name: its components joined by `.`. A name it cannot
 /// spell so that [`parse_name`] reads it back identically is `None`.
 pub fn table_spelling(name: &Name) -> Option<String> {
@@ -110,6 +137,7 @@ fn parse(table: &str) -> Result<Vec<(Name, PinStatus)>, ProtectedTableError> {
         let status = match status {
             "protected" => PinStatus::Protected,
             "unprotected" => PinStatus::Unprotected,
+            "alias" => PinStatus::Alias,
             "absent" => PinStatus::Absent,
             _ => return Err(ProtectedTableError::UnknownStatus(line_number)),
         };
@@ -173,29 +201,29 @@ mod tests {
 
     #[test]
     fn a_malformed_table_is_refused_never_read_as_fewer_marks() {
-        let good = "# c\nschema fln-seed-protected/1\nA.b\tprotected\nA.c\tunprotected\n";
+        let good = "# c\nschema fln-seed-protected/2\nA.b\tprotected\nA.c\tunprotected\n";
         assert_eq!(parse(good).unwrap().len(), 2);
         for (table, error) in [
             ("A.b\tprotected\n", ProtectedTableError::MissingSchema),
             ("# only a comment\n", ProtectedTableError::MissingSchema),
             (
-                "schema fln-seed-protected/1\nA.b protected\n",
+                "schema fln-seed-protected/2\nA.b protected\n",
                 ProtectedTableError::MalformedRow(2),
             ),
             (
-                "schema fln-seed-protected/1\nA.b\tprivate\n",
+                "schema fln-seed-protected/2\nA.b\tprivate\n",
                 ProtectedTableError::UnknownStatus(2),
             ),
             (
-                "schema fln-seed-protected/1\nA..b\tprotected\n",
+                "schema fln-seed-protected/2\nA..b\tprotected\n",
                 ProtectedTableError::MalformedRow(2),
             ),
             (
-                "schema fln-seed-protected/1\nA.c\tprotected\nA.b\tprotected\n",
+                "schema fln-seed-protected/2\nA.c\tprotected\nA.b\tprotected\n",
                 ProtectedTableError::UnsortedOrDuplicate(3),
             ),
             (
-                "schema fln-seed-protected/1\nA.b\tprotected\nA.b\tunprotected\n",
+                "schema fln-seed-protected/2\nA.b\tprotected\nA.b\tunprotected\n",
                 ProtectedTableError::UnsortedOrDuplicate(3),
             ),
         ] {

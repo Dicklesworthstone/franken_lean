@@ -124,11 +124,11 @@ fn complete_source_files_register_dictionaries_and_execute_do() {
         &format!(
             "{ID}\ndef nested (seed : Nat) : Id Nat := do\n  let n ← do\n    let n ← (seed : Id Nat)\n    return (n + 1)\n  (10 : Id Nat)\n  let n ← (n + 1 : Id Nat)\n  return n\n#eval nested 40"
         ),
-        "42",
+        "41",
     );
     execute(
         &format!(
-            "{ID}\ndef mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (x : Nat) => x + 1) 41 : Id Nat)"
+            "{ID}\ndef mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (x : Nat) => x + 1) (41 : Nat) : Id Nat)"
         ),
         "42",
     );

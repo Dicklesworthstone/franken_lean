@@ -1,6 +1,6 @@
 //! Collection operations cross the real source elaborator and both admission seats.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits};
+use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Mode, Name, SourceCheckLimits};
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
 
 fn engine() -> (Engine, EngineAdmissionLimits) {
@@ -187,17 +187,46 @@ fn list_polymorphism_is_not_specialized_to_nat_or_one_universe() {
 }
 
 #[test]
+/// The generated recursors are usable by source code. A computable `def` applying one to data
+/// is refused as the pin's code generator refuses it (bead `franken_lean-z8j.1.6.6`; the pin's
+/// `noncomputable def` form is not elaborated yet), so the program checks in the `frontier`
+/// mode, where executing such code lives.
 fn list_generated_recursor_is_usable_by_source_code() {
-    check(
-        r#"
+    let source = r#"
         def count.{u} {A : Type u} (xs : List A) : Nat :=
             List.rec 0 (fun head tail ih => Nat.succ ih) xs
         theorem count_two : count (List.cons true (List.cons false List.nil)) = 2 := by rfl
         def fallback (x : Option Nat) : Nat := Option.rec 11 (fun n => n) x
         theorem fallback_none : fallback Option.none = 11 := by rfl
         theorem fallback_some : fallback (Option.some 5) = 5 := by rfl
-        "#,
+        "#;
+    let (engine, limits) = engine();
+    let refused = engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err("the default refuses a computable recursor fold")
+        .to_string();
+    assert!(
+        refused.contains("code generator does not support recursor `List.rec` yet"),
+        "{refused}"
     );
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .unwrap();
 }
 
 #[test]

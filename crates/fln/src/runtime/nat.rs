@@ -3,7 +3,10 @@
 //! No kernel term is changed, and no arbitrary family is selected by spelling.
 use super::*;
 use fln_core::expr::{FVarId, NatLit};
+#[cfg(test)]
 use fln_core::level::Level;
+
+mod successor;
 
 pub(super) struct Recursion {
     pub lambda: Expr,
@@ -41,6 +44,7 @@ fn variable(index: usize) -> Result<Expr, IngressError> {
     Expr::bvar(index).map_err(|_| unsupported("Nat recursor binder scope"))
 }
 
+#[cfg(test)]
 fn call(spelling: &str, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments
         .into_iter()
@@ -48,6 +52,29 @@ fn call(spelling: &str, arguments: impl IntoIterator<Item = Expr>) -> Expr {
 }
 
 impl Preparation<'_> {
+    /// Only identities registered while lowering the exact Nat recursor select
+    /// this compiler-owned branch. A source declaration with that identity is
+    /// refused when the binding is created; spelling alone grants no authority.
+    pub(super) fn nat_case(
+        &mut self,
+        head: &Expr,
+    ) -> Result<Option<(Name, ValueType)>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        for index in 0..self.nat_cases.len() {
+            self.tick()?;
+            let case = &self.nat_cases[index];
+            if &case.name == name {
+                return Ok(Some((case.name.clone(), case.result)));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn check_nat_family(&mut self) -> Result<(), IngressError> {
         if self.nat_family_checked {
             return Ok(());
@@ -200,17 +227,24 @@ impl Preparation<'_> {
             .checked_add(1)
             .ok_or_else(|| unsupported("Nat recursor identity"))?;
         let marker = FVarId(Name::num(name("_fln_runtime_nat_ih"), id));
+        // The successor's binder is one value, as the pin binds it: substituting
+        // its expression would compute the predecessor again at every use.
+        let predecessor_marker = FVarId(Name::num(name("_fln_runtime_nat_pred"), id));
         let major = variable(extra)?;
-        let predecessor = call("Nat.pred", [major.clone()]);
-        let hypothesis = Expr::app(variable(extra + 1)?, predecessor.clone());
-        step = self.minor_apply(step, predecessor)?;
+        let predecessor = self.nat_predecessor(major.clone())?;
+        let hypothesis = Expr::app(variable(extra + 1)?, Expr::fvar(predecessor_marker.clone()));
+        step = self.minor_apply(step, Expr::fvar(predecessor_marker.clone()))?;
         step = self.minor_apply(step, Expr::fvar(marker.clone()))?;
         for index in (0..extra).rev() {
             let argument = variable(index)?;
             zero = self.minor_apply(zero, argument.clone())?;
             step = self.minor_apply(step, argument)?;
         }
-        if step.has_fvar() {
+        let body = step
+            .lift_loose(0, 1)
+            .and_then(|body| body.abstract_fvar(&marker, 0))
+            .map_err(|_| unsupported("Nat hypothesis scope"))?;
+        if body.has_loose_bvar(0) {
             // Share the recursive result when it is used more than once. An
             // unused IH was eliminated by beta reduction above, so ordinary
             // matching on a huge Nat still needs only one predecessor step.
@@ -224,26 +258,35 @@ impl Preparation<'_> {
                     BinderInfo::Default,
                 );
             }
-            let body = step
-                .lift_loose(0, 1)
-                .and_then(|body| body.abstract_fvar(&marker, 0))
-                .map_err(|_| unsupported("Nat hypothesis scope"))?;
             step = Expr::let_e(marker.0, hypothesis_type, hypothesis, body, false);
         }
-        let motive = Expr::lam(
-            Name::anonymous(),
-            scalar(ValueType::Bool)?,
-            result_type.clone(),
-            BinderInfo::Default,
-        );
-        // The ordinary Boolean preparation creates lazy branch closures before
-        // visiting their bodies, preserving every nested capture's indices.
-        let mut body = [motive, step, zero, call("Nat.beq", [major, literal(0)])]
-            .into_iter()
-            .fold(
-                Expr::const_(name("Bool.rec"), vec![Level::one()]),
-                Expr::app,
+        // Bound outside the hypothesis, whose recursive call reads it. An unused
+        // binder, with an unused hypothesis, computes no predecessor at all.
+        let body = step
+            .lift_loose(0, 1)
+            .and_then(|body| body.abstract_fvar(&predecessor_marker, 0))
+            .map_err(|_| unsupported("Nat predecessor scope"))?;
+        if body.has_loose_bvar(0) {
+            step = Expr::let_e(
+                predecessor_marker.0,
+                Expr::const_(name("Nat"), vec![]),
+                predecessor,
+                body,
+                false,
             );
+        }
+        // Pattern discrimination belongs to the recursor's checked Nat
+        // representation. Calling public Nat.beq here would let a recursive
+        // equality implementation call itself just to select its zero case.
+        // Ordinary source calls retain their own executable implementations.
+        let zero = self.typed_callable_result(zero, result_type.clone(), result)?;
+        let step = self.typed_callable_result(step, result_type.clone(), result)?;
+        let case = self.branch_name(result, ValueType::Nat)?;
+        // The worklist creates lazy branch closures before visiting bodies,
+        // preserving the lexical indices of every nested callback capture.
+        let mut body = [major, zero, step]
+            .into_iter()
+            .fold(Expr::const_(case, vec![]), Expr::app);
         let mut self_type = result_type;
         for domain in domains.iter().rev() {
             self.tick()?;
@@ -405,3 +448,9 @@ mod tests {
 
 #[cfg(test)]
 mod strict;
+
+#[cfg(test)]
+mod native_cases;
+
+#[cfg(test)]
+mod native_constructors;

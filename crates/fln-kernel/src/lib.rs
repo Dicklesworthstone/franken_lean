@@ -530,12 +530,87 @@ pub fn check_def_eq(
     s: &fln_core::expr::Expr,
     budget: Budget,
 ) -> Outcome<Verdict> {
+    def_eq_query(env, lparams, t, s, budget, None)
+}
+
+/// Delta restrictions for one conversion query. The borrowed set is immutable
+/// for the whole query, including its private normalization caches.
+/// Restrictions cannot grant declaration authority or enable any reduction
+/// unavailable to the ordinary kernel.
+#[derive(Debug, Clone, Copy)]
+pub struct DefEqUnfolding<'a> {
+    pub opaque_definitions: &'a std::collections::BTreeSet<Name>,
+    pub unfold_theorems: bool,
+}
+
+/// An equality query with caller-selected delta restrictions. Elaboration uses
+/// this to preserve its reducibility settings while retaining the kernel's
+/// conversion rules. [`check`], [`check_def_eq`] and declaration admission keep
+/// their ordinary unfolding policy. The supplied budget is used unchanged.
+pub fn check_def_eq_with_unfolding(
+    env: &Environment,
+    lparams: &[Name],
+    t: &fln_core::expr::Expr,
+    s: &fln_core::expr::Expr,
+    budget: Budget,
+    unfolding: DefEqUnfolding<'_>,
+) -> Outcome<Verdict> {
+    def_eq_query(env, lparams, t, s, budget, Some(unfolding))
+}
+
+/// Check a term at an expected type under one query's delta restrictions.
+/// Both the original term and its expected type are inferred under the policy;
+/// an application cannot hide a forbidden argument conversion behind an equal
+/// result type. This query admits no declaration and uses the supplied budget
+/// unchanged. Ordinary declaration checking retains its own unfolding policy.
+pub fn check_type_with_unfolding(
+    env: &Environment,
+    lparams: &[Name],
+    value: &fln_core::expr::Expr,
+    expected: &fln_core::expr::Expr,
+    budget: Budget,
+    unfolding: DefEqUnfolding<'_>,
+) -> Outcome<Verdict> {
     if let Some(refusal) = refuse_uncalibrated_budget(budget) {
         return refusal;
     }
-    let mut checker = TypeChecker::new(env, lparams, budget);
+    let mut checker = TypeChecker::new_for_def_eq(env, lparams, budget, Some(unfolding));
+    let outcome = (|| {
+        let type_sort = checker.infer(expected, 0)?;
+        let type_sort = checker.whnf_public(&type_sort, 0)?;
+        if !matches!(type_sort.node(), fln_core::expr::ExprNode::Sort { .. }) {
+            return Err(Stop::Reject(
+                RejectClass::SortExpected,
+                "expected type is not a sort".to_string(),
+            ));
+        }
+        let inferred = checker.infer(value, 0)?;
+        checker.def_eq_public(&inferred, expected, 0)
+    })();
+    conversion_query_outcome(outcome, checker.consumption(), budget)
+}
+
+fn def_eq_query(
+    env: &Environment,
+    lparams: &[Name],
+    t: &fln_core::expr::Expr,
+    s: &fln_core::expr::Expr,
+    budget: Budget,
+    unfolding: Option<DefEqUnfolding<'_>>,
+) -> Outcome<Verdict> {
+    if let Some(refusal) = refuse_uncalibrated_budget(budget) {
+        return refusal;
+    }
+    let mut checker = TypeChecker::new_for_def_eq(env, lparams, budget, unfolding);
     let outcome = checker.def_eq_public(t, s, 0);
-    let consumption = checker.consumption();
+    conversion_query_outcome(outcome, checker.consumption(), budget)
+}
+
+fn conversion_query_outcome(
+    outcome: Result<bool, Stop>,
+    consumption: verdict::Consumption,
+    budget: Budget,
+) -> Outcome<Verdict> {
     match outcome {
         Ok(true) => Outcome::complete(Verdict::Accepted { consumption }),
         Ok(false) => Outcome::complete(Verdict::Rejected {

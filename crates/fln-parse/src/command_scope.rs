@@ -2,16 +2,27 @@
 //! declaration parser; this layer partitions original bytes without rewriting.
 use super::*;
 pub mod attributes;
+pub mod guard_spec;
 pub mod imports;
 pub mod instances;
 pub mod modifiers;
 pub mod mutual;
+pub mod reducibility;
+pub(crate) mod syntax_decls;
+pub mod trees;
 pub mod variables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
     Namespace(Name),
     Section(Option<Name>),
+    /// The pin's `sectionHeader` public and exposure defaults. These are lexical
+    /// flags restored by the matching `end`, not declaration modifiers to drop.
+    SectionWithModifiers {
+        name: Option<Name>,
+        public: bool,
+        expose: bool,
+    },
     End(Option<Name>),
     Open(Vec<Name>),
     OpenScoped(Vec<Name>),
@@ -21,6 +32,7 @@ pub enum ScopeCommand {
     Omit(Vec<Name>),
     Simp(attributes::SimpAttribute),
     Instance(instances::InstanceAttribute),
+    Reducibility(reducibility::ReducibilityAttribute),
     /// `open A B in <command>` (`Lean.Parser.Command.in`): the pin's macro elaborates it as
     /// `section open A B <command> end`. `body` is the byte offset, within this command's own
     /// source, where the inner command starts.
@@ -29,18 +41,70 @@ pub enum ScopeCommand {
         scoped: bool,
         body: usize,
     },
+    /// `<command> in <command>` (`Lean.Parser.Command.in`) for any other head the partition joins
+    /// (`variable`, `universe`, `include`, `omit`, an explicit `open Ns (a)`): the
+    /// pin's macro elaborates it as `section <head> <body> end`. `head` is where the head command's
+    /// own source ends (the `in`), and `body` is as in [`ScopeCommand::OpenIn`].
+    In {
+        head: usize,
+        body: usize,
+    },
+    /// `set_option <name> <value>` (`Lean.Parser.Command.«set_option»`): the option holds to the
+    /// end of the enclosing `section` or `namespace`. `value` is the pin's `optionValue` (`true`,
+    /// `false`, a string or a numeral) as read; whether it is admitted is the option table's
+    /// decision, not the parser's.
+    SetOption {
+        name: Name,
+        value: fln_core::options::DataValue,
+    },
+    /// `set_option <name> <value> in <command>`: the pin's `in` macro elaborates it as
+    /// `section set_option <name> <value> <command> end`. `body` is as in [`ScopeCommand::OpenIn`].
+    SetOptionIn {
+        name: Name,
+        value: fln_core::options::DataValue,
+        body: usize,
+    },
+    /// `[docComment] #guard_msgs [spec] in <command>` (`Lean.guardMsgsCmd`). `expected` is the
+    /// doc's text as the pin's `elabGuardMsgs` reads it: `getDocStringText` (between `/--` and
+    /// `-/`), ASCII-trimmed, `⏎` markers removed; `""` without a doc. `specified` records a
+    /// `(…)` spec, which this parser does not read. `body` is as in [`ScopeCommand::OpenIn`].
+    GuardMsgs {
+        expected: String,
+        specified: bool,
+        body: usize,
+    },
+    /// `export Ns (a b …)` (`Lean.Parser.Command.export`): the pin's `elabExport` makes each
+    /// `currentNamespace ++ a` an alias of the declaration `a` names in the namespaces `Ns`
+    /// resolves to.
+    Export {
+        namespace: Name,
+        names: Vec<Name>,
+    },
+    /// `open Ns (a b …)` (`openOnly`): the pin's `elabOpenDecl` resolves each name in the
+    /// namespaces `Ns` resolves to and adds `OpenDecl.explicit a Ns.a`.
+    OpenExplicit {
+        namespace: Name,
+        names: Vec<Name>,
+    },
     Trivia,
+    /// `#exit` (`Lean.Parser.Command.exit`): the pin warns "using 'exit' to interrupt Lean"
+    /// (`elabExit`) and stops there, a terminal command (`Parser.isTerminalCommand`); the
+    /// partition keeps nothing after it.
+    Exit,
 }
 
-/// The scope layer's table: the full implicit-Init table, the same one declaration bodies use.
-/// Every scope keyword this layer recognises (`namespace`, `end`, `open`, `universe`, `scoped`,
-/// `omit`, …) is a token at the pin, so nothing is added by hand; `prelude` is header-only and
-/// lives in `imports`' header table.
-fn table() -> &'static TokenTable {
-    crate::reference_tokens::implicit_init_table()
+/// Lex with the scope layer's table, the one declaration bodies use: the implicit-Init table, or
+/// the entered grammar's (`crate::extensions::with_grammar`). Every scope keyword this layer
+/// recognises (`namespace`, `end`, `open`, `universe`, `scoped`, `omit`, …) is a token at the
+/// pin, so nothing is added by hand; `prelude` is header-only and lives in `imports`' header
+/// table.
+fn lex(view: &SourceView) -> fln_syntax::run::LexRun {
+    crate::extensions::with_token_table(|table| {
+        crate::extensions::interpolate(view.normalized(), table, lex_run(view.normalized(), table))
+    })
 }
-fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
-    let run = lex_run(view.normalized(), table());
+pub(crate) fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
+    let run = lex(view);
     let diagnostics: Vec<_> = run
         .diagnostics()
         .into_iter()
@@ -61,6 +125,105 @@ fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
         })
         .collect())
 }
+
+/// The original byte offset at which the pin positions a declaration command's warnings, such as
+/// "declaration uses `sorry`": the declared name for `def`, `theorem`, `abbrev`, `opaque`,
+/// `axiom` and a named `instance`, and the keyword for `example`, an anonymous `instance`,
+/// `structure`, `class` and `inductive` (measured at the pinned v4.32.0: `protected def Foo.bar`
+/// after a doc comment and an attribute warns at the name; `structure S` with a `sorry` field
+/// default warns at `structure`). `None` when no declaration keyword is found.
+pub fn declaration_warning_offset(source: &[u8]) -> Option<usize> {
+    let original = SourceText::from_utf8(source).ok()?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view).ok()?;
+    let symbol = |index: usize| match tokens.get(index).map(|token| &token.kind) {
+        Some(TokenKind::Symbol(symbol)) => Some(symbol.as_str()),
+        _ => None,
+    };
+    // A keyword inside an attribute list (`@[instance] def f`) names an attribute, not the
+    // declaration.
+    let mut depth = 0usize;
+    let keyword = (0..tokens.len()).find(|&index| {
+        match symbol(index) {
+            Some("@[") => depth += 1,
+            Some("[") if depth > 0 => depth += 1,
+            Some("]") if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+            && matches!(
+                symbol(index),
+                Some(
+                    "def"
+                        | "theorem"
+                        | "abbrev"
+                        | "opaque"
+                        | "axiom"
+                        | "instance"
+                        | "example"
+                        | "structure"
+                        | "class"
+                        | "inductive"
+                )
+            )
+    })?;
+    let at = |index: usize| view.to_original(tokens[index].extent.start()).0;
+    let named = matches!(
+        symbol(keyword),
+        Some("def" | "theorem" | "abbrev" | "opaque" | "axiom" | "instance")
+    ) && matches!(
+        tokens.get(keyword + 1).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    );
+    Some(if named { at(keyword + 1) } else { at(keyword) })
+}
+
+/// [`tokens`] for [`partition`], which goes past a refusal of one token: a symbol the table
+/// does not have (a notation this table lacks, such as a scoped one) or a character literal with
+/// no closing quote (`x#'lt` without the scoped `#'`). The pin's frontend reports such an error on
+/// the command that holds it and goes on with the next command; here that command keeps its
+/// bytes, so parsing it refuses it where the token starts. Every other refusal (an unterminated
+/// comment, string or identifier escape, which runs on past the command) still refuses the whole
+/// source.
+fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
+    let run = lex(view);
+    let diagnostics: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Refused { error, .. } if refusal_of_one_token(error) => None,
+            Event::Token(_) | Event::Trivia(_) => None,
+            Event::Refused { error, .. } => Some(ParseDiagnostic {
+                message: error.message(),
+                at: view.to_original(error.at()),
+            }),
+        })
+        .collect();
+    if !diagnostics.is_empty() {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+    Ok(run
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Token(token) => Some(token),
+            _ => None,
+        })
+        .collect())
+}
+/// A refusal of one token that [`partition`] goes past, leaving it to the command that holds it.
+pub(crate) fn refusal_of_one_token(error: &fln_syntax::run::RunError) -> bool {
+    use fln_syntax::literal::LiteralError;
+    use fln_syntax::run::RunError;
+    use fln_syntax::token::TokenError;
+    matches!(
+        error,
+        RunError::Token(
+            TokenError::NotAToken { .. }
+                | TokenError::Literal(LiteralError::MissingEndOfCharLiteral { .. }),
+        )
+    )
+}
 fn control(s: &str) -> bool {
     matches!(
         s,
@@ -73,8 +236,252 @@ fn control(s: &str) -> bool {
             | "variable"
             | "include"
             | "omit"
+            | "set_option"
     )
 }
+/// A command this grammar does not parse, at the head of a line where a declaration's body
+/// cannot go on: it ends the declaration before it rather than becoming its tokens. (`set_option`
+/// is a scope command, [`control`].)
+fn line_command(s: &str) -> bool {
+    !declaration(s)
+        && !modifiers::is_modifier(s)
+        && !matches!(s, "local" | "scoped")
+        && (PIN_DOC_CARRIERS.contains(&s)
+            || matches!(
+                s,
+                "grind_pattern"
+                    | "seal"
+                    | "unseal"
+                    | "export"
+                    | "init_grind_norm"
+                    | "gen_injective_theorems%"
+                    | "init_quot"
+                    | "docs_to_verso"
+            )
+            || crate::extensions::is_command_keyword(s))
+}
+/// A doc comment: the lexer's one token for `/--` or `/-!` and its whole body.
+fn doc_comment(token: &LexedToken) -> bool {
+    matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--" || symbol == "/-!")
+}
+
+/// A declaration's doc comment whose reference-manual links the pin refuses. The pin attaches
+/// the docstring through `addMarkdownDocString`, whose `validateDocComment` runs
+/// `rewriteManualLinksCore` (vendored `src/Lean/DocString/Links.lean`) and reports every link it
+/// cannot rewrite as an error. A module doc (`/-!`) is stored unvalidated. Out of line so its
+/// temporaries stay out of `partition`'s frame (parsers run on small host stacks).
+#[inline(never)]
+fn unvalidated_manual_link(
+    view: &SourceView,
+    token: &LexedToken,
+) -> Option<NatDefinitionParseError> {
+    let TokenKind::Symbol(symbol) = &token.kind else {
+        return None;
+    };
+    if symbol != "/--" {
+        return None;
+    }
+    let text = view
+        .normalized()
+        .as_str()
+        .get(token.extent.start().0..token.extent.end().0)?;
+    // `getDocStringText`: the comment body after the opener's trailing whitespace, without `-/`.
+    let body = text.get(3..)?.trim_start_matches([' ', '\n']);
+    let docstring = body.strip_suffix("-/").unwrap_or(body);
+    manual_link_refused(docstring).then(|| NatDefinitionParseError::OutsideSeedGrammar {
+        at: view.to_original(token.extent.start()),
+        expected: NatDefinitionExpectation::DocCommentWithoutManualLinks,
+    })
+}
+
+/// Whether `rewriteManualLinksCore` reports an error on `docstring`, scanning exactly as it does:
+/// at each `lean-manual://`, the URL runs over URL characters, and a URL character that ends the
+/// string ends the URL without being part of it; the path must be `section/<id>` or
+/// `errorExplanation/<name>`, one nonempty item after the kind.
+fn manual_link_refused(docstring: &str) -> bool {
+    const SCHEME: &str = "lean-manual://";
+    let url_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '-' | '.'
+                    | '_'
+                    | '~'
+                    | ':'
+                    | '/'
+                    | '?'
+                    | '#'
+                    | '['
+                    | ']'
+                    | '@'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+            )
+    };
+    let mut at = 0;
+    while let Some(found) = docstring[at..].find(SCHEME) {
+        let start = at + found + SCHEME.len();
+        let rest = &docstring[start..];
+        let mut chars = rest.char_indices().peekable();
+        let mut path_end = None;
+        while let Some((offset, c)) = chars.next() {
+            if url_char(c) && chars.peek().is_some() {
+                continue;
+            }
+            path_end = Some(offset);
+            break;
+        }
+        // At the very end of the string there is no character to end the URL: no rewrite and
+        // no error.
+        let Some(path_end) = path_end else {
+            return false;
+        };
+        let path = &rest[..path_end];
+        let mut parts = path.split('/');
+        let kind = parts.next().unwrap_or("");
+        let args: Vec<&str> = parts.collect();
+        let valid = matches!(kind, "section" | "errorExplanation")
+            && matches!(args.as_slice(), [item] if !item.is_empty());
+        if !valid {
+            return true;
+        }
+        at = start + path_end;
+    }
+    false
+}
+
+/// Refuses the doc comment at `tokens[index]` unless it is a module doc (a command of its own) or
+/// leads what can carry it: a declaration this grammar parses, or a command only the pin parses
+/// (`syntax`, `macro`, `add_decl_doc`, ...), with which the doc stays, so that one command is
+/// refused where it is parsed rather than the whole file here. A declaration's doc must not need
+/// manual-link validation, and the pin refuses `/-- d -/ #eval e` at the `#eval` and a doc at
+/// end of input. Out of line, with the refusals built here, so they occupy nothing of
+/// `partition`'s frame.
+#[inline(never)]
+fn doc_comment_is_carried(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    index: usize,
+    source_len: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let token = &tokens[index];
+    if let Some(refusal) = unvalidated_manual_link(view, token) {
+        return Err(refusal);
+    }
+    if !matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "/--") {
+        return Ok(());
+    }
+    let next = tokens.get(index + 1);
+    // A carrier the file itself declares (`Init/Meta.lean`'s `macro … "declare_simp_like_tactic"`)
+    // is an identifier under its imports' table: the partition is one pass over the whole file,
+    // before any of its declarations, so it reads the word by its text.
+    if next.is_some_and(|next| {
+        carries_doc_comment(next)
+            || matches!(&next.kind, TokenKind::Symbol(symbol)
+                if PIN_DOC_CARRIERS.contains(&symbol.as_str()))
+            || matches!(&next.kind, TokenKind::Ident(name)
+                if PIN_DOC_CARRIERS.contains(&name.to_display_string().as_str()))
+    }) {
+        return Ok(());
+    }
+    Err(NatDefinitionParseError::OutsideSeedGrammar {
+        at: next.map_or(BytePos(source_len), |next| {
+            view.to_original(next.extent.start())
+        }),
+        expected: NatDefinitionExpectation::DefinitionKeyword,
+    })
+}
+
+/// Every command keyword the pin accepts after a declaration's doc comment, as its parser lists
+/// them when the doc is followed by anything else (measured 2026-10-07), with the attribute kinds
+/// `scoped` and `local` that lead `syntax`, `notation` and `macro`.
+const PIN_DOC_CARRIERS: &[&str] = &[
+    "#guard_msgs",
+    "abbrev",
+    "add_decl_doc",
+    "axiom",
+    "binder_predicate",
+    "builtin_cbv_simproc",
+    "builtin_cbv_simproc_decl",
+    "builtin_dsimproc",
+    "builtin_dsimproc_decl",
+    "builtin_grind_propagator",
+    "builtin_initialize",
+    "builtin_simproc",
+    "builtin_simproc_decl",
+    "cbv_simproc",
+    "cbv_simproc_decl",
+    "class",
+    "coinductive",
+    "declare_simp_like_tactic",
+    "declare_syntax_cat",
+    "def",
+    "dsimproc",
+    "dsimproc_decl",
+    "elab",
+    "elab_rules",
+    "example",
+    "grind_propagator",
+    "inductive",
+    "infix",
+    "infixl",
+    "infixr",
+    "initialize",
+    "instance",
+    "local",
+    "macro",
+    "macro_rules",
+    "notation",
+    "opaque",
+    "postfix",
+    "prefix",
+    "recommended_spelling",
+    "register_error_explanation",
+    "register_tactic_tag",
+    "register_try?_tactic",
+    "scoped",
+    "simproc",
+    "simproc_decl",
+    "structure",
+    "syntax",
+    "tactic_extension",
+    "theorem",
+    "unif_hint",
+];
+
+/// Whether `token` can follow a declaration's doc comment: the declaration keywords and the
+/// rest of `declModifiers` (attributes, then the modifiers), whose first slot the doc fills.
+/// Whether a symbol opens (`Some(true)`) or closes (`Some(false)`) a bracket, for the
+/// partition's nesting depth. The pin's tokens put brackets inside longer symbols: `#[`, `%[`,
+/// `.(`, `-[`, `` `(tactic| ``, `wp⟦` open, and `]'` (`xs[i]'h`, `Init/GetElem.lean`) and
+/// `+1]` close, so a symbol is read by the brackets it contains.
+fn bracket(symbol: &str) -> Option<bool> {
+    const OPEN: &[char] = &['(', '[', '{', '⟨', '⟦', '⦃'];
+    const CLOSE: &[char] = &[')', ']', '}', '⟩', '⟧', '⦄'];
+    match (symbol.contains(OPEN), symbol.contains(CLOSE)) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+fn carries_doc_comment(token: &LexedToken) -> bool {
+    matches!(&token.kind, TokenKind::Symbol(symbol)
+    if modifiers::is_modifier(symbol)
+        || matches!(
+            symbol.as_str(),
+            "def" | "theorem" | "abbrev" | "opaque" | "axiom" | "example" | "instance"
+                | "structure" | "class" | "inductive" | "@["
+        ))
+}
+
 fn declaration(s: &str) -> bool {
     matches!(
         s,
@@ -87,6 +494,9 @@ fn declaration(s: &str) -> bool {
             | "inductive"
             | "#check"
             | "#eval"
+            | "#guard"
+            | "#synth"
+            | "#print"
     )
 }
 
@@ -100,9 +510,28 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let Some(first) = tokens.first() else {
         return Ok(Some(ScopeCommand::Trivia));
     };
+    // A module doc, or a declaration's doc comment that `partition` split off after checking
+    // what follows it, changes no environment and prints nothing.
+    if tokens.len() == 1 && doc_comment(first) {
+        if let Some(refusal) = unvalidated_manual_link(&view, first) {
+            return Err(refusal);
+        }
+        return Ok(Some(ScopeCommand::Trivia));
+    }
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
+    if keyword == "#exit" && tokens.len() == 1 {
+        return Ok(Some(ScopeCommand::Exit));
+    }
+    if matches!(keyword.as_str(), "public" | "@[")
+        && let Some(section) = trees::modified_section(&view, &tokens)
+    {
+        return Ok(Some(section));
+    }
+    if let Some(command) = generic_in(&view, &tokens, keyword, source.len()) {
+        return Ok(Some(command));
+    }
     if keyword == "variable" {
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
     }
@@ -110,7 +539,34 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         if let Some(attribute) = instances::parse(&view, &tokens)? {
             return Ok(Some(ScopeCommand::Instance(attribute)));
         }
+        if let Some(attribute) = reducibility::parse(&view, &tokens)? {
+            return Ok(Some(ScopeCommand::Reducibility(attribute)));
+        }
         return attributes::parse(source).map(|attribute| attribute.map(ScopeCommand::Simp));
+    }
+    if keyword == "set_option" {
+        return set_option(&view, &tokens, source.len()).map(Some);
+    }
+    let guarded = |index: usize| {
+        matches!(tokens.get(index).map(|t| &t.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == "#guard_msgs")
+    };
+    if keyword == "#guard_msgs" || (keyword == "/--" && guarded(1)) {
+        return guard_msgs(&view, &tokens, source.len()).map(Some);
+    }
+    if keyword == "export" {
+        return export(&view, &tokens, source.len()).map(Some);
+    }
+    // `open Ns (a b …)`: the same shape as `export`'s.
+    if keyword == "open"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(")
+    {
+        return export(&view, &tokens, source.len()).map(|command| match command {
+            ScopeCommand::Export { namespace, names } => {
+                Some(ScopeCommand::OpenExplicit { namespace, names })
+            }
+            other => Some(other),
+        });
     }
     if !control(keyword) {
         return Ok(None);
@@ -162,15 +618,265 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     Ok(Some(command))
 }
 
+/// `<head> in <body>` for the heads [`ScopeCommand::In`] covers: the first `in` outside brackets,
+/// with a command after it. `open Ns in …` and `set_option … in …` keep their own forms.
+fn generic_in(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: &str,
+    end: usize,
+) -> Option<ScopeCommand> {
+    let explicit_open = keyword == "open"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(");
+    // A global `attribute [a] x in …` is not one: the pin refuses it ("Despite the `in`, the
+    // attribute … is added globally"). A `local` one scopes to the body.
+    let local_attribute = keyword == "attribute"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "local");
+    if !matches!(keyword, "variable" | "universe" | "include" | "omit")
+        && !explicit_open
+        && !local_attribute
+    {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        let TokenKind::Symbol(symbol) = &token.kind else {
+            continue;
+        };
+        match crate::canonical_bracket(symbol.as_str()) {
+            "(" | "[" | "{" | ".{" | "⦃" | "⟨" | "@[" => depth += 1,
+            ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+            "in" if depth == 0 => {
+                let body = tokens.get(index + 1)?;
+                let head = view.to_original(token.extent.start()).0;
+                let body = view.to_original(body.extent.start()).0;
+                return (head < body && body < end).then_some(ScopeCommand::In { head, body });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The body boundary of a temporary command scope. This query reads only an
+/// actual `open`/`set_option`/`#guard_msgs` header containing `in`; other heads
+/// may be unfinished and are never sent through their scope/declaration parser.
+pub fn wrapper_body(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view)?;
+    let symbol = |index: usize, expected: &str| {
+        matches!(tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == expected)
+    };
+    if !(symbol(0, "open")
+        || symbol(0, "set_option")
+        || symbol(0, "#guard_msgs")
+        || (symbol(0, "/--") && symbol(1, "#guard_msgs")))
+        || !tokens
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "in"))
+    {
+        return Ok(None);
+    }
+    Ok(match parse(source)? {
+        Some(
+            ScopeCommand::OpenIn { body, .. }
+            | ScopeCommand::SetOptionIn { body, .. }
+            | ScopeCommand::GuardMsgs { body, .. },
+        ) => Some(body),
+        _ => None,
+    })
+}
+
+/// `set_option`'s operands, as the pin's `«set_option»` reads them: an identifier, then
+/// `optionValue` (`nonReservedSymbol "true" <|> nonReservedSymbol "false" <|> strLit <|> numLit`,
+/// vendored `src/Lean/Parser/Command.lean`), then the end of the command or `in` and one more
+/// command. A numeral is read in its own radix and refused past `u64`, the width of the
+/// `DataValue` it becomes. A string is read only without escapes or gaps, so nothing here decodes
+/// one differently from the pin; one with a backslash is refused.
+/// `"export " ident " (" ident+ ")"`: exactly a namespace and a parenthesized list of names.
+fn export(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    source_len: usize,
+) -> Result<ScopeCommand, DefinitionParseError> {
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens
+            .get(index)
+            .map_or(BytePos(source_len), |t| view.to_original(t.extent.start())),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let symbol = |index: usize, text: &str| matches!(tokens.get(index).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let Some(TokenKind::Ident(namespace)) = tokens.get(1).map(|t| &t.kind) else {
+        return Err(bad(1));
+    };
+    if !symbol(2, "(") {
+        return Err(bad(2));
+    }
+    let mut names = Vec::new();
+    let mut at = 3;
+    while let Some(TokenKind::Ident(name)) = tokens.get(at).map(|t| &t.kind) {
+        names.push(name.clone());
+        at += 1;
+    }
+    if names.is_empty() || !symbol(at, ")") || at + 1 != tokens.len() {
+        return Err(bad(at));
+    }
+    Ok(ScopeCommand::Export {
+        namespace: namespace.clone(),
+        names,
+    })
+}
+
+fn set_option(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    source_len: usize,
+) -> Result<ScopeCommand, DefinitionParseError> {
+    use fln_core::options::DataValue;
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens
+            .get(index)
+            .map_or(BytePos(source_len), |t| view.to_original(t.extent.start())),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let Some(TokenKind::Ident(name)) = tokens.get(1).map(|token| &token.kind) else {
+        return Err(bad(1));
+    };
+    let Some(operand) = tokens.get(2) else {
+        return Err(bad(2));
+    };
+    let text = view
+        .normalized()
+        .as_str()
+        .get(operand.extent.start().0..operand.extent.end().0)
+        .ok_or_else(|| bad(2))?;
+    let value = match &operand.kind {
+        TokenKind::Ident(word) if *word == Name::from_components(["true"]) => {
+            DataValue::OfBool(true)
+        }
+        TokenKind::Ident(word) if *word == Name::from_components(["false"]) => {
+            DataValue::OfBool(false)
+        }
+        TokenKind::Literal(LiteralKind::Nat) => {
+            let (digits, radix) = match text.get(..2) {
+                Some("0x" | "0X") => (&text[2..], 16),
+                Some("0b" | "0B") => (&text[2..], 2),
+                Some("0o" | "0O") => (&text[2..], 8),
+                _ => (text, 10),
+            };
+            DataValue::OfNat(u64::from_str_radix(digits, radix).map_err(|_| bad(2))?)
+        }
+        TokenKind::Literal(LiteralKind::Str) => {
+            let inner = text
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .filter(|inner| !inner.contains('\\'))
+                .ok_or_else(|| bad(2))?;
+            DataValue::OfString(inner.to_owned())
+        }
+        _ => return Err(bad(2)),
+    };
+    match tokens.get(3) {
+        None => Ok(ScopeCommand::SetOption {
+            name: name.clone(),
+            value,
+        }),
+        Some(token) if matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "in") => {
+            let body = tokens.get(4).ok_or_else(|| bad(4))?;
+            Ok(ScopeCommand::SetOptionIn {
+                name: name.clone(),
+                value,
+                body: view.to_original(body.extent.start()).0,
+            })
+        }
+        Some(_) => Err(bad(3)),
+    }
+}
+
+/// `[docComment] #guard_msgs [spec] in <command>`, as the pin's `guardMsgsCmd` reads it. The
+/// expected text is the pin's: `getDocStringText` takes the doc between `/--` and `-/`, and
+/// `elabGuardMsgs` trims it (`trimAscii`) and removes trailing-whitespace markers
+/// (`removeTrailingWhitespaceMarker`, `⏎` before a line break). A spec is only skipped to its
+/// closing parenthesis and reported, never interpreted here.
+fn guard_msgs(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    source_len: usize,
+) -> Result<ScopeCommand, DefinitionParseError> {
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens
+            .get(index)
+            .map_or(BytePos(source_len), |t| view.to_original(t.extent.start())),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let symbol = |index: usize, text: &str| {
+        matches!(tokens.get(index).map(|t| &t.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == text)
+    };
+    let (expected, mut index) = if symbol(0, "/--") {
+        let doc = view
+            .normalized()
+            .as_str()
+            .get(tokens[0].extent.start().0..tokens[0].extent.end().0)
+            .and_then(|text| text.strip_prefix("/--"))
+            .and_then(|text| text.strip_suffix("-/"))
+            .ok_or_else(|| bad(0))?;
+        let expected = doc
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .replace("⏎\n", "\n");
+        (expected, 1)
+    } else {
+        (String::new(), 0)
+    };
+    if !symbol(index, "#guard_msgs") {
+        return Err(bad(index));
+    }
+    index += 1;
+    let specified = symbol(index, "(");
+    if specified {
+        let mut depth = 0_usize;
+        loop {
+            let Some(TokenKind::Symbol(text)) = tokens.get(index).map(|t| &t.kind) else {
+                if tokens.get(index).is_none() {
+                    return Err(bad(index));
+                }
+                index += 1;
+                continue;
+            };
+            match bracket(text) {
+                Some(true) => depth += 1,
+                Some(false) => depth = depth.saturating_sub(1),
+                None => {}
+            }
+            index += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    if !symbol(index, "in") {
+        return Err(bad(index));
+    }
+    let body = tokens.get(index + 1).ok_or_else(|| bad(index + 1))?;
+    Ok(ScopeCommand::GuardMsgs {
+        expected,
+        specified,
+        body: view.to_original(body.extent.start()).0,
+    })
+}
+
 /// Partition both scope commands and declarations, preserving every source byte.
 /// Delimiters protect nested terms and explicit universe argument lists; comments
 /// and strings are lexer events, not text searched for command-looking words.
 /// Scope directives must start a source line. Within a declaration they must
 /// also leave its layout block; `end` is still a valid local name in a proof.
+/// A token the table lacks ends only the command holding it ([`partition_tokens`]).
 pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let tokens = tokens(&view)?;
+    let tokens = partition_tokens(&view)?;
     let mut starts = Vec::new();
     let mut depth = 0_usize;
     let source_view = view.normalized();
@@ -188,10 +894,11 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     // body's layout block is measured from the command's first token, not its keyword.
     let mut prefix_column = None;
     // `open A in <command>` is one command: after an `open`'s `in`, the next command that
-    // starts belongs to it.
+    // starts belongs to it. `set_option o v in <command>` is the same `in`.
     let mut current_open = false;
     let mut open_in = false;
     let mut mutual_until = 0;
+    let mut exit_end = None;
     for (index, token) in tokens.iter().enumerate() {
         if index < mutual_until {
             continue;
@@ -215,18 +922,64 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 || source_view.line_of(token.extent.start())
                     > source_view.line_of(tokens[index - 1].extent.end()))
                 && declaration_column.is_none_or(|base| column(token) <= base);
-            let scope_start = control(symbol) && command_line;
+            // `#exit` is a terminal command: the pin's frontend parses nothing after it
+            // (`Parser.isTerminalCommand`), so it is the last command, ending at its token.
+            if depth == 0 && command_line && !open_in && symbol == "#exit" {
+                starts.push(view.to_original(token.extent.start()).0);
+                exit_end = Some(view.to_original(token.extent.end()).0);
+                break;
+            }
+            // A module doc (`moduleDoc`) is its own command. A declaration's doc comment
+            // (`declModifiers`' first slot) leads its declaration's command, as an attribute
+            // does, and only before what can carry it, as at the pin, which refuses
+            // `/-- d -/ #eval e` at the `#eval`.
+            if depth == 0 && command_line && !open_in && doc_comment(token) {
+                doc_comment_is_carried(&view, &tokens, index, source.len())?;
+                starts.push(view.to_original(token.extent.start()).0);
+                current_open = false;
+                declaration_column = None;
+                attribute_prefix = false;
+                prefix_column = None;
+                // The command after a declaration's doc continues the doc's command, whether
+                // this grammar parses it or not.
+                if symbol == "/--" {
+                    attribute_prefix = true;
+                    prefix_column = Some(column(token));
+                }
+                continue;
+            }
+            // `deriving instance … for …` is a command; `deriving C` alone is a declaration's
+            // clause and stays with it.
+            let deriving_command = symbol == "deriving"
+                && matches!(tokens.get(index + 1).map(|t| &t.kind),
+                    Some(TokenKind::Symbol(next)) if next == "instance");
+            let scope_start =
+                (control(symbol) || line_command(symbol) || deriving_command) && command_line;
             // Attributes and declaration modifiers (`private`, `protected`, `noncomputable`,
             // …) precede the declaration keyword in one command (`declModifiers`).
-            let prefix = symbol == "@[" || modifiers::is_modifier(symbol);
+            // `local` and `scoped` (`attrKind`) lead `instance`, `notation`, `syntax`, … the same way.
+            let prefix = symbol == "@["
+                || modifiers::is_modifier(symbol)
+                || (command_line || attribute_prefix) && (symbol == "local" || symbol == "scoped");
             let inline_start = prefix && command_line;
-            let continues_prefix = attribute_prefix && (declaration(symbol) || prefix);
+            // `class inductive` and `class abbrev` are one declaration keyword at the pin.
+            let after_class = index > 0
+                && matches!(&tokens[index - 1].kind, TokenKind::Symbol(previous) if previous == "class");
+            // `deriving instance …` is one command: its `instance` starts none.
+            let after_deriving = index > 0
+                && matches!(&tokens[index - 1].kind, TokenKind::Symbol(previous) if previous == "deriving");
+            // A command keyword after the prefix is its command's (`@[inherit_doc f]` then
+            // `infixr:100 …` on the next line).
+            let continues_prefix = (attribute_prefix
+                && (declaration(symbol) || prefix || line_command(symbol) || symbol == "section"))
+                || (after_class && declaration(symbol));
             if depth == 0 && current_open && symbol == "in" {
                 open_in = true;
                 current_open = false;
                 continue;
             }
             if depth == 0
+                && !after_deriving
                 && (scope_start || declaration(symbol) || inline_start || continues_prefix)
             {
                 if !continues_prefix {
@@ -234,19 +987,56 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                         starts.push(view.to_original(token.extent.start()).0);
                     }
                     open_in = false;
-                    current_open = scope_start && symbol == "open";
+                    // `Command.in` (`cmd " in " cmd`): after these, a top-level `in` takes
+                    // the next command into this one.
+                    current_open = scope_start
+                        && matches!(
+                            symbol.as_str(),
+                            "open"
+                                | "set_option"
+                                | "attribute"
+                                | "variable"
+                                | "omit"
+                                | "include"
+                                | "universe"
+                        );
                     prefix_column = inline_start.then(|| column(token));
                 }
-                attribute_prefix = inline_start || (continues_prefix && !declaration(symbol));
+                attribute_prefix = inline_start
+                    || (continues_prefix
+                        && !declaration(symbol)
+                        && !line_command(symbol)
+                        && symbol != "section");
+                // `[doc] #guard_msgs … in <command>`: the guarded command belongs to it, whether
+                // the guard starts its command or continues its doc comment's.
+                if symbol == "#guard_msgs" {
+                    current_open = true;
+                }
                 declaration_column = declaration(symbol)
                     .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
+            } else if depth == 0 && attribute_prefix {
+                // Any other keyword ends the prefix: it carries the prefix (`abbrev`, `opaque`,
+                // `axiom`, …) and belongs to its command, and the next declaration starts anew.
+                attribute_prefix = false;
             }
-            match symbol.as_str() {
-                "(" | "[" | "@[" | "{" | ".{" | "⦃" | "⟨" => depth = depth.saturating_add(1),
-                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
-                _ => {}
+            match bracket(symbol) {
+                Some(true) => depth = depth.saturating_add(1),
+                Some(false) => depth = depth.saturating_sub(1),
+                None => {}
             }
         }
+    }
+    // Trivia before the first start belongs to its command. A token before it is a command of
+    // its own that this layer does not recognise (`grind_annotated "…"` right after a header),
+    // which is refused where it is parsed, not merged into the command after it.
+    let first_token = tokens
+        .first()
+        .map(|token| view.to_original(token.extent.start()).0);
+    if starts
+        .first()
+        .is_some_and(|&first| first_token.is_some_and(|token| token < first))
+    {
+        starts.insert(0, 0);
     }
     let mut output = Vec::new();
     let mut start = 0;
@@ -254,13 +1044,37 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
         output.push((BytePos(start), &source[start..next]));
         start = next;
     }
-    output.push((BytePos(start), &source[start..]));
+    output.push((
+        BytePos(start),
+        &source[start..exit_end.unwrap_or(source.len())],
+    ));
     Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapper_queries_parse_only_temporary_scope_headers() {
+        for source in [
+            "variable (x :",
+            "attribute [instance]",
+            "open",
+            "set_option maxRecDepth",
+            "@[expose] public def use (A : Type) : A := let x := Type in",
+        ] {
+            assert_eq!(wrapper_body(source.as_bytes()).unwrap(), None, "{source}");
+        }
+        for source in [
+            "open Chosen in @[expose] public def use (A : Type) : A :=",
+            "set_option maxRecDepth 256 in @[expose] public def use (",
+            "/-- note -/\r\n#guard_msgs in @[expose] public def use (",
+        ] {
+            let body = wrapper_body(source.as_bytes()).unwrap().unwrap();
+            assert!(source[body..].starts_with("@[expose] public def"));
+        }
+    }
+
     #[test]
     fn scoped_openings_preserve_structural_names_without_becoming_name_opens() {
         let source = "-- 😀\r\nopen scoped A.«B.C» D";
@@ -284,6 +1098,34 @@ mod tests {
         ] {
             assert!(parse(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    /// The pin's command boundaries (`Lines.lean`, dumped at the pin): a line-start command this
+    /// grammar cannot parse ends the declaration before it, `set_option … in` leads the next
+    /// command, and attributes and `noncomputable scoped`/`local` lead theirs.
+    #[test]
+    fn line_start_commands_end_the_declaration_before_them() {
+        let source = "theorem a : True := by\n  trivial\n\ngrind_pattern Nat.add_zero => n + 0\n\
+                      set_option pp.all true in\ntheorem b : True := trivial\n\
+                      @[inherit_doc f]\ninfixr:100 \" <&&> \" => Nat.add\n\
+                      noncomputable scoped instance i : Inhabited Nat := ⟨0⟩\n\
+                      local notation \"xx\" => 1\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        let heads: Vec<_> = commands
+            .iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap().lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "theorem a : True := by",
+                "grind_pattern Nat.add_zero => n + 0",
+                "set_option pp.all true in",
+                "@[inherit_doc f]",
+                "noncomputable scoped instance i : Inhabited Nat := ⟨0⟩",
+                "local notation \"xx\" => 1",
+            ]
+        );
     }
 
     #[test]
@@ -314,6 +1156,111 @@ mod tests {
             Some(ScopeCommand::Trivia)
         );
     }
+
+    #[test]
+    fn public_and_exposure_sections_keep_flags_and_multiline_command_boundaries() {
+        for (source, public, expose, name) in [
+            ("public section", true, false, None),
+            ("@[expose] section", false, true, None),
+            (
+                "@[expose] public section «A.B».C",
+                true,
+                true,
+                Some(Name::from_components(["A.B", "C"])),
+            ),
+        ] {
+            assert_eq!(
+                parse(source.as_bytes()).unwrap(),
+                Some(ScopeCommand::SectionWithModifiers {
+                    name,
+                    public,
+                    expose,
+                }),
+                "{source}"
+            );
+        }
+        let source = b"-- header\r\n@[expose]\r\npublic\r\nsection A.B\r\ndef identity (a : Type) (x : a) : a := x\r\nend B\r\nend A\r\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            parse(commands[0].1).unwrap(),
+            Some(ScopeCommand::SectionWithModifiers {
+                name: Some(Name::from_components(["A", "B"])),
+                public: true,
+                expose: true,
+            })
+        );
+        let mut joined = Vec::new();
+        for (offset, bytes) in commands {
+            assert_eq!(offset.0, joined.len());
+            joined.extend_from_slice(bytes);
+        }
+        assert_eq!(joined, source);
+    }
+
+    #[test]
+    fn unsupported_or_escaped_section_modifiers_are_never_consumed_as_scope_flags() {
+        for source in [
+            "public noncomputable section",
+            "@[expose] public meta section",
+            "public @[expose] section",
+            "@[local expose] public section",
+            "@[«expose»] public section",
+            "@[expose] «public» section",
+            "@[expose, simp] public section",
+        ] {
+            assert_eq!(parse(source.as_bytes()).unwrap(), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn public_section_tree_keeps_pinned_slots_and_original_leaves() {
+        let source = "-- preface\n@[expose] public section API";
+        let tree = trees::tree(source.as_bytes()).unwrap().unwrap();
+        let Syntax::Node { kind, args, .. } = &tree else {
+            panic!("section tree");
+        };
+        assert_eq!(kind, &parser_kind(&["Command", "section"]));
+        let Syntax::Node {
+            kind, args: header, ..
+        } = &args[0]
+        else {
+            panic!("section header");
+        };
+        assert_eq!(kind, &parser_kind(&["Command", "sectionHeader"]));
+        let slot_lengths = header
+            .iter()
+            .map(|slot| match slot {
+                Syntax::Node { kind, args, .. } if kind == &Name::from_components(["null"]) => {
+                    args.len()
+                }
+                _ => panic!("optional header slot"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(slot_lengths, [3, 1, 0, 0]);
+        let mut stack = vec![&tree];
+        let mut leaves = Vec::new();
+        while let Some(node) = stack.pop() {
+            match node {
+                Syntax::Node { args, .. } => stack.extend(args.iter().rev()),
+                Syntax::Atom { info, val } => {
+                    let fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } = info else {
+                        panic!("original atom positions");
+                    };
+                    assert_eq!(&source[pos.0..end_pos.0], val);
+                    leaves.push(val.as_str());
+                }
+                Syntax::Ident { info, .. } => {
+                    let fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } = info else {
+                        panic!("original name positions");
+                    };
+                    leaves.push(&source[pos.0..end_pos.0]);
+                }
+                Syntax::Missing => panic!("complete section syntax"),
+            }
+        }
+        assert_eq!(leaves, ["@[", "expose", "]", "public", "section", "API"]);
+    }
     #[test]
     fn malformed_scope_commands_are_not_partially_accepted() {
         for source in [
@@ -322,7 +1269,9 @@ mod tests {
             "end A B",
             "section A B",
             "open",
-            "open A (x)",
+            "open A ()",
+            "open A (x",
+            "open A (1)",
             "open A in",
             "open scoped",
             "open scoped A in",
@@ -335,7 +1284,43 @@ mod tests {
             assert!(parse(source.as_bytes()).is_err(), "{source}");
         }
         assert_eq!(parse(b"def value := 3").unwrap(), None);
+        // The pin's `openOnly` (measured: `open A ()`, `open A (x` and `open A (1)` are its parse
+        // errors; `open A (x)` is not).
+        assert_eq!(
+            parse(b"open A (x)").unwrap(),
+            Some(ScopeCommand::OpenExplicit {
+                namespace: Name::str(Name::anonymous(), "A"),
+                names: vec![Name::str(Name::anonymous(), "x")],
+            })
+        );
     }
+    /// `attribute`, `variable`, `omit` and `include` take the next command after a top-level
+    /// `in` too (`Command.in`), as in `Init/GrindInstances/Ring/SInt.lean`; an `in` inside
+    /// brackets is not that.
+    #[test]
+    fn scope_commands_followed_by_in_take_the_next_command() {
+        let file = "attribute [local instance] f in\ntheorem t : True := trivial\n\
+                    variable (x : Nat) in\ndef y := x\n\
+                    omit [Inhabited Nat] in\ndef z := 1\n\
+                    include x in\ndef w := x\n\
+                    def after := 2\n";
+        let commands = partition(file.as_bytes()).unwrap();
+        let texts: Vec<_> = commands
+            .iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "attribute [local instance] f in\ntheorem t : True := trivial\n",
+                "variable (x : Nat) in\ndef y := x\n",
+                "omit [Inhabited Nat] in\ndef z := 1\n",
+                "include x in\ndef w := x\n",
+                "def after := 2\n",
+            ]
+        );
+    }
+
     /// `open A in <command>` (`Lean.Parser.Command.in`) is one command whose body is the next
     /// command; the pin's macro elaborates it as `section open A <command> end`.
     #[test]
@@ -391,6 +1376,129 @@ mod tests {
     }
 
     #[test]
+    fn set_option_reads_the_pins_option_values_and_its_in_form() {
+        use fln_core::options::DataValue;
+        let option = |source: &str| match parse(source.as_bytes()).unwrap() {
+            Some(ScopeCommand::SetOption { name, value }) => (name.to_display_string(), value),
+            other => panic!("{source}: {other:?}"),
+        };
+        assert_eq!(
+            option("set_option linter.unusedVariables false"),
+            ("linter.unusedVariables".into(), DataValue::OfBool(false))
+        );
+        assert_eq!(
+            option("set_option autoLift true"),
+            ("autoLift".into(), DataValue::OfBool(true))
+        );
+        assert_eq!(
+            option("set_option maxHeartbeats 400000 -- more"),
+            ("maxHeartbeats".into(), DataValue::OfNat(400_000))
+        );
+        assert_eq!(option("set_option o 0x10").1, DataValue::OfNat(16));
+        assert_eq!(option("set_option o 0b101").1, DataValue::OfNat(5));
+        assert_eq!(
+            option("set_option o \"text\"").1,
+            DataValue::OfString("text".into())
+        );
+
+        let source = "set_option pp.all true in\n#check 1";
+        assert_eq!(
+            parse(source.as_bytes()).unwrap(),
+            Some(ScopeCommand::SetOptionIn {
+                name: Name::from_components(["pp", "all"]),
+                value: DataValue::OfBool(true),
+                body: source.find("#check").unwrap(),
+            })
+        );
+        // The body belongs to the option; the command after it does not.
+        let file =
+            "set_option autoLift false in\ndef x := 1\ndef y := 2\nset_option autoLift true\n";
+        let texts: Vec<_> = partition(file.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "set_option autoLift false in\ndef x := 1\n",
+                "def y := 2\n",
+                "set_option autoLift true\n"
+            ]
+        );
+
+        // Not the pin's `optionValue`, a value past `u64`, a string with an escape, no value,
+        // trailing tokens, and `in` without a command: each refused, none ignored.
+        for source in [
+            "set_option",
+            "set_option o",
+            "set_option o maybe",
+            "set_option o 1.5",
+            "set_option o 18446744073709551616",
+            "set_option o \"a\\nb\"",
+            "set_option o true false",
+            "set_option o true in",
+            "set_option 3 true",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn guard_msgs_reads_the_pins_expected_text_and_keeps_its_command() {
+        let guard = |source: &str| match parse(source.as_bytes()).unwrap() {
+            Some(ScopeCommand::GuardMsgs {
+                expected,
+                specified,
+                body,
+            }) => (expected, specified, source[body..].to_owned()),
+            other => panic!("{source}: {other:?}"),
+        };
+        // `getDocStringText`, `trimAscii` and `removeTrailingWhitespaceMarker`.
+        assert_eq!(
+            guard("/-- info: 4 -/\n#guard_msgs in\n#eval 2 + 2"),
+            ("info: 4".to_owned(), false, "#eval 2 + 2".to_owned())
+        );
+        assert_eq!(
+            guard("/--\ninfo: a⏎\nb\n-/\n#guard_msgs in #eval x"),
+            ("info: a\nb".to_owned(), false, "#eval x".to_owned())
+        );
+        assert_eq!(
+            guard("#guard_msgs in\nexample : True := trivial"),
+            (String::new(), false, "example : True := trivial".to_owned())
+        );
+        assert_eq!(
+            guard("/-- info: 1 -/ #guard_msgs (drop warning) in #eval 1"),
+            ("info: 1".to_owned(), true, "#eval 1".to_owned())
+        );
+
+        // The doc, the guard and its command are one command; the next is not.
+        let file = "def a := 1\n/-- info: 4 -/\n#guard_msgs in\n#eval 2 + 2\ndef b := 2\n";
+        let texts: Vec<_> = partition(file.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "def a := 1\n",
+                "/-- info: 4 -/\n#guard_msgs in\n#eval 2 + 2\n",
+                "def b := 2\n"
+            ]
+        );
+
+        for source in [
+            "#guard_msgs",
+            "#guard_msgs in",
+            "/-- info: 4 -/ #guard_msgs #eval 1",
+            "#guard_msgs (drop info in #eval 1",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn universe_commas_and_escaped_command_names_are_not_command_boundaries() {
         let commands = partition(
             "namespace A\ndef «end».{u,v} (x : Sort u) : Sort u := x\ndef q := f.{1,2} Nat\nend A"
@@ -400,6 +1508,100 @@ mod tests {
         assert_eq!(commands.len(), 4);
         assert!(parse_definition(commands[1].1).is_ok());
     }
+    /// `#exit` is terminal, as the pin's `Parser.isTerminalCommand`: it is the last command,
+    /// ending at its token, and nothing after it is a command, even text no grammar reads. A
+    /// comment naming it is not it.
+    #[test]
+    fn exit_is_the_last_command_and_ends_at_its_token() {
+        let source = b"def x : Nat := 1\n-- #exit in a comment\n#exit\ndef y := ((\n";
+        let commands = partition(source).unwrap();
+        let exit_at = source.windows(6).position(|w| w == b"\n#exit").unwrap() + 1;
+        // The comment is trailing trivia of the definition; the `#exit` command is its token.
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1], (BytePos(exit_at), &b"#exit"[..]));
+        assert_eq!(parse(commands[1].1).unwrap(), Some(ScopeCommand::Exit));
+        assert_eq!(parse(b"#exit").unwrap(), Some(ScopeCommand::Exit));
+    }
+
+    /// `#synth C` (`Lean.Parser.Command.synth`) starts a command and is read as a query.
+    #[test]
+    fn synth_starts_a_command_and_reads_as_a_query() {
+        let source = b"def x : Nat := 1\n#synth Inhabited Nat\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].1, b"#synth Inhabited Nat\n");
+        let parsed = crate::parse_source_command(commands[1].1).unwrap();
+        assert_eq!(parsed.kind(), crate::SourceCommandKind::Check);
+        assert_eq!(
+            parsed
+                .syntax()
+                .kind()
+                .map(Name::to_display_string)
+                .as_deref(),
+            Some("Lean.Parser.Command.synth")
+        );
+    }
+
+    /// `#print` starts a command, and each of its forms reads as the pin's node
+    /// (`Lean/Parser/Command.lean:594-603`), a query of the `#check` kind.
+    #[test]
+    fn print_starts_a_command_and_reads_each_form_as_the_pins_node() {
+        let source = b"def x : Nat := 1\n#print x\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].1, b"#print x\n");
+        let kind = |text: &[u8]| {
+            let parsed = crate::parse_source_command(text).unwrap();
+            assert_eq!(parsed.kind(), crate::SourceCommandKind::Check);
+            let Syntax::Node { kind, args, .. } = parsed.syntax() else {
+                panic!("#print is a node");
+            };
+            // The `nonReservedSymbol` word is an atom of the node, as in the pin's tree; a
+            // string argument is a `str` node.
+            let word = match args.get(1) {
+                Some(Syntax::Atom { val, .. }) => val.clone(),
+                Some(Syntax::Node { kind, .. }) => kind.to_display_string(),
+                _ => String::new(),
+            };
+            (
+                kind.to_display_string(),
+                args.len(),
+                word,
+                parsed.query_term_normalized().unwrap().to_owned(),
+            )
+        };
+        let print = |form: &str, arity, word: &str, term: &str| {
+            (
+                format!("Lean.Parser.Command.{form}"),
+                arity,
+                word.to_owned(),
+                term.to_owned(),
+            )
+        };
+        assert_eq!(kind(b"#print x"), print("print", 2, "", "x"));
+        assert_eq!(kind(b"#print \"hi\""), print("print", 2, "str", "\"hi\""));
+        assert_eq!(
+            kind(b"#print axioms Nat.add"),
+            print("printAxioms", 3, "axioms", "Nat.add")
+        );
+        assert_eq!(kind(b"#print sig x"), print("printSig", 3, "sig", "x"));
+        assert_eq!(
+            kind(b"#print equations x"),
+            print("printEqns", 3, "equations", "x")
+        );
+        assert_eq!(kind(b"#print eqns x"), print("printEqns", 3, "eqns", "x"));
+        // The longest match: a form's word alone is an identifier to print.
+        assert_eq!(kind(b"#print axioms"), print("print", 2, "", "axioms"));
+        for refused in [
+            &b"#print"[..],
+            b"#print x y",
+            b"#print axioms \"s\"",
+            b"#print 1",
+        ] {
+            assert!(crate::parse_source_command(refused).is_err());
+        }
+    }
+
     #[test]
     fn scope_words_inside_branch_binders_and_indented_terms_stay_in_the_declaration() {
         // Each bare scope word is a keyword, so the pinned Reference refuses the declaration;
@@ -465,6 +1667,171 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(command)
             );
+        }
+    }
+
+    /// The pin's tokens carry brackets inside longer symbols (`]'` in `xs[i]'h`, `#[`, `⟦`).
+    /// The partition's nesting depth reads them, so the next command starts where the pin
+    /// starts it instead of inside the previous one.
+    #[test]
+    fn brackets_inside_longer_symbols_keep_the_nesting_depth() {
+        for source in [
+            "theorem a (xs : Array Nat) (i : Nat) (h : i < xs.size) : xs[i]'h = xs[i]'h := rfl\ntheorem b : 1 = 1 := rfl\n",
+            "def a : Array Nat := #[1, 2]\ndef b : Nat := 1\n",
+        ] {
+            assert_eq!(partition(source.as_bytes()).unwrap().len(), 2, "{source}");
+        }
+        assert_eq!(bracket("]'"), Some(false));
+        assert_eq!(bracket("#["), Some(true));
+        assert_eq!(bracket("`(tactic|"), Some(true));
+        assert_eq!(bracket("+1]"), Some(false));
+        assert_eq!(bracket("=>"), None);
+    }
+
+    /// `class inductive` is one declaration (`Init/Prelude.lean`'s `Nonempty`): its constructors'
+    /// docs belong to it, and the next declaration starts a command of its own.
+    #[test]
+    fn class_inductive_is_one_command() {
+        let source = "/-- d -/\nclass inductive Nonempty (α : Sort u) : Prop where\n  /-- c -/\n  | intro (val : α) : Nonempty α\n\ndef x : Nat := 1\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands[1].1.starts_with(b"def x"));
+    }
+
+    /// A module doc is a command of its own wherever a command may start; a declaration's doc
+    /// leads its declaration's command, and only before what can carry it, the way the pin
+    /// refuses `/-- d -/ #eval e`.
+    #[test]
+    fn doc_comments_lead_their_declarations_and_must_be_carried() {
+        let source = "/-! A module doc with `code`; it's prose. -/\n/-- The answer. -/\ndef answer : Nat := 42\n/-- Inline. -/ private def other : Nat := 1\n#eval answer\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        let texts: Vec<_> = commands
+            .iter()
+            .map(|(_, command)| std::str::from_utf8(command).unwrap().trim_end())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "/-! A module doc with `code`; it's prose. -/",
+                "/-- The answer. -/\ndef answer : Nat := 42",
+                "/-- Inline. -/ private def other : Nat := 1",
+                "#eval answer",
+            ]
+        );
+        assert_eq!(
+            parse(texts[0].as_bytes()).unwrap(),
+            Some(ScopeCommand::Trivia)
+        );
+        // A declaration's doc is the first slot of its `declModifiers`, as at the pin.
+        for declaration in [texts[1], texts[2]] {
+            assert_eq!(
+                parse(declaration.as_bytes()).unwrap(),
+                None,
+                "{declaration}"
+            );
+            let parsed = crate::parse_source_command(declaration.as_bytes())
+                .unwrap_or_else(|error| panic!("{declaration}: {error:?}"));
+            let Syntax::Node { args, .. } = parsed.syntax() else {
+                panic!("a declaration");
+            };
+            let Syntax::Node {
+                args: modifiers, ..
+            } = &args[0]
+            else {
+                panic!("declModifiers");
+            };
+            assert!(
+                matches!(&modifiers[0], Syntax::Node { args, .. }
+                    if matches!(args.as_slice(), [Syntax::Node { kind, .. }]
+                        if kind == &parser_kind(&["Command", "docComment"]))),
+                "{declaration}"
+            );
+        }
+        for bad in [
+            "/-- d -/\n#eval 1\n",
+            "def x : Nat := 1\n/-- dangling -/\n",
+            "/-- d -/\n/-- e -/\ndef x : Nat := 1\n",
+        ] {
+            assert!(partition(bad.as_bytes()).is_err(), "{bad}");
+        }
+        // A command the pin lets a doc lead and this grammar does not parse (`elab`: the pin
+        // parses it, 2026-10-09) keeps its doc: the file partitions, and that one command is
+        // refused where it is parsed.
+        let unparsed = "/-- d -/\nelab \"x\" : term => return default\ndef y : Nat := 1\n";
+        let commands = partition(unparsed.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(
+            std::str::from_utf8(commands[0].1)
+                .unwrap()
+                .starts_with("/-- d -/\nelab")
+        );
+        assert!(!matches!(
+            parse(commands[0].1),
+            Ok(Some(ScopeCommand::Trivia))
+        ));
+        assert!(crate::parse_source_command(commands[0].1).is_err());
+        // A syntax declaration is parsed with its doc (`Command.syntax`), and so is a macro
+        // (`Command.macro`).
+        assert!(crate::parse_source_command(b"/-- d -/\nscoped syntax \"x\" : term").is_ok());
+        assert!(crate::parse_source_command(b"/-- d -/\nmacro \"x\" : term => `(0)").is_ok());
+        // The pin validates a declaration doc's manual links ("Unknown documentation type `f`")
+        // and stores a module doc's unvalidated; both verdicts measured 2026-10-07.
+        let linked = "/-- see [](lean-manual://f) -/\ndef x := 44\n";
+        assert!(matches!(
+            partition(linked.as_bytes()),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(0),
+                expected: NatDefinitionExpectation::DocCommentWithoutManualLinks,
+            })
+        ));
+        assert!(parse(b"/-- see [](lean-manual://f) -/").is_err());
+        // The links the pin rewrites pass, and the ones it reports refuse ("Expected one item
+        // after `section`", "Empty section ID"); all four verdicts measured 2026-10-08.
+        assert!(
+            partition(
+                b"/-- [s](lean-manual://section/foo) [e](lean-manual://errorExplanation/lean.x) -/\ndef x := 44\n"
+            )
+            .is_ok()
+        );
+        for bad in ["section/a/b", "section/", "f"] {
+            assert!(
+                manual_link_refused(&format!("see [s](lean-manual://{bad}) ")),
+                "{bad}"
+            );
+        }
+        // A link that reaches the end of the docstring has no character to end it: no error.
+        assert!(!manual_link_refused("trailing lean-manual://"));
+        let module = partition(b"/-! see [](lean-manual://f) -/\ndef x := 44\n").unwrap();
+        assert_eq!(parse(module[0].1).unwrap(), Some(ScopeCommand::Trivia));
+    }
+
+    #[test]
+    fn a_token_the_table_lacks_refuses_its_own_command_and_no_other() {
+        // `#'` is BitVec's scoped notation and `✓` no table's: each command holding one is kept
+        // whole and refused where it is parsed; the commands around it partition as before.
+        for bad in ["theorem t : x#'lt = 1 := rfl", "def ok : Nat := ✓"] {
+            let source = format!("def a : Nat := 1\n{bad}\ndef b : Nat := 2\n");
+            let commands = partition(source.as_bytes()).unwrap();
+            assert_eq!(commands.len(), 3, "{source}");
+            assert_eq!(commands[1].1, format!("{bad}\n").as_bytes(), "{source}");
+            assert!(
+                matches!(
+                    crate::parse_source_command(commands[1].1),
+                    Err(NatDefinitionParseError::Lexical { .. })
+                ),
+                "{source}"
+            );
+            assert!(
+                crate::parse_source_command(commands[2].1).is_ok(),
+                "{source}"
+            );
+        }
+        // A refusal that runs on past its command still refuses the whole source.
+        for bad in [
+            "def s := \"open\ndef b : Nat := 2\n",
+            "def c := /- open\ndef b := 2\n",
+        ] {
+            assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 }

@@ -128,9 +128,21 @@ pub(in crate::source_check) fn load(
     }
     let header = parse_source_header(text.as_bytes()).map_err(|e| Failure::input(e.to_string()))?;
     // No filesystem authority is needed for import-free and untitled documents.
-    if header.imports.is_empty() {
+    if header.imports.is_empty() && (!header.module_system || header.prelude) {
+        let name = if header.module_system {
+            document_path(uri)
+                .ok()
+                .and_then(|path| {
+                    path.file_stem()?
+                        .to_str()
+                        .map(|stem| Name::from_components([stem]))
+                })
+                .unwrap_or_else(|| Name::from_components(["__document"]))
+        } else {
+            Name::from_components(["__document"])
+        };
         return Ok(Sources {
-            names: vec![Name::from_components(["__document"])],
+            names: vec![name],
             sources: vec![text.as_bytes().to_vec()],
             uris: vec![uri.to_owned()],
             root: PathBuf::new(),
@@ -188,8 +200,16 @@ pub(in crate::source_check) fn load(
     let mut rows = 0usize;
     let mut cursor = 0usize;
     while cursor < result.sources.len() {
-        let header = parse_source_header(&result.sources[cursor])
+        let mut header = parse_source_header(&result.sources[cursor])
             .map_err(|e| Failure::input(format!("{}: {e}", result.uris[cursor])))?;
+        fln::source_check::modules::validate_source_header(&result.names[cursor], &header)
+            .map_err(|error| {
+                let (class, authority, exit) = error.disposition();
+                Failure::new(class, &error.to_string(), authority, exit)
+            })?;
+        if header.module_system && !header.prelude {
+            header.imports.insert(0, Name::from_components(["Init"]));
+        }
         rows = rows
             .checked_add(header.imports.len())
             .filter(|n| *n <= MAX_IMPORTS)

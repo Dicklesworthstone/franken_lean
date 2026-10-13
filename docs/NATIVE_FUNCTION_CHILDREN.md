@@ -82,9 +82,11 @@ valid child calls are lowered; a hidden nondecreasing call still refuses. Partia
 child functions are not accepted as data children. Resource stops remain
 nonanswers and failed file suffixes expose no successful successor environment.
 
-Run `fln check-source --json examples/native_function_children.lean` to check
-construction, matching, function-valued induction, source recursion and both
-forms of dependent accessibility folding.
+`examples/native_function_children.lean` covers construction, matching,
+function-valued induction, source recursion and both forms of dependent
+accessibility folding. Its `Accessible.rec` fold is a recursor the pin's code
+generator refuses (line 24), so `fln check-source` refuses the file in the default
+mode too (bead `franken_lean-z8j.1.6.6`); a `frontier` engine checks it.
 
 This is single-family strictly positive function recursion, not nested or mutual
 inductive support. The existing explicit result-type, root-match and immediate

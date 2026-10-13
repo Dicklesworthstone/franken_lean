@@ -123,9 +123,12 @@ class Root where
 instance combined {B : Type} [x : First B] [y : Second B] : Root := Root.mk (@First.tag B x)
 "#,
     );
+    // The pin's own order solves `First B` first: `firstNat` (priority 2000) fixes `B` to
+    // `Nat`, and `Second Nat` follows, so the tag is 7 (v4.32.0, 2026-10-07: `= 7` checks,
+    // `= 9` is refused). The imported order below starts from `Second B` instead.
     checked(
         &base,
-        "def original : Nat := Root.tag\ntheorem originalValue : original = 9 := by rfl",
+        "def original : Nat := Root.tag\ntheorem originalValue : original = 7 := by rfl",
     );
     let env = imported::register_instance(
         base.environment(),
@@ -140,7 +143,7 @@ instance combined {B : Type} [x : First B] [y : Second B] : Root := Root.mk (@Fi
     .unwrap();
     checked(
         &Engine::from_environment(env),
-        "def reordered : Nat := Root.tag\ntheorem reorderedValue : reordered = 7 := by rfl",
+        "def reordered : Nat := Root.tag\ntheorem reorderedValue : reordered = 9 := by rfl",
     );
 }
 

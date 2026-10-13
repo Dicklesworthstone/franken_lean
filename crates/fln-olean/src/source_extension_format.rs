@@ -13,6 +13,11 @@
 //! src/Lean/Meta/DiscrTree/Types.lean: sha256 c2964c861300247b99afb068c5c77046c8f746b8881e9cfb81e63195ba3d3773
 //! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
 //! src/Lean/ReducibilityAttrs.lean: sha256 8d11c2c5d9217eb7034426217b2075526ca4e55f1fdb73d8475d5034f3a6b1a2
+//! src/Lean/Compiler/ExternAttr.lean: sha256 b7fc317ef4457ee6383d2c85a264361b1960d0ce1109c8d2fe5901144d323345
+//! src/Lean/Compiler/ImplementedByAttr.lean: sha256 fec5d936a52cdbac96173249c9ad2028c2be3a049d380fdc0c84da5b4116640f
+//! src/Lean/AuxRecursor.lean: sha256 c004ddcbd0d6475550e701e30b8035e146132f8f7c8d3d5c8486c1f465a6ff9f
+//! src/Lean/Structure.lean: sha256 efb642c4ba81cda9af92374cc48e776ebad991faf16161ca71b6c1bda3b82671
+//! src/Lean/PrivateName.lean: sha256 f40339a7ed3fa6d741b26d9fe3e5c3c16c4ab8f283604e756dc6d0d43e399ae1
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -48,6 +53,27 @@ pub const SIMP_THM_BACKWARD_RFL_SCALAR: usize = 3;
 pub const SIMP_THM_POINTERS: usize = 5;
 pub const SIMP_THM_SCALAR_BYTES: usize = 4;
 
+pub const STRUCTURE_FIELD_FIELD_NAME: usize = 0;
+pub const STRUCTURE_FIELD_PROJ_FN: usize = 1;
+pub const STRUCTURE_FIELD_SUBOBJECT_OPTION: usize = 2;
+pub const STRUCTURE_FIELD_BINDER_INFO_SCALAR: usize = 0;
+pub const STRUCTURE_FIELD_AUTO_PARAM_OPTION: usize = 3;
+pub const STRUCTURE_FIELD_POINTERS: usize = 4;
+pub const STRUCTURE_FIELD_SCALAR_BYTES: usize = 1;
+
+pub const STRUCTURE_PARENT_STRUCT_NAME: usize = 0;
+pub const STRUCTURE_PARENT_SUBOBJECT_SCALAR: usize = 0;
+pub const STRUCTURE_PARENT_PROJ_FN: usize = 1;
+pub const STRUCTURE_PARENT_POINTERS: usize = 2;
+pub const STRUCTURE_PARENT_SCALAR_BYTES: usize = 1;
+
+pub const STRUCTURE_STRUCT_NAME: usize = 0;
+pub const STRUCTURE_FIELD_NAMES: usize = 1;
+pub const STRUCTURE_FIELD_INFO: usize = 2;
+pub const STRUCTURE_PARENT_INFO: usize = 3;
+pub const STRUCTURE_POINTERS: usize = 4;
+pub const STRUCTURE_SCALAR_BYTES: usize = 0;
+
 pub const SCOPE_GLOBAL: u8 = 0;
 pub const SCOPE_SCOPED: u8 = 1;
 pub const ATTRIBUTE_GLOBAL: u8 = 0;
@@ -74,6 +100,16 @@ pub const PROD_SND: usize = 1;
 pub const PROD_POINTERS: usize = 2;
 pub const PROD_SCALAR_BYTES: usize = 0;
 pub const PROTECTED_EXTENSION: &str = "Lean.protectedExt";
+pub const AUX_RECURSOR_EXTENSION: &str = "Lean.auxRecExt";
+pub const BINDER_DEFAULT: u8 = 0;
+pub const BINDER_IMPLICIT: u8 = 1;
+pub const BINDER_STRICT_IMPLICIT: u8 = 2;
+pub const BINDER_INST_IMPLICIT: u8 = 3;
+pub const STRUCTURE_EXTENSION: &str = "_private.Lean.Structure.0.Lean.structureExt";
+pub const STRUCTURE_EXTENSION_MODULE: &str = "Lean.Structure";
+pub const STRUCTURE_EXTENSION_DECLARATION: &str = "Lean.structureExt";
+pub const STRUCTURE_EXTENSION_PRIVATE_INDEX: u64 = 0;
+pub const STRUCTURE_PRIVATE_HEADER: &str = "_private";
 pub const KEY_STAR: u8 = 0;
 pub const KEY_OTHER: u8 = 1;
 pub const KEY_LIT: u8 = 2;
@@ -90,3 +126,10 @@ pub const REDUCIBILITY_REDUCIBLE: usize = 0;
 pub const REDUCIBILITY_SEMIREDUCIBLE: usize = 1;
 pub const REDUCIBILITY_IRREDUCIBLE: usize = 2;
 pub const REDUCIBILITY_IMPLICIT_REDUCIBLE: usize = 3;
+pub const EXTERN_EXTENSION: &str = "Lean.externAttr";
+pub const IMPLEMENTED_BY_EXTENSION: &str = "Lean.Compiler.implementedByAttr";
+pub const LIST_NIL: u8 = 0;
+pub const LIST_CONS: u8 = 1;
+pub const LIST_CONS_HEAD: usize = 0;
+pub const LIST_CONS_TAIL: usize = 1;
+pub const LIST_CONS_POINTERS: usize = 2;

@@ -51,6 +51,11 @@ impl Context {
                 Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
                     TacticError::ApplyMismatch,
                 ))) => {}
+                // The pin's `MVarId.constructor` catches every ordinary failure of
+                // `apply`, an unsynthesizable instance argument included, and tries
+                // the next constructor. `left`/`right` (`nthConstructor`) apply
+                // theirs directly and let the failure stand.
+                Err(problem) if selected.is_none() && backtrack::recoverable(&problem) => {}
                 Err(problem) => {
                     let spent = self.txn.budget.heartbeats_consumed;
                     *self = snapshot;

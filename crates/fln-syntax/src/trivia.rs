@@ -145,7 +145,13 @@ pub fn scan_trivia(text: &SourceText, from: BytePos) -> Result<BytePos, TriviaEr
 /// Consume a nesting block comment opened at `opened_at`, returning the offset past its
 /// closing delimiter.
 fn scan_block_comment(bytes: &[u8], opened_at: usize) -> Result<usize, TriviaError> {
-    let mut at = opened_at + 2;
+    finish_comment_block(bytes, opened_at + 2, opened_at)
+}
+
+/// `finishCommentBlock` at nesting 1 from `from`: the offset past the `-/` that closes a
+/// comment opened at `opened_at`.
+fn finish_comment_block(bytes: &[u8], from: usize, opened_at: usize) -> Result<usize, TriviaError> {
+    let mut at = from;
     let mut depth = 1usize;
     while depth > 0 {
         match (bytes.get(at), bytes.get(at + 1)) {
@@ -168,6 +174,20 @@ fn scan_block_comment(bytes: &[u8], opened_at: usize) -> Result<usize, TriviaErr
         }
     }
     Ok(at)
+}
+
+/// Consume the doc comment opening at `opened_at` (where [`opens_doc_comment`] holds), returning
+/// the offset past its closing `-/`.
+///
+/// `docComment := "/--" >> ppSpace >> commentBody` (`Lean/Parser/Term.lean:91`), and
+/// `moduleDoc` is `"/-!" >> commentBody`. The opener is an atom, so its trailing whitespace is
+/// consumed first (`mkTokenAndFixPos` calls `whitespace`), and `commentBody` is
+/// `finishCommentBlock` at nesting 1 from there. So a `--` right after the opener is a line
+/// comment, a tab there is the whitespace refusal, and an unclosed body is "unterminated
+/// comment", all as at the pin.
+pub fn scan_doc_comment(text: &SourceText, opened_at: BytePos) -> Result<BytePos, TriviaError> {
+    let body = scan_trivia(text, BytePos(opened_at.0 + 3))?;
+    finish_comment_block(text.as_bytes(), body.0, opened_at.0).map(BytePos)
 }
 
 /// Whether a doc comment opens at `at` — `/--` or `/-!`, which are tokens.
@@ -270,6 +290,31 @@ mod tests {
         assert!(opens_doc_comment(&text_of("/-! x"), BytePos(0)));
         assert!(!opens_doc_comment(&text_of("/- x"), BytePos(0)));
         assert!(!opens_doc_comment(&text_of("/x"), BytePos(0)));
+    }
+
+    /// A doc comment is the opener atom, its trailing whitespace, then a nesting body.
+    #[test]
+    fn a_doc_comment_body_nests_and_follows_its_opener_s_whitespace() {
+        let doc = |raw: &str| scan_doc_comment(&text_of(raw), BytePos(0)).map(|end| end.0);
+        assert_eq!(doc("/-- a doc -/x"), Ok(12));
+        assert_eq!(doc("/-! module -/"), Ok(13));
+        assert_eq!(doc("/-- a /- nested -/ b -/x"), Ok(23));
+        // The body starts after the opener: `/--/` does not close at its own dash.
+        assert_eq!(
+            doc("/--/"),
+            Err(TriviaError::UnterminatedComment {
+                opened_at: BytePos(0)
+            })
+        );
+        // A `--` right after the opener is the opener's trailing line comment.
+        assert_eq!(doc("/-- -- not -/ body\n -/x"), Ok(22));
+        assert_eq!(doc("/--\tx -/"), Err(TriviaError::Tab { at: BytePos(3) }));
+        assert_eq!(
+            doc("/-- never closed"),
+            Err(TriviaError::UnterminatedComment {
+                opened_at: BytePos(0)
+            })
+        );
     }
 
     /// Tabs and isolated carriage returns are refused, with the pin's own wording.

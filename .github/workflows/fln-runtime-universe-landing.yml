@@ -1,0 +1,170 @@
+name: Native runtime universe values - verify and land
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-runtime-universe-landing.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-runtime-universe-landing
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  verify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Install repository-pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Materialize reviewed implementation and regression patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'EXTRACT'
+          import os, pathlib, subprocess, textwrap
+          original = subprocess.check_output([
+              "git", "show",
+              "4dc3bb5e43b0123ea57b188d8dbb7bdfc1865f90:.github/workflows/fln-runtime-universe-landing.yml"
+          ], text=True)
+          start = original.index("          diff --git ")
+          end = original.index("          PATCH\n", start)
+          pathlib.Path(os.environ["RUNNER_TEMP"], "bare-universe.patch").write_text(
+              textwrap.dedent(original[start:end]))
+          EXTRACT
+          cat > "$RUNNER_TEMP/runtime-dispatch.patch" <<'PATCH'
+          diff --git a/crates/fln/src/runtime.rs b/crates/fln/src/runtime.rs
+          --- a/crates/fln/src/runtime.rs
+          +++ b/crates/fln/src/runtime.rs
+          @@ -653,4 +653,14 @@
+                                   ExprNode::Const { name, levels } => {
+          +                            // No source or private callable means no constructor,
+          +                            // producer or partial-application transformation can
+          +                            // apply. Preserve the unresolved name for ingress to
+          +                            // diagnose, rather than repeat those catalog searches.
+          +                            if !self.environment.contains(name)
+          +                                && !self.has_private_callable(name)
+          +                            {
+          +                                values.push(expr.clone());
+          +                                continue;
+          +                            }
+                                       if let Some(constructor) = self.specialize_constructor(&expr, &[])? {
+                                           tasks.push(Task::Visit(constructor));
+                                           continue;
+          diff --git a/crates/fln/src/runtime/specialize.rs b/crates/fln/src/runtime/specialize.rs
+          --- a/crates/fln/src/runtime/specialize.rs
+          +++ b/crates/fln/src/runtime/specialize.rs
+          @@ -100,6 +100,16 @@
+               pub(crate) fn specialized_definition(&self, name: &Name) -> Option<DefinitionVal> {
+                   self.specializations.definitions.get(name).cloned()
+               }
+          +
+          +    /// Private function, constructor and native-primitive identities remain
+          +    /// eligible for callable preparation without logical declarations. This is
+          +    /// only a dispatch filter: ordinary signature and contract checks still run.
+          +    pub(super) fn has_private_callable(&self, name: &Name) -> bool {
+          +        self.specializations.definitions.contains_key(name)
+          +            || self.specializations.constructor_types.contains_key(name)
+          +            || self.st_intrinsic_type(name).is_some()
+          +    }
+          +
+               fn definition(&self, name: &Name) -> Option<DefinitionVal> {
+                   match self.environment.find(name) {
+                       Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
+          PATCH
+      - name: Retain relevant source and tracker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz -o "$RUNNER_TEMP/runtime-context.tar.gz" HEAD \
+            .beads/issues.jsonl COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md \
+            crates/fln/src/runtime.rs crates/fln/src/runtime crates/fln/src/source_check/modules \
+            crates/fln/tests/runtime_interleaved_specialization.rs crates/fln/src/lib.rs \
+            crates/fln-cli/src/source_check/imports
+      - name: Reproduce, verify, and commit implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/fln-runtime-universe-target"
+          git config user.name 'OpenAI coding assistant'
+          git config user.email 'noreply@openai.com'
+          for attempt in 1 2 3; do
+            git -C "$root" fetch origin main
+            work="$RUNNER_TEMP/fln-runtime-universe-$attempt"
+            git -C "$root" worktree add --detach "$work" origin/main
+            cd "$work"
+            git rev-parse HEAD
+            git apply --check "$RUNNER_TEMP/bare-universe.patch"
+            git apply --exclude=crates/fln/src/runtime.rs "$RUNNER_TEMP/bare-universe.patch"
+            set +e
+            cargo test --locked -p fln --lib bare_universe_values_receive_private_ground_definitions -- --nocapture > "$RUNNER_TEMP/bare-universe-before-$attempt.log" 2>&1
+            before=$?
+            cargo test --locked -p fln --lib long_application_spines_are_prepared_once_and_remain_bounded -- --nocapture > "$RUNNER_TEMP/runtime-spine-before-$attempt.log" 2>&1
+            spine=$?
+            set -e
+            cat "$RUNNER_TEMP/bare-universe-before-$attempt.log"
+            cat "$RUNNER_TEMP/runtime-spine-before-$attempt.log"
+            test "$before" -ne 0
+            grep -F 'bare_universe_values_receive_private_ground_definitions ... FAILED' "$RUNNER_TEMP/bare-universe-before-$attempt.log"
+            test "$spine" -ne 0
+            grep -F 'long_application_spines_are_prepared_once_and_remain_bounded ... FAILED' "$RUNNER_TEMP/runtime-spine-before-$attempt.log"
+            git apply --include=crates/fln/src/runtime.rs "$RUNNER_TEMP/bare-universe.patch"
+            git apply --recount --check "$RUNNER_TEMP/runtime-dispatch.patch"
+            git apply --recount "$RUNNER_TEMP/runtime-dispatch.patch"
+            rustfmt --edition 2024 --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/specialize.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_interleaved_specialization.rs
+            git diff --check
+            cargo test --locked -p fln --lib bare_universe_ -- --nocapture | tee "$RUNNER_TEMP/bare-universe-after-$attempt.log"
+            grep -F '7 passed; 0 failed' "$RUNNER_TEMP/bare-universe-after-$attempt.log"
+            cargo test --locked -p fln --test runtime_interleaved_specialization -- --nocapture
+            cargo test --locked -p fln --lib -- --test-threads=2
+            cargo clippy --locked -p fln --lib --no-deps -- -D warnings
+            cargo check --locked -p fln-cli --all-targets
+            python3 -I - <<'CHECK'
+          import subprocess
+          allowed = {
+              "crates/fln/src/runtime.rs",
+              "crates/fln/src/runtime/specialize.rs",
+              "crates/fln/src/runtime/specialize/arguments/tests.rs",
+              "crates/fln/tests/runtime_interleaved_specialization.rs",
+          }
+          changes = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          if {line[3:] for line in changes} != allowed:
+              raise SystemExit(f"unexpected changed paths: {changes}")
+          CHECK
+            git add -- crates/fln/src/runtime.rs crates/fln/src/runtime/specialize.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_interleaved_specialization.rs
+            git commit -m "fix(runtime): execute bare universe values and prune unresolved callable searches" -m "Specialize nullary universe instances before callable preparation and dependency discovery, retaining checked contracts, cache identity, and resource limits. Avoid redundant callable searches for names absent from both logical and private catalogs; preserve them for ordinary ingress refusal and keep the existing long-spine budget unchanged. Seven focused compiler regressions and two dual-admitted execution regressions are added. Both the bare-value regression and existing long-spine test fail before the changes. Focused and integration tests, the complete fln library test target, library Clippy, and CLI all-target checking pass with pinned Rust."
+            if git push origin HEAD:main; then
+              echo "LANDED_IMPLEMENTATION_SHA=$(git rev-parse HEAD)"
+              exit 0
+            fi
+            echo "main advanced; replaying and retesting against its new tip"
+            cd "$root"
+          done
+          echo "No implementation published after three non-force attempts" >&2
+          exit 1
+      - name: Preserve source context and validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bare-universe-validation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bare-universe-*.log
+            ${{ runner.temp }}/runtime-spine-*.log
+            ${{ runner.temp }}/runtime-context.tar.gz
+          if-no-files-found: error

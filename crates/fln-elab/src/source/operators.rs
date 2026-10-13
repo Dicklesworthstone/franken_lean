@@ -20,11 +20,10 @@
 //! - `elabBinRelCore` for `binrel%` and `binrel_no_prop%`, including
 //!   `toBoolIfNecessary` and the `Prop`-to-`Bool` maximal type.
 //!
-//! What is refused with a type rather than approximated: inserting a
-//! coercion at a leaf ([`SourceInferenceError::OperatorCoercion`]). The pin's
-//! `mkCoe` returns the coercion after `expandCoe` has unfolded every
-//! `@[coe_decl]` head; the native coercion search here returns the unexpanded
-//! `CoeT.coe` application, which is a different term.
+//! A leaf needing `mkCoe` uses the ordinary transactional coercion path. Its
+//! builtin `expandCoe` traversal unfolds the registered coercion projections
+//! while retaining untagged conversion functions such as `Nat.cast`, so the
+//! stored operator term contains the same explicit conversion as the pin.
 //!
 //! A notation whose pin function is absent from the environment (the bounded
 //! source seed has no `LT`/`LE`, and the raw Nat fixture has no classes at all)
@@ -41,8 +40,67 @@ const MAX_OPERATOR_NESTING: usize = 256;
 pub(super) enum OperatorKind {
     /// `binop% f a b`: both operands take part in the protocol.
     Regular,
+    /// `binop_lazy% f a b`: both participate; `b` is passed as a Unit thunk.
+    Lazy,
+    /// `leftact% f a b`: only `b` takes part; `a` is an ordinary leaf.
+    LeftAction,
     /// `rightact% f a b`: only `a` takes part; `b` is an ordinary leaf.
     RightAction,
+}
+
+/// The explicit elaborator forms also occur in user-defined notation and
+/// imported macro expansions; they are not restricted to builtin operators.
+#[derive(Clone, Copy)]
+pub(super) enum ExplicitOperator {
+    Binary(OperatorKind),
+    Unary,
+    Relation(bool),
+}
+
+pub(super) fn explicit_operator(kind: &Name) -> Option<ExplicitOperator> {
+    for (name, form) in [
+        ("binop", ExplicitOperator::Binary(OperatorKind::Regular)),
+        ("binop_lazy", ExplicitOperator::Binary(OperatorKind::Lazy)),
+        (
+            "leftact",
+            ExplicitOperator::Binary(OperatorKind::LeftAction),
+        ),
+        (
+            "rightact",
+            ExplicitOperator::Binary(OperatorKind::RightAction),
+        ),
+        ("unop", ExplicitOperator::Unary),
+        ("binrel", ExplicitOperator::Relation(false)),
+        ("binrel_no_prop", ExplicitOperator::Relation(true)),
+    ] {
+        if kind == &parser_kind(&["Term", name]) {
+            return Some(form);
+        }
+    }
+    None
+}
+
+impl ExplicitOperator {
+    fn parts(self, syntax: &Syntax) -> Result<&[Syntax], NatDefinitionElabError> {
+        let (keyword, arity) = match self {
+            Self::Binary(OperatorKind::Regular) => ("binop%", 4),
+            Self::Binary(OperatorKind::Lazy) => ("binop_lazy%", 4),
+            Self::Binary(OperatorKind::LeftAction) => ("leftact%", 4),
+            Self::Binary(OperatorKind::RightAction) => ("rightact%", 4),
+            Self::Unary => ("unop%", 3),
+            Self::Relation(false) => ("binrel%", 4),
+            Self::Relation(true) => ("binrel_no_prop%", 4),
+        };
+        let kind = syntax
+            .kind()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        let parts = expect_node(syntax, kind, arity, "operator elaborator")?;
+        expect_atom(&parts[0], keyword, "operator keyword")?;
+        if !matches!(&parts[1], Syntax::Ident { .. }) {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        Ok(parts)
+    }
 }
 
 /// The pin's notation for one surface operator kind.
@@ -115,17 +173,45 @@ pub(super) fn pin_notation(kind: &Name) -> Option<PinNotation> {
         ),
         ("term-_", PinNotation::Unary("Neg.neg")),
         (
-            "term_<=_",
+            "term_<_",
+            PinNotation::Relation {
+                function: "LT.lt",
+                no_prop: false,
+            },
+        ),
+        (
+            "term_≤_",
             PinNotation::Relation {
                 function: "LE.le",
                 no_prop: false,
             },
         ),
         (
-            "term_<_",
+            "term_>_",
             PinNotation::Relation {
-                function: "LT.lt",
+                function: "GT.gt",
                 no_prop: false,
+            },
+        ),
+        (
+            "term_≥_",
+            PinNotation::Relation {
+                function: "GE.ge",
+                no_prop: false,
+            },
+        ),
+        (
+            "term_≠_",
+            PinNotation::Relation {
+                function: "Ne",
+                no_prop: false,
+            },
+        ),
+        (
+            "term_!=_",
+            PinNotation::Relation {
+                function: "bne",
+                no_prop: true,
             },
         ),
         (
@@ -153,12 +239,12 @@ enum OpNode {
     Leaf(usize),
     Binary {
         kind: OperatorKind,
-        function: Name,
+        function: Typed,
         lhs: usize,
         rhs: usize,
     },
     Unary {
-        function: Name,
+        function: Typed,
         arg: usize,
     },
 }
@@ -250,14 +336,17 @@ pub(super) fn probe_says_no(error: &NatDefinitionElabError) -> bool {
         SourceInferenceError::ResourceLimit
         | SourceInferenceError::Scope
         | SourceInferenceError::InstanceRegistry(_)
-        | SourceInferenceError::ObservationComplete => false,
+        | SourceInferenceError::ObservationComplete
+        | SourceInferenceError::ConversionRefused(_) => false,
         SourceInferenceError::TypeObligation(outcome) => complete(outcome),
         SourceInferenceError::Unification(error) => match error.as_ref() {
             UnificationError::Cancelled
             | UnificationError::StepLimit { .. }
             | UnificationError::NodeLimit { .. }
             | UnificationError::AssignmentLimit { .. }
-            | UnificationError::HeartbeatLimit => false,
+            | UnificationError::HeartbeatLimit
+            | UnificationError::Reducibility(_)
+            | UnificationError::InstanceRegistry(_) => false,
             UnificationError::ConversionCheck { outcome }
             | UnificationError::AssignmentCheck { outcome, .. }
             | UnificationError::ConstraintCheck { outcome, .. } => complete(outcome),
@@ -282,7 +371,10 @@ impl Context {
             return Ok(false);
         }
         let class = function.parent();
-        if class.is_anonymous() {
+        // `Ne`, `bne`, and the `GT.gt`/`GE.ge` definitions (whose namespaces name
+        // no declaration) are ordinary functions; only a class method waits on its
+        // class being registered.
+        if class.is_anonymous() || !self.txn.env.contains(&class) {
             return Ok(true);
         }
         Ok(self.instance_registry()?.is_class(&class))
@@ -293,7 +385,7 @@ impl Context {
     pub(super) fn operator_tree<'a>(
         &mut self,
         syntax: &'a Syntax,
-        notation: PinNotation,
+        notation: Option<PinNotation>,
     ) -> Result<OperatorTree<'a>, NatDefinitionElabError> {
         let mut tree = OperatorTree {
             nodes: Vec::new(),
@@ -301,18 +393,34 @@ impl Context {
             leaves: Vec::new(),
             relation: None,
         };
-        tree.root = if let PinNotation::Relation { no_prop, .. } = notation {
+        tree.root = if let Some(notation @ PinNotation::Relation { no_prop, .. }) = notation {
             let kind = syntax
                 .kind()
                 .cloned()
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
             let parts = expect_node(syntax, &kind, 3, "binary relation")?;
+            let function = self.constant(&notation.function())?;
             let lhs = self.collect_operator_tree(&mut tree, &parts[0])?;
             let rhs = self.collect_operator_tree(&mut tree, &parts[2])?;
             tree.relation = Some(no_prop);
             tree.nodes.push(OpNode::Binary {
                 kind: OperatorKind::Regular,
-                function: notation.function(),
+                function,
+                lhs,
+                rhs,
+            });
+            tree.nodes.len() - 1
+        } else if let Some(form @ ExplicitOperator::Relation(no_prop)) =
+            syntax.kind().and_then(explicit_operator)
+        {
+            let parts = form.parts(syntax)?;
+            let function = self.atom(&parts[1], None)?;
+            let lhs = self.collect_operator_tree(&mut tree, &parts[2])?;
+            let rhs = self.collect_operator_tree(&mut tree, &parts[3])?;
+            tree.relation = Some(no_prop);
+            tree.nodes.push(OpNode::Binary {
+                kind: OperatorKind::Regular,
+                function,
                 lhs,
                 rhs,
             });
@@ -333,8 +441,8 @@ impl Context {
         enum Step<'a> {
             Enter(&'a Syntax),
             Leaf(&'a Syntax),
-            Binary(OperatorKind, Name),
-            Unary(Name),
+            Binary(OperatorKind, Typed),
+            Unary(Typed),
         }
         let mut steps = vec![Step::Enter(syntax)];
         let mut built: Vec<usize> = Vec::new();
@@ -346,6 +454,34 @@ impl Context {
                         self.tick()?;
                         term = inner;
                     }
+                    if let Some(form) = term.kind().and_then(explicit_operator) {
+                        match form {
+                            ExplicitOperator::Binary(operator) => {
+                                let parts = form.parts(term)?;
+                                let function = self.atom(&parts[1], None)?;
+                                steps.push(Step::Binary(operator, function));
+                                steps.push(if operator == OperatorKind::RightAction {
+                                    Step::Leaf(&parts[3])
+                                } else {
+                                    Step::Enter(&parts[3])
+                                });
+                                steps.push(if operator == OperatorKind::LeftAction {
+                                    Step::Leaf(&parts[2])
+                                } else {
+                                    Step::Enter(&parts[2])
+                                });
+                                continue;
+                            }
+                            ExplicitOperator::Unary => {
+                                let parts = form.parts(term)?;
+                                steps.push(Step::Unary(self.atom(&parts[1], None)?));
+                                steps.push(Step::Enter(&parts[2]));
+                                continue;
+                            }
+                            // Relations delimit their own expression trees.
+                            ExplicitOperator::Relation(_) => {}
+                        }
+                    }
                     let notation = match term.kind().and_then(pin_notation) {
                         Some(notation) if self.pin_notation_available(notation)? => Some(notation),
                         _ => None,
@@ -354,19 +490,26 @@ impl Context {
                     match (notation, kind) {
                         (Some(PinNotation::Binary(operator, function)), Some(kind)) => {
                             let parts = expect_node(term, &kind, 3, "binary operator")?;
-                            let function = Name::from_components(function.split('.'));
+                            let function =
+                                self.constant(&Name::from_components(function.split('.')))?;
                             steps.push(Step::Binary(operator, function));
                             steps.push(if operator == OperatorKind::RightAction {
                                 Step::Leaf(&parts[2])
                             } else {
                                 Step::Enter(&parts[2])
                             });
-                            steps.push(Step::Enter(&parts[0]));
+                            steps.push(if operator == OperatorKind::LeftAction {
+                                Step::Leaf(&parts[0])
+                            } else {
+                                Step::Enter(&parts[0])
+                            });
                         }
                         (Some(PinNotation::Unary(function)), Some(kind)) => {
                             let parts = expect_node(term, &kind, 2, "unary operator")?;
                             expect_atom(&parts[0], "-", "negation prefix")?;
-                            steps.push(Step::Unary(Name::from_components(function.split('.'))));
+                            steps.push(Step::Unary(
+                                self.constant(&Name::from_components(function.split('.')))?,
+                            ));
                             steps.push(Step::Enter(&parts[1]));
                         }
                         // `binrel%` is an elaborator, not a tree node: a nested
@@ -556,6 +699,11 @@ impl Context {
             }
             match &state.nodes[node] {
                 OpNode::Binary {
+                    kind: OperatorKind::LeftAction,
+                    rhs,
+                    ..
+                } => pending.push(*rhs),
+                OpNode::Binary {
                     kind: OperatorKind::RightAction,
                     lhs,
                     ..
@@ -607,7 +755,7 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         struct Visit {
             node: usize,
-            function: Option<Name>,
+            function: Option<Typed>,
             lhs: bool,
             is_pred: bool,
         }
@@ -621,6 +769,16 @@ impl Context {
             self.tick()?;
             match state.nodes[visit.node].clone() {
                 OpNode::Binary {
+                    kind: OperatorKind::LeftAction,
+                    rhs,
+                    ..
+                } => pending.push(Visit {
+                    node: rhs,
+                    function: None,
+                    lhs: false,
+                    is_pred: false,
+                }),
+                OpNode::Binary {
                     kind: OperatorKind::RightAction,
                     lhs,
                     ..
@@ -631,7 +789,10 @@ impl Context {
                     is_pred: false,
                 }),
                 OpNode::Binary {
-                    function, lhs, rhs, ..
+                    kind,
+                    function,
+                    lhs,
+                    rhs,
                 } => {
                     if visit.is_pred || self.has_homogeneous_instance(&function, max)? {
                         pending.push(Visit {
@@ -654,7 +815,8 @@ impl Context {
                         let left = self.operator_to_expr(state, lhs, None)?;
                         let right = self.operator_to_expr(state, rhs, None)?;
                         state.depth -= 1;
-                        let value = self.operator_application(&function, [left, right], None)?;
+                        let value =
+                            self.operator_binary_application(kind, &function, left, right)?;
                         state.values.push(Some(value));
                         state.nodes[visit.node] = OpNode::Leaf(state.values.len() - 1);
                     }
@@ -711,14 +873,14 @@ impl Context {
                     pending.push((node, true));
                     pending.push((arg, false));
                 }
-                (OpNode::Binary { function, .. }, true) => {
+                (OpNode::Binary { kind, function, .. }, true) => {
                     let right = built
                         .pop()
                         .ok_or_else(|| failure(SourceInferenceError::Scope))?;
                     let left = built
                         .pop()
                         .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                    built.push(self.operator_application(&function, [left, right], None)?);
+                    built.push(self.operator_binary_application(kind, &function, left, right)?);
                 }
                 (OpNode::Unary { function, .. }, true) => {
                     let arg = built
@@ -734,17 +896,55 @@ impl Context {
         }
     }
 
+    /// `Op.mkBinOp`: laziness belongs to the emitted term, so the evaluator
+    /// receives a real closure and cannot evaluate a skipped right operand.
+    fn operator_binary_application(
+        &mut self,
+        kind: OperatorKind,
+        function: &Typed,
+        left: Typed,
+        mut right: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        if kind == OperatorKind::Lazy {
+            self.tick()?;
+            let unit = self.constant(&Name::from_components(["Unit"]))?;
+            self.sort_level(&unit)?;
+            let binder = self.fresh_name()?;
+            right = Typed {
+                value: Expr::lam(
+                    binder.clone(),
+                    unit.value.clone(),
+                    right
+                        .value
+                        .lift_loose(0, 1)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    BinderInfo::Default,
+                ),
+                type_: Expr::forall_e(
+                    binder,
+                    unit.value,
+                    right
+                        .type_
+                        .lift_loose(0, 1)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    BinderInfo::Default,
+                ),
+            };
+        }
+        self.operator_application(function, [left, right], None)
+    }
+
     /// `elabAppArgs f #[] args (expectedType? := …) (explicit := false)`:
     /// implicit and instance arguments become metavariables, each explicit
     /// argument is checked against its domain (with coercion), and the
     /// application's instance arguments are synthesized when possible.
     fn operator_application<const N: usize>(
         &mut self,
-        function: &Name,
+        function: &Typed,
         arguments: [Typed; N],
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let mut function = self.constant(function)?;
+        let mut function = function.clone();
         for argument in arguments {
             function = self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
             let ExprNode::ForallE {
@@ -848,28 +1048,28 @@ impl Context {
         }
     }
 
-    /// `mkCoe maxType e` at a leaf. Without any coercion the pin reports a
-    /// type mismatch; this is the ordinary typing constraint, which also
-    /// postpones a check that is not yet decidable.
+    /// `mkCoe maxType e` at a leaf. Use the same checked, expanded coercion as
+    /// an ordinary expected-type boundary. Failed alternatives roll back
+    /// assignments while retaining their work, and a not-yet-decidable typing
+    /// obligation is postponed by that shared path.
     fn operator_coercion(
         &mut self,
         value: Typed,
         max: &Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
-        if self.has_coercion(&value.type_, max)? {
-            return Err(failure(SourceInferenceError::OperatorCoercion));
-        }
-        self.constrain_type(&value.type_, max)?;
-        Ok(value)
+        self.coerce_expected(value, max)
     }
 
     /// `Op.hasHomogeneousInstance`: `Cls max max max` for `f = Cls.op`.
     fn has_homogeneous_instance(
         &mut self,
-        function: &Name,
+        function: &Typed,
         max: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
-        let class = function.parent();
+        let ExprNode::Const { name, .. } = function.value.node() else {
+            return Ok(false);
+        };
+        let class = name.parent();
         if class.is_anonymous() || !self.txn.env.contains(&class) {
             return Ok(false);
         }
@@ -911,15 +1111,18 @@ impl Context {
     /// `Op.hasHeterogeneousDefaultInstances`.
     fn has_heterogeneous_default_instances(
         &mut self,
-        function: &Name,
+        function: &Typed,
         max: &Expr,
         lhs: bool,
     ) -> Result<bool, NatDefinitionElabError> {
+        let ExprNode::Const { name, .. } = function.value.node() else {
+            return Ok(false);
+        };
         let max = self.instantiate(max)?;
         let Some(type_name) = head_constant(&max) else {
             return Ok(false);
         };
-        let class = function.parent();
+        let class = name.parent();
         let defaults = crate::instances::defaults::read(&self.txn.env).map_err(registry_error)?;
         let defaults: Vec<_> = defaults
             .into_iter()
@@ -1018,7 +1221,10 @@ mod tests {
         );
         for (syntax_kind, function) in [
             ("term_<_", "LT.lt"),
-            ("term_<=_", "LE.le"),
+            ("term_≤_", "LE.le"),
+            ("term_>_", "GT.gt"),
+            ("term_≥_", "GE.ge"),
+            ("term_≠_", "Ne"),
             ("term_=_", "Eq"),
         ] {
             assert_eq!(
@@ -1029,8 +1235,23 @@ mod tests {
                 })
             );
         }
+        assert_eq!(
+            pin_notation(&kind("term_!=_")),
+            Some(PinNotation::Relation {
+                function: "bne",
+                no_prop: true
+            })
+        );
         // Plain `infix` notations in the pin are ordinary applications.
-        for syntax_kind in ["term_<<<_", "term_>>>_", "term_∧_", "term_∨_", "term_↔_"] {
+        for syntax_kind in [
+            "term_<<<_",
+            "term_>>>_",
+            "term_∧_",
+            "term_∨_",
+            "term_↔_",
+            "term_&&_",
+            "term_||_",
+        ] {
             assert_eq!(pin_notation(&kind(syntax_kind)), None, "{syntax_kind}");
         }
     }

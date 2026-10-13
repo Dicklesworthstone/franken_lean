@@ -54,6 +54,15 @@ fn run(args: Vec<OsString>) -> fln_cli::MultiplexerOutput {
     fln_cli::run(args)
 }
 
+/// A false `by rfl` is refused while elaborating the command at `at`, as at the
+/// pin ("Tactic `rfl` failed: The left-hand side … is not definitionally equal to
+/// the right-hand side"), and is never left for the kernel to reject.
+fn assert_rfl_refused_at(stderr: &str, at: &str) {
+    assert!(stderr.contains("\"outcome\":\"elaboration\""), "{stderr}");
+    assert!(stderr.contains(at), "{stderr}");
+    assert!(stderr.contains("not definitionally equal"), "{stderr}");
+}
+
 // FrankenLean's refusal texts for the pinned Reference's reasons. The pin
 // (`lean` v4.32.0) says, respectively: "Too many variable names provided at
 // alternative", "Invalid target: Index in target's type is not a variable",
@@ -113,6 +122,111 @@ fn check_then_refuse_suffixes(prefix: &str, expected: &[&str], refusals: &[(&str
         assert_eq!(accept(), first);
         assert_eq!(std::fs::read(&prefix).unwrap(), original);
     }
+}
+
+#[test]
+fn installed_beq_deriving_checks_recursive_data_and_executes() {
+    let source = "inductive Chain (A : Type) where\n\
+                  | nil\n| cons (head : A) (tail : Chain A)\n\
+                  deriving BEq\n\
+                  def xs : Chain Nat := Chain.cons 7 (Chain.cons 9 Chain.nil)\n\
+                  theorem same : (xs == xs) = true := by rfl\n\
+                  theorem changed : (xs == Chain.cons 7 (Chain.cons 8 Chain.nil)) = false := by rfl";
+    check_then_refuse_suffixes(
+        source,
+        &["\"theorems\":2", "\"executed\":false"],
+        &[
+            ("theorem wrong : (xs == Chain.nil) = true := by rfl", None),
+            (
+                "structure Bad where\n run : Nat -> Nat\nderiving BEq",
+                Some("failed to generate BEq"),
+            ),
+            (
+                "structure Bad where\n n : Nat\nderiving BEq, UnknownHandler",
+                Some("unsupported deriving handler"),
+            ),
+        ],
+    );
+    let program = file(&format!(
+        "{source}\n#eval if xs == xs then 42 else 0\n#eval if xs == Chain.nil then 0 else 42\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n42\n");
+}
+
+#[test]
+fn installed_decidable_eq_deriving_checks_proofs_and_executes_recursive_decisions() {
+    let source = "inductive Chain (A : Type) where\n\
+                  | nil\n| cons (head : A) (tail : Chain A)\n\
+                  deriving DecidableEq\n\
+                  def xs : Chain Nat := Chain.cons 7 (Chain.cons 9 Chain.nil)\n\
+                  def ys : Chain Nat := Chain.cons 7 (Chain.cons 8 Chain.nil)\n\
+                  theorem same : xs = xs := by decide\n\
+                  theorem changed : Not (xs = ys) := by decide";
+    check_then_refuse_suffixes(
+        source,
+        &["\"theorems\":2", "\"executed\":false"],
+        &[
+            ("theorem wrong : xs = ys := by decide", None),
+            (
+                "structure Bad where\n run : Nat -> Nat\nderiving DecidableEq",
+                Some("failed to generate DecidableEq"),
+            ),
+            (
+                "structure Bad where\n n : Nat\nderiving BEq, DecidableEq, UnknownHandler",
+                Some("unsupported deriving handler"),
+            ),
+        ],
+    );
+    let program = file(&format!(
+        "{source}\n#eval if xs = xs then 42 else 0\n#eval if xs = ys then 0 else 42\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n42\n");
+}
+
+#[test]
+fn installed_structural_hints_check_selected_parameters_and_execute() {
+    let source = "def tally (acc n : Nat) : Nat := match n with\n\
+                  | .zero => acc\n| .succ k => tally (acc + 1) k\n\
+                  termination_by structural n\n\
+                  theorem computes : tally 10 32 = 42 := by rfl";
+    check_then_refuse_suffixes(
+        source,
+        &["\"commands\":2", "\"theorems\":1", "\"executed\":false"],
+        &[
+            (
+                "def wrongHint (a b : Nat) : Nat := match a, b with\n\
+                 | _, .zero => a\n| _, .succ k => wrongHint (a + 1) k\n\
+                 termination_by structural a",
+                None,
+            ),
+            (
+                "def wrongType (n : Nat) : Nat := match n with\n\
+                 | .zero => 0\n| .succ k => wrongType k\n\
+                 termination_by structural (n : Bool)",
+                None,
+            ),
+        ],
+    );
+    let program = file(&format!("{source}\n#eval tally 10 32\n"));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n");
 }
 
 #[test]
@@ -296,7 +410,7 @@ fn later_files_can_use_prior_theorems_and_failure_emits_no_partial_success() {
     let output = run(args);
     assert_eq!(output.exit_code, 1);
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.contains("\"outcome\":\"kernel-rejection\""));
+    assert_rfl_refused_at(&output.stderr, "file 1, command 1, byte 0:");
     assert!(!output.stderr.contains("\"outcome\":\"complete\""));
 }
 #[test]
@@ -437,7 +551,10 @@ fn installed_binary_resolves_source_instances_across_files_without_execution() {
         output.stdout.is_empty(),
         "late failure must not expose successful prefix"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+    assert_rfl_refused_at(
+        &String::from_utf8_lossy(&output.stderr),
+        "file 1, command 2, byte 0:",
+    );
 }
 
 #[test]
@@ -472,7 +589,7 @@ fn installed_binary_checks_local_dictionaries_and_conditional_instance_rewrites(
     let refused = run(args);
     assert_ne!(refused.exit_code, 0);
     assert!(refused.stdout.is_empty());
-    assert!(refused.stderr.contains("kernel-rejection"));
+    assert_rfl_refused_at(&refused.stderr, "file 1, command 2, byte 0:");
 }
 
 #[test]
@@ -515,7 +632,7 @@ fn later_record_file_failure_emits_no_successful_prefix_or_class_registration() 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("kernel-rejection"), "{error}");
+    assert_rfl_refused_at(&error, "file 1, command 2, byte 48:");
     assert!(!error.contains("\"outcome\":\"complete\""));
 }
 
@@ -595,7 +712,10 @@ fn installed_binary_checks_function_dictionaries_and_refuses_late_false_proofs()
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 3, byte 0:",
+            );
         }
     }
 }
@@ -638,7 +758,10 @@ fn installed_binary_checks_instance_dependent_field_receivers_atomically() {
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 2, byte 0:",
+            );
         }
     }
 }
@@ -736,7 +859,10 @@ fn installed_binary_checks_inductive_constructors_and_recursor_computation_atomi
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 1, byte 0:",
+            );
         }
         assert_eq!(std::fs::read(suffix).unwrap(), before);
         assert_eq!(
@@ -782,7 +908,10 @@ fn installed_binary_checks_defaults_updates_and_late_failure_without_partial_suc
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 3, byte 0:",
+            );
         }
     }
 }
@@ -889,9 +1018,13 @@ fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors(
     let prefix = file(
         "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k",
     );
-    let good = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    let good = file(
+        "def identity : Tower 1 := fun x => x\ntheorem ok : identity (9 : Nat) = (9 : Nat) := by rfl",
+    );
     let bad = file("def ambiguous (n : Nat) : Tower n := fun x => x");
-    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+    // `identity`'s domain is `Tower 0`, as at the pin, which has no `OfNat (Tower 0) 9` (2026-10-10).
+    let bare = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&bare, false), (&good, true)] {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["check-source", "--json"])
             .arg(&prefix)
@@ -1173,9 +1306,9 @@ fn indexed_proof_failure_emits_no_success_and_does_not_poison_the_next_check() {
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("\"outcome\":\"kernel-rejection\"")
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 1, byte 0:",
             );
         }
     }
@@ -1218,9 +1351,9 @@ fn installed_binary_checks_indexed_matches_without_publishing_failed_prefixes() 
         } else {
             assert!(output.stdout.is_empty());
             assert_eq!(output.status.code(), Some(1));
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("\"outcome\":\"kernel-rejection\"")
+            assert_rfl_refused_at(
+                &String::from_utf8_lossy(&output.stderr),
+                "file 1, command 2, byte 0:",
             );
         }
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
@@ -1455,7 +1588,9 @@ fn installed_heterogeneous_equality_checks_bridges_substitution_and_failure_isol
         );
         if valid {
             let result = String::from_utf8(output.stdout).unwrap();
-            for field in ["\"commands\":10", "\"theorems\":8", "\"executed\":false"] {
+            // Eight theorems, and `Certificate.valid`: the projection of a proof field is a
+            // theorem, as at the pin.
+            for field in ["\"commands\":10", "\"theorems\":9", "\"executed\":false"] {
                 assert!(result.contains(field), "{result}");
             }
             assert!(output.stderr.is_empty());
@@ -2227,42 +2362,29 @@ fn installed_literal_patterns_compute_and_preserve_failed_suffix_isolation() {
     }
 }
 
+/// The example folds `Accessible` with its recursor directly. The pin refuses it at line 24
+/// ("code generator does not support recursor `Accessible.rec`"), and so does the installed
+/// check-source in its default mode (bead `franken_lean-z8j.1.6.6`); executing it is the
+/// `frontier` lane. The refusal publishes nothing and leaves the file as it was.
 #[test]
-fn installed_function_children_check_real_recursors_and_preserve_failed_suffixes() {
+fn installed_function_children_refuse_direct_recursor_folds_as_the_pin_does() {
     let prefix = file(include_str!(
         "../../../examples/native_function_children.lean"
     ));
-    let invalid = file(
-        "def bad (t : Branching) : Nat := match t with | .leaf n => n | .node children => bad (children (bad t))",
-    );
     let before = std::fs::read(&prefix).unwrap();
-    for valid in [true, false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
-        command.args(["check-source", "--json"]).arg(&prefix);
-        if !valid {
-            command.arg(&invalid);
-        }
-        let result = command.output().unwrap();
-        assert_eq!(
-            result.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
+    for _ in 0..2 {
+        let result = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{stderr}");
+        assert!(result.stdout.is_empty(), "{stderr}");
+        assert!(
+            stderr.contains("code generator does not support recursor `Accessible.rec` yet"),
+            "{stderr}"
         );
-        if valid {
-            let json = String::from_utf8(result.stdout).unwrap();
-            for field in [
-                "\"commands\":20",
-                "\"theorems\":6",
-                "\"authority\":true",
-                "\"executed\":false",
-            ] {
-                assert!(json.contains(field), "{json}");
-            }
-        } else {
-            assert!(result.stdout.is_empty());
-            assert!(!result.stderr.is_empty());
-        }
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
     }
 }
@@ -2337,8 +2459,16 @@ fn installed_constructor_fallback_preserves_instance_obligations_and_failed_suff
             }
             assert!(result.stderr.is_empty());
         } else {
+            // `left` applies `needs` alone and keeps its failure, as the pin's
+            // `nthConstructor` does ("failed to synthesize Missing"); only
+            // `constructor` moves on to the next constructor.
             assert!(result.stdout.is_empty());
-            assert!(!result.stderr.is_empty());
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains("file 1, command 4, byte 0:"), "{stderr}");
+            assert!(
+                stderr.contains("native instance search could not resolve all instance arguments"),
+                "{stderr}"
+            );
         }
         assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
     }
@@ -2746,5 +2876,40 @@ fn an_unknown_constant_is_refused_by_its_name() {
             stderr.contains(&format!("Unknown identifier `{name}`")),
             "{stderr}"
         );
+    }
+}
+
+/// The pin admits a file's own `axiom` silently; this report counts them, because every
+/// theorem that uses one trusts it. Axioms of the base (none in the seed) are not counted, and
+/// a file without any keeps the plain wording.
+#[test]
+fn a_files_own_axioms_are_counted_in_the_report() {
+    let axioms = file(
+        "axiom unproven : False\naxiom pick {α : Type} (a : α) : α\ntheorem bad : 0 = 1 := False.elim unproven\n",
+    );
+    let plain = file("theorem t : True := True.intro\n");
+    for (path, json, expected) in [
+        (&axioms, true, "\"theorems\":1,\"axioms\":2,"),
+        (&plain, true, "\"theorems\":1,\"axioms\":0,"),
+        (
+            &axioms,
+            false,
+            "Checked 3 source commands (1 theorems, 2 axioms asserted without proof) in 1 files;",
+        ),
+        (
+            &plain,
+            false,
+            "Checked 1 source commands (1 theorems) in 1 files;",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.arg("check-source");
+        if json {
+            command.arg("--json");
+        }
+        let output = command.arg(path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(expected), "{stdout}");
     }
 }

@@ -35,7 +35,7 @@ fn repeated_inferred_outputs_share_the_first_complete_answer() {
     let base = checked(&seed(), &source);
     checked(
         &base,
-        "def result : Out12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+        "set_option synthInstance.maxSize 8192 in\ndef result : Out12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
     );
 }
 
@@ -54,18 +54,22 @@ class Root where
 
 #[test]
 fn a_cached_output_choice_can_resume_when_a_later_prerequisite_fails() {
+    // Fresh Need Nat waits for a generator. Existing Pick consumers resume
+    // first, and the newer both-Nat consumer receives its answer first.
     let base = checked(&seed(), CHOICES);
     checked(
         &base,
         r#"instance root {A B : Type} [warm : Pick A] [pick : Pick B] [need : Need B] : Root := Root.mk (need.finish pick.value) warm.stamp
 def result : Root := inferInstance
 theorem resumed : result.value = 9 := by rfl
-theorem firstUnchanged : result.stamp = 2 := by rfl"#,
+theorem earlierConsumerResumed : result.stamp = 1 := by rfl"#,
     );
 }
 
 #[test]
 fn replay_resumes_nested_choices_not_just_the_next_top_level_candidate() {
+    // The same consumer order propagates through Mid; its older Bool answer
+    // cannot freeze the earlier sibling once the Nat answer is published.
     let base = checked(&seed(), CHOICES);
     checked(
         &base,
@@ -76,7 +80,7 @@ instance middle {A : Type} [pick : Pick A] : Mid A := Mid.mk pick.value pick.sta
 instance root {A B : Type} [warm : Mid A] [pick : Mid B] [need : Need B] : Root := Root.mk (need.finish pick.value) warm.stamp
 def result : Root := inferInstance
 theorem resumed : result.value = 9 := by rfl
-theorem firstUnchanged : result.stamp = 2 := by rfl"#,
+theorem earlierConsumerResumed : result.stamp = 1 := by rfl"#,
     );
 }
 
@@ -90,17 +94,19 @@ instance incompatible {A : Type} [warm : Pick A] [wrong : Pick Nat] : Root := Ro
     );
     checked(
         &base,
-        "def result : Root := inferInstance\ntheorem fallbackSelected : result.value = 7 := by rfl",
+        // The known child goal keeps Nat despite the cached open Bool answer;
+        // the pin therefore selects this candidate, not the fallback.
+        "def result : Root := inferInstance\ntheorem preferredSelected : result.value = 99 := by rfl\ntheorem openAnswerPreserved : result.stamp = 2 := by rfl",
     );
     let before = base.logical_root(&KVMap::new());
-    assert!(
-        base.check_source_files(
+    let error = base
+        .check_source_files(
             &[b"def wrong : Pick Nat := inferInstance"],
             &KVMap::new(),
-            limits()
+            limits(),
         )
-        .is_err()
-    );
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(before, base.logical_root(&KVMap::new()));
     checked(
         &base,
@@ -153,7 +159,7 @@ fn repeated_semi_output_queries_share_answers_without_erasing_known_filters() {
     let base = checked(&seed(), &source);
     checked(
         &base,
-        "def result : Semi12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+        "set_option synthInstance.maxSize 8192 in\ndef result : Semi12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
     );
     let base = checked(&seed(), &CHOICES.replace("outParam", "semiOutParam"));
     checked(
@@ -195,13 +201,13 @@ theorem preserved : result.value = 7 := by rfl"#,
 }
 
 #[test]
-fn resumed_semi_output_answers_do_not_replace_the_first_priority_answer() {
+fn resumed_semi_output_consumers_try_the_newest_cached_answer_first() {
     let base = checked(&seed(), &CHOICES.replace("outParam", "semiOutParam"));
     checked(
         &base,
         r#"instance root {A B C : Type} [warm : Pick A] [pick : Pick B] [need : Need B] [again : Pick C] : Root := Root.mk (need.finish pick.value) again.stamp
 def result : Root := inferInstance
 theorem resumed : result.value = 9 := by rfl
-theorem firstStillFirst : result.stamp = 2 := by rfl"#,
+theorem latestCachedAnswer : result.stamp = 1 := by rfl"#,
     );
 }

@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::wire::{
     ExprId, ExprNode, LevelId, LevelNode, MAX_BVAR_INDEX, MetadataValue, WireExpr, WireName,
-    expression_owned_units, level_owned_units, usize_units,
+    expression_owned_units, level_owned_units, name_owned_units, usize_units,
 };
 
 /// Exact root facts used by checker traversal and pruning.
@@ -460,6 +460,9 @@ enum Operation<'a> {
         ordinals: &'a BTreeMap<WireName, u32>,
         binder_count: u32,
     },
+    OpenMany {
+        names: &'a [&'a WireName],
+    },
     Free {
         name: &'a WireName,
     },
@@ -669,6 +672,10 @@ struct Transformer<'a, 'c> {
     /// as the original input node.
     memo: Visited,
     scopes: Option<ScopeMemo>,
+    /// An opened local is free at every binder depth. Share its emitted node
+    /// across distinct bound occurrences, as single-binder substitution shares
+    /// its replacement. Unused telescope positions need no cache entry.
+    opened_names: BTreeMap<usize, ExprId>,
 }
 
 impl<'a, 'c> Transformer<'a, 'c> {
@@ -698,6 +705,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                             binder_count: 0,
                             ..
                         }
+                        | Operation::OpenMany { names: [] }
                 ) =>
             {
                 return Mode::Copy;
@@ -719,6 +727,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                 Operation::Close { .. } | Operation::CloseMany { .. } => {
                     !scope.free && scope.external <= depth
                 }
+                Operation::OpenMany { .. } => scope.external <= depth,
             },
         };
         if unchanged { Mode::Copy } else { mode }
@@ -1146,6 +1155,39 @@ impl<'a, 'c> Transformer<'a, 'c> {
                         Self::raised(index, u64::from(binder_count), scope, at, &self.control)?;
                     self.emit(ExprNode::Bound { index }, at)
                 }
+                Operation::OpenMany { names } => {
+                    let Some(external) = u64::from(index).checked_sub(scope) else {
+                        return self.emit(ExprNode::Bound { index }, at);
+                    };
+                    let count = usize_units(names.len());
+                    if external < count {
+                        // Names are outer-to-inner; bound zero denotes the
+                        // last name. Free locals need no lifting beneath the
+                        // subject's own binders.
+                        let ordinal = names.len() - 1 - external as usize;
+                        if let Some(done) = self.opened_names.get(&ordinal) {
+                            self.values.push(*done);
+                            return Ok(());
+                        }
+                        let name = names[ordinal];
+                        self.control
+                            .output(1u64.saturating_add(name_owned_units(name)), at)?;
+                        let done = self.push_reserved(ExprNode::Free { name: name.clone() }, at)?;
+                        self.opened_names.insert(ordinal, done);
+                        self.values.push(done);
+                        Ok(())
+                    } else {
+                        // Every consumed position counts, even when no node
+                        // referenced its local. The surviving index is still
+                        // in range because count <= external <= index.
+                        self.emit(
+                            ExprNode::Bound {
+                                index: (u64::from(index) - count) as u32,
+                            },
+                            at,
+                        )
+                    }
+                }
                 Operation::Free { .. } => self.emit(ExprNode::Bound { index }, at),
             },
         }
@@ -1203,6 +1245,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                         Operation::Raise
                         | Operation::Bound { .. }
                         | Operation::Close { .. }
+                        | Operation::OpenMany { .. }
                         | Operation::Free { .. } => FreeAction::Retain,
                     },
                 }),
@@ -1591,6 +1634,7 @@ fn transform_subterms_with(
             && matches!(plan.operation, Operation::Raise)
             && matches!(plan.root_mode, Mode::Rewrite { .. })))
         .then(ScopeMemo::default),
+        opened_names: BTreeMap::new(),
     };
     outcome(transformer.run(plan.root_mode))
 }
@@ -1718,6 +1762,29 @@ pub fn substitute_bound_with(
     )
 }
 
+/// Open an outer-to-inner telescope as free query-local names in one walk.
+///
+/// The last name replaces bound zero, the preceding name replaces bound one,
+/// and so on. Any surviving external index decreases by the number of names.
+/// Nested binders retain their indices; inserted free names cannot be captured.
+/// This is equivalent to substituting each free name at bound zero in reverse
+/// order, without copying the whole reachable term once per local.
+pub(crate) fn open_bound_telescope_with(
+    term: &WireExpr,
+    names: &[&WireName],
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
+    transform_with(
+        term,
+        None,
+        Operation::OpenMany { names },
+        Mode::Rewrite { scope: 0 },
+        budget,
+        cancelled,
+    )
+}
+
 /// Close a term over one free name, shifting existing external indices away
 /// from the new binder.
 pub fn abstract_free(
@@ -1798,6 +1865,9 @@ pub fn substitute_free_with(
         &mut cancelled,
     )
 }
+
+#[cfg(test)]
+mod telescope_tests;
 
 #[cfg(test)]
 mod tests {

@@ -23,7 +23,7 @@ def package : Package := by
   exact Nat
   exact 7
 
-theorem package_ok : package.value = 7 := by rfl
+theorem package_ok : package.value = (7 : Nat) := by rfl
 
 def identity : forall A : Type, A -> A := by
   refine fun A x => ?_
@@ -45,7 +45,7 @@ theorem functions_ok : functions.first 7 + functions.second 7 = 17 := by rfl
 theorem transported (A B : Type) (a : A) (b : B) (h : HEq a b)
     (P : forall T : Type, T -> Prop) (pa : P A a) : P B b := by
   refine ?_
-  subst h
+  cases h
   exact pa
 
 def copy (n : Nat) : Nat := match n with

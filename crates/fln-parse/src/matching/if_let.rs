@@ -3,6 +3,39 @@
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
+/// The pattern, the `:=` and the value of a term `if let p := e then …` (`termIfLet`).
+pub(super) fn term_parts(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: &ConditionalPlan,
+    grammar: DefinitionGrammar,
+    splices: &mut Splices,
+    updates: &HashSet<usize>,
+) -> Result<(Syntax, Syntax, Syntax), NatDefinitionParseError> {
+    let assignment = plan
+        .pattern_assignment
+        .filter(|&at| is_symbol(tokens, at, ":="))
+        .ok_or_else(|| refuse(view, tokens, plan.start + 1))?;
+    let then_at = plan
+        .then_at
+        .ok_or_else(|| refuse(view, tokens, plan.start))?;
+    if assignment <= plan.start + 2 || assignment + 1 >= then_at {
+        return Err(refuse(view, tokens, assignment));
+    }
+    let pattern = pattern(leaves, view, tokens, plan.start + 2..assignment)?;
+    let value = branch_value(
+        leaves,
+        view,
+        tokens,
+        assignment + 1..then_at,
+        grammar,
+        splices,
+        updates,
+    )?;
+    Ok((pattern, leaves.leaf(assignment)?, value))
+}
+
 pub(super) fn condition(
     leaves: &Leaves,
     view: &SourceView,

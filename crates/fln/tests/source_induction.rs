@@ -21,6 +21,32 @@ fn check(source: &str) -> fln::SourceFileCheck {
         .into_complete()
         .unwrap()
 }
+/// `with tac` before the alternatives and a `_` alternative parse as the pin's `inductionAlts` and
+/// `Term.hole`; the elaborator models neither, so it refuses these files, which the pin accepts,
+/// rather than dropping the tactic or misnaming the alternative.
+#[test]
+fn a_with_tactic_and_a_wildcard_alternative_are_refused() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for source in [
+        "theorem t (n : Nat) : n = n := by\n  cases n with try skip\n  | zero => rfl\n  | succ m => rfl\n",
+        "theorem t (n : Nat) : n = n := by\n  cases n with\n  | _ => rfl\n",
+    ] {
+        let result = engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        );
+        assert!(
+            !matches!(result, Ok(fln::Outcome::Complete(_))),
+            "accepted {source}"
+        );
+    }
+}
+
 #[test]
 fn cases_specializes_the_goal_and_matches_constructor_names() {
     check(
@@ -45,6 +71,33 @@ fn dependent_hypotheses_are_specialized_and_reintroduced() {
     check(
         "theorem dependent (n : Nat) (h : n = n) : n = n := by\n  cases n with\n  | zero => exact h\n  | succ k => exact h",
     );
+}
+/// `| zero | succ k => t` is one alternative with two left-hand sides (`inductionAltLHS+`): `t`
+/// runs on each constructor's goal, so a body that fails on one of them is refused. An
+/// alternative without `=>`, whose goal the enclosing sequence would take, is refused too.
+#[test]
+fn shared_alternatives_run_their_body_on_each_constructor() {
+    check("theorem self (n : Nat) : n = n := by\n  cases n with\n  | zero | succ k => rfl");
+    check("theorem self (b : Bool) : b = b := by cases b with | false | true => rfl");
+    let base = engine();
+    for source in [
+        // The `succ k` goal is `k + 1 = 0`.
+        "theorem bad (n : Nat) : n = 0 := by\n  cases n with\n  | zero | succ k => rfl",
+        "theorem bad (n : Nat) : n = n := by\n  cases n with\n  | zero | zero => rfl",
+        "theorem bodiless (n : Nat) : n = n := by\n  cases n with\n  | zero => rfl\n  | succ k\n  rfl",
+    ] {
+        assert!(
+            !matches!(
+                base.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits())
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
 }
 #[test]
 fn bare_cases_exposes_goals_to_the_following_sequence() {
@@ -94,7 +147,7 @@ fn empty_inductives_eliminate_without_fabricating_a_branch() {
 #[test]
 fn dependent_record_case_analysis_returns_the_field_at_its_actual_type() {
     check(
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef unpack (p : Package) : p.carrier := by\n  cases p with\n  | mk carrier value => exact value\ndef p : Package := { carrier := Nat, value := 31 }\ntheorem unpack_ok : unpack p = 31 := by rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef unpack (p : Package) : p.carrier := by\n  cases p with\n  | mk carrier value => exact value\ndef p : Package := { carrier := Nat, value := 31 }\ntheorem unpack_ok : unpack p = (31 : Nat) := by rfl",
     );
 }
 #[test]
@@ -165,7 +218,7 @@ theorem copy_ok {A : Type} (xs : Chain A) : copy xs = xs := by
 #[test]
 fn transitive_data_dependencies_are_reintroduced_at_the_branch_type() {
     check(
-        "def Carrier (n : Nat) : Type := match n with | .zero => Nat | .succ k => Bool\ndef keep (n : Nat) (x : Carrier n) (h : x = x) : Carrier n := by\n  cases n with\n  | zero => exact x\n  | succ k => exact x\ntheorem keep_ok : keep 0 9 rfl = 9 := by rfl",
+        "def Carrier (n : Nat) : Type := match n with | .zero => Nat | .succ k => Bool\ndef keep (n : Nat) (x : Carrier n) (h : x = x) : Carrier n := by\n  cases n with\n  | zero => exact x\n  | succ k => exact x\ntheorem keep_ok : keep 0 (9 : Nat) rfl = (9 : Nat) := by rfl",
     );
 }
 #[test]
@@ -191,7 +244,8 @@ fn false_proofs_and_invalid_unused_terms_are_still_refused() {
     for (source, refusal, twin) in [
         (
             "theorem false_proof (n : Nat) : 1 = 2 := by cases n with | zero => rfl | succ k => rfl",
-            ("kernel-rejection", true, 1),
+            // A false `rfl` is refused while elaborating, as at the pin ("Tactic `rfl` failed").
+            ("elaboration", false, 1),
             "theorem false_proof (n : Nat) : 1 = 1 := by cases n with | zero => rfl | succ k => rfl",
         ),
         (

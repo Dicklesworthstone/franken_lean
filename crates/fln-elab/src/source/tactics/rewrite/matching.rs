@@ -87,67 +87,39 @@ impl Context {
         }
     }
 
-    pub(super) fn rewrite_types_have_distinct_heads(
+    fn rewrite_types_have_distinct_heads(
         &mut self,
         left: &Expr,
         right: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
-        Ok(matches!(
-            (self.rigid_rewrite_type_head(left)?, self.rigid_rewrite_type_head(right)?),
-            (Some(left), Some(right)) if left != right
-        ))
+        let (Some(actual), Some(expected)) = (
+            self.rigid_rewrite_type_head(left)?,
+            self.rigid_rewrite_type_head(right)?,
+        ) else {
+            return Ok(false);
+        };
+        Ok(actual != expected)
     }
 
-    /// A syntactic telescope prefix suffices to recognize a partial constant
-    /// application's function type. Substitution cannot erase a literal Pi or
-    /// Sort at this position. Other result shapes require actual inference.
     fn rigid_rewrite_constant_result(
         &mut self,
         expression: &Expr,
     ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
-        let mut head = expression;
-        let mut arguments = 0usize;
-        loop {
-            self.tick()?;
-            match head.node() {
-                ExprNode::App { f, .. } => {
-                    arguments = arguments
-                        .checked_add(1)
-                        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
-                    head = f;
-                }
-                ExprNode::MData { expr, .. } => head = expr,
-                _ => break,
-            }
+        let mut expression = expression;
+        while let ExprNode::App { f, .. } = expression.node() {
+            expression = f;
         }
-        let ExprNode::Const { name, levels } = head.node() else {
+        let ExprNode::Const { name, .. } = expression.node() else {
             return Ok(None);
         };
-        let Some(info) = self.txn.env.find(name).cloned() else {
+        let Some(type_) = self.txn.env.find(name).map(|c| c.type_().clone()) else {
             return Ok(None);
         };
-        let base = info.constant_val();
-        if levels.len() != base.level_params.len() {
-            return Ok(None);
+        let mut result = type_;
+        while let ExprNode::ForallE { body, .. } = result.node() {
+            result = body.clone();
         }
-        let mut result = &base.type_;
-        loop {
-            self.tick()?;
-            match result.node() {
-                ExprNode::MData { expr, .. } => result = expr,
-                ExprNode::ForallE { body, .. } if arguments > 0 => {
-                    arguments -= 1;
-                    result = body;
-                }
-                ExprNode::ForallE { .. } if arguments == 0 => {
-                    return Ok(Some(RigidTypeHead::Forall));
-                }
-                ExprNode::Sort { .. } if arguments == 0 => {
-                    return Ok(Some(RigidTypeHead::Sort));
-                }
-                _ => return Ok(None),
-            }
-        }
+        self.rigid_rewrite_type_head(&result)
     }
 
     pub(super) fn rewrite_trial(&self) -> Self {
@@ -161,6 +133,17 @@ impl Context {
     }
 
     pub(super) fn rewrite_nonmatch(error: &NatDefinitionElabError) -> bool {
+        if let NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict)) =
+            error
+        {
+            return matches!(
+                verdict.as_ref(),
+                Verdict::Rejected {
+                    class: fln_kernel::verdict::RejectClass::NotDefEq,
+                    ..
+                }
+            );
+        }
         let NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) = error
         else {
             return false;
@@ -178,36 +161,9 @@ impl Context {
         }
     }
 
-    /// Prepare a selection equation without starting ordinary inference. Keep
-    /// its scoped-conversion and universe obligations, but never let a failed
-    /// candidate retry by unfolding every safe definition before selection runs.
-    /// The result records whether solving can make this pair newly ground.
-    fn prepare_rewrite_selection(
-        &mut self,
-        actual: &Expr,
-        expected: &Expr,
-    ) -> Result<bool, NatDefinitionElabError> {
-        let actual = self.instantiate(actual)?;
-        let expected = self.instantiate(expected)?;
-        let open = actual.has_expr_mvar()
-            || expected.has_expr_mvar()
-            || actual.has_level_mvar()
-            || expected.has_level_mvar();
-        if !open {
-            self.check_scoped_equation(&actual, &expected)?;
-        } else if let (Some(left), Some(right)) =
-            (self.known_type(&actual)?, self.known_type(&expected)?)
-            && (left.has_level_mvar() || right.has_level_mvar())
-        {
-            self.equations.push(SourceEquation::selection(left, right));
-        }
-        self.equations
-            .push(SourceEquation::selection(actual, expected));
-        Ok(open)
-    }
-
-    /// Match both term and carrier in one selection batch, including closed
-    /// mismatches that ordinary inference leaves to final declaration checking.
+    /// Match both the term and its type. `constrain` contributes universe
+    /// equations and concrete closed conversion refusals. Explicit equations
+    /// retain the same obligations through the transactional selection batch.
     fn match_rewrite_occurrence(
         &mut self,
         pattern: &Expr,
@@ -237,31 +193,22 @@ impl Context {
         if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
         }
-        let open_type = self.prepare_rewrite_selection(&type_, alpha)?;
-        let open_term = self.prepare_rewrite_selection(occurrence, pattern)?;
+        self.constrain(&type_, alpha)?;
+        self.constrain(occurrence, pattern)?;
+        self.equations
+            .push(SourceEquation::selection(type_, alpha.clone()));
+        self.equations.push(SourceEquation::selection(
+            occurrence.clone(),
+            pattern.clone(),
+        ));
         self.flush(true)?;
-        for (was_open, actual, expected) in
-            [(open_type, &type_, alpha), (open_term, occurrence, pattern)]
-        {
-            if was_open {
-                let actual = self.instantiate(actual)?;
-                let expected = self.instantiate(expected)?;
-                if !actual.has_expr_mvar()
-                    && !expected.has_expr_mvar()
-                    && !actual.has_level_mvar()
-                    && !expected.has_level_mvar()
-                {
-                    self.check_scoped_equation(&actual, &expected)?;
-                }
-            }
-        }
         Ok(true)
     }
 
     fn discharge_rewrite_premises(
         &mut self,
         holes: &[MVarId],
-        selected_rules: &SimpRules<'_>,
+        selected_rules: &[SimpRule<'_>],
     ) -> Result<bool, NatDefinitionElabError> {
         loop {
             let before = self.txn.mvars.assignments().len();
@@ -327,7 +274,7 @@ impl Context {
         target: &Expr,
         reverse: bool,
         inside_out: bool,
-        selected_rules: &SimpRules<'_>,
+        selected_rules: &[SimpRule<'_>],
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
@@ -352,7 +299,18 @@ impl Context {
         let mut holes = Vec::new();
         loop {
             template.tick()?;
-            rule.type_ = template.whnf(&rule.type_)?;
+            // The pin prepares simp theorems at reducible transparency without
+            // unfolding local lets. Preserve the final proposition's head too:
+            // unfolding Nat.lt here would hide it from the occurrence matcher.
+            rule.type_ = if inside_out {
+                template.whnf_with_transparency(
+                    &rule.type_,
+                    UnificationTransparency::Abbreviations,
+                    false,
+                )?
+            } else {
+                template.whnf(&rule.type_)?
+            };
             // A refutation is a rewrite of its proposition to False, not an
             // implication whose antecedent simp must first prove. Stop before
             // consuming that final proof binder; outer parameters still infer

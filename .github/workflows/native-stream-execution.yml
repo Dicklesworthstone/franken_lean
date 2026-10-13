@@ -1,0 +1,164 @@
+name: Native stream execution
+
+# Validate the exact stream-control candidate on the current main tree. Publish
+# immutable file blobs only after testing; this workflow never moves a Git ref.
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-stream-execution.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  controls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EVIDENCE: /tmp/native-stream-evidence
+      RUST_MIN_STACK: '268435456'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify and apply the exact candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          git rev-parse HEAD > "$EVIDENCE/base.txt"
+          git archive --format=tar.gz HEAD > "$EVIDENCE/source.tar.gz"
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          out = pathlib.Path(os.environ['EVIDENCE'])
+          repo = 'Dicklesworthstone/franken_lean'
+          chunks = ['940e000b05015ac05003d099e27955b16d3df2d2', '880151189ba7609f0259aaf20707e3dfba4afa0d', 'ffa299607fd6634d8cf1944955060a26dd412d0f', '42e2abdc64c933dbeeaaccda37163cec88b78e64']
+          def blob_hash(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          packed = b''
+          for sha in chunks:
+              request = urllib.request.Request(f'https://api.github.com/repos/{repo}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  value = json.load(response)
+              part = base64.b64decode(value['content'])
+              assert blob_hash(part) == sha
+              packed += part
+          assert blob_hash(packed) == 'c1e3b5127f8d52b162045f347bec9262d1334fd5'
+          patch = gzip.decompress(packed)
+          assert len(patch) == 42882
+          assert hashlib.sha256(patch).hexdigest() == '3ccbdf047d529be00b86eec5fbd2428c885867b3f59f95a345e076e5ceeb1c65'
+          candidate = out / 'candidate.patch'
+          candidate.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error', str(candidate)], check=True)
+          subprocess.run(['git', 'apply', '--index', str(candidate)], check=True)
+          # Replace the obsolete refusal expectation with both checked success
+          # and independent FLBC replay. Exact source guards prevent broad edits.
+          regression = pathlib.Path('crates/fln/src/runtime/stdout/tests.rs')
+          text = regression.read_text()
+          before_test = '''    assert!(matches!(
+                  &batch.batch.executions[batch.batch.source_evaluation_indices[0]].exit,
+                  VmExit::Refused {
+                      refusal: fln_vm::interpreter::VmRefusal::UnsupportedNativeClosure,
+                      ..
+                  }
+              ));
+              assert_eq!(engine.logical_root(&KVMap::new()), root);'''
+          after_test = '''    let execution = &batch.batch.executions[batch.batch.source_evaluation_indices[0]];
+              assert_unit_packet(&execution.exit);
+              let program = assert_native_row(execution);
+              assert_unit_packet(
+                  &execute_golem_with_options(&program, &KVMap::new(), VmExecutionLimits::default())
+                      .into_complete()
+                      .unwrap(),
+              );
+              assert_eq!(engine.logical_root(&KVMap::new()), root);'''
+          assert text.count(before_test) == 1
+          regression.write_text(text.replace(before_test, after_test))
+          subprocess.run(['git', 'add', str(regression)], check=True)
+          expected = set('''ci/BOUNDARY_API.txt
+          ci/UNSAFE_LEDGER.txt
+          crates/fln-rt/src/lib.rs
+          crates/fln-unsafe-abi/src/handle.rs
+          crates/fln-unsafe-abi/src/handle/stdout_capture.rs
+          crates/fln-unsafe-abi/src/handle/stream_control.rs
+          crates/fln-unsafe-abi/src/handle/stream_control/tests.rs
+          crates/fln-unsafe-abi/src/stdio.rs
+          crates/fln-unsafe-abi/src/stdio/stream_control.rs
+          crates/fln-vm/src/interpreter.rs
+          crates/fln-vm/tests/stdio_bridge.rs
+          crates/fln/src/runtime/stdout.rs
+          crates/fln/src/runtime/stdout/tests.rs
+          crates/fln/src/runtime/stdout/tests/input.rs'''.splitlines())
+          paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert set(paths) == expected
+          before, after = {}, {}
+          for path in paths:
+              result = subprocess.run(['git', 'rev-parse', '--verify', 'HEAD:' + path], capture_output=True, text=True)
+              before[path] = result.stdout.strip() if result.returncode == 0 else None
+              after[path] = blob_hash(pathlib.Path(path).read_bytes())
+          receipt = {'base': (out / 'base.txt').read_text().strip(), 'before': before, 'after': after, 'branch_updated': False, 'tests_passed': False}
+          (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY
+          git diff --cached --check
+          git diff --cached --stat
+      - name: Install the configured Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee "$EVIDENCE/compiler.txt"
+      - name: Required pinned Lean fixtures, not an execution backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 3 --output "$archive" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          printf '%s  %s\n' fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 "$archive" | sha256sum --check --strict
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
+          root="$RUNNER_TEMP/lean-4.32.0-linux"
+          test "$("$root/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LIB=$root/lib/lean" >> "$GITHUB_ENV"
+          echo "FLN_REFERENCE_LEAN=$root/bin/lean" >> "$GITHUB_ENV"
+          echo 'FLN_REQUIRE_REFERENCE=1' >> "$GITHUB_ENV"
+          cd "$root/lib/lean"
+          find Init -type f \( -name '*.olean' -o -name '*.olean.server' -o -name '*.olean.private' \) -print0 | tar --null -T - -czf "$EVIDENCE/reference-init.tar.gz"
+      - name: ABI ownership, real file effects, VM replay and checked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-unsafe-abi --lib -- --test-threads=1 2>&1 | tee "$EVIDENCE/abi.log"
+          cargo test --locked -p fln-vm --test stdio_bridge --test stdio_input --test stdio_capture -- --test-threads=1 2>&1 | tee "$EVIDENCE/vm.log"
+          cargo test --locked -p fln --lib runtime::stdout::tests -- --nocapture --test-threads=1 2>&1 | tee "$EVIDENCE/source.log"
+          cargo clippy --locked -p fln-unsafe-abi -p fln-rt -p fln-vm -p fln --lib -- -D warnings 2>&1 | tee "$EVIDENCE/clippy.log"
+      - name: Publish only tested immutable file blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          out = pathlib.Path(os.environ['EVIDENCE'])
+          receipt = json.loads((out / 'receipt.json').read_text())
+          for path, expected in receipt['after'].items():
+              data = pathlib.Path(path).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == expected
+          receipt['tests_passed'] = True
+          (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-stream-controls-${{ github.sha }}
+          path: /tmp/native-stream-evidence
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error

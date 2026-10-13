@@ -122,7 +122,7 @@ fn equation_return_types_can_depend_on_the_discriminant() {
     check(
         "structure Package where\n carrier : Type\n value : carrier\n\
       def unpack : forall p : Package, p.carrier | .mk A value => value\n\
-      def package : Package := { carrier := Nat, value := 8 }\n theorem a : unpack package = 8 := by rfl",
+      def package : Package := { carrier := Nat, value := 8 }\n theorem a : unpack package = (8 : Nat) := by rfl",
     );
 }
 #[test]

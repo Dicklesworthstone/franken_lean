@@ -46,6 +46,8 @@ struct Block {
     require_unit: bool,
     terminal: bool,
     loop_scope: Option<loop_returns::LoopScope>,
+    completion: Option<Syntax>,
+    nested: bool,
 }
 impl Block {
     fn new(
@@ -64,8 +66,29 @@ impl Block {
             require_unit,
             terminal: true,
             loop_scope,
+            completion: None,
+            nested: false,
         })
     }
+}
+
+/// The returning-sequence worklist ([`Context::expand_returning_sequence_at`]).
+enum Task {
+    Block(Block),
+    Resume(Block),
+    FinishException(exceptions::ExceptionRegion, usize),
+    Conditional(
+        Syntax,
+        Option<Syntax>,
+        bool,
+        Option<loop_returns::LoopScope>,
+        Option<Syntax>,
+        bool,
+    ),
+    FinishNested(Option<(Syntax, Syntax)>),
+    FinishLoop(Box<loop_returns::LoopBuild>),
+    Finish(conditional::Header, usize, Option<(Syntax, Syntax)>, bool),
+    Value(Syntax),
 }
 
 impl Context {
@@ -84,6 +107,10 @@ impl Context {
             let Syntax::Node { kind, args, .. } = syntax else {
                 continue;
             };
+            if nested::sequence(syntax).is_some() || kind == &parser_kind(&["Term", "nativeDoTry"])
+            {
+                return Ok(true);
+            }
             if kind == &parser_kind(&["Term", "doReturn"]) && branch {
                 return Ok(true);
             }
@@ -150,121 +177,58 @@ impl Context {
         &mut self,
         sequence: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        enum Task {
-            Block(Block),
-            Resume(Block),
-            Conditional(
-                Syntax,
-                Option<Syntax>,
-                bool,
-                Option<loop_returns::LoopScope>,
-            ),
-            FinishLoop(Box<loop_returns::LoopBuild>),
-            Finish(conditional::Header, usize, Option<(Syntax, Syntax)>),
-            Value(Syntax),
-        }
-        let mut work = vec![Task::Block(Block::new(sequence, None, false, None)?)];
+        self.expand_returning_sequence_at(sequence, None)
+    }
+
+    /// An exception region has a normal-completion packet, not a source
+    /// statement after its last return. Keep that distinction on the worklist:
+    /// returns bypass this continuation, while ordinary actions must finish at
+    /// Unit before it is produced.
+    pub(super) fn expand_returning_sequence_at(
+        &mut self,
+        sequence: Syntax,
+        normal: Option<Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let require_unit = normal.is_some();
+        let mut work = vec![Task::Block(Block::new(
+            sequence,
+            normal,
+            require_unit,
+            None,
+        )?)];
         let mut values = Vec::new();
         while let Some(task) = work.pop() {
             self.tick()?;
             match task {
                 Task::Value(value) => values.push(value),
-                Task::Block(mut block) => {
-                    let Some(statement) = block.statements.pop() else {
-                        values.push(block.result.ok_or_else(invalid)?);
-                        continue;
-                    };
-                    let terminal = block.terminal;
-                    block.terminal = false;
-                    let element = sequence_element(statement)?;
-                    if element.kind() == Some(&parser_kind(&["Term", "nativeDoReturningFor"])) {
-                        let mut element = node(element, "nativeDoReturningFor", 1)?;
-                        let (build, sequence, scope, normal) = self.prepare_returning_loop(
-                            element.pop().expect("retained loop"),
-                            block.result.take(),
-                            block.loop_scope.as_ref(),
-                        )?;
-                        work.push(Task::Resume(block));
-                        work.push(Task::FinishLoop(Box::new(build)));
-                        work.push(Task::Block(Block::new(
-                            sequence,
-                            Some(normal),
-                            true,
-                            Some(scope),
-                        )?));
-                    } else if conditional::is_compound(&element) {
-                        let suffix = block.result.take();
-                        let require_unit = block.require_unit;
-                        let loop_scope = block.loop_scope.clone();
-                        work.push(Task::Resume(block));
-                        work.push(Task::Conditional(element, suffix, require_unit, loop_scope));
-                    } else {
-                        if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
-                            // Only an administrative join can be skipped. Source
-                            // after an unconditional return still refuses rather
-                            // than disappearing before ordinary checking.
-                            if !terminal {
-                                return Err(invalid());
-                            }
-                            if block.loop_scope.is_some() {
-                                block.result = Some(self.expand_loop_return(element)?);
-                                work.push(Task::Block(block));
-                                continue;
-                            }
-                            block.result = None;
-                        }
-                        let scope = SequenceScope {
-                            targets: block.loop_scope.as_ref().map(|scope| &scope.targets),
-                            signal: false,
-                            require_unit: block.require_unit,
-                            allow_return: true,
-                        };
-                        block.result = Some(self.prepend_do_element(
-                            element,
-                            block.result,
-                            scope,
-                            terminal,
-                        )?);
-                        work.push(Task::Block(block));
-                    }
-                }
+                Task::Block(block) => self.returning_block(block, &mut work, &mut values)?,
                 Task::Resume(mut block) => {
                     block.result = Some(values.pop().ok_or_else(invalid)?);
                     work.push(Task::Block(block));
+                }
+                Task::FinishNested(join) => self.finish_returning_nested(join, &mut values)?,
+                Task::FinishException(region, start) => {
+                    let bodies = values.split_off(start);
+                    values.push(self.finish_exception_region(region, bodies)?);
                 }
                 Task::FinishLoop(build) => {
                     let body = values.pop().ok_or_else(invalid)?;
                     values.push(self.finish_returning_loop(*build, body)?);
                 }
-                Task::Conditional(syntax, suffix, require_unit, loop_scope) => {
-                    let branches = conditional::split(self, syntax)?;
-                    let require_unit = require_unit || suffix.is_some();
-                    let join = suffix
-                        .map(|suffix| Ok((self.do_control_name()?, suffix)))
-                        .transpose()?;
-                    // Only the constant-size call is copied, never source code.
-                    let next = join.as_ref().map(|(name, _)| resume(name));
-                    work.push(Task::Finish(branches.header, values.len(), join));
-                    for arm in branches.arms.into_iter().rev() {
-                        self.tick()?;
-                        work.push(match arm {
-                            Some(sequence) => Task::Block(Block::new(
-                                sequence,
-                                next.clone(),
-                                require_unit,
-                                loop_scope.clone(),
-                            )?),
-                            None => Task::Value(next.clone().unwrap_or_else(skip)),
-                        });
-                    }
+                Task::Conditional(syntax, suffix, require_unit, loop_scope, completion, nested) => {
+                    self.returning_branches(
+                        syntax,
+                        suffix,
+                        require_unit,
+                        loop_scope,
+                        completion,
+                        nested,
+                        &mut work,
+                        values.len(),
+                    )?
                 }
-                Task::Finish(header, start, join) => {
-                    let bodies = values.split_off(start);
-                    let body = self.finish_do_condition(header, bodies)?;
-                    values.push(match join {
-                        Some((name, suffix)) => term("nativeDoJoin", vec![name, suffix, body]),
-                        None => body,
-                    });
+                Task::Finish(header, start, join, nested) => {
+                    self.finish_returning_branches(header, start, join, nested, &mut values)?
                 }
             }
         }
@@ -273,6 +237,278 @@ impl Context {
         }
         values.pop().ok_or_else(invalid)
     }
+
+    #[inline(never)]
+    fn finish_returning_nested(
+        &mut self,
+        join: Option<(Syntax, Syntax)>,
+        values: &mut Vec<Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let body = values.pop().ok_or_else(invalid)?;
+        values.push(match join {
+            Some((name, continuation)) if self.do_syntax_uses(&body, &name)? => {
+                term("nativeDoBindJoin", vec![name, continuation, body])
+            }
+            Some((_, continuation)) => match nested::bind_join_domain(&continuation)? {
+                // The binder belongs to the reachable declaration,
+                // even when the continuation body is dead. Check its
+                // explicit type without imposing it on early returns.
+                Some(annotation) => {
+                    term("nativeDoNestedAnnotation", vec![annotation.clone(), body])
+                }
+                None => body,
+            },
+            _ => body,
+        });
+        Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn returning_branches(
+        &mut self,
+        syntax: Syntax,
+        suffix: Option<Syntax>,
+        require_unit: bool,
+        loop_scope: Option<loop_returns::LoopScope>,
+        completion: Option<Syntax>,
+        nested: bool,
+        work: &mut Vec<Task>,
+        start: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        let branches = conditional::split(self, syntax)?;
+        let require_unit = require_unit || suffix.is_some();
+        let join = suffix
+            .map(|suffix| Ok((self.do_control_name()?, suffix)))
+            .transpose()?;
+        // Only the constant-size call is copied, never source code.
+        let next = join.as_ref().map(|(name, _)| resume(name));
+        work.push(Task::Finish(branches.header, start, join, nested));
+        for arm in branches.arms.into_iter().rev() {
+            self.tick()?;
+            work.push(match arm {
+                Some(sequence) => {
+                    let mut block =
+                        Block::new(sequence, next.clone(), require_unit, loop_scope.clone())?;
+                    block.completion = completion.clone();
+                    block.nested = nested;
+                    Task::Block(block)
+                }
+                None => Task::Value(next.clone().unwrap_or_else(|| match &completion {
+                    Some(completion) => nested::complete(skip(), completion.clone()),
+                    None => skip(),
+                })),
+            });
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn finish_returning_branches(
+        &mut self,
+        header: conditional::Header,
+        start: usize,
+        join: Option<(Syntax, Syntax)>,
+        nested: bool,
+        values: &mut Vec<Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let bodies = values.split_off(start);
+        let body = self.finish_do_condition(header, bodies)?;
+        values.push(match join {
+            Some((name, suffix)) if !nested || self.do_syntax_uses(&body, &name)? => {
+                term("nativeDoJoin", vec![name, suffix, body])
+            }
+            Some(_) => body,
+            None => body,
+        });
+        Ok(())
+    }
+
+    /// One statement of a block on the returning worklist, each kind of statement out of line:
+    /// the deep-nesting tests run this worklist on 128 KiB host stacks, and with every arm in one
+    /// function a debug build gave that frame about 66 KB, nearly all of it the slots of arms that
+    /// are not running.
+    #[inline(never)]
+    fn returning_block(
+        &mut self,
+        mut block: Block,
+        work: &mut Vec<Task>,
+        values: &mut Vec<Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some(statement) = block.statements.pop() else {
+            values.push(block.result.ok_or_else(invalid)?);
+            return Ok(());
+        };
+        let terminal = block.terminal;
+        block.terminal = false;
+        let element = sequence_element(statement)?;
+        if element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
+            && block.result.is_none()
+            && block.loop_scope.is_none()
+        {
+            self.returning_try(block, element, terminal, work, values)
+        } else if nested::sequence(&element).is_some() {
+            self.returning_nested(block, element, work)
+        } else if element.kind() == Some(&parser_kind(&["Term", "nativeDoReturningFor"])) {
+            self.returning_loop(block, element, work)
+        } else if conditional::is_compound(&element) {
+            returning_conditional(block, element, work);
+            Ok(())
+        } else {
+            self.returning_element(block, element, terminal, work)
+        }
+    }
+
+    #[inline(never)]
+    fn returning_try(
+        &mut self,
+        block: Block,
+        element: Syntax,
+        terminal: bool,
+        work: &mut Vec<Task>,
+        values: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        // A value-bearing nested completion needs a separate
+        // normal payload as well as the return packet. Never
+        // discard that continuation or invoke it inside try.
+        if !terminal || block.completion.is_some() {
+            return Err(invalid());
+        }
+        let mut parts = node(element, "nativeDoTry", 2)?;
+        expect_atom(&parts[1], "returning", "retained exception control")?;
+        let (region, sequences) = self.split_exception_region(parts.remove(0))?;
+        work.push(Task::Resume(block));
+        work.push(Task::FinishException(region, values.len()));
+        for sequence in sequences.into_iter().rev() {
+            self.tick()?;
+            work.push(Task::Block(Block::new(sequence, None, false, None)?));
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn returning_nested(
+        &mut self,
+        mut block: Block,
+        element: Syntax,
+        work: &mut Vec<Task>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let scope = SequenceScope {
+            targets: block.loop_scope.as_ref().map(|scope| &scope.targets),
+            signal: false,
+            require_unit: block.require_unit,
+            allow_return: true,
+        };
+        let nested = self.prepare_nested_do(
+            element,
+            block.result.take(),
+            block.completion.clone(),
+            scope,
+        )?;
+        let mut inner = Block::new(nested.sequence, None, false, block.loop_scope.clone())?;
+        inner.completion = nested.completion;
+        inner.nested = true;
+        work.push(Task::Resume(block));
+        work.push(Task::FinishNested(nested.join));
+        work.push(Task::Block(inner));
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn returning_loop(
+        &mut self,
+        mut block: Block,
+        element: Syntax,
+        work: &mut Vec<Task>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if block.result.is_none()
+            && let Some(completion) = &block.completion
+        {
+            block.result = Some(nested::complete(skip(), completion.clone()));
+        }
+        let mut element = node(element, "nativeDoReturningFor", 1)?;
+        let (build, sequence, scope, normal) = self.prepare_returning_loop(
+            element.pop().expect("retained loop"),
+            block.result.take(),
+            block.loop_scope.as_ref(),
+        )?;
+        work.push(Task::Resume(block));
+        work.push(Task::FinishLoop(Box::new(build)));
+        work.push(Task::Block(Block::new(
+            sequence,
+            Some(normal),
+            true,
+            Some(scope),
+        )?));
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn returning_element(
+        &mut self,
+        mut block: Block,
+        element: Syntax,
+        terminal: bool,
+        work: &mut Vec<Task>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if element.kind() == Some(&parser_kind(&["Term", "doReturn"])) {
+            // Only an administrative join can be skipped. Source
+            // after an unconditional return still refuses rather
+            // than disappearing before ordinary checking.
+            if !terminal {
+                return Err(invalid());
+            }
+            if let Some(scope) = &block.loop_scope {
+                block.result = Some(if scope.targets.return_state.is_empty() {
+                    self.expand_loop_return(element)?
+                } else {
+                    self.expand_scoped_loop_return(element, false, &scope.targets)?
+                });
+                work.push(Task::Block(block));
+                return Ok(());
+            }
+            block.result = None;
+        }
+        let scope = SequenceScope {
+            targets: block.loop_scope.as_ref().map(|scope| &scope.targets),
+            signal: false,
+            require_unit: block.require_unit,
+            allow_return: true,
+        };
+        let completes = terminal
+            && block.result.is_none()
+            && element.kind() == Some(&parser_kind(&["Term", "doExpr"]));
+        let value = self.prepend_do_element(element, block.result, scope, terminal)?;
+        block.result = Some(if completes {
+            match &block.completion {
+                Some(completion) => nested::complete(value, completion.clone()),
+                None => value,
+            }
+        } else {
+            value
+        });
+        work.push(Task::Block(block));
+        Ok(())
+    }
+}
+
+#[inline(never)]
+fn returning_conditional(block: Block, element: Syntax, work: &mut Vec<Task>) {
+    let mut block = block;
+    let suffix = block.result.take();
+    let require_unit = block.require_unit;
+    let loop_scope = block.loop_scope.clone();
+    let completion = suffix.is_none().then(|| block.completion.clone()).flatten();
+    let nested = block.nested;
+    work.push(Task::Resume(block));
+    work.push(Task::Conditional(
+        element,
+        suffix,
+        require_unit,
+        loop_scope,
+        completion,
+        nested,
+    ));
 }
 
 #[cfg(test)]

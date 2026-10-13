@@ -107,6 +107,18 @@ impl Preparation<'_> {
         if args.len() < group.arity || group.shapes.len() > u16::MAX as usize {
             return Ok(None);
         }
+        self.mutual_fold_with_group(rec, &group, args)
+    }
+
+    // Discover every admitted layout before entering the larger peer/branch
+    // construction frame, including on a small bounded host stack.
+    #[inline(never)]
+    fn mutual_fold_with_group(
+        &mut self,
+        rec: &RecursorVal,
+        group: &Group,
+        args: &[Expr],
+    ) -> Result<Option<Fold>, IngressError> {
         let mut motives = Vec::new();
         for (index, shape) in group.shapes.iter().enumerate() {
             self.tick()?;
@@ -173,7 +185,7 @@ impl Preparation<'_> {
                     self.tick()?;
                     let field =
                         Expr::proj(shape.projection(ctor), field_index as u64, variable(0)?);
-                    body = self.minor_apply(body, field.clone())?;
+                    body = self.constructor_minor_apply(body, ctor, field_index, field.clone())?;
                     let logical = self.type_head(&logical_fields)?;
                     let ExprNode::ForallE {
                         binder_type: logical_type,
@@ -292,7 +304,10 @@ mod tests {
         let text = std::fs::read_to_string(&example)
             .expect("examples/native_mutual_folds.lean is readable");
         let source = text.split("#eval").next().unwrap();
-        let engine = Engine::with_source_seed(limits)
+        // The example folds with `Forest.rec` directly: the `frontier` lane (z8j.1.6.6).
+        let engine = Engine::builder()
+            .mode(fln_core::mode::Mode::Frontier)
+            .build_with_source_seed(limits)
             .unwrap()
             .into_complete()
             .unwrap()

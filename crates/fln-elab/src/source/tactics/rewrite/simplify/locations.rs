@@ -7,7 +7,7 @@ impl Context {
         &mut self,
         local: &LocalDecl,
         rule: &SimpRule<'_>,
-        rules: &SimpRules<'_>,
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let target = self.instantiate(&local.type_)?;
         match self.unfold_simp_rule(rule, &target)? {
@@ -48,9 +48,10 @@ impl Context {
             return Err(error(TacticError::MalformedScript));
         };
         expect_atom(keyword, "simp_all", "whole-context simplification keyword")?;
-        expect_empty_null(config, "default simplification configuration")?;
+        expect_default_config(config, "default simplification configuration")?;
         // Reuse the ordinary set parser without reparsing source or changing
         // the persistent registry. Its location slot is an empty null node.
+        let no_location = Syntax::node(Name::from_components(["null"]), Vec::new());
         let selection = [
             Syntax::Atom {
                 info: keyword.info(),
@@ -60,13 +61,13 @@ impl Context {
             discharger.clone(),
             only.clone(),
             arguments.clone(),
-            config.clone(),
+            no_location,
         ];
         self.txn.lctx = initial.lctx.clone();
         let mut rules = self.simp_rules(&selection)?;
         let mut hypotheses = Vec::new();
         let mut selected = HashSet::new();
-        for rule in &rules.selected {
+        for rule in &rules {
             self.tick()?;
             if let SimpRule::Local(id) = rule {
                 selected.insert(id.clone());
@@ -89,7 +90,7 @@ impl Context {
                 continue;
             }
             if selected.insert(local.id.clone()) {
-                rules.selected.push(SimpRule::Local(local.id.clone()));
+                rules.push(SimpRule::Local(local.id.clone()));
             }
             // Shadowed and inaccessible locals may provide evidence by ID,
             // but must never redirect a source-visible simplification location.
@@ -134,14 +135,14 @@ impl Context {
         proof: &mut ProofState<'_>,
         initial: &ProofGoal,
         locations: super::super::locations::RewriteLocations,
-        mut rules: SimpRules<'_>,
+        mut rules: Vec<SimpRule<'_>>,
         saturate: bool,
     ) -> Result<(), NatDefinitionElabError> {
         let mut protected = HashSet::new();
         if locations.all {
             // Preserve explicitly selected evidence for the entire traversal.
             // Automatically selected locals are remapped after each transport.
-            for rule in &rules.selected {
+            for rule in &rules {
                 self.tick()?;
                 if !matches!(rule, SimpRule::Explicit(_)) {
                     continue;
@@ -189,15 +190,12 @@ impl Context {
                         .ok_or_else(|| error(TacticError::RewriteLocation))?;
                     let mut advanced = false;
                     // Self evidence is also unavailable for premise discharge.
-                    let active = self.index_simp_rules(
-                        rules
-                            .selected
-                            .iter()
-                            .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
-                            .cloned()
-                            .collect(),
-                    )?;
-                    for rule in &active.selected {
+                    let active: Vec<_> = rules
+                        .iter()
+                        .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
+                        .cloned()
+                        .collect();
+                    for rule in &active {
                         self.tick()?;
                         let original = self.rewrite_trial();
                         let Some(replacement) = self.simp_hypothesis_step(&local, rule, &active)?
@@ -224,13 +222,27 @@ impl Context {
                             .ok_or_else(|| failure(SourceInferenceError::Scope))?
                             .id
                             .clone();
-                        for rule in &mut rules.selected {
-                            self.tick()?;
-                            if let SimpRule::Local(id) = rule
-                                && id == &local.id
-                            {
-                                *id = replacement_id.clone();
+                        if saturate {
+                            for rule in &mut rules {
+                                self.tick()?;
+                                if let SimpRule::Local(id) = rule
+                                    && id == &local.id
+                                {
+                                    *id = replacement_id.clone();
+                                }
                             }
+                        } else {
+                            // The pin builds its simp set once, so a located
+                            // hypothesis that was actually rewritten keeps no
+                            // rule for the rest of the tactic — measured at
+                            // v4.32.0: neither its old form nor its rewritten
+                            // form fires afterwards, while an unrewritten
+                            // located hypothesis's rule stays live. Only
+                            // `simp_all`'s saturating revisits remap.
+                            let _ = &replacement_id;
+                            rules.retain(
+                                |rule| !matches!(rule, SimpRule::Local(id) if id == &local.id),
+                            );
                         }
                         proof.work.push(Work::Close(parent, value));
                         goal = next;

@@ -1,6 +1,6 @@
 //! Native single-family inductive syntax, retaining every original token leaf.
 //! Index telescopes and constructor results are retained; unsupported mutual
-//! blocks and deriving are not dropped or repaired.
+//! blocks and deriving handlers are not dropped or repaired.
 use super::*;
 use std::ops::Range;
 
@@ -13,25 +13,60 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionP
         expected: NatDefinitionExpectation::InductiveConstructor,
     }
 }
+/// `rawIdent` at `at`: an identifier, or a keyword spelled as one (`| return : σ → T`), named by its
+/// text.
+fn raw_ident(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let token = tokens.get(at).ok_or_else(|| refuse(view, tokens, at))?;
+    match &token.kind {
+        TokenKind::Ident(_) => Ok(leaves.leaf(at)?),
+        TokenKind::Symbol(text) if crate::spells_identifier(text) => Ok(Syntax::Ident {
+            info: leaves.leaf(at)?.info(),
+            raw_val: token.extent,
+            val: Name::from_components([text.as_str()]),
+            preresolved: Vec::new(),
+        }),
+        _ => Err(refuse(view, tokens, at)),
+    }
+}
+
 fn ctor(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let start = range.start;
-    if !symbol(tokens, start, "|")
-        || !matches!(
-            tokens.get(start + 1).map(|t| &t.kind),
-            Some(TokenKind::Ident(_))
-        )
-    {
+    // `ctor := optional docComment >> "| " >> declModifiers >> rawIdent >> optDeclSig`
+    // (`Lean/Parser/Command.lean`): a constructor's doc comes before its `|`.
+    let doc = if symbol(tokens, range.start, "/--") {
+        // `doc_comment_syntax` is already the optional slot: `null[docComment]`.
+        crate::doc_comment_syntax(view, leaves, tokens, range.start)?
+    } else {
+        null_node(vec![])
+    };
+    let start = range.start + usize::from(symbol(tokens, range.start, "/--"));
+    if !symbol(tokens, start, "|") {
         return Err(refuse(view, tokens, start));
     }
+    // `declModifiers` after the `|`: a doc comment (`| /-- … -/ first`), then `private` or
+    // `protected`.
+    let inner_doc = symbol(tokens, start + 1, "/--").then_some(start + 1);
+    let mut name = start + 1 + usize::from(inner_doc.is_some());
+    let visibility = ["private", "protected"]
+        .into_iter()
+        .find(|word| symbol(tokens, name, word))
+        .map(|word| (word, name));
+    name += usize::from(visibility.is_some());
+    let modifiers = records::modifiers_with(view, leaves, tokens, inner_doc, visibility)?;
+    let name_syntax = raw_ident(leaves, view, tokens, name)?;
     let (groups, end) = bounded_binders(
         view,
         &tokens[..range.end],
-        start + 2,
+        name + 1,
         DefinitionGrammar::Scalar,
     )?;
     let binders = bounded_binder_syntax(leaves, view, tokens, groups, DefinitionGrammar::Scalar)?;
@@ -39,10 +74,10 @@ fn ctor(
     Ok(Syntax::node(
         parser_kind(&["Command", "ctor"]),
         vec![
-            null_node(vec![]),
+            doc,
             leaves.leaf(start)?,
-            records::modifiers(),
-            leaves.leaf(start + 1)?,
+            modifiers,
+            name_syntax,
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
                 vec![null_node(binders), result],
@@ -51,33 +86,46 @@ fn ctor(
     ))
 }
 
+/// `inductive` at token `keyword` of `prefix` (the doc comment's end, the attributes' end and the
+/// keyword, as `declaration_prefix` finds them).
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
+    prefix: (usize, usize, usize),
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
-    if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-        return Err(refuse(&view, &tokens, 1));
+    let (doc_end, attributes_end, keyword) = prefix;
+    if !matches!(
+        tokens.get(keyword + 1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        return Err(refuse(&view, &tokens, keyword + 1));
     }
-    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
+    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, keyword + 2)?;
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
+    let end_body = records::deriving_start(&tokens, cursor);
     let mut end_header = cursor;
     let mut nesting = Vec::new();
-    while end_header < tokens.len() {
+    while end_header < end_body {
+        // Without `where`, the first constructor's doc comment ends the header (`ctor` opens
+        // with `optional docComment`).
         if nesting.is_empty()
             && (symbol(&tokens, end_header, "where")
                 || symbol(&tokens, end_header, ":=")
-                || symbol(&tokens, end_header, "|"))
+                || symbol(&tokens, end_header, "|")
+                || symbol(&tokens, end_header, "/--"))
         {
             break;
         }
         if let TokenKind::Symbol(s) = &tokens[end_header].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => nesting.push(")"),
                 "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
                 "⟨" => nesting.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if nesting.pop() != Some(s.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if nesting.pop() != Some(crate::canonical_bracket(s.as_str())) =>
+                {
                     return Err(refuse(&view, &tokens, end_header));
                 }
                 _ => {}
@@ -101,19 +149,21 @@ pub(super) fn parse(
         null_node(vec![])
     };
     let mut begins = Vec::new();
-    for at in end_header..tokens.len() {
+    for at in end_header..end_body {
         if nesting.is_empty() && symbol(&tokens, at, "|") {
-            begins.push(at);
+            // A constructor's doc comment begins it.
+            let doc = at > end_header && symbol(&tokens, at - 1, "/--");
+            begins.push(if doc { at - 1 } else { at });
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => nesting.push(")"),
                 "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
                 "⟨" => nesting.push("⟩"),
                 ")" | "}" | "]" | "⦄" | "⟩" => {
-                    if nesting.pop() != Some(s.as_str()) {
+                    if nesting.pop() != Some(crate::canonical_bracket(s.as_str())) {
                         return Err(refuse(&view, &tokens, at));
                     }
                 }
@@ -122,10 +172,10 @@ pub(super) fn parse(
             }
         }
     }
-    if !nesting.is_empty() || (end_header < tokens.len() && begins.first() != Some(&end_header)) {
+    if !nesting.is_empty() || (end_header < end_body && begins.first() != Some(&end_header)) {
         return Err(refuse(&view, &tokens, end_header));
     }
-    begins.push(tokens.len());
+    begins.push(end_body);
     let ctors = begins
         .windows(2)
         .map(|w| ctor(&leaves, &view, &tokens, w[0]..w[1]))
@@ -133,11 +183,11 @@ pub(super) fn parse(
     let command = Syntax::node(
         parser_kind(&["Command", "inductive"]),
         vec![
-            leaves.leaf(0)?,
+            leaves.leaf(keyword)?,
             Syntax::node(
                 parser_kind(&["Command", "declId"]),
                 vec![
-                    leaves.leaf(1)?,
+                    leaves.leaf(keyword + 1)?,
                     levels::declaration_syntax(&leaves, universe_suffix)?,
                 ],
             ),
@@ -148,17 +198,16 @@ pub(super) fn parse(
             body_keyword,
             null_node(ctors),
             null_node(vec![]),
-            Syntax::node(
-                parser_kind(&["Command", "optDeriving"]),
-                vec![null_node(vec![])],
-            ),
+            records::deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
+    let modifiers =
+        crate::declaration_modifiers(&view, &leaves, &tokens, doc_end, attributes_end, keyword)?;
     Ok(ParsedDefinition {
         source_view: view,
         syntax: Syntax::node(
             parser_kind(&["Command", "declaration"]),
-            vec![records::modifiers(), command],
+            vec![modifiers, command],
         ),
         epilogue,
     })
@@ -185,9 +234,20 @@ mod tests {
         for source in [
             "inductive X where |",
             "inductive X where | c (x : Nat",
-            "inductive X where | c deriving Inhabited",
+            "inductive X where | c deriving",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn deriving_follows_the_complete_constructor_telescope() {
+        let text = "inductive Choice (A : Type) where\r\n | value (a : A)\r\n | empty\r\n deriving Inhabited, Repr\r\n";
+        let parsed = parse_definition(text.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            text.replace("\r\n", "\n").as_bytes()
+        );
     }
 }

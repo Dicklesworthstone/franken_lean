@@ -77,11 +77,16 @@ fn invalid_collection_suffixes_do_not_emit_partial_success_or_poison_a_later_run
         } else {
             assert!(!output.status.success());
             assert!(output.stdout.is_empty());
+            // A false `by rfl` is refused while elaborating, as at the pin ("Tactic `rfl`
+            // failed: The left-hand side … is not definitionally equal to the right-hand side").
             let error = String::from_utf8(output.stderr).unwrap();
-            assert!(
-                error.contains("\"outcome\":\"kernel-rejection\""),
-                "{error}"
-            );
+            for expected in [
+                "\"outcome\":\"elaboration\"",
+                "file 1, command 1, byte 0:",
+                "not definitionally equal",
+            ] {
+                assert!(error.contains(expected), "{error}");
+            }
             assert!(!error.contains("\"outcome\":\"complete\""));
         }
     }

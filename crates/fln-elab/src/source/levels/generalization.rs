@@ -19,9 +19,19 @@ impl Context {
         for term in terms {
             holes.extend(self.txn.mvars.collect_mvars(term));
         }
+        // A let-rec's value is deliberately not available while its enclosing
+        // declaration elaborates. These are registered, already elaborated
+        // obligations, not inference holes; declaration completion assigns
+        // them before the final closed-term check and kernel admission.
+        for pending in &self.deferred_local_functions {
+            holes.remove(&pending.id);
+        }
         if holes.is_empty() {
             Ok(())
         } else {
+            if let Some(error) = self.postponed_application_errors.first() {
+                return Err(error.clone());
+            }
             Err(failure(SourceInferenceError::UnresolvedHoles {
                 count: holes.len(),
             }))
@@ -43,6 +53,22 @@ impl Context {
         }
         self.require_resolved_terms(&roots)?;
 
+        // Instantiated roots carry exact, cached subtree flags. With no
+        // reachable universe hole the scan cannot publish any assignment or
+        // parameter, so avoid walking a fully monomorphic declaration. Keep
+        // every finalization check above this shortcut.
+        let mut has_holes = false;
+        for root in &roots {
+            self.tick()?;
+            if root.has_level_mvar() {
+                has_holes = true;
+                break;
+            }
+        }
+        if !has_holes {
+            return Ok(());
+        }
+
         let mut reserved: HashSet<Name> = self.level_params.iter().cloned().collect();
         reserved.extend(self.source_scope.universes.iter().cloned());
         let mut pending: Vec<_> = roots.iter().rev().collect();
@@ -53,6 +79,12 @@ impl Context {
         while let Some(expr) = pending.pop() {
             self.tick()?;
             if !seen.insert(expr.allocation_identity()) {
+                continue;
+            }
+            // Closed proof fragments cannot contribute holes or reserved
+            // names. A rigid parameter still requires traversal even when
+            // its subtree contains no holes: a later root can reserve u_1.
+            if !expr.has_level_mvar() && !expr.has_level_param() {
                 continue;
             }
             let mut levels = Vec::new();
@@ -131,6 +163,46 @@ mod tests {
         let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
         let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
         Context::new(&env, budget)
+    }
+
+    fn large_closed_natural() -> Expr {
+        let successor = Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new());
+        let mut value = Expr::const_(Name::from_components(["Nat", "zero"]), Vec::new());
+        for _ in 0..4096 {
+            value = Expr::app(successor.clone(), value);
+        }
+        value
+    }
+
+    #[test]
+    fn monomorphic_declarations_do_not_rescan_large_closed_terms() {
+        let mut context = context();
+        let root = large_closed_natural();
+        let before = context.txn.universes.clone();
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 32;
+        context
+            .generalize_declaration_universes(std::slice::from_ref(&root))
+            .unwrap();
+        assert_eq!(context.txn.universes, before);
+        assert!(context.level_params.is_empty());
+    }
+
+    #[test]
+    fn closed_fragments_are_pruned_without_skipping_later_reserved_names() {
+        let mut context = context();
+        let closed = large_closed_natural();
+        let hole = Expr::sort(context.level().unwrap());
+        let rigid = Expr::sort(Level::param(Name::from_components(["u_1"])));
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 64;
+        context
+            .generalize_declaration_universes(&[closed, hole.clone(), rigid.clone()])
+            .unwrap();
+        assert_eq!(context.level_params, vec![Name::from_components(["u_2"])]);
+        assert_eq!(context.instantiate(&rigid).unwrap(), rigid);
+        assert_eq!(
+            context.instantiate(&hole).unwrap(),
+            Expr::sort(Level::param(Name::from_components(["u_2"])))
+        );
     }
 
     #[test]

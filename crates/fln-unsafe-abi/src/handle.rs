@@ -25,6 +25,17 @@ use crate::rc::{self, Header};
 use crate::shadow;
 use crate::tagged;
 
+pub mod fs;
+pub mod stdout_capture;
+
+/// Flush native writes to the process stdout before a host publishes through
+/// its own stdout buffer. Thread-local stream overrides and other files are
+/// untouched. An error retains any bytes the OS already accepted; no action is
+/// repeated and no logical IO result or declaration authority is produced.
+pub fn flush_native_stdout() -> std::io::Result<()> {
+    crate::stdio::flush_native_stdout()
+}
+
 /// Boxed-convention function types for the callable-closure constructors: every
 /// parameter and the result are `lean_object*`, per the pin's `m_fun` contract
 /// (`lean.h:211-217`; apply arms `apply.cpp:101-460`).
@@ -61,6 +72,19 @@ unsafe extern "C" fn counting_foreach(_data: *mut c_void, _fn: *mut LeanObject) 
 
 /// An owned CompatHeap reference (or boxed scalar). See the module invariant.
 pub struct Obj(*mut LeanObject);
+
+/// Bounded stdout callback failures. Invalid inputs are rejected before the
+/// write. The other variants describe a completed write attempt: their byte
+/// count is exactly what fwrite reported, not an OS-flush or rollback promise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioPutStrError {
+    InvalidCallback,
+    InvalidString,
+    InvalidWorld,
+    Capture(stdout_capture::StdoutCaptureError),
+    UnrepresentableWrite { errno: i32, bytes_written: usize },
+    MalformedResult { bytes_written: usize },
+}
 
 // The single allowance for this module: every method body below manipulates
 // raw membrane objects under the documented linear-ownership invariant.
@@ -495,23 +519,41 @@ impl Obj {
             && byte_off.checked_add(width).is_some_and(|end| end <= extent)
     }
 
-    /// Fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    /// Borrow a string view `(size, capacity, length, bytes-with-NUL)`.
     ///
     /// Returns `None` when the handle is not a string or the header is
     /// inconsistent (`m_size == 0`, `m_size` past `m_capacity`, missing
-    /// NUL). Product paths that accept untrusted objects must use this;
-    /// [`string_view`] still asserts. Inflating both `m_size` and
-    /// `m_capacity` past the minted allocation remains outside this check
-    /// (same residual as [`try_mpz_view`]): the test plants `m_size` only,
-    /// so Drop still frees with the real `m_capacity`.
-    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+    /// NUL). The returned bytes alias the immutable ABI buffer and remain
+    /// valid only while this handle is borrowed. There is no allocation,
+    /// copy, UTF-8 scan, or ownership transfer: callers can check their byte
+    /// allowance before validating the text or creating an owned copy.
+    /// `length` is the recorded character count, not a verified count.
+    ///
+    /// Inflating both `m_size` and `m_capacity` past the minted allocation
+    /// remains outside this check (same residual as [`Self::try_mpz_view`]):
+    /// the test plants `m_size` only, so Drop still frees with the real
+    /// `m_capacity`.
+    ///
+    /// The byte slice cannot outlive its owning handle:
+    ///
+    /// ```compile_fail
+    /// use fln_unsafe_abi::handle::Obj;
+    /// let bytes = {
+    ///     let value = Obj::mk_string("borrowed");
+    ///     value.try_borrow_string_view().unwrap().3
+    /// };
+    /// assert_eq!(bytes, b"borrowed\0");
+    /// ```
+    pub fn try_borrow_string_view(&self) -> Option<(usize, usize, usize, &[u8])> {
         if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_STRING) {
             return None;
         }
         // SAFETY: tag is TAG_STRING, so the object is a LeanStringObject.
         // `m_size <= m_capacity` is the inline-buffer law: the minted
-        // data area is `m_capacity` bytes. Copying `m_size` after that
-        // check cannot run past the header's own capacity claim.
+        // data area is `m_capacity` bytes. Reading `m_size` after that
+        // check cannot run past the header's own capacity claim. The live
+        // owning &self keeps the immutable allocation alive for the slice's
+        // complete lifetime; no raw pointer or unconstrained borrow escapes.
         unsafe {
             let s = self.0.cast::<crate::layout::LeanStringObject>();
             let size = (&raw const (*s).m_size).read();
@@ -521,12 +563,23 @@ impl Obj {
                 return None;
             }
             let data = (&raw const (*s).m_data).cast::<u8>();
-            let copy = core::slice::from_raw_parts(data, size).to_vec();
-            if copy[size - 1] != 0 {
+            let bytes = core::slice::from_raw_parts(data, size);
+            if bytes[size - 1] != 0 {
                 return None;
             }
-            Some((size, cap, len, copy))
+            Some((size, cap, len, bytes))
         }
+    }
+
+    /// Copy a fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    ///
+    /// Uses [`Self::try_borrow_string_view`]'s category, header, and terminator
+    /// checks before allocating the copy. Resource-bounded callers should use
+    /// that borrowed view to check their allowance before copying; this
+    /// convenience observer retains its original owned-byte behavior.
+    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+        self.try_borrow_string_view()
+            .map(|(size, cap, len, bytes)| (size, cap, len, bytes.to_vec()))
     }
 
     /// String salient facts `(size, capacity, length, bytes-with-NUL)`.
@@ -615,7 +668,7 @@ impl Obj {
         }
     }
 
-    /// Fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    /// Borrow an sarray view `(elem_size, size, capacity, live-bytes)`.
     ///
     /// Returns `None` when the handle is not a scalar array, `m_other`
     /// (element size) is 0, `m_size` is past `m_capacity`, or
@@ -625,25 +678,47 @@ impl Obj {
     /// `m_size` and `m_capacity` past the minted allocation remains
     /// outside this check (same residual as [`try_array_view`]): the
     /// test plants `m_size` only, so Drop still frees with the real
-    /// `m_capacity`.
-    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+    /// `m_capacity`. The immutable slice borrows this owning handle; there is
+    /// no allocation or reference transfer, and no spare capacity is exposed.
+    /// Callers can check a byte allowance before scanning or copying data.
+    ///
+    /// ```compile_fail
+    /// use fln_unsafe_abi::handle::Obj;
+    /// let bytes = {
+    ///     let value = Obj::mk_sarray(1, b"borrowed");
+    ///     value.try_borrow_sarray_view().unwrap().3
+    /// };
+    /// assert_eq!(bytes, b"borrowed");
+    /// ```
+    pub fn try_borrow_sarray_view(&self) -> Option<(u8, usize, usize, &[u8])> {
         if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_SCALAR_ARRAY) {
             return None;
         }
         // SAFETY: tag is TAG_SCALAR_ARRAY, so the object is a
         // LeanSarrayObject. `m_size <= m_capacity` is the inline-buffer
         // law: the minted data area is `m_capacity * elem_size` bytes.
-        // Copying `m_size * elem_size` after that check and the overflow
-        // check cannot run past the header's own capacity claim.
+        // Reading `m_size * elem_size` after that check and the overflow
+        // check cannot run past the header's own capacity claim. The owning
+        // &self keeps that immutable allocation live for the returned borrow.
         unsafe {
             let (elem, size, cap, data) = object::sarray_fields(self.0);
             if elem == 0 || size > cap {
                 return None;
             }
             let nbytes = size.checked_mul(usize::from(elem))?;
-            let copy = core::slice::from_raw_parts(data, nbytes).to_vec();
-            Some((elem, size, cap, copy))
+            let bytes = core::slice::from_raw_parts(data, nbytes);
+            Some((elem, size, cap, bytes))
         }
+    }
+
+    /// Copy a fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    ///
+    /// Uses [`Self::try_borrow_sarray_view`]'s category and layout checks.
+    /// Bounded consumers should use that borrowed view before allocating;
+    /// this convenience observer retains its original owned-copy behavior.
+    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+        self.try_borrow_sarray_view()
+            .map(|(elem, size, cap, bytes)| (elem, size, cap, bytes.to_vec()))
     }
 
     #[cfg(test)]
@@ -781,6 +856,110 @@ impl Obj {
             }
             Some((arity, fixed))
         }
+    }
+
+    /// Retain this thread's stdout only when it is the exact six-method
+    /// native stream_of_handle carrier over one live Handle. A malformed,
+    /// foreign, or Golem-shell TLS override returns None before core can
+    /// assign private callable types to its fields.
+    pub fn stdio_stdout() -> Option<Obj> {
+        crate::stdio::checked_get_stdout().map(Obj)
+    }
+
+    /// Retain this thread's stdin only after the complete native six-method
+    /// stream and its single shared Handle have been validated under TLS borrow.
+    pub fn stdio_stdin() -> Option<Obj> {
+        crate::stdio::checked_get_stdin().map(Obj)
+    }
+
+    /// Recognize exactly the native getLine callback over one live Handle.
+    pub fn is_stdio_get_line_closure(&self) -> bool {
+        // SAFETY: Obj is live; the observer checks category, pointer, arity
+        // and capture before borrowing its exact Handle, and invokes nothing.
+        unsafe { crate::stdio::stream_get_line_handle(self.0).is_some() }
+    }
+
+    /// Read through the exact native getLine callback without general native
+    /// apply. None means an unrelated callback and precedes all input effects.
+    /// Success returns the same private seven-field packet as try_file_get_line;
+    /// resource/post-read failures retain its consumed-byte observations.
+    pub fn try_stdio_get_line(
+        &self,
+        world: &Obj,
+        max_input_bytes: usize,
+        max_output_bytes: usize,
+    ) -> Result<Option<Obj>, fs::FileReadError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(fs::FileReadError::InvalidWorld);
+        }
+        // SAFETY: the observer lends a live Handle from the borrowed closure.
+        // Retain before wrapping as Obj, then let ordinary RAII settle exactly
+        // that reference after the bounded call; the native pointer is not run.
+        let handle = unsafe {
+            let Some(handle) = crate::stdio::stream_get_line_handle(self.0) else {
+                return Ok(None);
+            };
+            rc::inc_ref_n(handle, 1);
+            Obj(handle)
+        };
+        handle
+            .try_file_get_line(world, max_input_bytes, max_output_bytes)
+            .map(Some)
+    }
+
+    /// Whether this is precisely Marrow's putStr callback over a live Handle.
+    /// Arbitrary native closures, shells, and other stream methods are false.
+    pub fn is_stdio_put_str_closure(&self) -> bool {
+        // SAFETY: the Obj invariant supplies a live object or scalar; the
+        // checked observer does not invoke the stored function pointer.
+        unsafe { crate::stdio::stream_put_str_handle(self.0).is_some() }
+    }
+
+    /// Apply the one reviewed native stdout callback to canonical String and
+    /// world scalar 0, borrowing all three inputs. No general closure apply
+    /// machinery is reached. Invalid input errors precede effects; an
+    /// unrepresentable write error or malformed result preserves fwrite's count.
+    ///
+    /// Ok is an owned neutral tag-0 record with exactly six object fields:
+    /// [success Bool, errorTag Nat, osCode Nat, hasFilename Bool, filename
+    /// String, details String]. Success uses [1, 0, 0, 0, "", ""]. This is
+    /// transport data, never the logical Unit, IO.Error, or EST.Out layout.
+    pub fn try_stdio_put_str(&self, text: &Obj, world: &Obj) -> Result<Obj, StdioPutStrError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(StdioPutStrError::InvalidWorld);
+        }
+        if !canonical_stdio_string(text) {
+            return Err(StdioPutStrError::InvalidString);
+        }
+        if !self.is_stdio_put_str_closure() {
+            return Err(StdioPutStrError::InvalidCallback);
+        }
+        if stdout_capture::write_if_captured(self, text).map_err(StdioPutStrError::Capture)? {
+            return Ok(Obj::mk_ctor(
+                0,
+                vec![
+                    Obj::mk_nat(1),
+                    Obj::mk_nat(0),
+                    Obj::mk_nat(0),
+                    Obj::mk_nat(0),
+                    Obj::mk_string(""),
+                    Obj::mk_string(""),
+                ],
+                &[],
+            ));
+        }
+        // SAFETY: the observer checks the native callback and Handle before
+        // the primitive; canonical_stdio_string established the String law.
+        // The returned native result carries exactly one owned reference.
+        let native = unsafe { crate::stdio::checked_stream_put_str(self.0, text.0) }.map_err(
+            |(errno, bytes_written)| StdioPutStrError::UnrepresentableWrite {
+                errno,
+                bytes_written,
+            },
+        )?;
+        let (result, bytes_written) = native.ok_or(StdioPutStrError::InvalidCallback)?;
+        let result = Obj(result);
+        stdio_result_transport(&result).ok_or(StdioPutStrError::MalformedResult { bytes_written })
     }
 
     /// Fallible `ST.Ref` read.
@@ -1077,6 +1256,127 @@ impl Obj {
     }
 }
 
+fn canonical_stdio_string(value: &Obj) -> bool {
+    let Some((size, _, length, bytes)) = value.try_borrow_string_view() else {
+        return false;
+    };
+    std::str::from_utf8(&bytes[..size - 1]).is_ok_and(|text| text.chars().count() == length)
+}
+
+fn native_stdio_ctor_shape(value: &Obj, tag: u8, fields: u8, scalar_bytes: usize) -> bool {
+    if value.is_scalar() {
+        return false;
+    }
+    let header = value.header();
+    let word = size_of::<usize>();
+    let expected_size =
+        (size_of::<LeanObject>() + usize::from(fields) * word + scalar_bytes).div_ceil(word) * word;
+    header.tag == tag && header.other == fields && value.byte_size() == expected_size
+}
+
+/// Decode the pinned native IO.Result and packed IO.Error layouts into a
+/// neutral transport. No native packed constructor escapes as a logical
+/// constructor: core must supply independently admitted reconstruction.
+pub(crate) fn stdio_result_transport(result: &Obj) -> Option<Obj> {
+    if result.is_scalar() || result.header().tag > 1 {
+        return None;
+    }
+    let success = result.header().tag == 0;
+    if !native_stdio_ctor_shape(result, u8::from(!success), 1, 0) {
+        return None;
+    }
+    let payload = result.try_ctor_child(0)?;
+    let (tag, code, filename, details) = if success {
+        if !payload.is_scalar() || payload.unbox() != 0 {
+            return None;
+        }
+        (0, 0, None, Obj::mk_string(""))
+    } else if payload.is_scalar() {
+        if payload.unbox() != 17 {
+            return None;
+        }
+        (17, 0, None, Obj::mk_string(""))
+    } else {
+        let tag = payload.header().tag;
+        match tag {
+            // The pin's optional-filename constructors contain two object
+            // fields followed by the unboxed UInt32 operating-system code.
+            0 | 12..=16 => {
+                if !native_stdio_ctor_shape(&payload, tag, 2, 4) {
+                    return None;
+                }
+                let option = payload.try_ctor_child(0)?;
+                let filename = if option.is_scalar() {
+                    if option.unbox() != 0 {
+                        return None;
+                    }
+                    None
+                } else {
+                    if !native_stdio_ctor_shape(&option, 1, 1, 0) {
+                        return None;
+                    }
+                    Some(option.try_ctor_child(0)?)
+                };
+                (
+                    tag,
+                    payload.try_ctor_scalar_u32(2 * size_of::<usize>())?,
+                    filename,
+                    payload.try_ctor_child(1)?,
+                )
+            }
+            // interrupted and noFileOrDirectory require a filename.
+            10 | 11 => {
+                if !native_stdio_ctor_shape(&payload, tag, 2, 4) {
+                    return None;
+                }
+                (
+                    tag,
+                    payload.try_ctor_scalar_u32(2 * size_of::<usize>())?,
+                    Some(payload.try_ctor_child(0)?),
+                    payload.try_ctor_child(1)?,
+                )
+            }
+            1..=9 => {
+                if !native_stdio_ctor_shape(&payload, tag, 1, 4) {
+                    return None;
+                }
+                (
+                    tag,
+                    payload.try_ctor_scalar_u32(size_of::<usize>())?,
+                    None,
+                    payload.try_ctor_child(0)?,
+                )
+            }
+            18 => {
+                if !native_stdio_ctor_shape(&payload, tag, 1, 0) {
+                    return None;
+                }
+                (tag, 0, None, payload.try_ctor_child(0)?)
+            }
+            _ => return None,
+        }
+    };
+    if !canonical_stdio_string(&details)
+        || filename
+            .as_ref()
+            .is_some_and(|value| !canonical_stdio_string(value))
+    {
+        return None;
+    }
+    Some(Obj::mk_ctor(
+        0,
+        vec![
+            Obj::mk_nat(usize::from(success)),
+            Obj::mk_nat(usize::from(tag)),
+            Obj::mk_nat(code as usize),
+            Obj::mk_nat(usize::from(filename.is_some())),
+            filename.unwrap_or_else(|| Obj::mk_string("")),
+            details,
+        ],
+        &[],
+    ))
+}
+
 // UNSAFE-LEDGER: FLN-UL-0050
 #[allow(unsafe_code)]
 impl Drop for Obj {
@@ -1088,3 +1388,12 @@ impl Drop for Obj {
         }
     }
 }
+
+#[cfg(test)]
+mod stdio_tests;
+
+#[cfg(test)]
+mod stdio_input_tests;
+
+#[cfg(test)]
+mod sarray_view_tests;

@@ -693,7 +693,8 @@ fn normalized_error_position(error: &NatDefinitionParseError, view: &SourceView)
             .map_or(BytePos(view.original_len_bytes()), |diagnostic| {
                 diagnostic.at
             }),
-        NatDefinitionParseError::OutsideSeedGrammar { at, .. } => *at,
+        NatDefinitionParseError::OutsideSeedGrammar { at, .. }
+        | NatDefinitionParseError::ModuleHeader { at, .. } => *at,
         NatDefinitionParseError::Build(_) => BytePos(view.original_len_bytes()),
     };
     view.from_original(original)

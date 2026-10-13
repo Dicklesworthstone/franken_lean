@@ -1,0 +1,34 @@
+rintro_pair	accept	theorem f (p q : Prop) : p ∧ q → q := by rintro ⟨hp, hq⟩; exact hq
+rintro_nested_tuple	accept	theorem f (p q r : Prop) : p ∧ q ∧ r → r := by rintro ⟨hp, hq, hr⟩; exact hr
+rintro_alternatives	accept	theorem f (p : Prop) : p ∨ p → p := by rintro (hp | hp); exact hp; exact hp
+rintro_branch_then_binder	accept	theorem f (p q : Prop) : p ∨ p → q → q := by rintro (hp | hp) hq; exact hq; exact hq
+rintro_group	accept	theorem f (p : Prop) : p → p → p := by rintro (hp hq : p); exact hq
+rintro_typed_pair	accept	theorem f (p q : Prop) : p ∧ q → q := by rintro (⟨hp, hq⟩ : p ∧ q); exact hq
+rintro_wildcard	accept	theorem f (p q : Prop) : p ∧ q → q := by rintro ⟨_, hq⟩; exact hq
+rintro_dependent	accept	theorem f : (n : Nat) → n = n → n = n := by rintro n hn; exact hn
+rintro_empty	accept	theorem f : False → False := by rintro ⟨⟩
+obtain_pair	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ := h; exact hq
+obtain_nested_tuple	accept	theorem f (p q r : Prop) (h : p ∧ q ∧ r) : r := by obtain ⟨hp, hq, hr⟩ := h; exact hr
+obtain_alternatives	accept	theorem f (p : Prop) (h : p ∨ p) : p := by obtain hp | hp := h; exact hp; exact hp
+obtain_computed	accept	theorem f (p q : Prop) (hp : p) (hq : q) : q := by obtain ⟨a, b⟩ := And.intro hp hq; exact b
+obtain_annotation	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ : p ∧ q := h; exact hq
+obtain_typed_hole	reject	theorem f (p : Prop) (hp : p) : p := by obtain h : p; exact hp; exact h
+obtain_default_this	reject	theorem f (p : Prop) (hp : p) : p := by obtain : p; exact hp; exact this
+obtain_pattern_hole	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨hp, hq⟩ : p ∧ q; exact h; exact hq
+obtain_empty_hole	accept	theorem f (h : False) : False := by obtain ⟨⟩ : False; exact h
+obtain_dependent	accept	theorem f (p q : Prop) (P : p ∧ q → Prop) (h : p ∧ q) (hh : P h) : P h := by obtain ⟨hp, hq⟩ := h; exact hh
+obtain_exists	accept	theorem f (P : Nat → Prop) (h : ∃ n, P n) : ∃ n, P n := by obtain ⟨n, hn⟩ := h; exact Exists.intro n hn
+rintro_bad_body	reject	theorem f (p q : Prop) : p ∧ q → p := by rintro ⟨hp, hq⟩; exact hq
+rintro_bad_annotation	reject	theorem f (p : Prop) : p → p := by rintro (hp : Nat); exact hp
+rintro_too_many	reject	theorem f (p : Prop) : p → p := by rintro hp extra; exact hp
+rintro_incomplete_branch	reject	theorem f (p : Prop) : p ∨ p → p := by rintro (hp | hp); exact hp
+rintro_bad_later_branch	reject	theorem f (p : Prop) : p ∨ p → p := by rintro (hp | hp); exact hp; exact missing
+obtain_wrong_annotation	reject	theorem f (p q : Prop) (h : p ∧ q) : p := by obtain ⟨hp, hq⟩ : Nat := h; exact hp
+obtain_self_reference	reject	theorem f (p : Prop) : p := by obtain h : p; exact h; exact h
+obtain_false_without_proof	reject	theorem f : False := by obtain ⟨⟩ : False
+obtain_wrong_witness	reject	theorem f (p q : Prop) (hq : q) : p := by obtain hp : p; exact hq; exact hp
+obtain_missing_value	reject	theorem f (p : Prop) (hp : p) : p := by obtain h := missing; exact hp
+obtain_removed_subject	reject	theorem f (p q : Prop) (h : p ∧ q) : p ∧ q := by obtain ⟨hp, hq⟩ := h; exact h
+obtain_incomplete_branch	reject	theorem f (p : Prop) (h : p ∨ p) : p := by obtain hp | hp := h; exact hp
+obtain_opaque_witness	accept	theorem f : True := by obtain h : True; exact True.intro; assumption
+obtain_opaque_default_witness	accept	theorem f : True := by obtain : True; exact True.intro; assumption

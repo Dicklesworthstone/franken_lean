@@ -31,8 +31,7 @@ class Bind (m : Type -> Type) where
 def Id (A : Type) : Type := A
 instance idPure : Pure Id := { pure := fun a => a }
 instance idBind : Bind Id := { bind := fun a k => k a }
-inductive PUnit : Type where
-  | unit
+instance idOfNat {A : Type} {n : Nat} [inst : OfNat A n] : OfNat (Id A) n := inst
 inductive ForInStep (A : Type) where
   | done (value : A)
   | yield (value : A)

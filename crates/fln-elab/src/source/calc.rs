@@ -5,7 +5,8 @@
 use super::*;
 
 pub(super) struct Build<'a> {
-    pub steps: Vec<&'a [Syntax]>,
+    /// Each step's relation and proof.
+    pub steps: Vec<(&'a Syntax, &'a Syntax)>,
     pub cursor: usize,
     expected: Option<Expr>,
     saved: LocalContext,
@@ -57,22 +58,35 @@ impl Context {
         syntax: &'a Syntax,
         expected: Option<Expr>,
     ) -> Result<Build<'a>, NatDefinitionElabError> {
-        let parts = expect_node(syntax, &parser_kind(&["Term", "calc"]), 2, "calculation")?;
+        // `"calc" calcSteps` (`Lean.calc`, or `Lean.calcTactic` as a tactic), `calcSteps :=
+        // calcFirstStep calcStep*`, `calcFirstStep := term (" := " term)?`.
+        let lean = |kind: &str| Name::from_components(["Lean", kind]);
+        let kind = if syntax.kind() == Some(&lean("calcTactic")) {
+            lean("calcTactic")
+        } else {
+            lean("calc")
+        };
+        let parts = expect_node(syntax, &kind, 2, "calculation")?;
         expect_atom(&parts[0], "calc", "calculation keyword")?;
-        let mut steps = Vec::new();
+        let parts = expect_node(&parts[1], &lean("calcSteps"), 2, "calculation steps")?;
+        let first = expect_node(
+            &parts[0],
+            &lean("calcFirstStep"),
+            2,
+            "first calculation step",
+        )?;
+        // A first step without a proof (`calc a` then `_ = b := p`) starts at `a = a`, which
+        // is not read here.
+        let [assign, proof] = expect_null_args(&first[1], "first calculation step proof")? else {
+            return Err(invalid());
+        };
+        expect_atom(assign, ":=", "calculation proof separator")?;
+        let mut steps = vec![(&first[0], proof)];
         for step in expect_null_args(&parts[1], "calculation steps")? {
             self.tick()?;
-            let parts = expect_node(
-                step,
-                &parser_kind(&["Term", "calcStep"]),
-                3,
-                "calculation step",
-            )?;
+            let parts = expect_node(step, &lean("calcStep"), 3, "calculation step")?;
             expect_atom(&parts[1], ":=", "calculation proof separator")?;
-            steps.push(parts);
-        }
-        if steps.is_empty() {
-            return Err(invalid());
+            steps.push((&parts[0], &parts[2]));
         }
         Ok(Build {
             steps,

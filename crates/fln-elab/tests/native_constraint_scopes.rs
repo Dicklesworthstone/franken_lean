@@ -76,7 +76,7 @@ fn a_typing_obligation_survives_leaving_its_binder_scope() {
         .solve_constraints_with(&[row], budget(), &|| false)
         .unwrap();
     assert_eq!(report.solved, vec![row]);
-    assert_eq!(report.unification.kernel_checks, 1);
+    assert_eq!(report.unification.kernel_checks, 2);
     assert_eq!(tx.lctx, ambient);
     assert!(tx.constraints.is_empty());
 }
@@ -147,7 +147,7 @@ fn a_mixed_batch_restores_each_sibling_scope_independently() {
             .unwrap();
         assert_eq!(report.solved, vec![left, right]);
         assert_eq!(tx.mvars.get_assigned_expr(&ty), Some(&nat()));
-        assert_eq!(report.unification.kernel_checks, 3);
+        assert_eq!(report.unification.kernel_checks, 6);
         assert!(tx.lctx.is_empty());
     }
 }
@@ -440,7 +440,7 @@ fn successive_wakeups_resume_without_reissuing_ids_or_restoring_ambient_binders(
         .resume_constraints_with(&report.unification.awakened, budget(), &|| false)
         .unwrap();
     assert_eq!(final_report.solved, vec![last]);
-    assert_eq!(final_report.unification.kernel_checks, 1);
+    assert_eq!(final_report.unification.kernel_checks, 2);
     assert!(tx.constraints.is_empty());
     assert!(tx.lctx.is_empty());
     assert_eq!(typing(&mut tx, number(7), nat()), ConstraintId(last.0 + 1));

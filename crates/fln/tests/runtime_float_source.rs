@@ -246,3 +246,40 @@ fn dynamic_explicit_record_projections_keep_the_receivers_ground_layout() {
         Some(fln::ClosedVmValue::Scalar(42))
     );
 }
+
+#[test]
+fn unary_math_pow_and_atan2_reach_the_owned_numerics_plane_from_source() {
+    // IEEE-exact rows carry definitional goldens; sqrt(-1) leaves the real
+    // line and must surface as a NaN value, never a refusal.
+    assert_eq!(
+        floats(
+            "#eval Float.sqrt 4.0\n#eval Float32.sqrt 2.25\n#eval Float.floor 2.9\n#eval Float.ceil (-2.9)\n#eval Float.round 2.5\n#eval Float.pow 2.0 10.0\n#eval Float32.pow 2.0 10.0"
+        ),
+        vec![
+            f64_value(2.0),
+            f32_value(1.5),
+            f64_value(2.0),
+            f64_value(-2.0),
+            f64_value(3.0),
+            f64_value(1024.0),
+            f32_value(1024.0),
+        ]
+    );
+    // Transcendental results are the owned plane's exact bits at each width
+    // (§6.8, D21) — including the canonical NaN for a domain-edge input and
+    // atan2's pin argument order, `atan2 (y x)`.
+    assert_eq!(
+        floats(
+            "#eval Float.sin 1.0\n#eval Float32.sin 1.0\n#eval Float.exp 1.0\n#eval Float.log2 5.0\n#eval Float.atan2 1.0 0.0\n#eval Float.log (-1.0)\n#eval Float32.cbrt 2.0"
+        ),
+        vec![
+            f64_value(fln_libm::sin(1.0)),
+            f32_value(fln_libm::f32::sin(1.0)),
+            f64_value(fln_libm::exp(1.0)),
+            f64_value(fln_libm::log2(5.0)),
+            f64_value(fln_libm::atan2(1.0, 0.0)),
+            f64_value(fln_libm::log(-1.0)),
+            f32_value(fln_libm::f32::cbrt(2.0)),
+        ]
+    );
+}

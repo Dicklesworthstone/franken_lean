@@ -9,11 +9,47 @@ pub(super) enum Prefix {
     Binders(Box<term_binders::Prefix>),
     Assertion(Box<Assertion>),
     Do(Box<term_do::Prefix>),
+    /// `← e` (`Term.nestedAction`, `"← " doElem` at minimum precedence): the `←` token; its
+    /// body is the rest of the enclosing group.
+    Nested(usize),
+    /// `return e` outside `do` (`Term.termReturn`, `"return" (ppSpace term)?`): the keyword; its
+    /// body, possibly empty, is the rest of the enclosing group.
+    Return(usize),
+    /// `"set_option " identWithPartialTrailingDot optionValue " in " termParser`
+    /// (`Lean/Parser/Command.lean`): the checked header and the rest of the group
+    /// as its body. The option value is syntax, not an elaborated expression.
+    SetOption {
+        keyword: usize,
+        value: Box<Syntax>,
+    },
+    /// A bounded range after an application's last argument (`f a lo...<hi`): the application's
+    /// head and earlier arguments. The range (`syntax:max`) takes only that argument on its left
+    /// and the rest of the group on its right, so the body is the range, `f a (lo...<hi)`.
+    RangeArgument(Vec<(Syntax, usize)>),
+    /// A range unbounded below, `*...b`, `*...<b` or `*...=b` (`syntax:max ("*..." term)`,
+    /// `Init/Data/Range/Polymorphic/PRange.lean`, namespace `Std`): the symbol and its kind's
+    /// last component (`term*..._`); the bound is the rest of the enclosing group.
+    StarRange(usize, &'static str),
 }
 impl From<term_binders::Prefix> for Prefix {
     fn from(value: term_binders::Prefix) -> Self {
         Self::Binders(Box::new(value))
     }
+}
+
+/// The application a [`Prefix::RangeArgument`] closes: its head and earlier arguments, then the
+/// range as the last argument.
+#[inline(never)]
+fn range_argument(mut head: Vec<(Syntax, usize)>, body: Syntax) -> (Syntax, usize) {
+    let start = head.first().map_or(0, |(_, at)| *at);
+    let function = head.remove(0).0;
+    let mut arguments: Vec<Syntax> = head.into_iter().map(|(term, _)| term).collect();
+    arguments.push(body);
+    let syntax = Syntax::node(
+        parser_kind(&["Term", "app"]),
+        vec![function, null_node(arguments)],
+    );
+    (syntax, start)
 }
 
 pub(super) struct Assertion {
@@ -32,8 +68,29 @@ pub(super) struct Assertion {
 enum Form {
     Let,
     Have,
+    /// `"letI " letConfig letDecl` and `"haveI "` (`Lean/Parser/Term.lean`): `let`'s and
+    /// `have`'s grammar under their own kinds.
+    LetI,
+    HaveI,
     Show,
     Suffices,
+}
+
+impl Form {
+    /// A local declaration (`letDecl`), not `show`/`suffices`.
+    fn declares(self) -> bool {
+        matches!(self, Form::Let | Form::Have | Form::LetI | Form::HaveI)
+    }
+    fn keyword(self) -> &'static str {
+        match self {
+            Form::Let => "let",
+            Form::Have => "have",
+            Form::LetI => "letI",
+            Form::HaveI => "haveI",
+            Form::Show => "show",
+            Form::Suffices => "suffices",
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum Phase {
@@ -147,7 +204,7 @@ pub(super) fn proof_limit(
             return at;
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
                 ")" | "]" | "}" | "⦄" | "⟩" if depth == 0 => return at,
                 ")" | "]" | "}" | "⦄" | "⟩" => depth -= 1,
@@ -168,6 +225,38 @@ fn primed_proof(mut proof: Syntax) -> Syntax {
 }
 
 impl Prefix {
+    pub(super) fn set_option(
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        keyword: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let name = keyword + 1;
+        if name >= end || !matches!(&tokens[name].kind, TokenKind::Ident(_)) {
+            return Err(refuse(view, tokens, name));
+        }
+        let value_at = name + 1;
+        if value_at >= end {
+            return Err(refuse(view, tokens, value_at));
+        }
+        let value = crate::command_scope::trees::option_value(leaves, tokens, value_at)?
+            .ok_or_else(|| refuse(view, tokens, value_at))?;
+        let in_at = value_at + 1;
+        if in_at >= end || !word(tokens, in_at, "in") {
+            return Err(refuse(view, tokens, in_at));
+        }
+        *cursor = in_at + 1;
+        if *cursor >= end {
+            return Err(refuse(view, tokens, *cursor));
+        }
+        Ok(Self::SetOption {
+            keyword,
+            value: Box::new(value),
+        })
+    }
+
     pub(super) fn assertion(
         view: &SourceView,
         tokens: &[LexedToken],
@@ -177,6 +266,10 @@ impl Prefix {
     ) -> Result<Self, NatDefinitionParseError> {
         let form = if word(tokens, keyword, "let") {
             Form::Let
+        } else if word(tokens, keyword, "letI") {
+            Form::LetI
+        } else if word(tokens, keyword, "haveI") {
+            Form::HaveI
         } else if word(tokens, keyword, "show") {
             Form::Show
         } else if word(tokens, keyword, "suffices") {
@@ -207,14 +300,17 @@ impl Prefix {
                 assertion.colon = Some(*cursor + 1);
                 *cursor += 2;
             }
-        } else if matches!(form, Form::Have | Form::Let) {
-            if *cursor < end && matches!(&tokens[*cursor].kind, TokenKind::Ident(_)) {
+        } else if form.declares() {
+            // `letId := binderIdent`: a name or the hole `_`.
+            if *cursor < end
+                && (matches!(&tokens[*cursor].kind, TokenKind::Ident(_))
+                    || word(tokens, *cursor, "_"))
+            {
                 assertion.name = Some(*cursor);
                 *cursor += 1;
             }
-            if form == Form::Let && assertion.name.is_none() {
-                return Err(refuse(view, tokens, *cursor));
-            }
+            // An anonymous `let : C := v` or `letI : C := v` names its local by hygiene, as an
+            // anonymous `have` does (`letIdLhs`'s `hygieneInfo`).
             if *cursor < end && word(tokens, *cursor, ":") {
                 assertion.colon = Some(*cursor);
                 *cursor += 1;
@@ -232,11 +328,24 @@ impl Prefix {
         Ok(Self::Assertion(Box::new(assertion)))
     }
 
+    /// See [`term_do::Prefix::repeat_keyword`].
+    pub(super) fn repeat_keyword(&self) -> Option<usize> {
+        match self {
+            Prefix::Do(prefix) => prefix.repeat_keyword(),
+            _ => None,
+        }
+    }
     /// See [`term_do::Prefix::jump_keyword`].
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self {
             Prefix::Do(prefix) => prefix.jump_keyword(),
-            Prefix::Binders(_) | Prefix::Assertion(_) => None,
+            Prefix::Binders(_)
+            | Prefix::Assertion(_)
+            | Prefix::Nested(_)
+            | Prefix::Return(_)
+            | Prefix::SetOption { .. }
+            | Prefix::RangeArgument(_)
+            | Prefix::StarRange(..) => None,
         }
     }
     pub(super) fn body(&self) -> bool {
@@ -244,14 +353,24 @@ impl Prefix {
             Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
+            Self::Nested(_)
+            | Self::Return(_)
+            | Self::SetOption { .. }
+            | Self::RangeArgument(_)
+            | Self::StarRange(..) => true,
         }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
+            Self::Nested(_)
+            | Self::Return(_)
+            | Self::SetOption { .. }
+            | Self::RangeArgument(_)
+            | Self::StarRange(..) => false,
             Self::Assertion(p) => match p.phase {
-                Phase::Annotation if !matches!(p.form, Form::Have | Form::Let) => {
+                Phase::Annotation if !p.form.declares() => {
                     word(tokens, at, "from") || word(tokens, at, "by")
                 }
                 Phase::Annotation => word(tokens, at, ":="),
@@ -281,12 +400,19 @@ impl Prefix {
                     .map(|(p, next)| (Self::Binders(Box::new(p)), next));
             }
             Self::Assertion(p) => p,
+            Self::Nested(_)
+            | Self::Return(_)
+            | Self::SetOption { .. }
+            | Self::RangeArgument(_)
+            | Self::StarRange(..) => {
+                return Err(refuse(view, tokens, at));
+            }
         };
         let mut next = at + 1;
         match p.phase {
             Phase::Annotation => {
                 p.annotation = Some(expression);
-                if !matches!(p.form, Form::Have | Form::Let) {
+                if !p.form.declares() {
                     p.proof_intro = Some(at);
                     p.phase = if p.form == Form::Show {
                         Phase::Body
@@ -329,6 +455,42 @@ impl Prefix {
         let p = match self {
             Self::Do(p) => return p.finish(leaves, body),
             Self::Binders(p) => return p.finish(leaves, body),
+            Self::Nested(arrow) => {
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "nestedAction"]),
+                    vec![leaves.leaf(arrow)?, super::term_do::arrow_element(body)],
+                );
+                return Ok((syntax, arrow));
+            }
+            Self::RangeArgument(head) => return Ok(range_argument(head, body)),
+            Self::StarRange(at, label) => {
+                let syntax = Syntax::node(
+                    Name::from_components(["Std", label]),
+                    vec![leaves.leaf(at)?, body],
+                );
+                return Ok((syntax, at));
+            }
+            Self::Return(keyword) => {
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "termReturn"]),
+                    vec![leaves.leaf(keyword)?, null_node(vec![body])],
+                );
+                return Ok((syntax, keyword));
+            }
+            Self::SetOption { keyword, value } => {
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "set_option"]),
+                    vec![
+                        leaves.leaf(keyword)?,
+                        leaves.leaf(keyword + 1)?,
+                        null_node(Vec::new()),
+                        *value,
+                        leaves.leaf(keyword + 3)?,
+                        body,
+                    ],
+                );
+                return Ok((syntax, keyword));
+            }
             Self::Assertion(p) => p,
         };
         let syntax = if p.form == Form::Show {
@@ -352,15 +514,16 @@ impl Prefix {
                 ],
             )
         } else if p.form == Form::Suffices {
+            // `atomic (group (binderIdent " : ")) <|> hygieneInfo`.
             let binder = match p.name {
-                Some(at) => null_node(vec![
-                    leaves.leaf(at)?,
-                    leaves.leaf(p.colon.expect("suffices colon"))?,
-                ]),
-                None => Syntax::node(
-                    Name::from_components(["hygieneInfo"]),
-                    vec![hygiene_ident()],
+                Some(at) => Syntax::node(
+                    Name::from_components(["group"]),
+                    vec![
+                        leaves.leaf(at)?,
+                        leaves.leaf(p.colon.expect("suffices colon"))?,
+                    ],
                 ),
+                None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let intro = p.proof_intro.expect("suffices proof introducer");
             let proof = p.value.expect("suffices continuation");
@@ -389,11 +552,14 @@ impl Prefix {
         } else {
             let separator = separator(leaves, p.separator)?;
             let name = match p.name {
-                Some(at) => leaves.leaf(at)?,
-                None => Syntax::node(
-                    Name::from_components(["hygieneInfo"]),
-                    vec![hygiene_ident()],
-                ),
+                // `_` is a symbol, so its leaf is an atom: the hole `Term.hole`.
+                Some(at) => match leaves.leaf(at)? {
+                    hole @ Syntax::Atom { .. } => {
+                        Syntax::node(parser_kind(&["Term", "hole"]), vec![hole])
+                    }
+                    name => name,
+                },
+                None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let annotation = match (p.colon, p.annotation) {
                 (Some(colon), Some(type_)) => null_node(vec![Syntax::node(
@@ -413,7 +579,7 @@ impl Prefix {
                     p.value.expect("have value"),
                 ],
             );
-            let keyword = if p.form == Form::Let { "let" } else { "have" };
+            let keyword = p.form.keyword();
             Syntax::node(
                 parser_kind(&["Term", keyword]),
                 vec![

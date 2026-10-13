@@ -85,7 +85,7 @@ fn lambda_assignments_infer_function_types_and_their_universes() {
             (left, right)
         };
         let report = t.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert!(report.residual_metavariables.is_empty());
         assert_eq!(t.mvars.get_assigned_expr(&f), Some(&value));
         t.unify(&Expr::mvar(a), &pi(nat(), nat()), budget())
@@ -105,7 +105,7 @@ fn dependent_lambda_telescope_is_closed_capture_avoidantly() {
     let value = lam(Expr::sort(Level::one()), lam(bvar(0), bvar(0)));
     let env = t.env.clone();
     let report = t.unify(&Expr::mvar(f), &value, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     let type_ = t.mvars.get_assigned_expr(&a).unwrap();
     assert!(!type_.has_fvar() && !type_.has_loose_bvars());
     t.unify(
@@ -216,7 +216,7 @@ fn an_applied_pattern_infers_a_missing_function_valued_result_family() {
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert!(report.residual_metavariables.is_empty());
     t.unify(&Expr::mvar(family), &lam(nat(), pi(nat(), nat())), budget())
         .unwrap();
@@ -267,7 +267,7 @@ fn nested_let_type_hints_do_not_erase_original_value_checks() {
             );
             unchanged(&t, &before);
         } else {
-            assert_eq!(result.unwrap().kernel_checks, 2);
+            assert_eq!(result.unwrap().kernel_checks, 4);
             assert_eq!(t.mvars.get_assigned_expr(&f), Some(&value));
             t.unify(&Expr::mvar(a), &pi(nat(), nat()), budget())
                 .unwrap();

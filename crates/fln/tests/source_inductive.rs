@@ -35,6 +35,15 @@ fn source_enumerations_and_payload_variants_are_usable_by_later_commands() {
             .contains(&Name::from_components(["Message", "rec"]))
     );
 }
+/// A constructor's doc comment is its `ctor`'s optional slot, as at the pin, and means nothing to
+/// the kernel: the inductive is admitted with it.
+#[test]
+fn documented_constructors_are_admitted() {
+    let result = check(
+        "inductive Coin where\n  /-- Heads. -/\n  | heads\n  /-- Tails. -/\n  | tails : Coin\ndef coin : Coin := Coin.heads\n",
+    );
+    assert_eq!(result.commands, 2);
+}
 #[test]
 fn source_uniform_parameters_and_result_annotations_are_preserved() {
     check(
@@ -124,7 +133,8 @@ fn source_recursors_compute_and_false_computation_does_not_publish() {
             SourceCheckLimits::new(limits()),
         )
         .unwrap_err();
-    assert_eq!(error.disposition(), ("kernel-rejection", true, 1));
+    // A false `by rfl` is refused while elaborating, as at the pin ("Tactic `rfl` failed").
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(e.logical_root(&KVMap::new()), root);
     assert_eq!(check(&good).theorems, 1);
 }

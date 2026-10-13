@@ -201,9 +201,11 @@ impl Resolved {
 /// this run), and under `reuse-verified` the closure key and the record's fate.
 pub(in crate::source_check) fn json_fields(report: &ImportPostureReport) -> String {
     let mut fields = format!(
-        "\"trust\":{},\"admission\":{}",
+        "\"trust\":{},\"admission\":{},\"reusedModules\":{},\"councilModules\":{}",
         json_string(report.posture.as_str()),
-        json_string(report.admission.as_str())
+        json_string(report.admission.as_str()),
+        report.reused_modules,
+        report.council_modules,
     );
     if let Some(key) = report.key {
         fields.push_str(&format!(",\"closureKey\":{}", json_string(&key.to_hex())));
@@ -243,9 +245,14 @@ pub(in crate::source_check) fn sentence(report: &ImportPostureReport) -> String 
         fln::source_check::modules::reuse::ImportAdmission::Reused => {
             "reused from this binary's earlier K1 and independent-checker admission of the identical bytes, re-proved by logical root"
         }
+        fln::source_check::modules::reuse::ImportAdmission::Composed => {
+            "composed from re-proved module admissions and modules checked by K1 and the independent checker in this run"
+        }
     };
     format!(
-        "{how}; trust: {}{key}{record}{write}",
-        report.posture.as_str()
+        "{how}; {} modules reused, {} modules checked; trust: {}{key}{record}{write}",
+        report.reused_modules,
+        report.council_modules,
+        report.posture.as_str(),
     )
 }

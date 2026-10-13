@@ -1,4 +1,4 @@
-//! User-facing source proof checking. No compiler or VM is entered.
+//! Source proof checking and explicit import resolution for source front doors.
 use super::*;
 use fln::source_check::modules::imported::SourceOleanImport;
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
@@ -21,6 +21,108 @@ pub(super) fn load_build_base(
 }
 
 pub(crate) use imports::{external_inputs, module_records, posture_json, posture_sentence};
+
+/// Explicit import programs use their admitted module worlds. `None` keeps the
+/// existing headerless and ordinary local-source `fln run` contract.
+pub(super) fn run_imported(
+    paths: &[PathBuf],
+    max_bytes: usize,
+    json: bool,
+    publication: SourcePublication,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+) -> Option<MultiplexerOutput> {
+    imports::execution::run(
+        paths,
+        max_bytes,
+        imports::execution::Presentation::Fln { json },
+        publication,
+        jobs,
+        posture,
+        vm_limits,
+        None,
+    )
+}
+
+/// The drop-in `lean` gives every source module its ordinary implicit Init
+/// import unless that module declares `prelude`. Imports resolve from
+/// `LEAN_PATH`, else the pinned library, under the interactive reuse posture.
+/// A missing import never falls back to a synthetic source environment.
+pub(super) fn run_imported_lean(
+    path: &Path,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    imports::execution::run(
+        &[path.to_path_buf()],
+        max_bytes,
+        imports::execution::Presentation::Lean,
+        SourcePublication::None,
+        import_jobs,
+        ImportPosture::ReuseVerified,
+        vm_limits,
+        None,
+    )
+    .unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the Lean source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    })
+}
+
+/// Execute a script in its ordinary Lean import world, then invoke its main.
+/// This route never falls back to the import-free synthetic source seed.
+pub(super) fn run_imported_lean_main(
+    path: &Path,
+    arguments: Vec<String>,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    imports::execution::run(
+        &[path.to_path_buf()],
+        max_bytes,
+        imports::execution::Presentation::Lean,
+        SourcePublication::None,
+        import_jobs,
+        ImportPosture::ReuseVerified,
+        vm_limits,
+        Some(arguments),
+    )
+    .unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the executable source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    })
+}
+
+/// Standard input has the same import and admission semantics as a Lean file.
+pub(super) fn run_imported_lean_stdin(
+    source: Vec<u8>,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    imports::execution::run_stdin(source, max_bytes, import_jobs, vm_limits).unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the standard input source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    })
+}
 
 /// Remove `--import-posture P` / `--import-posture=P` from an interactive front
 /// door's arguments, which otherwise keep their order. Options end at `--`. The
@@ -189,15 +291,15 @@ pub(super) fn run(
                     Err(imports::Failure::new(class, &error.to_string(), authority, exit))
                 }
             };
-            if let Err(error) = loaded.preflight() {
+            let mut limits = fln::SourceCheckLimits::new(admission);
+            limits.max_bytes = max_bytes;
+            if let Err(error) = loaded.preflight(limits) {
                 return failed(error.class, &error.detail, error.authority, json, error.exit);
             }
             let (engine, olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
-            let mut limits = fln::SourceCheckLimits::new(admission);
-            limits.max_bytes = max_bytes;
             let result = match loaded.check(&engine, olean_base.as_ref(), limits) {
                 Ok(fln::Outcome::Complete(result)) => result,
                 Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source check exhausted its configured resources", false, json, 3),
@@ -205,16 +307,51 @@ pub(super) fn run(
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let olean_json = olean_base.as_ref().map_or_else(String::new, |base| base.json());
+            // The sources' own `axiom`s: admitted without proof, so every theorem that uses
+            // one trusts it. The pin admits them silently; the report names how many.
+            let axioms = result
+                .engine
+                .environment()
+                .constants()
+                .filter(|(name, info)| {
+                    matches!(info, fln::ConstantInfo::Axiom(_)) && !engine.environment().contains(name)
+                })
+                .count();
+            // The sources' declarations that use `sorry` (`sorryAx`): the pin admits each with
+            // the warning "declaration uses `sorry`"; this report, which prints no warnings,
+            // counts them.
+            let sorries = result
+                .engine
+                .environment()
+                .constants()
+                .filter(|(name, info)| {
+                    !engine.environment().contains(name) && fln::constant_uses_sorry(info)
+                })
+                .count();
             let stdout = if json {
-                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
+                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"axioms\":{axioms},\"sorryDeclarations\":{sorries},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
                     result.files, result.commands, result.theorems, loaded.total_bytes,
                     json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()), olean_json)
             } else {
                 let base = olean_base.as_ref().map_or(String::new(), |base| {
                     format!(" against {} imported .olean modules ({} declarations, {})", base.modules, base.declarations, posture_sentence(&base.report))
                 });
-                format!("Checked {} source commands ({} theorems) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
+                let axioms = if axioms == 0 {
+                    String::new()
+                } else {
+                    format!(", {axioms} axioms asserted without proof")
+                };
+                let sorries = if sorries == 0 {
+                    String::new()
+                } else {
+                    format!(", {sorries} declarations use `sorry`")
+                };
+                format!("Checked {} source commands ({} theorems{axioms}{sorries}) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };
+            // The process ends with this answer. Tearing down an imported closure
+            // (65,404 declarations for `Init`) node by node took seconds; the
+            // operating system reclaims it at exit in one step.
+            std::mem::forget((engine, olean_base, result, loaded));
             MultiplexerOutput::success(stdout)
         });
     match worker {

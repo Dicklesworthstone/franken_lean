@@ -191,7 +191,7 @@ fn field_holes_are_checked_and_published_in_field_order() {
         };
         let report = txn.unify(left, right, budget()).unwrap();
         assert_eq!(report.expression_assignments, vec![x.clone(), y.clone()]);
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert!(report.residual_metavariables.is_empty());
         assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("PairN", 0, &p)));
         assert_eq!(txn.mvars.get_assigned_expr(&y), Some(&proj("PairN", 1, &p)));
@@ -216,7 +216,7 @@ fn eta_precedes_rigid_application_congruence() {
     let x = goal(&mut txn, "x", constant("Nat"));
     let record = mk("PairN", [Expr::mvar(x.clone()), proj("PairN", 1, &value)]);
     let report = txn.unify(&record, &value, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
         Some(&proj("PairN", 0, &value))
@@ -242,7 +242,7 @@ fn dependent_function_results_infer_record_parameters_before_fields() {
     let record = mk("Box", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
     let report = txn.unify(&record, &value, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![a.clone(), x.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&constant("Nat")));
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
@@ -263,7 +263,7 @@ fn empty_records_still_compare_and_infer_parameters() {
         .unify(&mk("EmptyBox", [Expr::mvar(a.clone())]), &value, budget())
         .unwrap();
     assert_eq!(report.expression_assignments, vec![a.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&constant("Nat")));
     let before = txn.clone();
     assert!(matches!(
@@ -319,7 +319,7 @@ fn later_type_assignments_wake_blocked_record_equations() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments, vec![t, x.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
         Some(&proj("PairN", 0, &value))
@@ -500,7 +500,7 @@ fn final_barrier_cancellation_discards_k1_checked_eta_assignments() {
             false
         })
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     let stop = polls.get();
     let calls = Cell::new(0_u64);
     let mut cancelled = initial.clone();
@@ -584,7 +584,7 @@ fn nested_record_projection_receivers_support_field_inference() {
     let x = goal(&mut txn, "x", constant("Nat"));
     let record = mk("PairN", [Expr::mvar(x.clone()), proj("PairN", 1, &value)]);
     let report = txn.unify(&record, &value, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
         Some(&proj("PairN", 0, &value))
@@ -608,7 +608,7 @@ fn dependent_record_fields_are_checked_after_earlier_field_inference() {
     let record = mk("Pack", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
     let report = txn.unify(&record, &p, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![a.clone(), x.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&proj("Pack", 0, &p)));
     assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("Pack", 1, &p)));
 }
@@ -628,7 +628,7 @@ fn projected_record_parameters_use_earlier_fields_of_the_same_receiver() {
     let record = mk("Box", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
     let report = txn.unify(&record, &value, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![a.clone(), x.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(
         txn.mvars.get_assigned_expr(&a),
         Some(&proj("Envelope", 0, &p))
@@ -658,7 +658,7 @@ fn projected_functions_can_produce_records() {
     let x = goal(&mut txn, "x", constant("Nat"));
     let record = mk("PairN", [Expr::mvar(x.clone()), proj("PairN", 1, &value)]);
     let report = txn.unify(&record, &value, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
         Some(&proj("PairN", 0, &value))
@@ -683,7 +683,7 @@ fn dependent_projected_functions_preserve_application_substitution() {
     let x = goal(&mut txn, "x", Expr::mvar(a.clone()));
     let record = mk("Box", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
     let report = txn.unify(&record, &value, budget()).unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&constant("Nat")));
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
@@ -738,7 +738,7 @@ fn a_later_assignment_can_reveal_a_projected_receivers_record_type() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments, vec![t, x.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(
         txn.mvars.get_assigned_expr(&x),
         Some(&proj("PairN", 0, &value))
@@ -827,7 +827,7 @@ fn record_eta_composes_with_function_eta_and_miller_patterns() {
     let left = Expr::lam(name("n"), constant("Nat"), body, BinderInfo::Default);
     let report = txn.unify(&left, &f, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![x.clone(), y.clone()]);
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     let value = Expr::app(f, numeral(42));
     for (index, id) in [(0, x), (1, y)] {
         let application = Expr::app(Expr::mvar(id), numeral(42));

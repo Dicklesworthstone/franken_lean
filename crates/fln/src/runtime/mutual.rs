@@ -157,6 +157,19 @@ impl Preparation<'_> {
         if args.len() != group.arity {
             return Ok(None);
         }
+        self.mutual_case_with_group(rec, &group, args)
+    }
+
+    // Layout discovery and branch synthesis each use bounded heap worklists.
+    // Keep their fixed host-stack frames separate as well: constructor proof
+    // erasure must finish before reserving the branch-building frame.
+    #[inline(never)]
+    fn mutual_case_with_group(
+        &mut self,
+        rec: &RecursorVal,
+        group: &Group,
+        args: &[Expr],
+    ) -> Result<Option<variants::Case>, IngressError> {
         let shape = &group.shapes[group.selected];
         let families: Vec<_> = group
             .shapes
@@ -192,8 +205,10 @@ impl Preparation<'_> {
             let mut hypotheses = Vec::new();
             for (field, type_) in ctor.fields.iter().enumerate() {
                 self.tick()?;
-                body = self.minor_apply(
+                body = self.constructor_minor_apply(
                     body,
+                    ctor,
+                    field,
                     Expr::proj(shape.projection(ctor), field as u64, major.clone()),
                 )?;
                 if self.recursive_field(type_, &families)?.is_some() {

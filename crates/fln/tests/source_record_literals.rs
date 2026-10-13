@@ -30,11 +30,39 @@ fn named_fields_are_reordered_to_the_constructor_telescope() {
         "structure Point where\n  x : Nat\n  y : Nat\ndef point : Point := { y := 9, x := 7 }\ntheorem x_ok : Point.x point = 7 := by rfl\ntheorem y_ok : Point.y point = 9 := by rfl",
     );
 }
+/// Fields may be separated by line breaks as well as commas, and a line break may trail the last
+/// field before a `}` on its own line: the pin's empty separator, read as a `,`.
 #[test]
-fn dependent_fields_see_actual_earlier_values_even_when_written_last() {
+fn line_breaks_separate_fields_as_commas_do() {
     check(
         &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := { value := 23, carrier := Nat }\ntheorem value_ok : Package.value wrapped = 23 := by rfl",
+        "structure Point where\n  x : Nat\n  y : Nat\ndef p : Point := {\n  x := 7,\n  y := 9\n}\ndef q : Point := { x := 1\n                   y := 2 }\ntheorem p_ok : Point.y p = 9 := by rfl\ntheorem q_ok : Point.y q = 2 := by rfl",
+    );
+}
+#[test]
+fn dependent_fields_see_actual_earlier_values_even_when_written_last() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    // The pin preserves wrapped.carrier during numeral instance synthesis.
+    // Keep the original source as a refusal control beside its typed positive.
+    let original = "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := { value := 23, carrier := Nat }\ntheorem value_ok : Package.value wrapped = 23 := by rfl";
+    let Err(error) = base.check_source_files(
+        &[original.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ) else {
+        panic!("accepted an unannotated dependent-field numeral");
+    };
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["wrapped"]))
+    );
+    check(
+        &base,
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := { value := 23, carrier := Nat }\ntheorem value_ok : Package.value wrapped = (23 : Nat) := by rfl",
     );
 }
 #[test]
@@ -400,7 +428,7 @@ fn proof_fields_use_the_ordinary_tactic_and_kernel_path() {
 fn named_field_access_carries_receiver_and_dependent_field_types() {
     check(
         &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef packed : Package := { carrier := Nat, value := 23 }\ndef read (p : Package) : p.carrier := p.value\ntheorem value_ok : packed.value = 23 := by rfl\ntheorem read_ok : read packed = 23 := by rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef packed : Package := { carrier := Nat, value := 23 }\ndef read (p : Package) : p.carrier := p.value\ntheorem value_ok : packed.value = (23 : Nat) := by rfl\ntheorem read_ok : read packed = (23 : Nat) := by rfl",
     );
 }
 #[test]
@@ -690,6 +718,69 @@ fn type_positions_allow_later_header_constraints_before_resolving_instances() {
 }
 
 #[test]
+fn class_projections_reduce_inline_and_registered_dictionaries_in_instance_comparison() {
+    // The pin's unfoldProjInst? opens the class projection at default
+    // transparency only when the dictionary projects at instances transparency.
+    // Local candidates reach comparison without the discrimination tree's
+    // separate reducible-transparency filter. Keep that distinction explicit.
+    check(
+        &engine(),
+        "class Index where\n  value : Nat\n\
+         class Select (n : Nat) where\n  value : Nat\n\
+         def inline [Select (@Index.value { value := 7 })] : Nat := Select.value 7\n\
+         def inlineAnswer : Nat := @inline { value := 19 }\n\
+         theorem inline_computes : inlineAnswer = 19 := by rfl\n\
+         def localLet [Select (let d : Index := { value := 7 }; Index.value)] : Nat := Select.value 7\n\
+         def letAnswer : Nat := @localLet { value := 23 }\n\
+         theorem let_computes : letAnswer = 23 := by rfl\n\
+         instance natural : Index := { value := 7 }\n\
+         def selected [Select Index.value] : Nat := Select.value 7\n\
+         def selectedAnswer : Nat := @selected { value := 29 }\n\
+         theorem selected_computes : selectedAnswer = 29 := by rfl\n\
+         class Family (A : Type) where\n  index : A -> Nat\n\
+         def applied [Select (@Family.index Nat { index := fun n => n } 7)] : Nat := Select.value 7\n\
+         def appliedAnswer : Nat := @applied { value := 31 }\n\
+         theorem applied_computes : appliedAnswer = 31 := by rfl",
+    );
+}
+
+#[test]
+fn class_projection_instance_reduction_preserves_neutral_and_opaque_dictionaries() {
+    let base = check(
+        &engine(),
+        "class Factory where\n  carrier : Type\n  produce : carrier\n\
+         def named : Factory := { carrier := Nat, produce := 7 }\n\
+         def keep (x : @Factory.carrier named) : Nat := x",
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad : @Factory.carrier named := 8",
+        "theorem bad : keep 8 = 8 := by rfl",
+        "def bad [Factory] : Factory.carrier := 8",
+        "def bad : Nat := have d : Factory := { carrier := Nat, produce := 7 }; (8 : Factory.carrier)",
+        "def bad : Nat := let d : Factory := { carrier := Nat, produce := 7 }; (true : Factory.carrier)",
+        "def bad : Factory.carrier := 8",
+    ] {
+        let Err(error) = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        ) else {
+            panic!("accepted {source}");
+        };
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    }
+    check(&base, "theorem typed : keep (8 : Nat) = 8 := by rfl");
+}
+
+#[test]
 fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionaries() {
     let base = check(
         &engine(),
@@ -700,12 +791,23 @@ fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionarie
     // Parenthesized locals are now real source terms. Their dictionaries may
     // determine the annotation, but must leave scope before later annotations
     // or the body. Do not retain the old parser-refusal expectation as a gate.
+    // A bare `8` at `let d : Factory := …; Factory.carrier` has no `OfNat` instance at
+    // the pin ("failed to synthesize", 5:26), the typed numeral checks (2026-10-11). The pin
+    // also refuses `def recursiveType (x : (let rec ty …; ty 2)) : Nat := x` ("Type
+    // mismatch": a `let rec` stays opaque until its definition is complete).
+    // `source_local_recursion` exercises that distinct delayed-closure boundary.
     check(
         &base,
         "def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\n\
-         theorem computes : nested 8 = 8 := by rfl\n\
-         def recursiveType (x : (let rec ty (n : Nat) : Type := match n with | .zero => Nat | .succ k => ty k; ty 2)) : Nat := x\n\
-         theorem recursive_computes : recursiveType 9 = 9 := by rfl",
+         theorem computes : nested (8 : Nat) = 8 := by rfl",
+    );
+    assert!(
+        base.check_source_files(
+            &["def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\ntheorem computes : nested 8 = 8 := by rfl".as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_err()
     );
     for source in [
         "def bad (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Factory.carrier := x",

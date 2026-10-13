@@ -88,7 +88,7 @@ fn diamonds_replay_shared_declarations_and_simp_journals_once() {
         &[
             (
                 "Main",
-                "import Left Right Left\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp",
+                "import Left\nimport Right\nimport Left\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp",
             ),
             ("Left", "import Base\ndef left := 1"),
             ("Right", "import Base\ndef right := 2"),
@@ -118,7 +118,7 @@ fn sibling_instances_cannot_change_previously_elaborated_definitions() {
         &[
             (
                 "Main",
-                "import Choice Independent\ntheorem fixed : independent = 0 := by rfl\ntheorem current : (default : Nat) = 7 := by rfl",
+                "import Choice\nimport Independent\ntheorem fixed : independent = 0 := by rfl\ntheorem current : (default : Nat) = 7 := by rfl",
             ),
             ("Choice", "instance seven : Inhabited Nat := Inhabited.mk 7"),
             ("Independent", "def independent : Nat := default"),
@@ -135,7 +135,7 @@ fn siblings_cannot_lend_names_or_simp_rules_to_an_unimporting_module() {
     let result = check(
         &base,
         &[
-            ("Main", "import A B"),
+            ("Main", "import A\nimport B"),
             ("A", "def secret := 7"),
             ("B", "def stolen := secret"),
         ],
@@ -146,7 +146,7 @@ fn siblings_cannot_lend_names_or_simp_rules_to_an_unimporting_module() {
     let result = check(
         &base,
         &[
-            ("Main", "import A B"),
+            ("Main", "import A\nimport B"),
             ("Base", "def wrap (n : Nat) : Nat := n"),
             (
                 "A",
@@ -171,9 +171,8 @@ fn siblings_cannot_lend_names_or_simp_rules_to_an_unimporting_module() {
 #[test]
 fn import_order_controls_instance_recency_not_input_array_order() {
     let base = engine();
-    for (imports, expected) in [("A B", 9), ("B A", 7)] {
-        let main =
-            format!("import {imports}\ntheorem chosen : (default : Nat) = {expected} := by rfl");
+    for (imports, expected) in [("import A\nimport B", 9), ("import B\nimport A", 7)] {
+        let main = format!("{imports}\ntheorem chosen : (default : Nat) = {expected} := by rfl");
         let files = [
             ("Main", main.as_str()),
             ("A", "instance seven : Inhabited Nat := Inhabited.mk 7"),
@@ -211,7 +210,7 @@ fn conflicting_sibling_declarations_are_not_deduplicated_by_spelling() {
     let result = check(
         &engine(),
         &[
-            ("Main", "import A B"),
+            ("Main", "import A\nimport B"),
             ("A", "def collision := 1"),
             ("B", "def collision := 1"),
         ],

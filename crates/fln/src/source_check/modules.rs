@@ -10,14 +10,46 @@ use std::collections::BTreeMap;
 mod artifacts;
 mod cache;
 mod contexts;
+pub mod execution;
 mod graph;
 pub mod imported;
 pub mod persisted;
 mod replay;
 pub mod reuse;
+pub(crate) mod visibility;
 pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError};
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
+
+/// Public imports preserve their export visibility in the module graph.
+/// Refuse unsupported phase/private-artifact modifiers at their original
+/// position before resolving or admitting the requested import.
+pub fn validate_source_header(
+    module: &Name,
+    header: &SourceHeader,
+) -> Result<(), SourceModuleCheckError> {
+    for import in &header.import_specs {
+        let unsupported = [
+            (import.meta_at, "`meta import` execution phases"),
+            (import.all_at, "`import all` private import visibility"),
+        ];
+        if let Some((at, feature)) = unsupported
+            .into_iter()
+            .find_map(|(at, feature)| at.map(|at| (at, feature)))
+        {
+            return Err(SourceModuleCheckError::Source {
+                module: module.clone(),
+                error: SourceCheckError::Command {
+                    file: 0,
+                    command: 0,
+                    offset: at.0,
+                    error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                },
+            });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceModuleCheckLimits {
@@ -49,6 +81,13 @@ pub struct SourceModuleCheck {
     pub module_order: Vec<Name>,
     /// Declarations actually replayed in this invocation, not cache-hit work.
     pub replayed_declarations: usize,
+    /// The exact checked exported prefix for semantic observations inside a
+    /// public declaration. Kept only by native module checking; callers cannot
+    /// supply or replace this provenance with a filtered environment.
+    pub(crate) public_environment: Option<Environment>,
+    /// Lexical activation positions from that same exported journal, including
+    /// namespace/open events before later registrations and restored sections.
+    pub(crate) public_scope: Option<fln_elab::source::scope::SourceScope>,
 }
 
 #[derive(Debug)]

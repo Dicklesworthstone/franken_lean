@@ -60,6 +60,55 @@ fn both_servers_recheck_and_repair_importers_before_the_next_request() {
 }
 
 #[test]
+fn both_servers_invalidate_and_restore_consumers_when_an_exposed_api_becomes_private() {
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let root = scratch();
+        let api = uri(&root.join("Api.lean"));
+        let main = uri(&root.join("Main.lean"));
+        let public = "module\nprelude\npublic inductive Token where | left | right\n@[expose] public def chosen : Token := Token.left";
+        let private = "module\nprelude\npublic inductive Token where | left | right\nprivate def chosen : Token := Token.left";
+        let messages = run(
+            binary,
+            args,
+            &[
+                open(&api, public),
+                open(
+                    &main,
+                    "prelude\nimport Api\ndef verifies (P : Token -> Prop) (h : P Token.left) : P chosen := h",
+                ),
+                change(&api, 2, private),
+                wait(&main, 1, 181),
+                change(&api, 3, public),
+                wait(&main, 1, 182),
+            ],
+        );
+        assert!(errors(&messages, &api).is_empty(), "{messages:#?}");
+        assert_eq!(errors(&messages, &main).len(), 1, "{messages:#?}");
+        assert_eq!(successes_for(&messages, &main).len(), 2, "{messages:#?}");
+        let failed = messages
+            .iter()
+            .position(|message| {
+                message.contains("publishDiagnostics")
+                    && message.contains(&q(&main))
+                    && message.contains("\"diagnostics\":[{")
+            })
+            .unwrap();
+        assert!(failed < response_index(&messages, 181));
+        let restored = messages
+            .iter()
+            .rposition(|message| message.contains("sourceCheck") && message.contains(&q(&main)))
+            .unwrap();
+        assert!(
+            response_index(&messages, 181) < restored && restored < response_index(&messages, 182)
+        );
+        assert!(messages[response_index(&messages, 182)].contains("\"result\":{}"));
+    }
+}
+
+#[test]
 fn transitive_diamond_consumers_refresh_once_without_rechecking_unrelated_files() {
     let root = scratch();
     let base = uri(&root.join("Base.lean"));
@@ -73,7 +122,7 @@ fn transitive_diamond_consumers_refresh_once_without_rechecking_unrelated_files(
         open(&right, "import Base\ndef right := value"),
         open(
             &main,
-            "import Left Right\ntheorem fixed : left = right := by rfl",
+            "import Left\nimport Right\ntheorem fixed : left = right := by rfl",
         ),
         open(&other, "def unrelated := 7"),
         change(&base, 2, "def value := 1"),
@@ -109,6 +158,37 @@ fn opening_a_previously_missing_import_repairs_its_waiting_consumer() {
     assert_eq!(successes_for(&messages, &main).len(), 1, "{messages:#?}");
     assert!(!root.join("New.lean").exists());
     assert!(messages[response_index(&messages, 73)].contains("\"result\":{}"));
+}
+
+#[test]
+fn opening_init_repairs_a_failed_implicit_import_without_editing_the_module() {
+    let root = scratch();
+    // Fail while loading the header, before a completed source graph can
+    // replace the conservative dependency watch with its observed paths.
+    std::fs::write(root.join("Init.lean"), "import").unwrap();
+    let init = uri(&root.join("Init.lean"));
+    let main = uri(&root.join("Main.lean"));
+    let messages = fln(&[
+        open(
+            &main,
+            "module\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        ),
+        open(
+            &init,
+            "prelude\ndef identity.{u} {A : Sort u} (x : A) : A := x",
+        ),
+        wait(&main, 1, 173),
+    ]);
+    assert_eq!(errors(&messages, &main).len(), 1, "{messages:#?}");
+    assert_eq!(successes_for(&messages, &main).len(), 1, "{messages:#?}");
+    assert!(
+        messages[response_index(&messages, 173)].contains("\"result\":{}"),
+        "{messages:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Init.lean")).unwrap(),
+        "import"
+    );
 }
 
 #[test]

@@ -33,12 +33,15 @@ fn repeated_ground_prerequisites_share_their_solved_dictionary() {
     let base = checked(&engine(), &source);
     checked(
         &base,
-        "def result : D12 := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+        "set_option synthInstance.maxSize 8192 in\ndef result : D12 := inferInstance\ntheorem correct : result.value = 7 := by rfl",
     );
 }
 
 #[test]
-fn a_cycle_dependent_fallback_is_not_reused_on_a_different_search_path() {
+fn all_consumers_of_a_cyclic_query_share_its_first_ground_answer() {
+    // The pinned table publishes lowB before highA completes. A later highB
+    // answer has the same type B and is discarded by isNewAnswer, so both
+    // consumers retain B's published value 1, irrespective of their paths.
     checked(
         &engine(),
         r#"class A where
@@ -55,7 +58,56 @@ class Pair where
 instance pair [a : A] [b : B] : Pair := Pair.mk a.value b.value
 def result : Pair := inferInstance
 theorem leftValue : result.left = 1 := by rfl
-theorem rightValue : result.right = 3 := by rfl"#,
+theorem rightValue : result.right = 1 := by rfl"#,
+    );
+}
+
+#[test]
+fn cached_answer_size_counts_every_use_and_the_scoped_bound_recovers() {
+    let mut source = String::from("class D0 where\n  value : Nat\ninstance d0 : D0 := D0.mk 7\n");
+    for depth in 1..=7 {
+        let previous = depth - 1;
+        source.push_str(&format!(
+            "class D{depth} where\n  value : Nat\ninstance d{depth} [first : D{previous}] [second : D{previous}] : D{depth} := D{depth}.mk first.value\n"
+        ));
+    }
+    let base = checked(&engine(), &source);
+    // D6 uses 127 instances; D7 uses 255 despite having only eight distinct
+    // table entries. The pin's default128 limits answer size, not query depth.
+    checked(&base, "def allowed : D6 := inferInstance");
+    let before = base.logical_root(&KVMap::new());
+    for rejected in [
+        "def tooLarge : D7 := inferInstance",
+        "def tooLargeFunction : Nat -> D7 := inferInstance",
+        "set_option synthInstance.maxSize 254 in\ndef tooLarge : D7 := inferInstance",
+        "set_option synthInstance.maxSize 0 in\ndef evenLeaf : D0 := inferInstance",
+    ] {
+        let error = base
+            .check_source_files(&[rejected.as_bytes()], &KVMap::new(), limits())
+            .expect_err("the result exceeds the synthesis size bound");
+        assert_eq!(error.disposition(), ("elaboration", false, 1));
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+    let raised = checked(
+        &base,
+        "set_option synthInstance.maxSize 255 in\ndef allowed : D7 := inferInstance\ntheorem correct : allowed.value = 7 := by rfl",
+    );
+    checked(
+        &base,
+        "def termAllowed : D7 := set_option synthInstance.maxSize 255 in inferInstance\ntheorem correct : termAllowed.value = 7 := by rfl",
+    );
+    checked(
+        &base,
+        "set_option synthInstance.maxSize 255 in\ndef functionAllowed : Nat -> D7 := inferInstance\ntheorem correct : (functionAllowed 0).value = 7 := by rfl",
+    );
+    assert!(
+        raised
+            .check_source_files(
+                &[b"def stillTooLarge : D7 := inferInstance"],
+                &KVMap::new(),
+                limits(),
+            )
+            .is_err()
     );
 }
 
@@ -159,12 +211,17 @@ fn fixed_output_parameter_prerequisites_replay_their_fresh_output_assignments() 
     let base = checked(&engine(), &source);
     checked(
         &base,
-        "def result : Out12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+        "set_option synthInstance.maxSize 8192 in\ndef result : Out12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
     );
 }
 
+/// The pin selects `incompatible` (value 99): its prerequisite `Transfer Nat Bool` is
+/// solved by `boolean`, so the known `Bool` output takes part in that subgoal's search,
+/// and the lower-priority `fallback` is never reached. Measured at v4.32.0, 2026-10-07:
+/// `result.value = 99 := by rfl` checks there and `= 7` is refused. FrankenLean agrees
+/// since 10136909; this test expected 7 before that, against the pin.
 #[test]
-fn output_answer_replay_does_not_turn_output_parameters_into_input_filters() {
+fn a_known_output_in_a_prerequisite_selects_its_answer_as_at_the_pin() {
     let base = checked(
         &engine(),
         r#"class Transfer (A : Type) (B : outParam Type) where
@@ -178,6 +235,6 @@ instance incompatible [first : Transfer Nat Nat] [again : Transfer Nat Nat] [bad
     );
     checked(
         &base,
-        "def result : Root := inferInstance\ntheorem priorityPreserved : result.value = 7 := by rfl",
+        "def result : Root := inferInstance\ntheorem selected : result.value = 99 := by rfl",
     );
 }

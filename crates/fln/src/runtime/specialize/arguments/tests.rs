@@ -3,6 +3,197 @@
 use super::*;
 use fln_env::constants::{ConstantVal, ReducibilityHints};
 
+// These worlds exercise post-admission compiler mechanics, not admission itself.
+// The integration tests admit the corresponding declarations through both seats.
+fn bare_universe_definition(label: &str, value: Expr) -> DefinitionVal {
+    let declaration_name = name(label);
+    DefinitionVal {
+        base: ConstantVal {
+            name: declaration_name.clone(),
+            level_params: vec![name("u")],
+            type_: ty("Nat"),
+        },
+        value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![declaration_name],
+    }
+}
+
+#[test]
+fn bare_universe_values_receive_private_ground_definitions() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition.clone()))
+        .unwrap();
+    let input = Expr::const_(definition.base.name.clone(), vec![Level::one()]);
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let prepared = preparation.expression(&input).unwrap();
+    let ExprNode::Const { name, levels } = prepared.node() else {
+        panic!("a nullary value must remain a constant, not execute during preparation");
+    };
+    assert_ne!(name, &definition.base.name);
+    assert!(levels.is_empty());
+    let specialized = preparation.specialized_definition(name).unwrap();
+    assert!(specialized.base.level_params.is_empty());
+    assert_eq!(specialized.base.type_, definition.base.type_);
+    assert_eq!(specialized.value, definition.value);
+    assert!(!environment.contains(name));
+    assert_eq!(
+        environment.find(&definition.base.name),
+        Some(&ConstantInfo::Defn(definition.clone()))
+    );
+}
+
+#[test]
+fn bare_universe_cache_keys_distinguish_universes_and_reuse_repeated_values() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let zero = Expr::const_(name("bareAnswer"), vec![Level::zero()]);
+    let one = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+    let first = preparation.expression(&zero).unwrap();
+    let second = preparation.expression(&one).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(preparation.expression(&zero).unwrap(), first);
+    assert_eq!(preparation.expression(&one).unwrap(), second);
+    assert_eq!(preparation.specializations.definitions.len(), 2);
+}
+
+#[test]
+fn bare_universe_alias_dependencies_reach_the_executable_catalog() {
+    let inner = bare_universe_definition("bareInner", nat::literal(42));
+    let outer = bare_universe_definition(
+        "bareOuter",
+        Expr::const_(inner.base.name.clone(), vec![Level::param(name("u"))]),
+    );
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(inner))
+        .unwrap()
+        .add_decl(ConstantInfo::Defn(outer))
+        .unwrap();
+    let limits = IngressLimits::default();
+    let mut preparation = Preparation::new(&environment, limits);
+    let prepared = preparation
+        .expression(&Expr::const_(name("bareOuter"), vec![Level::one()]))
+        .unwrap();
+    let catalog =
+        executable_dependencies(&environment, &prepared, limits, &mut preparation).unwrap();
+    assert_eq!(catalog.functions.len(), 2);
+    assert_eq!(preparation.specializations.definitions.len(), 2);
+    for function in &catalog.functions {
+        assert_eq!(function.universe_arity, 0);
+        assert!(function.parameters.is_empty());
+        assert!(!environment.contains(&function.name));
+    }
+    assert!(
+        catalog
+            .functions
+            .iter()
+            .any(|function| function.body == nat::literal(42))
+    );
+    let mut referenced = std::collections::BTreeSet::new();
+    let mut visited = 0;
+    for function in &catalog.functions {
+        collect_executable_constants(&function.body, &mut referenced, &mut visited, limits)
+            .unwrap();
+    }
+    assert_eq!(referenced.len(), 1);
+    assert!(
+        referenced
+            .iter()
+            .all(|name| catalog.functions.iter().any(|f| &f.name == name))
+    );
+}
+
+#[test]
+fn bare_universe_path_leaves_monomorphic_constants_unchanged() {
+    let mut definition = bare_universe_definition("monoAnswer", nat::literal(42));
+    definition.base.level_params.clear();
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    let input = ty("monoAnswer");
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    assert_eq!(preparation.expression(&input).unwrap(), input);
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn bare_universe_specialization_never_guesses_open_or_mismatched_levels() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    for levels in [
+        vec![],
+        vec![Level::zero(), Level::one()],
+        vec![Level::param(name("unresolved"))],
+    ] {
+        let mut preparation = Preparation::new(&environment, IngressLimits::default());
+        let input = Expr::const_(name("bareAnswer"), levels);
+        assert!(preparation.specialize_call(&input, &[]).unwrap().is_none());
+        assert!(preparation.specializations.definitions.is_empty());
+    }
+}
+
+#[test]
+fn bare_universe_specialization_refuses_reserved_name_collisions() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let mut collision = bare_universe_definition("collision", nat::literal(0));
+    collision.base.name = Name::num(name("_fln_runtime_specialization"), 0);
+    collision.base.level_params.clear();
+    collision.all = vec![collision.base.name.clone()];
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap()
+        .add_decl(ConstantInfo::Defn(collision.clone()))
+        .unwrap();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let input = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+    assert!(matches!(
+        preparation.expression(&input),
+        Err(IngressError::UnsupportedNode {
+            kind: "runtime specialization name collision"
+        })
+    ));
+    assert!(preparation.specializations.definitions.is_empty());
+    assert_eq!(
+        environment.find(&collision.base.name),
+        Some(&ConstantInfo::Defn(collision.clone()))
+    );
+}
+
+#[test]
+fn bare_universe_specialization_obeys_table_limits_and_allows_a_clean_retry() {
+    let definition = bare_universe_definition("bareAnswer", nat::literal(42));
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(definition))
+        .unwrap();
+    let input = Expr::const_(name("bareAnswer"), vec![Level::one()]);
+    let mut limits = IngressLimits::default();
+    limits.fir.max_functions = 0;
+    let mut preparation = Preparation::new(&environment, limits);
+    assert!(matches!(
+        preparation.expression(&input),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::ProgramTables,
+            limit: 0,
+            observed: 1,
+        })
+    ));
+    assert!(preparation.specializations.definitions.is_empty());
+    let first = Preparation::new(&environment, IngressLimits::default())
+        .expression(&input)
+        .unwrap();
+    let retry = Preparation::new(&environment, IngressLimits::default())
+        .expression(&input)
+        .unwrap();
+    assert_eq!(first, retry);
+}
+
 fn b(index: u32) -> Expr {
     Expr::bvar(index).unwrap()
 }
@@ -410,3 +601,213 @@ fn late_static_arguments_use_a_bounded_heap_telescope() {
 
 #[cfg(test)]
 mod stages;
+
+#[test]
+fn predicate_arguments_share_closed_metadata_but_retain_decision_callbacks() {
+    let environment = Environment::new();
+    let predicate_domain = telescope(
+        &[(ty("Nat"), BinderInfo::Default)],
+        Expr::sort(Level::zero()),
+        false,
+    );
+    let canonical = telescope(
+        &[(ty("Nat"), BinderInfo::Default)],
+        erased_proposition(),
+        true,
+    );
+    let decision_domain = telescope(
+        &[(ty("Nat"), BinderInfo::Default)],
+        Expr::app(ty("Decidable"), Expr::app(b(1), b(0))),
+        false,
+    );
+    let binders = [
+        (ty("Nat"), BinderInfo::Default),
+        (predicate_domain, BinderInfo::Implicit),
+        (decision_domain, BinderInfo::Default),
+        (ty("Nat"), BinderInfo::Default),
+    ];
+    let captured_predicate = Expr::lam(
+        name("k"),
+        ty("Nat"),
+        application(
+            Expr::const_(name("Eq"), vec![Level::one()]),
+            [ty("Nat"), b(0), b(1)],
+        ),
+        BinderInfo::Default,
+    );
+    let retained = [
+        (ty("Nat"), BinderInfo::Default),
+        (
+            telescope(
+                &[(ty("Nat"), BinderInfo::Default)],
+                Expr::app(ty("Decidable"), erased_proposition()),
+                false,
+            ),
+            BinderInfo::Default,
+        ),
+        (ty("Nat"), BinderInfo::Default),
+    ];
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    // The open variable represents a predicate forwarded by another helper.
+    for predicate in [captured_predicate, b(4), canonical.clone()] {
+        let result = preparation
+            .specialize_arguments(
+                telescope(&binders, ty("Nat"), false),
+                telescope(&binders, b(0), true),
+                &[b(0), predicate, b(1), nat::literal(42)],
+            )
+            .unwrap();
+        assert_eq!(result.static_arguments, vec![(1, canonical.clone())]);
+        assert_eq!(result.runtime_arguments, vec![b(0), b(1), nat::literal(42)]);
+        assert_eq!(
+            preparation.normalize_type(&result.type_).unwrap(),
+            telescope(&retained, ty("Nat"), false),
+        );
+        assert!(!result.value.has_loose_bvars());
+    }
+    assert!(preparation.lambdas.is_empty());
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn erased_predicate_telescopes_keep_dependent_domains_and_still_type_as_prop() {
+    let binders = [
+        (Expr::sort(Level::one()), BinderInfo::Implicit),
+        (b(0), BinderInfo::Default),
+    ];
+    let domain = telescope(&binders, Expr::sort(Level::zero()), false);
+    let engine = Engine::from_environment(Environment::new());
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let canonical = preparation
+        .erased_proposition_argument(&domain)
+        .unwrap()
+        .expect("a closed dependent telescope ends in Prop");
+    assert_eq!(canonical, telescope(&binders, erased_proposition(), true));
+    assert!(closed(&canonical));
+    assert_eq!(
+        preparation
+            .erased_proposition_argument(&Expr::sort(Level::zero()))
+            .unwrap(),
+        Some(erased_proposition()),
+    );
+    let declaration_name = name("erasedDependentPredicate");
+    engine
+        .admit_declaration(
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: declaration_name.clone(),
+                    level_params: vec![],
+                    type_: domain,
+                },
+                value: canonical,
+                safety: DefinitionSafety::Safe,
+                hints: ReducibilityHints::Abbrev,
+                all: vec![declaration_name],
+            }),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(fln_kernel::verdict::Budget::for_stack_bytes(
+                2 * 1024 * 1024,
+            )),
+        )
+        .unwrap()
+        .into_complete()
+        .expect("both checking engines confirm the original dependent Prop type");
+}
+
+#[test]
+fn predicate_metadata_requires_closed_domains_and_an_exact_prop_result() {
+    let environment = Environment::new();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    for domain in [
+        Expr::sort(Level::one()),
+        Expr::sort(Level::param(name("u"))),
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::sort(Level::one()),
+            false,
+        ),
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::sort(Level::param(name("u"))),
+            false,
+        ),
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::app(ty("Decidable"), erased_proposition()),
+            false,
+        ),
+        // The argument's data domain refers to an outer A : Type.
+        telescope(
+            &[(b(0), BinderInfo::Default)],
+            Expr::sort(Level::zero()),
+            false,
+        ),
+        telescope(
+            &[(Expr::sort(Level::param(name("u"))), BinderInfo::Default)],
+            Expr::sort(Level::zero()),
+            false,
+        ),
+        b(0),
+    ] {
+        assert!(
+            preparation
+                .erased_proposition_argument(&domain)
+                .unwrap()
+                .is_none(),
+            "must retain this parameter: {domain:?}",
+        );
+    }
+    assert!(preparation.lambdas.is_empty());
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn predicate_telescope_erasure_is_heap_backed_and_propagates_resource_stops() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let environment = Environment::new();
+            let mut domain = Expr::sort(Level::zero());
+            for _ in 0..300 {
+                domain = Expr::forall_e(Name::anonymous(), ty("Nat"), domain, BinderInfo::Default);
+            }
+            let mut preparation = Preparation::new(&environment, IngressLimits::default());
+            let mut value = preparation
+                .erased_proposition_argument(&domain)
+                .unwrap()
+                .unwrap();
+            let mut count = 0;
+            while let ExprNode::Lam { body, .. } = value.node() {
+                count += 1;
+                value = body.clone();
+            }
+            assert_eq!(count, 300);
+            assert_eq!(value, erased_proposition());
+            for (limits, expected) in [
+                (
+                    IngressLimits {
+                        max_context_depth: 8,
+                        ..IngressLimits::default()
+                    },
+                    IngressResource::ProgramTables,
+                ),
+                (
+                    IngressLimits {
+                        max_nodes: 1,
+                        ..IngressLimits::default()
+                    },
+                    IngressResource::Nodes,
+                ),
+            ] {
+                let Err(IngressError::ResourceLimit { resource, .. }) =
+                    Preparation::new(&environment, limits).erased_proposition_argument(&domain)
+                else {
+                    panic!("predicate metadata must retain its resource refusal")
+                };
+                assert_eq!(resource, expected);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

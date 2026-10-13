@@ -123,6 +123,36 @@ fn transaction() -> ElabTxn {
     add_record(&mut txn, unit);
     txn
 }
+
+fn transaction_with_large_instance_journal() -> ElabTxn {
+    let mut txn = transaction();
+    // Valid long names and ordinary priority updates build a journal larger than
+    // one equation's step budget without introducing hundreds of declarations.
+    // Its effective instance set has no bearing on the unrelated Box equation.
+    let class_text = format!("Unrelated{}", "x".repeat(1024));
+    let class = name(&class_text);
+    add_record(
+        &mut txn,
+        spec(&class_text, vec![], vec![binder("value", constant("Nat"))]),
+    );
+    txn.env = fln_elab::instances::register_class(&txn.env, &class).unwrap();
+    let constructor = Name::str(class.clone(), "mk");
+    for priority in 0..64 {
+        txn.env = fln_elab::instances::set_instance(&txn.env, &constructor, priority).unwrap();
+    }
+    let registry = fln_elab::instances::InstanceRegistry::read(&txn.env).unwrap();
+    assert!(registry.is_class(&class));
+    assert!(!registry.is_class(&name("Box")));
+    assert_eq!(registry.candidates(&class).len(), 1);
+    let journal = txn
+        .env
+        .extension(&name("FrankenLean.sourceInstances.v1"))
+        .unwrap();
+    let bytes: usize = journal.entries().map(|entry| entry.payload.len()).sum();
+    assert!(u64::try_from(bytes).unwrap() > budget().max_steps);
+    txn
+}
+
 fn local(txn: &mut ElabTxn, text: &str, type_: Expr) -> Expr {
     let id = FVarId(name(text));
     txn.lctx
@@ -175,8 +205,60 @@ fn a_singleton_projection_recovers_the_record_in_both_orientations() {
             mk("Box", [constant("Nat"), numeral(7)])
         );
         assert_eq!(report.expression_assignments, vec![r]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert!(report.residual_metavariables.is_empty());
+    }
+}
+
+#[test]
+fn unrelated_instance_journals_do_not_exhaust_singleton_inversion() {
+    let mut txn = transaction_with_large_instance_journal();
+    let r = goal(
+        &mut txn,
+        "record",
+        Expr::app(constant("Box"), constant("Nat")),
+    );
+    let record = Expr::mvar(r.clone());
+    let before = txn.clone();
+    let report = txn
+        .unify(&proj("Box", 0, &record), &numeral(7), budget())
+        .unwrap();
+    assert_eq!(
+        txn.mvars.instantiate(&record),
+        mk("Box", [constant("Nat"), numeral(7)])
+    );
+    assert_eq!(report.expression_assignments, vec![r]);
+    assert_eq!(report.kernel_checks, 2);
+    assert!(report.residual_metavariables.is_empty());
+    assert!(report.unifier_steps < 10_000);
+    assert_eq!(txn.env, before.env);
+    assert_eq!(txn.constraints, before.constraints);
+    assert_eq!(txn.lctx, before.lctx);
+}
+
+#[test]
+fn large_class_or_malformed_registries_cannot_authorize_singleton_inversion() {
+    let base = transaction_with_large_instance_journal();
+    for malformed in [false, true] {
+        let mut txn = base.clone();
+        txn.env = if malformed {
+            txn.env
+                .push_extension_entry(&name("FrankenLean.sourceInstances.v1"), vec![0xff])
+                .unwrap()
+        } else {
+            fln_elab::instances::register_class(&txn.env, &name("Box")).unwrap()
+        };
+        let r = goal(
+            &mut txn,
+            "dictionary",
+            Expr::app(constant("Box"), constant("Nat")),
+        );
+        let before = txn.clone();
+        assert!(matches!(
+            txn.unify(&proj("Box", 0, &Expr::mvar(r)), &numeral(7), budget()),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged(&txn, &before);
     }
 }
 
@@ -262,7 +344,7 @@ fn applied_record_holes_are_solved_as_checked_lambda_patterns() {
         BinderInfo::Default,
     );
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&expected));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert!(report.residual_metavariables.is_empty());
 }
 
@@ -289,7 +371,7 @@ fn dependent_receiver_parameters_are_substituted_before_inversion() {
     let receiver = apply(Expr::mvar(f.clone()), [a_type, a.clone()]);
     let report = txn.unify(&proj("Box", 0, &receiver), &a, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![f.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let assigned = txn.mvars.get_assigned_expr(&f).unwrap();
     assert!(!assigned.has_fvar());
     assert!(!assigned.has_expr_mvar());
@@ -409,7 +491,7 @@ fn exhaustion_and_final_cancellation_leave_no_partial_reconstruction() {
             false
         })
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let mut step_limit = budget();
     step_limit.max_steps = report.unifier_steps - 1;
     let mut node_limit = budget();

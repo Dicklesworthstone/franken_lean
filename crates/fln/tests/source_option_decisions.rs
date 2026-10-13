@@ -16,7 +16,7 @@ fn engine() -> Engine {
     assert!(
         engine
             .environment()
-            .contains(&Name::from_components(["instDecidableEqOption",]))
+            .contains(&Name::from_components(["Option", "instDecidableEq"]))
     );
     engine
 }
@@ -75,7 +75,7 @@ fn false_option_claims_refuse_without_publishing_the_batch_prefix() {
         "theorem false_nested : Option.some (Option.none : Option Bool) = Option.some (Option.some Bool.false) := by decide",
     ] {
         let source = format!(
-            "attribute [instance] instDecidableEqOption\ndef unpublished_prefix : Nat := 0\n{claim}\n"
+            "attribute [instance] Option.instDecidableEq\ndef unpublished_prefix : Nat := 0\n{claim}\n"
         );
         let result = engine.check_source_files(
             &[source.as_bytes()],
@@ -101,7 +101,7 @@ fn registered_engine() -> Engine {
     let engine = engine();
     engine
         .check_source_files(
-            &[b"attribute [instance] instDecidableEqOption"],
+            &[b"attribute [instance] Option.instDecidableEq"],
             &KVMap::new(),
             SourceCheckLimits::new(limits()),
         )

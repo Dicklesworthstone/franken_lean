@@ -1,12 +1,16 @@
 //! Runtime motive normalization must not guess a dependent representation.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, VmExit};
+use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Mode, VmExit};
 
 fn limits() -> EngineExecutionLimits {
     EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
+/// Directly written recursors execute only in the `frontier` mode; the default refuses
+/// them as the pin's code generator does (bead `franken_lean-z8j.1.6.6`).
 fn engine() -> Engine {
-    Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
         .unwrap()
         .into_complete()
         .unwrap()
@@ -30,11 +34,11 @@ fn execute(source: &str, expected: &str) {
 #[test]
 fn named_reducible_motives_work_in_direct_and_first_class_recursors() {
     execute(
-        "def Result (n : Nat) : Type := Nat\n#eval @Nat.rec Result 0 (fun (n ih : Nat) => ih + 1) 42",
+        "def Result (n : Nat) : Type := Nat\n#eval @Nat.rec Result (0 : Nat) (fun (n ih : Nat) => ih + 1) 42",
         "42",
     );
     execute(
-        "def Result (n : Nat) : Type := Nat\n#eval let fold : Nat -> Nat := @Nat.rec Result 0 (fun (n ih : Nat) => ih + 1); fold 42",
+        "def Result (n : Nat) : Type := Nat\n#eval let fold : Nat -> Nat := @Nat.rec Result (0 : Nat) (fun (n ih : Nat) => ih + 1); fold 42",
         "42",
     );
 }
@@ -43,6 +47,14 @@ fn named_reducible_motives_work_in_direct_and_first_class_recursors() {
 fn normalized_function_motives_keep_changing_accumulator_arguments() {
     execute(
         "def Accum (n : Nat) : Type := Nat -> Nat\n#eval @Nat.rec Accum (fun (acc : Nat) => acc) (fun (n : Nat) (ih : Nat -> Nat) (acc : Nat) => ih (acc + 1)) 40 2",
+        "42",
+    );
+}
+
+#[test]
+fn record_motives_erase_major_dependent_callback_proofs_before_layout_discovery() {
+    execute(
+        "structure Pair where\n  first : Nat\n  second : Nat\ndef unpack (p : Pair) : ((q : Pair) -> q.first = p.first -> Nat) -> Nat := @Pair.rec (fun p : Pair => ((q : Pair) -> q.first = p.first -> Nat) -> Nat) (fun first second next => next (Pair.mk first second) (Eq.refl first)) p\n#eval unpack (Pair.mk 19 23) (fun q h => q.first + q.second)",
         "42",
     );
 }

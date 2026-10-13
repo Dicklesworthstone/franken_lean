@@ -29,15 +29,16 @@ use std::fmt;
 /// runtime representation may be either a tagged scalar or an owned mpz;
 /// version 13 carries canonical arbitrary-precision Nat literal limbs;
 /// version 14 adds borrowed, shape-checked constructor discrimination;
-/// version 15 adds terminal direct and closure calls with frame ownership transfer.
-pub const FLBC_SCHEMA_VERSION: u16 = 15;
+/// version 15 adds terminal direct and closure calls with frame ownership transfer;
+/// version 16 distinguishes erased ABI results from the Nat-specific union.
+pub const FLBC_SCHEMA_VERSION: u16 = 16;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 10;
+pub const FLBC_WIRE_VERSION: u16 = 11;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -54,8 +55,9 @@ pub const FLBC_WIRE_VERSION: u16 = 10;
 /// intrinsic results; version 13 binds function, direct-call, and dynamic-Apply
 /// result ownership plus exact owned/scalar invocation counts; version 14
 /// admits cyclic CFG register reuse and binds its redefinition count; version
-/// 15 recognizes terminal calls as releasing the caller's remaining handles.
-pub const OWNERSHIP_WITNESS_VERSION: u16 = 15;
+/// 15 recognizes terminal calls as releasing the caller's remaining handles;
+/// version 16 counts erased callable results as potentially owned handles.
+pub const OWNERSHIP_WITNESS_VERSION: u16 = 16;
 
 const FLBC_MAGIC: [u8; 8] = *b"FLNFLBC\0";
 
@@ -400,15 +402,17 @@ impl ResultOwnership {
 ///
 /// A completed function always transfers one register-owned [`fln_rt::obj::Obj`]
 /// to its continuation. `Owned` requires a heap object; `Scalar` requires a
-/// tagged immediate; `OwnedOrScalar` admits the ABI representation used by
-/// values such as `Nat`, where small values are immediate and large values are
-/// owned mpz objects. Borrowed and unique callable results are deliberately not
-/// representable in this bounded schema.
+/// tagged immediate; `OwnedOrScalar` admits exactly the `Nat` representation,
+/// where small values are immediate and large values are nonnegative owned
+/// mpz objects. `Erased` transfers an arbitrary ABI value, whose concrete type
+/// was erased by the compiler. It still transfers an owned handle for heap
+/// objects. Borrowed and unique callable results are not representable here.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CallableResultOwnership {
     Owned,
     Scalar,
     OwnedOrScalar,
+    Erased,
 }
 
 impl CallableResultOwnership {
@@ -417,6 +421,7 @@ impl CallableResultOwnership {
             Self::Owned => "owned",
             Self::Scalar => "scalar",
             Self::OwnedOrScalar => "owned-or-scalar",
+            Self::Erased => "erased",
         }
     }
 
@@ -425,6 +430,7 @@ impl CallableResultOwnership {
             Self::Owned => 0,
             Self::Scalar => 1,
             Self::OwnedOrScalar => 2,
+            Self::Erased => 3,
         }
     }
 
@@ -433,6 +439,7 @@ impl CallableResultOwnership {
             0 => Ok(Self::Owned),
             1 => Ok(Self::Scalar),
             2 => Ok(Self::OwnedOrScalar),
+            3 => Ok(Self::Erased),
             _ => Err(CodecError::InvalidCallableResultOwnership { tag, offset }),
         }
     }
@@ -3802,19 +3809,23 @@ fn owned_callable_result_count(instruction: &Instruction) -> usize {
         instruction,
         Instruction::Call {
             result_ownership: CallableResultOwnership::Owned
-                | CallableResultOwnership::OwnedOrScalar,
+                | CallableResultOwnership::OwnedOrScalar
+                | CallableResultOwnership::Erased,
             ..
         } | Instruction::Apply {
             result_ownership: CallableResultOwnership::Owned
-                | CallableResultOwnership::OwnedOrScalar,
+                | CallableResultOwnership::OwnedOrScalar
+                | CallableResultOwnership::Erased,
             ..
         } | Instruction::TailCall {
             result_ownership: CallableResultOwnership::Owned
-                | CallableResultOwnership::OwnedOrScalar,
+                | CallableResultOwnership::OwnedOrScalar
+                | CallableResultOwnership::Erased,
             ..
         } | Instruction::TailApply {
             result_ownership: CallableResultOwnership::Owned
-                | CallableResultOwnership::OwnedOrScalar,
+                | CallableResultOwnership::OwnedOrScalar
+                | CallableResultOwnership::Erased,
             ..
         }
     ))
@@ -7284,7 +7295,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=8 emitted=16 drops=4 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7484,7 +7495,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=5 emitted=8 drops=1 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7546,7 +7557,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=6 emitted=12 drops=4 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7690,7 +7701,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=13 drops=3 moves=0 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-cyclic-cfg result=scalar source=1 emitted=2 drops=0 moves=0 redefs=0 edges=1 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -7823,7 +7834,7 @@ mod codec_tests {
         assert_eq!(
             backedge_inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=14 drops=4 moves=1 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8156,7 +8167,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-linear result=scalar source=5 emitted=7 drops=2 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear result=scalar source=2 emitted=3 drops=1 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=inserted-acyclic-cfg result=scalar source=3 emitted=5 drops=0 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -8311,7 +8322,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear-reuse result=scalar source=6 emitted=8 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8478,7 +8489,7 @@ mod codec_tests {
         assert_eq!(
             preserved.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=preserved-non-ssa result=scalar source=3 emitted=3 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8544,7 +8555,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=scalar source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8747,7 +8758,7 @@ mod codec_tests {
         assert_eq!(
             entry_owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-acyclic-cfg-reuse result=scalar source=6 emitted=12 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8813,7 +8824,7 @@ mod codec_tests {
         assert_eq!(
             inserted_cycle.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=5 emitted=9 drops=1 moves=0 redefs=1 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8864,7 +8875,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -9158,7 +9169,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=validated-existing-ownership result=scalar source=4 emitted=4 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -9680,7 +9691,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-linear result=scalar source=4 emitted=5 drops=1 moves=0 redefs=0 edges=0 extern_consumes=1 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -11389,7 +11400,7 @@ mod codec_tests {
         let mut entry = function(
             0,
             0,
-            3,
+            4,
             vec![
                 Instruction::Call {
                     dst: r(0),
@@ -11411,6 +11422,13 @@ mod codec_tests {
                     args: Vec::new(),
                     argument_ownership: Vec::new(),
                     result_ownership: CallableResultOwnership::OwnedOrScalar,
+                },
+                Instruction::Call {
+                    dst: r(3),
+                    function: f(4),
+                    args: Vec::new(),
+                    argument_ownership: Vec::new(),
+                    result_ownership: CallableResultOwnership::Erased,
                 },
                 Instruction::Return { src: r(1) },
             ],
@@ -11454,7 +11472,20 @@ mod codec_tests {
             ],
         );
         owned_or_scalar.result_ownership = CallableResultOwnership::OwnedOrScalar;
-        let program = Program::new(f(0), vec![entry, scalar, owned, owned_or_scalar]);
+        let mut erased = function(
+            4,
+            0,
+            1,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "erased".to_string(),
+                },
+                Instruction::Return { src: r(0) },
+            ],
+        );
+        erased.result_ownership = CallableResultOwnership::Erased;
+        let program = Program::new(f(0), vec![entry, scalar, owned, owned_or_scalar, erased]);
         let source = validate(program.clone()).expect("all callable result classes validate");
         let bytes =
             encode_canonical(&source, CodecLimits::default()).expect("result classes encode");
@@ -11463,8 +11494,8 @@ mod codec_tests {
         assert_eq!(decoded, source);
 
         let inserted = insert_ownership(&source, OwnershipLimits::default())
-            .expect("ownership witness binds both callable result classes");
-        assert_eq!(inserted.witness().functions()[0].owned_callable_results, 2);
+            .expect("ownership witness binds every callable result class");
+        assert_eq!(inserted.witness().functions()[0].owned_callable_results, 3);
         assert_eq!(inserted.witness().functions()[0].scalar_callable_results, 1);
         let mut forged_rows = inserted.witness().functions().to_vec();
         forged_rows[0].owned_callable_results = 0;
@@ -11479,7 +11510,7 @@ mod codec_tests {
             Err(OwnershipError::WitnessCount {
                 function,
                 count: OwnershipWitnessCount::OwnedCallableResults,
-                expected: 2,
+                expected: 3,
                 actual: 0,
             }) if function == f(0)
         ));
@@ -11505,10 +11536,10 @@ mod codec_tests {
 
         let mut invalid_tag =
             encode_canonical(&minimal_program(), CodecLimits::default()).expect("minimal bytes");
-        invalid_tag[32] = 3;
+        invalid_tag[32] = 4;
         assert_eq!(
             decode_canonical(&invalid_tag, CodecLimits::default()),
-            Err(CodecError::InvalidCallableResultOwnership { tag: 3, offset: 32 })
+            Err(CodecError::InvalidCallableResultOwnership { tag: 4, offset: 32 })
         );
     }
 
@@ -11520,8 +11551,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                10, 0, // wire version: terminal call opcodes 20 and 21
-                15, 0, // schema version: terminal frame ownership transfer
+                11, 0, // wire version: erased callable result tag 3
+                16, 0, // schema version: erased ABI result ownership
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id

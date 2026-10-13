@@ -138,7 +138,14 @@ pub fn fixture(
     families: usize,
     mutation: Mutation,
 ) -> Fixture {
-    build(false, generic, indexed, higher, families, mutation)
+    build(
+        ResultSort::Data,
+        generic,
+        indexed,
+        higher,
+        families,
+        mutation,
+    )
 }
 
 /// The same block as [`fixture`], declared in `Prop`: the pin's recursors for a
@@ -152,11 +159,44 @@ pub fn proposition_fixture(
     families: usize,
     mutation: Mutation,
 ) -> Fixture {
-    build(true, generic, indexed, higher, families, mutation)
+    build(
+        ResultSort::Prop,
+        generic,
+        indexed,
+        higher,
+        families,
+        mutation,
+    )
+}
+
+/// Kernel-level Sort u families with parameters and fields in that same
+/// universe. The pin's primitive addDecl admits them with Prop-only motives;
+/// its source elaborator independently refuses Sort polymorphism by default.
+pub fn sort_polymorphic_fixture(
+    indexed: bool,
+    higher: bool,
+    families: usize,
+    mutation: Mutation,
+) -> Fixture {
+    build(
+        ResultSort::Polymorphic,
+        true,
+        indexed,
+        higher,
+        families,
+        mutation,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResultSort {
+    Data,
+    Prop,
+    Polymorphic,
 }
 
 fn build(
-    proposition: bool,
+    result_sort: ResultSort,
     generic: bool,
     indexed: bool,
     higher: bool,
@@ -166,23 +206,25 @@ fn build(
     assert!(families >= 2 && (!indexed || (families == 2 && generic)) && (!higher || generic));
     let names: Vec<_> = (0..families).map(|i| name(&format!("Mutual{i}"))).collect();
     let levels = if generic { vec![name("u")] } else { vec![] };
-    let result = if generic {
+    let result = if matches!(result_sort, ResultSort::Polymorphic) {
+        Level::param(name("u"))
+    } else if generic {
         Level::succ(Level::param(name("u"))).unwrap()
     } else {
         Level::one()
     };
-    let family_level = if proposition {
+    let family_level = if matches!(result_sort, ResultSort::Prop) {
         Level::zero()
     } else {
         result.clone()
     };
     let motive_level = if generic { name("u_1") } else { name("u") };
-    let motive_sort = if proposition {
+    let motive_sort = if !matches!(result_sort, ResultSort::Data) {
         Expr::sort(Level::zero())
     } else {
         Expr::sort(Level::param(motive_level.clone()))
     };
-    let mut rec_levels = if proposition {
+    let mut rec_levels = if !matches!(result_sort, ResultSort::Data) {
         vec![]
     } else {
         vec![motive_level.clone()]

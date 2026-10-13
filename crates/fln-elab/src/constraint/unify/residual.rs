@@ -8,6 +8,8 @@
 //! depend on earlier locals. Scope compatibility includes the residual's entire
 //! declared context, not just the free variables visible in its type.
 
+mod closure;
+
 use super::{Engine, UnificationDeferred, UnificationError, ValidationTarget};
 use crate::lctx::LocalContext;
 use crate::mvar::{AssignmentJustification, MetavarStore};
@@ -335,48 +337,9 @@ impl Engine<'_> {
                 }
             }
         }
-        let mut value = self.validation_instantiate(raw_value, &validation_store)?;
-        let mut type_ = self.validation_instantiate(raw_type, &validation_store)?;
-        for local in telescope.decls().iter().rev() {
-            self.meter.tick()?;
-            self.scan(&value)?;
-            self.scan(&type_)?;
-            value = value
-                .abstract_fvar(&local.id, 0)
-                .map_err(|_| UnificationError::ExpressionScope)?;
-            type_ = type_
-                .abstract_fvar(&local.id, 0)
-                .map_err(|_| UnificationError::ExpressionScope)?;
-            if let Some(local_value) = &local.value {
-                value = Expr::let_e(
-                    local.user_name.clone(),
-                    local.type_.clone(),
-                    local_value.clone(),
-                    value,
-                    false,
-                );
-                type_ = Expr::let_e(
-                    local.user_name.clone(),
-                    local.type_.clone(),
-                    local_value.clone(),
-                    type_,
-                    false,
-                );
-            } else {
-                value = Expr::lam(
-                    local.user_name.clone(),
-                    local.type_.clone(),
-                    value,
-                    local.binder_info,
-                );
-                type_ = Expr::forall_e(
-                    local.user_name.clone(),
-                    local.type_.clone(),
-                    type_,
-                    local.binder_info,
-                );
-            }
-        }
+        let value = self.validation_instantiate(raw_value, &validation_store)?;
+        let type_ = self.validation_instantiate(raw_type, &validation_store)?;
+        let (value, type_) = closure::close(value, type_, &telescope, &mut self.meter)?;
         Ok((value, type_, residuals))
     }
 }
@@ -443,7 +406,7 @@ mod tests {
             .unify(&Expr::mvar(a.clone()), &Expr::mvar(b.clone()), budget())
             .unwrap();
         assert_eq!(report.residual_metavariables, vec![b.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert_eq!(
             txn.mvars.get_assigned_expr(&a),
             Some(&Expr::mvar(b.clone()))

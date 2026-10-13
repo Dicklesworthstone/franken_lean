@@ -95,7 +95,7 @@ fn same_head_keeps_only_agreeing_positions_and_reports_the_typed_residual() {
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(report.expression_assignments, vec![f.clone()]);
-        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.kernel_checks, 2);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
         let declaration = txn.mvars.get_decl(&residual).unwrap();
@@ -161,7 +161,7 @@ fn dependent_results_keep_their_type_parameter_without_inventing_an_inhabitant()
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(report.residual_metavariables.len(), 1);
     let id = &report.residual_metavariables[0];
     let ExprNode::ForallE {
@@ -504,7 +504,7 @@ fn distinct_heads_share_one_typed_residual_and_check_both_assignments() {
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
         assert_eq!(report.expression_assignments.len(), 2);
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
         assert!(!txn.mvars.is_assigned(&residual));
@@ -546,7 +546,7 @@ fn distinct_arities_and_permuted_intersections_rebind_each_function_separately()
             (left, right)
         };
         let report = txn.unify(&left, &right, budget()).unwrap();
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         assert_eq!(report.residual_metavariables.len(), 1);
         let residual = report.residual_metavariables[0].clone();
         txn.unify(
@@ -624,7 +624,7 @@ fn subsequent_equations_can_prune_the_shared_residual_again() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments.len(), 3);
-    assert_eq!(report.kernel_checks, 3);
+    assert_eq!(report.kernel_checks, 6);
     assert_eq!(report.residual_metavariables.len(), 1);
     let residual = report.residual_metavariables[0].clone();
     assert_eq!(txn.mvars.get_decl(&residual).unwrap().type_, nat());
@@ -659,7 +659,7 @@ fn different_captured_contexts_are_not_silently_merged() {
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     let residual = report.residual_metavariables[0].clone();
     assert!(txn.mvars.get_decl(&residual).unwrap().lctx.is_empty());
     let before = txn.clone();
@@ -774,7 +774,7 @@ fn shared_residual_depth_preserves_the_stricter_parent_scope() {
         let depth = left_depth.min(right_depth);
         let residual = report.residual_metavariables[0].clone();
         assert_eq!(txn.mvars.get_decl(&residual).unwrap().depth, depth);
-        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.kernel_checks, 4);
         if depth > 0 {
             let before = txn.clone();
             limits.max_metavar_depth = depth - 1;
@@ -810,7 +810,7 @@ fn distinct_heads_retain_a_dependent_result_parameter_in_the_shared_telescope() 
             budget(),
         )
         .unwrap();
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert_eq!(report.residual_metavariables.len(), 1);
     let residual = &report.residual_metavariables[0];
     let ExprNode::ForallE {

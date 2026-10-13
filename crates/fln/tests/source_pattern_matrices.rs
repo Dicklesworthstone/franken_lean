@@ -112,31 +112,38 @@ fn row_bindings_are_simultaneous_even_when_names_swap() {
 const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n";
 #[test]
 fn nested_fixed_index_patterns_prune_only_proved_impossible_branches() {
+    // The index fields are `_`: a named one against the fixed `2` is the pin's "Type mismatch"
+    // (2026-10-10; source_pattern_typing.rs).
     check(&format!(
         "{VEC}
       def second (xs : Vec Nat 2) : Nat := match xs with
-      | .cons k x (.cons j y rest) => y
+      | .cons _ x (.cons _ y rest) => y
       theorem value : second (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 9 := by rfl"
     ));
 }
 #[test]
 fn dependent_discriminants_refine_each_others_types() {
+    // One column names its index field: with both named, the pin refuses the match ("Type
+    // mismatch", 2026-10-10; source_pattern_typing.rs).
     check(&format!(
         "{VEC}
       def sumHeads (n : Nat) (xs ys : Vec Nat n) : Nat := match xs, ys with
       | .nil, .nil => 0
-      | .cons k x xt, .cons j y yt => x + y
+      | .cons k x xt, .cons _ y yt => x + y
       theorem nils : sumHeads 0 Vec.nil Vec.nil = 0 := by rfl
       theorem heads : sumHeads 1 (Vec.cons 0 7 Vec.nil) (Vec.cons 0 9 Vec.nil) = 16 := by rfl"
     ));
 }
 #[test]
 fn a_prior_scalar_column_refines_a_later_indexed_column() {
+    // The cons row's index field is `_`: named, `Vec (j + 1)` against `Vec (k + 1)` is a
+    // mismatch of two pattern variables at the pin ("Type mismatch", 2026-10-10;
+    // source_pattern_typing.rs).
     check(&format!(
         "{VEC}
       def first (n : Nat) (xs : Vec Nat n) : Nat := match n, xs with
       | .zero, .nil => 0
-      | .succ k, .cons j x tail => x
+      | .succ k, .cons _ x tail => x
       theorem empty : first 0 Vec.nil = 0 := by rfl
       theorem value : first 1 (Vec.cons 0 7 Vec.nil) = 7 := by rfl"
     ));

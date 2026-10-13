@@ -81,7 +81,7 @@ fn typing_survives_leaving_the_original_local_context() {
         .solve_constraints_with(&[id], budget(), &|| false)
         .unwrap();
     assert_eq!(report.solved, vec![id]);
-    assert_eq!(report.unification.kernel_checks, 1);
+    assert_eq!(report.unification.kernel_checks, 2);
     assert!(tx.lctx.is_empty());
 }
 #[test]
@@ -102,7 +102,7 @@ fn sibling_contexts_with_reused_local_ids_are_not_conflated() {
             .solve_constraints_with(&selected, budget(), &|| false)
             .unwrap();
         assert_eq!(report.solved, vec![first, second]);
-        assert_eq!(report.unification.kernel_checks, 2);
+        assert_eq!(report.unification.kernel_checks, 4);
         assert!(tx.lctx.is_empty());
     }
 }

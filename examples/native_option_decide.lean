@@ -1,6 +1,6 @@
 -- The candidate is admitted by the native source seed. Register its ordinary
 -- instance metadata explicitly; no kernel axiom or trusted host comparison.
-attribute [instance] instDecidableEqOption
+attribute [instance] Option.instDecidableEq
 
 theorem option_same : (Option.some 0 : Option Nat) = Option.some 0 := by decide
 theorem option_different : Not ((Option.some 0 : Option Nat) = Option.some 1) := by decide

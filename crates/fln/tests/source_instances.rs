@@ -20,7 +20,7 @@ fn engine() -> Engine {
 }
 fn checked(base: &Engine, text: &str) -> Engine {
     base.check_source_files(&[text.as_bytes()], &KVMap::new(), limits())
-        .unwrap()
+        .unwrap_or_else(|error| panic!("{text}\n{error:?}"))
         .into_complete()
         .unwrap()
         .engine
@@ -323,8 +323,16 @@ fn named_instance_syntax_is_canonical_and_lossless_and_bounded() {
         assert_eq!(command.syntax(), parsed.syntax());
         assert!(command.query_term_normalized().is_none());
     }
+    // An anonymous instance is named by the pin's generator (`mkInstanceName`).
+    assert!(matches!(
+        engine().check_source_files(
+            &[b"instance : Inhabited Nat := Inhabited.mk 1".as_slice()],
+            &KVMap::new(),
+            limits()
+        ),
+        Ok(fln::Outcome::Complete(_))
+    ));
     for source in [
-        "instance : Inhabited Nat := Inhabited.mk 1",
         "instance (priority := -1) x : Inhabited Nat := Inhabited.mk 1",
         "instance (priority := 4294967296) x : Inhabited Nat := Inhabited.mk 1",
     ] {
@@ -550,4 +558,115 @@ fn dictionary_rewriting_uses_local_precedence_without_guessing_from_occurrences(
         .is_err()
     );
     assert_eq!(before, base.logical_root(&KVMap::new()));
+}
+
+/// Anonymous instances get the pin's generated names (`mkInstanceName`,
+/// `Lean/Elab/DeclNameGen.lean`): type heads in order, `Of…` for each binder the type
+/// does not mention, the current namespace's constants omitted, and `_1`, … while a name
+/// is taken. Every name below is the one the pinned Reference generates for this source;
+/// a wrong one is an unknown identifier in the `example` that uses it.
+#[test]
+fn anonymous_instances_receive_the_pins_generated_names() {
+    let source = "class Shape (α : Type) where
+  area : α → Nat
+structure Sq where
+  s : Nat
+instance : Shape Sq := ⟨fun q => q.s⟩
+instance : Shape (List Sq) := ⟨fun _ => 0⟩
+instance : Inhabited Sq := ⟨⟨1⟩⟩
+instance : Inhabited Sq := ⟨⟨2⟩⟩
+class Foo (α : Type) (n : Nat) where
+  x : Nat
+instance {α : Type} [Inhabited α] : Foo (List α) 3 := ⟨1⟩
+instance (n : Nat) : Foo Sq n := ⟨n⟩
+namespace Sq
+instance : Shape (Option Sq) := ⟨fun _ => 0⟩
+end Sq
+example : Shape Sq := instShapeSq
+example : Shape (List Sq) := instShapeListSq
+example : Inhabited Sq := instInhabitedSq_1
+example : Foo (List Nat) 3 := instFooListOfNatNatOfInhabited
+example : Foo Sq 4 := instFooSq 4
+example : Shape (Option Sq) := Sq.instShapeOption
+";
+    let result = engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
+    assert!(
+        matches!(result, Ok(fln::Outcome::Complete(_))),
+        "{result:?}"
+    );
+}
+
+/// The pin's tests/elab/509.lean, with its notation expanded. Matching
+/// foo.has_note2 requires solving the candidate's function-valued dictionary
+/// before a stuck parent-class projection can reduce.
+const INHERITED_FUNCTION_INSTANCES: &str = r#"
+class has_note (M : Type) where
+  note : M
+class has_note2 (M : Type) extends has_note M
+variable {ι : Type} (β : ι → Type)
+structure foo [∀ i, has_note (β i)] : Type where
+  to_fun : ∀ i, β i
+instance foo.has_note [∀ i, has_note (β i)] : has_note (foo (fun i => β i)) where
+  note := { to_fun := fun _ => has_note.note }
+instance foo.has_note2 [∀ i, has_note2 (β i)] : has_note2 (foo (fun i => β i)) where
+  note := has_note.note
+variable (α : Type) (M : Type)
+structure bar [has_note M] where
+  to_fun : α → M
+instance bar.has_note [has_note M] : has_note (bar α M) where
+  note := { to_fun := fun _ => has_note.note }
+instance bar.has_note2 [has_note2 M] : has_note2 (bar α M) where
+  note := has_note.note
+"#;
+
+#[test]
+fn higher_order_instance_projection_constraints_synthesize_the_candidate_dictionary() {
+    let base = checked(&engine(), INHERITED_FUNCTION_INSTANCES);
+    // The explicit candidate already works. The search must find that same
+    // checked dictionary instead of abandoning its unresolved projection.
+    let base = checked(
+        &base,
+        r#"def explicit {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := foo.has_note2 _"#,
+    );
+    let result = checked(
+        &base,
+        r#"def inferred {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance
+theorem same {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  inferred β M = explicit β M := by rfl"#,
+    );
+    let Some(ConstantInfo::Defn(definition)) = result.environment().find(&n("inferred")) else {
+        panic!("instance synthesis must publish the checked definition");
+    };
+    assert!(has_constant(&definition.value, &n("foo.has_note2")));
+    assert!(has_constant(&definition.value, &n("bar.has_note2")));
+}
+
+#[test]
+fn higher_order_instance_projection_failures_preserve_the_environment_and_recover() {
+    let base = checked(&engine(), INHERITED_FUNCTION_INSTANCES);
+    let before = base.logical_root(&KVMap::new());
+    // A parent dictionary cannot supply the stronger child class. A solved
+    // candidate from an earlier command must not escape a later refusal.
+    let source = r#"def provisional {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance
+def rejected {ι : Type} (β : ι → Type) (M : Type) [has_note M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance"#;
+    let error = base
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .expect_err("a missing child instance must remain a real synthesis failure");
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
+    assert!(
+        matches!(error, fln::SourceCheckError::Command { command: 1, .. }),
+        "the valid earlier command must complete before the missing-instance refusal: {error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+    assert!(!base.environment().contains(&n("provisional")));
+    assert!(!base.environment().contains(&n("rejected")));
+    checked(
+        &base,
+        r#"def recovered {ι : Type} (β : ι → Type) (M : Type) [has_note2 M] :
+  has_note2 (foo (fun (i : ι) => bar (β i) M)) := inferInstance"#,
+    );
 }

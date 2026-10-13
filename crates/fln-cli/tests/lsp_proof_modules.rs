@@ -140,6 +140,31 @@ fn errors<'a>(messages: &'a [String], uri: &str) -> Vec<&'a str> {
 }
 
 #[test]
+fn module_prelude_editor_checks_use_an_unseeded_session_and_recover() {
+    let uri = "untitled:PrivateModule.lean";
+    let seeded = "def answer : Nat := 42";
+    let private = "module\nprelude\ndef identity.{u} {A : Sort u} (x : A) : A := x\ndef use.{u} {A : Sort u} (x : A) : A := identity x";
+    let messages = fln(&[
+        open(uri, seeded),
+        wait(uri, 1, 31),
+        change(uri, 2, "module\nprelude\ndef seedLeak : Nat := 42"),
+        wait(uri, 2, 32),
+        change(uri, 3, private),
+        wait(uri, 3, 33),
+        change(uri, 4, seeded),
+        wait(uri, 4, 34),
+    ]);
+    let successful = successes(&messages);
+    assert_eq!(successful.len(), 3, "{messages:#?}");
+    assert!(successful[1].contains("\"commands\":2"), "{messages:#?}");
+    assert!(
+        successful[2].contains("\"reusedModules\":1"),
+        "{messages:#?}"
+    );
+    assert_eq!(errors(&messages, uri).len(), 1, "{messages:#?}");
+}
+
+#[test]
 fn both_installed_server_doors_check_proofs_records_and_registered_simp() {
     let source = "namespace Library\n@[simp] def wrap (n : Nat) : Nat := n\ntheorem checked (n : Nat) : wrap n = n := by simp\nend Library\nstructure Box where\n  value : Nat\ndef boxed : Box := { value := 7 }\ntheorem field : boxed.value = 7 := by rfl";
     for (binary, args) in [

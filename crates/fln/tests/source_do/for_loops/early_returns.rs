@@ -82,9 +82,9 @@ fn nested_do_returns_and_completed_loops_do_not_exit_the_outer_do() {
         &state_engine(),
         r#"
 def nested (flag : Bool) : State Nat := do
-  let n <- do
+  let n <- (do
     if flag then return 7
-    return 8
+    return 8)
   for x in items do mark x
   if n == 7 then return 3
   mark 9
@@ -163,17 +163,17 @@ fn early_returns_execute_lazily_on_golem() {
 fn nested_inference_retains_result_constraints_across_completed_loops() {
     let base = state_engine();
     for source in [
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    if b then return 7\n    return 8\n  for x in items do mark x\n  if n == 7 then return 3\n  mark 9\n  return 4",
-        "def f (b : Bool) : State Nat := do\n  let n : Nat <- do\n    if b then return 7\n    return 8\n  for x in items do mark x\n  if n == 7 then return 3\n  mark 9\n  return 4",
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    return 8\n  for x in items do mark x\n  if n == 7 then mark 3\n  mark 9\n  return 4",
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    if b then return 7\n    return 8\n  for x in items do mark x\n  if n == 7 then return 3\n  return 4",
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    return 8\n  return n",
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    if b then return 7\n    return 8\n  return n",
-        "def f (b : Bool) : State Nat := do\n  let n : Nat <- do\n    if b then return 7\n    return 8\n  return n",
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    if b then return 7\n    return 8\n  for x in items do mark x\n  return n",
-        "def f (b : Bool) : State Nat := do\n  let n : Nat <- do\n    if b then return 7\n    return 8\n  for x in items do mark x\n  return n",
-        "def f (b : Bool) : State Nat := do\n  let n <- do\n    if b then return 7\n    return 8\n  if n == 7 then return 3\n  return 4",
-        "def f (b : Bool) : State Nat := do\n  let n : Nat <- do\n    if b then return 7\n    return 8\n  if n == 7 then return 3\n  return 4",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    if b then return 7\n    return 8)\n  for x in items do mark x\n  if n == 7 then return 3\n  mark 9\n  return 4",
+        "def f (b : Bool) : State Nat := do\n  let n : Nat <- (do\n    if b then return 7\n    return 8)\n  for x in items do mark x\n  if n == 7 then return 3\n  mark 9\n  return 4",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    return 8)\n  for x in items do mark x\n  if n == 7 then mark 3\n  mark 9\n  return 4",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    if b then return 7\n    return 8)\n  for x in items do mark x\n  if n == 7 then return 3\n  return 4",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    return 8)\n  return n",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    if b then return 7\n    return 8)\n  return n",
+        "def f (b : Bool) : State Nat := do\n  let n : Nat <- (do\n    if b then return 7\n    return 8)\n  return n",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    if b then return 7\n    return 8)\n  for x in items do mark x\n  return n",
+        "def f (b : Bool) : State Nat := do\n  let n : Nat <- (do\n    if b then return 7\n    return 8)\n  for x in items do mark x\n  return n",
+        "def f (b : Bool) : State Nat := do\n  let n <- (do\n    if b then return 7\n    return 8)\n  if n == 7 then return 3\n  return 4",
+        "def f (b : Bool) : State Nat := do\n  let n : Nat <- (do\n    if b then return 7\n    return 8)\n  if n == 7 then return 3\n  return 4",
     ] {
         checked(&base, source);
     }

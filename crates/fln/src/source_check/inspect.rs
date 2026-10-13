@@ -96,11 +96,10 @@ pub(super) fn module(
         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
     };
-    let environment = prefix.checked.checked.engine.environment();
     // Replaying controls against the final environment moves every scoped
     // activation after later global registrations and loses checked variables.
     // The successful prefix (including a cache hit) owns the exact lexical state.
-    let scope = prefix.checked.checked.scope.clone();
+    let mut scope = prefix.checked.checked.scope.clone();
     let mut observation = None;
     if let Some((command_index, (_, command))) = selected {
         let control = fln_parse::command_scope::parse(command).map_err(|error| {
@@ -123,21 +122,88 @@ pub(super) fn module(
                     },
                 }
             })?;
+            scope = scope.for_declaration(parsed.syntax()).map_err(|error| {
+                SourceModuleCheckError::Source {
+                    module: entry.clone(),
+                    error: SourceCheckError::Command {
+                        file: 0,
+                        command: command_index,
+                        offset: prefix_end,
+                        error: Box::new(EngineExecutionError::Frontend(
+                            DefinitionFrontendError::Elaborate(error),
+                        )),
+                    },
+                }
+            })?;
+            let public_theorem =
+                scope.exports_declaration() && fln_elab::source::is_theorem(parsed.syntax());
+            let public_instance =
+                scope.exports_declaration() && fln_elab::source::is_instance(parsed.syntax());
+            let private_scope = scope.clone();
+            let environment = if scope.exports_declaration() {
+                scope.instance_scopes = prefix
+                    .checked
+                    .public_scope
+                    .as_ref()
+                    .ok_or_else(|| {
+                        scope_error("checked public scope prefix is unavailable for inspection")
+                    })?
+                    .instance_scopes
+                    .clone();
+                prefix.checked.public_environment.as_ref().ok_or_else(|| {
+                    scope_error("checked public source prefix is unavailable for inspection")
+                })?
+            } else {
+                prefix.checked.checked.engine.environment()
+            };
             // A CR removed by CRLF normalization has no parser coordinate.
             if let Some(position) = parsed
                 .source_view()
                 .from_original(fln_parse::BytePos(offset - prefix_end))
             {
-                let inspected =
-                    source_records::elaboration_outcome(fln_elab::source::inspect::declaration(
+                let mut private_instance_body = false;
+                let observed = if public_instance {
+                    fln_elab::source::inspect::public_instance(
+                        parsed.syntax(),
+                        &fln_elab::source::TheoremWorlds {
+                            public: environment,
+                            private: prefix.checked.checked.engine.environment(),
+                            public_scope: &scope,
+                            private_scope: &private_scope,
+                        },
+                        limits.source.admission.kernel,
+                        position.0,
+                        kind,
+                    )
+                    .map(|inspected| {
+                        private_instance_body = inspected.private_body;
+                        inspected.observation
+                    })
+                } else if public_theorem {
+                    fln_elab::source::inspect::public_theorem(
+                        parsed.syntax(),
+                        &fln_elab::source::TheoremWorlds {
+                            public: environment,
+                            private: prefix.checked.checked.engine.environment(),
+                            public_scope: &scope,
+                            private_scope: &private_scope,
+                        },
+                        limits.source.admission.kernel,
+                        position.0,
+                        kind,
+                    )
+                } else {
+                    fln_elab::source::inspect::declaration(
                         parsed.syntax(),
                         environment,
                         limits.source.admission.kernel,
                         &scope,
                         position.0,
                         kind,
-                    ))
-                    .map_err(|error| SourceModuleCheckError::Source {
+                    )
+                };
+                let inspected = source_records::elaboration_outcome(observed).map_err(|error| {
+                    SourceModuleCheckError::Source {
                         module: entry.clone(),
                         error: SourceCheckError::Command {
                             file: 0,
@@ -145,7 +211,8 @@ pub(super) fn module(
                             offset: prefix_end,
                             error: Box::new(error),
                         },
-                    })?;
+                    }
+                })?;
                 observation = match inspected {
                     Outcome::Complete(observation) => observation,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -166,6 +233,14 @@ pub(super) fn module(
                                 .source_view()
                                 .to_original(fln_parse::BytePos(range.end))
                                 .0;
+                }
+                if private_instance_body
+                    || (public_theorem
+                        && fln_parse::command_scope::modifiers::theorem_body_start(command)
+                            .map_err(|error| scope_error(&error.to_string()))?
+                            .is_some_and(|body| offset - prefix_end >= body))
+                {
+                    scope.instance_scopes = private_scope.instance_scopes;
                 }
             }
         }

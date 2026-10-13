@@ -10,6 +10,7 @@
 pub mod attach;
 pub mod hygiene;
 pub mod literal;
+pub mod pin_syntax;
 pub mod recover;
 pub mod rope;
 pub mod run;

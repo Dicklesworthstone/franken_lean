@@ -40,7 +40,7 @@ def unpack (package : Package) : package.carrier := by
   | mk carrier value => exact value
 
 def packed : Package := { carrier := Nat, value := 31 }
-theorem unpack_ok : unpack packed = 31 := by rfl
+theorem unpack_ok : unpack packed = (31 : Nat) := by rfl
 
 theorem by_cases (b : Bool) : b = b := by
   cases b with

@@ -9,8 +9,10 @@ The logical declarations and both admission engines are unchanged.
 
 `examples/native_mutual_indexed.lean` maps an index-preserving transformation
 over a mutually recursive Tree/Forest group, returns newly constructed owned
-objects, and sums the result to 42. Installed tests exercise both `fln run` and
-`lean`, imported modules, deterministic recovery, and independent FLBC replay.
+objects, and sums the result to 42 under a `frontier` engine, as the `fln` runtime
+tests run it. The pin refuses it (an application type mismatch at line 11,
+`franken_lean-z8j.1.6.3`), and the installed `fln run` and `lean` refuse it in the
+default mode because it applies `Forest.rec` directly (`franken_lean-z8j.1.6.6`).
 
 ## Per-member layouts and recursive interfaces
 

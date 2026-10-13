@@ -563,19 +563,29 @@ impl Context {
         if evidence.clash {
             return self.close_proof_goal(goal, evidence.proof);
         }
-        if labels.len() > evidence.relations.len() {
-            return Err(error(TacticError::EliminationArity));
+        // Names go, in order, to the equations the pin makes: never to a proof field's
+        // (as in `inject_named_proof_goal`).
+        let named = evidence
+            .relations
+            .iter()
+            .filter(|type_| !super::equality::proof_equation(type_))
+            .count();
+        if labels.len() > named {
+            return Err(error(TacticError::InjectionUnusedNames {
+                unused: labels[named..].to_vec(),
+            }));
         }
         if evidence.relations.is_empty() {
             return Err(error(TacticError::ConstructorEquality));
         }
+        let mut next = labels.iter();
         let mut locals = Vec::new();
-        for (index, type_) in evidence.relations.into_iter().enumerate() {
+        for type_ in evidence.relations {
+            let proof = super::equality::proof_equation(&type_);
             let mut local = self.equality_local(type_)?;
-            local.user_name = labels
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| local.user_name.clone());
+            if !proof && let Some(label) = next.next() {
+                local.user_name = label.clone();
+            }
             locals.push(local);
         }
         let continuation_type =

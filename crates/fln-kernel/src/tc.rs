@@ -39,6 +39,151 @@ use fln_env::environment::Environment;
 
 use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
 
+/// Deterministic multiplicative hasher for the kernel's internal maps.
+///
+/// `std`'s default `RandomState` runs SipHash-1-3 under per-process random
+/// seeds. Measured on the release corpus replay (bead
+/// `franken_lean-z8j.1.13`, comment 3322), that hashing was 29% of kernel
+/// wall clock — more than the whnf/defeq/infer decision logic combined — and
+/// the randomization buys nothing HERE: every hot key's entropy source is
+/// the pin-faithful packed structural hash or an allocation address, and the
+/// structural hash is attacker-predictable by construction (the pin computes
+/// it identically), so an adversarial artifact can already choose colliding
+/// KEYS below any seeding of the table's slot function. The honest claim is
+/// PARITY WITH THE PIN, not a bound (corrected per the slice-A review,
+/// z8j.1.13 comment 3324): hashbrown's probing is not step-metered, so a
+/// slot-collision flood degrades probes rather than converting to a typed
+/// outcome — the worst case is bounded only by steps times table occupancy,
+/// and a fixed multiply-fold additionally lets low-bit-colliding structural
+/// hashes share a probe start, where the exact-key caps do not apply. The
+/// pin's kernel caches are unseeded `std::unordered_map` over the same
+/// deterministic expression hash, uncapped (vendor `expr_maps.h`), so
+/// nothing here is weaker than the surface being mirrored. A fixed hasher
+/// also removes per-process seed state from the kernel, so two runs of one
+/// input probe identically.
+///
+/// The mixer is the word-at-a-time rotate/multiply fold rustc's FxHash uses,
+/// chosen for measured cheapness on small integer keys; it is a performance
+/// surface only. Correctness never depends on its distribution: every map
+/// lookup still compares full keys on candidate slots, so a poor mix can
+/// cost steps and wall, never an answer.
+///
+/// Private to `fln_kernel` by design: the independent checker must not share
+/// this code (the dual-engine argument depends on not sharing it), and
+/// nothing outside the kernel can observe it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DetHashState;
+
+pub(crate) struct DetHasher {
+    hash: u64,
+}
+
+const DET_HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+
+impl DetHasher {
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(DET_HASH_MULTIPLIER);
+    }
+}
+
+impl std::hash::Hasher for DetHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.add(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(tail) ^ rest.len() as u64);
+        }
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
+
+impl std::hash::BuildHasher for DetHashState {
+    type Hasher = DetHasher;
+
+    fn build_hasher(&self) -> DetHasher {
+        DetHasher { hash: 0 }
+    }
+}
+
+/// Kernel-internal map on the deterministic hasher. Hit and miss are decided
+/// by key equality, never by the hasher, so this alias changes cost and
+/// nothing else.
+pub(crate) type KMap<K, V> = HashMap<K, V, DetHashState>;
+
+/// Per-check hash-consing table (plan §7.1b, bead `franken_lean-z8j.1.13`
+/// slice B): one retained allocation per structural identity among the terms
+/// this checker REBUILDS. Decoded terms already arrive maximally shared
+/// (measured: unique allocations equal distinct structures on every probed
+/// module), so the duplication this table removes is exactly the checker's
+/// own — equal results built by separate reductions. Interning after
+/// construction is deliberate: a duplicate's children are already interned,
+/// so dropping the duplicate decrements refcounts without a cascade, and
+/// every later comparison against the retained copy short-circuits on
+/// allocation identity. Bucket candidates verify with full structural
+/// equality (binder names and mdata included, as §7.1b requires), so a
+/// data-word collision costs a compare, never an answer.
+///
+/// The table lives and dies with one `TypeChecker`: nothing it retains
+/// outlives the check, and growth is bounded by the step budget every
+/// constructing operation already charges (§8.2c).
+struct Interner {
+    table: KMap<u64, Vec<Expr>>,
+    hits: u64,
+    misses: u64,
+}
+
+impl Interner {
+    fn new() -> Self {
+        Self {
+            table: KMap::default(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// The retained representative of `e`'s structural identity class.
+    fn intern(&mut self, e: Expr) -> Expr {
+        let bucket = self.table.entry(e.data().0).or_default();
+        for candidate in bucket.iter() {
+            if *candidate == e {
+                self.hits += 1;
+                return candidate.clone();
+            }
+        }
+        self.misses += 1;
+        bucket.push(e.clone());
+        e
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+}
+
 /// Internal control flow: a real rejection or a budget stop. Never observable
 /// outside `check`/`check_defeq`, which convert to [`Verdict`].
 #[derive(Debug)]
@@ -199,17 +344,26 @@ struct LocalDecl {
 /// so the no-aliasing property this function exists to preserve holds in the
 /// degraded mode too, while ordinary large terms keep their cache rows
 /// instead of poisoning a permanent refusal key (bead `franken_lean-shgs`).
+/// Buckets are `Vec`s under the same `TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES`
+/// cap the old inline `[Option<Expr>; 64]` arrays enforced — the array form
+/// put a 1,024-byte value behind every first-seen packed word (one slot
+/// typically occupied), so map growth memmoved kilobytes per rehash and the
+/// admit scan walked 64 slots regardless of occupancy; measured at 4.4% of
+/// replay wall in the post-slice-C profile (bead `franken_lean-z8j.1.13`,
+/// comment 3336). Capacity, fill order and the degraded transition are
+/// unchanged: a bucket at the cap flips `degraded` exactly where a fully
+/// occupied array did.
 struct DependencyScanSeen {
-    structural: HashMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
-    allocations: HashMap<usize, ()>,
+    structural: KMap<u64, Vec<Expr>>,
+    allocations: KMap<usize, ()>,
     degraded: bool,
 }
 
 impl DependencyScanSeen {
     fn new() -> Self {
         Self {
-            structural: HashMap::new(),
-            allocations: HashMap::new(),
+            structural: KMap::default(),
+            allocations: KMap::default(),
             degraded: false,
         }
     }
@@ -219,24 +373,15 @@ impl DependencyScanSeen {
     /// hash bucket ran out of slots.
     fn admit(&mut self, current: &Expr) -> Option<Expr> {
         if !self.degraded {
-            let bucket = self
-                .structural
-                .entry(current.data().0)
-                .or_insert_with(|| std::array::from_fn(|_| None));
-            if let Some(earlier) = bucket
-                .iter()
-                .flatten()
-                .find(|candidate| *candidate == current)
-            {
+            let bucket = self.structural.entry(current.data().0).or_default();
+            if let Some(earlier) = bucket.iter().find(|candidate| *candidate == current) {
                 return Some(earlier.clone());
             }
-            match bucket.iter_mut().find(|candidate| candidate.is_none()) {
-                Some(vacant) => {
-                    *vacant = Some(current.clone());
-                    return None;
-                }
-                None => self.degraded = true,
+            if bucket.len() < TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
+                bucket.push(current.clone());
+                return None;
             }
+            self.degraded = true;
         }
         let was_present = self
             .allocations
@@ -269,8 +414,8 @@ impl DependencyScanSeen {
 /// memo stays bounded.
 #[derive(Default)]
 struct FreeVars {
-    rows: HashMap<usize, (Expr, Rc<[u32]>)>,
-    index: HashMap<FVarId, u32>,
+    rows: KMap<usize, (Expr, Rc<[u32]>)>,
+    index: KMap<FVarId, u32>,
     ids: Vec<FVarId>,
 }
 
@@ -416,7 +561,7 @@ enum DependencyScanRefusal {
 
 impl DependencyScanRefusal {
     /// `true` while this row must still suppress reuse in this context.
-    fn blocks(&self, local_positions: &HashMap<FVarId, usize>) -> bool {
+    fn blocks(&self, local_positions: &KMap<FVarId, usize>) -> bool {
         match self {
             Self::Permanent | Self::CellCap => true,
             Self::MissingFvar(id) => !local_positions.contains_key(id),
@@ -429,7 +574,7 @@ impl DependencyScanRefusal {
 fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
-    seen_ids: &mut HashMap<u32, ()>,
+    seen_ids: &mut KMap<u32, ()>,
     scan: (&mut FreeVars, &mut DependencyScanSeen),
     nodes_left: &mut usize,
 ) -> bool {
@@ -457,13 +602,13 @@ fn collect_fvar_ids(
 fn local_dependencies(
     expressions: &[&Expr],
     locals: &[LocalDecl],
-    local_positions: &HashMap<FVarId, usize>,
+    local_positions: &KMap<FVarId, usize>,
     free_vars: &mut FreeVars,
     nodes_left: &mut usize,
 ) -> Result<Vec<LocalDependency>, DependencyScanRefusal> {
     free_vars.start_scan();
     let mut ids = Vec::new();
-    let mut seen_ids = HashMap::new();
+    let mut seen_ids = KMap::default();
     let mut seen_nodes = DependencyScanSeen::new();
     for expression in expressions {
         let scan = (&mut *free_vars, &mut seen_nodes);
@@ -519,7 +664,7 @@ fn local_dependencies(
 fn dependencies_are_live(
     dependencies: &[LocalDependency],
     locals: &[LocalDecl],
-    local_positions: &HashMap<FVarId, usize>,
+    local_positions: &KMap<FVarId, usize>,
 ) -> bool {
     dependencies.iter().all(|dependency| {
         local_positions
@@ -543,7 +688,7 @@ fn dependencies_are_present(dependencies: &[LocalDependency], locals: &[LocalDec
 /// generation is never reused, so such a row can never be live again: it only
 /// holds dependency cells. Returns the rows and cells removed.
 fn remove_dead_rows<K, E>(
-    buckets: &mut HashMap<K, Vec<E>>,
+    buckets: &mut KMap<K, Vec<E>>,
     locals: &[LocalDecl],
     dependencies: impl Fn(&E) -> &[LocalDependency],
 ) -> (usize, usize) {
@@ -581,12 +726,12 @@ struct ExprResultCacheEntry {
 type ExprResultCrossScopeEntry = (Expr, usize);
 
 struct ExprResultCache {
-    buckets: HashMap<(u64, usize), Vec<ExprResultCacheEntry>>,
-    cross_scope: HashMap<u64, Vec<ExprResultCrossScopeEntry>>,
+    buckets: KMap<(u64, usize), Vec<ExprResultCacheEntry>>,
+    cross_scope: KMap<u64, Vec<ExprResultCrossScopeEntry>>,
     priority_results: Vec<ExprResultCacheEntry>,
-    priority_scan_refusals: HashMap<(u64, usize), DependencyScanRefusal>,
+    priority_scan_refusals: KMap<(u64, usize), DependencyScanRefusal>,
     cross_scope_entries: usize,
-    dependency_scan_refusals: HashMap<(u64, usize), DependencyScanRefusal>,
+    dependency_scan_refusals: KMap<(u64, usize), DependencyScanRefusal>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -618,12 +763,12 @@ impl ExprResultCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            buckets: HashMap::new(),
-            cross_scope: HashMap::new(),
+            buckets: KMap::default(),
+            cross_scope: KMap::default(),
             priority_results: Vec::new(),
-            priority_scan_refusals: HashMap::new(),
+            priority_scan_refusals: KMap::default(),
             cross_scope_entries: 0,
-            dependency_scan_refusals: HashMap::new(),
+            dependency_scan_refusals: KMap::default(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -643,7 +788,7 @@ impl ExprResultCache {
         &self,
         key: &Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) -> Option<Expr> {
         if let Some(value) = self.priority_results.iter().find_map(|entry| {
             (entry.key == *key
@@ -721,7 +866,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         self.insert_with_collision_policy(key, value, locals, local_positions, false);
     }
@@ -735,7 +880,7 @@ impl ExprResultCache {
         &mut self,
         identity: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         let lookup = identity.clone();
         self.insert_with_collision_policy(
@@ -759,7 +904,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         self.insert(key.clone(), value.clone(), locals, local_positions);
         if self.get(&key, locals, local_positions).is_none() {
@@ -772,7 +917,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         let mut removed_cells = 0_usize;
         self.priority_results.retain(|entry| {
@@ -864,7 +1009,7 @@ impl ExprResultCache {
         key: Expr,
         value: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
         replace_collision: bool,
     ) {
         self.inserts_since_reclaim = self.inserts_since_reclaim.saturating_add(1);
@@ -1067,10 +1212,10 @@ impl ExprResultCache {
 }
 
 struct PositiveDefEqCache {
-    buckets: HashMap<(u64, u64, usize), Vec<PositiveDefEqCacheEntry>>,
-    cross_scope: HashMap<(u64, u64), Vec<PositiveDefEqCrossScopeEntry>>,
+    buckets: KMap<(u64, u64, usize), Vec<PositiveDefEqCacheEntry>>,
+    cross_scope: KMap<(u64, u64), Vec<PositiveDefEqCrossScopeEntry>>,
     cross_scope_entries: usize,
-    dependency_scan_refusals: HashMap<(u64, u64, usize), DependencyScanRefusal>,
+    dependency_scan_refusals: KMap<(u64, u64, usize), DependencyScanRefusal>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -1100,10 +1245,10 @@ impl PositiveDefEqCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            buckets: HashMap::new(),
-            cross_scope: HashMap::new(),
+            buckets: KMap::default(),
+            cross_scope: KMap::default(),
             cross_scope_entries: 0,
-            dependency_scan_refusals: HashMap::new(),
+            dependency_scan_refusals: KMap::default(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -1135,7 +1280,7 @@ impl PositiveDefEqCache {
         left: &Expr,
         right: &Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) -> bool {
         let matches = |bucket: &Vec<PositiveDefEqCacheEntry>| {
             bucket.iter().any(|entry| {
@@ -1227,7 +1372,7 @@ impl PositiveDefEqCache {
         left: Expr,
         right: Expr,
         locals: &[LocalDecl],
-        local_positions: &HashMap<FVarId, usize>,
+        local_positions: &KMap<FVarId, usize>,
     ) {
         self.inserts_since_reclaim = self.inserts_since_reclaim.saturating_add(1);
         if (left.has_fvar() || right.has_fvar())
@@ -1426,7 +1571,7 @@ type InstantiateCacheKey = (u64, u32, u64);
 type InstantiateCacheEntry = (Expr, u32, Expr, Expr);
 
 struct InstantiateCache {
-    buckets: HashMap<InstantiateCacheKey, Vec<InstantiateCacheEntry>>,
+    buckets: KMap<InstantiateCacheKey, Vec<InstantiateCacheEntry>>,
     entries: usize,
     max_entries: usize,
     max_bucket_entries: usize,
@@ -1442,7 +1587,7 @@ impl InstantiateCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: KMap::default(),
             entries: 0,
             max_entries,
             max_bucket_entries,
@@ -1500,7 +1645,7 @@ type InstantiateRevCacheKey = (u64, u32);
 type InstantiateRevCacheEntry = (Expr, u32, Expr);
 
 struct InstantiateRevCache {
-    buckets: HashMap<InstantiateRevCacheKey, Vec<InstantiateRevCacheEntry>>,
+    buckets: KMap<InstantiateRevCacheKey, Vec<InstantiateRevCacheEntry>>,
     entries: usize,
     max_entries: usize,
     max_bucket_entries: usize,
@@ -1509,7 +1654,7 @@ struct InstantiateRevCache {
 impl InstantiateRevCache {
     fn new() -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: KMap::default(),
             entries: 0,
             max_entries: TYPE_CHECKER_CACHE_MAX_ENTRIES,
             max_bucket_entries: TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
@@ -1561,9 +1706,9 @@ struct InstantiateRevContext {
 /// reuse results reached from a different top-level body under that vector.
 /// Full structural equality is the authority after every packed prefilter.
 struct InstantiateRevContextCache {
-    contexts: HashMap<(u64, usize), Vec<InstantiateRevContext>>,
+    contexts: KMap<(u64, usize), Vec<InstantiateRevContext>>,
     context_count: usize,
-    results: HashMap<(u32, u64, u32), Vec<(Expr, Expr)>>,
+    results: KMap<(u32, u64, u32), Vec<(Expr, Expr)>>,
     entries: usize,
     argument_cells: usize,
     max_contexts: usize,
@@ -1583,9 +1728,9 @@ impl InstantiateRevContextCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize, max_argument_cells: usize) -> Self {
         Self {
-            contexts: HashMap::new(),
+            contexts: KMap::default(),
             context_count: 0,
-            results: HashMap::new(),
+            results: KMap::default(),
             entries: 0,
             argument_cells: 0,
             max_contexts: max_entries.min(4_096),
@@ -1681,9 +1826,9 @@ struct LParamContext {
 }
 
 struct InstantiateLParamsCache {
-    contexts: HashMap<(u64, u64, usize, usize), Vec<LParamContext>>,
+    contexts: KMap<(u64, u64, usize, usize), Vec<LParamContext>>,
     context_count: usize,
-    results: HashMap<(u32, u64), Vec<(Expr, Expr)>>,
+    results: KMap<(u32, u64), Vec<(Expr, Expr)>>,
     entries: usize,
     max_contexts: usize,
     max_entries: usize,
@@ -1700,9 +1845,9 @@ impl InstantiateLParamsCache {
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
-            contexts: HashMap::new(),
+            contexts: KMap::default(),
             context_count: 0,
-            results: HashMap::new(),
+            results: KMap::default(),
             entries: 0,
             max_contexts: max_entries.min(1_024),
             max_entries,
@@ -1810,7 +1955,7 @@ impl InstantiateLParamsCache {
 }
 
 struct RecursorMajorCache {
-    buckets: HashMap<u64, Vec<(Name, Option<Name>)>>,
+    buckets: KMap<u64, Vec<(Name, Option<Name>)>>,
     entries: usize,
     max_entries: usize,
     max_bucket_entries: usize,
@@ -1819,7 +1964,7 @@ struct RecursorMajorCache {
 impl RecursorMajorCache {
     fn new() -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: KMap::default(),
             entries: 0,
             max_entries: 1_024,
             max_bucket_entries: TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
@@ -1877,7 +2022,7 @@ pub(crate) struct TypeChecker<'a> {
     env: &'a Environment,
     lparams: &'a [Name],
     locals: Vec<LocalDecl>,
-    local_positions: HashMap<FVarId, usize>,
+    local_positions: KMap<FVarId, usize>,
     fresh: u64,
     next_local_generation: Option<u64>,
     budget: Budget,
@@ -1907,13 +2052,13 @@ pub(crate) struct TypeChecker<'a> {
     positive_def_eq_cache: PositiveDefEqCache,
     /// Landed lazy-delta outcome memo (bead `fln-4hol` item 2): bounded,
     /// refuse-not-evict, replay-gated by live dependencies; see consts.
-    lazy_delta_outcomes: HashMap<(u64, u64), Vec<LazyDeltaOutcomeEntry>>,
+    lazy_delta_outcomes: KMap<(u64, u64), Vec<LazyDeltaOutcomeEntry>>,
     lazy_delta_outcome_rows: usize,
     lazy_delta_outcome_scan_nodes: u64,
     lazy_delta_replay_hits: u64,
     /// Landed major-coercion outcome memo (bead `fln-4hol` item 2, site 0):
     /// bounded, refuse-not-evict, replay-gated by live dependencies.
-    major_coercion_outcomes: HashMap<(u64, u64), Vec<MajorCoercionEntry>>,
+    major_coercion_outcomes: KMap<(u64, u64), Vec<MajorCoercionEntry>>,
     major_coercion_outcome_rows: usize,
     major_coercion_scan_nodes: u64,
     major_coercion_replay_hits: u64,
@@ -1924,6 +2069,7 @@ pub(crate) struct TypeChecker<'a> {
     regular_app_def_eq_failure_cache: PositiveDefEqCache,
     /// Free variables for this checker's own dependency scans (`FreeVars`).
     free_vars: FreeVars,
+    interner: Interner,
     instantiate_cache: InstantiateCache,
     instantiate_rev_context_cache: InstantiateRevContextCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
@@ -1937,6 +2083,9 @@ pub(crate) struct TypeChecker<'a> {
     /// domain comparison for an `eagerReduce _ _` argument may reduce open
     /// Nat applications; the previous value is restored after that query.
     eager_reduction: bool,
+    /// Immutable restrictions for a standalone equality query. Admission never
+    /// sets this field, and every query owns all of its policy-sensitive caches.
+    unfolding: Option<crate::DefEqUnfolding<'a>>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -1954,7 +2103,7 @@ impl<'a> TypeChecker<'a> {
             env,
             lparams,
             locals: Vec::new(),
-            local_positions: HashMap::new(),
+            local_positions: KMap::default(),
             fresh: 0,
             next_local_generation: Some(1),
             budget,
@@ -1965,25 +2114,38 @@ impl<'a> TypeChecker<'a> {
             whnf_core_cache: ExprResultCache::rolling(),
             whnf_core_cheap_sensitive_cache: ExprResultCache::rolling(),
             cheap_proj_events: 0,
-            major_coercion_outcomes: HashMap::new(),
+            major_coercion_outcomes: KMap::default(),
             major_coercion_outcome_rows: 0,
             major_coercion_scan_nodes: 0,
             major_coercion_replay_hits: 0,
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
-            lazy_delta_outcomes: HashMap::new(),
+            lazy_delta_outcomes: KMap::default(),
             lazy_delta_outcome_rows: 0,
             lazy_delta_outcome_scan_nodes: 0,
             lazy_delta_replay_hits: 0,
             regular_app_def_eq_failure_cache: PositiveDefEqCache::new(),
             free_vars: FreeVars::default(),
+            interner: Interner::new(),
             instantiate_cache: InstantiateCache::new(),
             instantiate_rev_context_cache: InstantiateRevContextCache::new(),
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
             recursor_major_cache: RecursorMajorCache::new(),
             defer_recursor_major: None,
             eager_reduction: false,
+            unfolding: None,
         }
+    }
+
+    pub(crate) fn new_for_def_eq(
+        env: &'a Environment,
+        lparams: &'a [Name],
+        budget: Budget,
+        unfolding: Option<crate::DefEqUnfolding<'a>>,
+    ) -> Self {
+        let mut checker = Self::new(env, lparams, budget);
+        checker.unfolding = unfolding;
+        checker
     }
 
     /// Adopt an externally-created local (the admission engine's telescopes,
@@ -2100,7 +2262,7 @@ impl<'a> TypeChecker<'a> {
                 lifted: Option<Expr>,
             },
         }
-        let lookup = |done: &HashMap<(usize, u32, usize), Expr>,
+        let lookup = |done: &KMap<(usize, u32, usize), Expr>,
                       child: &Expr,
                       k: u32,
                       subst: &Expr|
@@ -2109,7 +2271,7 @@ impl<'a> TypeChecker<'a> {
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<(usize, u32, usize), Expr> = HashMap::new();
+        let mut done: KMap<(usize, u32, usize), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             k,
@@ -2327,6 +2489,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, k, &subst)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     if result != e {
                         self.instantiate_cache
                             .insert(e.clone(), k, subst.clone(), result.clone());
@@ -2373,15 +2536,14 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, bound: u32, depth: u32 },
             Finish { e: Expr, bound: u32 },
         }
-        let lookup =
-            |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
-                done.get(&(child.allocation_identity(), bound))
-                    .cloned()
-                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
-            };
+        let lookup = |done: &KMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+            done.get(&(child.allocation_identity(), bound))
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
         let count =
             u32::try_from(fvars.len()).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             bound,
@@ -2586,6 +2748,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     match context {
                         Some(context) => self.instantiate_rev_context_cache.insert(
                             context,
@@ -2623,12 +2786,12 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, depth: u32 },
             Finish { e: Expr },
         }
-        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+        let lookup = |done: &KMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
             done.get(&child.allocation_identity())
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut done: KMap<usize, Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             depth,
@@ -2791,6 +2954,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     if result != e {
                         self.instantiate_lparams_cache.insert(
                             e.clone(),
@@ -3217,12 +3381,21 @@ impl<'a> TypeChecker<'a> {
                 // A theorem carries no `DefinitionSafety`, and the pin reports
                 // `is_unsafe() == false` for every theorem, so the KR-973
                 // refusal stays on this arm rather than becoming a shared gate.
-                if !self.may_unfold(defn.safety) {
+                if !self.may_unfold(defn.safety)
+                    || self
+                        .unfolding
+                        .is_some_and(|policy| policy.opaque_definitions.contains(name))
+                {
                     return Ok(None);
                 }
                 (defn.value.clone(), defn.base.level_params.clone())
             }
-            Some(ConstantInfo::Thm(thm)) => (thm.value.clone(), thm.base.level_params.clone()),
+            Some(ConstantInfo::Thm(thm)) => {
+                if self.unfolding.is_some_and(|policy| !policy.unfold_theorems) {
+                    return Ok(None);
+                }
+                (thm.value.clone(), thm.base.level_params.clone())
+            }
             // `is_delta` calls `has_value()` with `allow_opaque` at its DEFAULT
             // false, so an opaque is deliberately not delta. This arm is spelled
             // out rather than swept into a catch-all so the refusal is enforced
@@ -3274,7 +3447,12 @@ impl<'a> TypeChecker<'a> {
             return None;
         };
         match self.env.find(name)? {
-            ConstantInfo::Defn(d) if self.may_unfold(d.safety) => {
+            ConstantInfo::Defn(d)
+                if self.may_unfold(d.safety)
+                    && !self
+                        .unfolding
+                        .is_some_and(|policy| policy.opaque_definitions.contains(name)) =>
+            {
                 Some(match d.hints {
                     ReducibilityHints::Regular(h) => h,
                     // Abbrev unfolds eagerly (treated as tall); Opaque as height 0.
@@ -3285,7 +3463,11 @@ impl<'a> TypeChecker<'a> {
             // Pin `constant_info::get_hints()` has no hints field to read for a
             // theorem and returns `g_opaque`, which is height 0 — the shortest,
             // so lazy delta unfolds the other side first, as at the pin.
-            ConstantInfo::Thm(_) => Some(0),
+            ConstantInfo::Thm(_)
+                if !self.unfolding.is_some_and(|policy| !policy.unfold_theorems) =>
+            {
+                Some(0)
+            }
             _ => None,
         }
     }
@@ -4724,10 +4906,10 @@ impl<'a> TypeChecker<'a> {
 
     /// The positive branch of the pin's equal-regular-definition shortcut.
     ///
-    /// Requiring the same constant head makes every recursive query strictly
-    /// smaller (arguments only), so this cannot re-enter on the original pair.
-    /// Structural identity still decides cache hits elsewhere; the packed
-    /// expression hash is never authority here.
+    /// The pin's `is_def_eq_args` walks last-to-first (type_checker.cpp:786).
+    /// A trailing mismatch must avoid forcing expensive earlier arguments.
+    /// Queries are strictly smaller (arguments only); structural identity,
+    /// never the packed expression hash, still decides cache hits elsewhere.
     fn regular_same_head_apps_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
         let (t_head, t_args) = app_spine(t);
         let (s_head, s_args) = app_spine(s);
@@ -4770,7 +4952,7 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(false);
         }
-        for (t_arg, s_arg) in t_args.iter().zip(&s_args) {
+        for (t_arg, s_arg) in t_args.iter().zip(&s_args).rev() {
             if !self.is_def_eq(t_arg, s_arg, depth)? {
                 self.regular_app_def_eq_failure_cache.insert(
                     t.clone(),
@@ -5435,7 +5617,7 @@ impl<'a> TypeChecker<'a> {
         let result = (|| {
             let mut current = e.clone();
             let mut opened_fvars = Vec::new();
-            let mut ordinals = HashMap::new();
+            let mut ordinals = KMap::default();
             let mut binders: Vec<(Name, Expr, BinderInfo, FVarId)> = Vec::new();
             while let ExprNode::Lam {
                 binder_name,
@@ -5600,7 +5782,7 @@ impl<'a> TypeChecker<'a> {
     fn abstract_fvar_set(
         &mut self,
         e: &Expr,
-        ordinals: &HashMap<FVarId, u32>,
+        ordinals: &KMap<FVarId, u32>,
         active: u32,
         bound: u32,
         depth: u32,
@@ -5612,13 +5794,12 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, bound: u32, depth: u32 },
             Finish { e: Expr, bound: u32 },
         }
-        let lookup =
-            |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
-                done.get(&(child.allocation_identity(), bound))
-                    .cloned()
-                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
-            };
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let lookup = |done: &KMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+            done.get(&(child.allocation_identity(), bound))
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
+        let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             bound,
@@ -5793,6 +5974,7 @@ impl<'a> TypeChecker<'a> {
                         } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     done.insert(key, result);
                 }
             }
@@ -5809,12 +5991,12 @@ impl<'a> TypeChecker<'a> {
             Enter { e: Expr, depth: u32 },
             Finish { e: Expr },
         }
-        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+        let lookup = |done: &KMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
             done.get(&child.allocation_identity())
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut done: KMap<usize, Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
             depth,
@@ -6892,7 +7074,7 @@ fn substitute_level(level: &Level, params: &[Name], levels: &[Level]) -> Level {
     if !level.has_param() {
         return level.clone();
     }
-    let mut done: HashMap<Level, Level> = HashMap::new();
+    let mut done: KMap<Level, Level> = KMap::default();
     let mut stack = vec![(level.clone(), false)];
     while let Some((current, exit)) = stack.pop() {
         if done.contains_key(&current) {
@@ -7340,7 +7522,7 @@ mod tests {
         for _ in 0..400 {
             expr = Expr::app(expr, fvar.clone());
         }
-        let mut ordinals = HashMap::new();
+        let mut ordinals = KMap::default();
         ordinals.insert(id, 0);
         let result = tc
             .abstract_fvar_set(&expr, &ordinals, 1, 0, 0)
@@ -10872,9 +11054,9 @@ mod tests {
         };
 
         let mut ordinary = seed_collision();
-        ordinary.insert(redex.clone(), redex.clone(), &[], &HashMap::new());
+        ordinary.insert(redex.clone(), redex.clone(), &[], &KMap::default());
         assert!(
-            ordinary.get(&redex, &[], &HashMap::new()).is_none()
+            ordinary.get(&redex, &[], &KMap::default()).is_none()
                 && ordinary.entries == 1
                 && ordinary.cross_scope_entries == 1,
             "ordinary collision saturation must remain a bounded cache miss"
@@ -11117,16 +11299,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for key in &keys {
-            cache.insert_reduction_result(key.clone(), value.clone(), &[], &HashMap::new());
+            cache.insert_reduction_result(key.clone(), value.clone(), &[], &KMap::default());
         }
 
         assert!(
             cache.entries == 0
                 && cache.priority_results.len() == TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS
-                && cache.get(&keys[0], &[], &HashMap::new()).is_none()
-                && cache.get(&keys[1], &[], &HashMap::new()) == Some(value.clone())
-                && cache.get(keys.last().expect("one overflow row"), &[], &HashMap::new())
-                    == Some(value)
+                && cache.get(&keys[0], &[], &KMap::default()).is_none()
+                && cache.get(&keys[1], &[], &KMap::default()) == Some(value.clone())
+                && cache.get(
+                    keys.last().expect("one overflow row"),
+                    &[],
+                    &KMap::default()
+                ) == Some(value)
                 && cache.priority_next_replacement == 1,
             "the first overflow must replace exactly the oldest reserved row without widening the bound"
         );
@@ -11303,5 +11488,138 @@ mod tests {
             Err(Stop::Reject(RejectClass::BlockMismatch, message))
                 if message.contains("cannot contain local variables")
         ));
+    }
+
+    /// Section 7.1b slice B (bead franken_lean-z8j.1.13): the per-check
+    /// interner returns ONE retained allocation per structural identity
+    /// class, keeps distinct structures distinct, and separates alpha-varied
+    /// binders that share a packed data word. Binder names are excluded from
+    /// the hash and included in identity, so the alpha pair exercises the
+    /// bucket-collision path: same bucket, structural verify separates.
+    #[test]
+    fn interner_unifies_equal_structures_and_separates_alpha_variants() {
+        let mut interner = Interner::new();
+        let nat = || Expr::const_(Name::str(Name::anonymous(), "Nat"), vec![]);
+        let one = interner.intern(Expr::app(nat(), nat()));
+        let two = interner.intern(Expr::app(nat(), nat()));
+        assert!(
+            one.allocation_identity() == two.allocation_identity(),
+            "equal structures must share one retained allocation"
+        );
+        let lam = |name: &str| {
+            Expr::lam(
+                Name::str(Name::anonymous(), name),
+                nat(),
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            )
+        };
+        let (lam_a, lam_b) = (lam("a"), lam("b"));
+        assert!(
+            lam_a.data().0 == lam_b.data().0,
+            "alpha variants share the packed word, or this test stops testing collisions"
+        );
+        let kept_a = interner.intern(lam_a);
+        let kept_b = interner.intern(lam_b);
+        assert!(
+            kept_a.allocation_identity() != kept_b.allocation_identity(),
+            "binder names are part of structural identity (7.1b: names included)"
+        );
+        let (hits, misses) = interner.stats();
+        assert!(
+            hits == 1 && misses == 3,
+            "one dedupe hit and three retained classes, got {hits}/{misses}"
+        );
+    }
+
+    /// Two substitutes whose FULL packed words collide must not confuse the
+    /// instantiate cache (bead fln-kernel-reject-side-at-scale-bemc, the
+    /// cache-key adversary made per-commit). Nat literals 54795 and 229944
+    /// share the packed word under this tree's packing (found by birthday
+    /// search against fln-core's own Expr::lit data), and a collision
+    /// propagates upward through identical contexts because application
+    /// packing mixes child words — so the two substitution results share
+    /// every hash-shaped cache key and are separated ONLY by the structural
+    /// verify. The acceptance-3 campaign measured this family unreachable by
+    /// the corpus operators (the P-MEMO plant flipped nothing in 290
+    /// mutants); this test is that plant's standing per-commit killer: drop
+    /// the verify and the second instantiate answers with the first's
+    /// result.
+    #[test]
+    fn colliding_packed_words_do_not_confuse_the_instantiate_cache() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let lit = |v: u64| Expr::lit(Literal::Nat(NatLit::from_u64(v)));
+        let (low, high) = (lit(54_795), lit(229_944));
+        assert!(
+            low.data().0 == high.data().0,
+            "the measured pair must still collide on the full packed word, or this test              stopped testing collisions (re-run the birthday search and update the pair)"
+        );
+        assert!(low != high, "and they must remain structurally distinct");
+        let wrap = |inner: Expr| Expr::app(Expr::sort(Level::zero()), inner);
+        let (sub_low, sub_high) = (wrap(low), wrap(high));
+        assert!(
+            sub_low.data().0 == sub_high.data().0,
+            "a collision must propagate through an identical wrapper, or app packing moved"
+        );
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let open = Expr::app(bv(0), bv(0));
+        let first = tc.instantiate(&open, 0, &sub_low, 0).expect("instantiates");
+        let second = tc
+            .instantiate(&open, 0, &sub_high, 0)
+            .expect("instantiates");
+        assert!(
+            first != second,
+            "two colliding-word substitutes produced one result: a cache answered on the              packed word without its structural verify — the P-MEMO defect, live"
+        );
+        assert!(
+            first == Expr::app(sub_low.clone(), sub_low)
+                && second == Expr::app(sub_high.clone(), sub_high),
+            "each substitution must carry ITS OWN literal through"
+        );
+    }
+
+    /// Two separate instantiations that rebuild the same structure yield the
+    /// SAME allocation within one checker    /// Two separate instantiations that rebuild the same structure yield the
+    /// SAME allocation within one checker — and the unifier must provably be
+    /// the interner, which takes dodging the unifier this test's first
+    /// version did not dodge (found by the slice-B1 verifier, z8j.1.13
+    /// comment 3327: `InstantiateCache` verifies sources structurally, so
+    /// identical sources hand back one allocation with the interner gutted,
+    /// and the test's kill claim was false). The sources here are
+    /// structurally DIFFERENT (`#0 #0` against `Sort0 #0`), so the
+    /// instantiate cache cannot join them; and each call substitutes its own
+    /// ALLOCATION of `Sort 0`, so the rebuilt applications also have
+    /// allocation-distinct operands — which additionally future-proofs the
+    /// kill against any parts-keyed construction index (one was built,
+    /// measured perf-neutral at corpus scale, and withdrawn; the record is
+    /// on the bead). A mutant that makes `intern` return the fresh node
+    /// fails exactly here, verified by planting that mutant rather than
+    /// asserting it.
+    #[test]
+    fn instantiate_results_are_interned_across_calls() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let subst_a = Expr::sort(Level::zero());
+        let subst_b = Expr::sort(Level::zero());
+        assert!(
+            subst_a.allocation_identity() != subst_b.allocation_identity(),
+            "the two substitutes must be allocation-distinct or a construction index unifies for free"
+        );
+        let open = Expr::app(bv(0), bv(0));
+        let first = tc.instantiate(&open, 0, &subst_a, 0).expect("instantiates");
+        let half_closed = Expr::app(subst_b.clone(), bv(0));
+        let second = tc
+            .instantiate(&half_closed, 0, &subst_b, 0)
+            .expect("instantiates");
+        assert!(
+            first == second,
+            "the two rebuilds must be structurally equal before identity is even asked"
+        );
+        assert!(
+            first.allocation_identity() == second.allocation_identity(),
+            "equal rebuilds from DIFFERENT sources and DIFFERENT substitute allocations must              share the interner's retained allocation; only the structural table can join them"
+        );
     }
 }

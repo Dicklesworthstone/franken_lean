@@ -2,13 +2,102 @@
 //! types. Source-local ids are resolved only after every lambda (including
 //! lazy branches and recursors) is known. The compiler independently validates
 //! the resulting canonical signature table, captures, ownership, and calls.
+#[cfg(test)]
+mod intrinsic_types;
+#[cfg(test)]
+mod projected;
 mod recursors;
+mod signatures;
 mod stages;
 
 use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
 
+mod administrative;
+
 impl Preparation<'_> {
+    /// Recognize a literal callback after strict lets or administrative record
+    /// projections. Only select its annotation here: the original operand and
+    /// all initializers still enter the ordinary strict preparation path.
+    pub(super) fn has_literal_callable_tail(&mut self, value: &Expr) -> Result<bool, IngressError> {
+        let mut value = value.clone();
+        loop {
+            self.tick()?;
+            value = match value.node() {
+                ExprNode::LetE { body, .. } => body.clone(),
+                ExprNode::MData { expr, .. } => expr.clone(),
+                ExprNode::Lam { .. } => return Ok(true),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+                        return Ok(false);
+                    };
+                    field
+                }
+                ExprNode::App { .. } => {
+                    let (head, args) = self.spine(&value)?;
+                    let Some(field) = self.callback_projection_body(&head, &args)? else {
+                        return Ok(false);
+                    };
+                    field
+                }
+                _ => return Ok(false),
+            };
+        }
+    }
+
+    /// Expose only an admitted projection's administrative body for the
+    /// annotation probe. Unlike `projection_call`, do not erase or prepare its
+    /// selected field here: proof erasure itself calls this probe, and entering
+    /// it again would recursively traverse nested callback bodies. The returned
+    /// projection is inspected only; the caller keeps the original expression.
+    fn callback_projection_body(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.environment.find(name).cloned() else {
+            return Ok(None);
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params.len() != levels.len()
+        {
+            return Ok(None);
+        }
+        let mut body = &definition.value;
+        let mut arity = 0usize;
+        while let ExprNode::Lam { body: next, .. } = body.node() {
+            self.tick()?;
+            arity += 1;
+            body = next;
+        }
+        // Applying a selected callback is execution, not projection discovery.
+        // Only the exact administrative projection telescope is inspected.
+        if arity == 0
+            || args.len() != arity
+            || !matches!(body.node(), ExprNode::Proj { expr, .. }
+                if matches!(expr.node(), ExprNode::BVar { idx: 0 }))
+        {
+            return Ok(None);
+        }
+        let mut value =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        for arg in args {
+            self.tick()?;
+            let ExprNode::Lam { body, .. } = value.node() else {
+                return Ok(None);
+            };
+            value = self.substitution(body, arg)?;
+        }
+        Ok(Some(value))
+    }
+
     /// Adapt underapplication before separating an eliminator's returned
     /// closure from overapplication. Both forms keep the original recursor on
     /// the ordinary family-specific lowering path.
@@ -20,7 +109,7 @@ impl Preparation<'_> {
         if let Some(partial) = self.partially_applied_recursor(head, args)? {
             return Ok(Some(partial));
         }
-        let ExprNode::Const { name, .. } = head.node() else {
+        let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
         let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
@@ -65,6 +154,23 @@ impl Preparation<'_> {
             type_ = self.minor_apply(type_, arg.clone())?;
         }
         let type_ = self.erase_runtime_type(&type_)?;
+        if rec.all.len() == 1
+            && rec.num_indices == 0
+            && rec.num_minors >= 2
+            && let Some(shape) = self.recursor_shape(rec, levels, args)?
+            && !shape.recursive
+            && shape.constructors.len() == rec.rules.len()
+            && self
+                .saturated_variant_result(&type_, args.len() - arity)?
+                .is_some()
+        {
+            // Keep a fully supplied variant's operands for its lazy minors.
+            // Selecting a function first would require one fixed closure ABI
+            // even when those minors return the same telescope in different
+            // stages. The variant path applies actual operands in order inside
+            // the selected branch and joins only the final data result.
+            return Ok(None);
+        }
         let mut function = head.clone();
         for argument in &args[..arity] {
             self.tick()?;
@@ -241,6 +347,7 @@ impl Preparation<'_> {
     pub(crate) fn finalize_callables(
         &mut self,
         functions: &mut [FunctionBinding],
+        intrinsics: &mut [IntrinsicBinding],
     ) -> Result<Vec<ClosureSignature>, IngressError> {
         if self.interfaces.is_empty() {
             return Ok(Vec::new());
@@ -274,9 +381,19 @@ impl Preparation<'_> {
                 &mut self.visited,
             )?;
         }
+        signatures::deduplicate_unowned(&mut signatures, self.limits, &mut self.visited)?;
         let mut ranks = (0..self.interfaces.len())
             .map(|index| u32::try_from(index).map_err(|_| unsupported("callback rank width")))
             .collect::<Result<Vec<_>, _>>()?;
+        // Retain the preceding structural order across refinement rounds. A
+        // remap usually changes only some nested closure ids, leaving long
+        // sorted runs available to the metered stable merge below.
+        let mut order = Vec::new();
+        for index in 0..signatures.len() {
+            self.tick()?;
+            reserve(&mut order, self.limits.fir.max_closure_types)?;
+            order.push(index);
+        }
         let mut settled = false;
         for _ in 0..=self.interfaces.len() {
             let mut ordered = Vec::new();
@@ -286,25 +403,13 @@ impl Preparation<'_> {
                 reserve(&mut ordered, self.limits.fir.max_closure_types)?;
                 ordered.push((*owner, signature));
             }
-            // Charge the comparison/operand envelope before sorting. The bound
-            // is conservative and deterministic, not wall-clock fuel.
-            let width = ordered.len().max(1).ilog2() as usize + 1;
-            let cells = ordered
-                .iter()
-                .try_fold(0usize, |sum, (_, item)| {
-                    sum.checked_add(item.parameters.len().saturating_add(1))
-                })
-                .and_then(|sum| sum.checked_mul(width))
-                .ok_or_else(|| unsupported("callback sort work overflow"))?;
-            for _ in 0..cells {
-                self.tick()?;
-            }
-            ordered.sort_by(|(_, a), (_, b)| signature_order(a, b));
+            signatures::sort::stable_order(&ordered, &mut order, self.limits, &mut self.visited)?;
             let mut next = vec![0; ranks.len()];
             let mut rank = 0u32;
-            for (index, (owner, signature)) in ordered.iter().enumerate() {
+            for (index, &row) in order.iter().enumerate() {
                 self.tick()?;
-                if index != 0 && signature != &ordered[index - 1].1 {
+                let (owner, signature) = &ordered[row];
+                if index != 0 && signature != &ordered[order[index - 1]].1 {
                     rank = rank
                         .checked_add(1)
                         .ok_or_else(|| unsupported("callback rank width"))?;
@@ -328,6 +433,17 @@ impl Preparation<'_> {
             }
             function.result = remap_type(function.result, &ranks)?;
         }
+        // Native higher-order rows share the canonical callback ABI with
+        // function parameters, lambda captures and object fields. Their
+        // bindings were copied into the catalog before discovery completed.
+        for intrinsic in intrinsics {
+            for argument in &mut intrinsic.arguments {
+                charge_catalog_node(&mut self.visited, self.limits)?;
+                *argument = remap_type(*argument, &ranks)?;
+            }
+            charge_catalog_node(&mut self.visited, self.limits)?;
+            intrinsic.result = remap_type(intrinsic.result, &ranks)?;
+        }
         for lambda in &mut self.lambdas {
             for parameter in &mut lambda.parameters {
                 *parameter = remap_type(*parameter, &ranks)?;
@@ -345,6 +461,9 @@ impl Preparation<'_> {
         for case in &mut self.cases {
             case.result = remap_type(case.result, &ranks)?;
         }
+        for case in &mut self.nat_cases {
+            case.result = remap_type(case.result, &ranks)?;
+        }
         for case in &mut self.variant_cases {
             case.result = remap_type(case.result, &ranks)?;
         }
@@ -358,6 +477,7 @@ impl Preparation<'_> {
     }
 }
 
+#[cfg(test)]
 fn signature_order(a: &ClosureSignature, b: &ClosureSignature) -> std::cmp::Ordering {
     a.parameters
         .cmp(&b.parameters)

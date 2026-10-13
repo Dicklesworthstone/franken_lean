@@ -40,8 +40,16 @@ fn explicit_dependent_and_higher_order_proof_arguments_execute() {
 }
 #[test]
 fn proof_lets_and_local_callbacks_keep_capture_indices() {
+    // `:= by rfl; let f …` would hand the `;` and the rest to the `by` block, as the pin does
+    // ("unknown tactic" at `f 2`); the proof is parenthesized so the `;` ends the local.
+    assert!(
+        fln_parse::parse_definition(
+            b"def keep (n : Nat) : Nat := let h : n = n := by rfl; let f (k : Nat) (hk : k = k) : Nat := n + k; f 2 (by rfl)"
+        )
+        .is_err()
+    );
     run(
-        "def keep (n : Nat) : Nat := let h : n = n := by rfl; let f (k : Nat) (hk : k = k) : Nat := n + k; f 2 (by rfl)\n#eval keep 40",
+        "def keep (n : Nat) : Nat := let h : n = n := (by rfl); let f (k : Nat) (hk : k = k) : Nat := n + k; f 2 (by rfl)\n#eval keep 40",
         "42",
     );
     run(

@@ -54,8 +54,13 @@ fn lambda_holes_keep_separate_shadowed_variable_identities() {
 }
 #[test]
 fn dependent_holes_schedule_type_and_witness_before_consumers() {
-    check(
+    // The pin refuses OfNat synthesis through package.carrier. Preserve that
+    // original program as a control, and check the explicitly typed witness.
+    reject(
         "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by refine Package.mk ?_ ?_; exact Nat; exact 7\ntheorem checked : package.value = 7 := by rfl",
+    );
+    check(
+        "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by refine Package.mk ?_ ?_; exact Nat; exact 7\ntheorem checked : package.value = (7 : Nat) := by rfl",
     );
     check(
         "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem existsLemma : Witness (fun n => n = 7) := by refine Witness.intro ?w ?p; exact 7; rfl",
@@ -176,8 +181,29 @@ fn dependent_substitution_rebuilds_refined_hole_contexts() {
     check(
         "theorem move (n m : Nat) (h : n = m) (P : Nat -> Prop) (p : P n) : P m := by refine ?_; subst h; exact p",
     );
+    // The pin substitutes an `HEq` only when its two types are definitionally equal: the
+    // same-type case is accepted and the two-type case refused, each run at the pin (lean
+    // v4.32.0, 2026-10-06), the refusal with exactly this first error.
     check(
-        "theorem move (A B : Type) (a : A) (b : B) (h : HEq a b) (P : forall T : Type, T -> Prop) (p : P A a) : P B b := by refine ?_; subst h; exact p",
+        "theorem t (x y : Nat) (h : HEq x y) (P : Nat -> Prop) (p : P x) : P y := by refine ?_; subst h; exact p",
+    );
+    let source = "theorem move (A B : Type) (a : A) (b : B) (h : HEq a b) (P : forall T : Type, T -> Prop) (p : P A a) : P B b := by refine ?_; subst h; exact p";
+    reject(source);
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let error = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err(source)
+        .to_string();
+    assert!(
+        error.contains("Tactic `subst` failed: did not find equation for eliminating 'h'"),
+        "{source}\nmust be refused as the pin refuses it: {error}"
     );
 }
 
@@ -225,11 +251,15 @@ fn irrelevant_ill_typed_arguments_are_actually_refused() {
         ),
         Ok(fln::Outcome::Complete(_))
     ));
+    // The pin refuses this while elaborating: `refine Eq.refl ?_` closes the goal, and
+    // `exact m` is "No goals to be solved" (v4.32.0, 2026-10-06). FrankenLean refuses
+    // it at the same stage since 5a3ff40e, though by a conversion refusal (NotDefEq)
+    // rather than the pin's "No goals"; that difference in reason is not asserted here.
     let source = "def identity (n : Nat) : Nat := n\ntheorem bad (n m : Nat) : identity n = n := by refine Eq.refl ?_; exact m";
     let problem = run(source).unwrap_err();
     assert_eq!(
         problem.disposition(),
-        ("kernel-rejection", true, 1),
+        ("elaboration", false, 1),
         "{problem:?}"
     );
     assert_eq!(engine.logical_root(&KVMap::new()), root);

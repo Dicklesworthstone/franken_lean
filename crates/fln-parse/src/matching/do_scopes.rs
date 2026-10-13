@@ -165,6 +165,34 @@ impl DoScopes {
         })
     }
 
+    /// `leftArrow doElemParser` (`doIdDecl`, `doPatDecl`, `nestedAction`): an `if` or `match` right
+    /// after a `←` is a do element, not a term. `doIf`'s `withPositionAfterLinebreak` anchors it at
+    /// its own column after a line break, and otherwise at the enclosing sequence's position, which
+    /// a bracket's `withoutPosition` clears.
+    pub(super) fn arrow_element(
+        &self,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        at: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if at == 0
+            || !(is_symbol(tokens, at - 1, "←") || is_symbol(tokens, at - 1, "<-"))
+            || !(is_symbol(tokens, at, "if") || is_symbol(tokens, at, "match"))
+        {
+            return None;
+        }
+        if later_line(view, tokens, at, at - 1) {
+            return Some(column(view, tokens, at));
+        }
+        Some(
+            self.sequences
+                .last()
+                .filter(|s| s.depth == depth)
+                .map_or(0, |s| s.baseline),
+        )
+    }
+
     pub(super) fn after(
         &mut self,
         tokens: &[LexedToken],
@@ -182,6 +210,19 @@ impl DoScopes {
                 s.ready = true;
             }
         }
+    }
+
+    /// A catch/finally delimiter ends the preceding exception body and any
+    /// unbraced statement branches nested inside it. Braces keep their own
+    /// delimiter discipline and cannot be silently crossed.
+    pub(super) fn end_exception_body(&mut self, start: usize) -> bool {
+        while self.sequences.last().is_some_and(|s| s.introducer >= start) {
+            if self.sequences.last().is_some_and(|s| s.braced) {
+                return false;
+            }
+            self.pop();
+        }
+        true
     }
 
     pub(super) fn ended(&self, start: usize) -> bool {

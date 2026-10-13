@@ -165,3 +165,1539 @@ jobs:
           path: ${{ runner.temp }}/assignment-transfer
           retention-days: 7
           if-no-files-found: error
+
+  scientific-conversions:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify imported numeric helpers and persistent defaults on current main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '6a6e09c09707ade38f4959faf19d1d5bf4032e4f'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '6a6e09c09707ade38f4959faf19d1d5bf4032e4f'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/OfScientific; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format the five conversion files and preserve the tested bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln/src/source_intrinsics/float.rs
+            crates/fln/src/source_intrinsics/float/tests.rs
+            crates/fln/tests/source_imported_floats.rs
+            crates/fln/src/runtime/partial.rs
+            crates/fln/src/runtime/floats/imported.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_SCI_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_SCI_RUSTFMT_DIFF_END
+          echo FLN_SCI_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_SCI_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Compare all dynamic conversion bit expectations with the live pin
+        shell: python
+        run: |
+          import os, pathlib, re, subprocess
+          test = pathlib.Path('crates/fln/tests/source_imported_floats.rs').read_text()
+          helper = test.split('fn assert_dynamic_conversions(', 1)[1]
+          source = re.search(r'let source = r#"(.*?)"#;', helper, re.S).group(1)
+          source, count = re.subn(r'^#eval (.+)$', r'#eval ((\1).toBits).toNat', source, flags=re.M)
+          assert count == 17, count
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dynamic-conversion-oracle.lean'
+          fixture.write_text('import Init.Data.OfScientific\n' + source)
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          result = subprocess.run([str(lean), str(fixture)], text=True, capture_output=True)
+          print(result.stdout, end='')
+          print(result.stderr, end='')
+          assert result.returncode == 0, result.returncode
+          expected = ['4611911198408756429', '1074161254', '4906019910204099648', '4608285800708723180', '1067408425', '4611911198408756429', '0', '1', '1', '9218868437227405312', '2139095040', '4895412794951729152', '1593835521', '4631107791820423168', '1109917696', '13854479828675198976', '1123680256']
+          assert result.stdout.splitlines() == expected, (result.stdout.splitlines(), expected)
+      - name: Check complete Float models and selected native helper authority
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --lib source_intrinsics::float::tests -- --nocapture --test-threads=1
+      - name: Execute and replay actual imported scientific bodies
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_imported_floats actual_imported_scientific_floats_execute_and_replay_the_regression -- --exact --nocapture --test-threads=1
+
+  automatic-termination:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify automatic termination with dependent recursion on current main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'b617187c6db7acda22d81ad7ee9756c48ae40d39'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'b617187c6db7acda22d81ad7ee9756c48ae40d39'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/WFTactics Init/Omega; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format integrated default source and preserve the tested merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-elab/src/instances/defaults.rs
+            crates/fln-elab/src/instances/defaults/export.rs
+            crates/fln-elab/src/instances/defaults/export/tests.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/instance_command.rs
+            crates/fln-elab/src/source/instances.rs
+            crates/fln-elab/src/source/scope/simp.rs
+            crates/fln-elab/src/source/scope/visibility.rs
+            crates/fln-olean/src/write/source.rs
+            crates/fln-olean/src/write/source/defaults.rs
+            crates/fln-olean/src/write/source/namespaces.rs
+            crates/fln-parse/src/command_scope/instances.rs
+            crates/fln/src/lib.rs
+            crates/fln/src/source_check.rs
+            crates/fln/src/source_check/instance_attributes.rs
+            crates/fln/src/source_check/modules/artifacts.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/persisted.rs
+            crates/fln/src/source_check/modules/replay.rs
+            crates/fln/src/source_check/modules/visibility.rs
+            crates/fln/src/source_records.rs
+            crates/fln/tests/source_default_instances.rs
+            crates/fln/tests/source_default_simp.rs
+            crates/fln/tests/source_module_artifacts/classes.rs
+            crates/fln/tests/source_module_artifacts/defaults.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_INTEGRATED_DEFAULT_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_INTEGRATED_DEFAULT_RUSTFMT_DIFF_END
+          echo FLN_INTEGRATED_DEFAULT_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_INTEGRATED_DEFAULT_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Format only the four candidate files and preserve the tested bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-elab/src/source/recursion.rs
+            crates/fln-elab/src/source/recursion/well_founded.rs
+            crates/fln/tests/source_well_founded.rs
+            crates/fln/tests/support/well_founded_inference.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_WF_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_WF_RUSTFMT_DIFF_END
+          echo FLN_WF_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_WF_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Check inferred measures and proof-selection behavior against the live pin
+        shell: python
+        run: |
+          import json, os, pathlib, re, subprocess
+          source = pathlib.Path('crates/fln/tests/support/well_founded_inference.rs').read_text()
+          literal = r'"(?:[^"\\]|\\.)*"'
+          tuple_pattern = re.compile(r'\(\s*(' + literal + r')\s*,\s*(' + literal + r')\s*,\s*(' + literal + r')\s*,?\s*\)')
+          programs = [tuple(json.loads(value) for value in match) for match in tuple_pattern.findall(source.split('const REFUSALS', 1)[0])]
+          refusal_source = source.split('const REFUSALS: &[&str] = &[', 1)[1].split('\n];', 1)[0]
+          refusals = [json.loads(value) for value in re.findall(r'^\s*(' + literal + r'),\s*$', refusal_source, re.M)]
+          assert len(programs) == 16, len(programs)
+          assert len(refusals) == 20, len(refusals)
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'well-founded-inference-oracle.lean'
+          failures = []
+          def check(name, body, accepts, evaluates=False):
+              fixture.write_text('import Init.WFTactics\nimport Init.Omega\n' + body + '\n')
+              result = subprocess.run([str(lean), str(fixture)], text=True, capture_output=True, timeout=120)
+              print('FLN_WF_ORACLE_CASE ' + name, flush=True)
+              print(result.stdout, end='', flush=True)
+              print(result.stderr, end='', flush=True)
+              if (result.returncode == 0) != accepts:
+                  failures.append((name, 'acceptance', result.returncode, accepts))
+              if evaluates and re.findall(r'^\d+$', result.stdout, re.M) != ['42']:
+                  failures.append((name, 'evaluation', result.stdout))
+              if not accepts and ('unexpected token' in result.stdout or 'expected token' in result.stdout):
+                  failures.append((name, 'syntax', result.stdout))
+          for name, definition, application in programs:
+              check(name, definition + '\n#eval ' + application, True, True)
+          # These two native refusals are explicit capability boundaries:
+          # the pin can use an earlier non-Nat SizeOf or a lexicographic tuple.
+          native_only_boundaries = {14, 15}
+          for index, definition in enumerate(refusals):
+              check('refusal-' + str(index), definition, index in native_only_boundaries)
+          assert not failures, failures
+          print('FLN_WF_ORACLE_COMPLETE 16 evaluations; 18 pin refusals; 2 native capability boundaries', flush=True)
+      - name: Check complete native well-founded lowering and proof replay
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_well_founded -- --nocapture --test-threads=1
+      - name: Check postponed applications with the new recursive-definition fallback
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_postponed_applications -- --nocapture --test-threads=1
+
+      - name: Check elaborator warnings on the exact merged implementation
+        if: success() || failure()
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check runtime and well-founded target warnings
+        if: success() || failure()
+        run: cargo clippy --locked --offline -p fln --test source_well_founded -- -D warnings
+  default-instances:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): verify default registration order and persistent source metadata on current main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '18f9ef22ae702128bc1c9ed7eaf19d4776bf567c'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '18f9ef22ae702128bc1c9ed7eaf19d4776bf567c'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/WFTactics Init/Omega; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Format only candidate files and preserve the tested bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-elab/src/instances/defaults.rs
+            crates/fln-elab/src/instances/defaults/export.rs
+            crates/fln-elab/src/instances/defaults/export/tests.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/instance_command.rs
+            crates/fln-elab/src/source/instances.rs
+            crates/fln-elab/src/source/scope/simp.rs
+            crates/fln-elab/src/source/scope/visibility.rs
+            crates/fln-olean/src/write/source.rs
+            crates/fln-olean/src/write/source/defaults.rs
+            crates/fln-olean/src/write/source/namespaces.rs
+            crates/fln-parse/src/command_scope/instances.rs
+            crates/fln/src/lib.rs
+            crates/fln/src/source_check.rs
+            crates/fln/src/source_check/instance_attributes.rs
+            crates/fln/src/source_check/modules/artifacts.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/persisted.rs
+            crates/fln/src/source_check/modules/replay.rs
+            crates/fln/src/source_check/modules/visibility.rs
+            crates/fln/src/source_records.rs
+            crates/fln/tests/source_default_instances.rs
+            crates/fln/tests/source_default_simp.rs
+            crates/fln/tests/source_module_artifacts/classes.rs
+            crates/fln/tests/source_module_artifacts/defaults.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${paths[@]}"
+          echo FLN_DEFAULT_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_DEFAULT_RUSTFMT_DIFF_END
+          echo FLN_DEFAULT_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_DEFAULT_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Check parsed default attributes and existing instance refusals
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln-parse --lib command_scope::instances::tests -- --test-threads=1
+      - name: Check native default journals and bounded export
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln-elab --lib instances::defaults -- --test-threads=1
+      - name: Check exact physical default entry encoding
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln-olean --lib write::source::defaults::tests -- --test-threads=1
+      - name: Check source inference, ordinary precedence, visibility and artifact round trips
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --test source_default_instances --test source_module_artifacts --test source_olean_instances --test source_instance_attributes --test source_module_visibility_instances --test source_scoped_instance_commands --test source_module_visibility --test source_compiler_hints --test source_reducibility_attributes --test source_noncomputable --test source_default_simp --test source_numeric_literals --test source_instance_universe_holes --no-fail-fast -- --test-threads=1
+      - name: Check persisted metadata, diamond imports and tamper refusals
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --lib source_check::modules::persisted::tests -- --test-threads=1
+      - name: Check batched and sequential activation against the actual pin
+        if: success() || failure()
+        run: cargo test --locked --offline -p fln --lib source_check::modules::imported::tests::batched_metadata_activation_equals_one_registration_at_a_time -- --exact --nocapture --test-threads=1
+
+  array-iteration:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate Array execution with current source elaboration'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'ab488a0556d986f1a97790f944891dc3595f6b79'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'ab488a0556d986f1a97790f944891dc3595f6b79'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control Init/Data/String/Defs; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete candidate and retain the verified bytes
+        id: array-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object crates/fln/src/source_intrinsics/array_iteration/dependencies.txt)" = 03bd623fb97a1617ce726aeaf978810922143663
+          rust_paths=(
+            crates/fln/src/runtime/array_iteration.rs
+            crates/fln/src/source_intrinsics/array_iteration.rs
+            crates/fln/src/runtime/implemented_by.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime.rs
+            crates/fln/src/source_intrinsics.rs
+            crates/fln/tests/source_imported_arrays.rs
+            crates/fln/tests/source_imported_arrays/execution.rs
+            crates/fln/tests/source_imported_arrays/authority.rs
+            crates/fln/src/runtime/array_iteration/tests.rs
+          )
+          paths=(
+            crates/fln/src/runtime/array_iteration.rs
+            crates/fln/src/source_intrinsics/array_iteration.rs
+            crates/fln/src/runtime/implemented_by.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime.rs
+            crates/fln/src/source_intrinsics.rs
+            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
+            crates/fln/tests/source_imported_arrays.rs
+            crates/fln/tests/source_imported_arrays/programs.lean
+            crates/fln/tests/source_imported_arrays/effects.lean
+            crates/fln/tests/source_imported_arrays/execution.rs
+            crates/fln/tests/source_imported_arrays/authority.rs
+            crates/fln/tests/source_imported_arrays/check_oracle.py
+            crates/fln/src/runtime/array_iteration/tests.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_ARRAY_RUSTFMT_DIFF_END
+          echo FLN_ARRAY_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_ARRAY_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check exact Array model and compiler-companion authority
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --lib runtime::array_iteration::tests -- --nocapture --test-threads=1
+      - name: Check retained recursive producers and staged callbacks
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --lib runtime::global -- --nocapture --test-threads=1
+      - name: Execute and replay every Array probe and checked model control
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_imported_arrays actual_imported_array_iteration_executes_replays_and_preserves_authority -- --exact --nocapture --test-threads=1
+      - name: Check Array integration and current merged runtime
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib --test source_imported_arrays --test source_well_founded -- -D warnings
+
+  mutable-loop-regressions:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate mutable loop returns and imported Array execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '85912fee213d168817011fbc738db8ba30b284b5'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '85912fee213d168817011fbc738db8ba30b284b5'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control Init/Data/String/Defs; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete candidate and retain the verified bytes
+        id: array-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object crates/fln/src/source_intrinsics/array_iteration/dependencies.txt)" = 03bd623fb97a1617ce726aeaf978810922143663
+          rust_paths=(
+            crates/fln/src/runtime/array_iteration.rs
+            crates/fln/src/source_intrinsics/array_iteration.rs
+            crates/fln/src/runtime/implemented_by.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime.rs
+            crates/fln/src/source_intrinsics.rs
+            crates/fln/tests/source_imported_arrays.rs
+            crates/fln/tests/source_imported_arrays/execution.rs
+            crates/fln/tests/source_imported_arrays/authority.rs
+            crates/fln/src/runtime/array_iteration/tests.rs
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/loop_returns.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/returns.rs
+            crates/fln-elab/src/source/do_notation.rs
+            crates/fln-elab/src/source/do_notation/for_loop.rs
+          )
+          paths=(
+            crates/fln/src/runtime/array_iteration.rs
+            crates/fln/src/source_intrinsics/array_iteration.rs
+            crates/fln/src/runtime/implemented_by.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime.rs
+            crates/fln/src/source_intrinsics.rs
+            crates/fln/src/source_intrinsics/array_iteration/dependencies.txt
+            crates/fln/tests/source_imported_arrays.rs
+            crates/fln/tests/source_imported_arrays/programs.lean
+            crates/fln/tests/source_imported_arrays/effects.lean
+            crates/fln/tests/source_imported_arrays/execution.rs
+            crates/fln/tests/source_imported_arrays/authority.rs
+            crates/fln/tests/source_imported_arrays/check_oracle.py
+            crates/fln/src/runtime/array_iteration/tests.rs
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/loop_returns.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/returns.rs
+            crates/fln-elab/src/source/do_notation.rs
+            crates/fln-elab/src/source/do_notation/for_loop.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_ARRAY_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_ARRAY_RUSTFMT_DIFF_END
+          echo FLN_ARRAY_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_ARRAY_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check bounded do-notation transformation and recovery controls
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib source::do_notation -- --test-threads=1
+      - name: Execute retained loop, exception, membership, instance and text-pattern regressions
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_do --test source_exception_loops --test source_for_membership --test source_implemented_by --test source_default_instances --test source_text_patterns --no-fail-fast -- --test-threads=1
+      - name: Check the changed elaborator library
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check the affected source and runtime targets
+        if: (success() || failure()) && steps.array-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib --test source_do --test source_exception_loops --test source_for_membership --test source_implemented_by --test source_default_instances --test source_text_patterns -- -D warnings
+
+  array-iteration-oracle:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate Array execution with current source elaboration'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'ab488a0556d986f1a97790f944891dc3595f6b79'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'ab488a0556d986f1a97790f944891dc3595f6b79'
+          persist-credentials: false
+      - name: Verify candidate and install the exact Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control Init/Data/String/Defs; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Compare all 43 Array probes with the exact pinned Lean oracle
+        run: python3 crates/fln/tests/source_imported_arrays/check_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+
+  mutable-loop-returns:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate deferred records and terminal mutable returns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'd9647ab468671f9706f20f2208e1bd722a024e65'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'd9647ab468671f9706f20f2208e1bd722a024e65'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete mutable-return candidate and retain its exact bytes
+        id: mutable-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln/tests/source_do/for_loops/mutable_returns.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln/tests/source_do/for_loops/mutable_returns.rs
+            crates/fln/tests/source_do/for_loops/mutable_returns.lean
+            crates/fln/tests/source_do/for_loops/mutable_returns.expected.tsv
+            crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_MUTABLE_RETURN_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_MUTABLE_RETURN_RUSTFMT_DIFF_END
+          echo FLN_MUTABLE_RETURN_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_MUTABLE_RETURN_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check bounded do-notation transformations and recovery
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib source::do_notation -- --test-threads=1
+      - name: Require all 53 exact pinned mutable-return values and effect traces
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: python3 crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+      - name: Execute and replay mutable returns with all retained do-notation regressions
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_do -- --nocapture --test-threads=1
+      - name: Check mutable-return production and source fixtures
+        if: (success() || failure()) && steps.mutable-format.outcome == 'success'
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln --test source_do -- -D warnings
+
+  deferred-record-arguments:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate deferred records and terminal mutable returns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'd9647ab468671f9706f20f2208e1bd722a024e65'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'd9647ab468671f9706f20f2208e1bd722a024e65'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete record-argument candidate
+        id: record-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/application/postponed.rs
+            crates/fln/tests/source_postponed_records.rs
+          )
+          paths=(
+            crates/fln-elab/src/source.rs
+            crates/fln-elab/src/source/application/postponed.rs
+            crates/fln/tests/source_postponed_records.lean
+            crates/fln/tests/source_postponed_records.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_RECORD_ARGUMENT_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_RECORD_ARGUMENT_RUSTFMT_DIFF_END
+          echo FLN_RECORD_ARGUMENT_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_RECORD_ARGUMENT_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check ten shared computation proofs using the exact Lean pin
+        if: (success() || failure()) && steps.record-format.outcome == 'success'
+        run: |
+          set -euo pipefail
+          timeout 180 "$FLN_REFERENCE_LIB/../../bin/lean" crates/fln/tests/source_postponed_records.lean
+          echo 'FLN_RECORD_ARGUMENT_ORACLE: 10 shared computation proofs checked'
+      - name: Execute every deferred-record value, replay and refusal control
+        if: (success() || failure()) && steps.record-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_postponed_records -- --nocapture --test-threads=1
+      - name: Check the changed elaborator and affected source targets
+        if: (success() || failure()) && steps.record-format.outcome == 'success'
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln --test source_postponed_records -- -D warnings
+
+  imported-structure-inventory:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate deferred records and terminal mutable returns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: 'd9647ab468671f9706f20f2208e1bd722a024e65'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'd9647ab468671f9706f20f2208e1bd722a024e65'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the bounded metadata observation fixture
+        id: inventory-format
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true crates/fln-olean/tests/reference_structure_inventory.rs
+          echo FLN_STRUCTURE_INVENTORY_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff -- crates/fln-olean/tests/reference_structure_inventory.rs
+          echo FLN_STRUCTURE_INVENTORY_RUSTFMT_DIFF_END
+          echo FLN_STRUCTURE_INVENTORY_FORMATTED_BLOBS_BEGIN
+          printf '%s  %s\n' "$(git hash-object crates/fln-olean/tests/reference_structure_inventory.rs)" crates/fln-olean/tests/reference_structure_inventory.rs
+          echo FLN_STRUCTURE_INVENTORY_FORMATTED_BLOBS_END
+          git diff --check
+      - name: Decode exact structure layouts and default helper interfaces
+        if: (success() || failure()) && steps.inventory-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-olean --test reference_structure_inventory dump_pinned_structure_layout -- --nocapture --test-threads=1
+
+  imported-structure-metadata:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate imported theorem projections and record defaults'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete imported-structure candidate
+        id: structure-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            scripts/extract/gen_source_extension_contract.py
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.lean
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_END
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+      - name: Verify extracted structure layouts against the locked Reference source
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: python3 -I -S scripts/extract/gen_source_extension_contract.py --check
+      - name: Decode every actual Prelude structure row and reject alias and resource controls
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-olean --test reference_structure_metadata -- --nocapture --test-threads=1
+      - name: Check native record journals and malformed interface controls
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib records -- --nocapture --test-threads=1
+      - name: Check module ownership and scoped activation regressions
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --lib source_check::modules::imported -- --nocapture --test-threads=1
+      - name: Check decoder and record registry production targets
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-olean --lib --test reference_structure_metadata -- -D warnings
+
+  imported-record-elaboration:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(elab): validate imported theorem projections and record defaults'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '55ec1a436edfda500c8531cfb2a74f9d29f841d3'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/Data/Array/Basic Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete imported-structure candidate
+        id: structure-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          paths=(
+            crates/fln-olean/src/source_extensions.rs
+            crates/fln-olean/src/source_extensions/structures.rs
+            scripts/extract/gen_source_extension_contract.py
+            crates/fln-olean/src/source_extension_format.rs
+            crates/fln-elab/src/records.rs
+            crates/fln-elab/src/records/imported.rs
+            crates/fln-elab/src/records/imported/equality.rs
+            crates/fln-elab/src/records/imported/tests.rs
+            crates/fln-elab/src/records/inheritance.rs
+            crates/fln-elab/src/instances/imported.rs
+            crates/fln/src/source_check/modules/imported.rs
+            crates/fln/src/source_check/modules/imported/structures.rs
+            crates/fln/src/source_check/modules/imported/structures/tests.rs
+            crates/fln-elab/src/source/record_terms.rs
+            crates/fln-elab/src/source/record_terms/imported.rs
+            crates/fln-elab/src/source.rs
+            crates/fln-olean/tests/reference_structure_metadata.rs
+            crates/fln/tests/source_imported_structure_parents.lean
+            crates/fln/tests/source_imported_structure_parents.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_IMPORTED_RECORD_RUSTFMT_DIFF_END
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_IMPORTED_RECORD_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+      - name: Check all 27 shared imported-record proofs with the exact Lean pin
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: timeout 180 "$FLN_REFERENCE_LIB/../../bin/lean" crates/fln/tests/source_imported_structure_parents.lean
+      - name: Admit the real Prelude then check and replay all imported-record values
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_imported_structure_parents -- --nocapture --test-threads=1
+      - name: Check retained record literals defaults updates and deferred arguments
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_records --test source_record_literals --test source_record_defaults --test source_record_updates --test source_postponed_records --test source_default_instances --no-fail-fast -- --nocapture --test-threads=1
+      - name: Check the complete elaborator production target
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check source importer and affected record integration targets
+        if: (success() || failure()) && steps.structure-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib --test source_imported_structure_parents --test source_records --test source_record_literals --test source_record_defaults --test source_record_updates --test source_postponed_records --test source_default_instances -- -D warnings
+
+  distance-termination-oracle:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/WFTactics Init/Omega; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete distance-measure candidate and retain its exact bytes
+        id: distance-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/recursion/well_founded.rs
+            crates/fln-elab/src/source/recursion/well_founded/distance.rs
+            crates/fln/tests/source_well_founded.rs
+            crates/fln/tests/support/well_founded_distance.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/recursion/well_founded.rs
+            crates/fln-elab/src/source/recursion/well_founded/distance.rs
+            crates/fln/tests/source_well_founded.rs
+            crates/fln/tests/support/well_founded_distance.rs
+            crates/fln/tests/support/well_founded_distance.lean
+            crates/fln/tests/support/well_founded_distance_controls.lean
+            crates/fln/tests/support/check_well_founded_distance_oracle.py
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_DISTANCE_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_DISTANCE_RUSTFMT_DIFF_END
+          echo FLN_DISTANCE_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_DISTANCE_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check shared distance-measure observations and refusals with the exact Lean pin
+        if: (success() || failure()) && steps.distance-format.outcome == 'success'
+        run: python3 crates/fln/tests/support/check_well_founded_distance_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+
+  distance-termination:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '5121dfe1e7faaa6ced356008ed696fb706e4e465'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/WFTactics Init/Omega; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete distance-measure candidate and retain its exact bytes
+        id: distance-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/recursion/well_founded.rs
+            crates/fln-elab/src/source/recursion/well_founded/distance.rs
+            crates/fln/tests/source_well_founded.rs
+            crates/fln/tests/support/well_founded_distance.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/recursion/well_founded.rs
+            crates/fln-elab/src/source/recursion/well_founded/distance.rs
+            crates/fln/tests/source_well_founded.rs
+            crates/fln/tests/support/well_founded_distance.rs
+            crates/fln/tests/support/well_founded_distance.lean
+            crates/fln/tests/support/well_founded_distance_controls.lean
+            crates/fln/tests/support/check_well_founded_distance_oracle.py
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_DISTANCE_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_DISTANCE_RUSTFMT_DIFF_END
+          echo FLN_DISTANCE_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_DISTANCE_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check all existing and new native well-founded computations and proof controls
+        if: (success() || failure()) && steps.distance-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_well_founded -- --nocapture --test-threads=1
+      - name: Check recursive fallback and postponed argument regressions
+        if: (success() || failure()) && steps.distance-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_postponed_applications -- --nocapture --test-threads=1
+      - name: Check the complete elaborator production target
+        if: (success() || failure()) && steps.distance-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check the affected source and native execution targets
+        if: (success() || failure()) && steps.distance-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib --test source_well_founded --test source_postponed_applications -- -D warnings
+  while-loop-observer:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate staged callbacks and loop progress'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '98a4c912491536213e18375016684d8847372d2a'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '98a4c912491536213e18375016684d8847372d2a'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/While Init/Control/Id Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete while-loop candidate and retain its exact bytes
+        id: while-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/do_notation.rs
+            crates/fln-elab/src/source/patterns.rs
+            crates/fln-elab/src/source/do_notation/while_loop.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/do_notation.rs
+            crates/fln-elab/src/source/patterns.rs
+            crates/fln-elab/src/source/do_notation/while_loop.rs
+            crates/fln/tests/support/source_while.lean
+            crates/fln/tests/support/observe_source_while_oracle.py
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_WHILE_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_WHILE_RUSTFMT_DIFF_END
+          echo FLN_WHILE_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_WHILE_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check shared while-loop observations and refusals with the exact Lean pin
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        run: python3 crates/fln/tests/support/observe_source_while_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+
+  partial-callback-stages:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify standalone recursive callback support'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      CANDIDATE_SHA: '321d3d9a4176cdd0b15e9271bb1d46f67b932441'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '321d3d9a4176cdd0b15e9271bb1d46f67b932441'
+          persist-credentials: false
+      - name: Verify the immutable candidate and exact Rust compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+      - name: Format the standalone recursive callback implementation
+        id: partial-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln/src/runtime/global/partial.rs
+            crates/fln/src/runtime/global/partial/callbacks.rs
+            crates/fln/src/runtime/callables/stages.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime/global/partial/tests.rs
+            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
+          )
+          paths=(
+            crates/fln/src/runtime/global/partial.rs
+            crates/fln/src/runtime/global/partial/callbacks.rs
+            crates/fln/src/runtime/callables/stages.rs
+            crates/fln/src/runtime/specialize.rs
+            crates/fln/src/runtime/global/partial/tests.rs
+            crates/fln/src/runtime/global/partial/tests/callback_stages.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_PARTIAL_CALLBACK_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_PARTIAL_CALLBACK_RUSTFMT_DIFF_END
+          echo FLN_PARTIAL_CALLBACK_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_PARTIAL_CALLBACK_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+      - name: Execute and independently replay checked recursive callback stages
+        if: (success() || failure()) && steps.partial-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --lib runtime::global -- --nocapture --test-threads=1
+      - name: Check the complete native runtime production target
+        if: (success() || failure()) && steps.partial-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib -- -D warnings
+
+  while-loop-oracle:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/While Init/Control/Id Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete while-loop candidate and retain its exact bytes
+        id: while-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/do_notation/repeat.rs
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/conditional.rs
+            crates/fln/tests/source_while.rs
+            crates/fln/src/runtime/indexed.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/do_notation/repeat.rs
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/conditional.rs
+            crates/fln/tests/source_while.rs
+            crates/fln/tests/support/source_while.lean
+            crates/fln/tests/support/source_while_expected.tsv
+            crates/fln/tests/support/check_source_while_oracle.py
+            crates/fln/src/runtime/indexed.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_WHILE_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_WHILE_RUSTFMT_DIFF_END
+          echo FLN_WHILE_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_WHILE_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check shared while-loop observations and refusals with the exact Lean pin
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        run: python3 crates/fln/tests/support/check_source_while_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+
+  while-loop:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      FLN_TRACE_NAT_MOTIVE: '1'
+      CANDIDATE_SHA: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/While Init/Control/Id Init/Data/List/Control; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Format the complete while-loop candidate and retain its exact bytes
+        id: while-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_paths=(
+            crates/fln-elab/src/source/do_notation/repeat.rs
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/conditional.rs
+            crates/fln/tests/source_while.rs
+            crates/fln/src/runtime/indexed.rs
+          )
+          paths=(
+            crates/fln-elab/src/source/do_notation/repeat.rs
+            crates/fln-elab/src/source/do_notation/mutation.rs
+            crates/fln-elab/src/source/do_notation/control.rs
+            crates/fln-elab/src/source/do_notation/conditional.rs
+            crates/fln/tests/source_while.rs
+            crates/fln/tests/support/source_while.lean
+            crates/fln/tests/support/source_while_expected.tsv
+            crates/fln/tests/support/check_source_while_oracle.py
+            crates/fln/src/runtime/indexed.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          echo FLN_WHILE_RUSTFMT_DIFF_BEGIN
+          git diff --no-ext-diff --binary -- "${paths[@]}"
+          echo FLN_WHILE_RUSTFMT_DIFF_END
+          echo FLN_WHILE_FORMATTED_BLOBS_BEGIN
+          for path in "${paths[@]}"; do
+            printf '%s  %s\n' "$(git hash-object "$path")" "$path"
+          done
+          echo FLN_WHILE_FORMATTED_BLOBS_END
+          rustfmt --edition 2024 --config skip_children=true --check "${rust_paths[@]}"
+          git diff --check
+
+      - name: Check native while computations, control-flow, effects and independent replay
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_while -- --nocapture --test-threads=1
+      - name: Check the existing do-notation elaboration and execution regressions
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        shell: bash
+        run: |
+          cargo test --locked --offline -p fln-elab --lib source::do_notation -- --nocapture --test-threads=1
+          cargo test --locked --offline -p fln --test source_do -- --nocapture --test-threads=1
+      - name: Check the complete elaborator production target
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+      - name: Check the affected source and native execution targets
+        if: (success() || failure()) && steps.while-format.outcome == 'success'
+        run: cargo clippy --locked --offline -p fln --lib --test source_while --test source_do -- -D warnings
+
+  while-source-regressions:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): validate distance inference and merged loop execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+    steps:
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '881df599b6a69289093dfc1cb198b49ffbc687ec'
+          persist-credentials: false
+      - name: Verify candidate and install the exact compiler and Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          rustup show active-toolchain
+          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
+          rustc -Vv
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for module in Init/Prelude Init/While Init/Control/Id Init/Control/Except Init/Data/List/Control Init/System/IO; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$RUNNER_TEMP/lean-4.32.0-linux/lib/lean/$module.$suffix"
+            done
+          done
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+
+      - name: Check current while, repeat, nested action and term do syntax through the CLI and exact Lean pin
+        run: cargo test --locked --offline -p fln-cli --test source_while_loops --test source_nested_actions --test source_term_do_elements -- --nocapture --test-threads=1

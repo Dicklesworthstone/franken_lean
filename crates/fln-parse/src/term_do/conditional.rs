@@ -23,7 +23,12 @@ pub(super) fn element(
 mod tests {
     use super::*;
     fn count(syntax: &Syntax, label: &str) -> usize {
-        let expected = parser_kind(&["Term", label]);
+        // The pin's term `if` is the root-namespace notation `termIfThenElse`.
+        let expected = if label == "termIfThenElse" {
+            Name::from_components([label])
+        } else {
+            parser_kind(&["Term", label])
+        };
         let mut pending = vec![syntax];
         let mut found = 0;
         while let Some(syntax) = pending.pop() {
@@ -59,7 +64,7 @@ mod tests {
         let source = "def run : Nat := do { if a then if b then break else continue else (if c then «break» else «continue»); return 7 }";
         let parsed = parse_definition(source.as_bytes()).unwrap();
         assert_eq!(count(parsed.syntax(), "doIf"), 2);
-        assert_eq!(count(parsed.syntax(), "ifThenElse"), 1);
+        assert_eq!(count(parsed.syntax(), "termIfThenElse"), 1);
         assert_eq!(count(parsed.syntax(), "doBreak"), 1);
         assert_eq!(count(parsed.syntax(), "doContinue"), 1);
     }

@@ -1,0 +1,152 @@
+name: Native guard specification integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/guard-spec-landing.yml
+      - .github/patches/apply_guard_spec.py
+      - crates/fln-parse/src/command_scope/guard_spec.rs
+      - crates/fln-cli/src/guard_spec_tests.rs
+      - crates/fln-cli/src/guard_filter_tests.rs
+      - crates/fln-cli/src/guard_messages.rs
+      - crates/fln-parse/tests/guard_spec_lexing.rs
+      - .github/patches/apply_guard_filters.py
+      - crates/fln-cli/tests/lean_guard_spec_parity.rs
+      - crates/fln/src/source_check/modules/execution/preflight.rs
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-guard-spec-landing
+  cancel-in-progress: false
+
+jobs:
+  integrate-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install the repository's pinned toolchain
+        run: |
+          rustup show active-toolchain
+          echo "GUARD_BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Install checksum-verified Lean oracle and standard library
+        run: |
+          set -euo pipefail
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 -o "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          mkdir -p "$HOME/.elan/toolchains"
+          ln -s "$RUNNER_TEMP/lean-4.32.0-linux" "$HOME/.elan/toolchains/leanprover--lean4---v4.32.0"
+          test -f "$HOME/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean/Init.olean"
+          echo "FLN_GUARD_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Apply native source integration
+        run: |
+          python3 -I .github/patches/apply_guard_spec.py
+          python3 -I .github/patches/apply_guard_filters.py
+      - name: Format only the integrated Rust paths
+        run: |
+          rustfmt --edition 2024 --config skip_children=true \
+            crates/fln-parse/src/command_scope.rs \
+            crates/fln-parse/src/command_scope/guard_spec.rs \
+            crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
+            crates/fln/src/source_check/modules/execution/preflight.rs \
+            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs \
+            crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs \
+            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs \
+            crates/fln-cli/tests/lean_guard_spec_parity.rs
+          git diff --check
+      - name: Test native parsing, preflight, execution and collectors with debug assertions
+        run: |
+          cargo test --locked -p fln-parse --lib --no-fail-fast
+          cargo test --locked -p fln-parse --test guard_spec_lexing
+          cargo test --locked -p fln --lib guard_preflight
+          cargo test --locked -p fln --test source_guard_msgs
+          cargo test --locked -p fln-cli --lib guard_ --no-fail-fast
+      - name: Check production libraries with strict Clippy
+        run: cargo clippy --locked -p fln-parse -p fln -p fln-cli --lib -- -D warnings
+      - name: Check the workspace without changing its debug profile
+        run: cargo check --locked --workspace --all-targets
+      # Run 38328744774 passed the debug unit/engine tests, then timed out
+      # running three cold, whole-Init CLI processes concurrently. Retain every
+      # installed assertion and the real Init world; use the release executable
+      # and one test thread so the first admission can be reused by later cases.
+      - name: Test installed native CLI and exact pinned oracle output
+        run: |
+          cargo test --locked --release -p fln-cli --test lean_guard_msgs -- --test-threads=1
+          cargo test --locked --release -p fln-cli --test lean_guard_spec_parity -- --test-threads=1
+      - name: Commit tested integration directly to main
+        run: |
+          set -euo pipefail
+          paths=(
+            crates/fln-parse/src/command_scope.rs
+            crates/fln-parse/src/command_scope/guard_spec.rs
+            crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs
+            crates/fln/src/source_check/modules/execution/preflight.rs
+            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs
+            crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs
+            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs
+            crates/fln-cli/tests/lean_guard_spec_parity.rs
+          )
+          git diff --check
+          if git diff --quiet -- "${paths[@]}"; then
+            echo 'The tested integration is already on main.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -o "${paths[@]}" -m 'feat(lean): activate validated native guard message filtering' \
+            -m 'Integrate the prepared severity-routing implementation from 3282c98d into the native engine and renderer. Preserve first-filter precedence, warning positions, formatter budgets, checked-message uncertainty and explicit error/IO/position refusals. Parser, preflight, engine and collector tests ran with debug assertions; the unchanged installed CLI assertions and pinned oracle comparison ran in release, serialized over real Init. Strict library Clippy and workspace all-target compilation passed. No full-workspace test or broad compatibility claim.'
+          git show --stat HEAD
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            # Never overwrite concurrent edits to a path being published. A
+            # disjoint new base is revalidated before a normal fast-forward push.
+            git diff --quiet "$GUARD_BASE" origin/main -- "${paths[@]}" || {
+              echo 'Concurrent edits overlap the tested integration; refusing publication.'
+              exit 1
+            }
+            git rebase origin/main
+            cargo test --locked -p fln-parse --lib --no-fail-fast
+            cargo test --locked -p fln-parse --test guard_spec_lexing
+            cargo test --locked -p fln --lib guard_preflight
+            cargo test --locked -p fln --test source_guard_msgs
+            cargo test --locked -p fln-cli --lib guard_ --no-fail-fast
+            cargo clippy --locked -p fln-parse -p fln -p fln-cli --lib -- -D warnings
+            cargo check --locked --workspace --all-targets
+            cargo test --locked --release -p fln-cli --test lean_guard_msgs -- --test-threads=1
+            cargo test --locked --release -p fln-cli --test lean_guard_spec_parity -- --test-threads=1
+            git diff --check
+          fi
+          git push origin HEAD:main
+      - name: Retain the exact attempted source delta
+        if: always()
+        run: |
+          if test -n "${GUARD_BASE:-}"; then
+            git diff "$GUARD_BASE" -- \
+              crates/fln-parse/src/command_scope.rs \
+              crates/fln-parse/src/command_scope/guard_spec.rs \
+              crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
+              crates/fln/src/source_check/modules/execution/preflight.rs \
+              crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs \
+              crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs \
+              crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs \
+              crates/fln-cli/tests/lean_guard_spec_parity.rs > "$RUNNER_TEMP/guard-integration.patch"
+            printf '%s\n' "$GUARD_BASE" > "$RUNNER_TEMP/guard-integration-base.txt"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-guard-integration-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/guard-integration.patch
+            ${{ runner.temp }}/guard-integration-base.txt
+          if-no-files-found: warn

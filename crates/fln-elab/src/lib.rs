@@ -22,16 +22,21 @@
 #![forbid(unsafe_code)]
 
 pub mod aliases;
+pub mod arithmetic;
+pub mod aux_recursors;
 pub mod constraint;
 pub mod dataflow;
 pub mod decision;
 pub mod effects;
+pub mod externs;
+pub mod implemented_by;
 pub mod inductive;
 pub mod info;
 pub mod instances;
 pub mod lctx;
 pub mod messages;
 pub mod mvar;
+pub mod noncomputable;
 pub mod perturbation;
 pub mod protected_names;
 pub mod records;
@@ -80,7 +85,6 @@ pub enum NatDefinitionElabError {
     AnonymousDeclarationName,
     InvalidGeneratedEvaluationName,
     InvalidGeneratedCheckName,
-    CannotInferCheckType,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
     InvalidScientificLiteral,
@@ -104,9 +108,6 @@ impl std::fmt::Display for NatDefinitionElabError {
                 formatter,
                 "check name must be one numeric component below the anonymous root"
             ),
-            Self::CannotInferCheckType => {
-                write!(formatter, "bounded check term has no inferable type")
-            }
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
             Self::InvalidScientificLiteral => write!(formatter, "scientific literal is invalid"),
@@ -230,6 +231,20 @@ fn expect_empty_null(
     expect_node(syntax, &Name::str(Name::anonymous(), "null"), 0, expected).map(|_| ())
 }
 
+/// A tactic's configuration slot holding the default: the pin's empty `optConfig`
+/// (`Init/Tactics.lean`), or the empty null node of syntax the elaborator builds itself.
+fn expect_default_config(
+    syntax: &Syntax,
+    expected: &'static str,
+) -> Result<(), NatDefinitionElabError> {
+    if matches!(syntax, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "optConfig"]))
+    {
+        let parts = expect_node(syntax, &parser_kind(&["Tactic", "optConfig"]), 1, expected)?;
+        return expect_empty_null(&parts[0], expected);
+    }
+    expect_empty_null(syntax, expected)
+}
+
 fn expect_null_args<'a>(
     syntax: &'a Syntax,
     expected: &'static str,
@@ -307,106 +322,12 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
     Ok(Literal::Nat(literal_from_bignat(&value)))
 }
 
-fn decode_hex_scalar(bytes: &[u8]) -> Result<char, NatDefinitionElabError> {
-    let mut value = 0_u32;
-    for byte in bytes {
-        let digit = natural_digit(*byte).ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        value = value
-            .checked_mul(16)
-            .and_then(|value| value.checked_add(u32::try_from(digit).ok()?))
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-    }
-    // Pin `decodeQuotedChar` (`Init/Meta/Defs.lean:1096-1105`) feeds the
-    // digits to `Char.ofNat`. Invalid scalars (the UTF-16 surrogates a
-    // four-digit `\u` can name) become `'\0'`, not a decode failure
-    // (`Prelude.lean:2867-2870`). `char::from_u32` is the Rust refusal;
-    // using it here rejected `"\uD800"` while the pin accepted a NUL.
-    Ok(char::from_u32(value).unwrap_or('\0'))
-}
-
+/// `Syntax.isStrLit?`'s value ([`fln_syntax::literal::decode_string`], shared with the parser,
+/// which reads `syntax` declarations' atoms with it).
 fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
-    if spelling.starts_with('r') {
-        let bytes = spelling.as_bytes();
-        let mut opener = 1;
-        while bytes.get(opener) == Some(&b'#') {
-            opener += 1;
-        }
-        if bytes.get(opener) != Some(&b'"') {
-            return Err(NatDefinitionElabError::InvalidStringLiteral);
-        }
-        let hashes = opener - 1;
-        let suffix = 1_usize
-            .checked_add(hashes)
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        let content_start = opener + 1;
-        let content_stop = spelling
-            .len()
-            .checked_sub(suffix)
-            .filter(|stop| *stop >= content_start)
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        if bytes.get(content_stop) != Some(&b'"')
-            || bytes[content_stop + 1..].iter().any(|byte| *byte != b'#')
-        {
-            return Err(NatDefinitionElabError::InvalidStringLiteral);
-        }
-        return Ok(Literal::Str(
-            spelling[content_start..content_stop].to_owned(),
-        ));
-    }
-
-    let content = spelling
-        .strip_prefix('"')
-        .and_then(|spelling| spelling.strip_suffix('"'))
-        .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-    let mut decoded = String::new();
-    let mut chars = content.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            decoded.push(character);
-            continue;
-        }
-        let escaped = chars
-            .next()
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        match escaped {
-            '\\' => decoded.push('\\'),
-            '"' => decoded.push('"'),
-            '\'' => decoded.push('\''),
-            'r' => decoded.push('\r'),
-            'n' => decoded.push('\n'),
-            't' => decoded.push('\t'),
-            'x' => {
-                let digits = chars.by_ref().take(2).collect::<String>();
-                if digits.len() != 2 {
-                    return Err(NatDefinitionElabError::InvalidStringLiteral);
-                }
-                decoded.push(decode_hex_scalar(digits.as_bytes())?);
-            }
-            'u' => {
-                let digits = chars.by_ref().take(4).collect::<String>();
-                if digits.len() != 4 {
-                    return Err(NatDefinitionElabError::InvalidStringLiteral);
-                }
-                decoded.push(decode_hex_scalar(digits.as_bytes())?);
-            }
-            // Pin `quotedCharCoreFn` (`Basic.lean:668`): a string gap starts
-            // only on a newline after `\`. `stringGapFn` then eats pin
-            // whitespace (`Char.isWhitespace`: space, tab, CR, LF) and
-            // refuses a second newline. Unicode White_Space (NBSP, form
-            // feed, …) is content, not gap.
-            '\n' => loop {
-                match chars.clone().next() {
-                    Some('\n') => return Err(NatDefinitionElabError::InvalidStringLiteral),
-                    Some(whitespace) if fln_syntax::literal::is_whitespace(whitespace) => {
-                        chars.next();
-                    }
-                    _ => break,
-                }
-            },
-            _ => return Err(NatDefinitionElabError::InvalidStringLiteral),
-        }
-    }
-    Ok(Literal::Str(decoded))
+    fln_syntax::literal::decode_string(spelling)
+        .map(Literal::Str)
+        .ok_or(NatDefinitionElabError::InvalidStringLiteral)
 }
 
 fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {
@@ -497,6 +418,8 @@ pub fn elaborate_definition_in(
 /// Elaborate with native expected-type propagation and implicit inference.
 /// Every speculative assignment uses the caller's calibrated kernel budget.
 /// The returned declaration is still an untrusted candidate, not admission.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects_in_with_budget`] instead.
 pub fn elaborate_definition_in_with_budget(
     syntax: &Syntax,
     environment: &Environment,
@@ -507,6 +430,22 @@ pub fn elaborate_definition_in_with_budget(
     // elaboration error as a kernel rejection.
     source::definition(syntax, environment, budget)
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// Elaborate an untrusted declaration together with effects selected by the
+/// successful elaboration. Both checkers must admit the candidate before the
+/// caller installs its effects in the checked successor.
+pub fn elaborate_definition_with_effects_in_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+) -> Result<source::ElaboratedDeclaration, NatDefinitionElabError> {
+    elaborate_definition_with_effects_in_scope_with_budget(
+        syntax,
+        environment,
+        budget,
+        &source::scope::SourceScope::default(),
+    )
 }
 
 /// The pin words an unknown name `Unknown constant` when a proper prefix of it is a
@@ -573,6 +512,57 @@ pub fn elaborate_evaluation_in_with_budget(
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
+/// [`elaborate_evaluation_in_with_budget`] with names resolved in a source scope
+/// (enclosing namespaces and `open` declarations).
+pub fn elaborate_evaluation_in_scope_with_budget(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    source::scope::elaborate_evaluation(syntax, generated_name, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// [`elaborate_definition_in_with_budget`] with names declared and resolved in a
+/// source scope.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects_in_scope_with_budget`] instead.
+pub fn elaborate_definition_in_scope_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    source::scope::elaborate_definition(syntax, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// The metadata-bearing source declaration seam with names resolved in `scope`.
+pub fn elaborate_definition_with_effects_in_scope_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<source::ElaboratedDeclaration, NatDefinitionElabError> {
+    source::scope::elaborate_definition_with_effects(syntax, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// A `#check` candidate with names resolved in a source scope.
+pub fn elaborate_check_in_scope_with_budget(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    // An unknown name is the pin's "Unknown identifier `x`" here too, as for a definition.
+    source::scope::elaborate_check(syntax, generated_name, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
 /// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a
 /// definition candidate used only for dual-checker validation.
 ///
@@ -595,12 +585,8 @@ pub fn elaborate_check_in_with_budget(
     environment: &Environment,
     budget: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::query(syntax, generated_name, environment, budget, false) {
-        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
-            _,
-        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
-        result => result,
-    }
+    source::query(syntax, generated_name, environment, budget, false)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
 fn elaborate_definition_with_types(
@@ -845,6 +831,28 @@ fn elaborate_atom(
         Syntax::Ident { val: name, .. } => {
             elaborate_nat_reference(name, locals, allow_string, environment)?
         }
+        // `nat_lit n` (`rawNatLit`): the pin's `elabRawNatLit` is `mkRawNatLit n`, a raw literal of
+        // type `Nat`, with no `OfNat` instance.
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["rawNatLit"]) && args.len() == 2 =>
+        {
+            let Syntax::Node { kind, args, .. } = &args[1] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            };
+            let [Syntax::Atom { val: spelling, .. }] = args.as_slice() else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            };
+            if kind != &Name::str(Name::anonymous(), "num") {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            }
+            Expr::lit(decode_natural(spelling)?)
+        }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "supported scalar literal or constant identifier",
@@ -899,6 +907,11 @@ enum BoundedInfixIntrinsic {
         intrinsic: Name,
     },
     ScalarBeq,
+    /// `notation:50 a:50 " ∈ " b:50 => Membership.mem b a` and `a ∉ b => ¬ (a ∈ b)`
+    /// (vendored `src/Init/Notation.lean:420-422`): the operands swap, and `∉` negates.
+    Membership {
+        negated: bool,
+    },
 }
 
 impl BoundedInfixIntrinsic {
@@ -906,7 +919,18 @@ impl BoundedInfixIntrinsic {
         match self {
             Self::Fixed { spelling, .. } => spelling,
             Self::ScalarBeq => "==",
+            Self::Membership { negated: false } => "∈",
+            Self::Membership { negated: true } => "∉",
         }
+    }
+
+    /// Whether `atom` spells this operator: its own spelling, or the ASCII alternative
+    /// of a `unicode(" ≤ ", " <= ")` notation, which is the same syntax at the pin.
+    fn spelled_by(&self, atom: &Syntax) -> bool {
+        let Syntax::Atom { val, .. } = atom else {
+            return false;
+        };
+        val == self.spelling() || (self.spelling() == "≤" && val == "<=")
     }
 }
 
@@ -919,11 +943,15 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
             ("\\/", "Or"),
             ("↔", "Iff"),
             ("<->", "Iff"),
+            // `infixl " && " => and`: the notation's `and` is the `export Bool (and)`
+            // alias, resolved when the notation was declared.
+            ("&&", "Bool.and"),
+            ("||", "Bool.or"),
         ] {
             if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
                 return Some(BoundedInfixIntrinsic::Fixed {
                     spelling,
-                    intrinsic: Name::from_components([constant]),
+                    intrinsic: Name::from_components(constant.split('.')),
                 });
             }
         }
@@ -937,6 +965,76 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
     if allow_string && kind == &Name::str(Name::anonymous(), "term_==_") {
         return Some(BoundedInfixIntrinsic::ScalarBeq);
     }
+    if allow_string {
+        // Init's plain `infix`/`infixl`/`infixr` notations: ordinary applications of the
+        // function each names (`Init/Notation.lean:272-428`, `Init/Core.lean:539-560`).
+        for (spelling, constant) in [
+            ("×", "Prod"),
+            ("×'", "PProd"),
+            ("∘", "Function.comp"),
+            ("∣", "Dvd.dvd"),
+            ("⊆", "HasSubset.Subset"),
+            ("⊂", "HasSSubset.SSubset"),
+            ("∪", "Union.union"),
+            ("∩", "Inter.inter"),
+            ("\\", "SDiff.sdiff"),
+            ("<$>", "Functor.map"),
+            (">>=", "Bind.bind"),
+            ("⊕", "Sum"),
+            ("•", "HSMul.hSMul"),
+            ("≍", "HEq"),
+            ("≈", "HasEquiv.Equiv"),
+        ] {
+            if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components(constant.split('.')),
+                });
+            }
+        }
+        // The bounded ranges, declared in namespace `Std` (`Init/Data/Range/Polymorphic`):
+        // `macro_rules | `($a...<$b) => ``(Rco.mk $a $b)` and the rest.
+        for (spelling, constant) in [
+            ("...<", "Rco"),
+            ("...", "Rco"),
+            ("...=", "Rcc"),
+            ("<...<", "Roo"),
+            ("<...", "Roo"),
+            ("<...=", "Roc"),
+        ] {
+            if kind == &Name::from_components(["Std", format!("term_{spelling}_").as_str()]) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components(["Std", constant, "mk"]),
+                });
+            }
+        }
+        // Declared in namespace `List` (`Init/Data/List/Basic.lean`), so their kinds are too.
+        for (spelling, constant) in [
+            ("<+:", "IsPrefix"),
+            ("<:+", "IsSuffix"),
+            ("<:+:", "IsInfix"),
+        ] {
+            if kind == &Name::str(Name::from_components(["List"]), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components(["List", constant]),
+                });
+            }
+        }
+        // `infixl:33 " ^^ " => xor` in namespace `Bool` (`Init/Data/Bool.lean`).
+        if kind == &Name::str(Name::from_components(["Bool"]), "term_^^_") {
+            return Some(BoundedInfixIntrinsic::Fixed {
+                spelling: "^^",
+                intrinsic: Name::from_components(["Bool", "xor"]),
+            });
+        }
+        for (spelling, negated) in [("∈", false), ("∉", true)] {
+            if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Membership { negated });
+            }
+        }
+    }
     let rows = [
         ("term_|||_", "|||", ["Nat", "lor"]),
         ("term_^^^_", "^^^", ["Nat", "xor"]),
@@ -949,7 +1047,7 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
         ("term_<<<_", "<<<", ["Nat", "shiftLeft"]),
         ("term_>>>_", ">>>", ["Nat", "shiftRight"]),
         ("term_^_", "^", ["Nat", "pow"]),
-        ("term_<=_", "<=", ["Nat", "decLe"]),
+        ("term_≤_", "≤", ["Nat", "decLe"]),
         ("term_<_", "<", ["Nat", "decLt"]),
     ];
     for (syntax_kind, spelling, constant) in rows {
@@ -999,11 +1097,11 @@ fn elaborate_nonlet_term(
                 };
                 if let Some(intrinsic) = bounded_infix_intrinsic(kind, allow_string) {
                     let parts = expect_node(term, kind, 3, "bounded scalar infix expression")?;
-                    expect_atom(
-                        &parts[1],
-                        intrinsic.spelling(),
-                        "bounded scalar infix operator",
-                    )?;
+                    if !intrinsic.spelled_by(&parts[1]) {
+                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                            expected: "bounded scalar infix operator",
+                        });
+                    }
                     tasks.push(Task::ApplyInfix {
                         values_before: values.len(),
                         intrinsic,
@@ -1082,6 +1180,11 @@ fn elaborate_nonlet_term(
                     })?;
                 let intrinsic = match intrinsic {
                     BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                    BoundedInfixIntrinsic::Membership { .. } => {
+                        return Err(NatDefinitionElabError::UnexpectedSyntax {
+                            expected: "an operator of the bounded definition grammar",
+                        });
+                    }
                     BoundedInfixIntrinsic::ScalarBeq => {
                         let left_type = infer_expr_type(&left, locals, environment);
                         let right_type = infer_expr_type(&right, locals, environment);
@@ -2453,6 +2556,31 @@ mod tests {
                 expected: "Lean.Parser.Command.check"
             })
         ));
+
+        // An unknown name is the pin's `error(lean.unknownIdentifier)` through either entry
+        // point, naming it, as for a definition.
+        let unknown = fln_parse::parse_source_command(b"#check Missing")
+            .expect("the unknown-name check parses");
+        let scope = source::scope::SourceScope::default();
+        for refused in [
+            elaborate_check_in(
+                unknown.syntax(),
+                Name::num(Name::anonymous(), 12),
+                &environment,
+            ),
+            elaborate_check_in_scope_with_budget(
+                unknown.syntax(),
+                Name::num(Name::anonymous(), 13),
+                &environment,
+                Budget::DEFAULT,
+                &scope,
+            ),
+        ] {
+            assert_eq!(
+                refused.map(|_| ()).map_err(|error| error.to_string()),
+                Err("Unknown identifier `Missing`".to_owned())
+            );
+        }
     }
 
     #[test]

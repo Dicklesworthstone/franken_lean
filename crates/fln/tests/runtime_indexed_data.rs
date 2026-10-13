@@ -1,12 +1,16 @@
 //! Indexed data executes only after ordinary dual-checker admission.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, VmExit};
+use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Mode, VmExit};
 
 fn limits() -> EngineExecutionLimits {
     EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
+/// Directly written recursors execute only in the `frontier` mode; the default refuses
+/// them as the pin's code generator does (bead `franken_lean-z8j.1.6.6`).
 fn engine() -> Engine {
-    Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
         .unwrap()
         .into_complete()
         .unwrap()
@@ -228,36 +232,62 @@ fn existential_type_fields_execute_with_a_boxed_value() {
 }
 
 #[test]
-fn type_indices_and_existential_runtime_representations_are_refused() {
-    use fln::{Outcome, SourceCheckLimits};
-    for source in [
-        "inductive Dynamic : Type -> Type where | nat (n : Nat) : Dynamic Nat | flag (b : Bool) : Dynamic Bool\n\
-         def ignore (x : Dynamic Nat) : Nat := 42\n#eval ignore (Dynamic.nat 7)",
-        // A function field over the existential type has no layout; only a
-        // field typed by exactly the type field is a boxed slot.
-        "inductive Dynamic : Nat -> Type 1 where | pack (A : Type) (value : A) (measure : A -> Nat) : Dynamic 0\n\
-         def ignore (x : Dynamic 0) : Nat := 42\n#eval ignore (Dynamic.pack Nat 1 (fun n => n + 1))",
-    ] {
-        let base = engine();
-        let options = KVMap::new();
-        let root = base.logical_root(&options);
-        // These are valid logical declarations, not parser-error controls.
-        base.check_source_files(
-            &[source.split("#eval").next().unwrap().as_bytes()],
+fn type_indices_select_one_uniform_runtime_layout() {
+    use fln::SourceCheckLimits;
+    let source = "inductive Dynamic : Type -> Type where | nat (n : Nat) : Dynamic Nat | flag (b : Bool) : Dynamic Bool\n\
+         def ignore (x : Dynamic Nat) : Nat := 42\n#eval ignore (Dynamic.nat 7)";
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let definitions = source.split("#eval").next().unwrap();
+    // This remains a valid logical declaration, not a parser-error control.
+    let checked = base
+        .check_source_files(
+            &[definitions.as_bytes()],
             &options,
             SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
         )
         .unwrap()
         .into_complete()
         .unwrap();
-        assert!(
-            !matches!(
-                base.execute_source_definitions(&[source.as_bytes()], &options, limits()),
-                Ok(Outcome::Complete(_))
+    let prepared = base
+        .execute_source_definitions(&[definitions.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        prepared.engine.logical_root(&options),
+        checked.engine.logical_root(&options)
+    );
+    let executed = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &executed.executions.last().unwrap().exit else {
+        panic!("native return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn indexed_existential_callbacks_consume_their_boxed_values() {
+    for (value, expected) in [
+        ("IndexedPackage.pack Nat 41 (fun n => n + 1)", "42"),
+        ("IndexedPackage.pack String \"boxed\" String.length", "5"),
+    ] {
+        run(
+            &format!(
+                "inductive IndexedPackage : Nat -> Type 1 where | pack (A : Type) (value : A) (measure : A -> Nat) : IndexedPackage 0\n\
+                 def read (p : IndexedPackage 0) : Nat := match p with | .pack A value measure => measure value\n\
+                 #eval read ({value})"
             ),
-            "{source}"
+            expected,
         );
-        assert_eq!(base.logical_root(&options), root);
     }
 }
 

@@ -175,7 +175,7 @@ fn k_can_expose_a_value_assignment_without_solving_an_opaque_proof() {
     );
     let report = txn.unify(&term, &number(23), budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![out.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(txn.mvars.get_assigned_expr(&out), Some(&number(23)));
     assert!(!txn.mvars.is_assigned(&p));
     assert!(txn.mvars.is_declared(&p));
@@ -255,7 +255,7 @@ fn later_endpoint_inference_retries_the_original_transport() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments, vec![index]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -673,7 +673,7 @@ fn dependent_type_indices_are_inferred_through_neutral_transports() {
         .unwrap();
     assert_eq!(report.expression_assignments, vec![index.clone()]);
     assert_eq!(txn.mvars.get_assigned_expr(&index), Some(&number(23)));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -737,7 +737,7 @@ fn mixed_queued_transport_obligations_preserve_the_opaque_proof_residual() {
         .unwrap();
     assert_eq!(report.solved, vec![typing, equation]);
     assert_eq!(report.unification.expression_assignments, vec![out.clone()]);
-    assert_eq!(report.unification.kernel_checks, 2);
+    assert_eq!(report.unification.kernel_checks, 4);
     assert_eq!(
         report.unification.residual_metavariables,
         vec![proof.clone()]
@@ -828,7 +828,7 @@ fn queued_transport_reduction_uses_the_saved_dependent_local_context() {
         .solve_constraints_with(&[typing, equation], budget(), &|| false)
         .unwrap();
     assert_eq!(report.solved, vec![typing, equation]);
-    assert_eq!(report.unification.kernel_checks, 2);
+    assert_eq!(report.unification.kernel_checks, 4);
     assert!(report.unification.residual_metavariables.is_empty());
     assert_eq!(txn.mvars.get_assigned_expr(&out), Some(&number(23)));
     assert!(txn.lctx.is_empty());

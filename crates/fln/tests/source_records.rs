@@ -46,9 +46,23 @@ fn source_records_generate_constructors_projections_and_real_proofs() {
 
 #[test]
 fn dependent_fields_infer_a_large_enough_record_universe() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    // The pin requires an explicit numeral type through this named projection.
+    let original = "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := Package.mk Nat 23\ntheorem value_ok : Package.value wrapped = 23 := by rfl";
+    let Err(error) = base.check_source_files(
+        &[original.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ) else {
+        panic!("accepted an unannotated dependent-field numeral");
+    };
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&n("wrapped")));
     check(
-        &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := Package.mk Nat 23\ntheorem value_ok : Package.value wrapped = 23 := by rfl",
+        &base,
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := Package.mk Nat 23\ntheorem value_ok : Package.value wrapped = (23 : Nat) := by rfl",
     );
 }
 
@@ -57,6 +71,83 @@ fn type_parameters_and_method_arguments_use_the_same_scoped_elaborator() {
     check(
         &engine(),
         "structure Box (A : Type) where\n  value : A\n  transform (x : A) : A\ndef box : Box Nat := Box.mk 3 (fun x => x + 1)\ntheorem box_ok : Box.transform box (Box.value box) = 4 := by rfl",
+    );
+}
+
+#[test]
+fn record_method_binders_and_result_types_use_checked_lambda_scopes() {
+    let source = r#"
+structure Methods where
+  apply : Nat → Nat → Nat
+  ignore : Nat → Nat
+  identity : {A : Type} → A → A
+def methods : Methods := {
+  apply (x y : Nat) : Nat := x + y,
+  ignore _ := 7,
+  identity {A : Type} (x : A) : A := x
+}
+theorem apply_ok : methods.apply 20 22 = 42 := by rfl
+theorem ignore_ok : methods.ignore 100 = 7 := by rfl
+theorem identity_ok : methods.identity 19 = 19 := by rfl
+structure Box where
+  value : Nat
+structure Factory where
+  make : Nat → Box
+def factory : Factory := { make (x : Nat) : Box := { value := x } }
+theorem nested_ok : (factory.make 23).value = 23 := by rfl
+def changed : Methods := { methods with apply x _ := x + 1 }
+theorem update_ok : changed.apply 41 99 = 42 := by rfl
+theorem copied_ok : changed.ignore 99 = 7 := by rfl
+class Printer (A : Type) where
+  render : A → Nat → String
+instance printer : Printer Nat where
+  render (_ : Nat) _ : String := "printed"
+theorem printer_ok : Printer.render 42 0 = "printed" := by rfl
+class Chosen (A : Type) where
+  value : A
+structure Selector where
+  select : {A : Type} → [Chosen A] → A
+def selector : Selector := {
+  select {A : Type} [d : Chosen A] : A := @Chosen.value A d
+}
+instance chosenNat : Chosen Nat := { value := 17 }
+theorem selected_ok : (selector.select : Nat) = 17 := by rfl
+"#;
+    let result = check(&engine(), source);
+    assert_eq!(result.theorems, 8);
+    assert!(result.engine.environment().contains(&n("printer_ok")));
+    assert!(result.engine.environment().contains(&n("selected_ok")));
+}
+
+#[test]
+fn field_method_annotations_are_checked_under_the_binders_without_leaking_names() {
+    let base = check(
+        &engine(),
+        "structure Method where\n apply : Nat → Nat\nclass Print where\n render : Nat → String",
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    for invalid in [
+        "def bad : Method := { apply (x : String) := 0 }",
+        "def bad : Method := { apply x : String := x }",
+        "def bad : Method := { apply x y := x }",
+        "instance bad : Print where\n render x : Nat := x",
+        "def good : Method := { apply x := x }\ndef escaped : Nat := x",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[invalid.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err(),
+            "field binders must obey ordinary typing and scope: {invalid}"
+        );
+        assert_eq!(root, base.logical_root(&KVMap::new()));
+    }
+    check(
+        &base,
+        "def retry : Method := { apply (x : Nat) : Nat := x + 1 }\ntheorem retry_ok : retry.apply 41 = 42 := by rfl",
     );
 }
 
@@ -203,7 +294,8 @@ fn source_command_report_retains_every_checked_declaration_transition() {
         .unwrap()
         .into_complete()
         .unwrap();
-    assert_eq!(result.admissions.len(), 3);
+    // The block, two projections, and the two checked recursor auxiliaries.
+    assert_eq!(result.admissions.len(), 5);
     assert!(matches!(
         result.admissions[0].declaration,
         Declaration::Inductive(_)

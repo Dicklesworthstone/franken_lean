@@ -64,7 +64,7 @@ fn wildcard_keeps_shadowed_proof_identities_and_ignores_nonproof_data() {
 }
 
 #[test]
-fn wildcard_locations_remap_replaced_locals_and_exclude_self_evidence() {
+fn wildcard_locations_drop_rewritten_rules_and_exclude_self_evidence() {
     let base = engine();
     check(
         &base,
@@ -72,6 +72,17 @@ fn wildcard_locations_remap_replaced_locals_and_exclude_self_evidence() {
       theorem transport (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by
         simp only [*] at hx
         exact hx
+    "#,
+    );
+    // Pin-audited 2026-10-06 (v4.32.0): the simp set is built once, so once
+    // `hx` is rewritten its rule fires nowhere afterwards — the goal pass
+    // neither closes `P y` with the old `P x` form nor with the rewritten
+    // one, and the pin reports "unsolved goals". The old encoding remapped
+    // the rule to the rewritten hypothesis and closed the goal, a false
+    // accept (reference_differential.tsv, native_simp_hypotheses).
+    refuse(
+        &base,
+        r#"
       theorem together (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by
         simp only [*] at hx ⊢
     "#,

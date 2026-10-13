@@ -22,10 +22,22 @@ impl Prefix {
             name,
             colon,
             assignment,
+            mutable,
+            reassign,
+            recursive,
         } = self.statement
         else {
             return Err(invalid());
         };
+        // A mutable or reassigning refutable binding is not read, and `doHave` and `let rec` have
+        // no failure branch.
+        if mutable.is_some()
+            || reassign
+            || recursive.is_some()
+            || matches!(&leaves.leaf(keyword)?, Syntax::Atom { val, .. } if val == "have")
+        {
+            return Err(invalid());
+        }
         let assignment = assignment.ok_or_else(invalid)?;
         let annotation = match (colon, self.annotation.take()) {
             (Some(colon), Some(type_)) => null_node(vec![Syntax::node(

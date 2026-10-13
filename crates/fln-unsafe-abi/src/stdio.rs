@@ -38,7 +38,7 @@
 use core::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
-use crate::layout::{LeanExternalClass, LeanObject};
+use crate::layout::{LeanExternalClass, LeanObject, LeanSarrayObject};
 use crate::{object, rc, tagged};
 
 // ---------------------------------------------------------------- platform
@@ -55,6 +55,7 @@ unsafe extern "C" {
     // three-argument redeclaration of a symbol std itself imports.
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
+    fn close(fd: c_int) -> c_int;
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn fread(ptr: *mut c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn feof(f: *mut c_void) -> c_int;
@@ -185,6 +186,29 @@ pub(crate) fn errno() -> c_int {
     #[allow(unsafe_code)]
     unsafe {
         *__errno_location()
+    }
+}
+
+/// Synchronize the process stdout used by native `fwrite` with a host writer
+/// which will subsequently publish through the same file descriptor.
+///
+/// This does not create a native stream, select a thread-local override, or
+/// flush unrelated files. Individual Lean writes retain their pinned buffering
+/// semantics. A failed flush reports the operating system error without
+/// constructing a logical `IO.Result` or retrying an already completed action.
+pub(crate) fn flush_native_stdout() -> std::io::Result<()> {
+    initialize_io_signals();
+    // SAFETY: glibc's process stdout is live for the process lifetime. fflush
+    // acquires its FILE lock internally; no borrowed object or raw pointer
+    // escapes, and errno is read before another native operation can change it.
+    // UNSAFE-LEDGER: FLN-UL-0659
+    #[allow(unsafe_code)]
+    unsafe {
+        if fflush(stdout) == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(errno()))
+        }
     }
 }
 
@@ -884,10 +908,81 @@ pub(crate) unsafe fn prim_handle_mk(filename: *mut LeanObject, mode: u8) -> *mut
             _ => b"a\0",
         };
         let fp = fdopen(fd, fp_mode.as_ptr().cast::<c_char>());
-        if fp.is_null() {
-            return io_result_mk_error(decode_io_error(errno(), filename));
+        let code = if fp.is_null() { errno() } else { 0 };
+        finish_handle_open(fd, fp, code, filename)
+    }
+}
+
+/// Settle the descriptor returned by open after fdopen. A failed fdopen has
+/// not taken ownership of fd; close it before allocating the captured error.
+/// File creation/truncation may already have happened and is not rolled back.
+///
+/// # Safety
+/// `fd` is owned after successful open; `file` is either null or the FILE
+/// that has taken ownership of that exact descriptor. `filename` is borrowed
+/// canonical String and `code` is errno captured immediately after failure.
+// UNSAFE-LEDGER: FLN-UL-0628
+#[allow(unsafe_code)]
+pub(crate) unsafe fn finish_handle_open(
+    fd: c_int,
+    file: *mut c_void,
+    code: c_int,
+    filename: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: successful fdopen transfers fd to FILE and its Handle finalizer;
+    // otherwise this is the unique descriptor owner. On Linux close settles
+    // the descriptor even on EINTR; retrying could close a reused descriptor.
+    unsafe {
+        if file.is_null() {
+            close(fd);
+            io_result_mk_error(decode_io_error(code, filename))
+        } else {
+            io_result_mk_ok(io_wrap_handle(file))
         }
-        io_result_mk_ok(io_wrap_handle(fp))
+    }
+}
+
+/// Recognize exactly the native FILE-owning Handle class, never an arbitrary
+/// external object or a logical Unit constructor.
+///
+/// # Safety
+/// `handle` is a scalar or a live membrane object, borrowed for this call.
+// UNSAFE-LEDGER: FLN-UL-0629
+#[allow(unsafe_code)]
+pub(crate) unsafe fn is_native_file_handle(handle: *mut LeanObject) -> bool {
+    // SAFETY: category check precedes external fields; the class is immutable
+    // and the owning live Obj keeps its nonnull FILE alive throughout.
+    unsafe {
+        if handle.is_null()
+            || tagged::is_scalar(handle)
+            || rc::read_header(handle).tag != crate::contract::TAG_EXTERNAL
+        {
+            return false;
+        }
+        let (class, file) = object::external_fields(handle);
+        class == handle_class() && !file.is_null()
+    }
+}
+
+/// Direct checked Handle.putStr, sharing the exact byte effect and error
+/// transport policy with the reviewed stdout callback.
+///
+/// # Safety
+/// `handle` is scalar or a live object, `text` a canonical live String. Both
+/// are borrowed. A returned native IO.Result owns one reference.
+// UNSAFE-LEDGER: FLN-UL-0630
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_put_str(
+    handle: *mut LeanObject,
+    text: *mut LeanObject,
+) -> Result<Option<(*mut LeanObject, usize)>, (c_int, usize)> {
+    // SAFETY: the class check precedes the primitive. Shared completion rejects
+    // filename-dependent decoder arms while preserving the completed count.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        checked_put_str_result(handle_put_str_status(handle, text)).map(Some)
     }
 }
 
@@ -902,26 +997,225 @@ pub(crate) unsafe fn prim_handle_put_str(
     h: *mut LeanObject,
     s: *mut LeanObject,
 ) -> *mut LeanObject {
-    // SAFETY: live objects per contract; fwrite reads exactly n bytes of
-    // the copied data.
+    // SAFETY: live objects per contract. This exported ABI entry retains
+    // the pin's filename precondition on its error decoder; safe Golem
+    // callers use checked_stream_put_str below instead.
     unsafe {
-        let fp = io_get_handle(h);
-        let (m_size, _, _, bytes) = object::string_fields(s);
-        let n = m_size - 1;
-        let m = fwrite(bytes.as_ptr().cast::<c_void>(), 1, n, fp);
-        if m == n {
-            io_result_mk_ok(tagged::boxi(0))
+        match handle_put_str_status(h, s) {
+            Ok(_) => io_result_mk_ok(tagged::boxi(0)),
+            Err((code, _)) => io_result_mk_error(decode_io_error(code, core::ptr::null_mut())),
+        }
+    }
+}
+
+/// Recognize the complete native stream_of_handle carrier before core may
+/// assign private callable types to its fields. In particular a Golem-shell
+/// TLS override must never reach ordinary Apply under those private types.
+///
+/// # Safety
+/// `stream` is a scalar or live membrane object; all observations are borrowed.
+// UNSAFE-LEDGER: FLN-UL-0625
+#[allow(unsafe_code)]
+pub(crate) unsafe fn is_native_handle_stream(stream: *mut LeanObject) -> bool {
+    if stream.is_null() || tagged::is_scalar(stream) {
+        return false;
+    }
+    // SAFETY: the exact constructor tag/slot count/extent precedes all field
+    // reads. Each live closure is checked for exact pointer/arity/fixed count
+    // before capture access, then for the owned Handle class and live FILE.
+    unsafe {
+        let header = rc::read_header(stream);
+        if header.tag != 0
+            || header.other != 6
+            || usize::from(header.cs_sz) != size_of::<LeanObject>() + 6 * size_of::<usize>()
+        {
+            return false;
+        }
+        let methods = [
+            (stream_flush_fn as *const (), 2),
+            (stream_read_fn as *const (), 3),
+            (stream_write_fn as *const (), 3),
+            (stream_get_line_fn as *const (), 2),
+            (stream_put_str_fn as *const (), 3),
+            (stream_is_tty_fn as *const (), 2),
+        ];
+        let mut shared_handle = None;
+        for (index, (expected_target, expected_arity)) in methods.into_iter().enumerate() {
+            let callback = object::ctor_get(stream, index);
+            if callback.is_null()
+                || tagged::is_scalar(callback)
+                || rc::read_header(callback).tag != crate::contract::TAG_CLOSURE
+            {
+                return false;
+            }
+            let (target, arity, fixed, captures) = object::closure_fields(callback);
+            if target != expected_target.cast_mut().cast::<c_void>()
+                || arity != expected_arity
+                || fixed != 1
+            {
+                return false;
+            }
+            let handle = captures.read();
+            if handle.is_null()
+                || tagged::is_scalar(handle)
+                || rc::read_header(handle).tag != crate::contract::TAG_EXTERNAL
+            {
+                return false;
+            }
+            let (class, file) = object::external_fields(handle);
+            if class != handle_class() || file.is_null() {
+                return false;
+            }
+            if shared_handle.is_some_and(|expected| expected != handle) {
+                return false;
+            }
+            shared_handle = Some(handle);
+        }
+        true
+    }
+}
+
+/// Inspect only the native callback installed in field 4 by stream_of_handle.
+/// No function pointer is invoked or exposed outside the membrane.
+///
+/// # Safety
+/// `closure` is either a scalar or a live membrane object. The returned
+/// Handle is borrowed from that live closure and must not outlive it.
+// UNSAFE-LEDGER: FLN-UL-0619
+#[allow(unsafe_code)]
+pub(crate) unsafe fn stream_put_str_handle(closure: *mut LeanObject) -> Option<*mut LeanObject> {
+    if closure.is_null() || tagged::is_scalar(closure) {
+        return None;
+    }
+    // SAFETY: each category is checked before reading its fields. A live
+    // closure owns every capture; the exact fixed count bounds the read.
+    unsafe {
+        if rc::read_header(closure).tag != crate::contract::TAG_CLOSURE {
+            return None;
+        }
+        let (target, arity, fixed, captures) = object::closure_fields(closure);
+        if target != stream_put_str_fn as *const () as *mut c_void || arity != 3 || fixed != 1 {
+            return None;
+        }
+        let handle = captures.read();
+        if handle.is_null()
+            || tagged::is_scalar(handle)
+            || rc::read_header(handle).tag != crate::contract::TAG_EXTERNAL
+        {
+            return None;
+        }
+        let (class, file) = object::external_fields(handle);
+        if class != handle_class() || file.is_null() {
+            return None;
+        }
+        Some(handle)
+    }
+}
+
+/// Borrow the Handle captured by exactly stream_of_handle's getLine method.
+/// No caller-supplied function pointer is executed.
+///
+/// # Safety
+/// `closure` is a scalar or live object. The returned Handle cannot outlive it.
+// UNSAFE-LEDGER: FLN-UL-0647
+#[allow(unsafe_code)]
+pub(crate) unsafe fn stream_get_line_handle(closure: *mut LeanObject) -> Option<*mut LeanObject> {
+    if closure.is_null() || tagged::is_scalar(closure) {
+        return None;
+    }
+    // SAFETY: tag precedes closure fields; exact arity/fixed count precedes
+    // the sole capture read; the external class is checked before its FILE.
+    unsafe {
+        if rc::read_header(closure).tag != crate::contract::TAG_CLOSURE {
+            return None;
+        }
+        let (target, arity, fixed, captures) = object::closure_fields(closure);
+        if target != stream_get_line_fn as *const () as *mut c_void || arity != 2 || fixed != 1 {
+            return None;
+        }
+        let handle = captures.read();
+        is_native_file_handle(handle).then_some(handle)
+    }
+}
+
+/// Shared putStr write, with errno captured immediately after fwrite.
+///
+/// # Safety
+/// `handle` is a borrowed live Handle and `text` a borrowed canonical String.
+// UNSAFE-LEDGER: FLN-UL-0620
+#[allow(unsafe_code)]
+unsafe fn handle_put_str_status(
+    handle: *mut LeanObject,
+    text: *mut LeanObject,
+) -> Result<usize, (c_int, usize)> {
+    // SAFETY: the Handle owns the live FILE; canonical String has a trailing
+    // NUL and at least one byte, and fwrite reads only the content bytes.
+    unsafe {
+        let file = io_get_handle(handle);
+        let (size, _, _, bytes) = object::string_fields(text);
+        let size = size - 1;
+        let written = fwrite(bytes.as_ptr().cast::<c_void>(), 1, size, file);
+        if written == size {
+            Ok(written)
         } else {
-            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+            Err((errno(), written))
+        }
+    }
+}
+
+/// Bounded native stream callback. Ok(None) rejects an unsupported callback
+/// before effects. Err preserves errno and fwrite-reported bytes after a
+/// short write whose error requires an unavailable filename.
+///
+/// # Safety
+/// `closure` is a scalar or live object; `text` is a canonical live String.
+/// Both are borrowed. Ok(Some((result, written))) carries one owned native
+/// IO.Result reference and the byte count reported by fwrite.
+// UNSAFE-LEDGER: FLN-UL-0621
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_stream_put_str(
+    closure: *mut LeanObject,
+    text: *mut LeanObject,
+) -> Result<Option<(*mut LeanObject, usize)>, (c_int, usize)> {
+    // SAFETY: stream_put_str_handle checks the exact target, arity, capture
+    // count, Handle class and nonnull FILE before the shared primitive.
+    unsafe {
+        let Some(handle) = stream_put_str_handle(closure) else {
+            return Ok(None);
+        };
+        checked_put_str_result(handle_put_str_status(handle, text)).map(Some)
+    }
+}
+
+/// Complete the bounded write without entering an error-decoder arm that
+/// requires an unavailable filename. Success carries one owned native result.
+/// Failure preserves errno and the byte count reported by the completed write;
+/// it does not assert that no output was emitted or can be rolled back.
+pub(crate) fn checked_put_str_result(
+    status: Result<usize, (c_int, usize)>,
+) -> Result<(*mut LeanObject, usize), (c_int, usize)> {
+    // SAFETY: both constructors create fresh owned results. EINTR and ENOENT
+    // are rejected before decode_io_error; every remaining errno permits a
+    // null filename by the pinned decoder's arm preconditions.
+    // UNSAFE-LEDGER: FLN-UL-0624
+    #[allow(unsafe_code)]
+    unsafe {
+        match status {
+            Ok(written) => Ok((io_result_mk_ok(tagged::boxi(0)), written)),
+            Err(failure @ (EINTR | ENOENT, _)) => Err(failure),
+            Err((code, written)) => Ok((
+                io_result_mk_error(decode_io_error(code, core::ptr::null_mut())),
+                written,
+            )),
         }
     }
 }
 
 /// `lean_io_prim_handle_read` (`io.cpp:584-607`), arm-for-arm: the
 /// overflow pre-check decodes ENOMEM; a zero-byte read answers ok before
-/// touching fread (the pin cites lean4#12138); a short read with EOF set
-/// clears the flag and answers the partial buffer; anything else decodes
-/// errno after releasing the buffer.
+/// touching fread (the pin cites lean4#12138); any positive read answers its
+/// partial buffer without clearing flags; zero at EOF clears the flag and
+/// answers an empty buffer; otherwise errno is decoded after buffer release.
 ///
 /// # Safety
 /// `h` is borrowed and live; caller owns the io_result.
@@ -972,17 +1266,60 @@ pub(crate) unsafe fn prim_handle_write(
     h: *mut LeanObject,
     buf: *mut LeanObject,
 ) -> *mut LeanObject {
-    // SAFETY: live objects per contract; fwrite reads exactly n salient
-    // bytes from the live array's data base.
+    // SAFETY: the shared effect reads only the live array's initialized
+    // prefix; this raw ABI door retains the pin's full errno decoder.
     unsafe {
-        let fp = io_get_handle(h);
-        let (_, n, _, data) = object::sarray_fields(buf);
-        let m = fwrite(data.cast::<c_void>(), 1, n, fp);
-        if m == n {
-            io_result_mk_ok(tagged::boxi(0))
-        } else {
-            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        match handle_write_status(h, buf) {
+            Ok(_) => io_result_mk_ok(tagged::boxi(0)),
+            Err((code, _)) => io_result_mk_error(decode_io_error(code, core::ptr::null_mut())),
         }
+    }
+}
+
+/// Shared Handle.write effect, capturing errno immediately after fwrite.
+///
+/// # Safety
+/// Handle and canonical element-width-one scalar array are live and borrowed.
+/// The array's salient prefix is initialized and does not exceed its capacity.
+// UNSAFE-LEDGER: FLN-UL-0654
+#[allow(unsafe_code)]
+unsafe fn handle_write_status(
+    handle: *mut LeanObject,
+    buffer: *mut LeanObject,
+) -> Result<usize, (c_int, usize)> {
+    // SAFETY: the Handle owns FILE and fwrite reads exactly the initialized
+    // size, not capacity. Neither borrowed object is modified or released.
+    unsafe {
+        let file = io_get_handle(handle);
+        let (_, size, _, data) = object::sarray_fields(buffer);
+        let written = fwrite(data.cast::<c_void>(), 1, size, file);
+        if written == size {
+            Ok(written)
+        } else {
+            Err((errno(), written))
+        }
+    }
+}
+
+/// Checked Handle.write with the same byte effect as the raw primitive and
+/// the checked putStr error policy. No filename is invented after a write.
+///
+/// # Safety
+/// Handle is scalar or a live object; buffer is a canonical live ByteArray.
+/// Both are borrowed. A returned native IO.Result transfers one reference.
+// UNSAFE-LEDGER: FLN-UL-0655
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_write(
+    handle: *mut LeanObject,
+    buffer: *mut LeanObject,
+) -> Result<Option<(*mut LeanObject, usize)>, (c_int, usize)> {
+    // SAFETY: the exact native Handle check precedes FILE access; completion
+    // refuses filename-dependent errno arms and retains fwrite's byte count.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        checked_put_str_result(handle_write_status(handle, buffer)).map(Some)
     }
 }
 
@@ -1028,6 +1365,225 @@ pub(crate) unsafe fn prim_handle_get_line(h: *mut LeanObject) -> *mut LeanObject
                 result.len(),
             ))
         }
+    }
+}
+
+/// A borrowed FILE lock, never sent or retained beyond a live Handle call.
+struct FileReadLock(*mut c_void);
+
+impl FileReadLock {
+    // SAFETY: caller keeps a live Handle owner throughout this guard's scope.
+    // UNSAFE-LEDGER: FLN-UL-0639
+    #[allow(unsafe_code)]
+    unsafe fn acquire(file: *mut c_void) -> Self {
+        // SAFETY: the caller supplies a live FILE; the guard owns one lock.
+        unsafe { flockfile(file) };
+        Self(file)
+    }
+}
+
+impl Drop for FileReadLock {
+    // UNSAFE-LEDGER: FLN-UL-0640
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: acquire took this one lock; the live borrowed Handle still
+        // owns FILE, and every return/unwind drops the guard exactly once.
+        unsafe { funlockfile(self.0) };
+    }
+}
+
+pub(crate) enum FileReadFailure {
+    InputLimit {
+        limit: usize,
+        observed: usize,
+        bytes_consumed: usize,
+    },
+    OutputLimit {
+        limit: usize,
+        observed: usize,
+        bytes_consumed: usize,
+    },
+    Allocation {
+        requested: usize,
+        bytes_consumed: usize,
+    },
+    Unrepresentable {
+        errno: c_int,
+        bytes_consumed: usize,
+    },
+}
+
+/// Bounded pinned counted read: one fread, no lookahead or UTF-8 conversion.
+/// The complete requested buffer is obtained fallibly before touching FILE.
+/// A positive short read succeeds without clearing flags; zero at EOF clears
+/// the flag, while a zero request performs no FILE operation at all.
+///
+/// # Safety
+/// `handle` is scalar or a live object, borrowed until return. A successful
+/// Some result transfers one owned native IO.Result, and its count records
+/// the bytes fread actually initialized and consumed.
+// UNSAFE-LEDGER: FLN-UL-0651
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_read(
+    handle: *mut LeanObject,
+    count: usize,
+    limit: usize,
+) -> Result<Option<(*mut LeanObject, usize)>, FileReadFailure> {
+    // SAFETY: class precedes FILE access; fresh byte array has capacity=count
+    // and size=0. fread writes at most count bytes, and only its initialized
+    // prefix becomes salient. Every error releases that buffer exactly once.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        if count > limit {
+            return Err(FileReadFailure::InputLimit {
+                limit,
+                observed: count,
+                bytes_consumed: 0,
+            });
+        }
+        let buffer = object::try_alloc_byte_array(count);
+        if buffer.is_null() {
+            return Err(FileReadFailure::Allocation {
+                requested: count.saturating_add(size_of::<LeanSarrayObject>()),
+                bytes_consumed: 0,
+            });
+        }
+        if count == 0 {
+            return Ok(Some((io_result_mk_ok(buffer), 0)));
+        }
+        let file = io_get_handle(handle);
+        let guard = FileReadLock::acquire(file);
+        let (_, _, _, data) = object::sarray_fields(buffer);
+        let read = fread(data.cast::<c_void>(), 1, count, file);
+        let code = errno();
+        if read > 0 {
+            (*buffer.cast::<LeanSarrayObject>()).m_size = read;
+            drop(guard);
+            return Ok(Some((io_result_mk_ok(buffer), read)));
+        }
+        if feof(file) != 0 {
+            clearerr(file);
+            drop(guard);
+            return Ok(Some((io_result_mk_ok(buffer), 0)));
+        }
+        drop(guard);
+        rc::dec_ref(buffer);
+        checked_get_line_error(code, 0).map(|result| Some((result, 0)))
+    }
+}
+
+/// Bounded exact getLine over a borrowed native Handle. The input ceiling
+/// permits one lookahead: EOF at the exact ceiling succeeds; an additional
+/// byte produces a resource stop with consumed=ceiling+1. No cursor rollback
+/// is attempted. The output ceiling is measured after exact UTF-8 recovery.
+///
+/// # Safety
+/// `handle` is scalar or a live object and remains borrowed until return.
+/// A successful Some result owns one native IO.Result reference and reports
+/// bytes consumed even if the result is a logical IO error.
+// UNSAFE-LEDGER: FLN-UL-0641
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_get_line(
+    handle: *mut LeanObject,
+    input_limit: usize,
+    output_limit: usize,
+) -> Result<Option<(*mut LeanObject, usize)>, FileReadFailure> {
+    // SAFETY: exact class checked before FILE access; all getc calls happen
+    // under the RAII lock while the caller retains the Handle. Error decoder
+    // filename preconditions are checked before native error construction.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        let file = io_get_handle(handle);
+        let guard = FileReadLock::acquire(file);
+        let mut bytes = Vec::new();
+        let last_errno;
+        loop {
+            if bytes.len() < input_limit && bytes.len() == bytes.capacity() {
+                let additional = (input_limit - bytes.len()).min(4096);
+                bytes
+                    .try_reserve_exact(additional)
+                    .map_err(|_| FileReadFailure::Allocation {
+                        requested: bytes.len().saturating_add(additional),
+                        bytes_consumed: bytes.len(),
+                    })?;
+            }
+            let c = getc_unlocked(file);
+            let code = errno();
+            if c == -1 {
+                last_errno = code;
+                break;
+            }
+            if bytes.len() == input_limit {
+                let consumed = bytes.len().saturating_add(1);
+                return Err(FileReadFailure::InputLimit {
+                    limit: input_limit,
+                    observed: consumed,
+                    bytes_consumed: consumed,
+                });
+            }
+            bytes.push(c as u8);
+            if c == c_int::from(b'\n') {
+                last_errno = code;
+                break;
+            }
+        }
+        let consumed = bytes.len();
+        let failed = ferror(file) != 0;
+        if !failed && feof(file) != 0 {
+            clearerr(file);
+        }
+        drop(guard);
+        if failed {
+            return checked_get_line_error(last_errno, consumed)
+                .map(|result| Some((result, consumed)));
+        }
+        let string =
+            crate::export::bounded_string_from_bytes(&bytes, output_limit).map_err(|error| {
+                match error {
+                    crate::export::BoundedStringError::Limit { limit, observed } => {
+                        FileReadFailure::OutputLimit {
+                            limit,
+                            observed,
+                            bytes_consumed: consumed,
+                        }
+                    }
+                    crate::export::BoundedStringError::Allocation { requested } => {
+                        FileReadFailure::Allocation {
+                            requested,
+                            bytes_consumed: consumed,
+                        }
+                    }
+                }
+            })?;
+        Ok(Some((io_result_mk_ok(string), consumed)))
+    }
+}
+
+/// Decode only error arms whose filename precondition is available. Every
+/// failure here follows a read attempt and retains its consumed-byte count.
+pub(crate) fn checked_get_line_error(
+    code: c_int,
+    consumed: usize,
+) -> Result<*mut LeanObject, FileReadFailure> {
+    if matches!(code, EINTR | ENOENT) {
+        return Err(FileReadFailure::Unrepresentable {
+            errno: code,
+            bytes_consumed: consumed,
+        });
+    }
+    // SAFETY: every remaining errno permits a null filename in the exact
+    // decoder; the returned IO.Result owns the newly built error reference.
+    // UNSAFE-LEDGER: FLN-UL-0644
+    #[allow(unsafe_code)]
+    unsafe {
+        Ok(io_result_mk_error(decode_io_error(
+            code,
+            core::ptr::null_mut(),
+        )))
     }
 }
 
@@ -1312,6 +1868,7 @@ unsafe impl Sync for InitialStream {}
 /// once per process: SIGPIPE ignored, the three streams built over the
 /// process's own stdio FILE*s and marked persistent.
 fn initial_streams() -> &'static [InitialStream; 3] {
+    initialize_io_signals();
     static INITIAL: OnceLock<[InitialStream; 3]> = OnceLock::new();
     INITIAL.get_or_init(|| {
         // SAFETY: the glibc FILE* globals are live for the process's life
@@ -1321,7 +1878,6 @@ fn initial_streams() -> &'static [InitialStream; 3] {
         // UNSAFE-LEDGER: FLN-UL-0295
         #[allow(unsafe_code)]
         unsafe {
-            signal(SIGPIPE, SIG_IGN);
             let mk = |fp: *mut c_void| {
                 let s = stream_of_handle(io_wrap_handle(fp));
                 rc::mark_persistent(s);
@@ -1330,6 +1886,21 @@ fn initial_streams() -> &'static [InitialStream; 3] {
             [mk(stdin), mk(stdout), mk(stderr)]
         }
     })
+}
+
+/// The shared pin runtime signal policy. Filesystem-only execution needs it
+/// before a possible pipe write, without creating or selecting any streams.
+pub(crate) fn initialize_io_signals() {
+    static INITIAL: OnceLock<()> = OnceLock::new();
+    INITIAL.get_or_init(|| {
+        // SAFETY: the pin establishes SIG_IGN for SIGPIPE once at runtime
+        // initialization; the existing stdio path and file path share it.
+        // UNSAFE-LEDGER: FLN-UL-0634
+        #[allow(unsafe_code)]
+        unsafe {
+            signal(SIGPIPE, SIG_IGN);
+        }
+    });
 }
 
 thread_local! {
@@ -1413,6 +1984,36 @@ pub(crate) fn get_stdin() -> *mut LeanObject {
 pub(crate) fn get_stdout() -> *mut LeanObject {
     get_current(IX_STDOUT)
 }
+
+/// Safe-door getter: inspect before retaining so even a scalar TLS override
+/// never reaches get_current's native non-scalar reference-count precondition.
+pub(crate) fn checked_get_stdout() -> Option<*mut LeanObject> {
+    checked_get_current(IX_STDOUT)
+}
+
+pub(crate) fn checked_get_stdin() -> Option<*mut LeanObject> {
+    checked_get_current(IX_STDIN)
+}
+
+fn checked_get_current(index: usize) -> Option<*mut LeanObject> {
+    CURRENT.with(|current| {
+        let mut slots = current.borrow_mut();
+        let stream = seeded(&mut slots, index);
+        // SAFETY: the TLS slot owns a live object/scalar. The complete native
+        // stream observer proves non-scalar before inc_ref_n. Retention occurs
+        // while the same TLS borrow protects the inspected slot from changes.
+        // UNSAFE-LEDGER: FLN-UL-0626
+        #[allow(unsafe_code)]
+        unsafe {
+            if !is_native_handle_stream(stream) {
+                return None;
+            }
+            rc::inc_ref_n(stream, 1);
+            Some(stream)
+        }
+    })
+}
+
 pub(crate) fn get_stderr() -> *mut LeanObject {
     get_current(IX_STDERR)
 }

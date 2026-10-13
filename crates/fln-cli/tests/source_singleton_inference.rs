@@ -77,7 +77,16 @@ fn a_false_suffix_emits_no_partial_success_and_recovery_is_repeatable() {
     let refused = check(&[&path, &bad]);
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("\"outcome\":\"kernel-rejection\""));
+    // A false `by rfl` is refused while elaborating the suffix's one command, as at the pin
+    // ("Tactic `rfl` failed: The left-hand side … is not definitionally equal …").
+    let error = String::from_utf8_lossy(&refused.stderr);
+    for expected in [
+        "\"outcome\":\"elaboration\"",
+        "file 1, command 7, byte 0:",
+        "not definitionally equal",
+    ] {
+        assert!(error.contains(expected), "{error}");
+    }
     let after = check(&[&path]);
     assert!(after.status.success());
     assert_eq!(before.stdout, after.stdout);

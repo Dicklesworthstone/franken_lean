@@ -104,11 +104,14 @@ fn wildcard_rules_are_ordered_and_quantified_arguments_are_fresh_per_location() 
 fn wildcard_simp_uses_checked_hypothesis_transports_and_the_target() {
     for source in [
         "theorem t (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by simp only [h] at *; exact hx",
-        "theorem t (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by simp only [*] at *",
         "theorem t : 2 + 3 = 5 := by simp only [] at *",
     ] {
         accepted(source);
     }
+    // The pin leaves this goal open ("unsolved goals", 1:72, 2026-10-11).
+    refused(
+        "theorem t (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by simp only [*] at *",
+    );
 }
 
 #[test]
@@ -133,10 +136,15 @@ fn wildcard_rewriting_retains_missing_premises_and_requires_a_real_match() {
     }
 }
 
+/// The pin's `decide` refuses a goal that mentions a local, true or false ("Expected type must not
+/// contain free variables", Lean/Elab/Tactic/Decide.lean:24-32); a closed beta-redex it decides
+/// (2026-10-11).
 #[test]
-fn decide_closes_polymorphic_contexts_without_accepting_false_propositions() {
-    accepted("theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => True) x := by decide");
+fn decide_refuses_polymorphic_contexts_and_decides_closed_redexes() {
+    refused("theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => True) x := by decide");
     refused("theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => False) x := by decide");
+    accepted("theorem t : (fun (_ : Nat) => True) 3 := by decide");
+    refused("theorem t : (fun (_ : Nat) => False) 3 := by decide");
 }
 
 #[test]

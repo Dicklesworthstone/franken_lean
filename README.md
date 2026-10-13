@@ -31,7 +31,7 @@
 | Compatibility | Drop-in at six binary surfaces: source language, `.olean` (read *and* byte-compatible write), the `lean_object` C ABI (`lean.h` twin — existing native plugins load), `.ilean`/artifact chain, the `Lean.*` Meta API, and LSP + `$/lean/*` (vscode-lean4 connects unmodified). |
 | Kernel | ≤ 12 KLOC `forbid(unsafe)` dual-engine checker (certified small-step + NbE accelerator, cross-checked), plus an independent in-repo checker and foreign witnesses. Disagreement halts; it never outvotes. |
 | Receipts | Every checked declaration can emit a compressed proof certificate; attested checks append to a transparency log; `fln check-olean` re-checks all of mathlib in minutes on a kernel sharing no code with the thing it checks. |
-| Determinism | Same input closure ⇒ same environment, same diagnostics, same artifacts, at any thread count — an invariant, tested at {1, 8, 32} threads on every commit **over the Prelude**; the corpus-scale comparison is a separate on-demand lane run at the pin (corpus matrix observations recorded: 1, latest observed 2026-07-26), so corpus schedule-independence is one observation rather than a measured invariant (beads `fln-8zsq`, `fln-corpus-thread-matrix-93te`). `--reproducible` yields bit-identical artifacts across the certified platform matrix. |
+| Determinism | Same input closure ⇒ same environment, same diagnostics, same artifacts, at any thread count — an invariant, tested at {1, 8, 32} threads on every commit **over the Prelude**; the corpus-scale comparison is a separate on-demand lane run at the pin (corpus matrix observations recorded: 5, latest observed 2026-10-07), so corpus schedule-independence is one observation rather than a measured invariant (beads `fln-8zsq`, `fln-corpus-thread-matrix-93te`). `--reproducible` yields bit-identical artifacts across the certified platform matrix. |
 | Incrementality | The environment is a Merkle DAG of content-addressed declarations. A leaf edit re-elaborates its *true dependency cone* (seconds), not its file cone (hours). Whitespace, comments, and reordering invalidate nothing. |
 | Server | One daemon, one shared immutable import heap. The ≈60 s × N workers × GBs × N multiplication becomes once-per-daemon; warm attach ≤ 2 s; thousands of O(1) proof-state forks per daemon. |
 | Metaprogramming | The entire tactic ecosystem (mathlib, aesop, downstream) runs unmodified on Golem, our register VM whose values *are* ABI objects — one calling convention across interpreted code, JIT'd code, Reference-built plugins, and native builtins. |
@@ -210,7 +210,7 @@ fln serve-mcp                      # Envoy: snapshots, tactics, search, eval —
 fln identity --json                # implementation commit, epoch, profile, TCB hash
 ```
 
-> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor` and `fln diff` are implemented and tested against real pinned artifacts — see IMPLEMENTATION_STATUS for exact scope and refusals. The `leanc` personality drives the host C compiler with the pin's flags, but its link flags name the Reference's runtime libraries (`-lleancpp -lLean -lInit -lleanrt -lgmp`), which FrankenLean does not build. Ordinary Lean with the implicit `Init`: the drop-in `lean` accepts 3 of the 27 probe programs the pinned Reference accepts, all 3 with identical output (`cargo test -p fln-cli --release --test ordinary_lean_probe -- --nocapture`, 2026-10-05). The `lake` personality covers package `init`/`new`/`clean`, TOML discovery, `check-build`, and `lake build +Module:olean` for modules under declared TOML library roots. That module facet checks the local import closure through K1 and the independent checker and emits separate, importable pinned-format `.olean` files under `buildDir/lib/lean`. A module whose source and imported environment are unchanged since a build by the same binary is not elaborated again. Both checkers re-admit it from a per-user record, and it is reported in `modules_cached`; `--import-posture recheck` elaborates every module. By default an external `.olean` import closure this binary admitted before is rebuilt from its bytes and matched against a per-user admission record instead of being admitted again; `--import-posture recheck` admits it again with both checkers. Default library `leanArts`, executables, executable `lakefile.lean` configuration and unsupported extension exports still refuse; see [the working example and exact boundaries](docs/NATIVE_LAKE.md). `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate. `fln build explain` compares the snapshot each successful `lake build` writes with the current tree. It reports changed inputs with their old and new content hashes, and Lake's file-cone rebuild decision. The native decision is reported as unavailable, because no Ledger records exist (franken_lean-z8j.1.2).
+> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln ir inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor` and `fln diff` (an alias of `fln olean diff LEFT RIGHT`; it has no `--level`) are implemented and tested against real pinned artifacts — see IMPLEMENTATION_STATUS for exact scope and refusals. The `leanc` personality hands its arguments unchanged to the host C compiler (`LEAN_CC`, else `cc`); `--print-cflags` and `--print-ldflags` print the pin's flags, and those link flags name the Reference's runtime libraries (`-lleancpp -lLean -lInit -lleanrt -lgmp`), which FrankenLean does not build. Ordinary headerless files and standard input now use their implicit `Init` import, and each `prelude` source module suppresses its own implicit edge. The earlier bounded-seed probe accepted 15 of the 29 programs the pinned Reference accepted, all 15 with identical output, and none of the 8 it rejected (`cargo test -p fln-cli --release --test ordinary_lean_probe -- --nocapture`, 2026-10-07); that historical result is not a measurement of the new import route. Compiled imports, whether implicit or explicit, are read from `LEAN_PATH`, else from the pinned toolchain under `ELAN_HOME` or `~/.elan`, decoded and checked by both checkers, and never executed. The first admission of a large closure is expensive, with cost depending on its size and the worker count; a later run reuses a verified record of it. The `lake` personality covers package `init`/`new`/`clean`, TOML discovery, `check-build`, and `lake build +Module:olean` for modules under declared TOML library roots. That module facet checks the local import closure through K1 and the independent checker and emits separate, importable pinned-format `.olean` files under `buildDir/lib/lean`. A module whose source and imported environment are unchanged since a build by the same binary is not elaborated again. Both checkers re-admit it from a per-user record, and it is reported in `modules_cached`; `--import-posture recheck` elaborates every module. By default an external `.olean` import closure this binary admitted before is rebuilt from its bytes and matched against a per-user admission record instead of being admitted again; `--import-posture recheck` admits it again with both checkers. Default library `leanArts`, executables, executable `lakefile.lean` configuration and unsupported extension exports still refuse; see [the working example and exact boundaries](docs/NATIVE_LAKE.md). `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate. `fln build explain` compares the snapshot each successful `lake build` writes with the current tree. It reports changed inputs with their old and new content hashes, and Lake's file-cone rebuild decision. The native decision is reported as unavailable, because no Ledger records exist (franken_lean-z8j.1.2).
 
 Native source execution also supports bounded `Float` and `Float32` programs:
 decimal and scientific literals, arithmetic, typed function arguments, branches,
@@ -338,10 +338,11 @@ product. This is not `LEAN_PATH` or package discovery, implicit Prelude
 ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
 
-An empty or comment-only import-free file, and an empty `lean --stdin` stream,
-also complete successfully with no output. This is an identity source
-transition after the same checked seed initialization; it does not relax the
-nonempty final-product requirement of `fln run`.
+An empty or comment-only file, and an empty `lean --stdin` stream, complete
+successfully with no output after admitting their imports. Ordinary Lean
+modules implicitly import `Init`; `prelude` suppresses that edge for the
+module that declares it. A missing `Init` is an input error. The nonempty
+final-product requirement of `fln run` remains separate.
 
 `fln run --emit-olean-snapshot PATH ...` now connects that checked execution
 to the real pinned-format writer. After every command has passed K1, the
@@ -372,16 +373,17 @@ remains atomic: a later failure leaves stdout empty. It is a presentation
 adapter over the same parser → K1 → independent checker → compiler → canonical
 FLBC → Golem execution used by `fln run`; it neither invokes nor falls back to
 the Reference. Local source imports are connected to the existing closed-module
-engine: the first direct `import A.B` must identify exactly one ancestor source
-root containing `A/B.lean`, then every transitive import is loaded from that
-same root in deterministic module-name order under the aggregate byte, module,
-import, and name-depth ceilings. Missing, ambiguous, symlink, and non-file
-imports are refused before execution; discovered bytes are not reread between
+engine: `import A.B` resolves `A/B.lean` under the entry's directory, and each
+dependency is checked in its own transitive import world. Compiled imports are
+admitted from their actual artifact bytes. Discovery and execution preserve
+the source headers' import order under aggregate byte, module, import, and
+name-depth ceilings. Missing, symlink, and non-file imports are refused before
+execution; discovered bytes are not reread between
 planning and checking. This bounded seam assumes a trusted filesystem namespace
 that remains stable for the invocation; directory-handle-relative path-race
 sealing is not implemented.
 
-Import-free `#check` commands are also live anywhere in the native `lean`
+`#check` commands are also live anywhere in the native `lean`
 command stream and may be interleaved with supported definitions and `#eval`
 commands. The bounded elaborator infers each term's real type, places an
 unspellable generated definition into a scratch successor, and requires both K1
@@ -402,16 +404,36 @@ proof as published dependency declarations; its scratch successor is discarded.
 The type renderer covers only bounded supported shapes rather than Reference
 pretty-printing or diagnostic-text parity.
 
-The same bounded local resolver is available through `lean --src-deps FILE`:
+The direct local dependency query is available through `lean --src-deps FILE`:
 it parses only the import header, validates every direct local source import,
 and prints those paths in source order without elaborating or executing the
 body. Duplicate direct imports remain duplicate output rows. This is the
 pin-shaped direct-source dependency query for the selected local root, not
 `LEAN_PATH`, package, or transitive dependency discovery.
-`lean --stdin` also feeds one bounded, import-free source through that same
-native parser, elaborator, both-checker admission path, compiler, and Golem VM;
-evaluation output is published only after the complete input succeeds. Standard
-input imports are refused until the toolchain owns a real search-path resolver.
+`lean --stdin` feeds one bounded source module through the same native parser,
+elaborator, both-checker admission path, compiler, and Golem VM as `lean FILE`.
+Both routes give each non-`prelude` source module its ordinary implicit `Init`
+import and select checked `Repr`/`ToString` printers in that admitted world.
+Local imports resolve under the entry file's directory, or the current
+directory for standard input; compiled imports resolve from `LEAN_PATH`, else
+the pinned toolchain. Standard input is the virtual module `_stdin`: its
+streamed input bytes never come from or replace a file on disk, and a real
+`stdin.lean` can be imported as an ordinary dependency. Source bytes remain
+unchanged, aggregate input
+limits include imported sources, and evaluation output is published only after
+the complete input succeeds. A `main` declaration runs only with `--run`.
+Each module's VM results and saved message guards are validated before its
+declarations are exported or a dependent module executes. A dependency failure
+therefore stops later source effects as well as entry output.
+Import admission is serial by default to limit peak memory while loading full
+`Init`. `-j N`, `-jN`, `--threads N`, and
+`--threads=N` select parallel import workers; zero also selects serial
+admission. Work that is not admission (re-proving a reused admission record
+under the `reuse-verified` posture, reading each module's extension data) uses
+up to the available parallelism, at most 8 threads, or `N` when that is
+larger. These options accept the pin's unsigned
+32-bit counts and stop being compiler options at `--run`, so a following
+`--threads=8` is a script argument.
 The personality also answers `-g`/`--githash` from the exact pinned Reference
 commit and reports `[]` for `--features`, truthfully reflecting the absence of
 an LLVM backend. `-q`/`--quiet` is accepted on source operations; there are no
@@ -424,9 +446,14 @@ tree is refused instead of advertising that build directory as an installed
 toolchain. These two queries derive paths; they do not install or register an
 elan toolchain, prove that the reported library tree is populated, or add Lake,
 package, `LEAN_PATH`, or `.olean` discovery.
+An import of `lean FILE` with no local source, such as `import Std`, is read as
+an `.olean` from `LEAN_PATH`, else the pinned toolchain's `lib/lean`, and its
+closure is admitted (or reused from this binary's earlier admission of the same
+bytes) before the entry runs, the same route as `fln run`; only the entry file's
+own `#eval` and `#check` lines are printed.
 The currently implemented binary is not yet the Reference CLI surface: it has
-no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
-implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.
+no general option compatibility, package discovery, implicit Prelude
+processing, general Lean elaboration, or diagnostic-text parity.
 
 The currently implemented `.olean` surface is likewise narrower than the target
 codec suite. `fln olean inspect` audits and decodes one artifact at the pinned
@@ -521,7 +548,7 @@ A few honest boundaries:
 
 **Why should I trust a brand-new kernel?** You shouldn't — you should check it, and FrankenLean is built to make that cheap. The kernel is ≤ 12 KLOC of forbid-unsafe Rust written against a rule-by-rule judgment specification anchored to Reference source lines; two in-house engines cross-check continuously; an independent checker with its own decoder joins every attested run; foreign checkers join via the export format; and every declaration can ship a certificate a simpler verifier replays. Two implementations agreeing is evidence; two *foreign* implementations agreeing is the strongest evidence this ecosystem can currently buy.
 
-**Does building or running it require Lean to be installed?** No. `cargo build` from a cold checkout produces the whole toolchain; there is no stage0 and no bootstrap. The pinned Reference exists only inside the conformance apparatus as the differential oracle, and a release-CI check proves shipped binaries contain no path by which it could be located, spawned, or linked.
+**Does building or running it require Lean to be installed?** No. `cargo build` from a cold checkout produces the whole toolchain; there is no stage0 and no bootstrap. The pinned Reference exists only inside the conformance apparatus as the differential oracle, and a release-CI check proves shipped binaries contain no path by which it could be located, spawned, or linked. Today, short of that target: no release CI exists yet, and anything beyond a headerless or `prelude` file reads the pinned toolchain's compiled library. A file with imports, `fln check-olean` on the standard library, and `lake build` of a package that imports `Init` take its `.olean` files from `LEAN_PATH`, else from under `ELAN_HOME` or `~/.elan`. They are read as data and checked; no Reference code runs.
 
 **What happens when Lean releases a new version?** The epoch ratchet (§22.5): fetch and hash the release, regenerate every extracted census, machine-diff the surfaces, mine new behavior into fixtures, close or classify every divergence (unclassified blocks the claim), then move the pin. Epoch toolchains install side by side and are selected by `lean-toolchain` exactly as users expect. The Ledger's epoch bridges keep provably-unaffected cache entries alive across bumps, so the monthly migration stops meaning "rebuild the world."
 

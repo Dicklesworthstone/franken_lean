@@ -1,0 +1,260 @@
+diff --git a/crates/fln-elab/src/instances.rs b/crates/fln-elab/src/instances.rs
+index 8d3f750..bdbdb28 100644
+--- a/crates/fln-elab/src/instances.rs
++++ b/crates/fln-elab/src/instances.rs
+@@ -511,8 +511,12 @@ impl RegistryCache {
+         {
+             return Ok(std::sync::Arc::clone(registry));
+         }
+-        let registry = std::sync::Arc::new(InstanceRegistry::read_with_scopes(env, scopes)?);
+-        *self.scoped.borrow_mut() = Some((env.clone(), scopes.clone(), std::sync::Arc::clone(&registry)));
++        let registry = InstanceRegistry::read_cached_with_scopes(self, env, scopes)?;
++        *self.scoped.borrow_mut() = Some((
++            env.clone(),
++            scopes.clone(),
++            std::sync::Arc::clone(&registry),
++        ));
+         Ok(registry)
+     }
+ }
+diff --git a/crates/fln-elab/src/instances/scoped.rs b/crates/fln-elab/src/instances/scoped.rs
+index 4b4dcd3..f37fb01 100644
+--- a/crates/fln-elab/src/instances/scoped.rs
++++ b/crates/fln-elab/src/instances/scoped.rs
+@@ -147,10 +147,38 @@ impl InstanceRegistry {
+         scopes: &ActiveScopes,
+     ) -> Result<Self, InstanceRegistryError> {
+         scopes.validate_prefix(env)?;
+-        let mut registry = Self::read(env)?;
++        Self::apply_scopes(Self::read(env)?, env, scopes)
++    }
++
++    /// Derive a lexical view from the cache's validated dormant registry. The
++    /// cache binds that registry to this exact environment; a scope change need
++    /// not decode and validate every imported instance row a second time.
++    pub(super) fn read_cached_with_scopes(
++        cache: &RegistryCache,
++        env: &Environment,
++        scopes: &ActiveScopes,
++    ) -> Result<Arc<Self>, InstanceRegistryError> {
++        // Keep the fresh read's refusal order, including for a cached base.
++        scopes.validate_prefix(env)?;
++        let registry = cache.read(env)?;
++        if scopes.activations.is_empty() {
++            return Ok(registry);
++        }
++        Self::apply_scopes(registry.as_ref().clone(), env, scopes).map(Arc::new)
++    }
++
++    fn apply_scopes(
++        mut registry: Self,
++        env: &Environment,
++        scopes: &ActiveScopes,
++    ) -> Result<Self, InstanceRegistryError> {
+         if scopes.activations.is_empty() {
+             return Ok(registry);
+         }
++        // Clone preserves an already published index, but that index describes
++        // the dormant candidate set. The activated view must derive its own,
++        // within its caller's budget, without changing the dormant cache.
++        registry.index = discr_tree::IndexCell::default();
+         // Event keys are (journal boundary, before/at row, activation-local
+         // registration order). One first activation per namespace is retained.
+         let mut events = Vec::new();
+@@ -271,6 +299,196 @@ pub fn register(
+ mod tests {
+     use super::*;
+ 
++    fn cache_fixture(with_global: bool) -> Environment {
++        use fln_core::level::Level;
++        use fln_env::constants::{AxiomVal, ConstantVal};
++
++        let class = Name::from_components(["C"]);
++        let axiom = |name: &str, type_: Expr| {
++            ConstantInfo::Axiom(AxiomVal {
++                base: ConstantVal {
++                    name: Name::from_components([name]),
++                    level_params: Vec::new(),
++                    type_,
++                },
++                is_unsafe: false,
++            })
++        };
++        let mut env = Environment::new()
++            .add_decl(axiom("C", Expr::sort(Level::one())))
++            .unwrap();
++        for name in ["global", "scoped", "local", "later"] {
++            env = env
++                .add_decl(axiom(name, Expr::const_(class.clone(), Vec::new())))
++                .unwrap();
++        }
++        env = register_class(&env, &class).unwrap();
++        if with_global {
++            env = register_instance(&env, &Name::from_components(["global"]), 1000).unwrap();
++        }
++        register(
++            &env,
++            &Name::from_components(["N"]),
++            &Name::from_components(["scoped"]),
++            1000,
++        )
++        .unwrap()
++    }
++
++    fn candidate_names(registry: &InstanceRegistry) -> Vec<Name> {
++        registry
++            .candidates(&Name::from_components(["C"]))
++            .iter()
++            .map(|row| row.declaration.clone())
++            .collect()
++    }
++
++    #[test]
++    fn cached_empty_scopes_share_the_dormant_registry_in_both_read_orders() {
++        let env = cache_fixture(true);
++        let scopes = ActiveScopes::default();
++        for scoped_first in [false, true] {
++            let cache = RegistryCache::default();
++            let first = if scoped_first {
++                cache.read_with_scopes(&env, &scopes).unwrap()
++            } else {
++                cache.read(&env).unwrap()
++            };
++            assert!(Arc::ptr_eq(&first, &cache.read(&env).unwrap()));
++            assert!(Arc::ptr_eq(
++                &first,
++                &cache.read_with_scopes(&env, &scopes).unwrap()
++            ));
++            assert_eq!(*first, InstanceRegistry::read(&env).unwrap());
++        }
++    }
++
++    #[test]
++    fn cached_scope_views_preserve_activation_order_local_priority_and_promotion() {
++        let env = cache_fixture(true);
++        let cache = RegistryCache::default();
++        let dormant = cache.read(&env).unwrap();
++        let mut opened = ActiveScopes::default();
++        opened.activate(&env, &Name::from_components(["N"])).unwrap();
++        let opened_view = cache.read_with_scopes(&env, &opened).unwrap();
++        assert_eq!(
++            candidate_names(&opened_view),
++            ["scoped", "global"].map(|name| Name::from_components([name]))
++        );
++        assert_eq!(
++            *opened_view,
++            InstanceRegistry::read_with_scopes(&env, &opened).unwrap()
++        );
++        let mut local = opened.clone();
++        local
++            .register_local(&env, &Name::from_components(["local"]), 2000)
++            .unwrap();
++        let local_view = cache.read_with_scopes(&env, &local).unwrap();
++        assert_eq!(
++            candidate_names(&local_view),
++            ["local", "scoped", "global"].map(|name| Name::from_components([name]))
++        );
++        assert_eq!(
++            *local_view,
++            InstanceRegistry::read_with_scopes(&env, &local).unwrap()
++        );
++        assert!(Arc::ptr_eq(&dormant, &cache.read(&env).unwrap()));
++        assert_eq!(
++            candidate_names(&dormant),
++            [Name::from_components(["global"])]
++        );
++        // Returning to an earlier lexical snapshot never leaks local instances.
++        assert_eq!(*cache.read_with_scopes(&env, &opened).unwrap(), *opened_view);
++
++        let later = register_instance(&env, &Name::from_components(["later"]), 1000).unwrap();
++        let later_view = cache.read_with_scopes(&later, &local).unwrap();
++        assert_eq!(
++            candidate_names(&later_view),
++            ["local", "later", "scoped", "global"].map(|name| Name::from_components([name]))
++        );
++        assert_eq!(
++            *later_view,
++            InstanceRegistry::read_with_scopes(&later, &local).unwrap()
++        );
++        // A global registration supersedes the local event, including priority.
++        let promoted = set_instance(&later, &Name::from_components(["local"]), 500).unwrap();
++        let promoted_view = cache.read_with_scopes(&promoted, &local).unwrap();
++        assert_eq!(
++            candidate_names(&promoted_view),
++            ["later", "scoped", "global", "local"].map(|name| Name::from_components([name]))
++        );
++        assert_eq!(
++            *promoted_view,
++            InstanceRegistry::read_with_scopes(&promoted, &local).unwrap()
++        );
++    }
++
++    #[test]
++    fn activated_views_do_not_inherit_a_warm_dormant_index_or_skip_its_budget() {
++        let env = cache_fixture(false);
++        let cache = RegistryCache::default();
++        let dormant = cache.read(&env).unwrap();
++        assert!(candidate_names(&dormant).is_empty());
++        // With no global candidates, an empty index is complete with zero work.
++        let mut no_work = 0;
++        let dormant_index = dormant.instance_index(&env, &mut no_work).unwrap();
++        let mut opened = ActiveScopes::default();
++        opened.activate(&env, &Name::from_components(["N"])).unwrap();
++        let active = cache.read_with_scopes(&env, &opened).unwrap();
++        assert_eq!(candidate_names(&active), [Name::from_components(["scoped"])]);
++        for _ in 0..2 {
++            // A cloned warm index would incorrectly succeed here, bypassing
++            // both the newly active row and the caller's zero-work budget.
++            assert!(matches!(
++                active.instance_index(&env, &mut no_work),
++                Err(InstanceRegistryError::Limit)
++            ));
++        }
++        assert!(std::ptr::eq(
++            dormant_index,
++            dormant.instance_index(&env, &mut no_work).unwrap()
++        ));
++        assert!(Arc::ptr_eq(&dormant, &cache.read(&env).unwrap()));
++    }
++
++    #[test]
++    fn cached_scope_failures_preserve_prefix_and_local_declaration_validation() {
++        use fln_env::constants::{AxiomVal, ConstantVal};
++
++        let base = cache_fixture(true);
++        let temporary = Name::from_components(["temporary"]);
++        let env = base
++            .add_decl(ConstantInfo::Axiom(AxiomVal {
++                base: ConstantVal {
++                    name: temporary.clone(),
++                    level_params: Vec::new(),
++                    type_: Expr::const_(Name::from_components(["C"]), Vec::new()),
++                },
++                is_unsafe: false,
++            }))
++            .unwrap();
++        let mut scopes = ActiveScopes::default();
++        scopes.register_local(&env, &temporary, 2000).unwrap();
++        let cache = RegistryCache::default();
++        let valid = cache.read_with_scopes(&env, &scopes).unwrap();
++        for _ in 0..2 {
++            // The journal prefix agrees but the local declaration was rolled back.
++            assert_eq!(
++                cache.read_with_scopes(&base, &scopes),
++                Err(InstanceRegistryError::UnknownDeclaration(temporary.clone()))
++            );
++            // A missing anchor is refused before any base view can be reused.
++            assert_eq!(
++                cache.read_with_scopes(&Environment::new(), &scopes),
++                Err(InstanceRegistryError::Malformed)
++            );
++            assert!(Arc::ptr_eq(
++                &valid,
++                &cache.read_with_scopes(&env, &scopes).unwrap()
++            ));
++        }
++    }
++
+     #[test]
+     fn activation_limits_are_failure_atomic_and_snapshots_share_their_history() {
+         let env = Environment::new();

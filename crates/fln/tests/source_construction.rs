@@ -49,15 +49,32 @@ fn nested_construction_and_introduced_contexts_close_in_order() {
     ));
 }
 #[test]
-fn dependent_record_fields_are_solved_before_their_consumers() {
-    check(
+fn dependent_record_fields_come_after_their_consumers_as_at_the_pin() {
+    // Pin-audited 2026-10-06 (v4.32.0): `constructor` returns non-dependent
+    // goals first, so the first goal is `value : ?carrier` and `exact Nat`
+    // is a universe error there ("has type Type of sort Type 1"). The old
+    // telescope-ordered script encoded a false accept.
+    reject(
         "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by constructor; exact Nat; exact 7\ntheorem value : package.value = 7 := by rfl",
+    );
+    // The ordering's payoff, accepted by the pin: solving `value` with an
+    // ascribed numeral assigns the deferred `carrier` goal by unification.
+    check(
+        "structure Package where\n carrier : Type\n value : carrier\ndef package : Package := by constructor; exact (7 : Nat)\ntheorem value : package.value = (7 : Nat) := by rfl",
     );
 }
 #[test]
-fn existential_witness_and_proof_are_both_checked() {
-    check(
+fn existential_witness_goals_follow_the_pins_non_dependent_first_order() {
+    // Pin-audited 2026-10-06 (v4.32.0): the first goal after `constructor`
+    // is `?n = 7`, so `exact 7` is "numerals are data in Lean, but the
+    // expected type is a proposition". The old script encoded a false accept.
+    reject(
         "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem existsLemma : Witness (fun n => n = 7) := by constructor; exact 7; rfl",
+    );
+    // Accepted by the pin: `rfl` proves `?n = 7`, assigning the deferred
+    // witness goal, which is discharged without another tactic.
+    check(
+        "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem existsLemma : Witness (fun n => n = 7) := by constructor; rfl",
     );
     reject(
         "inductive Witness (P : Nat -> Prop) : Prop where | intro (n : Nat) (proof : P n)\ntheorem bad : Witness (fun n => n = 7) := by constructor; exact 8; rfl",

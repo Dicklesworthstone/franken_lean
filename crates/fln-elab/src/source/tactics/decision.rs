@@ -3,10 +3,10 @@
 //! an unselected source branch or written annotation to disappear.
 use super::*;
 
-fn constant(name: &str, levels: Vec<Level>) -> Expr {
+pub(super) fn constant(name: &str, levels: Vec<Level>) -> Expr {
     Expr::const_(Name::from_components(name.split('.')), levels)
 }
-fn apps(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
+pub(super) fn apps(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments.into_iter().fold(head, Expr::app)
 }
 
@@ -24,6 +24,12 @@ impl Context {
         }
         let proposition = self.instantiate(&goal.target)?;
         self.require_resolved(std::slice::from_ref(&proposition))?;
+        // The pin's `preprocessPropToDecide` (Lean/Elab/Tactic/Decide.lean): let-bound locals are
+        // unfolded, and a goal that still mentions a local is refused, even where a local
+        // dictionary would decide it.
+        if self.zeta_locals(&proposition)?.has_fvar() {
+            return Err(error(TacticError::DecideFreeVariables));
+        }
         let dictionary = self.decision_dictionary(&proposition)?;
         let computation = apps(
             self.decide_constant(),
@@ -46,6 +52,28 @@ impl Context {
         self.close_proof_goal(goal, value)
     }
 
+    /// `expr` with every let-bound local of the current context replaced by its value (the pin's
+    /// `zetaReduce`). One pass from the newest local suffices: a value mentions only older ones.
+    fn zeta_locals(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        let mut current = expr.clone();
+        for local in self.txn.lctx.decls().to_vec().into_iter().rev() {
+            self.tick()?;
+            let Some(value) = &local.value else {
+                continue;
+            };
+            let abstracted = current
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            if abstracted.has_loose_bvar(0) {
+                let value = self.instantiate(value)?;
+                current = abstracted
+                    .subst_loose(0, std::slice::from_ref(&value))
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+            }
+        }
+        Ok(current)
+    }
+
     /// The Boolean decision the tactic evaluates. The pin builds it with `mkDecide`,
     /// whose head is `Decidable.decide` (vendored Lean/Meta/AppBuilder.lean:589-590); a
     /// plain `decide` exists there only as an `export` alias, which is no
@@ -53,7 +81,7 @@ impl Context {
     /// names the same function `decide`, so the seed spelling is used only where
     /// the pin's constant is absent; it goes when the seed is retired
     /// (franken_lean-z8j.1.8).
-    fn decide_constant(&self) -> Expr {
+    pub(in crate::source) fn decide_constant(&self) -> Expr {
         let pinned = Name::from_components(["Decidable", "decide"]);
         if self.txn.env.contains(&pinned) {
             Expr::const_(pinned, vec![])
@@ -138,9 +166,27 @@ impl Context {
     /// Final admission retains the unmodified dictionary and checks both seats.
     fn decision_computes_true(
         &mut self,
-        mut computation: Expr,
+        computation: Expr,
     ) -> Result<bool, NatDefinitionElabError> {
-        let mut truth = constant("Bool.true", vec![]);
+        self.decision_computes(computation, "Bool.true")
+    }
+
+    /// The `false` direction of the same evaluation, for the pin's
+    /// `contradiction` decide arm (Lean/Meta/Tactic/Contradiction.lean:199):
+    /// a closed hypothesis whose decision computes `false` is refutable.
+    pub(super) fn decision_computes_false(
+        &mut self,
+        computation: Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.decision_computes(computation, "Bool.false")
+    }
+
+    fn decision_computes(
+        &mut self,
+        mut computation: Expr,
+        constructor: &str,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut truth = constant(constructor, vec![]);
         let mut needed = self.elimination_reads(&computation)?;
         for mut local in self.txn.lctx.decls().to_vec().into_iter().rev() {
             self.tick()?;
@@ -197,7 +243,10 @@ impl Context {
         }
     }
 
-    fn decision_dictionary(&mut self, proposition: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(in crate::source) fn decision_dictionary(
+        &mut self,
+        proposition: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let domain = Expr::app(constant("Decidable", vec![]), proposition.clone());
         let dictionary = self.instance_hole(domain)?;
         self.resolve_instances(false)?;

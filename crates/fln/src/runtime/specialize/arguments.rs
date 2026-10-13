@@ -124,16 +124,33 @@ impl Preparation<'_> {
             };
             // A dictionary indexed by an earlier retained value is not a
             // global specialization, even when this caller supplies a literal.
-            // Closed static arguments with independent domains need no lift
-            // when substituted under the retained runtime binders.
-            let proposition = self.proposition_parameter(binder_type)?;
-            let selected = if proposition {
-                Some(erased_proposition())
-            } else if binder_type.has_loose_bvars() || !closed(argument) {
+            // A type-valued motive can mention that value only in domains
+            // which disappear under the checked representation erasure (for
+            // example `fuel -> x < fuel -> Type`). Its represented domain must
+            // be completely closed before a concrete motive may cross those
+            // retained binders. Runtime arguments keep their original slots.
+            let proposition = self.erased_proposition_argument(binder_type)?;
+            let is_proposition = proposition.is_some();
+            let type_argument = !is_proposition && self.type_parameter(binder_type)?;
+            let runtime_type = if type_argument {
+                Some(if closed(argument) {
+                    argument.clone()
+                } else {
+                    self.erase_type_argument(argument, &[])?
+                })
+            } else {
                 None
-            } else if self.type_parameter(binder_type)? {
-                Some(argument.clone())
-            } else if *binder_info == BinderInfo::InstImplicit {
+            };
+            let independent_domain = !binder_type.has_loose_bvars()
+                || (runtime_type.as_ref().is_some_and(closed)
+                    && closed(&self.erase_runtime_type(binder_type)?));
+            let selected = if is_proposition {
+                proposition
+            } else if !independent_domain {
+                None
+            } else if let Some(type_) = runtime_type {
+                closed(&type_).then_some(type_)
+            } else if *binder_info == BinderInfo::InstImplicit && closed(argument) {
                 self.instance_factory_value(argument)?
             } else {
                 None
@@ -142,12 +159,12 @@ impl Preparation<'_> {
                 let next_type = self.substitution(body, &selected)?;
                 let next_value = self.substitution(value_body, &selected)?;
                 reserve(&mut static_arguments, self.limits.max_application_args)?;
-                // Keep exact type/dictionary arguments in the key. Only Prop
-                // arguments are layout-independent: use their closed erased
-                // representative, never context-relative indices in a global key.
+                // Hidden-type arguments use their verified closed form, never
+                // context-relative receiver indices in a global key. Ordinary
+                // dictionary factories retain their original cache identity.
                 static_arguments.push((
                     index,
-                    if proposition {
+                    if is_proposition || type_argument {
                         selected
                     } else {
                         argument.clone()
@@ -236,6 +253,15 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, args)? {
+            return Ok(Some(replacement));
+        }
+        if let Some(fold) = self.imported_nat_recursion(head, args)? {
+            return Ok(Some(fold));
+        }
+        if let Some(fold) = self.imported_list_recursion(head, args)? {
+            return Ok(Some(fold));
+        }
         let ExprNode::Const {
             name: original,
             levels,
@@ -243,10 +269,7 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if self.specializations.definitions.contains_key(original) {
-            return Ok(None);
-        }
-        let Some(mut definition) = self.definition(original) else {
+        let Some(mut definition) = self.executable_definition(original)? else {
             return Ok(None);
         };
         if definition.base.level_params.len() != levels.len()
@@ -262,10 +285,20 @@ impl Preparation<'_> {
         let value =
             self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
         let prepared = self.specialize_arguments(type_, value, args)?;
+        // An earlier universe or dictionary specialization can still contain
+        // an open motive, exposed later by a checked local type binding. Allow
+        // another specialization only when a new static argument is removed.
+        // Canonical definitions have no universes left, so this gate also
+        // prevents a private entry from repeatedly specializing an unchanged
+        // telescope. Each such step strictly removes a supplied binder.
         if prepared.static_arguments.is_empty() && levels.is_empty() {
             return Ok(None);
         }
-        let key = (original.clone(), levels.clone(), prepared.static_arguments);
+        let key = (
+            definition.base.name.clone(),
+            levels.clone(),
+            prepared.static_arguments,
+        );
         let name = if let Some(name) = self.specializations.instances.get(&key) {
             name.clone()
         } else {

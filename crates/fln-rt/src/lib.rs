@@ -28,7 +28,13 @@ mod region_contract;
 
 /// The safe CompatHeap object surface (see the crate docs).
 pub mod obj {
-    pub use fln_unsafe_abi::handle::{EXTERNAL_FINALIZED, Obj};
+    pub use fln_unsafe_abi::handle::fs::{FileIoError, FileReadError};
+    pub use fln_unsafe_abi::handle::stdout_capture::{
+        CapturedStdout, StdoutCapture, StdoutCaptureError,
+    };
+    pub use fln_unsafe_abi::handle::{
+        EXTERNAL_FINALIZED, Obj, StdioPutStrError, flush_native_stdout,
+    };
     pub use fln_unsafe_abi::rc::Header;
     /// Ownership-shadow controls: deterministic replay events, quarantine
     /// discipline, and fault detection (plan §6.2 hardened builds).

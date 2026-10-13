@@ -259,23 +259,33 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
     // Before: `lexical analysis reported N diagnostic(s)` at the token. Now the bytes lex, and
     // what remains is the grammar's own typed refusal at that same token, which says nothing
     // about validity. Each such parser is added only with the pin's own tree for it
-    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `×` and `≤` come next.
-    for (source, token) in [
-        ("def p : Nat × Nat := (1, 2)", "×"),
-        (
-            "theorem o (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega",
-            "≤",
+    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `s!` comes next.
+    let (source, token) = ("def p : String := s!\"x\"", "s!");
+    let at = BytePos(source.find(token).expect("the token is in the source"));
+    assert!(
+        matches!(
+            parse_source_command(source.as_bytes()),
+            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) if refused == at
         ),
-    ] {
-        let at = BytePos(source.find(token).expect("the token is in the source"));
-        assert!(
-            matches!(
-                parse_source_command(source.as_bytes()),
-                Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) if refused == at
-            ),
-            "{source}: the grammar, not the lexer, refuses at {token}"
-        );
-    }
+        "{source}: the grammar, not the lexer, refuses at {token}"
+    );
+    // `≤` was the second: the relation parsers (`«term_≤_»`) now take it, with the pin's tree
+    // in `RELATIONS_AND_EXISTENTIALS` (`omega` parses too, and the elaborator refuses it).
+    assert!(
+        parse_source_command("theorem o (a b : Nat) (h : a < b) : a + 1 ≤ b := h".as_bytes())
+            .is_ok()
+    );
+    // `×` was the fourth: Init's infixes now take it, with the pin's tree in
+    // `INFIXES_AND_UNTYPED_BINDERS`.
+    assert!(parse_source_command("def p (α β : Type) : Type := α × β".as_bytes()).is_ok());
+    // `<|` was the fifth, with the pin's trees in `INFIXES_AND_UNTYPED_BINDERS`.
+    assert!(parse_source_command("def p : Nat := id <| 1".as_bytes()).is_ok());
+    // `|>` was the sixth, with the pin's trees in `PIPE_RIGHT`.
+    assert!(parse_source_command("def p : Nat := 1 |> id".as_bytes()).is_ok());
+    // `>>=` was the seventh, with the pin's trees in `BIND_LIST_RELATIONS_AND_PREFIXES`.
+    assert!(parse_source_command("def p : Option Nat := some 1 >>= some".as_bytes()).is_ok());
+    // `$` was the eighth, with the pin's trees in `DOLLAR_PIPELINE`.
+    assert!(parse_source_command("def p : Nat := id $ 1".as_bytes()).is_ok());
     // `⟨` was the third: the anonymous-constructor parser (Term.anonymousCtor) now takes it.
     assert!(
         parse_source_command(
@@ -291,7 +301,9 @@ fn production_lexes_the_tokens_the_hand_table_refused() {
 /// table parsed all five (each keyword was an identifier there); the derived table refuses each
 /// at the token the Reference names, except a word in the seed allowance, which is a declared
 /// divergence until it leaves (`exists` and `from` left it with fln-ffce). The escaped spelling
-/// the Reference accepts parses.
+/// the Reference accepts parses. The last five rows are the witnesses `franken_lean-z8j.1.6.2`
+/// names (`universe`, `scoped`, `local`, `repeat`, `prefix` as declaration names), captured the
+/// same way on 2026-10-09.
 const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     (
         "def at : Nat := 1",
@@ -312,6 +324,26 @@ const REFERENCE_KEYWORD_REFUSALS: &[(&str, &str)] = &[
     (
         "def h (using : Nat) : Nat := using",
         "1:7: error: unexpected token 'using'; expected '_' or identifier",
+    ),
+    (
+        "theorem universe : True := trivial",
+        "1:7: error: unexpected token 'universe'; expected identifier",
+    ),
+    (
+        "theorem scoped : True := trivial",
+        "1:7: error: unexpected token 'scoped'; expected identifier",
+    ),
+    (
+        "theorem local : True := trivial",
+        "1:7: error: unexpected token 'local'; expected identifier",
+    ),
+    (
+        "theorem repeat : True := trivial",
+        "1:7: error: unexpected token 'repeat'; expected identifier",
+    ),
+    (
+        "theorem prefix : True := trivial",
+        "1:7: error: unexpected token 'prefix'; expected identifier",
     ),
 ];
 

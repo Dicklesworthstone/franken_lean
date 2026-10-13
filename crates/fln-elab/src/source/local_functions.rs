@@ -4,6 +4,17 @@
 use super::*;
 use std::collections::HashSet;
 
+/// A local recursive value is checked before its continuation, but remains
+/// opaque until the enclosing declaration has finished elaborating. Captures
+/// are explicit arguments to its metavariable, so closing an enclosing let or
+/// lambda cannot leave hidden free variables in the deferred value.
+#[derive(Clone)]
+pub(super) struct Deferred {
+    pub id: MVarId,
+    value: Typed,
+    captures: Vec<LocalDecl>,
+}
+
 #[derive(Clone)]
 pub(super) struct Binding<'a> {
     pub name: Name,
@@ -13,6 +24,7 @@ pub(super) struct Binding<'a> {
     pub annotation: Option<&'a Syntax>,
     pub value: &'a Syntax,
     pub body: &'a Syntax,
+    pub termination: Option<recursion::StructuralHint<'a>>,
 }
 
 #[derive(Clone)]
@@ -23,6 +35,8 @@ pub(super) struct Build<'a> {
     pub value_syntax: &'a Syntax,
     pub checkpoint: Option<usize>,
     parameters: Vec<LocalDecl>,
+    header_parameters: usize,
+    lambdas: Vec<binders::Telescope<'a>>,
     saved: LocalContext,
     outer_recursion: Option<recursion::Recursion>,
     marker: Option<FVarId>,
@@ -72,12 +86,13 @@ fn original<'a>(
 impl<'a> Checkpoint<'a> {
     pub fn new(
         context: &mut Context,
-        build: Build<'a>,
+        mut build: Build<'a>,
         tasks: usize,
         values: usize,
     ) -> Result<Self, NatDefinitionElabError> {
+        context.open_local_recursive_lambdas(&mut build)?;
         let mut candidates = vec![None];
-        let body = original(context, build.binding.value)?;
+        let body = original(context, build.value_syntax)?;
         match context.recursion_columns(&build.parameters, body) {
             Ok(columns) => candidates.extend(columns.into_iter().map(Some)),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
@@ -148,6 +163,118 @@ pub(super) fn retryable(problem: &NatDefinitionElabError) -> bool {
 }
 
 impl Context {
+    pub(super) fn defer_local_function(
+        &mut self,
+        value: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let locals = self.txn.lctx.decls().to_vec();
+        let mut reads = self.elimination_reads(&value.value)?;
+        reads.extend(self.elimination_reads(&value.type_)?);
+        let mut captures = Vec::new();
+        for local in locals.iter().rev() {
+            self.tick()?;
+            if reads.contains(&local.id) {
+                reads.extend(self.elimination_reads(&local.type_)?);
+                if let Some(value) = &local.value {
+                    reads.extend(self.elimination_reads(value)?);
+                }
+                captures.push(local.clone());
+            }
+        }
+        captures.reverse();
+        let mut type_ = self.instantiate(&value.type_)?;
+        for local in captures.iter().rev() {
+            self.tick()?;
+            type_ = Expr::forall_e(
+                local.user_name.clone(),
+                self.instantiate(&local.type_)?,
+                type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
+        let name = self.fresh_name()?;
+        let id = MVarId(name.clone());
+        self.txn.mvars.declare(
+            id.clone(),
+            name,
+            type_,
+            LocalContext::new(),
+            MetavarKind::SyntheticOpaque,
+            0,
+            None,
+        );
+        let mut reference = Expr::mvar(id.clone());
+        for local in &captures {
+            self.tick()?;
+            reference = Expr::app(reference, Expr::fvar(local.id.clone()));
+        }
+        let type_ = value.type_.clone();
+        self.deferred_local_functions.push(Deferred {
+            id,
+            value,
+            captures,
+        });
+        Ok(Typed {
+            value: reference,
+            type_,
+        })
+    }
+
+    /// The pin assigns let-rec metavariables while forming the enclosing
+    /// declaration's closure (`MutualClosure.mkLetRecClosures`), after its
+    /// header and body constraints have already been checked. Assignment here
+    /// grants no admission authority: the resulting closed declaration still
+    /// passes the ordinary kernel and independent checker.
+    pub(super) fn complete_local_functions(&mut self) -> Result<(), NatDefinitionElabError> {
+        if self.deferred_local_functions.is_empty() {
+            return Ok(());
+        }
+        self.resolve_instances(true)?;
+        self.flush(true)?;
+        let deferred = std::mem::take(&mut self.deferred_local_functions);
+        for pending in deferred {
+            self.tick()?;
+            let mut value = self.instantiate(&pending.value.value)?;
+            for local in pending.captures.iter().rev() {
+                self.tick()?;
+                value = Expr::lam(
+                    local.user_name.clone(),
+                    self.instantiate(&local.type_)?,
+                    value
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+            self.txn
+                .mvars
+                .assign(pending.id, value, AssignmentJustification::UserGiven)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+        }
+        Ok(())
+    }
+
+    /// Freeze a public signature using only closures elaborated in its public
+    /// predecessor. Its proof still sees the original opaque metavariables.
+    /// Universe assignments and spent work remain shared across this boundary;
+    /// only the temporary disclosure of local function values is restored.
+    pub(super) fn with_closed_local_function_header<T>(
+        &mut self,
+        freeze: impl FnOnce(&mut Context) -> Result<T, NatDefinitionElabError>,
+    ) -> Result<T, NatDefinitionElabError> {
+        if self.deferred_local_functions.is_empty() {
+            return freeze(self);
+        }
+        let mvars = self.txn.mvars.clone();
+        let deferred = self.deferred_local_functions.clone();
+        let result = self.complete_local_functions().and_then(|()| freeze(self));
+        self.txn.mvars = mvars;
+        self.deferred_local_functions = deferred;
+        result
+    }
+
     pub(super) fn start_local_function<'a>(
         &mut self,
         binding: Binding<'a>,
@@ -160,6 +287,7 @@ impl Context {
         }
         let saved = self.txn.lctx.clone();
         let parameters = self.bind_parameters(binding.parameters)?;
+        let header_parameters = parameters.len();
         // Signatures see the enclosing scope. Nonrecursive values do too;
         // recursive values introduce their self binder after this phase.
         Ok(Build {
@@ -169,11 +297,71 @@ impl Context {
             result_type: None,
             checkpoint: None,
             parameters,
+            header_parameters,
+            lambdas: Vec::new(),
             saved,
             outer_recursion: None,
             marker: None,
             generalized_parameters: HashSet::new(),
         })
+    }
+
+    /// A recursive local's written lambdas belong to its function telescope,
+    /// just like named header parameters. Check their domains with the local
+    /// self in scope, so an outer declaration with the same name cannot supply
+    /// an annotation that the source's actual recursive name would invalidate.
+    fn open_local_recursive_lambdas<'a>(
+        &mut self,
+        build: &mut Build<'a>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if prepared(self, build.value_syntax)?.kind() != Some(&parser_kind(&["Term", "fun"])) {
+            return Ok(());
+        }
+        let saved = self.txn.lctx.clone();
+        let outer = self.recursion.clone();
+        let enclosing = self.enclosing_recursions.len();
+        self.start_local_function_value(build, None)?;
+        let marker = build
+            .marker
+            .clone()
+            .expect("temporary local recursive self");
+        let (body, expected, mut lambdas) = self.open_recursive_lambdas(
+            build.value_syntax,
+            build.result_type.clone(),
+            &mut build.parameters,
+        )?;
+        let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedFunction))?;
+        // A recursive call in a domain precedes the structural match, so no
+        // smaller constructor field can justify it. Do not retain a temporary
+        // self through the domains or turn it into an ordinary captured value.
+        for parameter in &build.parameters[build.header_parameters..] {
+            if self.elimination_reads(&parameter.type_)?.contains(&marker) {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::NotDecreasing,
+                )));
+            }
+        }
+        if self.elimination_reads(&expected)?.contains(&marker) {
+            return Err(failure(SourceInferenceError::Recursion(
+                recursion::RecursionError::NotDecreasing,
+            )));
+        }
+        for lambda in &mut lambdas {
+            self.forget_telescope_local(lambda, &marker)?;
+        }
+        self.txn.lctx = saved;
+        for parameter in &build.parameters[build.header_parameters..] {
+            self.tick()?;
+            tactics::eliminate::add_local(&mut self.txn.lctx, parameter);
+        }
+        self.recursion = outer;
+        self.enclosing_recursions.truncate(enclosing);
+        build.marker = None;
+        build.outer_recursion = None;
+        build.value_syntax = body;
+        build.result_type = Some(expected);
+        build.lambdas = lambdas;
+        Ok(())
     }
 
     pub(super) fn start_local_function_value(
@@ -187,17 +375,38 @@ impl Context {
         // The function is not in scope in its signature. Only now can its
         // complete type and private recursive marker be introduced.
         build.outer_recursion = self.recursion.take();
+        if let Some(outer) = &build.outer_recursion {
+            self.enclosing_recursions.push(outer.clone());
+        }
         let expected = build
             .result_type
             .as_ref()
             .expect("recursive result annotation");
-        let mut body = original(self, build.binding.value)?;
+        let mut body = original(self, build.value_syntax)?;
         while let Some(inner) = parenthesized_inner(body)? {
             self.tick()?;
             body = inner;
         }
         let marker = if let Some(column) = column {
             let columns = self.recursion_columns(&build.parameters, body)?;
+            if let Some(hint) = &build.binding.termination {
+                let parameter = self.structural_hint_parameter(
+                    hint,
+                    &build.parameters,
+                    build.header_parameters,
+                )?;
+                if !columns
+                    .iter()
+                    .any(|&(candidate, position)| candidate == column && position == parameter)
+                {
+                    // The initial nonrecursive candidate still runs first.
+                    // A surviving self reference may try only the column the
+                    // hint selects, never silently succeed on another one.
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::NotDecreasing,
+                    )));
+                }
+            }
             let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
             self.prepare_recursion(
                 &build.binding.name,
@@ -237,7 +446,7 @@ impl Context {
                 type_,
             }
         };
-        if let Syntax::Node { kind, args, .. } = prepared(self, build.binding.value)?
+        if let Syntax::Node { kind, args, .. } = prepared(self, build.value_syntax)?
             && kind == &parser_kind(&["Term", "localRecValue"])
         {
             let index = column.map_or(1, |column| column + 2);
@@ -307,7 +516,8 @@ impl Context {
                 recursion::RecursionError::NotDecreasing,
             )));
         }
-        for local in build.parameters.iter().rev() {
+        value = self.close_recursive_lambdas(&build.lambdas, value)?;
+        for local in build.parameters[..build.header_parameters].iter().rev() {
             self.tick()?;
             let domain = self.instantiate(&local.type_)?;
             value.value = value
@@ -334,6 +544,9 @@ impl Context {
         self.txn.lctx = build.saved.clone();
         if build.binding.recursive {
             self.recursion = build.outer_recursion.clone();
+            if build.outer_recursion.is_some() {
+                self.enclosing_recursions.pop();
+            }
         }
         // An explicit result remains in the let-bound function's full type.
         // K1 therefore checks it even when the enclosing body never calls f.
@@ -357,6 +570,7 @@ mod tests {
             annotation: Some(&missing),
             value: &missing,
             body: &missing,
+            termination: None,
         };
         let build = Build {
             binding,
@@ -365,6 +579,8 @@ mod tests {
             value_syntax: &missing,
             checkpoint: None,
             parameters: Vec::new(),
+            header_parameters: 0,
+            lambdas: Vec::new(),
             saved: LocalContext::new(),
             outer_recursion: None,
             marker: None,

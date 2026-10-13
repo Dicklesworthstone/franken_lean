@@ -66,6 +66,18 @@ fn raw_nat(term: &Expr, expected: u64) {
     );
 }
 
+fn ascribed_value(term: &Expr, carrier: &str) -> Expr {
+    let ExprNode::LetE {
+        type_, value, body, ..
+    } = term.node()
+    else {
+        panic!("expected the retained type ascription, got {term:?}");
+    };
+    constant(type_, carrier);
+    assert_eq!(body, &Expr::bvar(0).unwrap());
+    value.clone()
+}
+
 #[test]
 fn scientific_literals_retain_the_pins_class_application_and_raw_components() {
     let checked = checked(
@@ -166,21 +178,39 @@ fn expected_precision_reaches_nested_operations_and_function_arguments() {
 }
 
 #[test]
-fn numeric_defaults_convert_aliases_after_custom_instance_search() {
+fn numeric_aliases_preserve_explicit_types_and_matching_custom_instances() {
     let checked = checked(
         &base(),
         concat!(
-            "def Id (A : Type) : Type := A\n",
-            "def fromDefault : Id Nat := 7\n",
-            "def scientificDefault : Id Float := 1.25\n",
-            "instance customLiteral : OfNat (Id Nat) 7 := { ofNat := (8 : Nat) }\n",
-            "def fromCustom : Id Nat := 7\n",
-            "theorem default_ok : fromDefault = (7 : Nat) := by rfl\n",
+            "def NumericAlias (A : Type) : Type := A\n",
+            "def fromExplicit : NumericAlias Nat := (7 : Nat)\n",
+            "def scientificExplicit : NumericAlias Float := (1.25 : Float)\n",
+            "instance customLiteral : OfNat (NumericAlias Nat) 7 := { ofNat := (8 : Nat) }\n",
+            "def fromCustom : NumericAlias Nat := 7\n",
+            "theorem explicit_ok : fromExplicit = (7 : Nat) := by rfl\n",
             "theorem custom_ok : fromCustom = (8 : Nat) := by rfl\n",
         ),
     );
-    let (_, default_args) = application(value(&checked.engine, "fromDefault"));
-    constant(&application(default_args[2].clone()).0, "instOfNatNat");
+    let (explicit_head, explicit_args) = application(ascribed_value(
+        &value(&checked.engine, "fromExplicit"),
+        "Nat",
+    ));
+    constant(&explicit_head, "OfNat.ofNat");
+    assert_eq!(explicit_args.len(), 3);
+    constant(&explicit_args[0], "Nat");
+    raw_nat(&explicit_args[1], 7);
+    constant(&application(explicit_args[2].clone()).0, "instOfNatNat");
+    let (scientific_head, scientific_args) = application(ascribed_value(
+        &value(&checked.engine, "scientificExplicit"),
+        "Float",
+    ));
+    constant(&scientific_head, "OfScientific.ofScientific");
+    assert_eq!(scientific_args.len(), 5);
+    constant(&scientific_args[0], "Float");
+    constant(&scientific_args[1], "instOfScientificFloat");
+    raw_nat(&scientific_args[2], 125);
+    constant(&scientific_args[3], "Bool.true");
+    raw_nat(&scientific_args[4], 2);
     let (_, custom_args) = application(value(&checked.engine, "fromCustom"));
     constant(&custom_args[2], "customLiteral");
 }

@@ -139,11 +139,11 @@ use std::path::{Path, PathBuf};
 use fln_conformance::execution::{
     CiJob, ELAN_ROOTS, ELAN_TOOLCHAINS_SEGMENT, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES,
     autodiscovery_overrides, check_sh_reaches_workspace, ci_jobs, code_only, e2e_scenario_keys,
-    feature_gated_modules, features_off_by_default, ignored_tests, installs_reference_pin,
-    invokes_check_sh, is_terminal, logical_lines, module_path_prefix, names_scenario_in_code,
-    reach_covers, reaches_the_pinned_reference, record_field, scenario_assignments,
-    shell_code_only, test_function_citation, test_functions, test_reach, unmodelled_feature_cfgs,
-    workspace_member_patterns,
+    feature_gated_modules, features_off_by_default, file_module_declarations, ignored_tests,
+    installs_reference_pin, invokes_check_sh, is_terminal, logical_lines, module_path_prefix,
+    names_scenario_in_code, reach_covers, reaches_the_pinned_reference, record_field,
+    scenario_assignments, shell_code_only, test_function_citation, test_functions, test_reach,
+    unmodelled_feature_cfgs, workspace_member_patterns,
 };
 use fln_conformance::pin::{
     self, PinRig, RIG_EXECUTION_DIR_ENV, RigDisposition, RigExecutionRecord,
@@ -186,11 +186,19 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-mandated-mutant-join-unwatched-uagk",
     "fln-7li",
     "fln-lld",
-    "fln-sv7x",
-    "franken_lean-l8bj",
     "fln-d18-product-half-rgsg",
     "franken_lean-z8j.1.3",
     "franken_lean-z8j.1.4",
+    "fln-32rr",
+    "fln-5njk",
+    "fln-frontier-oom-abort-w9dx",
+    "fln-fur.1",
+    "fln-extended-25-modules-council-4974-9m8q",
+    "fln-init-bnh-council-4444-b443",
+    "fln-init-chain-council-3116-kipb",
+    "fln-init-control-council-4698-1yyb",
+    "fln-init-core-council-4442-aiwk",
+    "fln-init-sizeof-council-3290-w4xk",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -258,7 +266,31 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// surface-granularity debt as fln-7li and fln-lld, newly visible rather than newly
 /// created; it shrinks when CI runs those surfaces with the pin or the rows migrate off
 /// them.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 13;
+///
+/// 13 -> 21 on 2026-10-06 (coordinator, session projects-c9). Eighteen terminal rows had joined the
+/// population; eight of them left it by repair. Seven left because contract-drift's
+/// `pin-gated-differentials` job now runs their pin-gated targets with the pin and
+/// FLN_REQUIRE_REFERENCE=1: fln-52qv, fln-vm35, fln-gkhu, fln-export-aliases-ub7i, fln-eq4k, fln-wh2j
+/// and franken_lean-etj.1, measured passing locally at 70e6b559. One more, franken_lean-z8j.1.14,
+/// left when its row stopped citing an `#[ignore]`d test. The same job runs all of fln-olean with
+/// the pin, so the 8 -> 10 entry's decl_decode debt is repaired too: fln-sv7x and franken_lean-l8bj
+/// leave, as that entry said they would once CI installed the pin (decl_decode 97/0 with the pin).
+///
+/// The ten declared here share ONE cause. `crates/fln/src/lib.rs` became pin-reaching at
+/// `79b5e477`, and its only pin coordinate sits in the `#[ignore]`d decoder differential
+/// `every_declaration_under_the_roots_reads_the_same_to_both_decoders`, which IGNORED_PRODUCER_ALLOWANCE
+/// declares. Each of the ten cites that surface:
+/// - fln-32rr, fln-5njk, fln-frontier-oom-abort-w9dx and fln-fur.1 through pin-free `fln::lib` unit
+///   tests;
+/// - the six council rows (…-9m8q, -b443, -kipb, -1yyb, -aiwk, -w4xk) by the file itself. Their
+///   pinned_nat_council evidence already runs with the pin in the imported-tags step.
+///
+/// Measured on an rch worker, which has no pin: all seven cited `fln::lib` tests pass, and none
+/// prints a SKIP. This is the fln-7li and fln-lld surface-granularity debt again: no cited test
+/// needs the pin, and the pin-reaching test in that file is `#[ignore]`d, so CI never runs it. It
+/// shrinks when that differential's locator leaves `lib.rs`, or when these rows migrate off the
+/// surface.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 21;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
@@ -314,6 +346,50 @@ const PIN_REACH_SCAN_EXCLUSION_CEILING: usize = 2;
 /// repair is exactly that migration. See residue item 4 in the module header.
 const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     (
+        "crates/fln-syntax/tests/pin_syntax_corpus.rs",
+        "pin_syntax_corpus_against_the_pin",
+        "an on-demand pin-gated lane (bead fln-pin-syntax-corpus-7b5b): the pinned frontend dumps \
+         1,077 Init and Std files on first use (about 6 minutes; 6 s from its cache), checks every \
+         dump against the checked-in manifest and asserts the lossless round trip over all 72,092 \
+         commands; with FLN_PIN_SYNTAX_WRITE=1 it is the manifest's only writer. Per commit, \
+         every_vendored_init_and_std_source_has_its_manifest_row holds the population, the \
+         source digests and the producer, and fln-syntax's pin_syntax unit tests hold the round \
+         trip and its refusals on planted dumps",
+    ),
+    (
+        "crates/fln-parse/tests/pin_syntax_frontier.rs",
+        "pin_syntax_frontier_a_measures_the_production_parser",
+        "a measurement lane over the pin syntax corpus cache (bead fln-pin-syntax-corpus-7b5b \\
+         item 4, the metric franken_lean-z8j.1.10 asks for): FrankenLean's production parser on \\
+         all 72,092 commands against the pin's trees, typed SKIP without the cache. It fails \\
+         only on a broken scan, so it gates nothing yet; per commit, \\
+         the_comparison_names_shape_and_position_differences holds its classification",
+    ),
+    (
+        "crates/fln-cli/tests/source_olean_imports.rs",
+        "existential_notation_and_nested_anonymous_constructors",
+        "an on-demand council of the 51-module Init.NotationExtra closure (about a minute in \
+         release). Nothing per commit elaborates the pin's `∃` macro or nested `⟨…⟩` against \
+         the real closure, so no coverage row may cite this test for a per-commit claim",
+    ),
+    (
+        "crates/fln-cli/tests/upstream_suite_scoreboard.rs",
+        "upstream_suite_scoreboard_measures_the_drop_in_against_the_pin",
+        "an on-demand pin-gated lane over 3,379 upstream files, run by contract-drift with \
+         FLN_REQUIRE_REFERENCE=1 (bead fln-upstream-suite-scoreboard-n04o); per commit, \
+         the_checked_in_tables_name_exactly_the_upstream_suite holds the population, oracle \
+         and ledger bijection, and the planted false-accept, ratchet, drift and scan tests hold \
+         the scoring law without the pin",
+    ),
+    (
+        "crates/fln-cli/tests/upstream_suite_scoreboard.rs",
+        "regenerate_the_upstream_oracle_from_the_pin",
+        "the oracle's only writer, run by hand for a pin or vendor change behind \
+         FLN_UPSTREAM_ORACLE_WRITE=1 (bead fln-upstream-suite-scoreboard-n04o); the \
+         pin-gated scoreboard's drift check holds the recorded oracle to the live pin, and \
+         the per-commit bijection check holds it to the vendored population",
+    ),
+    (
         "crates/fln-conformance/tests/kernel_replay.rs",
         "pinned_present_olean_kernel_differential",
         "fln-8zsq made its census guard SOURCE-level precisely because this producer is \
@@ -334,6 +410,25 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          remains keyed by pin, so advancing SUITE.lock makes the file absent rather than stale \
          (93te's retention law). Wall-clock telemetry belongs to the retained producing run and \
          is excluded from semantic identity; row order, counts, verdicts, and stream digests are not",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "fln_4hol_units_accept_within_their_step_ceilings",
+        "the whole-stdlib differential catches the accepted-or-not half of the fln-4hol \
+         units on demand (subject_no_answer=0 at 0eb03c7b), and the step CEILINGS this lane \
+         adds are consumption bands, not verdicts: a recurrence of the e7cdcbbc unfolding \
+         pathology also reddens the corpus thread-matrix wall and the frontier runs, which \
+         is where it was found the first time. Bead franken_lean-z8j.1.13 comment 3319 \
+         records the measured values and this placement decision",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "bemc_synthetic_module_pin_and_kernel_verdicts_join",
+        "the join logic itself runs per commit as bemc_join_cells_classify_and_conserve, \
+         where the rig's planted mutants die; the full lane needs a pinned generator run, \
+         and the scheduled contract-drift workflow executes it weekly with fixed seeds, \
+         failing on any pin=reject/FrankenLean=accept row (bead \
+         fln-kernel-reject-side-at-scale-bemc, acceptance 5)",
     ),
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
@@ -494,6 +589,41 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          (the superset differential), both pin-gated. Nothing per commit elaborates against \
          the whole Init, and no coverage row may cite this function as a CI run",
     ),
+    (
+        "crates/fln-olean/tests/ir.rs",
+        "every_ir_file_of_the_pinned_toolchain_decodes_to_what_the_pin_prints",
+        "an on-demand whole-pin lane (bead fln-ir-decoder-call-graph-sjzl): it decodes every \
+         `.ir` file under the pinned toolchain's lib/lean, or under FLN_REFERENCE_LIB, and has \
+         the pinned `lean` print each declaration through scripts/tribunal/ir_dump.lean for a \
+         character-for-character comparison. Its recorded runs (2026-10-07): pinned toolchain \
+         394,720/394,720 declarations equal across 2,431 files (250 s at opt-level 2), and the \
+         Mathlib corpus 317,777/317,777 across 8,265. It launches the pin once per 64 files, so \
+         it never runs per push, and nothing dispatches it. Run it with `cargo test -p fln-olean \
+         --test ir -- --ignored`; the recorded runs set CARGO_PROFILE_TEST_OPT_LEVEL=2, and the \
+         unoptimized time was not measured. What holds the comparison per commit is two real \
+         `.ir` files committed beside the pin's printout of them: \
+         `two_real_ir_files_decode_to_exactly_what_the_pin_prints` (87 declarations, 25 of the \
+         28 IR forms the pin stores), with `the_committed_files_and_printouts_are_the_pins_own` \
+         re-deriving both where the pin is installed. Nothing per commit re-decodes the pin's \
+         other 2,429 files, and no coverage row may cite this function as a CI run",
+    ),
+    (
+        "crates/fln-olean/tests/ir_demand.rs",
+        "the_corpus_demand_on_the_toolchain_under_both_readings",
+        "an on-demand measurement, not a gate (beads fln-ir-decoder-call-graph-sjzl item 5 and \
+         fln-mirror-price-cszo): it decodes every `.ir` file of the pinned toolchain and of a \
+         built Mathlib checkout named by FLN_MATHLIB_CORPUS, joins the call graph to the \
+         untracked census partition (FLN_BUILTIN_PARTITION), and prints what the corpus's own \
+         declarations demand of the toolchain under two readings. It needs three inputs no CI \
+         host has, so it never runs per push, and it skips typed without any of them. Its one \
+         recorded run (2026-10-07, about 80 s with CARGO_PROFILE_TEST_OPT_LEVEL=2): 755,838 \
+         nodes, 1,492,181 edges; 2,008 toolchain-API constants reached directly and 383 \
+         externs reached through every body. What holds the graph and both stopping rules per \
+         commit is hand-built: `reach_looks_through_exactly_what_descend_accepts`, \
+         `the_graph_keeps_the_first_declaration_and_names_what_nothing_declares` and \
+         `the_two_readings_stop_at_different_walls`. Nothing per commit re-derives the corpus \
+         figures, and no coverage row may cite this function as a CI run",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -559,7 +689,44 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// 18 -> 19 for `crates/fln-cli/tests/source_import_reuse.rs`'s fln-52qv budget lane, declared
 /// in the same commit that adds it: a whole-Init council is too slow per push, and the entry
 /// names the pin-gated Init.Core tests that hold the filter per commit.
-const IGNORED_PRODUCER_CEILING: usize = 19;
+///
+/// 19 -> 21 for two kernel_replay lanes that landed `#[ignore]`d and UNDECLARED, by this
+/// author's own earlier commits (`0ce8af8c`, `1bdbe78f`), which reddened this suite until
+/// repaired here — the miss disclosed rather than smoothed: the fln-4hol step-ceiling lane
+/// (its accepted-or-not half held on demand by the stdlib differential, its consumption
+/// bands also visible in the corpus matrix wall; bead `franken_lean-z8j.1.13` comment 3319)
+/// and the bemc reject-side join (its join logic running per commit as
+/// `bemc_join_cells_classify_and_conserve` where the rig's planted mutants die, the full
+/// lane executed weekly with fixed seeds by the scheduled contract-drift workflow, failing
+/// on any pin=reject/FrankenLean=accept row; bead `fln-kernel-reject-side-at-scale-bemc`,
+/// acceptance 5).
+///
+/// 21 -> 24 for `crates/fln-cli/tests/upstream_suite_scoreboard.rs`'s two lanes (bead
+/// `fln-upstream-suite-scoreboard-n04o`), declared in the commit that adds them: the
+/// scoreboard is too slow per push (3,379 pinned elaborations) and the oracle writer runs
+/// only for a pin change, each entry naming what holds its law per commit; and
+/// `source_olean_imports.rs`'s `existential_notation_and_nested_anonymous_constructors`
+/// (`bef21b47`), which landed undeclared and kept this suite red. Declared from its own
+/// docstring by the coordinator, stating that nothing per commit compensates, so it may not
+/// be cited as per-commit evidence; its author may supply a stronger entry.
+///
+/// 24 -> 25 for `crates/fln-olean/tests/ir.rs`'s whole-pin `.ir` differential (bead
+/// `fln-ir-decoder-call-graph-sjzl`), declared in the commit that adds it: it launches the
+/// pinned `lean` over 2,431 files, which is minutes, and the entry names the two committed
+/// real files that hold the same comparison per commit.
+///
+/// 25 -> 26 for `crates/fln-olean/tests/ir_demand.rs`'s corpus demand measurement (beads
+/// `fln-ir-decoder-call-graph-sjzl` and `fln-mirror-price-cszo`), declared in the commit that
+/// adds it: it needs the pin, a built Mathlib and the untracked census partition, and the
+/// entry says it is a measurement, not a gate, and names the hand-built tests that hold its
+/// rules per commit.
+///
+/// 26 -> 27 for `crates/fln-syntax/tests/pin_syntax_corpus.rs`'s pinned lane (bead
+/// `fln-pin-syntax-corpus-7b5b`), declared in the commit that adds it: the pinned frontend over
+/// 1,077 files is minutes on first use, and the entry names what holds the corpus per commit.
+/// 27 -> 28 for `crates/fln-parse/tests/pin_syntax_frontier.rs`'s frontier A, in the same change:
+/// a measurement over that corpus's cache, which no CI host holds.
+const IGNORED_PRODUCER_CEILING: usize = 28;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -961,8 +1128,13 @@ struct Derivation {
     /// the three `tests/common/mod.rs` modules all claimed the stem `mod` and two vanished
     /// `(<package>, <stem>)` → path, for every integration target cargo auto-discovers.
     targets: BTreeMap<(String, String), String>,
-    /// `(<package>, <stem>)` → the `#[test]` functions inside that integration target.
+    /// `(<package>, <stem>)` → the `#[test]` functions inside that integration target, a test
+    /// in one of its file modules spelled `<module>::<fn>` as libtest runs it.
     target_tests: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `(<package>, <stem>)` → module name → file, for each file module the target's root
+    /// declares (`#[path = "admit/k_like.rs"] mod k_like;`). It is what the `#[ignore]` join reads
+    /// to find the file a `<module>::<fn>` citation's attribute would sit in.
+    target_modules: BTreeMap<(String, String), BTreeMap<String, String>>,
     /// `<package>` → `(module path prefix, function)` for every lib unit test.
     lib_tests: BTreeMap<String, BTreeSet<(String, String)>>,
     /// member directory → the package name its manifest **declares**. Read, never inferred
@@ -1326,13 +1498,50 @@ fn derive(root: &Path) -> Derivation {
             ));
         }
     }
+    // A target root's FILE modules compile into the same test binary, and libtest names their
+    // tests `<module>::<fn>`. Resolved by rustc's rule for a crate root: relative to the root
+    // file's directory, through `#[path]` when present, else `<name>.rs` or `<name>/mod.rs`.
+    // Before this, the sixteen `#[path]` children of `crates/fln-checker/tests/admit.rs` were
+    // invisible, and seven terminal rows citing `admit::<module>::<fn>` were reported unbound
+    // for naming functions `cargo test --test admit -- --exact` runs. A declaration this cannot
+    // resolve (a `..` path, a missing file) stays unindexed, so it fails loud, never silent.
+    let mut target_modules: BTreeMap<(String, String), BTreeMap<String, String>> = BTreeMap::new();
+    for (key, path) in &targets {
+        let Some((directory, _)) = path.rsplit_once('/') else {
+            continue;
+        };
+        for module in file_module_declarations(&surfaces[path]) {
+            let candidates = match &module.path {
+                Some(relative) if relative.split('/').any(|part| part == "..") => Vec::new(),
+                Some(relative) => vec![format!("{directory}/{relative}")],
+                None => vec![
+                    format!("{directory}/{}.rs", module.name),
+                    format!("{directory}/{}/mod.rs", module.name),
+                ],
+            };
+            if let Some(file) = candidates
+                .into_iter()
+                .find(|candidate| surfaces.contains_key(candidate))
+            {
+                target_modules
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(module.name, file);
+            }
+        }
+    }
     let target_tests: BTreeMap<(String, String), BTreeSet<String>> = targets
         .iter()
         .map(|(key, path)| {
-            (
-                key.clone(),
-                test_functions(&surfaces[path]).into_iter().collect(),
-            )
+            let mut names: BTreeSet<String> = test_functions(&surfaces[path]).into_iter().collect();
+            for (module, file) in target_modules.get(key).into_iter().flatten() {
+                names.extend(
+                    test_functions(&surfaces[file])
+                        .into_iter()
+                        .map(|function| format!("{module}::{function}")),
+                );
+            }
+            (key.clone(), names)
         })
         .collect();
     let mut by_stem: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1550,6 +1759,7 @@ fn derive(root: &Path) -> Derivation {
         cfg_gated_modules,
         targets,
         target_tests,
+        target_modules,
         lib_tests,
         packages,
         granularity_preconditions: preconditions,
@@ -1856,13 +2066,24 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 ));
                 continue;
             };
+            // A `<module>::<fn>` citation into a file module carries its `#[ignore]` in THAT
+            // file, never in the target root, so the join must look there.
+            let (surface, function) = path
+                .split_once("::")
+                .and_then(|(module, function)| {
+                    let modules = d
+                        .target_modules
+                        .get(&(package.to_string(), target.to_string()))?;
+                    Some((modules.get(module)?.clone(), function.to_string()))
+                })
+                .unwrap_or_else(|| (target_path.clone(), path.to_string()));
             if !d.target_tests[&(package.to_string(), target.to_string())].contains(path) {
                 findings.push(format!(
                     "granularity-unbound: terminal row {} cites {artifact:?}, but {target:?} \
                      declares no `#[test] fn {path}`.",
                     row.bead
                 ));
-            } else if d.ignored.contains(&(target_path.clone(), path.to_string())) {
+            } else if d.ignored.contains(&(surface, function)) {
                 findings.push(format!(
                     "granularity-ignored: terminal row {} cites {artifact:?}, and that function \
                      carries `#[ignore]`. Cargo compiles it; libtest never runs it. The row now \
@@ -1922,7 +2143,20 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=9 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=15 rows=13 citations=14 all-rows-declared=true
+    //
+    // `surfaces` rose 13 -> 15 with the declarations of the pin syntax corpus's pinned lane in
+    // crates/fln-syntax/tests/pin_syntax_corpus.rs and its frontier A in
+    // crates/fln-parse/tests/pin_syntax_frontier.rs (2026-10-08). `rows` and `citations` are
+    // unmoved: no terminal row cites either surface.
+    //
+    // `surfaces` rose 12 -> 13 with the declaration of the corpus demand measurement in
+    // crates/fln-olean/tests/ir_demand.rs (2026-10-07). `rows` and `citations` are unmoved:
+    // no terminal row cites that surface.
+    //
+    // `surfaces` rose 11 -> 12 with the declaration of the whole-pin `.ir` differential in
+    // crates/fln-olean/tests/ir.rs (2026-10-07). `rows` and `citations` are unmoved: no
+    // terminal row cites that surface.
     //
     // `surfaces` rose 5 -> 6 with the declaration of `check_olean_continue_resolves_imports_across_roots`
     // (crates/fln-cli/tests/cli_personalities_and_verbs.rs), declared 2026-09-27.
@@ -4283,6 +4517,90 @@ fn granularity_mutant_a_citation_naming_no_such_function_cannot_leave_the_popula
         .push("test:fln-conformance::kernel_replay::no_such_function".to_string());
     let findings = granularity_findings(&d);
     assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+/// A real test in `admit/k_like.rs`, spelled as libtest runs it: `k_like::<fn>`.
+fn a_file_module_test(d: &Derivation) -> String {
+    d.target_tests[&("fln-checker".to_string(), "admit".to_string())]
+        .iter()
+        .find(|name| name.starts_with("k_like::"))
+        .unwrap_or_else(|| fixture_panic!("admit/k_like.rs declares no indexed test"))
+        .clone()
+}
+
+fn unbound_for(findings: &[String], citation: &str) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.starts_with("granularity-unbound") && finding.contains(citation))
+}
+
+/// The control for the file-module admission. The real `admit` target's `#[path]` children
+/// are derived, and a citation at the path libtest runs a child's test under binds.
+#[test]
+fn granularity_control_a_citation_into_a_path_submodule_is_bound() {
+    let mut d = derive(&root());
+    let modules = &d.target_modules[&("fln-checker".to_string(), "admit".to_string())];
+    assert_eq!(
+        modules.get("k_like").map(String::as_str),
+        Some("crates/fln-checker/tests/admit/k_like.rs"),
+        "{modules:?}"
+    );
+    let citation = format!("test:fln-checker::admit::{}", a_file_module_test(&d));
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(
+        !unbound_for(&findings, &citation),
+        "{citation} must resolve: {findings:?}"
+    );
+}
+
+/// The admission names functions, never modules: a citation into a real file module naming a
+/// function that module does not declare stays unbound.
+#[test]
+fn granularity_mutant_a_submodule_citation_naming_no_such_function_is_caught() {
+    let mut d = derive(&root());
+    let citation = "test:fln-checker::admit::k_like::no_such_function".to_string();
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(unbound_for(&findings, &citation), "{findings:?}");
+}
+
+/// The `#[ignore]` on a file module's test sits in the module's own file. A join that still
+/// looked in the target root would let an ignored function bind as a running one.
+#[test]
+fn granularity_mutant_a_submodule_citation_naming_an_ignored_function_is_caught() {
+    let mut d = derive(&root());
+    let function = a_file_module_test(&d);
+    let bare = function
+        .strip_prefix("k_like::")
+        .unwrap_or_else(|| fixture_panic!("{function} is not a k_like test"))
+        .to_string();
+    d.ignored
+        .insert(("crates/fln-checker/tests/admit/k_like.rs".to_string(), bare));
+    let citation = format!("test:fln-checker::admit::{function}");
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("granularity-ignored") && f.contains(&citation)),
+        "{findings:?}"
+    );
+}
+
+/// Without the admission the citation is unbound again, so the control above passes because of
+/// the admission and not because the citation was always resolvable.
+#[test]
+fn granularity_mutant_dropping_the_file_module_admission_unbinds_the_citation_again() {
+    let mut d = derive(&root());
+    let citation = format!("test:fln-checker::admit::{}", a_file_module_test(&d));
+    d.target_modules.clear();
+    for names in d.target_tests.values_mut() {
+        names.retain(|name| !name.contains("::"));
+    }
+    a_coarse_row(&mut d).fine.push(citation.clone());
+    let findings = granularity_findings(&d);
+    assert!(unbound_for(&findings, &citation), "{findings:?}");
 }
 
 /// The control for the nested-workspace admission: `fln-epoch-lab` really is derived, so the

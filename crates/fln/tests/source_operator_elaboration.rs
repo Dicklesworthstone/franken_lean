@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, Environment, KVMap, Name,
-    NatDefinitionFrontendError, OleanCheckLimits, OleanModuleInput, Outcome, SourceCheckError,
-    SourceCheckLimits, SourceFileCheck,
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits,
+    Environment, FlbcExecutionLimits, KVMap, Name, NatDefinitionFrontendError, OleanCheckLimits,
+    OleanModuleInput, Outcome, SourceCheckError, SourceCheckLimits, SourceFileCheck, VmExit,
+    execute_flbc_artifact,
 };
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 use fln_core::level::{Level, LevelView};
@@ -571,6 +572,216 @@ fn operator_trees_elaborate_to_the_pins_terms() {
     });
 }
 
+/// Generated Unit binders have fresh display names. Compare every expression
+/// node, binder mode and de Bruijn index while ignoring only binder names;
+/// unlike definitional equality, this does not normalize away a wrong expansion.
+fn same_operator_term(left: &Expr, right: &Expr) -> bool {
+    let mut pending = vec![(left, right)];
+    while let Some((left, right)) = pending.pop() {
+        match (left.node(), right.node()) {
+            (ExprNode::App { f: lf, a: la }, ExprNode::App { f: rf, a: ra }) => {
+                pending.push((lf, rf));
+                pending.push((la, ra));
+            }
+            (
+                ExprNode::Lam {
+                    binder_type: lt,
+                    body: lb,
+                    binder_info: li,
+                    ..
+                },
+                ExprNode::Lam {
+                    binder_type: rt,
+                    body: rb,
+                    binder_info: ri,
+                    ..
+                },
+            )
+            | (
+                ExprNode::ForallE {
+                    binder_type: lt,
+                    body: lb,
+                    binder_info: li,
+                    ..
+                },
+                ExprNode::ForallE {
+                    binder_type: rt,
+                    body: rb,
+                    binder_info: ri,
+                    ..
+                },
+            ) if li == ri => {
+                pending.push((lt, rt));
+                pending.push((lb, rb));
+            }
+            _ if left == right => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[test]
+fn explicit_operators_resolve_local_functions_and_preserve_action_and_thunk_types() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    // The pin accepts each pair and gives the same elaborated value. Keeping
+    // the expansion beside its source exercises the ordinary elaboration and
+    // both checkers, including capture under the generated Unit lambda.
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "(op : Nat -> Nat -> Nat) (a b : Nat) : Nat",
+            "binop% op a b",
+            "op a b",
+        ),
+        ("(op : Nat -> Nat) (a : Nat) : Nat", "unop% op a", "op a"),
+        (
+            "(op : Nat -> Nat -> Prop) (a b : Nat) : Prop",
+            "binrel% op a b",
+            "op a b",
+        ),
+        (
+            "(op : Nat -> Nat -> Bool) (a b : Nat) : Bool",
+            "binrel_no_prop% op a b",
+            "op a b",
+        ),
+        (
+            "(op : Nat -> Bool -> Bool) (n : Nat) (b : Bool) : Bool",
+            "leftact% op n b",
+            "op n b",
+        ),
+        (
+            "(op : Bool -> Nat -> Bool) (b : Bool) (n : Nat) : Bool",
+            "rightact% op b n",
+            "op b n",
+        ),
+        (
+            "(op : Nat -> (Unit -> Nat) -> Nat) (a b : Nat) : Nat",
+            "binop_lazy% op a (Nat.add a b)",
+            "op a (fun _ : Unit => Nat.add a b)",
+        ),
+        (
+            "(op : Nat -> (Unit -> (Nat -> Nat)) -> (Nat -> Nat)) (a : Nat) : Nat -> Nat",
+            "binop_lazy% op a (fun b : Nat => Nat.add a b)",
+            "op a (fun _ : Unit => fun b : Nat => Nat.add a b)",
+        ),
+        (
+            "(n : Nat) : Nat",
+            "binop% HAdd.hAdd (unop% Nat.succ n) 1",
+            "(Nat.succ n) + 1",
+        ),
+        (
+            "(n : Nat) : Nat",
+            "binop% Nat.add unop% Nat.succ n 2",
+            "Nat.add (Nat.succ n) 2",
+        ),
+    ];
+    on_a_big_stack(move || {
+        let base = import_modules(
+            &lib,
+            &["Init.Prelude", "Init.Coe", "Init.Notation"],
+            "Init.Notation",
+        );
+        let mut source = String::new();
+        for (index, (signature, raw, expanded)) in CASES.iter().enumerate() {
+            source.push_str(&format!(
+                "def raw{index} {signature} := {raw}\ndef expanded{index} {signature} := {expanded}\n"
+            ));
+        }
+        let checked = match check(&base, &source) {
+            Ok(Outcome::Complete(checked)) => checked,
+            other => panic!("explicit operator fixtures must elaborate: {other:?}"),
+        };
+        for index in 0..CASES.len() {
+            let definition = |prefix: &str| {
+                let text = format!("{prefix}{index}");
+                let name = Name::from_components([text.as_str()]);
+                let Some(ConstantInfo::Defn(info)) = checked.engine.environment().find(&name)
+                else {
+                    panic!("missing {name:?}");
+                };
+                info
+            };
+            let actual = definition("raw");
+            let expanded = definition("expanded");
+            assert_eq!(actual.base.type_, expanded.base.type_, "case {index} type");
+            assert!(
+                same_operator_term(&actual.value, &expanded.value),
+                "case {index} term"
+            );
+        }
+        let setup =
+            "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n
+            def skip (a : Nat) (_ : Unit -> Nat) : Nat := a
+            def force (_ : Nat) (k : Unit -> Nat) : Nat := k ()
+            def capture (n : Nat) : Nat := binop_lazy% force 0 (Nat.add n 2)";
+        let runtime = match check(&base, setup) {
+            Ok(Outcome::Complete(checked)) => checked.engine,
+            other => panic!("lazy runtime fixtures must elaborate: {other:?}"),
+        };
+        let runtime_root = runtime.logical_root(&KVMap::new());
+        let mut execution = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        execution.vm.max_steps = 2_000;
+        for body in ["binop_lazy% skip 42 (expensive 10000)", "capture 40"] {
+            let source = format!("def result : Nat := {body}");
+            let result = runtime
+                .execute_source_definition(source.as_bytes(), &KVMap::new(), execution)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                .into_complete()
+                .expect("skipped work and the captured thunk return within the VM budget");
+            let replay = execute_flbc_artifact(
+                &result.flbc_artifact,
+                &KVMap::new(),
+                FlbcExecutionLimits {
+                    vm: execution.vm,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_complete()
+            .expect("the canonical artifact replays within the same VM budget");
+            for exit in [&result.exit, &replay] {
+                let VmExit::Returned(value) = exit else {
+                    panic!("{source} did not return: {exit:?}");
+                };
+                assert_eq!(
+                    fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+                    Some("42")
+                );
+            }
+        }
+        // Force precisely the same expensive operand under the same budget:
+        // only the lazily emitted Unit closure permits the skipped case above.
+        assert!(matches!(
+            runtime.execute_source_definition(
+                b"def forced : Nat := binop_lazy% force 42 (expensive 10000)",
+                &KVMap::new(),
+                execution,
+            ),
+            Ok(Outcome::Inconclusive(_))
+        ));
+        assert_eq!(runtime.logical_root(&KVMap::new()), runtime_root);
+        let root = base.logical_root(&KVMap::new());
+        for invalid in [
+            "def bad : Nat := binop% missingOperator 1 2",
+            "def bad : Nat := binop% Nat.add true 2",
+            "def bad : Nat := binop_lazy% Nat.add 1 2",
+            "def bad (op : Nat -> Bool -> Bool) : Bool := leftact% op true false",
+            "def bad (op : Bool -> Nat -> Bool) : Bool := rightact% op false true",
+            "def bad : Nat := binop% Nat.add 1",
+        ] {
+            assert!(check(&base, invalid).is_err(), "accepted {invalid}");
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+        }
+        assert!(matches!(
+            check(&base, "def recovered : Nat := binop% Nat.add 20 22"),
+            Ok(Outcome::Complete(_))
+        ));
+    });
+}
+
 /// Planted negatives, run through the pin the same way (`prelude`,
 /// `import Init.Notation`, then the declaration). The pin refuses three of them
 /// at instance synthesis (`failed to synthesize instance of type class
@@ -612,7 +823,9 @@ fn refusal(error: &SourceCheckError) -> Option<Refusal> {
     };
     match reason {
         SourceInferenceError::InstanceSynthesisRequired => Some(Refusal::InstanceSynthesis),
-        SourceInferenceError::Unification(_) => Some(Refusal::TypeMismatch),
+        SourceInferenceError::Unification(_) | SourceInferenceError::TypeMismatch { .. } => {
+            Some(Refusal::TypeMismatch)
+        }
         _ => None,
     }
 }
@@ -654,13 +867,21 @@ fn operands_without_an_instance_are_refused_where_the_pin_refuses_them() {
 /// fun (n : Nat) (i : Int) => @LT.lt.{0} Int Int.instLTInt i (@Nat.cast.{0} Int instNatCastInt n)
 /// ```
 ///
-/// The pin's `mkCoe` returns the coercion after `expandCoe` has unfolded the
-/// `@[coe_decl]` chain down to `Nat.cast`. That expansion is not implemented,
-/// so both must be refused with the typed `OperatorCoercion` refusal; neither
-/// may elaborate to the unexpanded `CoeT.coe` term the native search returns.
-const COERCION_FIXTURES: &[&str] = &[
-    "def g01 (n : Nat) (i : Int) : Int := n + i",
-    "def g02 (n : Nat) (i : Int) : Prop := i < n",
+/// The pin's `mkCoe` expands the `@[coe_decl]` chain down to `Nat.cast`.
+/// Preserving that untagged named conversion is observable in the stored
+/// declaration: neither an unexpanded `CoeT.coe` nor an over-unfolded
+/// `Int.ofNat` is the pin's term.
+const COERCION_FIXTURES: &[(&str, &str, &str)] = &[
+    (
+        "def g01 (n : Nat) (i : Int) : Int := n + i",
+        "(n : Nat) → (i : Int) → Int",
+        "fun (n : Nat) (i : Int) => @HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd) (@Nat.cast.{0} Int instNatCastInt n) i",
+    ),
+    (
+        "def g02 (n : Nat) (i : Int) : Prop := i < n",
+        "(n : Nat) → (i : Int) → Prop",
+        "fun (n : Nat) (i : Int) => @LT.lt.{0} Int Int.instLTInt i (@Nat.cast.{0} Int instNatCastInt n)",
+    ),
 ];
 
 /// `Init.Data.Int.Basic` and its import closure, dependency first.
@@ -683,27 +904,130 @@ const INT_CLOSURE: &[&str] = &[
 ];
 
 #[test]
-fn a_coercion_the_pin_inserts_is_refused_typed_rather_than_left_unexpanded() {
+fn mixed_nat_int_operators_elaborate_to_the_pins_expanded_coercions() {
     let Some(lib) = pinned_lib() else {
         eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
         return;
     };
     on_a_big_stack(move || {
         let base = import_modules(&lib, INT_CLOSURE, "Init.Data.Int.Basic");
-        for declaration in COERCION_FIXTURES {
-            // Matched by variant name so this file also builds against a
-            // tree without the variant (the mutant run in the bead record).
-            let refused = match check(&base, declaration) {
-                Err(error @ SourceCheckError::Command { .. }) => {
-                    format!("{error:?}").contains("Elaborate(Inference(OperatorCoercion))")
-                }
-                _ => false,
+        for (declaration, type_text, value_text) in COERCION_FIXTURES {
+            let checked = match check(&base, declaration) {
+                Ok(Outcome::Complete(checked)) => checked,
+                other => panic!("{declaration} must elaborate: {other:?}"),
             };
-            assert!(
-                refused,
-                "{declaration} must be refused with OperatorCoercion: {:?}",
-                check(&base, declaration).map(|_| ())
+            let name = Name::from_components([declaration_name(declaration)]);
+            let Some(ConstantInfo::Defn(info)) = checked.engine.environment().find(&name) else {
+                panic!("expected checked definition {name:?}");
+            };
+            assert_eq!(info.base.type_, PinTerm::parse(type_text), "{declaration}");
+            assert_eq!(
+                info.value,
+                PinTerm::parse(value_text),
+                "{declaration}\nours: {}",
+                render(&info.value, &mut Vec::new())
             );
         }
+    });
+}
+
+/// These source programs use the existing checked coercion library; they do
+/// not extend the seed. The explicit forms keep the conversion definition
+/// opaque to coercion expansion, as `Lean.Meta.expandCoe` requires for a
+/// function without `@[coe_decl]`.
+#[test]
+fn coerced_operator_leaves_preserve_named_conversions_and_checked_results() {
+    on_a_big_stack(|| {
+        let base =
+            Engine::with_coercion_seed(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)))
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let before = base.logical_root(&KVMap::new());
+        let source = r#"
+structure Box where
+  value : Nat
+def toNat (w : Box) : Nat := w.value
+instance boxToNat : Coe Box Nat := Coe.mk toNat
+def coercedLeft (w : Box) (n : Nat) : Nat := w + n
+def explicitLeft (w : Box) (n : Nat) : Nat := toNat w + n
+def coercedRight (w : Box) (n : Nat) : Nat := n + w
+def explicitRight (w : Box) (n : Nat) : Nat := n + toNat w
+def coercedBoth (w : Box) (z : Box) : Nat := w + z
+def explicitBoth (w : Box) (z : Box) : Nat := toNat w + toNat z
+def coercedNested (w : Box) (n : Nat) : Nat := (w + n) * (w + 1)
+def explicitNested (w : Box) (n : Nat) : Nat := (toNat w + n) * (toNat w + 1)
+def coercedRelation (w : Box) (n : Nat) : Prop := w = n
+def explicitRelation (w : Box) (n : Nat) : Prop := toNat w = n
+def coercedPower (w : Box) (n : Nat) : Nat := w ^ n
+def explicitPower (w : Box) (n : Nat) : Nat := toNat w ^ n
+theorem left_value : coercedLeft (Box.mk 3) 4 = 7 := by rfl
+theorem right_value : coercedRight (Box.mk 3) 4 = 7 := by rfl
+theorem both_value : coercedBoth (Box.mk 3) (Box.mk 4) = 7 := by rfl
+theorem nested_value : coercedNested (Box.mk 3) 4 = 28 := by rfl
+theorem relation_value : coercedRelation (Box.mk 3) 3 := by rfl
+theorem power_value : coercedPower (Box.mk 3) 2 = 9 := by rfl
+"#;
+        let checked = match check(&base, source) {
+            Ok(Outcome::Complete(checked)) => checked,
+            other => panic!("coerced operator programs must be admitted: {other:?}"),
+        };
+        assert_eq!(checked.theorems, 6);
+        for suffix in ["Left", "Right", "Both", "Nested", "Relation", "Power"] {
+            let definition = |prefix: &str| {
+                let text = format!("{prefix}{suffix}");
+                let name = Name::from_components([text.as_str()]);
+                let Some(ConstantInfo::Defn(info)) = checked.engine.environment().find(&name)
+                else {
+                    panic!("expected checked definition {name:?}");
+                };
+                info
+            };
+            let actual = definition("coerced");
+            let explicit = definition("explicit");
+            assert_eq!(actual.base.type_, explicit.base.type_, "{suffix} type");
+            assert_eq!(
+                actual.value, explicit.value,
+                "{suffix}: expansion must preserve the named conversion"
+            );
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+
+        let admitted = checked.engine;
+        let before_failure = admitted.logical_root(&KVMap::new());
+        let missing = r#"
+def beforeFailure (w : Box) (n : Nat) : Nat := w + n
+def missingOperator (w : Box) : Nat := w + true
+"#;
+        match check(&admitted, missing) {
+            Err(error) => assert_eq!(
+                refusal(&error),
+                Some(Refusal::InstanceSynthesis),
+                "a coercion to Nat cannot manufacture HAdd Box Bool Nat: {error:?}"
+            ),
+            other => panic!("the missing heterogeneous instance must be refused: {other:?}"),
+        }
+        assert!(
+            check(
+                &admitted,
+                "theorem falseResult : coercedLeft (Box.mk 3) 4 = 8 := by rfl"
+            )
+            .is_err(),
+            "coercion insertion cannot bypass proof checking"
+        );
+        assert_eq!(admitted.logical_root(&KVMap::new()), before_failure);
+        assert!(
+            !admitted
+                .environment()
+                .contains(&Name::from_components(["beforeFailure"]))
+        );
+        let recovery = check(
+            &admitted,
+            "theorem recovery : coercedLeft (Box.mk 3) 4 = 7 := by rfl",
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        assert_eq!(recovery.theorems, 1);
     });
 }

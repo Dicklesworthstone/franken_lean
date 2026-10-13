@@ -4,18 +4,17 @@ structure Package where
 
 theorem successor_injective (a b : Nat) (h : Nat.succ a = Nat.succ b) : a = b := by
   injection h with predecessor
-  exact predecessor
 
 theorem package_types (A B : Type) (a : A) (b : B)
     (h : Package.mk A a = Package.mk B b) : A = B := by
   injection h with types values
-  exact types
 
 theorem package_values (A B : Type) (a : A) (b : B)
-    (h : Package.mk A a = Package.mk B b) : HEq a b := by
+    (h : Package.mk A a = Package.mk B b) : HEq b a := by
   injection h with types values
   subst types
-  exact heq_of_eq values
+  subst values
+  rfl
 
 inductive Chain where
   | nil
@@ -26,6 +25,7 @@ theorem disjoint (h : true = false) : 0 = 1 := by
 
 theorem nested (a b : Nat)
     (h : Chain.cons a Chain.nil = Chain.cons b (Chain.cons 7 Chain.nil)) : 0 = 1 := by
+  injection h with value tail
   contradiction
 
 theorem enormous

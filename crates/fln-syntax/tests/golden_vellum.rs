@@ -62,7 +62,7 @@ use std::process::{Command, Output, Stdio};
 const CORPUS: &str = include_str!("corpus/vellum_goldens.hex");
 const PROVENANCE: &str = include_str!("corpus/VELLUM_GOLDENS_PROVENANCE.md");
 const PRODUCER: &str = "fln-syntax@0.0.0";
-const PRODUCER_COMMIT: &str = "d5ecb96659c5830449c5f000d9d9a4b9cb320dc8";
+const PRODUCER_COMMIT: &str = "cdae0e617a389b89a4219a04b47ae78cb20b6634";
 const SUPERSEDED_PRODUCER_COMMIT: &str = "d64218a954f8447b3f29c4ca230ae5d158d56dc9";
 const LEXER_SCHEMA: &str = "fln.vellum.token-stream/1";
 const TREE_SCHEMA: &str = "fln.vellum.green-tree/1";

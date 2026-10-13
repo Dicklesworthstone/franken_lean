@@ -81,9 +81,9 @@ def empty : Id Nat := do
 theorem emptyValue : empty = 9 := by rfl
 def separate : Id Nat := do
   for x in true do
-    let value <- do
+    let value <- (do
       if true then return (x + 1)
-      return x
+      return x)
     Pure.pure (f := Id) PUnit.unit
   return 7
 theorem separateValue : separate = 7 := by rfl
@@ -337,8 +337,6 @@ class Pure (f : Type u -> Type v) where
   pure : {A : Type u} -> A -> f A
 class Bind (m : Type u -> Type v) where
   bind : {A B : Type u} -> m A -> (A -> m B) -> m B
-inductive PUnit : Type where
-  | unit
 inductive ForInStep (A : Type u) where
   | done (value : A)
   | yield (value : A)

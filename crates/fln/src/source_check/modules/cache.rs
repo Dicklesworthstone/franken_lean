@@ -30,6 +30,8 @@ struct CachedModule {
     stamp: Arc<()>,
     dependencies: Vec<(Name, Arc<()>)>,
     engine: Engine,
+    public_environment: Option<Environment>,
+    public_scope: Option<fln_elab::source::scope::SourceScope>,
     export: Arc<replay::Export>,
     /// Present only after artifact-mode import/extension checks. Checking and
     /// compilation use different header semantics and cannot share cache hits.
@@ -130,6 +132,11 @@ impl SourceModuleSession {
         kind: super::super::inspect::ObservationKind,
     ) -> Result<Outcome<super::super::inspect::SourceInspection>, SourceModuleCheckError> {
         super::super::inspect::module(self, modules, entry, offset, kind, self.limits)
+    }
+
+    /// Header-only editor observations use this session's fixed checking budget.
+    pub(in crate::source_check) fn inspection_kernel_budget(&self) -> Budget {
+        self.limits.source.admission.kernel
     }
 
     /// Check a module closure and encode its own checked declarations as real
@@ -399,6 +406,8 @@ pub(super) fn run_collecting(
     let mut pending_records = Vec::new();
     let mut result_roots: BTreeMap<usize, LogicalRoot> = BTreeMap::new();
     let mut entry_result = None;
+    let mut entry_public_environment = None;
+    let mut entry_public_scope = None;
     for &index in &plan.order {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -459,6 +468,8 @@ pub(super) fn run_collecting(
                     .checked_add(module.source.len())
                     .is_some_and(|n| n <= view.limits.max_source_bytes)
         });
+        let mut public_environment = None;
+        let mut public_scope = None;
         let mut checked = if let Some(cached) = hit {
             meter.work(cached.work)?;
             meter.bytes(cached.bytes)?;
@@ -472,6 +483,8 @@ pub(super) fn run_collecting(
                 retained_bytes += module.source.len();
             }
             reused_modules += 1;
+            public_environment = cached.public_environment.clone();
+            public_scope = cached.public_scope.clone();
             provenance.push(ModuleProvenance {
                 name: module.name.clone(),
                 decision: ModuleDecision::ReusedInSession,
@@ -499,6 +512,7 @@ pub(super) fn run_collecting(
                     .collect();
                 SourceModuleKey::compute(
                     records.persisted.checker,
+                    base.mode(),
                     options,
                     base_logical_root,
                     module.name,
@@ -550,6 +564,24 @@ pub(super) fn run_collecting(
                 };
                 replayed_declarations += export.declarations.len();
             }
+            // Header-only modules and persisted hits still import a grammar
+            // world; neither may bypass its visibility and phase boundary.
+            if plan.headers[index].module_system {
+                grammar::SourceGrammar::for_environment(
+                    imported.environment(),
+                    Some(module.name),
+                    true,
+                )
+                .map_err(|error| SourceModuleCheckError::Source {
+                    module: module.name.clone(),
+                    error: SourceCheckError::Command {
+                        file: 0,
+                        command: 0,
+                        offset: plan.headers[index].body_start.0,
+                        error: Box::new(error),
+                    },
+                })?;
+            }
             let after_steps_work = meter.work;
             let after_steps_bytes = meter.bytes;
             let mut lookup = ModuleRecordLookup::NotConsulted;
@@ -598,6 +630,12 @@ pub(super) fn run_collecting(
             }
             if let Some(hit) = recorded {
                 artifacts.push(Arc::clone(&hit.artifact));
+                let scope = fln_elab::source::scope::SourceScope {
+                    private_module: plan.headers[index]
+                        .module_system
+                        .then(|| module.name.clone()),
+                    ..hit.engine.base_source_scope()
+                };
                 let checked = SourceFileCheck {
                     engine: hit.engine.clone(),
                     files: 1,
@@ -605,7 +643,7 @@ pub(super) fn run_collecting(
                     theorems: hit.theorems,
                     base_logical_root: hit.base_root,
                     result_logical_root: hit.result_root,
-                    scope: fln_elab::source::scope::SourceScope::default(),
+                    scope: scope.clone(),
                 };
                 if cache.is_some() {
                     let stamp = Arc::new(());
@@ -618,6 +656,8 @@ pub(super) fn run_collecting(
                                 stamp,
                                 dependencies: identities,
                                 engine: hit.engine,
+                                public_environment: None,
+                                public_scope: None,
                                 export: Arc::clone(&hit.export),
                                 artifact: Some(Arc::clone(&hit.artifact)),
                                 commands: hit.commands,
@@ -626,7 +666,7 @@ pub(super) fn run_collecting(
                                 result_root: hit.result_root,
                                 work: meter.work - before_work,
                                 bytes: meter.bytes - before_bytes,
-                                scope: fln_elab::source::scope::SourceScope::default(),
+                                scope,
                             }),
                         );
                         retained_bytes += module.source.len();
@@ -650,6 +690,31 @@ pub(super) fn run_collecting(
                 let elaboration_bytes = meter.bytes;
                 let mut declarations = Vec::new();
                 let header = &plan.headers[index];
+                let public_imports = if header.module_system {
+                    match visibility::imports(
+                        base,
+                        contexts,
+                        index,
+                        &plan,
+                        modules,
+                        |dependency| exports[&dependency].as_ref(),
+                        options,
+                        &mut meter,
+                        cancellation,
+                    )? {
+                        Outcome::Complete((engine, replayed)) => {
+                            replayed_declarations += replayed;
+                            Some(engine)
+                        }
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                } else {
+                    None
+                };
+                let mut public = public_imports.map(|engine| {
+                    visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
+                });
                 let source = &module.source[header.body_start.0..];
                 let mut source_limits = limits.source;
                 source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
@@ -662,7 +727,10 @@ pub(super) fn run_collecting(
                         theorems: 0,
                         base_logical_root: root,
                         result_logical_root: root,
-                        scope: fln_elab::source::scope::SourceScope::default(),
+                        scope: fln_elab::source::scope::SourceScope {
+                            private_module: header.module_system.then(|| module.name.clone()),
+                            ..imported.base_source_scope()
+                        },
                     }))
                 } else {
                     imported.check_source_files_recording(
@@ -670,6 +738,9 @@ pub(super) fn run_collecting(
                         options,
                         source_limits,
                         Some(&mut declarations),
+                        header.module_system.then_some(module.name),
+                        Some(module.name),
+                        public.as_mut(),
                     )
                 }
                 .map_err(|mut error| {
@@ -690,13 +761,23 @@ pub(super) fn run_collecting(
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                let export = Arc::new(replay::Export::capture(
-                    module.name,
-                    imported.environment(),
-                    checked.engine.environment(),
-                    declarations,
-                    &mut meter,
-                )?);
+                public_environment = public
+                    .as_ref()
+                    .map(|world| world.engine().environment().clone());
+                public_scope = public.as_ref().map(|world| world.scope().clone());
+                let export = Arc::new(if let Some(public) = public {
+                    let export = public.finish()?;
+                    replayed_declarations += export.declarations.len();
+                    export
+                } else {
+                    replay::Export::capture(
+                        module.name,
+                        imported.environment(),
+                        checked.engine.environment(),
+                        declarations,
+                        &mut meter,
+                    )?
+                });
                 let artifact = if collect_artifacts {
                     export.require_artifact_support(module.name)?;
                     let artifact = Arc::new(artifacts::PendingArtifact::capture(
@@ -722,6 +803,8 @@ pub(super) fn run_collecting(
                                 stamp,
                                 dependencies: identities,
                                 engine: checked.engine.clone(),
+                                public_environment: public_environment.clone(),
+                                public_scope: public_scope.clone(),
                                 export: Arc::clone(&export),
                                 artifact,
                                 commands: checked.commands,
@@ -779,6 +862,8 @@ pub(super) fn run_collecting(
             checked.theorems = theorems;
             checked.base_logical_root = base_logical_root;
             entry_result = Some(checked);
+            entry_public_environment = public_environment;
+            entry_public_scope = public_scope;
         }
     }
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -797,6 +882,8 @@ pub(super) fn run_collecting(
                     .map(|&index| modules[index].name.clone())
                     .collect(),
                 replayed_declarations,
+                public_environment: entry_public_environment,
+                public_scope: entry_public_scope,
             },
             reused_modules,
             elaborated_modules,

@@ -2,10 +2,9 @@ inductive Tree : Nat -> Type where
   | leaf (index : Nat) (value : Nat) : Tree index
   | node (index : Nat) (child : (n : Nat) -> Tree n) : Tree index
 
-def map (delta : Nat) (index : Nat) (tree : Tree index) : Tree index := by
-  induction tree with
-  | leaf k value => exact Tree.leaf k (value + delta)
-  | node k child ih => exact Tree.node k (fun n => ih n)
+def map (delta : Nat) (index : Nat) (tree : Tree index) : Tree index := match tree with
+  | .leaf k value => Tree.leaf k (value + delta)
+  | .node k child => Tree.node k (fun n => map delta n (child n))
 
 def read (index : Nat) (tree : Tree index) : Nat := match tree with
   | .leaf k value => value

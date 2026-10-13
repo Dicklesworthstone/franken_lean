@@ -6,12 +6,30 @@
 //! This module has no declaration-publication authority. Assignment validation
 //! and all-or-nothing publication remain in the parent solver.
 mod k;
+mod nat;
 mod quotient;
+mod string;
 
 use super::*;
 use fln_env::constants::RecursorVal;
 
+struct DeltaCandidate {
+    name: Name,
+    parameters: Vec<Name>,
+    levels: Vec<Level>,
+    value: Expr,
+    arguments: Vec<Expr>,
+    hints: ReducibilityHints,
+    reducible: bool,
+}
+
 enum Continuation {
+    Nat {
+        head: Expr,
+        arguments: Vec<Expr>,
+        operation: nat::NatOperation,
+        values: Vec<fln_core::expr::NatLit>,
+    },
     Quotient {
         head: Expr,
         arguments: Vec<Expr>,
@@ -21,6 +39,12 @@ enum Continuation {
         structure: Name,
         index: u64,
         arguments: Vec<Expr>,
+        expanded_literal: bool,
+    },
+    ClassProjection {
+        head: Expr,
+        arguments: Vec<Expr>,
+        projection: crate::records::projection::ClassProjection,
     },
     Recursor {
         head: Expr,
@@ -28,6 +52,7 @@ enum Continuation {
         arguments: Vec<Expr>,
         prefix: usize,
         major: usize,
+        expanded_literal: bool,
     },
 }
 
@@ -55,6 +80,27 @@ impl Engine<'_> {
         expr: &Expr,
         locals: &LocalContext,
     ) -> Result<Expr, UnificationError> {
+        self.whnf_with_lazy_outer_delta(expr, locals, false)
+    }
+
+    pub(super) fn whnf_for_comparison(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Expr, UnificationError> {
+        self.whnf_with_lazy_outer_delta(
+            expr,
+            locals,
+            self.budget.transparency == UnificationTransparency::Default,
+        )
+    }
+
+    fn whnf_with_lazy_outer_delta(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+        lazy_outer_delta: bool,
+    ) -> Result<Expr, UnificationError> {
         let mut head = expr.clone();
         let mut args = Vec::new();
         let mut continuations = Vec::new();
@@ -71,6 +117,7 @@ impl Engine<'_> {
                             structure: struct_name.clone(),
                             index: *idx,
                             arguments: std::mem::take(&mut args),
+                            expanded_literal: false,
                         });
                         head = expr.clone();
                     }
@@ -100,26 +147,47 @@ impl Engine<'_> {
                         head = self.substitute(body, &argument)?;
                     }
                     ExprNode::Const { name, levels } => {
-                        // The pin's `instances` transparency also unfolds what its
-                        // reducibility status marks `reducible` or `implicitReducible`.
-                        let status_unfolds = self.budget.transparency
-                            == UnificationTransparency::Instances
-                            && crate::reducibility::table(&self.work.env)
-                                .map_err(UnificationError::Reducibility)?
-                                .status(name)
-                                .unfolds_at_instances();
+                        if let Some(operation) = self.nat_operation(&head, &mut args)? {
+                            let operand = args.last().expect("validated Nat arity").clone();
+                            continuations.push(Continuation::Nat {
+                                head,
+                                arguments: std::mem::take(&mut args),
+                                operation,
+                                values: Vec::new(),
+                            });
+                            head = operand;
+                            continue;
+                        }
                         match self.work.env.find(name) {
                             Some(ConstantInfo::Defn(definition))
                                 if definition.safety == DefinitionSafety::Safe
                                     && definition.base.level_params.len() == levels.len()
+                                    && (!lazy_outer_delta || !continuations.is_empty())
                                     && match self.budget.transparency {
                                         UnificationTransparency::None => false,
                                         UnificationTransparency::Abbreviations => {
-                                            definition.hints == ReducibilityHints::Abbrev
+                                            crate::reducibility::table(&self.work.env)
+                                                .map_err(UnificationError::Reducibility)?
+                                                .get(name)
+                                                .map_or(
+                                                    definition.hints == ReducibilityHints::Abbrev,
+                                                    |status| status == crate::reducibility::Reducibility::Reducible,
+                                                )
                                         }
                                         UnificationTransparency::Instances => {
-                                            definition.hints == ReducibilityHints::Abbrev
-                                                || status_unfolds
+                                            crate::reducibility::table(&self.work.env)
+                                                .map_err(UnificationError::Reducibility)?
+                                                .get(name)
+                                                .map_or(
+                                                    definition.hints == ReducibilityHints::Abbrev,
+                                                    crate::reducibility::Reducibility::unfolds_at_instances,
+                                                )
+                                        }
+                                        UnificationTransparency::Default => {
+                                            crate::reducibility::table(&self.work.env)
+                                                .map_err(UnificationError::Reducibility)?
+                                                .status(name)
+                                                != crate::reducibility::Reducibility::Irreducible
                                         }
                                         UnificationTransparency::SafeDefinitions => true,
                                     } =>
@@ -134,6 +202,46 @@ impl Engine<'_> {
                                     &parameters,
                                     levels,
                                 )?;
+                            }
+                            Some(ConstantInfo::Defn(definition))
+                                if self.budget.transparency
+                                    == UnificationTransparency::Instances
+                                    && definition.base.level_params.len() == levels.len() =>
+                            {
+                                // `WHNF.unfoldProjInst?`: the class field may be
+                                // semireducible, but its receiver must project at
+                                // instances transparency. A stuck receiver keeps
+                                // the original named call, not a bare Expr::Proj.
+                                let Some(projection) =
+                                    crate::records::projection::class_projection(
+                                        &self.work.env,
+                                        definition,
+                                        || self.meter.node(),
+                                    )?
+                                else {
+                                    break;
+                                };
+                                if args.len() <= projection.parameters
+                                    || crate::reducibility::table(&self.work.env)
+                                        .map_err(UnificationError::Reducibility)?
+                                        .status(name)
+                                        == crate::reducibility::Reducibility::Irreducible
+                                    || !self
+                                        .projection_registry
+                                        .read(&self.work.env)
+                                        .map_err(UnificationError::InstanceRegistry)?
+                                        .is_class(&projection.structure)
+                                {
+                                    break;
+                                }
+                                let receiver =
+                                    args[args.len() - projection.parameters - 1].clone();
+                                continuations.push(Continuation::ClassProjection {
+                                    head,
+                                    arguments: std::mem::take(&mut args),
+                                    projection,
+                                });
+                                head = receiver;
                             }
                             Some(ConstantInfo::Quot(_)) => {
                                 let Some(major) = self.quotient_major_index(&head, args.len())?
@@ -181,6 +289,7 @@ impl Engine<'_> {
                                     arguments: std::mem::take(&mut args),
                                     prefix,
                                     major,
+                                    expanded_literal: false,
                                 });
                                 head = value;
                             }
@@ -193,6 +302,39 @@ impl Engine<'_> {
             while let Some(continuation) = continuations.pop() {
                 self.meter.tick()?;
                 match continuation {
+                    Continuation::Nat {
+                        head: operation_head,
+                        arguments: mut outer,
+                        operation,
+                        mut values,
+                    } => {
+                        let operand = self.rebuild_application(head, args)?;
+                        let position = outer.len() - values.len() - 1;
+                        outer[position] = operand.clone();
+                        if let Some(value) = self.nat_operand(&operand)? {
+                            values.push(value);
+                            if values.len() < operation.arity() {
+                                head = outer[outer.len() - values.len() - 1].clone();
+                                args = Vec::new();
+                                continuations.push(Continuation::Nat {
+                                    head: operation_head,
+                                    arguments: outer,
+                                    operation,
+                                    values,
+                                });
+                                continue 'reduce;
+                            }
+                            if let Some(value) = self.evaluate_nat(operation, &values)? {
+                                head = value;
+                                args = Vec::new();
+                                continue 'reduce;
+                            }
+                        }
+                        // A nonliteral operand (or the pin's exponent guard)
+                        // blocks this fold. Unwind once, just like blocked iota.
+                        head = operation_head;
+                        args = outer;
+                    }
                     Continuation::Quotient {
                         head: eliminator,
                         arguments: mut outer,
@@ -216,7 +358,21 @@ impl Engine<'_> {
                         structure,
                         index,
                         arguments: outer,
+                        expanded_literal,
                     } => {
+                        if !expanded_literal
+                            && args.is_empty()
+                            && let Some(expanded) = self.string_literal_constructor(&head)?
+                        {
+                            continuations.push(Continuation::Projection {
+                                structure,
+                                index,
+                                arguments: outer,
+                                expanded_literal: true,
+                            });
+                            head = expanded;
+                            continue 'reduce;
+                        }
                         if let Some(field) = crate::records::constructor_field(
                             &self.work.env,
                             &structure,
@@ -232,13 +388,49 @@ impl Engine<'_> {
                         head = Expr::proj(structure, index, head);
                         args = outer;
                     }
+                    Continuation::ClassProjection {
+                        head: projection_head,
+                        arguments: mut outer,
+                        projection,
+                    } => {
+                        if let Some(field) = crate::records::constructor_field(
+                            &self.work.env,
+                            &projection.structure,
+                            projection.index,
+                            &head,
+                            &args,
+                        ) {
+                            outer.truncate(outer.len() - projection.parameters - 1);
+                            head = field;
+                            args = outer;
+                            continue 'reduce;
+                        }
+                        head = projection_head;
+                        args = outer;
+                    }
                     Continuation::Recursor {
                         head: rec_head,
                         recursor,
                         arguments: mut outer,
                         prefix,
                         major,
+                        expanded_literal,
                     } => {
+                        if !expanded_literal
+                            && args.is_empty()
+                            && let Some(expanded) = self.string_literal_constructor(&head)?
+                        {
+                            continuations.push(Continuation::Recursor {
+                                head: rec_head,
+                                recursor,
+                                arguments: outer,
+                                prefix,
+                                major,
+                                expanded_literal: true,
+                            });
+                            head = expanded;
+                            continue 'reduce;
+                        }
                         let reduced =
                             self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?;
                         let reduced = match reduced {
@@ -276,6 +468,127 @@ impl Engine<'_> {
             head = Expr::app(head, argument);
         }
         Ok(head)
+    }
+
+    fn delta_candidate(&mut self, expr: &Expr) -> Result<Option<DeltaCandidate>, UnificationError> {
+        let mut head = expr;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.meter.node()?;
+            arguments.push(a.clone());
+            head = f;
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.work.env.find(name) else {
+            return Ok(None);
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params.len() != levels.len()
+        {
+            return Ok(None);
+        }
+        let status = crate::reducibility::table(&self.work.env)
+            .map_err(UnificationError::Reducibility)?
+            .status(name);
+        if status == crate::reducibility::Reducibility::Irreducible {
+            return Ok(None);
+        }
+        for _ in levels {
+            self.meter.node()?;
+        }
+        Ok(Some(DeltaCandidate {
+            name: name.clone(),
+            parameters: definition.base.level_params.clone(),
+            levels: levels.clone(),
+            value: definition.value.clone(),
+            arguments,
+            hints: definition.hints,
+            reducible: status == crate::reducibility::Reducibility::Reducible,
+        }))
+    }
+
+    fn unfold_delta(&mut self, candidate: DeltaCandidate) -> Result<Expr, UnificationError> {
+        self.scan(&candidate.value)?;
+        let value = crate::universe::parameters::instantiate(
+            || self.meter.node(),
+            || UnificationError::ExpressionScope,
+            &candidate.value,
+            &candidate.parameters,
+            &candidate.levels,
+        )?;
+        self.rebuild_application(value, candidate.arguments)
+    }
+
+    /// The ordinary conversion rung from the pin's `isDefEqDelta` and
+    /// `unfoldDefEq` (Meta/ExprDefEq.lean). Quick metavariable assignments have
+    /// already run. Unfold one permitted side, preferring reducible definitions
+    /// and then greater definitional height for ground terms. Each resulting
+    /// equation returns to the metered worklist; we never force both complete
+    /// normal forms before comparing them. Metavariable argument congruence
+    /// has already had its reversible trial before this rung. The pin's further
+    /// projection and matcher heuristics are not claimed here.
+    pub(super) fn lazy_delta(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<(Expr, Expr)>, UnificationError> {
+        if self.budget.transparency != UnificationTransparency::Default {
+            return Ok(None);
+        }
+        let left_candidate = self.delta_candidate(left)?;
+        let right_candidate = self.delta_candidate(right)?;
+        let (left_candidate, right_candidate) = match (left_candidate, right_candidate) {
+            (None, None) => return Ok(None),
+            (Some(candidate), None) => {
+                return Ok(Some((self.unfold_delta(candidate)?, right.clone())));
+            }
+            (None, Some(candidate)) => {
+                return Ok(Some((left.clone(), self.unfold_delta(candidate)?)));
+            }
+            (Some(left), Some(right)) => (left, right),
+        };
+        let same_name = left_candidate.name == right_candidate.name;
+        let preference = if !same_name && left_candidate.reducible != right_candidate.reducible {
+            if left_candidate.reducible {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        } else if !same_name && !left.has_expr_mvar() && !right.has_expr_mvar() {
+            // Declaration.lean: ReducibilityHints.compare orders abbreviations
+            // first, regular heights in descending order, and opaque hints last.
+            match (left_candidate.hints, right_candidate.hints) {
+                (ReducibilityHints::Abbrev, ReducibilityHints::Abbrev)
+                | (ReducibilityHints::Opaque, ReducibilityHints::Opaque) => {
+                    std::cmp::Ordering::Equal
+                }
+                (ReducibilityHints::Abbrev, _) | (_, ReducibilityHints::Opaque) => {
+                    std::cmp::Ordering::Less
+                }
+                (_, ReducibilityHints::Abbrev) | (ReducibilityHints::Opaque, _) => {
+                    std::cmp::Ordering::Greater
+                }
+                (ReducibilityHints::Regular(left), ReducibilityHints::Regular(right)) => {
+                    right.cmp(&left)
+                }
+            }
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        match preference {
+            std::cmp::Ordering::Less => {
+                Ok(Some((self.unfold_delta(left_candidate)?, right.clone())))
+            }
+            std::cmp::Ordering::Greater => {
+                Ok(Some((left.clone(), self.unfold_delta(right_candidate)?)))
+            }
+            std::cmp::Ordering::Equal => Ok(Some((
+                self.unfold_delta(left_candidate)?,
+                self.unfold_delta(right_candidate)?,
+            ))),
+        }
     }
 
     fn iota(

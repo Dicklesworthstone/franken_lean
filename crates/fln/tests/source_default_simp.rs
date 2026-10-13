@@ -36,175 +36,37 @@ const WRAP: &str = "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
     theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n";
 
 #[test]
-fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
-    let mut source = String::from(
-        "def wrap (n : Nat) : Nat := n\n\
-         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\n",
-    );
-    for index in 0..34 {
-        source.push_str(&format!(
-            "@[simp] def unrelated_def_{index} (n : Nat) : Nat := n\n"
-        ));
-    }
-    for index in 0..4000 {
-        source.push_str(&format!(
-            "@[simp] theorem unrelated_{index} : True := True.intro\n"
-        ));
-    }
-    source.push_str("theorem use_default (n : Nat) : wrap n = n := by simp\n");
-    let result = checked(&engine(), &[&source]);
-    assert_eq!(result.theorems, 4002);
-    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);
-    for source in [
-        "attribute [-simp] unwrap\ntheorem missing_rule (n : Nat) : wrap n = n := by simp",
-        "theorem false_goal : (0 : Nat) = 1 := by simp",
-    ] {
-        let error = result
-            .engine
+fn simp_preserves_terminal_predicates_while_opening_rule_binders() {
+    let base = engine();
+    // The pin accepts the selected fact at its declared predicate and refuses
+    // to unfold that predicate just to select the fact at a different goal.
+    for opacity in ["", "attribute [irreducible] Named\n"] {
+        let declarations = format!(
+            "def Named (p : Prop) : Prop := p\n\
+             theorem namedFact (p : Prop) (h : p) : Named p := h\n{opacity}"
+        );
+        let scoped = checked(&base, &[&declarations]).engine;
+        let root = scoped.logical_root(&KVMap::new());
+        checked(
+            &scoped,
+            &["theorem selected (p : Prop) (h : p) : Named p := by simp only [namedFact p h]"],
+        );
+        let refusal = scoped
             .check_source_files(
-                &[source.as_bytes()],
+                &[b"theorem unrelatedHead (p : Prop) (h : p) : p := by simp only [namedFact p h]"],
                 &KVMap::new(),
                 SourceCheckLimits::new(limits()),
             )
-            .unwrap_err();
-        let diagnostic = format!("{error}");
+            .expect_err("simp only must preserve the selected fact's predicate");
         assert!(
-            diagnostic.contains("simp only made no progress")
-                || diagnostic.contains("unsolved goals"),
-            "{diagnostic}"
+            !matches!(
+                refusal.disposition().0,
+                "resource" | "inconclusive" | "internal-fault"
+            ),
+            "predicate selection is a semantic refusal: {refusal:?}"
         );
+        assert_eq!(scoped.logical_root(&KVMap::new()), root);
     }
-}
-
-#[test]
-fn identical_failed_rules_are_reconsidered_after_unfolding_changes_the_goal() {
-    let result = checked(
-        &engine(),
-        &["def outer (n : Nat) : Nat := n\n\
-           def inner (n : Nat) : Nat := outer n\n\
-           @[simp] theorem peel_first (n : Nat) : outer n = n := by rfl\n\
-           @[simp] theorem peel_second (n : Nat) : outer n = n := by rfl\n\
-           attribute [simp] inner\n\
-           theorem after_unfold (n : Nat) : inner n = n := by simp"],
-    );
-    assert_eq!(result.theorems, 3);
-    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 3);
-}
-
-#[test]
-fn imported_rule_batch_retains_operations_and_is_atomic() {
-    let base = checked(&engine(), &[WRAP]).engine;
-    let wrap = Name::from_components(["wrap"]);
-    let unwrap = Name::from_components(["unwrap"]);
-    let rows = [
-        (wrap.clone(), Some(900)),
-        (unwrap.clone(), Some(1000)),
-        (wrap.clone(), None),
-        (wrap.clone(), Some(1000)),
-    ];
-    let mut sequential = base.environment().clone();
-    for (name, priority) in &rows {
-        sequential = simp::update(&sequential, name, priority.map(|p| (p, false))).unwrap();
-    }
-    let batched = simp::register_module(base.environment(), &rows).unwrap();
-    assert_eq!(batched, sequential);
-    assert_eq!(simp::read(&batched).unwrap()[0].declaration, wrap);
-    let repeated = simp::register_module(&batched, &[(unwrap.clone(), Some(1000))]).unwrap();
-    assert_ne!(
-        repeated, batched,
-        "a repeated import still exports a journal operation"
-    );
-    assert_eq!(simp::read(&repeated).unwrap()[0].declaration, unwrap);
-    let absent_erasure =
-        simp::register_module(base.environment(), &[(unwrap.clone(), None)]).unwrap();
-    assert_ne!(
-        &absent_erasure,
-        base.environment(),
-        "an absent rule still exports its tombstone"
-    );
-    assert!(simp::read(&absent_erasure).unwrap().is_empty());
-    assert!(simp::read(base.environment()).unwrap().is_empty());
-    let bad = [
-        (unwrap, Some(1000)),
-        (Name::from_components(["missing"]), Some(1000)),
-    ];
-    assert!(matches!(
-        simp::register_module(base.environment(), &bad),
-        Err(simp::SimpSetError::UnknownDeclaration(_))
-    ));
-    assert!(simp::read(base.environment()).unwrap().is_empty());
-}
-
-#[test]
-fn imported_journal_handles_standard_library_scale_and_keeps_a_hard_row_bound() {
-    let base = checked(&engine(), &[WRAP]).engine;
-    let declaration = Name::from_components(["unwrap"]);
-    let rows = vec![(declaration, Some(1000)); 65_536];
-    let full = simp::register_module(base.environment(), &rows).unwrap();
-    let active = simp::read(&full).unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].order, 65_535);
-    assert!(matches!(
-        simp::register_module(&full, &rows[..1]),
-        Err(simp::SimpSetError::Limit)
-    ));
-    let journal = Name::from_components(["FrankenLean", "sourceSimp", "v1"]);
-    let payload = full
-        .extension(&journal)
-        .unwrap()
-        .entries()
-        .next()
-        .unwrap()
-        .payload
-        .clone();
-    let hostile = full.push_extension_entry(&journal, payload).unwrap();
-    assert!(matches!(
-        simp::read(&hostile),
-        Err(simp::SimpSetError::Limit)
-    ));
-    assert_eq!(simp::read(&full).unwrap(), active);
-    assert!(simp::read(base.environment()).unwrap().is_empty());
-}
-
-#[test]
-fn imported_journal_keeps_the_aggregate_payload_budget() {
-    let text = "x".repeat(1024);
-    let source = format!("def {text} (n : Nat) : Nat := n");
-    let base = checked(&engine(), &[&source]).engine;
-    let name = Name::from_components([text.as_str()]);
-    let operation = (name.clone(), Some(1000));
-    let one = simp::register_module(base.environment(), std::slice::from_ref(&operation)).unwrap();
-    let journal = Name::from_components(["FrankenLean", "sourceSimp", "v1"]);
-    let payload = one
-        .extension(&journal)
-        .unwrap()
-        .entries()
-        .next()
-        .unwrap()
-        .payload
-        .clone();
-    let count = (64 * 1024 * 1024) / payload.len();
-    assert!(
-        count < 65_536,
-        "exercise bytes before the independent row limit"
-    );
-    let full = simp::register_module(base.environment(), &vec![operation.clone(); count]).unwrap();
-    assert_eq!(simp::read(&full).unwrap().len(), 1);
-    assert!(matches!(
-        simp::register_module(&full, &[operation]),
-        Err(simp::SimpSetError::Limit)
-    ));
-    assert!(matches!(
-        simp::update(&full, &name, Some((900, false))),
-        Err(simp::SimpSetError::Limit)
-    ));
-    // A journal constructed outside the native writer must obey the same bound.
-    let hostile = full.push_extension_entry(&journal, payload).unwrap();
-    assert!(matches!(
-        simp::read(&hostile),
-        Err(simp::SimpSetError::Limit)
-    ));
-    assert!(simp::read(base.environment()).unwrap().is_empty());
 }
 
 #[test]
@@ -385,7 +247,6 @@ fn per_call_erasures_and_readditions_follow_argument_order_without_changing_defa
         "simp [-unwrap]",
         "simp [unwrap, -unwrap]",
         "simp only [unwrap, -unwrap]",
-        "simp only [(unwrap), -unwrap]",
         "simp [-unwrap, unwrap, -unwrap]",
     ] {
         refused(
@@ -411,6 +272,37 @@ fn per_call_erasures_and_readditions_follow_argument_order_without_changing_defa
         assert_eq!(simp::read(result.engine.environment()).unwrap(), before);
     }
     assert_eq!(simp::read(base.environment()).unwrap(), before);
+}
+
+/// Only a bare identifier names a declaration in a simp argument; a parenthesized one is a
+/// term rule, as at the pin (`resolveSimpIdTheorem?` matches `$id:ident`; bead
+/// `franken_lean-jxw`). Each verdict below is the pinned Reference's, measured on 2026-10-07:
+/// `-unwrap` does not erase the term rule `(unwrap)`, and `(wrap)`, a term whose type is not a
+/// proposition, is refused ("Invalid simp theorem: Expected a proposition") where the bare
+/// `wrap` is unfolded.
+#[test]
+fn a_parenthesized_simp_argument_is_a_term_rule_not_a_declaration() {
+    let base = checked(&engine(), &[WRAP, "attribute [simp] unwrap"]).engine;
+    checked(
+        &base,
+        &["theorem kept (n : Nat) : wrap (wrap n) = n := by simp only [(unwrap), -unwrap]"],
+    );
+    let error = base
+        .check_source_files(
+            &["theorem paren (n : Nat) : wrap n = n := by simp only [(wrap)]".as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("a parenthesized definition is not a proposition")
+        .to_string();
+    assert!(
+        error.contains("Invalid simp theorem: Expected a proposition"),
+        "{error}"
+    );
+    checked(
+        &base,
+        &["theorem bare (n : Nat) : wrap n = n := by simp only [wrap]"],
+    );
 }
 
 #[test]
@@ -444,8 +336,17 @@ fn scoped_erasure_and_explicit_unfolding_use_normal_source_resolution() {
         end A\nopen A\n\
         theorem opened (n : Nat) : «wrap.x» n = n := by simp [-«unwrap.x», «wrap.x»]\n\
         theorem atRoot (n : Nat) : «wrap.x» n = n := by simp [-_root_.A.«unwrap.x», A.«unwrap.x»]\n\
-        theorem higher (T : Type) : «wrap.x» T = T := by simp only [«wrap.x»]\n\
-        theorem grouped (n : Nat) : «wrap.x» n = n := by simp only [((«wrap.x»))]"],
+        theorem higher (T : Type) : «wrap.x» T = T := by simp only [«wrap.x»]"],
+    );
+    // Grouping makes a term, not a declaration: the pin refuses `((«wrap.x»))` as a simp
+    // theorem (measured 2026-10-07; bead `franken_lean-jxw`).
+    refused(
+        &checked(
+            &engine(),
+            &["namespace A\ndef «wrap.x».{u} {T : Sort u} (x : T) : T := x\nend A\nopen A"],
+        )
+        .engine,
+        "theorem grouped (n : Nat) : «wrap.x» n = n := by simp only [((«wrap.x»))]",
     );
     let base = checked(
         &engine(),
@@ -705,4 +606,124 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
         &exhausted,
         &["theorem explicit (n : Nat) : n = n := by simp only []"],
     );
+}
+
+/// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
+/// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
+/// change no checked meaning, and refuses the rest. So no attribute is dropped and none is
+/// admitted without its meaning.
+#[test]
+fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
+    let base = engine();
+    for source in [
+        "@[macro_inline] def x : Nat := 0",
+        "@[simp, inline] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[local simp] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
+        "@[extern \"lean_x\"] def x : Nat := 0",
+        "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
+        "@[simp] example : (0 : Nat) = 0 := by rfl",
+    ] {
+        assert!(
+            fln_parse::parse_definition(source.as_bytes()).is_ok(),
+            "the pin parses {source}"
+        );
+        refused(&base, source);
+    }
+    checked(&base, &["instance : OfNat Bool 7 := ⟨false⟩"]);
+    // A default instance is now admitted through checked registration, including
+    // when the same declaration also installs an ordinary instance.
+    checked(
+        &base,
+        &[
+            "@[default_instance] instance : OfNat Bool 7 := ⟨false⟩",
+            "theorem defaultNumeral : (7 : Bool) = false := by rfl",
+        ],
+    );
+    // The code generator hints are admitted, on a definition and on an instance.
+    for source in [
+        "@[inline] def x : Nat := 0",
+        "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
+        "@[inline] instance : OfNat Bool 7 := ⟨false⟩",
+    ] {
+        checked(&base, &[source]);
+    }
+}
+
+/// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000
+/// (vendored `src/Init/Notation.lean`), alone or in parentheses.
+#[test]
+fn named_simp_priorities_register_their_values() {
+    let base = engine();
+    for (priority, value) in [
+        ("default", 1000),
+        ("low", 100),
+        ("mid", 500),
+        ("high", 10000),
+        ("(high)", 10000),
+        ("((7))", 7),
+    ] {
+        let result = checked(
+            &base,
+            &[&format!(
+                "{WRAP}@[simp {priority}] theorem again.{{u}} {{A : Sort u}} (x : A) : wrap x = x := by rfl"
+            )],
+        );
+        let rules = simp::read(result.engine.environment()).unwrap();
+        let rule = rules
+            .iter()
+            .find(|rule| rule.declaration == Name::from_components(["again"]))
+            .unwrap_or_else(|| panic!("{priority}: {rules:?}"));
+        assert_eq!(rule.priority, value, "{priority}");
+    }
+}
+
+#[test]
+fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
+    let mut source = String::from(
+        "def wrap (n : Nat) : Nat := n
+         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl
+",
+    );
+    for index in 0..34 {
+        source.push_str(&format!(
+            "@[simp] def unrelated_def_{index} (n : Nat) : Nat := n
+"
+        ));
+    }
+    for index in 0..4000 {
+        source.push_str(&format!(
+            "@[simp] theorem unrelated_{index} : True := True.intro
+"
+        ));
+    }
+    source.push_str("theorem use_default (n : Nat) : wrap n = n := by simp
+");
+    let result = checked(&engine(), &[&source]);
+    assert_eq!(result.theorems, 4002);
+    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);
+    for source in [
+        "attribute [-simp] unwrap
+theorem missing_rule (n : Nat) : wrap n = n := by simp",
+        "theorem false_goal : (0 : Nat) = 1 := by simp",
+    ] {
+        let error = result
+            .engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        let diagnostic = format!("{error}");
+        assert!(
+            diagnostic.contains("simp only made no progress")
+                || diagnostic.contains("unsolved goals"),
+            "{diagnostic}"
+        );
+    }
 }

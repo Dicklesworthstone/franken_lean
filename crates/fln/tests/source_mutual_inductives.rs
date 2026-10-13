@@ -85,12 +85,15 @@ fn forward_references_generate_both_families_and_reusable_constructors() {
         "def tree : Tree := Tree.node (Forest.cons (Tree.leaf 7) Forest.nil)\ntheorem good : tree = Tree.node (Forest.cons (Tree.leaf 7) Forest.nil) := by rfl",
     );
 }
+// Members spell their shared parameters alike: the pin refuses differing spellings
+// (`mutual_headers_are_refused_where_the_pin_refuses_them`). Both programs, with the
+// uses below, are accepted at the pin (lean v4.32.0, 2026-10-06).
 #[test]
 fn shared_polymorphic_parameters_are_rebound_without_capture() {
     let e = admit(
         &[
             "inductive Tree.{u} (A : Type u) where | leaf (value : A) | node (children : Forest A)",
-            "inductive Forest.{u} (B : Type u) where | nil | cons (head : Tree B) (tail : Forest B)",
+            "inductive Forest.{u} (A : Type u) where | nil | cons (head : Tree A) (tail : Forest A)",
         ],
         &SourceScope::default(),
     );
@@ -100,11 +103,11 @@ fn shared_polymorphic_parameters_are_rebound_without_capture() {
     );
 }
 #[test]
-fn dependent_shared_parameter_telescopes_align_by_identity_not_spelling() {
+fn dependent_shared_parameter_telescopes_align_by_identity() {
     let e = admit(
         &[
             "inductive Tree (A : Type) (P : A -> Type) where | leaf (x : A) (value : P x) | node (children : Forest A P)",
-            "inductive Forest (B : Type) (Q : B -> Type) where | nil | cons (head : Tree B Q) (tail : Forest B Q)",
+            "inductive Forest (A : Type) (P : A -> Type) where | nil | cons (head : Tree A P) (tail : Forest A P)",
         ],
         &SourceScope::default(),
     );
@@ -127,6 +130,141 @@ fn indexed_and_function_recursive_families_reach_both_checkers() {
     ] {
         admit(&source, &SourceScope::default());
     }
+}
+/// The pin promotes a prefix of indices fixed in every member to parameters
+/// (`fixedIndicesToParams` over the block). Measured at the pin (lean v4.32.0, 2026-10-09):
+/// `#print Forest` says `number of parameters: 1`, and the stored types begin
+/// `Forest : (a._@._internal._hyg.0 : Nat) → …` (default), `Forest.rec : {a._@._internal._hyg.0 : Nat} → …`
+/// (implicit) and `Forest.nil : (n : Nat) → …`. A member constructor whose result index is
+/// not its own field (`Tree.zero : Tree 0`) keeps every index an index: `number of
+/// parameters: 0`.
+#[test]
+fn a_block_promotes_the_indices_fixed_in_every_member_as_the_pin_does() {
+    use fln_core::expr::{BinderInfo, ExprNode};
+    use fln_env::constants::ConstantInfo;
+    let arrow = Name::num(Name::from_components(["a", "_@", "_internal", "_hyg"]), 0);
+    let forest = "inductive Forest : Nat -> Type where | nil (n : Nat) : Forest n | cons (n : Nat) (t : Tree n) (xs : Forest n) : Forest n";
+    let e = admit(
+        &[
+            "inductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n",
+            forest,
+        ],
+        &SourceScope::default(),
+    );
+    let first_binder = |constant: &str| {
+        let info = e.environment().find(&n(constant)).unwrap();
+        let ExprNode::ForallE {
+            binder_name,
+            binder_info,
+            ..
+        } = info.constant_val().type_.node()
+        else {
+            panic!("{constant} has no leading binder");
+        };
+        (binder_name.clone(), *binder_info)
+    };
+    for family in ["Tree", "Forest"] {
+        let Some(ConstantInfo::Induct(info)) = e.environment().find(&n(family)) else {
+            panic!("{family}");
+        };
+        assert_eq!((info.num_params, info.num_indices), (1, 0), "{family}");
+        assert_eq!(first_binder(family), (arrow.clone(), BinderInfo::Default));
+        let Some(ConstantInfo::Rec(rec)) = e.environment().find(&n(&format!("{family}.rec")))
+        else {
+            panic!("{family}.rec");
+        };
+        assert_eq!(
+            (
+                rec.num_params,
+                rec.num_indices,
+                rec.num_motives,
+                rec.num_minors
+            ),
+            (1, 0, 2, 4)
+        );
+        assert_eq!(
+            first_binder(&format!("{family}.rec")),
+            (arrow.clone(), BinderInfo::Implicit)
+        );
+    }
+    for (ctor, fields) in [
+        ("Tree.leaf", 1),
+        ("Tree.node", 1),
+        ("Forest.nil", 0),
+        ("Forest.cons", 2),
+    ] {
+        let Some(ConstantInfo::Ctor(info)) = e.environment().find(&n(ctor)) else {
+            panic!("{ctor}");
+        };
+        assert_eq!((info.num_params, info.num_fields), (1, fields), "{ctor}");
+        assert_eq!(first_binder(ctor), (n("n"), BinderInfo::Default), "{ctor}");
+    }
+    let e = admit(
+        &[
+            "inductive Tree : Nat -> Type where | leaf (n : Nat) (x : Nat) : Tree n | node (n : Nat) (xs : Forest n) : Tree n | zero : Tree 0",
+            forest,
+        ],
+        &SourceScope::default(),
+    );
+    for family in ["Tree", "Forest"] {
+        let Some(ConstantInfo::Induct(info)) = e.environment().find(&n(family)) else {
+            panic!("{family}");
+        };
+        assert_eq!((info.num_params, info.num_indices), (0, 1), "{family}");
+    }
+}
+/// An arrow field is named `a._@._internal._hyg.0`, as the pin's `elabArrow` names it, and
+/// its induction hypothesis is `Name.appendAfter`'s `a_ih._@._internal._hyg.0`: the
+/// suffix lands before the macro scopes. The kernel regenerates the recursor and compares
+/// it exactly, so a wrong name is refused (`BlockMismatch`). The pin accepts this block and
+/// prints `@Even.rec : ∀ {motive_1 : (a : Nat) → Even a → Prop} … (∀ (n : Nat) (a : Odd n),
+/// motive_2 n a → motive_1 (n + 1) ⋯) → …`.
+#[test]
+fn arrow_fields_and_their_hypotheses_carry_the_pins_hygienic_names() {
+    use fln_core::expr::ExprNode;
+    let e = admit(
+        &[
+            "inductive Even : Nat -> Prop where | zero : Even 0 | succ (n : Nat) : Odd n -> Even (n + 1)",
+            "inductive Odd : Nat -> Prop where | succ (n : Nat) : Even n -> Odd (n + 1)",
+        ],
+        &SourceScope::default(),
+    );
+    check(
+        &e,
+        "theorem two : Even 2 := Even.succ 1 (Odd.succ 0 Even.zero)",
+    );
+    let hygienic =
+        |base: &str| Name::num(Name::from_components([base, "_@", "_internal", "_hyg"]), 0);
+    // `Even.rec`'s second minor: `(n : Nat) → (a : Odd n) → motive_2 n a → …`.
+    let mut type_ = e
+        .environment()
+        .find(&n("Even.rec"))
+        .unwrap()
+        .constant_val()
+        .type_
+        .clone();
+    let mut binders = Vec::new();
+    while let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        ..
+    } = type_.node()
+    {
+        binders.push((binder_name.clone(), binder_type.clone()));
+        type_ = body.clone();
+    }
+    let minor = &binders[3].1;
+    let mut names = Vec::new();
+    let mut inner = minor.clone();
+    while let ExprNode::ForallE {
+        binder_name, body, ..
+    } = inner.node()
+    {
+        names.push(binder_name.clone());
+        inner = body.clone();
+    }
+    assert_eq!(names, [n("n"), hygienic("a"), hygienic("a_ih")]);
 }
 #[test]
 fn namespaces_three_families_and_empty_members_share_one_block() {
@@ -270,9 +408,147 @@ fn constructor_collisions_and_resource_stops_leave_the_original_engine_reusable(
 
 const MUTUAL_FILE: &str = "mutual
   inductive Tree (A : Type) where | node (value : A) (children : Forest A)
-  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)
+  inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)
 end
 ";
+
+const MUTUAL_PREDICATES: &str = "mutual
+  inductive Even : Nat -> Prop where
+    | zero : Even 0
+    | succ (n : Nat) (h : Odd n) : Even (Nat.succ n)
+  inductive Odd : Nat -> Prop where
+    | succ (n : Nat) (h : Even n) : Odd (Nat.succ n)
+end
+";
+
+#[test]
+fn mutual_predicates_support_constructor_proofs_and_all_recursion_motives() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let source = format!(
+        "{MUTUAL_PREDICATES}
+theorem evenTwo : Even 2 := Even.succ 1 (Odd.succ 0 Even.zero)
+theorem preserve (n : Nat) (h : Even n) : Even n :=
+  @Even.rec (fun n _ => Even n) (fun n _ => Odd n)
+    Even.zero (fun n h ih => Even.succ n ih) (fun n h ih => Odd.succ n ih) n h"
+    );
+    let checked = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_or_else(|error| panic!("mutual predicate source: {error:?}"))
+        .into_complete()
+        .expect("both checkers admit predicates and their proofs");
+    assert_eq!(checked.theorems, 2);
+    for name in ["Even.rec", "Odd.rec"] {
+        let Some(fln_env::constants::ConstantInfo::Rec(rec)) =
+            checked.engine.environment().find(&n(name))
+        else {
+            panic!("missing mutual recursor {name}");
+        };
+        assert!(rec.base.level_params.is_empty());
+        assert_eq!(rec.num_motives, 2);
+        assert!(!rec.k);
+    }
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn mutual_predicate_fields_may_live_in_higher_universes() {
+    check(
+        &engine(),
+        "universe u
+mutual
+  inductive Claim (A : Sort u) : Prop where
+    | datum (x : A)
+    | other (h : Other A)
+  inductive Other (A : Sort u) : Prop where
+    | claim (h : Claim A)
+end
+theorem carry (A : Sort u) (x : A) : Other A := Other.claim (Claim.datum x)
+theorem large : Other (Type 2) := Other.claim (Claim.datum (Type 1))",
+    );
+}
+
+const POSSIBLY_PROP: &str = "universe u
+mutual
+  inductive Reach (A : Sort u) : Sort u where
+    | here (value : A)
+    | next (step : Step A)
+  inductive Step (A : Sort u) : Sort u where
+    | back (reach : Reach A)
+end
+";
+
+#[test]
+fn source_rejects_possibly_zero_result_universes_under_the_pins_default_options() {
+    // The kernel permits these blocks, but the pinned source elaborator's
+    // default bootstrap.inductiveCheckResultingUniverse check refuses them.
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let refused = e
+        .check_source_files(
+            &[POSSIBLY_PROP.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.disposition(),
+        ("elaboration", false, 1),
+        "{refused:?}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+    assert!(!e.environment().contains(&n("Reach")));
+}
+
+#[test]
+fn mutual_predicates_refuse_mixed_sorts_and_large_elimination_atomically() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let mixed = candidate(
+        &e,
+        &[
+            "inductive A : Prop where | mk (b : B)",
+            "inductive B : Type where | mk",
+        ],
+        &SourceScope::default(),
+        RecordBudget::default(),
+    );
+    assert!(matches!(
+        mixed,
+        Err(fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::Inductive(
+                fln_elab::inductive::InductiveError::UnsupportedSort
+            )
+        ))
+    ));
+    let source = format!(
+        "{MUTUAL_PREDICATES}
+def reveal (n : Nat) (h : Even n) : Nat :=
+  @Even.rec (fun _ _ => Nat) (fun _ _ => Nat)
+    0 (fun n h ih => ih) (fun n h ih => ih) n h"
+    );
+    let refused = e
+        .check_source_files(
+            &[b"def beforeMutual := 7", source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.disposition(),
+        ("elaboration", false, 1),
+        "{refused:?}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+    for name in ["beforeMutual", "Even", "reveal"] {
+        assert!(!e.environment().contains(&n(name)));
+    }
+    check(&e, MUTUAL_PREDICATES);
+}
 
 #[test]
 fn source_files_admit_mutual_groups_before_using_their_eliminators() {
@@ -324,7 +600,7 @@ fn groups_preserve_namespace_and_universe_scope_and_single_member_groups_work() 
 universe u
 mutual
   inductive Tree (A : Type u) where | node (value : A) (xs : Forest A)
-  inductive Forest (B : Type u) where | nil | cons (t : Tree B)
+  inductive Forest (A : Type u) where | nil | cons (t : Tree A)
 end
 def tree : Tree Nat := Tree.node 7 (@Forest.nil Nat)
 end Demo
@@ -469,4 +745,113 @@ fn source_module_cache_reuses_and_invalidates_the_whole_mutual_unit() {
         changed.checked.checked.result_logical_root,
         cold.checked.checked.result_logical_root
     );
+}
+
+/// The pin's header checks across a `mutual` block, each refused with its own words.
+/// Every program was run headerless at the pin (lean v4.32.0) on 2026-10-06, and each
+/// wording is its first error, verbatim. The order is the pin's: universe names, then the
+/// parameter count over every member, then each later member's parameters (binder
+/// annotation before name) against the first's.
+const MUTUAL_HEADERS_REFUSED: &[(&str, &str)] = &[
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest (B : Type) where\n  | nil\n  | cons (head : Tree B) (tail : Forest B)\nend\n",
+        "Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) (n : Nat) where\n  | node (children : Forest A n)\ninductive Forest (A : Type) (m : Nat) where\n  | nil\nend\n",
+        "Invalid mutually inductive types: Parameter names `m` and `n` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) [i : Inhabited A] where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) [j : Inhabited A] where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+        "Invalid mutually inductive types: Parameter names `j` and `i` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive X (A : Type) where\n  | x (y : Y A)\ninductive Y (A : Type) where\n  | y (z : Z A)\n  | stop\ninductive Z (C : Type) where\n  | z (x : X C)\nend\n",
+        "Invalid mutually inductive types: Parameter names `C` and `A` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) (P : A -> Type) where | leaf (x : A) (value : P x) | node (children : Forest A P)\ninductive Forest (B : Type) (Q : B -> Type) where | nil | cons (head : Tree B Q) (tail : Forest B Q)\nend\n",
+        "Invalid mutually inductive types: Parameter names `B` and `A` differ but were expected to match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest {A : Type} where\n  | nil\n  | cons (head : Tree A) (tail : @Forest A)\nend\n",
+        "Invalid mutually inductive types: Binder annotations for parameter `A` must match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (children : Forest A)\ninductive Forest {B : Type} where\n  | nil\nend\n",
+        "Invalid mutually inductive types: Binder annotations for parameter `B` must match",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) (n : Nat) where\n  | nil\nend\n",
+        "Invalid mutually inductive types: `Forest` has 2 parameter(s), but the preceding type `Tree` has 1\n\nNote: All inductive types declared in the same `mutual` block must have the same parameters",
+    ),
+    (
+        "mutual\ninductive Tree (A : Type) where\n  | node (children : Forest A)\ninductive Forest (B : Type) (n : Nat) where\n  | nil\nend\n",
+        "Invalid mutually inductive types: `Forest` has 2 parameter(s), but the preceding type `Tree` has 1",
+    ),
+    (
+        "namespace Ns\nmutual\ninductive Tree (A : Type) where\n  | node (children : Forest A)\ninductive Forest (A : Type) (n : Nat) where\n  | nil\nend\nend Ns\n",
+        "Invalid mutually inductive types: `Forest` has 2 parameter(s), but the preceding type `Tree` has 1",
+    ),
+    (
+        "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest.{v} (A : Type v) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+        "Universe parameter mismatch in mutually inductive types: `Forest` has universe parameters\n  `v`\nbut the preceding declaration `Tree` has\n  `u`\n\nNote: All inductive declarations in the same `mutual` block must have the same universe level parameters",
+    ),
+    (
+        "mutual\ninductive Tree.{u, v} (A : Type u) (B : Type v) where\n  | node (value : A) (children : Forest A B)\ninductive Forest.{v, u} (A : Type u) (B : Type v) where\n  | nil\nend\n",
+        "`Forest` has universe parameters\n  `u`, `v`\nbut the preceding declaration `Tree` has\n  `v`, `u`\n",
+    ),
+    (
+        "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type u) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+        "`Forest` has universe parameters\n  \nbut the preceding declaration `Tree` has\n  `u`\n",
+    ),
+    (
+        "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (children : Forest A)\ninductive Forest.{v} (B : Type v) where\n  | nil\nend\n",
+        "`Forest` has universe parameters\n  `v`\nbut the preceding declaration `Tree` has\n  `u`\n",
+    ),
+    (
+        "universe w x\nmutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest.{v} (A : Type v) where\n  | nil\nend\n",
+        "`Forest` has universe parameters\n  `v`, `x`, `w`\nbut the preceding declaration `Tree` has\n  `u`, `x`, `w`\n",
+    ),
+];
+
+/// Accepted at the pin (exit 0, run as above): the controls a too-strict check would
+/// refuse. Anonymous instance binders get generated names on both sides and are exempt
+/// (lean4#4310); index names are not parameters; auto-bound names agree by spelling.
+const MUTUAL_HEADERS_ACCEPTED: &[&str] = &[
+    "mutual\ninductive Tree (A : Type) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree (A : Type) [Inhabited A] where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type) [Inhabited A] where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree.{u} (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest.{u} (A : Type u) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree (A : Type u) where\n  | node (value : A) (children : Forest A)\ninductive Forest (A : Type u) where\n  | nil\n  | cons (head : Tree A) (tail : Forest A)\nend\n",
+    "mutual\ninductive Tree : Nat \u{2192} Type where\n  | node (n : Nat) (children : Forest n) : Tree n\ninductive Forest : (m : Nat) \u{2192} Type where\n  | nil : Forest 0\nend\n",
+];
+
+#[test]
+fn mutual_headers_are_refused_where_the_pin_refuses_them() {
+    for (source, wording) in MUTUAL_HEADERS_REFUSED {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        let error = e
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        let text = error.to_string();
+        assert!(
+            text.contains(wording),
+            "{source}\nmust be refused as the pin refuses it, with\n{wording}\nbut was refused with\n{text}"
+        );
+        let (class, authority, _) = error.disposition();
+        assert_eq!(
+            (class, authority),
+            ("elaboration", false),
+            "{source}: {text}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root, "{source}");
+    }
+    for source in MUTUAL_HEADERS_ACCEPTED {
+        check(&engine(), source);
+    }
 }

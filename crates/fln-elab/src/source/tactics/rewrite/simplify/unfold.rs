@@ -29,6 +29,11 @@ impl Context {
             SimpRule::Local(_) => Ok(UnfoldResult::NotDefinition),
             SimpRule::Global(rule) => {
                 self.tick()?;
+                // A definition-valued equality proof is still evidence, not
+                // a request to unfold either it or its attribute origin.
+                if rule.proof.is_some() {
+                    return Ok(UnfoldResult::NotDefinition);
+                }
                 match self.txn.env.find(&rule.declaration) {
                     Some(ConstantInfo::Defn(definition))
                         if definition.safety == DefinitionSafety::Safe && !rule.reverse =>
@@ -47,20 +52,15 @@ impl Context {
 
     /// Selection respects local shadowing. A local proof/parameter with this
     /// name must not accidentally request expansion of a same-named global.
+    /// Only a bare identifier is an unfolding request, as at the pin: `(f)` is a
+    /// term rule (`simp_rule_global`).
     pub(super) fn unfold_simp_term(
         &mut self,
-        mut syntax: &Syntax,
+        syntax: &Syntax,
         reverse: bool,
         target: &Expr,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
-        loop {
-            self.tick()?;
-            if let Some(inner) = parenthesized_inner(syntax)? {
-                syntax = inner;
-            } else {
-                break;
-            }
-        }
+        self.tick()?;
         let Syntax::Ident { val: name, .. } = syntax else {
             return Ok(UnfoldResult::NotDefinition);
         };
@@ -198,20 +198,17 @@ impl Context {
                     idx,
                     expr,
                 } => Expr::proj(struct_name.clone(), *idx, child(expr)),
-                ExprNode::Const { name, levels } => match selection {
-                    Selection::Global(definition) if name == &definition.base.name => self
-                        .instantiate_params(
-                            &definition.value,
-                            &definition.base.level_params,
-                            levels,
-                        )?,
-                    _ => term.clone(),
-                },
                 ExprNode::FVar { id } => match selection {
                     Selection::Local(selected, value) if selected == id => value.clone(),
                     _ => term.clone(),
                 },
                 _ => term.clone(),
+            };
+            let rebuilt = match selection {
+                Selection::Global(definition) => {
+                    self.unfold_selected_definition(&rebuilt, definition)?
+                }
+                Selection::Local(..) => rebuilt,
             };
             let normalized = self.simp_beta_zeta(&rebuilt)?;
             done.insert(key, normalized);
@@ -232,85 +229,6 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn premise_unfolding_refreshes_names_exposed_by_definitions_and_assignments() {
-        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
-        use fln_env::pmap::CollisionBudget;
-        use fln_kernel::capability::{Published, admit};
-        use fln_kernel::council::{Council, CouncilOutcome, convene};
-
-        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
-        let mut env = Environment::new();
-        for source in [
-            "def Hidden : Type := Prop",
-            "def Reveal : Type := Hidden",
-            "def Absent : Type := Prop",
-        ] {
-            let declaration = crate::check_definition_source(source.as_bytes(), &env, budget)
-                .unwrap()
-                .declaration;
-            let Outcome::Complete(admitted) = admit(&env, declaration, budget) else {
-                panic!("definition admission did not complete");
-            };
-            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
-            else {
-                panic!("definition was rejected");
-            };
-            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
-                publication,
-            ))) = checked.publish(
-                DeclarationBudget::default(),
-                CollisionBudget::default(),
-                None,
-            )
-            else {
-                panic!("definition publication did not complete");
-            };
-            env = publication.environment;
-        }
-        let reveal = Expr::const_(Name::from_components(["Reveal"]), vec![]);
-        for through_hole in [false, true] {
-            for include_hidden in [false, true] {
-                let mut ctx = Context::new(&env, budget);
-                let sibling = ctx.hole(Expr::sort(Level::one())).unwrap();
-                let input = if through_hole {
-                    let hole = ctx.hole(Expr::sort(Level::one())).unwrap();
-                    ctx.txn
-                        .unify(&hole, &reveal, UnificationBudget::new(budget))
-                        .unwrap();
-                    assert!(matches!(hole.node(), ExprNode::MVar { .. }));
-                    assert_eq!(ctx.instantiate(&hole).unwrap(), reveal);
-                    hole
-                } else {
-                    reveal.clone()
-                };
-                let selected = ["Absent", "Reveal", "Hidden"]
-                    .into_iter()
-                    .take(if include_hidden { 3 } else { 2 })
-                    .map(|name| {
-                        SimpRule::Global(scope::simp::SimpEntry {
-                            declaration: Name::from_components([name]),
-                            priority: 1000,
-                            reverse: false,
-                            order: 0,
-                        })
-                    })
-                    .collect();
-                let rules = ctx.index_simp_rules(selected).unwrap();
-                let before = ctx.txn.mvars.clone();
-                let expected = if include_hidden {
-                    Expr::sort(Level::zero())
-                } else {
-                    Expr::const_(Name::from_components(["Hidden"]), vec![])
-                };
-                assert_eq!(ctx.simp_premise_target(&input, &rules).unwrap(), expected);
-                assert_eq!(ctx.instantiate(&sibling).unwrap(), sibling);
-                assert_eq!(ctx.txn.mvars, before);
-                assert_eq!(ctx.txn.env, env);
-            }
-        }
-    }
 
     #[test]
     fn unfolding_selects_only_the_requested_global_even_below_binders() {

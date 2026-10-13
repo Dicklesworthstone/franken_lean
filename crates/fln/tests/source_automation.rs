@@ -473,6 +473,42 @@ fn simp_only_empty_set_uses_kernel_conversion_and_never_proves_false() {
     );
 }
 
+/// Closed arithmetic reads numerals and Nat operators by shape, as the pin's
+/// `evalNat` and Nat simprocs do, and unfolds nothing but reducible definitions.
+/// 5a3ff40e registered the pin's statuses, which made every native instance
+/// `ImplicitReducible`. The closer had reached the literals by unfolding at
+/// abbreviation transparency, so it stopped at `instOfNatNat`, and
+/// `2 + 3 = 5 := by simp only []` was refused. Each program here was checked at
+/// the pinned lean v4.32.0, with these verdicts. (The pin also accepts the
+/// reducible spelling, `abbrev two` or `@[reducible] def two`, with
+/// `two + 3 = 5`. This engine door does not parse either spelling yet, so that
+/// case is not asserted here.)
+#[test]
+fn simp_closed_arithmetic_sees_through_instances_but_not_ordinary_definitions() {
+    let base = engine();
+    for accepted in [
+        "theorem direct : Nat.add 2 3 = 5 := by simp only []",
+        "theorem product : 2 * 3 = 6 := by simp only []",
+        "theorem successor : Nat.succ 4 = 5 := by simp only []",
+        "theorem everywhere : 2 + 3 = 5 := by simp_all only",
+    ] {
+        admit(&base, accepted);
+    }
+    // The pin: "`simp` made no progress". A regular definition is not unfolded.
+    let ordinary = admit(&base, "def two : Nat := 2");
+    for refused in [
+        "theorem opaque : two + 3 = 5 := by simp only []",
+        "theorem wrong : 2 + 3 = 6 := by simp only []",
+    ] {
+        assert!(
+            ordinary
+                .admit_source_declaration(refused.as_bytes(), &KVMap::new(), limits())
+                .is_err(),
+            "{refused} must be refused, as at the pin"
+        );
+    }
+}
+
 #[test]
 fn simp_only_keeps_ordinary_definitions_closed_without_an_explicit_rule() {
     let base = admit(&engine(), "def identity (x : Nat) : Nat := x");

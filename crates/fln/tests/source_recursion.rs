@@ -115,10 +115,45 @@ def indexSum {{A : Type}} (n : Nat) (xs : Vec A n) : Nat := match xs with
   | .cons k x tail => indexSum k tail + n
 theorem ok : indexSum 2 two = 3 := by rfl
 def retain {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with
-  | .nil => xs
-  | .cons k x tail => let used := retain k tail; xs
+  | .nil => Vec.nil
+  | .cons k x tail => let used := retain k tail; Vec.cons k x tail
 theorem retained : retain 2 two = two := by rfl"
     ));
+}
+
+#[test]
+fn structural_retry_cannot_retype_the_original_indexed_major() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    // The pin rejects the outer xs : Vec A n in a branch returning Vec A k.succ.
+    // The valid nil branch allows the self-reference to trigger a structural
+    // retry; rebinding xs before checking the original body used to accept it.
+    for nil in ["Vec.nil", "xs"] {
+        let source = format!(
+            "{VEC}\ndef beforeRetain : Nat := 7\ndef retain {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with\n  | .nil => {nil}\n  | .cons k x tail => let used := retain k tail; xs"
+        );
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &options,
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("ordinary indexed branch typing must survive recursive lowering");
+        assert_eq!(error.disposition(), ("elaboration", false, 1));
+        let fln::SourceCheckError::Command {
+            command, offset, ..
+        } = &error
+        else {
+            panic!("original source command must own its diagnostic: {error:?}");
+        };
+        assert_eq!(*command, 3);
+        assert_eq!(*offset, source.find("def retain").unwrap());
+        assert_eq!(base.logical_root(&options), root);
+        for name in ["Vec", "beforeRetain", "retain"] {
+            assert!(!base.environment().contains(&Name::from_components([name])));
+        }
+    }
 }
 
 #[test]
@@ -337,20 +372,11 @@ fn nondecreasing_and_escaping_calls_are_failure_atomic_even_when_unused() {
     );
 }
 #[test]
-fn recursive_match_under_application_is_a_known_completeness_gap() {
+fn recursive_match_under_application_computes_the_whole_body_at_each_step() {
     // Lean v4.32.0 accepts this and computes loop 3 = 4 (bcvq, comment 3172).
-    // Native lowering still refuses it; this is not a negative parity witness.
-    let base = engine();
-    let snapshot = base.environment().clone();
-    assert!(
-        base.check_source_files(
-            &[b"def loop (n : Nat) : Nat := (match n with | .zero => 0 | .succ k => loop k) + 1"],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits())
-        )
-        .is_err()
+    check(
+        "def loop (n : Nat) : Nat := (match n with | .zero => 0 | .succ k => loop k) + 1\ntheorem loopThree : loop 3 = 4 := rfl",
     );
-    assert_eq!(base.environment(), &snapshot);
 }
 #[test]
 fn recursion_can_change_a_leading_parameter_before_nat() {
@@ -472,11 +498,33 @@ fn different_tree_children_receive_independent_changing_accumulators() {
     );
 }
 
+/// A structural definition unfolds as the pin unfolds it, through its original body
+/// (`_sunfold`): `Tower 1` is `Tower 0 → Tower 0`, so `idTower`'s domain is `Tower 0`, where a
+/// bare numeral has no `OfNat` instance (instance resolution does not unfold `Tower`). The
+/// compiled recursor's `Nat.rec … 0` would reduce to `Nat` even there. The pin refuses each bare
+/// numeral ("failed to synthesize OfNat (Tower 0) 9", 4:26; 12 at 4:35) and accepts the typed
+/// ones (2026-10-10).
 #[test]
 fn recursive_type_computations_supply_source_lambda_domains() {
-    check(
-        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef idTower : Tower 1 := fun n => n\ndef higher : Tower 2 := fun f => f\ntheorem type_ok : idTower 9 = 9 := by rfl\ntheorem higher_ok : higher idTower 12 = 12 := by rfl",
-    );
+    let tower = "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef idTower : Tower 1 := fun n => n\ndef higher : Tower 2 := fun f => f\n";
+    check(&format!(
+        "{tower}theorem type_ok : idTower (9 : Nat) = (9 : Nat) := by rfl\ntheorem higher_ok : higher idTower (12 : Nat) = (12 : Nat) := by rfl"
+    ));
+    let base = engine();
+    for bare in [
+        "theorem type_ok : idTower 9 = 9 := by rfl",
+        "theorem higher_ok : higher idTower 12 = 12 := by rfl",
+    ] {
+        let source = format!("{tower}{bare}");
+        let Err(error) = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        ) else {
+            panic!("accepted a numeral at `Tower 0`: {bare}");
+        };
+        assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    }
 }
 
 #[test]

@@ -1,0 +1,110 @@
+name: Native loop integration
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-loop-integration.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callbacks:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate and publish checked computed callback stages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          repo = 'Dicklesworthstone/franken_lean'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'computed-callbacks'
+          root.mkdir()
+          checkout = pathlib.Path.cwd()
+          os.environ['CARGO_TARGET_DIR'] = str(root / 'target')
+          request = urllib.request.Request('https://api.github.com/repos/' + repo + '/git/blobs/3005f1cbe654a424346d451939758dc102040264', headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          assert data['encoding'] == 'base64'
+          patch = base64.b64decode(data['content'])
+          assert hashlib.sha256(patch).hexdigest() == 'c4a8004527b75ab37434909dd7b31ca09fef6d60f9ea779893e8354d0a6427f3'
+          patch_path = root / 'computed-callbacks.patch'
+          patch_path.write_bytes(patch)
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert len(paths) == len(set(paths)) == 9
+          assert all(path.startswith(('crates/fln/src/runtime/global', 'docs/NATIVE_MULTISTAGE_CALLBACKS.md')) and '..' not in path.split('/') for path in paths)
+          assert '\ndeleted file mode ' not in patch.decode()
+          def out(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def run(args, label, attempt):
+              print('RUN ' + ' '.join(args), flush=True)
+              with (root / (str(attempt) + '-' + label + '.log')).open('w') as log:
+                  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  for line in process.stdout:
+                      print(line, end='', flush=True)
+                      log.write(line)
+                  code = process.wait()
+              (root / (str(attempt) + '-' + label + '.exit')).write_text(str(code) + '\n')
+              if code:
+                  raise subprocess.CalledProcessError(code, args)
+          for attempt in range(1, 4):
+              os.chdir(checkout)
+              run(['git', 'fetch', 'origin', 'main'], 'fetch', attempt)
+              head = out('git', 'rev-parse', 'origin/main')
+              candidate = root / ('candidate-' + str(attempt))
+              run(['git', 'worktree', 'add', '--detach', str(candidate), head], 'worktree', attempt)
+              os.chdir(candidate)
+              assert not out('git', 'status', '--porcelain')
+              run(['git', 'apply', '--check', '--index', str(patch_path)], 'apply-check', attempt)
+              run(['git', 'apply', '--index', str(patch_path)], 'apply', attempt)
+              assert sorted(out('git', 'diff', '--cached', '--name-only').splitlines()) == sorted(paths)
+              run(['rustup', 'show', 'active-toolchain'], 'toolchain', attempt)
+              run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *[p for p in paths if p.endswith('.rs')]], 'format', attempt)
+              run(['git', 'diff', '--cached', '--check'], 'whitespace', attempt)
+              run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'runtime::global::', '--', '--test-threads=2'], 'global', attempt)
+              run(['cargo', 'test', '--locked', '-p', 'fln', '--test', 'runtime_staged_closures', '--test', 'runtime_known_callbacks', '--test', 'runtime_staged_specialization', '--test', 'runtime_captured_stages', '--test', 'runtime_callback_lets', '--test', 'runtime_inductive_callbacks', '--', '--test-threads=2'], 'integration', attempt)
+              run(['cargo', 'clippy', '--locked', '-p', 'fln', '--all-targets', '--', '-D', 'warnings'], 'clippy', attempt)
+              run(['cargo', 'check', '--locked', '--workspace', '--all-targets'], 'workspace', attempt)
+              identities = {path: out('git', 'hash-object', path) for path in paths}
+              for path in paths:
+                  assert out('git', 'rev-parse', ':' + path) == identities[path]
+              message = 'feat(runtime): preserve computed callback stages through recursive consumers\n\nDiscover actual returned lambda interfaces from safe ground factories without replacing their executable operands. Preserve strict factory work, runtime captures, let aliases, flat/staged distinctions and exact recursive callback forwarding. Only completed interfaces enter the private variant cache; budget and unsafe-candidate controls remain fail-closed.\n\nAdd five checked-engine regressions for producer captures, middle callbacks, strict divergent prefixes, bytecode replay and warm-cache budgets. The preimplementation local reproducer fails with FunctionArgumentType Closure(3) versus Closure(2).\n\nFresh pinned validation on this exact parent: complete runtime::global unit group, six runtime integration targets, strict all-target fln Clippy, changed-file formatting and workspace all-target compilation passed. No full-workspace test, arbitrary recursive-group or Reference-parity claim. Direct main, no PR or force push.'
+              run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', message], 'commit', attempt)
+              sha = out('git', 'rev-parse', 'HEAD')
+              (root / (str(attempt) + '-candidate.json')).write_text(json.dumps({'parent': head, 'commit': sha, 'files': identities}, indent=2))
+              result = subprocess.run(['git', 'push', 'origin', 'HEAD:main'])
+              if result.returncode == 0:
+                  remote = out('git', 'ls-remote', 'origin', 'refs/heads/main').split()[0]
+                  run(['git', 'fetch', 'origin', 'main'], 'verify-fetch', attempt)
+                  subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'origin/main'], check=True)
+                  (root / 'published.json').write_text(json.dumps({'commit': sha, 'parent': head, 'remote': remote, 'files': identities, 'force': False}, indent=2))
+                  print('PUBLISHED ' + sha, flush=True)
+                  break
+              run(['git', 'fetch', 'origin', 'main'], 'retry-fetch', attempt)
+              assert out('git', 'rev-parse', 'origin/main') != head, 'publication failed without concurrent main movement'
+          else:
+              raise RuntimeError('main advanced during all three validated attempts')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: computed-callbacks-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/computed-callbacks/*.log
+            ${{ runner.temp }}/computed-callbacks/*.exit
+            ${{ runner.temp }}/computed-callbacks/*.json
+            ${{ runner.temp }}/computed-callbacks/*.patch
+          retention-days: 7
+          if-no-files-found: error

@@ -1,12 +1,18 @@
 //! Checked mutual recursors execute through native peer-closure groups.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Outcome, VmExit};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Mode, Outcome, VmExit,
+};
 
 fn limits() -> EngineExecutionLimits {
     EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
 }
+/// Directly written recursors execute only in the `frontier` mode; the default refuses
+/// them as the pin's code generator does (bead `franken_lean-z8j.1.6.6`).
 fn engine() -> Engine {
-    Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(EngineAdmissionLimits::new(limits().kernel))
         .unwrap()
         .into_complete()
         .unwrap()
@@ -81,7 +87,7 @@ fn nested_group_dependencies_are_discovered_to_a_fixed_point() {
 
 #[test]
 fn ground_parameters_and_three_member_peer_indices_are_not_special_cases() {
-    let data = "mutual\ninductive Tree (A : Type u) where | node (n : A) (xs : Forest A)\ninductive Forest (B : Type u) where | nil | cons (t : Tree B) (xs : Forest B)\nend\n";
+    let data = "mutual\ninductive Tree (A : Type u) where | node (n : A) (xs : Forest A)\ninductive Forest (A : Type u) where | nil | cons (t : Tree A) (xs : Forest A)\nend\n";
     let motives = "(fun (t : Tree Nat) => Nat) (fun (xs : Forest Nat) => Nat)";
     let minors = "(fun (n : Nat) (xs : Forest Nat) (ih : Nat) => n + ih) 0 (fun (t : Tree Nat) (xs : Forest Nat) (ihT : Nat) (ihF : Nat) => ihT + ihF)";
     run(

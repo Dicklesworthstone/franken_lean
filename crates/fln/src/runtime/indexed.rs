@@ -1,13 +1,15 @@
-//! Erase value indices and value parameters from runtime *types*, never from
-//! executable arguments. A supported family has one uniform layout at fixed
-//! type parameters: like the pinned compiler, a constructor object stores only
-//! its fields, so neither an index nor a value parameter selects a layout. Both
-//! checkers see the original declaration and every original application.
+//! Erase supported indices and value parameters from runtime *types*. A
+//! supported family has one uniform layout at fixed type parameters: like the
+//! pinned compiler, a constructor object stores only its fields. Value-index
+//! arguments remain strict computations; Type-index arguments have inert slots
+//! in generated folds. Both checkers see every original application.
 use super::*;
 use fln_core::expr::FVarId;
 use fln_core::level::Level;
 use fln_env::constants::InductiveVal;
 use std::collections::HashMap;
+
+pub(super) mod cache;
 
 /// Stands for an unknown value parameter while a family or constructor
 /// telescope is opened. A free variable selects no reduction, so a type still
@@ -15,6 +17,26 @@ use std::collections::HashMap;
 /// and has no uniform representation. It never reaches executable code.
 pub(super) fn pending_parameter() -> Expr {
     Expr::fvar(FVarId(name("_fln_runtime_value_parameter")))
+}
+
+/// The logical index telescope remains intact for motive checks. Only a
+/// validated Type index has an inert native domain; scalar index domains and
+/// arguments are unchanged. Keeping its slot preserves the checked index
+/// order without making a type expression into an executable value.
+pub(super) fn runtime_index_domain(domain: &Expr) -> Expr {
+    if matches!(domain.node(), ExprNode::Sort { .. }) {
+        proofs::erased_type()
+    } else {
+        domain.clone()
+    }
+}
+
+pub(super) fn runtime_index_argument(domain: &Expr, argument: &Expr) -> Expr {
+    if matches!(domain.node(), ExprNode::Sort { .. }) {
+        proofs::erased_value()
+    } else {
+        argument.clone()
+    }
 }
 
 impl Preparation<'_> {
@@ -96,7 +118,10 @@ impl Preparation<'_> {
     }
 
     /// Replace each value-parameter argument of a data family with the erased
-    /// marker, without inspecting it. Static type arguments are unchanged.
+    /// marker, without inspecting it. Static propositions and predicates use
+    /// the same canonical arguments as function specialization, so a supplied
+    /// motive and its specialized recursor retain exactly the same carrier.
+    /// Other static type arguments keep their actual representation.
     pub(super) fn runtime_parameters(
         &mut self,
         family: &InductiveVal,
@@ -107,15 +132,31 @@ impl Preparation<'_> {
             return Ok(None);
         };
         let erased = self.erased_parameter()?;
+        let pending = pending_parameter();
+        let mut type_ =
+            self.universe_instance(&family.base.type_, &family.base.level_params, levels)?;
         let mut result = Vec::new();
         for (parameter, value) in parameters.iter().zip(values) {
             self.tick()?;
-            reserve(&mut result, self.limits.max_application_args)?;
-            result.push(if value {
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            let parameter = if value {
                 erased.clone()
             } else {
-                parameter.clone()
-            });
+                self.erased_proposition_argument(binder_type)?
+                    .unwrap_or_else(|| parameter.clone())
+            };
+            // A later predicate may depend on earlier static parameters. A
+            // runtime value stays unresolved; it must not fabricate a closed
+            // domain for a genuinely value-dependent type argument.
+            type_ = self.substitution(body, if value { &pending } else { &parameter })?;
+            reserve(&mut result, self.limits.max_application_args)?;
+            result.push(parameter);
         }
         Ok(Some(result))
     }
@@ -142,11 +183,11 @@ impl Preparation<'_> {
         Ok(source)
     }
 
-    /// The indexed profile has independent scalar index domains. Type
-    /// indices and domains depending on earlier indices or on a value
-    /// parameter are not layout evidence. This is deliberately nonrecursive:
-    /// discovering an index type must not recursively start discovery of the
-    /// family whose layout is being built.
+    /// Index domains are independent scalars, or Type sorts for a single
+    /// family. A domain depending on an earlier index or a value parameter is
+    /// not layout evidence. This discovery is deliberately nonrecursive: it
+    /// cannot start discovering the family whose layout is being built. The
+    /// original domains are retained for checked motive comparisons.
     pub(super) fn index_domains(
         &mut self,
         family: &InductiveVal,
@@ -167,12 +208,15 @@ impl Preparation<'_> {
                 return Ok(None);
             };
             let domain = self.normalize_type(binder_type)?;
+            let type_index = family.all.len() == 1
+                && matches!(domain.node(), ExprNode::Sort { level } if level.is_never_zero());
             if domain.has_loose_bvars()
                 || domain.has_fvar()
-                || !matches!(
-                    executable_value_type(&domain, &self.value_types),
-                    Some((ValueType::Nat | ValueType::Bool | ValueType::String, _))
-                )
+                || (!type_index
+                    && !matches!(
+                        executable_value_type(&domain, &self.value_types),
+                        Some((ValueType::Nat | ValueType::Bool | ValueType::String, _))
+                    ))
             {
                 return Ok(None);
             }
@@ -193,6 +237,10 @@ impl Preparation<'_> {
     /// postorder is heap-backed and memoized; erased indices are never traversed
     /// or normalized, so a large index expression cannot expand into a layout.
     pub(super) fn erase_data_indices(&mut self, input: &Expr) -> Result<Expr, IngressError> {
+        cache::erase_data_indices(self, input)
+    }
+
+    fn erase_data_indices_uncached(&mut self, input: &Expr) -> Result<Expr, IngressError> {
         enum Work {
             Enter(Expr),
             Finish(Expr, Expr),
@@ -209,8 +257,9 @@ impl Preparation<'_> {
                     }
                     let mut normal = self.type_head(&source)?;
                     let (head, args) = self.spine(&normal)?;
-                    if let Some(decision) = self.decision_representation(&head, &args)? {
-                        normal = decision;
+                    let decision = self.decision_representation(&head, &args)?;
+                    if let Some(decision) = &decision {
+                        normal = decision.clone();
                     }
                     if let Some(carrier) = self.quotient_carrier(&head, &args)? {
                         // A quotient has its carrier's representation. Reenter
@@ -222,7 +271,10 @@ impl Preparation<'_> {
                         work.push(Work::Enter(carrier));
                         continue;
                     }
-                    if let ExprNode::Const { name, levels } = head.node()
+                    // Keep the checked Decidable representative selected above;
+                    // generic predicate erasure must not replace its carrier.
+                    if decision.is_none()
+                        && let ExprNode::Const { name, levels } = head.node()
                         && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)
                         && args.len()
                             == (family.num_params as usize)
@@ -233,7 +285,7 @@ impl Preparation<'_> {
                             &args[..family.num_params as usize],
                         )?
                     {
-                        // Value parameters and scalar indices are erased before
+                        // Value parameters and supported indices are erased before
                         // their children are visited: neither is traversed or
                         // normalized, so a computed argument never expands here.
                         let erase_indices = family.num_indices != 0

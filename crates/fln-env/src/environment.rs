@@ -18,7 +18,7 @@ use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonHasher, CanonWriter, Canonical, ExprMerkle};
 use fln_hash::domain::{Digest, Domain, hash};
-use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
+use fln_hash::root::LogicalRoot;
 
 use crate::constants::{ConstantInfo, DefinitionSafety, QuotKind, ReducibilityHints};
 use crate::extensions::{
@@ -177,6 +177,22 @@ pub enum DeclarationCommitted {
 /// the twin of `ModuleGraphAdmissionPlan`/`PreparedAdmission` in
 /// [`crate::modules`] on purpose rather than a second invention: one plan shape in the
 /// crate, so a reader who has understood one has understood both.
+/// A declaration with its environment-independent admission facts, from
+/// [`Environment::measure_declaration`]. Only a plan can publish it.
+#[derive(Debug)]
+pub struct MeasuredDeclaration {
+    info: ConstantInfo,
+    provisional_digest: Digest,
+    usage: DeclarationUsage,
+}
+
+impl MeasuredDeclaration {
+    /// The declaration that was measured.
+    pub fn declaration(&self) -> &ConstantInfo {
+        &self.info
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedDeclarationAdmission {
     schema: u16,
@@ -284,7 +300,10 @@ impl PreparedDeclarationAdmission {
         // `CollisionBudget::max_expanded_weight` is now a `u64` limit and the numbers fit by
         // construction (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`). Deleting it
         // is how that bead proves it closed the gap instead of papering it.
-        let digests = env.digests.insert(name.clone(), self.provisional_digest);
+        let digests = env.digests.insert(
+            name.clone(),
+            NamedDigest::new(&name, self.provisional_digest),
+        );
         env.constants
             .try_insert_with_budget(
                 name,
@@ -935,6 +954,24 @@ impl EnvironmentEntry {
     }
 }
 
+/// A constant's content digest with its name's canonical bytes, both computed once when the
+/// constant is inserted. [`Environment::logical_root`] sorts and streams these; building a
+/// map of freshly encoded names on every call was most of its cost.
+#[derive(Debug, Clone, PartialEq)]
+struct NamedDigest {
+    digest: Digest,
+    canonical: Arc<[u8]>,
+}
+
+impl NamedDigest {
+    fn new(name: &Name, digest: Digest) -> Self {
+        NamedDigest {
+            digest,
+            canonical: name.to_canonical_bytes().into(),
+        }
+    }
+}
+
 /// The environment. `Clone` IS `snapshot`: O(1), fully isolated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
@@ -942,7 +979,7 @@ pub struct Environment {
     /// `decl_content_digest` of every constant, computed once when it is inserted.
     /// `logical_root` combines these instead of re-serializing every constant on
     /// every call, which made admitting n declarations O(n^2) in hashing.
-    digests: PMap<Name, Digest>,
+    digests: PMap<Name, NamedDigest>,
     extensions: PMap<Name, Arc<ExtensionState>>,
 }
 
@@ -973,7 +1010,7 @@ impl Environment {
     pub fn entry(&self, name: &Name) -> Option<EnvironmentEntry> {
         Some(EnvironmentEntry {
             info: Arc::clone(self.constants.get(name)?),
-            digest: *self.digests.get(name)?,
+            digest: self.digests.get(name)?.digest,
         })
     }
 
@@ -988,7 +1025,9 @@ impl Environment {
             return Err(EnvError::DuplicateDeclaration { name });
         }
         Ok(Environment {
-            digests: self.digests.insert(name.clone(), entry.digest),
+            digests: self
+                .digests
+                .insert(name.clone(), NamedDigest::new(&name, entry.digest)),
             constants: self.constants.insert(name, entry.info),
             extensions: self.extensions.clone(),
         })
@@ -1112,7 +1151,9 @@ impl Environment {
         }
         let digest = Environment::decl_content_digest(&info);
         Ok(Environment {
-            digests: self.digests.insert(name.clone(), digest),
+            digests: self
+                .digests
+                .insert(name.clone(), NamedDigest::new(&name, digest)),
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
         })
@@ -1167,9 +1208,10 @@ impl Environment {
         // into local ones. There is no arm here that could launder a fault into "this
         // declaration is inadmissible" or report it as a budget stop, because there is no
         // longer anywhere local for either to go.
-        let digests = self
-            .digests
-            .insert(name.clone(), Environment::decl_content_digest(&info));
+        let digests = self.digests.insert(
+            name.clone(),
+            NamedDigest::new(&name, Environment::decl_content_digest(&info)),
+        );
         self.constants
             .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
             .map_complete(|constants| {
@@ -1242,16 +1284,58 @@ impl Environment {
         if self.constants.contains_key(&name) {
             return Outcome::complete(DeclarationPlan::DuplicateName { name });
         }
+        match Environment::measure_declaration(info, budget, cancellation) {
+            Outcome::Complete(content) => self.plan_measured_decl(content, collision_budget),
+            Outcome::Inconclusive(inconclusive) => Outcome::Inconclusive(inconclusive),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        }
+    }
+
+    /// The facts [`Environment::plan_add_decl`] decides a declaration on that do not
+    /// depend on any environment: its provisional content digest and its exact
+    /// preflight usage under `budget`, or the non-answer that preflight reaches.
+    ///
+    /// It reads only `info`, so callers may measure many declarations at once (on
+    /// several threads) and plan each against the environment of its turn with
+    /// [`Environment::plan_measured_decl`]; the plan is the one `plan_add_decl`
+    /// would have made from the same declaration and budget.
+    pub fn measure_declaration(
+        info: ConstantInfo,
+        budget: DeclarationBudget,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<MeasuredDeclaration> {
         // One Merkle walk gives both the byte fact preflight budgets and the digest;
         // they used to be two walks. A refusal drops the digest unpublished.
         let (provisional_digest, canonical_bytes) = Environment::decl_content_digest_and_len(&info);
-        let usage =
-            match preflight_declaration_measured(&info, budget, cancellation, canonical_bytes)
-                .non_answer_for()
-            {
-                Ok(non_answer) => return non_answer,
-                Err(usage) => usage,
-            };
+        match preflight_declaration_measured(&info, budget, cancellation, canonical_bytes)
+            .non_answer_for()
+        {
+            Ok(non_answer) => non_answer,
+            Err(usage) => Outcome::complete(MeasuredDeclaration {
+                info,
+                provisional_digest,
+                usage,
+            }),
+        }
+    }
+
+    /// Plan a measured declaration against this environment: the duplicate-name
+    /// observation and the base binding of [`Environment::plan_add_decl`], with the
+    /// measurement taken from `content` instead of recomputed.
+    pub fn plan_measured_decl(
+        &self,
+        content: MeasuredDeclaration,
+        collision_budget: CollisionBudget,
+    ) -> Outcome<DeclarationPlan> {
+        let MeasuredDeclaration {
+            info,
+            provisional_digest,
+            usage,
+        } = content;
+        let name = info.name().clone();
+        if self.constants.contains_key(&name) {
+            return Outcome::complete(DeclarationPlan::DuplicateName { name });
+        }
         Outcome::complete(DeclarationPlan::Prepared(PreparedDeclarationAdmission {
             schema: DECLARATION_PLAN_SCHEMA,
             info: Arc::new(info),
@@ -1530,16 +1614,32 @@ impl Environment {
 
     /// The logical root of this commit: declarations + extension deltas + options —
     /// and nothing else (wall-clock, paths, and schedule have no way in).
+    ///
+    /// The same root as a [`fln_hash::root::LogicalRootBuilder`] given every declaration and
+    /// extension: both streams sorted by canonical name bytes, which every declaration carries
+    /// from its insertion, so no name is encoded and no map is built here.
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
-        let mut builder = LogicalRootBuilder::new();
-        for (name, digest) in self.digests.iter() {
-            builder.add_decl(name, *digest);
-        }
-        for (name, state) in self.extensions.iter() {
-            builder.add_extension_delta(name, state.content_digest());
-        }
-        builder.set_options(options);
-        builder.finalize()
+        let mut decls: Vec<(&[u8], &Digest)> = self
+            .digests
+            .iter()
+            .map(|(_, named)| (&*named.canonical, &named.digest))
+            .collect();
+        decls.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut extensions: Vec<(Vec<u8>, Digest)> = self
+            .extensions
+            .iter()
+            .map(|(name, state)| (name.to_canonical_bytes(), state.content_digest()))
+            .collect();
+        extensions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        fln_hash::root::sorted_logical_root(
+            decls.len(),
+            decls,
+            extensions.len(),
+            extensions
+                .iter()
+                .map(|(name, digest)| (name.as_slice(), digest)),
+            options,
+        )
     }
 
     /// The operational-metadata root: host facts, paths, timings — everything the
@@ -1562,6 +1662,7 @@ mod tests {
     use fln_core::level::Level;
     use fln_core::options::DataValue;
     use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
+    use fln_hash::root::LogicalRootBuilder;
     use std::collections::HashSet;
 
     fn n(s: &str) -> Name {

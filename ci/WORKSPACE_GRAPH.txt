@@ -71,12 +71,14 @@ edge fln-conformance -> fln-parse  # G0-4 syntax fidelity spike drives real Prat
 edge fln-conformance -> fln-server # diagnostic LSP projection conformance (franken_lean-wlan)
 edge fln-conformance -> fln-syntax # G0-4 syntax fidelity spike binds lexer, trivia, SourceInfo, and tree identity (franken_lean-hly)
 edge fln -> fln-checker            # independent checker veto on embeddable definition publication
+edge fln -> fln-anvil              # native arithmetic provider; source proofs replay through ordinary admission (fln-7kv)
 edge fln -> fln-core               # embeddable typed diagnostic projection (franken_lean-wlan)
 edge fln -> fln-comp               # bounded checked-source to canonical FLBC facade (franken_lean-7kc)
 edge fln -> fln-elab               # bounded checked-source elaboration facade (franken_lean-7kc)
 edge fln -> fln-env                # immutable environment snapshots returned to embedders (franken_lean-7kc)
 edge fln -> fln-hash               # typed pre/post logical roots for embeddable executions (franken_lean-7kc)
 edge fln -> fln-kernel             # kernel admission and publication capability facade (franken_lean-7kc)
+edge fln -> fln-libm               # dev-only: source-level float math tests assert the VM returns the owned numerics plane's exact bits (§6.8, D21)
 edge fln -> fln-olean              # bounded public reader for pinned .olean artifacts
 edge fln -> fln-parse              # bounded source parser facade (franken_lean-7kc)
 edge fln -> fln-rt                 # serialized instance-import integration reaches Marrow objects (52a1fa53, 2026-09-29)
@@ -86,11 +88,14 @@ edge fln -> fln-verdict            # checked bv_decide publication through the e
 edge fln -> fln-vm                 # canonical FLBC execution result facade (franken_lean-7kc)
 edge fln-cli -> fln                # executable multiplexer delegates to the embeddable engine
 edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)
+edge fln-cli -> fln-elab           # dev-only: actual imported metadata for bounded Lake execution diagnostics; not module-closure admission
 edge fln-cli -> fln-hash         # chained check-olean run receipts over the transparency-leaf domain
 edge fln-cli -> fln-lake           # Lake personality package management and build execution (§13.3, §17.1, rank 21 -> 16)
 edge fln-cli -> fln-olean          # checked olean instance metadata activation for source and Lake builds (7e3887f7, 2026-09-28)
+edge fln-cli -> fln-parse          # native Lake command partitioning and file-local syntax state (§13.3, rank 21 -> 8)
 edge fln-cli -> fln-rt             # same activation path reaches Marrow objects (7e3887f7, 2026-09-28)
 edge fln-cli -> fln-server         # serve-lsp verb routes stdio transport through the diagnostic projector (§14, rank 21 -> 17)
+edge fln-cli -> fln-syntax         # retain Lake field tokens and exact source spans for checked Lean elaboration (§13.3, rank 21 -> 7)
 edge fln-server -> fln-core        # LSP diagnostic adapter (franken_lean-wlan)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
 edge fln-bench -> fln-hash         # canonical benchmark evidence records and roots (franken_lean-oy62)
@@ -141,8 +146,11 @@ edge fln-vm -> fln-comp            # interpreter accepts only the compiler-owned
 edge fln-vm -> fln-bignum          # generated Nat intrinsics execute over ABI scalar/mpz values with owned arbitrary precision (§11.4)
 edge fln-vm -> fln-core            # shared FL-INV-07 outcomes plus the extern-dispatch e2e scratch fence (franken_lean-zoe/franken_lean-pw6t)
 edge fln-vm -> fln-hash            # inline-cache namespaces bind canonical FLBC and every semantic execution coordinate (franken_lean-zoe)
+edge fln-vm -> fln-libm            # Float/Float32 unary-math and pow/atan2 extern rows execute on the owned deterministic numerics plane (§6.8, D21)
 edge fln-vm -> fln-rt              # every live FLBC register is an owned Marrow Obj handle (franken_lean-zoe prototype handoff)
 edge fln-anvil -> fln-core         # simp/egraph/grind types reference canonical Name and Expr (§12, rank 14 -> 0)
+edge fln-anvil -> fln-bignum       # arbitrary-precision coefficient arithmetic and certificate checking (fln-7kv)
+edge fln-anvil -> fln-elab         # untrusted arithmetic provider protocol; no upward elaborator dependency (fln-7kv)
 edge fln-anvil -> fln-env          # rewrite indexes consult the environment for transparency and unfolding (§12.1, rank 14 -> 4)
 edge fln-ledger -> fln-core        # content-addressed records reference declaration Name and Mode (§13, rank 15 -> 0)
 edge fln-ledger -> fln-hash        # CAS keys, logical roots, and epoch digests (§13.1, rank 15 -> 1)

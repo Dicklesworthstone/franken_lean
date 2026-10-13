@@ -46,6 +46,15 @@ inside checked wrapper functions, curried callbacks, and overapplications.
 The source seed now wires in the existing ordinary definitions `False.elim` and
 `Ne`; these add no axioms and still pass both admission seats.
 
+**A directly written recursor is the `frontier` lane** (bead `franken_lean-z8j.1.6.6`). The
+pinned Reference refuses to compile a `def`, `instance`, `example` or `#eval` that applies
+`T.rec` to data: "code generator does not support recursor `T.rec` yet, consider using
+'match ... with' and/or structural recursion". The default and `faithful` modes refuse the
+same programs with the same message. FrankenLean lowers `match`, `cases` and structural
+recursion to recursors itself, so this runtime still executes those. Only an engine built
+with `Mode::Frontier` executes a recursor the source names, and its source-run product
+sidecar binds the frontier tag, which a Sound consumer refuses.
+
 ## Boundaries and evidence
 
 This is a bounded native runtime surface, not complete dependent-pattern

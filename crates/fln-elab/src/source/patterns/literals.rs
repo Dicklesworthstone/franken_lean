@@ -8,8 +8,16 @@ use super::*;
 use fln_bignum::nat::BigNat;
 use fln_core::expr::{Literal, NatLit};
 
+/// A Char pattern retains its domain even though Char.ofNat carries a Nat payload.
+#[derive(Clone)]
+enum Value {
+    Nat(NatLit),
+    String(String),
+    Char(char),
+}
+
 pub(super) struct LiteralPattern<'a> {
-    value: Literal,
+    value: Value,
     syntax: Cow<'a, Syntax>,
 }
 
@@ -22,13 +30,10 @@ impl Context {
             return Ok(None);
         };
         let natural = kind == &Name::from_components(["num"]);
-        if !natural && kind != &Name::from_components(["str"]) {
+        let string = kind == &Name::from_components(["str"]);
+        let character = kind == &Name::from_components(["char"]);
+        if !natural && !string && !character {
             return Ok(None);
-        }
-        // The current source String is opaque. Its executable comparison has
-        // no checked definition, so do not invent a kernel conversion rule.
-        if !natural {
-            return Err(invalid());
         }
         let [Syntax::Atom { val, .. }] = args.as_slice() else {
             return Err(invalid());
@@ -37,7 +42,19 @@ impl Context {
         for _ in val.as_bytes() {
             self.tick()?;
         }
-        let value = decode_natural(val)?;
+        let value = if natural {
+            let Literal::Nat(number) = decode_natural(val)? else {
+                return Err(invalid());
+            };
+            Value::Nat(number)
+        } else if string {
+            let Literal::Str(text) = decode_string(val)? else {
+                return Err(invalid());
+            };
+            Value::String(text)
+        } else {
+            Value::Char(super::super::character::decode_character(val)?)
+        };
         Ok(Some(LiteralPattern {
             value,
             syntax: Cow::Borrowed(syntax),
@@ -46,11 +63,11 @@ impl Context {
 
     fn same_pattern_literal(
         &mut self,
-        a: &Literal,
-        b: &Literal,
+        a: &Value,
+        b: &Value,
     ) -> Result<bool, NatDefinitionElabError> {
         match (a, b) {
-            (Literal::Nat(a), Literal::Nat(b)) => {
+            (Value::Nat(a), Value::Nat(b)) => {
                 if a.limbs_le().len() != b.limbs_le().len() {
                     return Ok(false);
                 }
@@ -61,6 +78,22 @@ impl Context {
                     }
                 }
                 Ok(true)
+            }
+            (Value::String(a), Value::String(b)) => {
+                if a.len() != b.len() {
+                    return Ok(false);
+                }
+                for (a, b) in a.bytes().zip(b.bytes()) {
+                    self.tick()?;
+                    if a != b {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Value::Char(a), Value::Char(b)) => {
+                self.tick()?;
+                Ok(a == b)
             }
             _ => Err(invalid()),
         }
@@ -88,7 +121,7 @@ impl Context {
             }
         }
         Ok(LiteralPattern {
-            value: Literal::Nat(NatLit::from_limbs_le(value.limbs_le().to_vec())),
+            value: Value::Nat(NatLit::from_limbs_le(value.limbs_le().to_vec())),
             syntax: Cow::Owned(Syntax::node(
                 Name::from_components(["num"]),
                 vec![atom(&spelling)],
@@ -136,7 +169,7 @@ impl Context {
             }
         }
         if constructors {
-            if !matches!(value, Literal::Nat(_)) {
+            if !matches!(value, Value::Nat(_)) {
                 return Err(invalid());
             }
             let mut expanded = HashMap::new();
@@ -148,7 +181,7 @@ impl Context {
                     continue;
                 }
                 let Pattern::Literal(LiteralPattern {
-                    value: Literal::Nat(number),
+                    value: Value::Nat(number),
                     ..
                 }) = &arena[pattern]
                 else {
@@ -201,19 +234,35 @@ impl Context {
                 Pattern::Constructor(_) => return Err(invalid()),
             }
         }
-        // Nat is an infinite domain. A finite literal-only decision
-        // cannot justify erasing its uncovered branch, even for a closed input.
+        // Nat and String are infinite domains. Char is finite, but this bounded
+        // splitter does not certify exhaustive enumeration of it. Retain the
+        // catchall obligation even when the discriminant is a closed value.
         if miss.is_empty() {
             return Err(invalid());
         }
-        let comparator = Name::from_components(["Nat", "beq"]);
-        let test = Syntax::node(
-            parser_kind(&["Term", "app"]),
-            vec![
-                identifier(comparator),
-                null(vec![identifier(subject.clone()), syntax]),
-            ],
-        );
+        let application = |function, arguments| {
+            Syntax::node(
+                parser_kind(&["Term", "app"]),
+                vec![function, null(arguments)],
+            )
+        };
+        let operands = vec![identifier(subject.clone()), syntax];
+        let test = if matches!(value, Value::Nat(_)) {
+            application(identifier(Name::from_components(["Nat", "beq"])), operands)
+        } else {
+            // CaseValues.caseValue at the pin uses decidable propositional
+            // equality. BEq need not agree with equality, and the synthetic
+            // seed's String.decEq has only an opaque Bool-valued signature.
+            // Neither justifies value-pattern semantics. Ordinary elaboration
+            // must synthesize Decidable (Eq x value) in the admitted environment;
+            // no instance or kernel rule is installed here. The globals cannot
+            // be captured by local or namespace binders.
+            let global = |leaf| identifier(Name::from_components(["_root_", leaf]));
+            application(
+                identifier(Name::from_components(["_root_", "Decidable", "decide"])),
+                vec![application(global("Eq"), operands)],
+            )
+        };
         let mut miss_subjects = vec![subject.clone()];
         miss_subjects.extend(matrix.subjects.iter().cloned());
         Ok(Some((

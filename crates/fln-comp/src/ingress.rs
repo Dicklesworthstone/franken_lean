@@ -40,7 +40,7 @@ use std::fmt;
 mod branch;
 mod constructor_case;
 mod empty_case;
-pub use branch::{BoolCaseBinding, CallableBindings};
+pub use branch::{BoolCaseBinding, CallableBindings, NatCaseBinding};
 pub use constructor_case::ConstructorCaseBinding;
 pub use empty_case::EmptyCaseBinding;
 
@@ -124,6 +124,11 @@ pub enum IngressError {
         resource: IngressResource,
         requested: usize,
     },
+    /// A bounded metadata reader exhausted capacity without an individual
+    /// resource count. Preserve its nonanswer without fabricating counters.
+    MetadataResourceExhausted {
+        kind: &'static str,
+    },
     OpenFreeVariable,
     UnresolvedMetavariable,
     LooseBoundVariables {
@@ -140,7 +145,10 @@ pub enum IngressError {
     UnsupportedNode {
         kind: &'static str,
     },
+    /// A constant no runtime catalog binds. The name is carried so a refusal says which
+    /// constant it is; `name_hash` is its observable `Name.hash`.
     UnknownConstant {
+        name: Name,
         name_hash: u64,
     },
     CheckSystemUniverseArity {
@@ -286,7 +294,10 @@ pub enum IngressError {
         first: usize,
         second: usize,
     },
+    /// No catalog binds this structure's field. `structure` is carried so a refusal says
+    /// which; `name_hash` is its observable `Name.hash`.
     UnknownProjection {
+        structure: Name,
         name_hash: u64,
         field: u64,
     },
@@ -443,6 +454,12 @@ impl fmt::Display for IngressError {
                 "core Expr ingress could not reserve {requested} {}",
                 resource.token()
             ),
+            Self::MetadataResourceExhausted { kind } => {
+                write!(
+                    formatter,
+                    "core Expr ingress metadata resource exhausted: {kind}"
+                )
+            }
             Self::OpenFreeVariable => {
                 formatter.write_str("core Expr ingress requires no free variables")
             }
@@ -473,9 +490,10 @@ impl fmt::Display for IngressError {
                     "core Expr node {kind} is outside the executable subset"
                 )
             }
-            Self::UnknownConstant { name_hash } => write!(
+            Self::UnknownConstant { name, name_hash } => write!(
                 formatter,
-                "core Expr constant with observable name hash {name_hash} is not in the runtime catalogs"
+                "core Expr constant `{}` (observable name hash {name_hash}) is not in the runtime catalogs",
+                name.to_display_string()
             ),
             Self::CheckSystemUniverseArity {
                 name_hash,
@@ -692,9 +710,14 @@ impl fmt::Display for IngressError {
                 formatter,
                 "constructor catalog bindings {first} and {second} duplicate projection structure name hash {name_hash}"
             ),
-            Self::UnknownProjection { name_hash, field } => write!(
+            Self::UnknownProjection {
+                structure,
+                name_hash,
+                field,
+            } => write!(
                 formatter,
-                "structure projection with observable name hash {name_hash} and field {field} is absent"
+                "structure projection `{}` field {field} (observable name hash {name_hash}) is absent",
+                structure.to_display_string()
             ),
             Self::ProjectionOperandType {
                 name_hash,
@@ -926,7 +949,9 @@ impl IngressError {
     /// source-shape refusal. Nested FIR validation is classified the same way.
     pub fn is_resource_exhaustion(&self) -> bool {
         match self {
-            Self::ResourceLimit { .. } | Self::AllocationFailure { .. } => true,
+            Self::ResourceLimit { .. }
+            | Self::AllocationFailure { .. }
+            | Self::MetadataResourceExhausted { .. } => true,
             Self::FirValidation(error) => error.is_resource_exhaustion(),
             _ => false,
         }
@@ -1186,6 +1211,7 @@ struct PreparedFunction<'a> {
 enum PreparedFunctionBody<'a> {
     Expression(&'a Expr),
     BoolCase,
+    NatCase,
     ConstructorCase(Vec<fir::ConstructorId>),
     EmptyCase,
 }
@@ -2505,6 +2531,7 @@ fn prepare_catalog<'a>(
         functions,
         lambdas,
         bool_cases,
+        nat_cases,
         constructor_cases,
         empty_cases,
     } = callables;
@@ -2517,6 +2544,7 @@ fn prepare_catalog<'a>(
     let function_count = functions
         .len()
         .saturating_add(bool_cases.len())
+        .saturating_add(nat_cases.len())
         .saturating_add(constructor_cases.len())
         .saturating_add(empty_cases.len())
         .saturating_add(1);
@@ -2609,10 +2637,19 @@ fn prepare_catalog<'a>(
 
     prepare_lambdas(&mut catalog, lambdas, interfaces, limits)?;
     branch::prepare(&mut catalog, bool_cases, functions.len(), limits)?;
+    branch::prepare_nat(
+        &mut catalog,
+        nat_cases,
+        functions.len().saturating_add(bool_cases.len()),
+        limits,
+    )?;
     constructor_case::prepare(
         &mut catalog,
         constructor_cases,
-        functions.len().saturating_add(bool_cases.len()),
+        functions
+            .len()
+            .saturating_add(bool_cases.len())
+            .saturating_add(nat_cases.len()),
         limits,
     )?;
 
@@ -2622,6 +2659,7 @@ fn prepare_catalog<'a>(
         functions
             .len()
             .saturating_add(bool_cases.len())
+            .saturating_add(nat_cases.len())
             .saturating_add(constructor_cases.len()),
         limits,
     )?;
@@ -2798,7 +2836,10 @@ fn resolve_call<'a>(
             arguments,
         });
     }
-    Err(IngressError::UnknownConstant { name_hash })
+    Err(IngressError::UnknownConstant {
+        name: name.clone(),
+        name_hash,
+    })
 }
 
 fn malformed(phase: &'static str, expected: usize, observed: usize) -> IngressError {
@@ -3970,12 +4011,14 @@ fn lower_body<'a>(
                         idx,
                         expr,
                     } => {
-                        let projection = catalog.resolve_projection(struct_name, *idx).ok_or(
-                            IngressError::UnknownProjection {
-                                name_hash: struct_name.hash(),
-                                field: *idx,
-                            },
-                        )?;
+                        let projection =
+                            catalog
+                                .resolve_projection(struct_name, *idx)
+                                .ok_or_else(|| IngressError::UnknownProjection {
+                                    structure: struct_name.clone(),
+                                    name_hash: struct_name.hash(),
+                                    field: *idx,
+                                })?;
                         work.projection_calls = work.projection_calls.saturating_add(1);
                         try_push(
                             &mut tasks,
@@ -4592,6 +4635,7 @@ const fn default_callable_result_ownership(
             crate::flbc::CallableResultOwnership::Scalar
         }
         fir::ValueType::Nat => crate::flbc::CallableResultOwnership::OwnedOrScalar,
+        fir::ValueType::Abi => crate::flbc::CallableResultOwnership::Erased,
         fir::ValueType::String
         | fir::ValueType::Float
         | fir::ValueType::Float32
@@ -4601,8 +4645,7 @@ const fn default_callable_result_ownership(
         | fir::ValueType::Ref
         | fir::ValueType::Thunk
         | fir::ValueType::Task
-        | fir::ValueType::Closure(_)
-        | fir::ValueType::Abi => crate::flbc::CallableResultOwnership::Owned,
+        | fir::ValueType::Closure(_) => crate::flbc::CallableResultOwnership::Owned,
     }
 }
 
@@ -4677,6 +4720,7 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
             functions,
             lambdas,
             bool_cases: &[],
+            nat_cases: &[],
             constructor_cases: &[],
             empty_cases: &[],
         },
@@ -4831,7 +4875,9 @@ pub fn lower_closed_expr_at_result<'a>(
                     constructor_case::assemble(function, constructors, limits)?,
                     constructors.len().saturating_mul(2).saturating_add(1),
                 ),
-                PreparedFunctionBody::BoolCase => (branch::assemble(function)?, 2),
+                PreparedFunctionBody::BoolCase | PreparedFunctionBody::NatCase => {
+                    (branch::assemble(function)?, 2)
+                }
                 PreparedFunctionBody::EmptyCase => (empty_case::assemble(function, limits)?, 1),
                 PreparedFunctionBody::Expression(_) => unreachable!("handled expression body"),
             };
@@ -5042,9 +5088,20 @@ mod tests {
             resource: fir::ValidationResource::Functions,
             requested: 1,
         });
-        let shape = IngressError::UnknownConstant { name_hash: 0 };
+        let metadata = IngressError::MetadataResourceExhausted {
+            kind: "extern attribute journal capacity",
+        };
+        let shape = IngressError::UnknownConstant {
+            name: Name::anonymous(),
+            name_hash: 0,
+        };
         assert!(direct.is_resource_exhaustion());
         assert!(nested.is_resource_exhaustion());
+        assert!(metadata.is_resource_exhaustion());
+        assert_eq!(
+            metadata.to_string(),
+            "core Expr ingress metadata resource exhausted: extern attribute journal capacity"
+        );
         assert!(!shape.is_resource_exhaustion());
     }
 
@@ -5382,7 +5439,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
@@ -5442,7 +5499,10 @@ mod tests {
                 &Expr::const_(Name::anonymous(), Vec::new()),
                 IngressLimits::default()
             ),
-            Err(IngressError::UnknownConstant { name_hash: 1723 })
+            Err(IngressError::UnknownConstant {
+                name: Name::anonymous(),
+                name_hash: 1723,
+            })
         );
         assert_eq!(
             lower_closed_expr(&Expr::app(nat(0), nat(1)), IngressLimits::default()),
@@ -5511,7 +5571,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "function f0 params=[] ownership=[] result=unit result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:unit = check_system 10:4c616b652e4275696c64\n",
@@ -5681,6 +5741,7 @@ mod tests {
         assert_eq!(
             lower_closed_expr(&projection, IngressLimits::default()),
             Err(IngressError::UnknownProjection {
+                structure: Name::anonymous(),
                 name_hash: Name::anonymous().hash(),
                 field: 0,
             })
@@ -5727,7 +5788,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "intrinsic i1 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
@@ -5866,7 +5927,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "constructor c1 tag=3 fields=[] scalar_bytes=0:\n",
                 "function f0 params=[] ownership=[] result=ctor result_ownership=owned\n",
@@ -5929,8 +5990,18 @@ mod tests {
         let source = Expr::const_(name.clone(), Vec::new());
         assert!(matches!(
             lower_closed_expr(&source, IngressLimits::default()),
-            Err(IngressError::UnknownConstant { name_hash }) if name_hash == name.hash()
+            Err(IngressError::UnknownConstant { name: unknown, name_hash })
+                if name_hash == name.hash() && unknown == name
         ));
+        // The refusal names the constant, so a reader can tell which one is missing.
+        let refused = lower_closed_expr(&source, IngressLimits::default())
+            .expect_err("Bool.true is in no catalog here");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("core Expr constant `Bool.true` ("),
+            "{refused}"
+        );
 
         let binding = scalar_bool_constructor(&["Bool", "true"], true);
         let applied = Expr::app(source.clone(), nat(0));
@@ -6273,7 +6344,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "projection p0 constructor=c0 field=0\n",
                 "projection p1 constructor=c0 field=1\n",
@@ -6347,9 +6418,25 @@ mod tests {
                 IngressLimits::default(),
             ),
             Err(IngressError::UnknownProjection {
+                structure: unknown_name.clone(),
                 name_hash: unknown_name.hash(),
                 field: 0,
             })
+        );
+        assert_eq!(
+            lower_closed_expr_with_catalogs(
+                &Expr::proj(unknown_name.clone(), 0, nat(0)),
+                &[],
+                std::slice::from_ref(&pair),
+                &[],
+                IngressLimits::default(),
+            )
+            .map_err(|error| error.to_string()),
+            Err(
+                "structure projection `User.Missing` field 0 (observable name hash ".to_owned()
+                    + &unknown_name.hash().to_string()
+                    + ") is absent"
+            )
         );
         assert_eq!(
             lower_closed_expr_with_catalogs(
@@ -6360,6 +6447,7 @@ mod tests {
                 IngressLimits::default(),
             ),
             Err(IngressError::UnknownProjection {
+                structure: Name::from_components(["User", "Pair"]),
                 name_hash: projection_name_hash,
                 field: 2,
             })
@@ -6527,7 +6615,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
@@ -6807,7 +6895,7 @@ mod tests {
         );
         assert!(matches!(
             &lowered.functions()[0].code[2],
-            crate::flbc::Instruction::Call {
+            crate::flbc::Instruction::TailCall {
                 function,
                 argument_ownership,
                 ..
@@ -7114,7 +7202,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/17 entry=f0\n",
+                "fir/18 entry=f0\n",
                 "closure_type s0 params=[string] ownership=[borrowed] result=string result_ownership=owned\n",
                 "intrinsic i0 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=string result_ownership=owned\n",
@@ -7142,7 +7230,7 @@ mod tests {
         ));
         assert!(matches!(
             &lowered.functions()[0].code[3],
-            crate::flbc::Instruction::Apply { args, .. } if args.len() == 1
+            crate::flbc::Instruction::TailApply { args, .. } if args.len() == 1
         ));
     }
 
@@ -8161,11 +8249,12 @@ mod tests {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                crate::flbc::Instruction::Apply { args, .. } => Some(args.len()),
+                crate::flbc::Instruction::Apply { args, .. } => Some((false, args.len())),
+                crate::flbc::Instruction::TailApply { args, .. } => Some((true, args.len())),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(partial_widths, [1, 1]);
+        assert_eq!(partial_widths, [(false, 1), (true, 1)]);
 
         std::thread::scope(|scope| {
             let mut joins = Vec::new();
@@ -8239,7 +8328,7 @@ mod tests {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                crate::flbc::Instruction::Apply { args, .. } => Some(args.len()),
+                crate::flbc::Instruction::TailApply { args, .. } => Some(args.len()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -8419,6 +8508,7 @@ mod tests {
                 IngressLimits::default(),
             ),
             Err(IngressError::UnknownConstant {
+                name: unknown_name.clone(),
                 name_hash: unknown_name.hash(),
             })
         );

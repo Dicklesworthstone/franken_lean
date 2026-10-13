@@ -35,17 +35,25 @@ fn refuse(base: &Engine, source: &str) {
 }
 
 #[test]
-fn simpa_normalizes_both_sides_and_completes_with_explicit_or_local_evidence() {
+fn simpa_normalizes_goal_and_using_evidence_and_closes_by_assumption() {
     let base = engine();
+    // Pin-audited 2026-10-06/07 (v4.32.0): bare `simpa` simplifies the goal
+    // and closes with plain `assumption` against the UNSIMPLIFIED
+    // hypotheses — including when simp makes no progress — so `fromShape`
+    // needs evidence already in the simplified shape, while the old `loc`
+    // encoding (evidence `P (f x)`) is the pin's "Tactic `assumption`
+    // failed" (reference_differential.tsv, native_simpa Reference 16).
     check(
         &base,
         r#"
       theorem supplied (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
           (hf : f x = x) (hg : g x = x) (p : P (f x)) : P (g x) := by
         simpa only [hf, hg] using p
-      theorem loc (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
-          (hf : f x = x) (hg : g x = x) (p : P (f x)) : P (g x) := by
-        simpa only [hf, hg]
+      theorem fromShape (P : Nat -> Prop) (g : Nat -> Nat) (x : Nat)
+          (hg : g x = x) (p : P x) : P (g x) := by
+        simpa only [hg]
+      theorem noProgress (P : Prop) (h1 : P) : P := by
+        simpa only []
       theorem wildcard (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
           (hf : f x = x) (hg : g x = x) (p : P (f x)) : P (g x) := by
         simpa only [*] using p
@@ -59,6 +67,14 @@ fn simpa_normalizes_both_sides_and_completes_with_explicit_or_local_evidence() {
         let x := n
         have hx : P x := p
         simpa only [x] using hx
+    "#,
+    );
+    refuse(
+        &base,
+        r#"
+      theorem loc (P : Nat -> Prop) (f g : Nat -> Nat) (x : Nat)
+          (hf : f x = x) (hg : g x = x) (p : P (f x)) : P (g x) := by
+        simpa only [hf, hg]
     "#,
     );
 }

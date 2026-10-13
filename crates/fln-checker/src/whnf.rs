@@ -250,9 +250,17 @@ impl WhnfContext {
     }
 
     /// The memo, while no let-bound local is in scope: only then does reduction
-    /// read nothing a context can change.
+    /// read nothing a context can change. The KR-317 gate's outcomes are kept
+    /// only here.
     fn memo(&self) -> Option<&WhnfMemo> {
         self.free_bindings.is_empty().then_some(&self.memo)
+    }
+
+    /// The memo for weak head normal forms, with the let-bound locals in scope.
+    /// Reduction reads those locals' values, so a remembered result belongs to
+    /// exactly this binding set (see the memo module).
+    fn whnf_memo(&self) -> (&WhnfMemo, &[FreeBinding]) {
+        (&self.memo, &self.free_bindings)
     }
 }
 
@@ -3375,16 +3383,21 @@ impl<'a, 'c> Reducer<'a, 'c> {
             WhnfInput::Borrowed(term) => self.materialize_term(term, root, WhnfPhase::Initial)?,
         };
         self.entry = Some(Arc::clone(&current.arena));
-        let Some(memo) = self.context.source.memo() else {
-            return self.normalize(current);
-        };
+        let (memo, bindings) = self.context.source.whnf_memo();
         let (delta_mode, budget) = (self.delta_mode, self.control.budget);
-        if let Some(remembered) = memo.recall(&current.arena, delta_mode, &budget) {
+        if let Some(remembered) = memo.recall(&current.arena, delta_mode, &budget, bindings) {
             return Ok(remembered);
         }
         let input = Arc::clone(&current.arena);
         let (result, copied) = self.normalize(current)?;
-        memo.remember(input, delta_mode, budget.materialization, &result, copied);
+        memo.remember(
+            input,
+            delta_mode,
+            budget.materialization,
+            bindings,
+            &result,
+            copied,
+        );
         Ok((result, copied))
     }
 

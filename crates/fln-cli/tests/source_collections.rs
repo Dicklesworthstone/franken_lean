@@ -75,8 +75,16 @@ fn false_collection_suffixes_emit_no_partial_success_and_allow_recovery() {
                 output.stdout.is_empty(),
                 "no partial success for the prefix"
             );
+            // A false `by rfl` is refused while elaborating, as at the pin ("Tactic `rfl`
+            // failed: The left-hand side … is not definitionally equal to the right-hand side").
             let text = String::from_utf8(output.stderr).unwrap();
-            assert!(text.contains("\"outcome\":\"kernel-rejection\""), "{text}");
+            for expected in [
+                "\"outcome\":\"elaboration\"",
+                "file 1, command 1, byte 0:",
+                "not definitionally equal",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
             assert!(!text.contains("\"outcome\":\"complete\""), "{text}");
         }
     }

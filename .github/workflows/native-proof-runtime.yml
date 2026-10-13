@@ -4,11 +4,19 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/native-proof-runtime.yml'
+      - 'Cargo.lock'
+      - 'SUITE.lock'
+      - 'rust-toolchain.toml'
       - 'crates/fln/src/**'
       - 'crates/fln/tests/runtime_proof*.rs'
+      - 'crates/fln/tests/runtime_equality_transport.rs'
+      - 'crates/fln/tests/runtime_quotients.rs'
+      - 'crates/fln/tests/runtime_quotient_functions.rs'
+      - 'crates/fln/tests/runtime_imported_prelude.rs'
       - 'crates/fln-cli/src/**'
       - 'crates/fln-cli/tests/source_proof_runtime.rs'
       - 'examples/native_proof*.lean'
+      - 'examples/native_quotient_runtime.lean'
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,10 +33,43 @@ jobs:
         with:
           persist-credentials: false
       - name: Install repository toolchain
+        id: toolchain
         run: |
           channel=$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+      - name: Test equality transport declaration validation
+        run: cargo test --locked -p fln --lib runtime::transport -- --test-threads=1
+      - name: Test equality transports and quotient execution
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked --no-fail-fast -p fln --test runtime_equality_transport --test runtime_quotients --test runtime_quotient_functions -- --test-threads=1
+      - name: Install the pinned Reference for import tests
+        id: reference
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          grep -Fxq 'reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=15bccb750e9d73cd2a40f488bec389504a87896c' SUITE.lock
+          lean_archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 3 --silent --show-error \
+            --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+            --output "$lean_archive" \
+            https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          printf '%s  %s\n' 'fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516' "$lean_archive" | sha256sum --check --strict
+          tar --zstd --no-same-owner -xf "$lean_archive" -C "$RUNNER_TEMP"
+          lean_toolchain="$RUNNER_TEMP/lean-4.32.0-linux"
+          reference_commit=$("$lean_toolchain/bin/lean" --githash)
+          printf 'Pinned Reference commit: %s\n' "$reference_commit"
+          test "$reference_commit" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          for suffix in olean olean.server olean.private; do
+            test -s "$lean_toolchain/lib/lean/Init/Prelude.$suffix"
+          done
+          printf 'FLN_REFERENCE_LIB=%s\n' "$lean_toolchain/lib/lean" >> "$GITHUB_ENV"
+          printf 'FLN_REFERENCE_LEAN=%s\n' "$lean_toolchain/bin/lean" >> "$GITHUB_ENV"
+      - name: Test execution from the required pinned Prelude
+        if: ${{ !cancelled() && steps.reference.outcome == 'success' }}
+        env:
+          FLN_REQUIRE_REFERENCE: '1'
+        run: cargo test --locked --no-fail-fast -p fln --test runtime_imported_prelude -- --nocapture --test-threads=1
       - name: Test checked proof erasure and execution boundaries
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           cargo test --locked -p fln --lib --test runtime_proof_erasure --test runtime_proof_data
           cargo test --locked -p fln-cli --test source_proof_runtime --test source_mutual_data --test source_closure_data

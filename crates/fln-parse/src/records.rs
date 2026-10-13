@@ -1,7 +1,7 @@
 //! Bounded record/class declarations using the ordinary token leaves and types.
 //! No source rewriting or fabricated definitions: field scopes survive as syntax.
 //! Parent clauses retain their original type syntax and optional projection names.
-//! Custom constructors and deriving remain explicit refusals.
+//! Deriving clauses retain their handlers; custom constructors remain refused.
 use super::*;
 use std::ops::Range;
 
@@ -14,11 +14,113 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], index: usize) -> NatDefiniti
 fn symbol(tokens: &[LexedToken], index: usize, text: &str) -> bool {
     matches!(tokens.get(index).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text)
 }
-pub(super) fn modifiers() -> Syntax {
-    Syntax::node(
+
+/// The declaration parser consumes a deriving suffix without discarding its
+/// token leaves. Only a top-level keyword ends the constructor/field telescope.
+pub(super) fn deriving_start(tokens: &[LexedToken], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if let TokenKind::Symbol(symbol) = &token.kind {
+            match crate::canonical_bracket(symbol.as_str()) {
+                "deriving" if depth == 0 => return index,
+                "(" | "{" | ".{" | "[" | "⦃" | "⟨" => depth += 1,
+                ")" | "}" | "]" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    tokens.len()
+}
+
+pub(super) fn deriving_suffix(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    Ok(Syntax::node(
+        parser_kind(&["Command", "optDeriving"]),
+        vec![deriving_clause(leaves, view, tokens, start)?],
+    ))
+}
+
+/// `("deriving " derivingClass,+)?` from `start` to the last token, as its optional node: empty,
+/// or the keyword and the classes (each a name), as `optDeriving` and `optDefDeriving` hold it.
+pub(super) fn deriving_clause(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut suffix = Vec::new();
+    if start < tokens.len() {
+        if !symbol(tokens, start, "deriving") || start + 1 == tokens.len() {
+            return Err(refuse(view, tokens, start));
+        }
+        let mut classes = Vec::new();
+        for index in start + 1..tokens.len() {
+            if (index - start) % 2 == 1 {
+                if !matches!(&tokens[index].kind, TokenKind::Ident(_)) {
+                    return Err(refuse(view, tokens, index));
+                }
+                classes.push(Syntax::node(
+                    parser_kind(&["Command", "derivingClass"]),
+                    vec![null_node(Vec::new()), leaves.leaf(index)?],
+                ));
+            } else {
+                if !symbol(tokens, index, ",") || index + 1 == tokens.len() {
+                    return Err(refuse(view, tokens, index));
+                }
+                classes.push(leaves.leaf(index)?);
+            }
+        }
+        suffix = vec![leaves.leaf(start)?, null_node(classes)];
+    }
+    Ok(null_node(suffix))
+}
+
+/// A `declModifiers` node holding only the doc comment at token `doc`, if any.
+fn modifiers_with_doc(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    doc: Option<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut parts: Vec<Syntax> = (0..7).map(|_| null_node(Vec::new())).collect();
+    if let Some(doc) = doc {
+        parts[0] = crate::doc_comment_syntax(view, leaves, tokens, doc)?;
+    }
+    Ok(Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
-        (0..7).map(|_| null_node(Vec::new())).collect(),
-    )
+        parts,
+    ))
+}
+
+/// A `declModifiers` node with the doc comment at token `doc` and the `private` or `protected` at
+/// its token: `docComment? attributes? visibility? protected? …`, where `private` is a visibility
+/// and `protected` a slot of its own.
+pub(super) fn modifiers_with(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    doc: Option<usize>,
+    visibility: Option<(&str, usize)>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut modifiers = modifiers_with_doc(view, leaves, tokens, doc)?;
+    if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut modifiers) {
+        let slot = if word == "protected" { 3 } else { 2 };
+        args[slot] = null_node(vec![Syntax::node(
+            parser_kind(&["Command", word]),
+            vec![leaves.leaf(at)?],
+        )]);
+    }
+    Ok(modifiers)
+}
+
+/// Whether token `at` is a declaration doc comment (`/--`), which leads a field as it leads a
+/// declaration: `structSimpleBinder`'s own `declModifiers` (`Lean/Parser/Command.lean`).
+fn doc_at(tokens: &[LexedToken], at: usize) -> bool {
+    symbol(tokens, at, "/--")
 }
 pub(super) fn optional_type(
     leaves: &Leaves,
@@ -53,6 +155,20 @@ fn field(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let doc = doc_at(tokens, range.start).then_some(range.start);
+    let range = range.start + usize::from(doc.is_some())..range.end;
+    // `private` or `protected` before the field's name.
+    let visibility = ["private", "protected"]
+        .into_iter()
+        .find(|word| symbol(tokens, range.start, word))
+        .map(|word| (word, range.start));
+    let range = range.start + usize::from(visibility.is_some())..range.end;
+    if ["(", "{", "["]
+        .into_iter()
+        .any(|open| symbol(tokens, range.start, open))
+    {
+        return bracketed_field(leaves, view, tokens, range, doc, visibility);
+    }
     if !matches!(
         tokens.get(range.start).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
@@ -65,36 +181,51 @@ fn field(
         range.start + 1,
         DefinitionGrammar::Scalar,
     )?;
-    if !symbol(tokens, colon, ":") || colon >= range.end {
+    // `optDeclSig`'s type is optional: `x := v` overrides an inherited field's default.
+    let typed = symbol(tokens, colon, ":");
+    if colon >= range.end || !typed && !symbol(tokens, colon, ":=") {
         return Err(refuse(view, tokens, colon));
     }
     let parameters =
         bounded_binder_syntax(leaves, view, tokens, groups, DefinitionGrammar::Scalar)?;
-    let type_limit = type_end(&tokens[..range.end], colon, ":=");
+    let type_limit = if typed {
+        type_end(&tokens[..range.end], colon, ":=")
+    } else {
+        colon
+    };
     let default = if type_limit < range.end {
         let bounded_tokens = &tokens[..range.end];
         let (bindings, body_start) = bounded_let_bindings(view, bounded_tokens, type_limit + 1)?;
-        null_node(vec![Syntax::node(
-            parser_kind(&["Term", "binderDefault"]),
-            vec![
-                leaves.leaf(type_limit)?,
-                bounded_value_syntax(
-                    leaves,
-                    view,
-                    bounded_tokens,
-                    bindings,
-                    body_start,
-                    DefinitionGrammar::Scalar,
-                )?,
-            ],
-        )])
+        let value = bounded_value_syntax(
+            leaves,
+            view,
+            bounded_tokens,
+            bindings,
+            body_start,
+            DefinitionGrammar::Scalar,
+        )?;
+        // `:= by tac` is `binderTactic` (an `autoParam` field), not a default value that happens
+        // to be a proof: `" := " " by " tacticSeq` wins over `binderDefault` at the pin.
+        let tactic = symbol(tokens, type_limit + 1, "by")
+            && value.kind() == Some(&parser_kind(&["Term", "byTactic"]));
+        null_node(vec![match (tactic, &value) {
+            (true, Syntax::Node { args, .. }) if args.len() == 2 => Syntax::node(
+                parser_kind(&["Term", "binderTactic"]),
+                vec![leaves.leaf(type_limit)?, args[0].clone(), args[1].clone()],
+            ),
+            _ => Syntax::node(
+                parser_kind(&["Term", "binderDefault"]),
+                vec![leaves.leaf(type_limit)?, value],
+            ),
+        }])
     } else {
         null_node(Vec::new())
     };
+    let field_modifiers = modifiers_with(view, leaves, tokens, doc, visibility)?;
     Ok(Syntax::node(
         parser_kind(&["Command", "structSimpleBinder"]),
         vec![
-            modifiers(),
+            field_modifiers,
             leaves.leaf(range.start)?,
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
@@ -106,6 +237,108 @@ fn field(
             default,
         ],
     ))
+}
+
+/// A field written as a binder (`Lean/Parser/Command.lean`): `structExplicitBinder`
+/// (`"(" ident+ optDeclSig (binderDefault)? ")"`), `structImplicitBinder` (`"{" ident+ declSig "}"`)
+/// and `structInstBinder` (`"[" ident+ declSig "]"`), each its names, `:` and a type. Out of line,
+/// as every field form is built.
+#[inline(never)]
+fn bracketed_field(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    doc: Option<usize>,
+    visibility: Option<(&str, usize)>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let open = range.start;
+    let (kind, closing) = if symbol(tokens, open, "(") {
+        ("structExplicitBinder", ")")
+    } else if symbol(tokens, open, "{") {
+        ("structImplicitBinder", "}")
+    } else {
+        ("structInstBinder", "]")
+    };
+    let close = range.end - 1;
+    if close <= open + 2 || !symbol(tokens, close, closing) {
+        return Err(refuse(view, tokens, close));
+    }
+    let mut colon = open + 1;
+    while colon < close && matches!(&tokens[colon].kind, TokenKind::Ident(_)) {
+        colon += 1;
+    }
+    if colon == open + 1 || !symbol(tokens, colon, ":") {
+        return Err(refuse(view, tokens, colon));
+    }
+    let names = (open + 1..colon)
+        .map(|at| leaves.leaf(at))
+        .collect::<Result<Vec<_>, _>>()?;
+    // An explicit field's default (`(n : Nat := 0)`): the type ends at its top-level `:=`.
+    let type_end = if kind == "structExplicitBinder" {
+        type_end(&tokens[..close], colon, ":=")
+    } else {
+        close
+    };
+    if type_end <= colon + 1 {
+        return Err(refuse(view, tokens, colon + 1));
+    }
+    let type_spec = Syntax::node(
+        parser_kind(&["Term", "typeSpec"]),
+        vec![
+            leaves.leaf(colon)?,
+            bounded_type(
+                leaves,
+                view,
+                tokens,
+                colon + 1..type_end,
+                DefinitionGrammar::Scalar,
+            )?,
+        ],
+    );
+    let mut modifiers = modifiers_with_doc(view, leaves, tokens, doc)?;
+    if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut modifiers) {
+        let slot = if word == "protected" { 3 } else { 2 };
+        args[slot] = null_node(vec![Syntax::node(
+            parser_kind(&["Command", word]),
+            vec![leaves.leaf(at)?],
+        )]);
+    }
+    let mut parts = vec![modifiers, leaves.leaf(open)?, null_node(names)];
+    if kind == "structExplicitBinder" {
+        let default = if type_end < close {
+            if type_end + 1 >= close {
+                return Err(refuse(view, tokens, type_end));
+            }
+            null_node(vec![Syntax::node(
+                parser_kind(&["Term", "binderDefault"]),
+                vec![
+                    leaves.leaf(type_end)?,
+                    bounded_term(
+                        leaves,
+                        view,
+                        tokens,
+                        type_end + 1..close,
+                        DefinitionGrammar::Scalar,
+                    )?,
+                ],
+            )])
+        } else {
+            null_node(Vec::new())
+        };
+        parts.push(Syntax::node(
+            parser_kind(&["Command", "optDeclSig"]),
+            vec![null_node(Vec::new()), null_node(vec![type_spec])],
+        ));
+        parts.push(default);
+    } else {
+        parts.push(Syntax::node(
+            parser_kind(&["Command", "declSig"]),
+            vec![null_node(Vec::new()), type_spec],
+        ));
+    }
+    parts.push(leaves.leaf(close)?);
+    Ok(Syntax::node(parser_kind(&["Command", kind]), parts))
 }
 
 fn fields(
@@ -125,12 +358,18 @@ fn fields(
             .expect("token's line exists")
             .0
     };
+    // `structFields` is `manyIndent`: the first field may sit at any column, even 0 (the pin
+    // accepts `structure A where` then `x : Nat` at the line start), and each later field at
+    // a line start sits at the first one's column.
     let base = column(start);
-    if source.line_of(tokens[start].extent.start()) > source.line_of(tokens[0].extent.start())
-        && base <= column(0)
-    {
-        return Err(refuse(view, tokens, start));
-    }
+    // A field's own bracket (`(x : Nat)`), after its doc comment and visibility: the field ends
+    // where that bracket closes, so `(x : Nat) (y : Nat)` on one line is two fields. The next
+    // one passes `checkColGe` at any column from the first field's on: a line starting further
+    // left is refused below, as the pin ends the command there and fails on the rest.
+    let opening = |first: usize| {
+        let at = first + usize::from(doc_at(tokens, first));
+        at + usize::from(symbol(tokens, at, "private") || symbol(tokens, at, "protected"))
+    };
     let mut output = Vec::new();
     let mut first = start;
     let mut stack = Vec::new();
@@ -138,7 +377,9 @@ fn fields(
         let begins_line = index > first
             && source.line_of(tokens[index].extent.start())
                 > source.line_of(tokens[index - 1].extent.end());
-        if stack.is_empty() && begins_line && column(index) <= base {
+        // A field's doc comment and its name start lines of one field.
+        let after_doc = index == first + 1 && doc_at(tokens, first);
+        if stack.is_empty() && begins_line && !after_doc && column(index) <= base {
             if column(index) != base {
                 return Err(refuse(view, tokens, index));
             }
@@ -146,14 +387,27 @@ fn fields(
             first = index;
         }
         if let TokenKind::Symbol(s) = &tokens[index].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => stack.push(")"),
                 "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
                 "⟨" => stack.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if stack.pop() != Some(s.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if stack.pop() != Some(crate::canonical_bracket(s.as_str())) =>
+                {
                     return Err(refuse(view, tokens, index));
+                }
+                ")" | "}" | "]"
+                    if stack.is_empty()
+                        && ["(", "{", "["]
+                            .into_iter()
+                            .any(|open| symbol(tokens, opening(first), open))
+                        && index + 1 < tokens.len()
+                        && column(index + 1) >= base =>
+                {
+                    output.push(field(leaves, view, tokens, first..index + 1)?);
+                    first = index + 1;
                 }
                 "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
                 _ => {}
@@ -219,13 +473,15 @@ fn parents(
             }
             first = index + 1;
         } else if let TokenKind::Symbol(s) = &tokens[index].kind {
-            match s.as_str() {
+            match crate::canonical_bracket(s.as_str()) {
                 "(" => stack.push(")"),
                 "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
                 "⟨" => stack.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if stack.pop() != Some(s.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if stack.pop() != Some(crate::canonical_bracket(s.as_str())) =>
+                {
                     return Err(refuse(view, tokens, index));
                 }
                 _ => {}
@@ -241,23 +497,35 @@ fn parents(
     )]))
 }
 
+/// `structure`/`class` after its `declModifiers`: `prefix` is where the doc comment, the
+/// attributes and the modifier keywords end, the last being the keyword's token.
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
+    prefix: (usize, usize, usize),
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
-    let is_class = symbol(&tokens, 0, "class");
-    if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-        return Err(refuse(&view, &tokens, 1));
+    let (doc_end, attributes_end, keyword) = prefix;
+    let is_class = symbol(&tokens, keyword, "class");
+    if !matches!(
+        tokens.get(keyword + 1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        return Err(refuse(&view, &tokens, keyword + 1));
     }
-    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
+    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, keyword + 2)?;
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
+    let end_body = deriving_start(&tokens, cursor);
+    let body_tokens = &tokens[..end_body];
+    // The body opens with `where` or, in the pin's older spelling, `:=` (`" := " <|> " where "`).
     let end_result = if symbol(&tokens, cursor, ":") {
-        type_end(&tokens, cursor, "where").min(type_end(&tokens, cursor, "extends"))
+        type_end(body_tokens, cursor, "where")
+            .min(type_end(body_tokens, cursor, ":="))
+            .min(type_end(body_tokens, cursor, "extends"))
     } else {
         cursor
     };
     let end_header = if symbol(&tokens, end_result, "extends") {
-        type_end(&tokens, end_result, "where")
+        type_end(body_tokens, end_result, "where").min(type_end(body_tokens, end_result, ":="))
     } else {
         end_result
     };
@@ -267,16 +535,51 @@ pub(super) fn parse(
         bounded_binder_syntax(&leaves, &view, &tokens, groups, DefinitionGrammar::Scalar)?;
     let result = optional_type(&leaves, &view, &tokens, cursor..end_result)?;
     let inheritance = parents(&leaves, &view, &tokens, end_result, end_header)?;
-    let body = if end_header == tokens.len() {
+    let body = if end_header == end_body {
         null_node(Vec::new())
     } else {
-        if !symbol(&tokens, end_header, "where") {
+        if !symbol(&tokens, end_header, "where") && !symbol(&tokens, end_header, ":=") {
             return Err(refuse(&view, &tokens, end_header));
         }
-        let fields = fields(&leaves, &view, &tokens, end_header + 1)?;
+        // `structCtor := declModifiers ident " :: "`: the constructor's own name, after its doc
+        // comment and visibility if any (which otherwise lead the first field).
+        let mut name = end_header + 1;
+        let doc = doc_at(&tokens, name).then_some(name);
+        name += usize::from(doc.is_some());
+        let visibility = ["private", "protected"]
+            .into_iter()
+            .find(|word| symbol(&tokens, name, word))
+            .map(|word| (word, name));
+        name += usize::from(visibility.is_some());
+        let named_ctor = matches!(tokens.get(name).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+            && symbol(&tokens, name + 1, "::");
+        let ctor = if named_ctor {
+            let mut ctor_modifiers = modifiers_with_doc(&view, &leaves, &tokens, doc)?;
+            if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut ctor_modifiers)
+            {
+                let slot = if word == "protected" { 3 } else { 2 };
+                args[slot] = null_node(vec![Syntax::node(
+                    parser_kind(&["Command", word]),
+                    vec![leaves.leaf(at)?],
+                )]);
+            }
+            null_node(vec![Syntax::node(
+                parser_kind(&["Command", "structCtor"]),
+                vec![
+                    ctor_modifiers,
+                    leaves.leaf(name)?,
+                    null_node(Vec::new()),
+                    leaves.leaf(name + 1)?,
+                ],
+            )])
+        } else {
+            null_node(Vec::new())
+        };
+        let first_field = if named_ctor { name + 2 } else { end_header + 1 };
+        let fields = fields(&leaves, &view, body_tokens, first_field)?;
         null_node(vec![
             leaves.leaf(end_header)?,
-            null_node(Vec::new()),
+            ctor,
             Syntax::node(
                 parser_kind(&["Command", "structFields"]),
                 vec![null_node(fields)],
@@ -288,12 +591,12 @@ pub(super) fn parse(
         vec![
             Syntax::node(
                 parser_kind(&["Command", if is_class { "classTk" } else { "structureTk" }]),
-                vec![leaves.leaf(0)?],
+                vec![leaves.leaf(keyword)?],
             ),
             Syntax::node(
                 parser_kind(&["Command", "declId"]),
                 vec![
-                    leaves.leaf(1)?,
+                    leaves.leaf(keyword + 1)?,
                     levels::declaration_syntax(&leaves, universe_suffix)?,
                 ],
             ),
@@ -303,17 +606,16 @@ pub(super) fn parse(
             ),
             inheritance,
             body,
-            Syntax::node(
-                parser_kind(&["Command", "optDeriving"]),
-                vec![null_node(Vec::new())],
-            ),
+            deriving_suffix(&leaves, &view, &tokens, end_body)?,
         ],
     );
+    let modifiers =
+        crate::declaration_modifiers(&view, &leaves, &tokens, doc_end, attributes_end, keyword)?;
     Ok(ParsedDefinition {
         source_view: view,
         syntax: Syntax::node(
             parser_kind(&["Command", "declaration"]),
-            vec![modifiers(), structure],
+            vec![modifiers, structure],
         ),
         epilogue,
     })
@@ -350,13 +652,13 @@ mod tests {
     fn unsupported_record_forms_and_bad_indentation_do_not_disappear() {
         for text in [
             "structure A extends where x : Nat",
-            "structure A where\nx : Nat",
             "structure A where\n  x : Nat\n y : Nat",
+            "structure A := (x : Nat)\n  (y : Nat)",
+            "structure A := (x : Nat) :=",
             "structure A where\n  x : Nat :=",
-            "structure A where\n  x : Nat\nderiving Inhabited",
+            "structure A where\n  x : Nat\nderiving",
             "structure A where\n  x Nat",
             "class A where\n  x : (Nat",
-            "structure A where\n  mk ::",
             "structure A extra",
         ] {
             assert!(
@@ -368,8 +670,40 @@ mod tests {
             "structure Empty",
             "structure Empty where",
             "structure Empty : Type where",
+            // A named constructor and no fields (`structCtor`), which the elaborator refuses.
+            "structure A where\n  mk ::",
+            // `structFields` is `manyIndent`: the first field may start a line at column 0.
+            "structure A where\nx : Nat",
+            "structure A where\nx : Nat\ny : Nat",
+            // The older `:=` body, and bracketed fields sharing a line.
+            "structure A :=\n(x : Nat)",
+            "structure A := (x : Nat) (y z : Bool := true)",
+            "class A (α : Type) := (op : α → α)",
         ] {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
+        }
+    }
+
+    #[test]
+    fn deriving_preserves_handlers_and_original_bytes() {
+        for text in [
+            "structure Point where\r\n  x : Nat\r\n  deriving Inhabited, Repr\r\n",
+            "structure Empty deriving Inhabited",
+            "structure Child extends Parent deriving Inhabited",
+        ] {
+            let parsed = parse_definition(text.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                text.replace("\r\n", "\n").as_bytes()
+            );
+        }
+        for text in [
+            "structure A deriving Inhabited,",
+            "structure A deriving Inhabited Repr",
+            "structure A deriving , Inhabited",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
     }
     #[test]

@@ -226,17 +226,18 @@ impl Preparation<'_> {
         let mut parameters = Vec::new();
         for (domain, kind) in threaded
             .iter()
-            .map(|(_, domain)| (domain, "value parameter representation"))
-            .chain(
-                index_domains
-                    .iter()
-                    .map(|domain| (domain, "index representation")),
-            )
+            .map(|(_, domain)| (domain.clone(), "value parameter representation"))
+            .chain(index_domains.iter().map(|domain| {
+                (
+                    indexed::runtime_index_domain(domain),
+                    "index representation",
+                )
+            }))
         {
             reserve(&mut domains, self.limits.max_context_depth)?;
             reserve(&mut parameters, self.limits.max_context_depth)?;
-            parameters.push(self.value_type(domain)?.ok_or_else(|| unsupported(kind))?);
-            domains.push(domain.clone());
+            parameters.push(self.value_type(&domain)?.ok_or_else(|| unsupported(kind))?);
+            domains.push(domain);
         }
         reserve(&mut domains, self.limits.max_context_depth)?;
         reserve(&mut parameters, self.limits.max_context_depth)?;
@@ -326,7 +327,7 @@ impl Preparation<'_> {
             for (field_index, field_type) in ctor.fields.iter().enumerate() {
                 self.tick()?;
                 let field = Expr::proj(shape.projection(ctor), field_index as u64, major.clone());
-                body = self.minor_apply(body, field.clone())?;
+                body = self.constructor_minor_apply(body, ctor, field_index, field.clone())?;
                 let logical = self.type_head(&logical_fields)?;
                 let ExprNode::ForallE {
                     binder_type: logical_type,
@@ -360,14 +361,15 @@ impl Preparation<'_> {
                             reserve(&mut indices, self.limits.max_application_args)?;
                             indices.push(self.lift(value, depth)?);
                         }
-                        for index in self.indexed_recursive_field_arguments(
+                        let child_indices = self.indexed_recursive_field_arguments(
                             &recursive,
                             logical_type,
                             &family,
                             rec.num_indices as usize,
-                        )? {
+                        )?;
+                        for (domain, index) in index_domains.iter().zip(&child_indices) {
                             reserve(&mut indices, self.limits.max_application_args)?;
-                            indices.push(index);
+                            indices.push(indexed::runtime_index_argument(domain, index));
                         }
                         indices
                     };
@@ -423,9 +425,12 @@ impl Preparation<'_> {
             reserve(&mut arguments, self.limits.max_application_args)?;
             arguments.push(parameter_arguments[*position].clone());
         }
-        for arg in &args[rec.rules.len() + 1..] {
+        for (position, arg) in args[rec.rules.len() + 1..].iter().enumerate() {
             reserve(&mut arguments, self.limits.max_application_args)?;
-            arguments.push(arg.clone());
+            arguments.push(match index_domains.get(position) {
+                Some(domain) => indexed::runtime_index_argument(domain, arg),
+                None => arg.clone(),
+            });
         }
         Ok(Some(Recursion {
             name: Name::num(super::name("_fln_runtime_data_rec"), id),

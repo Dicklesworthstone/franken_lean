@@ -658,6 +658,98 @@ fn span(start: BytePos, end: BytePos) -> ByteSpan {
     ByteSpan::new(start, end).unwrap_or(ByteSpan::empty_at(start))
 }
 
+/// A string literal's value from its spelling (`Syntax.isStrLit?`, `decodeStrLit`,
+/// `Init/Meta/Defs.lean`): the raw form `r#"…"#` verbatim, otherwise the quoted form with its
+/// escapes decoded. `None` for a spelling the lexer would not produce.
+pub fn decode_string(spelling: &str) -> Option<String> {
+    if spelling.starts_with('r') {
+        let bytes = spelling.as_bytes();
+        let mut opener = 1;
+        while bytes.get(opener) == Some(&b'#') {
+            opener += 1;
+        }
+        if bytes.get(opener) != Some(&b'"') {
+            return None;
+        }
+        let hashes = opener - 1;
+        let suffix = 1_usize.checked_add(hashes)?;
+        let content_start = opener + 1;
+        let content_stop = spelling
+            .len()
+            .checked_sub(suffix)
+            .filter(|stop| *stop >= content_start)?;
+        if bytes.get(content_stop) != Some(&b'"')
+            || bytes[content_stop + 1..].iter().any(|byte| *byte != b'#')
+        {
+            return None;
+        }
+        return Some(spelling[content_start..content_stop].to_owned());
+    }
+
+    let content = spelling
+        .strip_prefix('"')
+        .and_then(|spelling| spelling.strip_suffix('"'))?;
+    let mut decoded = String::new();
+    let mut chars = content.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        match chars.next()? {
+            '\\' => decoded.push('\\'),
+            '"' => decoded.push('"'),
+            '\'' => decoded.push('\''),
+            'r' => decoded.push('\r'),
+            'n' => decoded.push('\n'),
+            't' => decoded.push('\t'),
+            'x' => {
+                let digits = chars.by_ref().take(2).collect::<String>();
+                if digits.len() != 2 {
+                    return None;
+                }
+                decoded.push(decode_hex_scalar(&digits)?);
+            }
+            'u' => {
+                let digits = chars.by_ref().take(4).collect::<String>();
+                if digits.len() != 4 {
+                    return None;
+                }
+                decoded.push(decode_hex_scalar(&digits)?);
+            }
+            // Pin `quotedCharCoreFn` (`Basic.lean:668`): a string gap starts
+            // only on a newline after `\`. `stringGapFn` then eats pin
+            // whitespace (`Char.isWhitespace`: space, tab, CR, LF) and
+            // refuses a second newline. Unicode White_Space (NBSP, form
+            // feed, …) is content, not gap.
+            '\n' => loop {
+                match chars.clone().next() {
+                    Some('\n') => return None,
+                    Some(whitespace) if is_whitespace(whitespace) => {
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            },
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn decode_hex_scalar(digits: &str) -> Option<char> {
+    let mut value = 0_u32;
+    for digit in digits.chars() {
+        value = value.checked_mul(16)?.checked_add(digit.to_digit(16)?)?;
+    }
+    // Pin `decodeQuotedChar` (`Init/Meta/Defs.lean:1096-1105`) feeds the
+    // digits to `Char.ofNat`. Invalid scalars (the UTF-16 surrogates a
+    // four-digit `\u` can name) become `'\0'`, not a decode failure
+    // (`Prelude.lean:2867-2870`). `char::from_u32` is the Rust refusal;
+    // using it here rejected `"\uD800"` while the pin accepted a NUL.
+    Some(char::from_u32(value).unwrap_or('\0'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

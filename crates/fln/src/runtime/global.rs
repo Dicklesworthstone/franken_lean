@@ -3,6 +3,9 @@
 //! spine is not eta-expanded across its strict, closure-producing body.
 mod applications;
 mod callbacks;
+mod partial;
+
+pub(super) use partial::Store as PartialStages;
 
 use super::*;
 
@@ -18,7 +21,7 @@ fn variable(index: usize) -> Result<Expr, IngressError> {
 }
 
 impl Preparation<'_> {
-    fn producer_depth(&mut self, depth: usize) -> Result<u32, IngressError> {
+    pub(in crate::runtime) fn producer_depth(&mut self, depth: usize) -> Result<u32, IngressError> {
         self.tick()?;
         if depth > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
@@ -56,7 +59,16 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, args)? {
+            return Ok(Some(replacement));
+        }
+        if let Some(staged) = self.partial_stage_call(head, args)? {
+            return Ok(Some(staged));
+        }
         if let Some(specialized) = self.specialize_staged_callback(head, args)? {
+            return Ok(Some(specialized));
+        }
+        if let Some(specialized) = self.specialize_computed_callback(head, args)? {
             return Ok(Some(specialized));
         }
         let ExprNode::Const { name, levels } = head.node() else {
@@ -67,7 +79,9 @@ impl Preparation<'_> {
                 Some(definition.clone())
             }
             Some(_) => None,
-            None => self.specialized_definition(name),
+            None => self
+                .specialized_definition(name)
+                .filter(|definition| definition.safety == DefinitionSafety::Safe),
         };
         let Some(mut definition) = definition else {
             return Ok(None);
@@ -108,6 +122,15 @@ impl Preparation<'_> {
         if !matches!(remaining.node(), ExprNode::ForallE { .. }) {
             return Ok(None);
         }
+        // This staged producer's constant disappears when its body is copied.
+        // Preserve the selected extern policy before bypassing catalog discovery.
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
         definition.base.type_ = self.universe_instance(
             &definition.base.type_,
             &definition.base.level_params,

@@ -46,7 +46,8 @@ fn build(
 }
 
 const LIB: &str = "prelude\ndef identity.{u} {A : Sort u} (x : A) : A := x";
-const MAIN: &str = "prelude\nimport Lib Lib\ndef use.{u} {A : Sort u} (x : A) : A := identity x";
+const MAIN: &str =
+    "prelude\nimport Lib\nimport Lib\ndef use.{u} {A : Sort u} (x : A) : A := identity x";
 
 #[test]
 fn artifacts_are_separate_importable_deltas_rechecked_by_both_engines() {

@@ -8,6 +8,10 @@ use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
 
+mod imported;
+
+#[cfg(test)]
+mod expected_tests;
 #[cfg(test)]
 mod lookup_tests;
 
@@ -17,6 +21,13 @@ pub enum RecordTermError {
     UnknownField(Name),
     DuplicateField(Name),
     MissingField(Name),
+    /// `e.i` with `i` past the structure's field count (`fields` of them).
+    ProjectionIndex {
+        index: u64,
+        fields: usize,
+    },
+    /// `e.i` on a type that is not a one-constructor inductive.
+    ProjectionNotStructure,
 }
 impl std::fmt::Display for RecordTermError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +44,14 @@ impl std::fmt::Display for RecordTermError {
             Self::MissingField(name) => {
                 write!(f, "missing record field {}", name.to_display_string())
             }
+            // The pin's messages' first lines (`Lean/Elab/App.lean`, `resolveLValAux`).
+            Self::ProjectionIndex { index, fields } => write!(
+                f,
+                "Invalid projection: Index `{index}` is invalid for this structure; it must be between 1 and {fields}"
+            ),
+            Self::ProjectionNotStructure => f.write_str(
+                "Invalid projection: Projections extract constructor fields for one-constructor inductive types.",
+            ),
         }
     }
 }
@@ -48,6 +67,7 @@ pub(super) struct RecordParts<'a> {
 pub(super) struct RecordBuild<'a> {
     // Parent subobjects use heap continuations, never recursive elaboration.
     frames: Vec<RecordFrame<'a>>,
+    imported: Option<imported::ImportedRecord<'a>>,
 }
 struct RecordFrame<'a> {
     parents: HashMap<Name, Vec<Name>>,
@@ -62,17 +82,23 @@ struct RecordFrame<'a> {
     defaults: Vec<Option<Name>>,
     levels: Vec<Level>,
 }
+pub(super) enum RecordTarget {
+    Constructor(Expr),
+    Imported(usize),
+}
+
 pub(super) enum RecordStep<'a> {
     Field {
         syntax: &'a Syntax,
         domain: Expr,
-        codomain: Expr,
+        target: RecordTarget,
     },
     Copy {
         value: Typed,
-        codomain: Expr,
+        target: RecordTarget,
     },
     Complete(Typed),
+    Continue,
 }
 
 pub(super) enum FieldResolution {
@@ -89,7 +115,108 @@ pub(super) enum FieldReceiver<'a> {
     Elaborated(Typed, Name),
 }
 
+/// Field methods are syntax sugar for a checked lambda. A field's result
+/// annotation belongs inside that lambda, where its binders are in scope.
+pub(super) fn is_field_notation(syntax: &Syntax) -> bool {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return false;
+    };
+    if kind != &parser_kind(&["Term", "structInstField"]) {
+        return false;
+    }
+    let Some(Syntax::Node { args: payload, .. }) = args.get(1) else {
+        return false;
+    };
+    payload
+        .iter()
+        .take(2)
+        .any(|syntax| matches!(syntax, Syntax::Node { args, .. } if !args.is_empty()))
+}
+
+fn owned_args(mut syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+    match &mut syntax {
+        Syntax::Node { args, .. } => Ok(std::mem::take(args)),
+        _ => Err(failure(SourceInferenceError::Scope)),
+    }
+}
+
 impl Context {
+    /// Part of the ordinary inside-out source expansion. Moving the field body
+    /// preserves heap-bounded traversal even when methods contain other records.
+    pub(super) fn expand_record_field_node(
+        &mut self,
+        mut syntax: Syntax,
+        pattern: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        if pattern || !is_field_notation(&syntax) {
+            return Ok(syntax);
+        }
+        self.tick()?;
+        let field = expect_node(
+            &syntax,
+            &parser_kind(&["Term", "structInstField"]),
+            2,
+            "record field",
+        )?;
+        let [binders, annotation, definition] = expect_null_args(&field[1], "field value")? else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_null_args(binders, "field method binders")?;
+        optional_type_syntax(annotation)?;
+        let definition = expect_node(
+            definition,
+            &parser_kind(&["Term", "structInstFieldDef"]),
+            3,
+            "field assignment",
+        )?;
+        expect_atom(&definition[0], ":=", "field assignment token")?;
+        expect_empty_null(&definition[1], "unsupported private field value")?;
+
+        let Syntax::Node { args: field, .. } = &mut syntax else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
+        let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+        let payload = std::mem::replace(&mut field[1], null(Vec::new()));
+        let [binders, annotation, mut definition]: [Syntax; 3] = owned_args(payload)?
+            .try_into()
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let binders = owned_args(binders)?;
+        let annotation = owned_args(annotation)?.into_iter().next();
+        let Syntax::Node {
+            args: definition_args,
+            ..
+        } = &mut definition
+        else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut value = std::mem::replace(&mut definition_args[2], null(Vec::new()));
+        if let Some(annotation) = annotation {
+            let [colon, type_]: [Syntax; 2] = owned_args(annotation)?
+                .try_into()
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            value = Syntax::node(
+                parser_kind(&["Term", "typeAscription"]),
+                vec![atom("("), value, colon, null(vec![type_]), atom(")")],
+            );
+        }
+        if !binders.is_empty() {
+            value = Syntax::node(
+                parser_kind(&["Term", "fun"]),
+                vec![
+                    atom("fun"),
+                    Syntax::node(
+                        parser_kind(&["Term", "basicFun"]),
+                        vec![null(binders), null(Vec::new()), atom("=>"), value],
+                    ),
+                ],
+            );
+        }
+        definition_args[2] = value;
+        field[1] = null(vec![null(Vec::new()), null(Vec::new()), definition]);
+        Ok(syntax)
+    }
+
     pub(super) fn field_application_receiver<'a>(
         &mut self,
         syntax: &'a Syntax,
@@ -98,10 +225,10 @@ impl Context {
         if syntax.kind() == Some(&kind) {
             let parts = expect_node(syntax, &kind, 3, "field projection")?;
             expect_atom(&parts[1], ".", "field dot")?;
-            let Syntax::Ident { val: field, .. } = &parts[2] else {
-                return Err(failure(SourceInferenceError::Scope));
-            };
-            return Ok(Some(FieldReceiver::Syntax(&parts[0], field.clone())));
+            return Ok(Some(FieldReceiver::Syntax(
+                &parts[0],
+                projection_field(&parts[2])?,
+            )));
         }
         if let Syntax::Ident { val: name, .. } = syntax
             && let Some((receiver, path)) = self.qualified_field_receiver(name)?
@@ -115,12 +242,13 @@ impl Context {
     pub(super) fn qualified_record_field(
         &mut self,
         name: &Name,
+        expected: Option<&Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let Some((receiver, path)) = self.qualified_field_receiver(name)? else {
             return Ok(None);
         };
         let field = self.resolve_field_path(receiver, &path, false)?;
-        Ok(Some(self.field_value(field)?))
+        Ok(Some(self.field_value(field, expected)?))
     }
 
     /// Splitting is reserved for identifiers that did not resolve as a whole.
@@ -193,6 +321,12 @@ impl Context {
         path: &Name,
         has_arguments: bool,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
+        if let LeafView::Num(index) = path.leaf_view()
+            && path.parent().is_anonymous()
+        {
+            let field = self.indexed_field(receiver.clone(), index)?;
+            return self.resolve_field(receiver, &field, has_arguments);
+        }
         let parts = scope::components(path).map_err(|_| failure(SourceInferenceError::Scope))?;
         let Some((last, prefix)) = parts.split_last() else {
             return Err(failure(SourceInferenceError::Scope));
@@ -201,7 +335,7 @@ impl Context {
             self.tick()?;
             let field =
                 self.resolve_field(receiver, &Name::from_components([part.as_str()]), false)?;
-            receiver = self.field_value(field)?;
+            receiver = self.field_value(field, None)?;
         }
         self.resolve_field(
             receiver,
@@ -234,18 +368,23 @@ impl Context {
                 binder_info,
                 ..
             } = receiver.type_.node()
-                && (*binder_info == BinderInfo::Implicit
-                    || *binder_info == BinderInfo::InstImplicit
-                    || has_arguments && *binder_info == BinderInfo::StrictImplicit)
             {
-                let argument = if *binder_info == BinderInfo::InstImplicit {
-                    self.instance_hole(binder_type.clone())?
+                let argument = if *binder_info == BinderInfo::Implicit
+                    || has_arguments && *binder_info == BinderInfo::StrictImplicit
+                {
+                    Some(self.hole(binder_type.clone())?)
+                } else if *binder_info == BinderInfo::InstImplicit {
+                    Some(self.instance_hole(binder_type.clone())?)
                 } else {
-                    self.hole(binder_type.clone())?
+                    // The pin's receiver `consumeImplicits` also applies
+                    // leading `optParam` defaults before namespace lookup.
+                    optional::default_value(binder_type).cloned()
                 };
-                receiver.type_ = self.substitute(body, &argument)?;
-                receiver.value = Expr::app(receiver.value, argument);
-                continue;
+                if let Some(argument) = argument {
+                    receiver.type_ = self.substitute(body, &argument)?;
+                    receiver.value = Expr::app(receiver.value, argument);
+                    continue;
+                }
             }
             let mut head = &receiver.type_;
             let mut arguments = Vec::new();
@@ -326,11 +465,26 @@ impl Context {
                     base,
                 });
             }
+            if let Some(recursion) = &self.well_founded
+                && recursion.name == method
+            {
+                if recursion.proving {
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::RecursionInDecreasingProof,
+                    )));
+                }
+                return Ok(FieldResolution::Method {
+                    function: recursion.reference.clone(),
+                    receiver,
+                    base,
+                });
+            }
             // Before the recursion context exists, a reference to the declaration being
             // defined is reported as the unknown constant it still is, exactly as a direct
             // `T.size l` is: `definition_body` retries such a failure with the structural
             // recursion context, where the branch above resolves it.
             if self.recursion.is_none()
+                && self.well_founded.is_none()
                 && self.defining.as_ref() == Some(&method)
                 && !self.txn.env.contains(&method)
             {
@@ -365,7 +519,11 @@ impl Context {
         }
     }
 
-    fn field_value(&mut self, field: FieldResolution) -> Result<Typed, NatDefinitionElabError> {
+    fn field_value(
+        &mut self,
+        field: FieldResolution,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         let FieldResolution::Method {
             function,
             receiver,
@@ -377,8 +535,13 @@ impl Context {
             };
             return Ok(value);
         };
+        // A bare qualified method still applies its receiver. Preserve the
+        // whole term's expectation here, just as the explicit projection and
+        // application paths do, so its implicit result constructor is chosen
+        // before instance synthesis. Intermediate path receivers have no such
+        // expectation: it belongs only to the final field or method.
         let mut state =
-            self.start_field_application(function, receiver, &base, &[], None, false)?;
+            self.start_field_application(function, receiver, &base, &[], expected.cloned(), false)?;
         while let Some(argument) = self.next_named_argument(&mut state)? {
             let application::ApplicationValue::Elaborated(value) = argument.value else {
                 return Err(failure(SourceInferenceError::Scope));
@@ -393,6 +556,38 @@ impl Context {
     /// Apply admitted generated projections to the actual receiver. In
     /// particular, an instance-implicit class receiver must not be replaced by
     /// a dictionary selected from the surrounding context.
+    /// `e.i` (`fieldIdx`): the name of the `i`-th field, from one, of the structure
+    /// `e`'s type (`LValResolution.projIdx`, `Lean/Elab/App.lean`).
+    fn indexed_field(
+        &mut self,
+        receiver: Typed,
+        index: u64,
+    ) -> Result<Name, NatDefinitionElabError> {
+        let receiver = self.insert_implicits(receiver, ImplicitInsertion::FieldReceiver)?;
+        let target = self.whnf(&receiver.type_)?;
+        let mut head = &target;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Err(error(RecordTermError::ProjectionNotStructure));
+        };
+        let mut remaining = RecordBudget::default().max_nodes;
+        let fields = direct_fields(&self.txn.env, name, &mut remaining)
+            .map_err(|_| error(RecordTermError::ProjectionNotStructure))?;
+        let position = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| fields.get(index));
+        position.map(|(label, _)| label.clone()).ok_or_else(|| {
+            error(RecordTermError::ProjectionIndex {
+                index,
+                fields: fields.len(),
+            })
+        })
+    }
+
     pub(super) fn record_field(
         &mut self,
         receiver: Typed,
@@ -497,22 +692,19 @@ impl Context {
             return Err(error(RecordTermError::UnknownField(field.clone())));
         }
         let projection_name = name.append_core(field);
-        let Some(ConstantInfo::Defn(projection)) = self.txn.env.find(&projection_name).cloned()
-        else {
-            return Err(error(RecordTermError::UnknownField(field.clone())));
+        let projection = match self.txn.env.find(&projection_name).cloned() {
+            Some(ConstantInfo::Defn(projection)) if projection.safety == DefinitionSafety::Safe => {
+                projection.base
+            }
+            Some(ConstantInfo::Thm(projection)) => projection.base,
+            _ => return Err(error(RecordTermError::UnknownField(field.clone()))),
         };
-        if projection.safety != DefinitionSafety::Safe
-            || projection.base.level_params.len() != levels.len()
-        {
+        if projection.level_params.len() != levels.len() {
             return Err(error(RecordTermError::UnknownField(field.clone())));
         }
         let mut term = Typed {
             value: Expr::const_(projection_name, levels.clone()),
-            type_: self.instantiate_params(
-                &projection.base.type_,
-                &projection.base.level_params,
-                levels,
-            )?,
+            type_: self.instantiate_params(&projection.type_, &projection.level_params, levels)?,
         };
         params.push(receiver.value);
         for argument in params {
@@ -588,7 +780,11 @@ impl Context {
         {
             self.tick()?;
             if index % 2 == 1 {
-                expect_atom(syntax, ",", "record field separator")?;
+                // `sepByIndent … (allowTrailingSep := true)`: a `,`, or a line break, which is
+                // the pin's empty separator node.
+                if expect_empty_null(syntax, "record line separator").is_err() {
+                    expect_atom(syntax, ",", "record field separator")?;
+                }
                 continue;
             }
             let field = expect_node(
@@ -642,8 +838,16 @@ impl Context {
         expected: Option<Expr>,
         sources: Vec<Typed>,
     ) -> Result<RecordBuild<'a>, NatDefinitionElabError> {
+        let frame = self.start_record_frame(parts, expected, sources)?;
+        if let Some(layout) = self.imported_record_layout(&frame)? {
+            return Ok(RecordBuild {
+                frames: Vec::new(),
+                imported: Some(self.start_imported_record(frame, layout)?),
+            });
+        }
         Ok(RecordBuild {
-            frames: vec![self.start_record_frame(parts, expected, sources)?],
+            frames: vec![frame],
+            imported: None,
         })
     }
 
@@ -825,6 +1029,9 @@ impl Context {
         &mut self,
         state: &mut RecordBuild<'a>,
     ) -> Result<RecordStep<'a>, NatDefinitionElabError> {
+        if let Some(imported) = &mut state.imported {
+            return self.next_imported_record_field(imported);
+        }
         loop {
             self.tick()?;
             let frame = state
@@ -860,7 +1067,11 @@ impl Context {
                         let Some(codomain) = finished.return_codomain else {
                             return Ok(RecordStep::Complete(term));
                         };
-                        self.accept_record_field(state, &codomain, term)?;
+                        self.accept_record_field(
+                            state,
+                            &RecordTarget::Constructor(codomain),
+                            term,
+                        )?;
                         continue;
                     }
                     // Copy a whole available parent before considering defaults:
@@ -879,8 +1090,29 @@ impl Context {
                 // structural initializer or refund the work it already spent.
                 let mut trial = self.clone();
                 let attempt = (|| {
+                    trial.flush(false)?;
+                    let registry = crate::instances::InstanceRegistry::read_with_scopes(
+                        &trial.txn.env,
+                        &trial.source_scope.instance_scopes,
+                    )
+                    .map_err(instances::registry_error)?;
+                    let saved = trial.txn.lctx.clone();
+                    let suspended = std::mem::take(&mut trial.equations);
                     let hole = trial.instance_hole(domain.clone())?;
-                    trial.resolve_instances(false)?;
+                    let ExprNode::MVar { id } = hole.node() else {
+                        unreachable!("fresh parent instance hole");
+                    };
+                    // Pinned StructInst.trySynthParent uses trySynthInstance:
+                    // a missing optional parent dictionary permits structural
+                    // defaults. It is not a required synthetic instance goal,
+                    // whose concrete failure resolve_instances must report.
+                    if trial.search_instance(id.clone(), &registry)?
+                        != instances::SearchResult::Solved
+                    {
+                        return Ok(None);
+                    }
+                    trial.txn.lctx = saved;
+                    trial.equations.extend(suspended);
                     let value = trial.instantiate(&hole)?;
                     Ok::<_, NatDefinitionElabError>(
                         (!value.has_expr_mvar() && !value.has_level_mvar()).then_some(Typed {
@@ -892,7 +1124,10 @@ impl Context {
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                 if let Some(value) = attempt? {
                     *self = trial;
-                    return Ok(RecordStep::Copy { value, codomain });
+                    return Ok(RecordStep::Copy {
+                        value,
+                        target: RecordTarget::Constructor(codomain),
+                    });
                 }
             }
             let frame = state.frames.last_mut().expect("active record frame");
@@ -977,7 +1212,7 @@ impl Context {
                         let value = self.finish_term(value, Some(binder_type))?;
                         return Ok(RecordStep::Copy {
                             value,
-                            codomain: body.clone(),
+                            target: RecordTarget::Constructor(body.clone()),
                         });
                     }
                     Err(NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
@@ -997,7 +1232,16 @@ impl Context {
                     return Err(failure(SourceInferenceError::Scope));
                 };
                 let mut value = Typed {
-                    value: Expr::const_(helper.clone(), state.levels.clone()),
+                    // The pin's instantiateStructDefaultValueFn? instantiates
+                    // the registered helper's checked body, rather than leaving
+                    // an application of its semireducible name. Later fields
+                    // must see the actual chosen value at their expected type,
+                    // without changing ordinary instance-search transparency.
+                    value: self.instantiate_params(
+                        &definition.value,
+                        &definition.base.level_params,
+                        &state.levels,
+                    )?,
                     type_: self.instantiate_params(
                         &definition.base.type_,
                         &definition.base.level_params,
@@ -1020,12 +1264,15 @@ impl Context {
                         return Err(failure(SourceInferenceError::Scope));
                     };
                     value.type_ = self.substitute(body, &argument)?;
-                    value.value = Expr::app(value.value, argument);
+                    let ExprNode::Lam { body, .. } = value.value.node() else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    value.value = self.substitute(body, &argument)?;
                 }
                 let value = self.finish_term(value, Some(binder_type))?;
                 return Ok(RecordStep::Copy {
                     value,
-                    codomain: body.clone(),
+                    target: RecordTarget::Constructor(body.clone()),
                 });
             }
             return Err(error(RecordTermError::MissingField(binder_name.clone())));
@@ -1033,17 +1280,26 @@ impl Context {
         Ok(RecordStep::Field {
             syntax,
             domain: binder_type.clone(),
-            codomain: body.clone(),
+            target: RecordTarget::Constructor(body.clone()),
         })
     }
 
     pub(super) fn accept_record_field(
         &mut self,
         state: &mut RecordBuild<'_>,
-        codomain: &Expr,
+        target: &RecordTarget,
         value: Typed,
     ) -> Result<(), NatDefinitionElabError> {
         self.tick()?;
+        if let Some(imported) = &mut state.imported {
+            let RecordTarget::Imported(index) = target else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            return self.accept_imported_record_field(imported, *index, value);
+        }
+        let RecordTarget::Constructor(codomain) = target else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
         let state = state
             .frames
             .last_mut()
@@ -1052,5 +1308,25 @@ impl Context {
         state.constructor.value = Expr::app(state.constructor.value.clone(), value.value);
         state.remaining -= 1;
         Ok(())
+    }
+}
+
+/// A projection's field: an identifier, or a `fieldIdx` numeral read as `Name::num`.
+pub(super) fn projection_field(syntax: &Syntax) -> Result<Name, NatDefinitionElabError> {
+    match syntax {
+        Syntax::Ident { val, .. } => Ok(val.clone()),
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::str(Name::anonymous(), "fieldIdx") && args.len() == 1 =>
+        {
+            let Syntax::Atom { val, .. } = &args[0] else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            val.parse::<u64>()
+                .ok()
+                .filter(|index| *index > 0)
+                .map(|index| Name::num(Name::anonymous(), index))
+                .ok_or_else(|| failure(SourceInferenceError::Scope))
+        }
+        _ => Err(failure(SourceInferenceError::Scope)),
     }
 }

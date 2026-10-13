@@ -5,6 +5,11 @@ use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportL
 use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
 use fln_olean::source_extensions::{self, ClassEntry, DecodeLimits};
 
+#[path = "defaults.rs"]
+mod defaults;
+#[path = "instances.rs"]
+mod instances;
+
 const CLASS: &str = "prelude\nclass Mapper (A : Type) where\n  apply : A -> A";
 
 fn compiled(files: &[(&str, &str)]) -> SourceModuleBuild {
@@ -77,11 +82,41 @@ def use (A : Type) (x : A) : A := Mapper.apply x
 }
 
 #[test]
+fn structures_and_explicit_reducibility_survive_a_compiled_module_boundary() {
+    use fln_elab::reducibility::{Reducibility, ReducibilityTable};
+    let built = compiled(&[(
+        "Main",
+        "prelude\nstructure Holder (A : Type) where\n  value : A\ndef hidden (A : Type) (x : A) : A := x\nattribute [irreducible] hidden",
+    )]);
+    let before = ReducibilityTable::read(built.checked.checked.engine.environment()).unwrap();
+    let receipt = imported(&built);
+    let after = ReducibilityTable::read(receipt.engine.environment()).unwrap();
+    assert_eq!(before.get(&name("hidden")), Some(Reducibility::Irreducible));
+    assert_eq!(before, after);
+    let rows = metadata(&built.artifacts[0].bytes).reducibility;
+    assert!(!rows.is_empty());
+    assert!(
+        rows.windows(2)
+            .all(|pair| { pair[0].declaration.quick_cmp(&pair[1].declaration).is_lt() })
+    );
+    receipt
+        .engine
+        .check_source_files(
+            &[b"def useHolder (A : Type) (x : A) : A := Holder.value (Holder.mk x)"],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+}
+
+#[test]
 fn only_owned_class_rows_are_exported_across_a_diamond() {
     let built = compiled(&[
         (
             "Main",
-            "prelude\nimport Left Right\nclass Outer (A : Type) where\n  apply : A -> A",
+            "prelude\nimport Left\nimport Right\nclass Outer (A : Type) where\n  apply : A -> A",
         ),
         ("Left", "prelude\nimport Base"),
         ("Right", "prelude\nimport Base"),
@@ -103,6 +138,15 @@ fn only_owned_class_rows_are_exported_across_a_diamond() {
     );
     let receipt = imported(&built);
     assert_eq!(receipt.modules.iter().map(|m| m.classes).sum::<usize>(), 2);
+    for artifact in &built.artifacts {
+        let rows = metadata(&artifact.bytes).reducibility;
+        if matches!(artifact.name.to_display_string().as_str(), "Left" | "Right") {
+            assert!(
+                rows.is_empty(),
+                "imports do not re-export another module's statuses"
+            );
+        }
+    }
 }
 
 #[test]
@@ -198,19 +242,32 @@ fn warm_class_artifacts_remain_byte_identical_and_writer_failures_preserve_cache
 }
 
 #[test]
-fn unsupported_instance_rows_cannot_escape_in_an_incomplete_artifact() {
+fn polymorphic_instances_survive_compilation_and_dual_checked_import() {
     let initial = Engine::builder().build_empty();
     let root = initial.logical_root(&KVMap::new());
     let source =
         format!("{CLASS}\ninstance mapperId (A : Type) : Mapper A := Mapper.mk (fun x => x)");
-    assert!(matches!(
-        build(&initial, &[("Main", &source)], OleanWriteBudget::default()),
-        Err(SourceModuleBuildError::Check(
-            SourceModuleCheckError::Extension { .. }
-        ))
-    ));
+    let built = build(&initial, &[("Main", &source)], OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
     assert_eq!(initial.logical_root(&KVMap::new()), root);
-    imported(&compiled(&[("Main", CLASS)]));
+    let rows = metadata(&built.artifacts[0].bytes).instances;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].declaration, name("mapperId"));
+    assert_eq!(
+        rows[0].keys,
+        [
+            source_extensions::InstanceKey::Const(name("Mapper"), 1),
+            source_extensions::InstanceKey::Star
+        ]
+    );
+    let receipt = imported(&built);
+    assert_eq!(receipt.modules[0].instances, 1);
+    receipt.engine.check_source_files(
+        &[b"def useMapper (A : Type) (x : A) : A := Mapper.apply x\ndef mapperIdentity (A : Type) (P : A -> Prop) (x : A) (h : P x) : P (Mapper.apply x) := h"],
+        &KVMap::new(), limits().source,
+    ).unwrap().into_complete().unwrap();
 }
 
 #[test]

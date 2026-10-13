@@ -285,7 +285,7 @@ fn quotient_induction_computes_a_dependent_proof() {
     let report = txn
         .unify(&Expr::mvar(proof.clone()), &induction(q.clone()), budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     // The hole is assigned the eliminator as written, not its computed proof: the
     // pin's `isDefEqQuickOther` assigns a metavariable the other side unreduced
     // (bead fln-eeew; the pin's `isDefEq ?out (Quot.lift …)` leaves `?out :=
@@ -302,7 +302,7 @@ fn a_quotient_valued_assignment_is_validated_by_k1() {
     let report = txn
         .unify(&Expr::mvar(id.clone()), &value, budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert_eq!(txn.mvars.get_assigned_expr(&id), Some(&value));
 }
 
@@ -321,7 +321,7 @@ fn a_later_major_assignment_reawakens_quotient_computation() {
         )
         .unwrap();
     assert_eq!(report.expression_assignments, vec![q]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -423,7 +423,7 @@ fn lift_preserves_distinct_source_and_result_universes() {
     let report = txn
         .unify(&expr, &Expr::mvar(out.clone()), budget())
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     // Assigned as written, as the pin assigns it (bead fln-eeew): measured with the
     // pinned `lean`, `isDefEq ?out (Quot.lift (fun _ => 9) h (Quot.mk r 0))` leaves
     // `?out := Quot.lift (fun x => 9) ⋯ (Quot.mk r 0)`. `k1_proves_computation`
@@ -636,7 +636,7 @@ fn quotient_branches_feed_ordinary_higher_order_pattern_inference() {
     );
     let report = txn.unify(&expr, &x, budget()).unwrap();
     assert_eq!(report.expression_assignments, vec![f.clone()]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     assert!(
         txn.mvars.get_assigned_expr(&h).is_none(),
         "computation is not a proof of the respectfulness obligation"
@@ -688,7 +688,7 @@ fn final_barrier_cancellation_discards_quotient_assignments() {
             false
         })
         .unwrap();
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
     let stop = polls.get();
     let calls = Cell::new(0_u64);
     let mut cancelled = initial.clone();

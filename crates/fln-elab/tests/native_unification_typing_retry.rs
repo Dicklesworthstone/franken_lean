@@ -110,7 +110,7 @@ fn a_later_function_type_revives_an_earlier_unavailable_assignment_hint() {
                 .unify_many_with(&equations, budget(), &|| false)
                 .unwrap();
             assert_eq!(report.expression_assignments.len(), 3);
-            assert_eq!(report.kernel_checks, 3);
+            assert_eq!(report.kernel_checks, 6);
             assert!(report.residual_metavariables.is_empty());
             txn.unify(&Expr::mvar(result_type), &function_type(), budget())
                 .unwrap();
@@ -145,7 +145,7 @@ fn newly_inferred_types_unlock_further_hints_across_multiple_generations() {
         ];
         let selected: Vec<_> = order.into_iter().map(|i| equations[i].clone()).collect();
         let report = txn.unify_many_with(&selected, budget(), &|| false).unwrap();
-        assert_eq!(report.kernel_checks, 5);
+        assert_eq!(report.kernel_checks, 10);
         assert!(report.residual_metavariables.is_empty());
         txn.unify(&Expr::mvar(t1), &function_type(), budget())
             .unwrap();
@@ -168,7 +168,7 @@ fn a_later_sort_enables_previously_blocked_pi_formation() {
     let report = txn
         .unify_many_with(&equations, budget(), &|| false)
         .unwrap();
-    assert_eq!(report.kernel_checks, 3);
+    assert_eq!(report.kernel_checks, 6);
     assert_eq!(
         txn.mvars.get_assigned_expr(&t),
         Some(&Expr::sort(Level::one()))

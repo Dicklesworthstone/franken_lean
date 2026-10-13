@@ -45,13 +45,220 @@ fn cons(head: Syntax, tail: Syntax) -> Syntax {
     application(constructor("cons"), vec![head, tail])
 }
 
+/// The index notations of `Init/GetElem.lean`.
+const INDEX_KINDS: [&str; 4] = ["term__[_]", "term__[_]'_", "term__[_]_?", "term__[_]_!"];
+
 pub(super) fn is_notation(syntax: &Syntax) -> bool {
     syntax.kind().is_some_and(|kind| {
-        kind == &Name::from_components(["term[_]"]) || kind == &Name::from_components(["term_::_"])
+        INDEX_KINDS
+            .iter()
+            .any(|index| kind == &Name::from_components([*index]))
+            || kind == &Name::from_components(["term[_]"])
+            || kind == &Name::from_components(["term#[_,]"])
+            || kind == &Name::from_components(["term{_:_//_}"])
+            || kind == &Name::from_components(["term_::_"])
+            || kind == &parser_kind(&["Term", "tuple"])
     })
 }
 
+fn root_ident(components: &[&str]) -> Syntax {
+    Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default(),
+        val: Name::from_components(std::iter::once("_root_").chain(components.iter().copied())),
+        preresolved: Vec::new(),
+    }
+}
+
+/// `by first | done | assumption`: the alternatives of the pin's `get_elem_tactic`
+/// (`Init/Tactics.lean`) this frontend runs as the pin does. The pin then tries
+/// `get_elem_tactic_extensible` (`omega`, `simp +arith; done`, `trivial`, ...); here the
+/// `first` fails instead, and the index is refused.
+fn get_elem_tactic() -> Syntax {
+    let sequence = |tactic: Syntax| {
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticSeq"]),
+            vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                vec![null(vec![tactic])],
+            )],
+        )
+    };
+    let alternative = |name: &str| {
+        Syntax::node(
+            Name::from_components(["group"]),
+            vec![
+                atom("|"),
+                sequence(Syntax::node(
+                    parser_kind(&["Tactic", name]),
+                    vec![atom(name)],
+                )),
+            ],
+        )
+    };
+    Syntax::node(
+        parser_kind(&["Term", "byTactic"]),
+        vec![
+            atom("by"),
+            sequence(Syntax::node(
+                parser_kind(&["Tactic", "first"]),
+                vec![
+                    atom("first"),
+                    null(vec![alternative("done"), alternative("assumption")]),
+                ],
+            )),
+        ],
+    )
+}
+
+/// The index notations' macros (`Init/GetElem.lean`), each to its exported method resolved where
+/// it is defined:
+/// - `x[i]` is `getElem x i (by get_elem_tactic)`;
+/// - `x[i]'h` is `getElem x i h`;
+/// - `x[i]?` is `getElem? x i`;
+/// - `x[i]!` is `getElem! x i`.
+///
+/// None is a pattern.
+fn expand_index(
+    kind: &Name,
+    args: Vec<Syntax>,
+    pattern: bool,
+) -> Result<Syntax, NatDefinitionElabError> {
+    if pattern {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    if kind == &Name::from_components(["term__[_]"]) {
+        let Ok([x, open, i, close]) = <[Syntax; 4]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "index opener")?;
+        expect_atom(&close, "]", "index closer")?;
+        return Ok(application(
+            root_ident(&["GetElem", "getElem"]),
+            vec![x, i, get_elem_tactic()],
+        ));
+    }
+    if kind == &Name::from_components(["term__[_]'_"]) {
+        let Ok([x, open, i, close, proof]) = <[Syntax; 5]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "index opener")?;
+        expect_atom(&close, "]'", "index closer")?;
+        return Ok(application(
+            root_ident(&["GetElem", "getElem"]),
+            vec![x, i, proof],
+        ));
+    }
+    let Ok([x, _, open, i, close, _, mark]) = <[Syntax; 7]>::try_from(args) else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    expect_atom(&open, "[", "index opener")?;
+    expect_atom(&close, "]", "index closer")?;
+    let method = if kind == &Name::from_components(["term__[_]_?"]) {
+        expect_atom(&mark, "?", "optional index mark")?;
+        "getElem?"
+    } else {
+        expect_atom(&mark, "!", "checked index mark")?;
+        "getElem!"
+    };
+    Ok(application(root_ident(&["GetElem?", method]), vec![x, i]))
+}
+
+/// `{x // p}` is `Subtype (fun (x : _) => p)` and `{x : T // p}` is `Subtype (fun (x : T) =>
+/// p)`, the macro's quoted `Subtype` resolved where it is defined (`Init/Core.lean`). Not a
+/// pattern here.
+fn expand_subtype(args: Vec<Syntax>, pattern: bool) -> Result<Syntax, NatDefinitionElabError> {
+    if pattern {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let Ok([open, name, type_, separator, predicate, close]) = <[Syntax; 6]>::try_from(args) else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    expect_atom(&open, "{", "subtype opener")?;
+    expect_atom(&separator, "//", "subtype separator")?;
+    expect_atom(&close, "}", "subtype closer")?;
+    if !matches!(name, Syntax::Ident { .. }) {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let annotation = match expect_null_args(&type_, "subtype binder type")? {
+        [] => null(Vec::new()),
+        [colon, domain] => {
+            expect_atom(colon, ":", "subtype binder colon")?;
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "typeSpec"]),
+                vec![atom(":"), domain.clone()],
+            )])
+        }
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    };
+    let lambda = Syntax::node(
+        parser_kind(&["Term", "fun"]),
+        vec![
+            atom("fun"),
+            Syntax::node(
+                parser_kind(&["Term", "basicFun"]),
+                vec![null(vec![name]), annotation, atom("=>"), predicate],
+            ),
+        ],
+    );
+    let head = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default(),
+        val: Name::from_components(["_root_", "Subtype"]),
+        preresolved: Vec::new(),
+    };
+    Ok(application(head, vec![lambda]))
+}
+
+fn pair(first: Syntax, second: Syntax) -> Syntax {
+    let head = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default(),
+        // The macro's quoted `Prod.mk` is resolved where the macro is defined.
+        val: Name::from_components(["_root_", "Prod", "mk"]),
+        preresolved: Vec::new(),
+    };
+    application(head, vec![first, second])
+}
+
 impl Context {
+    /// A tuple's body `[e "," [es,*]]` as `mkPairs` builds it (`expandTuple`,
+    /// `Lean/Elab/BuiltinNotation.lean:414`): `Prod.mk e₀ (Prod.mk e₁ … eₙ)`, nested right.
+    fn expand_pairs(&mut self, mut body: Syntax) -> Result<Syntax, NatDefinitionElabError> {
+        let parts = expect_null_args(&body, "tuple body")?;
+        let [_, separator, rest] = parts else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(separator, ",", "tuple separator")?;
+        // `sepBy1 term ", " (allowTrailingSep := true)`: terms at even positions, at least one.
+        let rest = expect_null_args(rest, "tuple elements")?;
+        if rest.is_empty() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        for (index, element) in rest.iter().enumerate() {
+            self.tick()?;
+            if index % 2 == 1 {
+                expect_atom(element, ",", "tuple separator")?;
+            }
+        }
+        let Syntax::Node { args: parts, .. } = &mut body else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut rest = parts.pop().expect("validated tuple elements");
+        let first = parts.swap_remove(0);
+        let Syntax::Node { args: rest, .. } = &mut rest else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut elements: Vec<Syntax> = std::mem::take(rest).into_iter().step_by(2).collect();
+        elements.insert(0, first);
+        let mut tuple = elements.pop().expect("a tuple has two elements");
+        while let Some(element) = elements.pop() {
+            self.tick()?;
+            tuple = pair(element, tuple);
+        }
+        Ok(tuple)
+    }
+
     /// Called by the existing inside-out pattern-planning traversal. Children
     /// are already lowered; the pattern flag comes from matchAlt's pattern slot.
     /// This leaves that traversal's recursion-root and source-row witnesses intact.
@@ -66,13 +273,63 @@ impl Context {
         let Syntax::Node { kind, args, .. } = &mut syntax else {
             return Err(failure(SourceInferenceError::Scope));
         };
+        if kind == &Name::from_components(["term{_:_//_}"]) {
+            return expand_subtype(std::mem::take(args), pattern);
+        }
+        if INDEX_KINDS
+            .iter()
+            .any(|index| kind == &Name::from_components([*index]))
+        {
+            return expand_index(kind, std::mem::take(args), pattern);
+        }
         if args.len() != 3 {
             return Err(failure(SourceInferenceError::Scope));
         }
-        let literal = kind == &Name::from_components(["term[_]"]);
+        if kind == &parser_kind(&["Term", "tuple"]) {
+            let opener = expect_node(
+                &args[0],
+                &parser_kind(&["Term", "hygienicLParen"]),
+                2,
+                "empty tuple hygienic opener",
+            )?;
+            expect_atom(&opener[0], "(", "empty tuple opener")?;
+            let hygiene = expect_node(
+                &opener[1],
+                &Name::from_components(["hygieneInfo"]),
+                1,
+                "empty tuple hygiene information",
+            )?;
+            if !matches!(hygiene, [Syntax::Ident { val, .. }] if val.is_anonymous()) {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            expect_atom(&args[2], ")", "empty tuple closer")?;
+            if !expect_null_args(&args[1], "tuple optional body")?.is_empty() {
+                return self.expand_pairs(std::mem::replace(&mut args[1], null(Vec::new())));
+            }
+            // The pinned expandTuple macro chooses Unit.unit, whose universe
+            // is fixed. A generic PUnit.unit would accept additional types.
+            // Root qualification preserves that macro reference under local
+            // binders and namespaces; ordinary constant checking still applies.
+            return Ok(Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::default(),
+                val: Name::from_components(["_root_", "Unit", "unit"]),
+                preresolved: Vec::new(),
+            });
+        }
+        // `#[a, b]` is `List.toArray [a, b]` (`Init/Data/Array/Basic.lean`); not a pattern here.
+        let array = kind == &Name::from_components(["term#[_,]"]);
+        if array && pattern {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let literal = array || kind == &Name::from_components(["term[_]"]);
         let mut args = std::mem::take(args);
         if literal {
-            expect_atom(&args[0], "[", "list literal opener")?;
+            expect_atom(
+                &args[0],
+                if array { "#[" } else { "[" },
+                "list literal opener",
+            )?;
             expect_atom(&args[2], "]", "list literal closer")?;
             // Validate separators before taking ownership. A hand-constructed
             // malformed tree must not hide a term in a separator slot.
@@ -95,6 +352,16 @@ impl Context {
                 if index % 2 == 0 {
                     tail = cons(element, tail);
                 }
+            }
+            if array {
+                let to_array = Syntax::Ident {
+                    info: SourceInfo::None,
+                    raw_val: ByteSpan::default(),
+                    // The macro's quoted `List.toArray` is resolved where it is defined.
+                    val: Name::from_components(["_root_", "List", "toArray"]),
+                    preresolved: Vec::new(),
+                };
+                return Ok(application(to_array, vec![tail]));
             }
             Ok(tail)
         } else {
@@ -125,6 +392,138 @@ mod tests {
     }
     fn number(n: &str) -> Syntax {
         Syntax::node(Name::from_components(["num"]), vec![atom(n)])
+    }
+
+    fn empty_tuple() -> Syntax {
+        let hygiene = Syntax::node(
+            Name::from_components(["hygieneInfo"]),
+            vec![Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::default(),
+                val: Name::anonymous(),
+                preresolved: Vec::new(),
+            }],
+        );
+        Syntax::node(
+            parser_kind(&["Term", "tuple"]),
+            vec![
+                Syntax::node(
+                    parser_kind(&["Term", "hygienicLParen"]),
+                    vec![atom("("), hygiene],
+                ),
+                null(vec![]),
+                atom(")"),
+            ],
+        )
+    }
+
+    #[test]
+    fn empty_tuple_expands_to_the_fixed_global_unit_constant() {
+        let expanded = context()
+            .expand_collection_node(empty_tuple(), false)
+            .unwrap();
+        assert!(matches!(&expanded, Syntax::Ident { val, .. }
+            if val == &Name::from_components(["_root_", "Unit", "unit"])));
+    }
+
+    #[test]
+    fn empty_tuple_expansion_cannot_discard_a_body_or_malformed_delimiters() {
+        for replacement in [number("42"), null(vec![number("42")])] {
+            let mut tuple = empty_tuple();
+            let Syntax::Node { args, .. } = &mut tuple else {
+                unreachable!();
+            };
+            args[1] = replacement;
+            assert!(context().expand_collection_node(tuple, false).is_err());
+        }
+        for index in [0, 2] {
+            let mut tuple = empty_tuple();
+            let Syntax::Node { args, .. } = &mut tuple else {
+                unreachable!();
+            };
+            args[index] = atom("not a delimiter");
+            assert!(context().expand_collection_node(tuple, false).is_err());
+        }
+        let mut tuple = empty_tuple();
+        let Syntax::Node { args, .. } = &mut tuple else {
+            unreachable!();
+        };
+        let Syntax::Node { args, .. } = &mut args[0] else {
+            unreachable!();
+        };
+        args[1] = null(vec![]);
+        assert!(context().expand_collection_node(tuple, false).is_err());
+    }
+
+    fn tuple(body: Vec<Syntax>) -> Syntax {
+        let mut tuple = empty_tuple();
+        let Syntax::Node { args, .. } = &mut tuple else {
+            unreachable!();
+        };
+        args[1] = null(body);
+        tuple
+    }
+
+    /// `Prod.mk head tail`, or `None` for anything else.
+    fn pair_parts(syntax: &Syntax) -> Option<(&Syntax, &Syntax)> {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return None;
+        };
+        if kind != &parser_kind(&["Term", "app"]) {
+            return None;
+        }
+        let Syntax::Ident { val, .. } = &args[0] else {
+            return None;
+        };
+        if val != &Name::from_components(["_root_", "Prod", "mk"]) {
+            return None;
+        }
+        match expect_null_args(&args[1], "pair arguments").ok()? {
+            [head, tail] => Some((head, tail)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_tuple_expands_to_right_nested_root_pairs() {
+        let body = || {
+            vec![
+                number("1"),
+                atom(","),
+                null(vec![number("2"), atom(","), number("3")]),
+            ]
+        };
+        let expanded = context()
+            .expand_collection_node(tuple(body()), false)
+            .unwrap();
+        let (first, rest) = pair_parts(&expanded).expect("an outer pair");
+        assert_eq!(first, &number("1"));
+        let (second, third) = pair_parts(rest).expect("an inner pair");
+        assert_eq!((second, third), (&number("2"), &number("3")));
+        // A trailing comma adds no element.
+        let trailing = vec![number("1"), atom(","), null(vec![number("2"), atom(",")])];
+        let expanded = context()
+            .expand_collection_node(tuple(trailing), false)
+            .unwrap();
+        assert_eq!(pair_parts(&expanded), Some((&number("1"), &number("2"))));
+    }
+
+    #[test]
+    fn a_malformed_tuple_body_is_refused_not_reinterpreted() {
+        for body in [
+            vec![number("1")],
+            vec![number("1"), atom(",")],
+            vec![number("1"), atom(","), null(vec![])],
+            vec![number("1"), atom(";"), null(vec![number("2")])],
+            vec![number("1"), atom(","), null(vec![number("2"), number("3")])],
+            vec![number("1"), atom(","), number("2")],
+        ] {
+            assert!(
+                context()
+                    .expand_collection_node(tuple(body), false)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

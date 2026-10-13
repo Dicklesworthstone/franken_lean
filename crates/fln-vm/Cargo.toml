@@ -11,4 +11,5 @@ fln-bignum = { path = "../fln-bignum" }
 fln-core = { path = "../fln-core" }
 fln-comp = { path = "../fln-comp" }
 fln-hash = { path = "../fln-hash" }
+fln-libm = { path = "../fln-libm" }
 fln-rt = { path = "../fln-rt" }

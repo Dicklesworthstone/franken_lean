@@ -6,6 +6,8 @@
 //! elaborator. Every original row has an elaboration witness: a redundant row
 //! cannot hide an ill-typed body when a generated fallback is unnecessary.
 use super::*;
+mod coverage;
+mod functions;
 mod literals;
 use fln_env::constants::ConstantInfo;
 use fln_syntax::source::{ByteSpan, SourceInfo};
@@ -167,6 +169,293 @@ fn complex(syntax: &Syntax, environment: &Environment) -> bool {
     })
 }
 
+/// The element patterns of `⟨p, …⟩`, if `syntax` is one.
+fn anonymous_elements(syntax: &Syntax) -> Result<Option<Vec<&Syntax>>, NatDefinitionElabError> {
+    let kind = parser_kind(&["Term", "anonymousCtor"]);
+    if syntax.kind() != Some(&kind) {
+        return Ok(None);
+    }
+    let parts = expect_node(syntax, &kind, 3, "anonymous constructor pattern")?;
+    expect_atom(&parts[0], "⟨", "anonymous constructor opener")?;
+    expect_atom(&parts[2], "⟩", "anonymous constructor closer")?;
+    let items = expect_null_args(&parts[1], "anonymous constructor fields")?;
+    let mut elements = Vec::with_capacity(items.len().div_ceil(2));
+    for (index, item) in items.iter().enumerate() {
+        if index % 2 == 0 {
+            elements.push(item);
+        } else {
+            expect_atom(item, ",", "anonymous constructor separator")?;
+        }
+    }
+    if items.len() % 2 == 0 && !items.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Some(elements))
+}
+
+/// The head standing for "the only constructor" in a generated match.
+pub(super) fn anonymous_head() -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "anonymousCtor"]),
+        vec![atom("⟨"), null(Vec::new()), atom("⟩")],
+    )
+}
+
+/// `if let p := e then a else b` is `match e with | p => a | _ => b` (`termIfLet`'s macro,
+/// `Init/Notation.lean`).
+fn expand_if_let(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["termIfLet"]) && args.len() == 9);
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let mut take = |index: usize| std::mem::replace(&mut args[index], null(vec![]));
+    let (case, value, yes, no) = (take(2), take(4), take(6), take(8));
+    let alternative = |pattern: Syntax, body: Syntax| {
+        Syntax::node(
+            parser_kind(&["Term", "matchAlt"]),
+            vec![atom("|"), null(vec![null(vec![pattern])]), atom("=>"), body],
+        )
+    };
+    Syntax::node(
+        parser_kind(&["Term", "match"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), value],
+            )]),
+            atom("with"),
+            Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null(vec![
+                    alternative(case, yes),
+                    alternative(
+                        Syntax::node(parser_kind(&["Term", "hole"]), vec![atom("_")]),
+                        no,
+                    ),
+                ])],
+            ),
+        ],
+    )
+}
+
+/// `e matches p | q` is `match e with | p => true | q => true | _ => false` (the macro of
+/// `Lean.«term_Matches_|»`, `Init/Notation.lean`, which shares one `true` between the
+/// alternatives; one alternative per pattern means the same).
+fn expand_matches(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["Lean", "term_Matches_|"]) && args.len() == 3);
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let value = std::mem::replace(&mut args[0], null(vec![]));
+    let Syntax::Node { args: listed, .. } = &mut args[2] else {
+        return syntax;
+    };
+    let alternative = |pattern: Syntax, body: Syntax| {
+        Syntax::node(
+            parser_kind(&["Term", "matchAlt"]),
+            vec![atom("|"), null(vec![null(vec![pattern])]), atom("=>"), body],
+        )
+    };
+    let mut alternatives: Vec<Syntax> = listed
+        .iter()
+        .step_by(2)
+        .map(|pattern| {
+            alternative(
+                pattern.clone(),
+                identifier(Name::from_components(["Bool", "true"])),
+            )
+        })
+        .collect();
+    alternatives.push(alternative(
+        wildcard(),
+        identifier(Name::from_components(["Bool", "false"])),
+    ));
+    Syntax::node(
+        parser_kind(&["Term", "match"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), value],
+            )]),
+            atom("with"),
+            Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null(alternatives)],
+            ),
+        ],
+    )
+}
+
+/// Whether `syntax` is a term `let` whose declaration is a pattern (`letPatDecl`, `let ⟨a, b⟩ := p`)
+/// with no `letConfig` option, which [`expand_let_pattern`] rewrites.
+fn let_pattern(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Term", "let"])
+            && args.len() == 5
+            && matches!(&args[1], Syntax::Node { kind, args: config, .. }
+                if kind == &parser_kind(&["Term", "letConfig"])
+                    && matches!(config.as_slice(), [Syntax::Node { args: options, .. }]
+                        if options.is_empty()))
+            && matches!(&args[2], Syntax::Node { kind, args: declaration, .. }
+                if kind == &parser_kind(&["Term", "letDecl"])
+                    && matches!(declaration.as_slice(), [Syntax::Node { kind, args: parts, .. }]
+                        if kind == &parser_kind(&["Term", "letPatDecl"])
+                            && parts.len() == 5
+                            && parts[0].kind() != Some(&parser_kind(&["Term", "hole"]))
+                            && matches!(&parts[1], Syntax::Node { args, .. } if args.is_empty()))))
+}
+
+/// `let p := v; b` with a pattern is `match v with | p => b`, and `let p : T := v; b` is
+/// `match (v : T) with | p => b` (`elabLetDeclCore`'s `letPatDecl` case, `Lean/Elab/Binders.lean`).
+fn expand_let_pattern(mut syntax: Syntax, pattern: bool) -> Syntax {
+    if pattern || !let_pattern(&syntax) {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked let");
+    };
+    let body = std::mem::replace(&mut args[4], null(vec![]));
+    let Syntax::Node {
+        args: declaration, ..
+    } = &mut args[2]
+    else {
+        unreachable!("checked declaration");
+    };
+    let Syntax::Node { args: parts, .. } = &mut declaration[0] else {
+        unreachable!("checked pattern declaration");
+    };
+    let case = std::mem::replace(&mut parts[0], null(vec![]));
+    let value = std::mem::replace(&mut parts[4], null(vec![]));
+    let annotation = match &mut parts[2] {
+        Syntax::Node { args: spec, .. } => match spec.as_mut_slice() {
+            [Syntax::Node { args: typed, .. }] if typed.len() == 2 => {
+                Some(std::mem::replace(&mut typed[1], null(vec![])))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let value = match annotation {
+        Some(type_) => Syntax::node(
+            parser_kind(&["Term", "typeAscription"]),
+            vec![atom("("), value, atom(":"), null(vec![type_]), atom(")")],
+        ),
+        None => value,
+    };
+    Syntax::node(
+        parser_kind(&["Term", "match"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), value],
+            )]),
+            atom("with"),
+            Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null(vec![Syntax::node(
+                    parser_kind(&["Term", "matchAlt"]),
+                    vec![atom("|"), null(vec![null(vec![case])]), atom("=>"), body],
+                )])],
+            ),
+        ],
+    )
+}
+
+/// `‹T›` is `(by assumption : T)` (`macro "‹" type:term "›" : term`, `Init/Tactics.lean`).
+fn expand_assumption(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let rewrite = !pattern
+        && matches!(&syntax, Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["term‹_›"]) && args.len() == 3);
+    if !rewrite {
+        return syntax;
+    }
+    let Syntax::Node { args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let type_ = std::mem::replace(&mut args[1], null(vec![]));
+    let proof = Syntax::node(
+        parser_kind(&["Term", "byTactic"]),
+        vec![
+            atom("by"),
+            Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq"]),
+                vec![Syntax::node(
+                    parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                    vec![null(vec![Syntax::node(
+                        parser_kind(&["Tactic", "assumption"]),
+                        vec![atom("assumption")],
+                    )])],
+                )],
+            ),
+        ],
+    );
+    Syntax::node(
+        parser_kind(&["Term", "typeAscription"]),
+        vec![atom("("), proof, atom(":"), null(vec![type_]), atom(")")],
+    )
+}
+
+/// Whether the lambda has destructuring binders requiring native expansion.
+fn fun_patterns(syntax: &Syntax) -> bool {
+    functions::needs_expansion(syntax)
+}
+
+/// A field defined by equations, `toString | true => "t" | false => "f"`, is the field
+/// `toString := fun | true => "t" | false => "f"`. The equations become the pattern lambda when
+/// their own node is rebuilt (and are compiled there, as any `fun | …`); the field holding a bare
+/// lambda in its definition slot, which only this produces, then gets its `:=` definition.
+fn expand_field_equations(mut syntax: Syntax, pattern: bool) -> Syntax {
+    if pattern {
+        return syntax;
+    }
+    let equations = parser_kind(&["Term", "structInstFieldEqns"]);
+    let field = parser_kind(&["Term", "structInstField"]);
+    let lambda = parser_kind(&["Term", "fun"]);
+    match &mut syntax {
+        Syntax::Node { kind, args, .. }
+            if *kind == equations
+                && args.len() == 2
+                && matches!(&args[0], Syntax::Node { args, .. } if args.is_empty()) =>
+        {
+            let alternatives = std::mem::replace(&mut args[1], null(vec![]));
+            Syntax::node(lambda, vec![atom("fun"), alternatives])
+        }
+        Syntax::Node { kind, args, .. } if *kind == field && args.len() == 2 => {
+            if let Syntax::Node { args: payload, .. } = &mut args[1]
+                && payload.len() == 3
+                && payload[2].kind() == Some(&lambda)
+            {
+                let value = std::mem::replace(&mut payload[2], null(vec![]));
+                payload[2] = Syntax::node(
+                    parser_kind(&["Term", "structInstFieldDef"]),
+                    vec![atom(":="), null(vec![]), value],
+                );
+            }
+            syntax
+        }
+        _ => syntax,
+    }
+}
+
 fn pattern_function(syntax: &Syntax) -> bool {
     matches!(syntax, Syntax::Node {kind,args,..}
         if kind == &parser_kind(&["Term","fun"])
@@ -242,7 +531,10 @@ impl Context {
         // They also satisfy the ordinary backend's unqualified-name invariant.
         Ok(Name::num(Name::anonymous(), id))
     }
-    fn copy_pattern_syntax(&mut self, syntax: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
+    pub(super) fn copy_pattern_syntax(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
         let mut pending = vec![syntax];
         while let Some(syntax) = pending.pop() {
             self.tick()?;
@@ -263,7 +555,7 @@ impl Context {
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
-            Constructor(Head, &'a Syntax, usize),
+            Constructor(Head, Cow<'a, Syntax>, usize),
         }
         let mut pending = vec![Task::Visit(syntax)];
         let mut values = Vec::new();
@@ -275,13 +567,28 @@ impl Context {
                     values.push(arena.len());
                     arena.push(Pattern::Constructor(Constructor {
                         head,
-                        syntax: Cow::Borrowed(syntax),
+                        syntax,
                         fields,
                     }));
                 }
                 Task::Visit(syntax) => {
                     if let Some(inner) = parenthesized_inner(syntax)? {
                         pending.push(Task::Visit(inner));
+                        continue;
+                    }
+                    // `⟨p, …⟩`: a constructor pattern whose head is the column type's only
+                    // constructor. The head is the empty `⟨⟩`, which the ordinary match
+                    // backend resolves against the discriminant's family.
+                    if let Some(elements) = anonymous_elements(syntax)? {
+                        pending.push(Task::Constructor(
+                            Head {
+                                relative: true,
+                                name: Name::anonymous(),
+                            },
+                            Cow::Owned(anonymous_head()),
+                            values.len(),
+                        ));
+                        pending.extend(elements.into_iter().rev().map(Task::Visit));
                         continue;
                     }
                     let (head, arguments) = if let Syntax::Node { kind, args, .. } = syntax
@@ -339,7 +646,11 @@ impl Context {
                         _ => None,
                     };
                     if let Some(head_key) = constructor {
-                        pending.push(Task::Constructor(head_key, head, values.len()));
+                        pending.push(Task::Constructor(
+                            head_key,
+                            Cow::Borrowed(head),
+                            values.len(),
+                        ));
                         pending.extend(arguments.iter().rev().map(Task::Visit));
                     } else {
                         if !arguments.is_empty() {
@@ -355,7 +666,7 @@ impl Context {
         values.pop().ok_or_else(invalid)
     }
 
-    fn compile_pattern_matrix(
+    pub(super) fn compile_pattern_matrix(
         &mut self,
         syntax: &Syntax,
         required: &mut Vec<Name>,
@@ -434,6 +745,35 @@ impl Context {
             // the original expression still occurs in precisely this binding.
             subjects.push(fresh.clone());
             inputs.push((fresh, self.copy_pattern_syntax(&parts[1])?));
+        }
+        // A match as written is typed as the pin types its patterns once every input is bound
+        // (`pattern_typing`); the bodies play no part, so only the pattern rows are kept.
+        if !recursive_root
+            && matches!(&parts[0], Syntax::Atom { info, .. } if matches!(info, SourceInfo::Original { .. }))
+            && let Some((last, _)) = inputs.last()
+        {
+            let mut patterns = Vec::new();
+            for alt in alts {
+                self.tick()?;
+                let parts =
+                    expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
+                patterns.push(Syntax::node(
+                    parser_kind(&["Term", "matchAlt"]),
+                    vec![
+                        parts[0].clone(),
+                        self.copy_pattern_syntax(&parts[1])?,
+                        parts[2].clone(),
+                        wildcard(),
+                    ],
+                ));
+            }
+            self.pattern_typing_checks.insert(
+                last.clone(),
+                (
+                    inputs.iter().map(|(name, _)| name.clone()).collect(),
+                    patterns,
+                ),
+            );
         }
         // Structural selection changes the decision-tree split, not argument
         // order or row priority. Original inputs retain their checked bindings.
@@ -626,8 +966,10 @@ impl Context {
                         canonical.insert(c.head.clone(), head);
                     }
                     let mut heads = Vec::new();
+                    let mut has_fallback = false;
                     for row in &matrix.rows {
                         self.tick()?;
+                        has_fallback |= matches!(&arena[row.patterns[0]], Pattern::Bind(_));
                         if let Pattern::Constructor(constructor) = &arena[row.patterns[0]]
                             && !heads.iter().any(|h: &usize| matches!(&arena[*h], Pattern::Constructor(c) if canonical[&c.head] == canonical[&constructor.head]))
                         { heads.push(row.patterns[0]); }
@@ -646,6 +988,8 @@ impl Context {
                         pending.push(Task::Build(matrix));
                         continue;
                     }
+                    let needs_fallback = has_fallback
+                        && !self.matrix_constructors_exhaustive(&heads, &arena, &canonical)?;
                     let mut branches = Vec::new();
                     let mut alternatives = Vec::new();
                     for pattern in heads {
@@ -690,9 +1034,17 @@ impl Context {
                             // environment already. Preserve that identity on
                             // re-entry: an enclosing namespace may contain a
                             // different declaration with the same suffix.
-                            identifier(
-                                Name::from_components(["_root_"]).append_core(&resolved.name),
-                            )
+                            let name =
+                                if self.source_scope.user_name(&resolved.name) != resolved.name {
+                                    // A current-module private core name is
+                                    // already exact. `_root_` is a source prefix;
+                                    // putting it before an internal numeric name
+                                    // would make that identity unrecognizable.
+                                    resolved.name.clone()
+                                } else {
+                                    Name::from_components(["_root_"]).append_core(&resolved.name)
+                                };
+                            identifier(name)
                         };
                         let pattern = if fields.is_empty() {
                             head
@@ -709,15 +1061,26 @@ impl Context {
                             recursive_root: false,
                         });
                     }
+                    // Catchall rows already participate, in source order, in
+                    // every explicit constructor branch. When those branches
+                    // cover the family there is no additional input on which
+                    // to run the catchall-only submatrix. Compiling it anyway
+                    // can invent a coverage failure in a later literal column
+                    // (notably when structural recursion reorders columns).
+                    // Keep every row's required elaboration witness: dropping
+                    // an unreachable fallback must not hide an invalid body.
                     let mut fallback = Vec::new();
-                    for row in matrix.rows {
-                        if let Pattern::Bind(name) = &arena[row.patterns[0]] {
-                            let mut copy = row.clone();
-                            copy.patterns.remove(0);
-                            if let Some(name) = name {
-                                copy.bindings.push((name.clone(), subject.clone()));
+                    if needs_fallback {
+                        for row in matrix.rows {
+                            self.tick()?;
+                            if let Pattern::Bind(name) = &arena[row.patterns[0]] {
+                                let mut copy = row.clone();
+                                copy.patterns.remove(0);
+                                if let Some(name) = name {
+                                    copy.bindings.push((name.clone(), subject.clone()));
+                                }
+                                fallback.push(copy);
                             }
-                            fallback.push(copy);
                         }
                     }
                     if !fallback.is_empty() {
@@ -778,35 +1141,129 @@ impl Context {
     }
 
     /// Rebuild once, inside out. Ordinary flat matches are not cloned or changed.
+    /// `| p₁ | p₂ => rhs` as `| p₁ => rhs` and `| p₂ => rhs`: the pin's `expandMatchAlt`
+    /// (vendored Lean/Elab/BindersUtil.lean), which its term and do `match` apply to their
+    /// alternatives before elaborating them, as its equations do through `expandEqnsIntoMatch`.
+    /// Each copy keeps the same right-hand side. A name one group binds and another does not is
+    /// then simply unbound in that copy, as at the pin.
+    pub(super) fn expand_match_alternatives<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        let mut scan = vec![syntax];
+        let mut needed = false;
+        while let Some(node) = scan.pop() {
+            self.tick()?;
+            if alternative_groups(node) > 1 {
+                needed = true;
+                break;
+            }
+            if let Syntax::Node { args, .. } = node {
+                scan.extend(args);
+            }
+        }
+        if !needed {
+            return Ok(Cow::Borrowed(syntax));
+        }
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(&'a Syntax, usize),
+        }
+        let null = Name::from_components(["null"]);
+        let mut tasks = vec![Task::Visit(syntax)];
+        let mut built: Vec<Syntax> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(node @ Syntax::Node { args, .. }) => {
+                    tasks.push(Task::Build(node, built.len()));
+                    tasks.extend(args.iter().rev().map(Task::Visit));
+                }
+                Task::Visit(leaf) => built.push(leaf.clone()),
+                Task::Build(Syntax::Node { info, kind, .. }, start) => {
+                    let mut args = built.split_off(start);
+                    // Alternatives live in the `null` node of their `matchAlts`.
+                    if *kind == null && args.iter().any(|arg| alternative_groups(arg) > 1) {
+                        args = args.into_iter().flat_map(split_alternative).collect();
+                    }
+                    built.push(Syntax::Node {
+                        info: *info,
+                        kind: kind.clone(),
+                        args,
+                    });
+                }
+                Task::Build(..) => unreachable!("only nodes are built"),
+            }
+        }
+        built
+            .pop()
+            .map(Cow::Owned)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))
+    }
+
     pub(super) fn lower_pattern_matrices<'a>(
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
         let mut scan = vec![syntax];
         let mut needed = false;
+        let mut mutation = false;
+        let mut nested = false;
+        let mut loops = false;
         let mut local_roots = HashSet::new();
         while let Some(node) = scan.pop() {
             self.tick()?;
             if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) {
                 continue;
             }
+            mutation |= do_notation::is_mutation(node);
+            nested |= node.kind() == Some(&parser_kind(&["Term", "nestedAction"]));
+            loops |= do_notation::is_while_loop(node);
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || collections::is_notation(node)
                 || cdot::is_cdot(node)
-                || node.kind() == Some(&parser_kind(&["Term", "do"]));
+                || binders::is_exists(node)
+                || binders::is_binder_predicate(node)
+                || node.kind() == Some(&parser_kind(&["Term", "binderDefault"]))
+                || record_terms::is_field_notation(node)
+                || fun_patterns(node)
+                || node.kind() == Some(&Name::from_components(["term‹_›"]))
+                || node.kind() == Some(&Name::from_components(["termIfLet"]))
+                || let_pattern(node)
+                || node.kind() == Some(&Name::from_components(["Lean", "term_Matches_|"]))
+                || node.kind() == Some(&parser_kind(&["Term", "structInstFieldEqns"]))
+                || node.kind() == Some(&parser_kind(&["Term", "do"]))
+                || do_notation::is_term_block(node);
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
                     let binding = self.let_parts(args, false, true)?;
-                    let mut root = binding.value;
-                    while let Some(inner) = parenthesized_inner(root)? {
-                        self.tick()?;
-                        root = inner;
-                    }
+                    let root = self.recursive_lambda_body(binding.value)?;
                     local_roots.insert(std::ptr::from_ref(root));
                 }
                 scan.extend(args);
             }
+        }
+        // `while` is its `for` loop first: the pin's macro expands before the element elaborates.
+        if loops {
+            let expanded = self.expand_while_loops(syntax)?;
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&expanded)?.into_owned(),
+            ));
+        }
+        // `(← e)` becomes `let x ← e` before its element first, as the pin expands an element's
+        // nested actions before elaborating it; a reassignment's action is then the mutation's.
+        if nested && let Some(lifted) = self.lift_nested_actions(syntax)? {
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&lifted)?.into_owned(),
+            ));
+        }
+        if mutation {
+            // `let mut` and reassignment become immutable `do` first; the result has none left.
+            let rewritten = self.eliminate_do_mutation(syntax)?;
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&rewritten)?.into_owned(),
+            ));
         }
         if !needed {
             return Ok(Cow::Borrowed(syntax));
@@ -839,6 +1296,10 @@ impl Context {
                             || kind == &parser_kind(&["Term", "doIfLet"])
                         {
                             index == 1
+                        } else if kind == &Name::from_components(["termIfLet"])
+                            || kind == &Name::from_components(["Lean", "term_Matches_|"])
+                        {
+                            index == 2
                         } else if kind == &parser_kind(&["Term", "doPatDecl"])
                             || kind == &parser_kind(&["Term", "letPatDecl"])
                         {
@@ -860,6 +1321,17 @@ impl Context {
                     let node = self.expand_cdot_node(node, pattern)?;
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
+                    let node = self.expand_binder_predicate_node(node, pattern)?;
+                    let node = self.expand_optional_binder_node(node, pattern)?;
+                    let node = self.expand_exists_node(node, pattern)?;
+                    let node = self.expand_record_field_node(node, pattern)?;
+                    let node = self.expand_offset_pattern(node, pattern)?;
+                    let node = self.expand_fun_patterns(node, pattern)?;
+                    let node = expand_field_equations(node, pattern);
+                    let node = expand_assumption(node, pattern);
+                    let node = expand_if_let(node, pattern);
+                    let node = expand_let_pattern(node, pattern);
+                    let node = expand_matches(node, pattern);
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
                         && complex(&node, &self.txn.env)
@@ -944,4 +1416,46 @@ impl Context {
             bodies,
         ))
     }
+}
+
+/// The number of pattern groups of a `matchAlt` (`| p₁ | p₂ => rhs` has two), else 0.
+fn alternative_groups(syntax: &Syntax) -> usize {
+    match syntax {
+        Syntax::Node { kind, args, .. }
+            if *kind == parser_kind(&["Term", "matchAlt"]) && args.len() == 4 =>
+        {
+            match &args[1] {
+                Syntax::Node { args: groups, .. } => groups.len().div_ceil(2),
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// One `matchAlt` per pattern group, each with the alternative's own `|`, `=>` and right-hand side.
+fn split_alternative(alternative: Syntax) -> Vec<Syntax> {
+    if alternative_groups(&alternative) <= 1 {
+        return vec![alternative];
+    }
+    let Syntax::Node { info, kind, args } = &alternative else {
+        unreachable!("an alternative with groups is a node");
+    };
+    let Syntax::Node { args: groups, .. } = &args[1] else {
+        unreachable!("an alternative's groups are a node");
+    };
+    groups
+        .iter()
+        .step_by(2)
+        .map(|group| Syntax::Node {
+            info: *info,
+            kind: kind.clone(),
+            args: vec![
+                args[0].clone(),
+                Syntax::node(Name::from_components(["null"]), vec![group.clone()]),
+                args[2].clone(),
+                args[3].clone(),
+            ],
+        })
+        .collect()
 }

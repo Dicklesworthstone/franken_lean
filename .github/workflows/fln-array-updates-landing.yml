@@ -1,0 +1,99 @@
+name: Native array updates - implement and verify
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-array-updates-landing.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-array-updates-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install repository-pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Prepare reviewed implementation and complete dispatch coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os
+          import subprocess
+          import textwrap
+          from pathlib import Path
+          original = subprocess.check_output([
+              "git", "show", "19bbd89ccdde44552e384708e7d7be6e2b0656c3:.github/workflows/fln-array-updates-landing.yml"
+          ], text=True)
+          start = 'cat > "$RUNNER_TEMP/apply-array-updates.py" <<\'PY\'\n'
+          payload = textwrap.dedent(original.split(start, 1)[1].split("\n          PY\n", 1)[0])
+          payload += '''
+          path = Path("crates/fln-vm/src/interpreter.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "        | IntrinsicImplementation::Float(_)"
+          new = "        | IntrinsicImplementation::ArrayExtra(_)\\n" + old
+          if text.count(old) != 1:
+              raise SystemExit("managerless dispatch anchor changed")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          '''
+          compile(payload, "apply-array-updates.py", "exec")
+          Path(os.environ["RUNNER_TEMP"], "apply-array-updates.py").write_text(payload, encoding="utf-8")
+          PY
+      - name: Test and commit array updates directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/array-updates-target"
+          git config user.name 'OpenAI coding assistant'
+          git config user.email 'noreply@openai.com'
+          for attempt in 1 2 3; do
+            git -C "$root" fetch origin main
+            work="$RUNNER_TEMP/array-updates-$attempt"
+            git -C "$root" worktree add --detach "$work" origin/main
+            cd "$work"
+            python3 -I "$RUNNER_TEMP/apply-array-updates.py"
+            rustfmt --edition 2024 crates/fln-vm/src/interpreter/arrays.rs crates/fln-vm/src/interpreter.rs crates/fln-vm/tests/flbc_interpreter.rs
+            git diff --check
+            cargo test --locked -p fln-vm --test flbc_interpreter array_updates_ -- --nocapture
+            cargo test --locked -p fln-vm --lib
+            cargo test --locked -p fln-vm --test flbc_interpreter
+            cargo clippy --locked -p fln-vm --lib --no-deps -- -D warnings
+            python3 -I - <<'PY'
+          import subprocess
+          allowed = {
+              "crates/fln-vm/src/interpreter.rs",
+              "crates/fln-vm/src/interpreter/arrays.rs",
+              "crates/fln-vm/tests/flbc_interpreter.rs",
+          }
+          changed = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          unexpected = [line for line in changed if line[3:] not in allowed]
+          if unexpected:
+              raise SystemExit(f"unexpected worktree changes: {unexpected}")
+          PY
+            git add -- crates/fln-vm/src/interpreter.rs crates/fln-vm/src/interpreter/arrays.rs crates/fln-vm/tests/flbc_interpreter.rs
+            git commit -m "feat(vm): execute array set, uset, pop and swap intrinsics" -m "Preserve aliases and row ownership through native Marrow objects. Refuse erased invalid bounds without truncating Nat indices, use boxed USize inputs, and preserve total swapIfInBounds/empty pop semantics. Add FLBC execution regressions for shared heap cells, reference release, invalid bounds and every swap pair. Verified with repository-pinned Rust: VM library and complete FLBC interpreter suites, plus library Clippy."
+            if git push origin HEAD:main; then
+              git rev-parse HEAD
+              exit 0
+            fi
+            echo "main advanced; replaying and retesting on its new tip"
+            cd "$root"
+          done
+          echo "Could not publish after three non-force fast-forward attempts" >&2
+          exit 1

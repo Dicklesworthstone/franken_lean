@@ -65,16 +65,17 @@ pub fn audit_instance_goal(
     };
     let ambient = context.txn.lctx.clone();
     let mut search = context.clone();
-    let Some(frame) = context.instance_frame(id.clone(), &registry, &ambient, None)? else {
+    let Some(frame) = context.instance_frame(id.clone(), &registry, &ambient, None, true)? else {
         return Ok(None);
     };
     search.txn.budget.heartbeats_consumed = 0;
     let choice = match search.search_instance(id.clone(), &registry) {
-        Ok(true) => match search.instantiate(&hole) {
+        Ok(SearchResult::Solved) => match search.instantiate(&hole) {
             Ok(value) => answer_head(&value).map_or(Choice::Inconclusive, Choice::Instance),
             Err(_) => Choice::Inconclusive,
         },
-        Ok(false) => Choice::NoAnswer,
+        Ok(SearchResult::Failed) => Choice::NoAnswer,
+        Ok(SearchResult::Stuck) => Choice::Inconclusive,
         Err(error) if nonmatch(&error) => Choice::NoAnswer,
         Err(_) => Choice::Inconclusive,
     };

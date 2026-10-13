@@ -1,7 +1,7 @@
 //! Native mutual generator through both real admission engines, not mock verdicts.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap};
-use fln_core::expr::{BinderInfo, Expr, FVarId};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::{level::Level, name::Name};
 use fln_elab::{
     inductive::{ConstructorSpec, InductiveError, InductiveSpec, mutual_inductive_declaration},
@@ -123,6 +123,96 @@ fn generated_direct_indexed_and_function_children_pass_both_seats() {
             }
         }
     }
+}
+
+#[test]
+fn generated_mutual_predicates_keep_prop_motives_and_original_universes() {
+    for function in [false, true] {
+        for indexed in [false, true] {
+            for polymorphic_result in [false, true] {
+                let mut s = specs(function, indexed);
+                for spec in &mut s {
+                    spec.result_level = if polymorphic_result {
+                        Level::param(name("u"))
+                    } else {
+                        Level::zero()
+                    };
+                    if polymorphic_result {
+                        // Fields must fit at every instantiation of Sort u.
+                        // The Prop-only cell above deliberately retains A : Type u.
+                        spec.parameters[0].type_ = Expr::sort(Level::param(name("u")));
+                    }
+                }
+                let e = accept(&s);
+                for recursor in ["Tree.rec", "Forest.rec"] {
+                    let Some(fln_env::constants::ConstantInfo::Rec(rec)) =
+                        e.environment().find(&name(recursor))
+                    else {
+                        panic!("the admitted block must contain {recursor}");
+                    };
+                    assert_eq!(rec.base.level_params, [name("u")]);
+                    assert!(!rec.k, "mutual predicates never use K reduction");
+                    let ExprNode::ForallE { body, .. } = rec.base.type_.node() else {
+                        panic!("shared parameter missing");
+                    };
+                    let mut remaining = body;
+                    for _ in 0..rec.num_motives {
+                        let ExprNode::ForallE {
+                            binder_type, body, ..
+                        } = remaining.node()
+                        else {
+                            panic!("mutual motive missing");
+                        };
+                        let mut target = binder_type;
+                        while let ExprNode::ForallE { body, .. } = target.node() {
+                            target = body;
+                        }
+                        assert_eq!(target, &Expr::sort(Level::zero()));
+                        remaining = body;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_mutual_predicates_cannot_publish_a_forged_large_eliminator() {
+    let data = specs(false, true);
+    let mut predicates = data.clone();
+    for spec in &mut predicates {
+        spec.result_level = Level::zero();
+    }
+    let fln::Declaration::Inductive(mut forged) =
+        mutual_inductive_declaration(&predicates, RecordBudget::default()).unwrap()
+    else {
+        panic!("mutual generation returns an inductive block");
+    };
+    let fln::Declaration::Inductive(large) =
+        mutual_inductive_declaration(&data, RecordBudget::default()).unwrap()
+    else {
+        panic!("mutual generation returns an inductive block");
+    };
+    forged.recursors = large.recursors;
+    let candidate = fln::Declaration::Inductive(forged);
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let base = Engine::from_environment(Environment::new());
+    let root = base.logical_root(&KVMap::new());
+    let verdict = fln_kernel::check(base.environment(), &candidate, limits.kernel);
+    assert!(
+        matches!(
+            verdict,
+            fln::Outcome::Complete(fln_kernel::verdict::Verdict::Rejected { .. })
+        ),
+        "large elimination must be rejected, not a resource nonanswer: {verdict:?}"
+    );
+    assert!(
+        base.admit_declaration(candidate, &KVMap::new(), limits)
+            .is_err()
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&name("Tree")));
+    accept(&predicates);
 }
 #[test]
 fn three_families_and_empty_siblings_keep_all_ordered_motives() {

@@ -188,3 +188,35 @@ fn deep_capture_scopes_use_heap_frames_and_do_not_run_strict_initializers() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn repeated_captures_in_a_large_catalog_fit_the_existing_work_bound() {
+    let environment = Environment::new();
+    let mut prep = Preparation::new(
+        &environment,
+        IngressLimits {
+            max_nodes: 3000,
+            ..IngressLimits::default()
+        },
+    );
+    let selected = local(&mut prep, Expr::bvar(0).unwrap(), ValueType::Nat);
+    for _ in 0..600 {
+        local(&mut prep, Expr::bvar(0).unwrap(), ValueType::Nat);
+    }
+    let mut source = Expr::const_(name("unknownConsumer"), vec![]);
+    for _ in 0..60 {
+        source = Expr::app(source, selected.clone());
+    }
+    let original = source.clone();
+    // Each occurrence must still inspect its own lexical context. Looking
+    // through all 601 catalog rows for each one exhausted this same bound.
+    assert_eq!(prep.captured_result(&source, &[]).unwrap(), None);
+    assert_eq!(source, original);
+    assert_eq!(prep.lambdas.len(), 601);
+    assert_eq!(prep.lambdas[0].lambda, selected);
+    assert!(
+        prep.lambdas
+            .iter()
+            .all(|binding| binding.result == ValueType::Nat)
+    );
+}

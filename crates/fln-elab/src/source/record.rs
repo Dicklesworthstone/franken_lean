@@ -33,13 +33,48 @@ fn empty_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
         7,
         "record modifiers",
     )?;
-    for part in parts {
+    super::doc_comment_slot(&parts[0])?;
+    for part in &parts[1..] {
         expect_empty_null(part, "absent record modifiers")?;
     }
     Ok(())
 }
 
-/// Elaborate a Type-valued, nonrecursive structure/class with named fields.
+/// `(x y : T := d)` (`structExplicitBinder`) declares each name as the field `x : T := d`, as the
+/// pin's `expandFields` reads it: one `structSimpleBinder` per name, sharing the modifiers, the
+/// signature and the default. The implicit and instance binder forms stay refused.
+fn simple_fields(fields: &[Syntax]) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+    let mut output = Vec::with_capacity(fields.len());
+    for field in fields {
+        if field.kind() != Some(&parser_kind(&["Command", "structExplicitBinder"])) {
+            output.push(field.clone());
+            continue;
+        }
+        let parts = expect_node(
+            field,
+            &parser_kind(&["Command", "structExplicitBinder"]),
+            6,
+            "explicit structure field",
+        )?;
+        expect_atom(&parts[1], "(", "explicit structure field bracket")?;
+        expect_atom(&parts[5], ")", "explicit structure field bracket")?;
+        for name in expect_null_args(&parts[2], "explicit structure field names")? {
+            output.push(Syntax::node(
+                parser_kind(&["Command", "structSimpleBinder"]),
+                vec![
+                    parts[0].clone(),
+                    name.clone(),
+                    parts[3].clone(),
+                    parts[4].clone(),
+                ],
+            ));
+        }
+    }
+    Ok(output)
+}
+
+/// Elaborate a nonrecursive structure/class with named fields. Prop-valued
+/// records require proof fields, as in the pin's projection generator.
 /// Registration is intentionally absent here: only checked successors can own it.
 pub fn elaborate_record(
     syntax: &Syntax,
@@ -63,7 +98,8 @@ pub(super) fn elaborate_record_scoped(
         2,
         "record declaration",
     )?;
-    empty_modifiers(&root[0])?;
+    scope::visibility::data_modifiers(&root[0])?;
+    let scope = scope.for_declaration(syntax)?;
     let parts = expect_node(
         &root[1],
         &parser_kind(&["Command", "structure"]),
@@ -108,27 +144,40 @@ pub(super) fn elaborate_record_scoped(
         2,
         "record signature",
     )?;
-    let mut context = Context::scoped(environment, kernel, scope);
+    let own = super::own_short_name(name);
+    let mut context = Context::scoped(environment, kernel, &scope);
     let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
-    let parameters = context.bind_parameters(&signature[0])?;
-    let explicit = optional_type_syntax(&signature[1])?
-        .map(|syntax| {
-            let term = context.term(syntax, None)?;
-            // Inspecting only the reduced Sort would discard invalid ascriptions
-            // or unused let initializers. Check the original type before any
-            // record-field locals enter the telescope. This publishes nothing.
-            inductive::checked_type(&mut context, term.value, budget)
-        })
-        .transpose()?;
+    // Auto-bound implicits become leading parameters, as at the pin (`@Box : {α : Sort u_1} → α →
+    // Type` for `structure Box (x : α)`, 2026-10-11). A field never auto-binds: the pin refuses one.
+    let (autos, (mut parameters, explicit)) =
+        context.with_auto_bound_implicits(&own, |context| {
+            let parameters = context.bind_parameters(&signature[0])?;
+            let explicit = optional_type_syntax(&signature[1])?
+                .map(|syntax| {
+                    let term = context.term(syntax, None)?;
+                    // Inspecting only the reduced Sort would discard invalid ascriptions
+                    // or unused let initializers. Check the original type before any
+                    // record-field locals enter the telescope. This publishes nothing.
+                    inductive::checked_type(context, term.value, budget)
+                })
+                .transpose()?;
+            Ok((parameters, explicit))
+        })?;
+    context.refuse_auto_bound_dependencies(&autos, &parameters)?;
+    parameters.splice(0..0, autos);
     let inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = inheritance.labels;
     let mut inferred = inheritance.level;
     let fields = match expect_null_args(&parts[4], "record body")? {
         [] => &[][..],
         [keyword, ctor, fields] => {
-            expect_atom(keyword, "where", "record body keyword")?;
+            // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
+            // `expandFields` only logs a deprecation lint, a warning.
+            if expect_atom(keyword, ":=", "record body keyword").is_err() {
+                expect_atom(keyword, "where", "record body keyword")?;
+            }
             expect_empty_null(ctor, "unsupported custom constructor")?;
             let fields = expect_node(
                 fields,
@@ -140,6 +189,7 @@ pub(super) fn elaborate_record_scoped(
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
+    let fields = &simple_fields(fields)?;
     if parameters.len().saturating_add(fields.len()) > budget.max_binders {
         return Err(failure(SourceInferenceError::Record(
             crate::records::RecordError::ResourceLimit,
@@ -157,8 +207,27 @@ pub(super) fn elaborate_record_scoped(
             "named structure field",
         )?;
         empty_modifiers(&parts[0])?;
+        // `h : P := by tac` is the pin's `binderTactic`, an `autoParam` field: an omitted field
+        // is filled by running its tactic. It is read as a default proved by that tactic, as the
+        // checker read the field before its tree was the pin's: the constructor then takes `P`,
+        // where the pin's takes `autoParam P _` (`autoParam` is a reducible `P`).
+        let tactic_default;
         let default = match expect_null_args(&parts[3], "field default")? {
             [] => None,
+            [syntax] if syntax.kind() == Some(&parser_kind(&["Term", "binderTactic"])) => {
+                let tactic = expect_node(
+                    syntax,
+                    &parser_kind(&["Term", "binderTactic"]),
+                    3,
+                    "field tactic",
+                )?;
+                expect_atom(&tactic[0], ":=", "field tactic assignment")?;
+                tactic_default = Syntax::node(
+                    parser_kind(&["Term", "byTactic"]),
+                    vec![tactic[1].clone(), tactic[2].clone()],
+                );
+                Some(&tactic_default)
+            }
             [syntax] => {
                 let parts = expect_node(
                     syntax,
@@ -283,7 +352,8 @@ pub(super) fn elaborate_record_scoped(
         let type_ = context
             .known_type(&domain)?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-        let completed = context.finish(Typed {
+        // Universe holes are generalized once the whole record is elaborated (below).
+        let completed = context.finish_open_universes(Typed {
             value: domain,
             type_,
         })?;
@@ -316,6 +386,22 @@ pub(super) fn elaborate_record_scoped(
         }
         None => inferred,
     };
+    if result_level.normalize_fixpoint().is_zero() {
+        for field in &output {
+            context.tick()?;
+            let domain = context.instantiate(&field.type_)?;
+            let sort = context
+                .known_type(&domain)?
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            if !matches!(context.whnf(&sort)?.node(), ExprNode::Sort { level }
+                if level.normalize_fixpoint().is_zero())
+            {
+                return Err(failure(SourceInferenceError::Record(
+                    crate::records::RecordError::NonProofField,
+                )));
+            }
+        }
+    }
     let mut parameters = parameters;
     for param in &mut parameters {
         param.type_ = context.instantiate(&param.type_)?;
@@ -349,6 +435,40 @@ pub(super) fn elaborate_record_scoped(
     {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
+    // An auto-bound implicit (or a written `Sort _`) leaves a universe hole in the telescope:
+    // generalize it into a level parameter as a definition does (the pin's
+    // `@Box : {α : Sort u_1} → α → Type` for `structure Box (x : α)`, 2026-10-11).
+    context.generalize_declaration_universes(&roots)?;
+    for local in parameters
+        .iter_mut()
+        .chain(section.iter_mut())
+        .chain(output.iter_mut())
+    {
+        context.tick()?;
+        local.type_ = context.instantiate(&local.type_)?;
+    }
+    let result_level = match context.instantiate(&Expr::sort(result_level))?.node() {
+        ExprNode::Sort { level } => level.clone(),
+        _ => return Err(failure(SourceInferenceError::ExpectedType)),
+    };
+    for helper in &mut helpers {
+        if let Declaration::Defn(definition) = helper {
+            definition.base.type_ = context.instantiate(&definition.base.type_)?;
+            definition.value = context.instantiate(&definition.value)?;
+        }
+    }
+    let mut roots: Vec<_> = parameters
+        .iter()
+        .chain(&section)
+        .chain(&output)
+        .map(|p| p.type_.clone())
+        .collect();
+    roots.push(Expr::sort(result_level.clone()));
+    for helper in &helpers {
+        if let Declaration::Defn(definition) = helper {
+            roots.extend([definition.base.type_.clone(), definition.value.clone()]);
+        }
+    }
     let level_params = context.declaration_levels(&roots)?;
     let mut closer = crate::records::Builder {
         remaining: budget.max_nodes,
@@ -379,11 +499,7 @@ pub(super) fn elaborate_record_scoped(
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
     declarations.extend(helpers);
-    let mut parent_instances = inheritance.instances;
-    for coercion in context.record_parent_coercions(&spec, &inheritance.parents, budget)? {
-        parent_instances.push(coercion.base.name.clone());
-        declarations.push(Declaration::Defn(coercion));
-    }
+    let parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
     Ok(SourceRecord {
         name: name.clone(),
         is_class,

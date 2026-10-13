@@ -37,13 +37,15 @@ pub(super) fn block_end(
             }
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" => delimiters.push(")"),
                 "{" | ".{" => delimiters.push("}"),
                 "[" | "@[" => delimiters.push("]"),
                 "⦃" => delimiters.push("⦄"),
                 "⟨" => delimiters.push("⟩"),
-                ")" | "}" | "]" | "⦄" | "⟩" if delimiters.pop() != Some(symbol.as_str()) => {
+                ")" | "}" | "]" | "⦄" | "⟩"
+                    if delimiters.pop() != Some(crate::canonical_bracket(symbol.as_str())) =>
+                {
                     return Err(refusal(view, tokens, index));
                 }
                 _ => {}
@@ -80,7 +82,7 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
             starts.push(index);
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
-            match symbol.as_str() {
+            match crate::canonical_bracket(symbol.as_str()) {
                 "(" | "{" | ".{" | "[" | "@[" | "⦃" | "⟨" => depth += 1,
                 ")" | "}" | "]" | "⦄" | "⟩" => depth -= 1, // block_end checked balance
                 _ => {}
@@ -164,11 +166,8 @@ mod tests {
         let error = parse(source.as_bytes()).unwrap_err();
         assert_eq!(error.primary_offset().unwrap().0, source.find(']').unwrap());
         let source =
-            "mutual\r\ninductive A where | mk\r\ninductive B where | bad deriving Nat\r\nend";
+            "mutual\r\ninductive A where | mk\r\ninductive B where | bad deriving , Nat\r\nend";
         let error = parse(source.as_bytes()).unwrap_err();
-        assert_eq!(
-            error.primary_offset().unwrap().0,
-            source.find("deriving").unwrap()
-        );
+        assert_eq!(error.primary_offset().unwrap().0, source.find(',').unwrap());
     }
 }

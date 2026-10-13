@@ -4,11 +4,12 @@
 //! Every verdict below is the pinned Reference's (`lean` v4.32.0, commit
 //! `8c9756b2`), measured on the same program on 2026-10-05. A `def` here stands
 //! for the pin's `noncomputable def`: the pin's code generator does not support
-//! `Chain.rec`, and FrankenLean's source check does not compile, so the
-//! elaboration question is the same. FrankenLean's frontend has no
-//! `noncomputable` modifier.
+//! `Chain.rec`. FrankenLean's frontend has no `noncomputable` modifier, and its
+//! default mode now refuses such a `def` as the pin's code generator does (bead
+//! `franken_lean-z8j.1.6.6`), so these programs are checked by a `frontier`
+//! engine, which skips that refusal and leaves the elaboration question the same.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Mode, SourceCheckLimits};
 
 const CHAIN: &str = "inductive Chain where | nil | cons (head : Nat) (tail : Chain)\n";
 
@@ -17,7 +18,9 @@ fn limits() -> EngineAdmissionLimits {
 }
 
 fn engine() -> Engine {
-    Engine::with_source_seed(limits())
+    Engine::builder()
+        .mode(Mode::Frontier)
+        .build_with_source_seed(limits())
         .unwrap()
         .into_complete()
         .unwrap()
@@ -75,9 +78,14 @@ fn an_implicit_recursor_motive_is_computed_from_the_expected_type() {
     ] {
         accepted(&source);
     }
-    // The motive is right, so a false computation is a kernel rejection.
+    // The motive is right, so a false computation fails only at its `rfl`, which is
+    // refused while elaborating, as at the pin ("Tactic `rfl` failed: The left-hand side
+    // … is not definitionally equal …", v4.32.0, measured 2026-10-07).
     let wrong = refused(&format!("{CHAIN}theorem count : {term} = 2 := by rfl"));
-    assert!(wrong.contains("kernel"), "{wrong}");
+    assert!(
+        wrong.contains("elaboration refused source") && wrong.contains("not definitionally equal"),
+        "{wrong}"
+    );
 }
 
 /// `mkMotive` abstracts the major premise (and the indices) out of the

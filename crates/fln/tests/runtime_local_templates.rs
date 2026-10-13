@@ -64,7 +64,7 @@ fn local_type_arguments_can_follow_runtime_parameters() {
 #[test]
 fn type_constructor_parameters_use_the_ordinary_static_application_path() {
     execute(
-        "def Id (A : Type) : Type := A\ndef answer : Nat := let pass (F : Type -> Type) (A : Type) (x : F A) : F A := x; pass Id Nat 42\n#eval answer",
+        "def Id (A : Type) : Type := A\ndef answer : Nat := let pass (F : Type -> Type) (A : Type) (x : F A) : F A := x; pass Id Nat (42 : Nat)\n#eval answer",
         "42",
     );
 }

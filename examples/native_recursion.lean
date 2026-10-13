@@ -42,5 +42,5 @@ def Tower (n : Nat) : Type := match n with
 def identity : Tower 1 := fun x => x
 def higherIdentity : Tower 2 := fun f => f
 
-theorem computed_type_ok : identity 9 = 9 := by rfl
-theorem higher_type_ok : higherIdentity identity 12 = 12 := by rfl
+theorem computed_type_ok : identity (9 : Nat) = (9 : Nat) := by rfl
+theorem higher_type_ok : higherIdentity identity (12 : Nat) = (12 : Nat) := by rfl

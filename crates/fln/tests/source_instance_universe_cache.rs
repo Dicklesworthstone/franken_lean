@@ -49,7 +49,7 @@ fn higher_universe_diamonds_keep_checked_terms_and_execute_their_dictionary_valu
     );
     let result = checked(
         &base,
-        "def result : Answer := inferInstance\ntheorem correct : result.value = 42 := by rfl",
+        "set_option synthInstance.maxSize 512 in\ndef result : Answer := inferInstance\ntheorem correct : result.value = 42 := by rfl",
     );
     let execution = result
         .execute_source_definitions(

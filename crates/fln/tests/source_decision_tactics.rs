@@ -22,6 +22,31 @@ fn check(source: &str) {
         .into_complete()
         .unwrap();
 }
+/// The pin's `preprocessPropToDecide` (Lean/Elab/Tactic/Decide.lean:24-32) zeta-reduces the goal and
+/// then refuses one that still mentions a local, whatever dictionary is in scope.
+fn reject_decide_with_free_variables(source: &str) {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let error = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("accepted: {source}"));
+    let rendered = format!("{error:?} {error}");
+    assert!(
+        rendered.contains("DecideFreeVariables"),
+        "{source}\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Expected type must not contain free variables"),
+        "{source}\n{rendered}"
+    );
+}
 fn reject(source: &str) {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
@@ -70,20 +95,41 @@ fn case_splits_compute_data_without_skipping_either_source_branch() {
     );
     reject("def invalid : Nat := by by_cases h : True; exact 7; exact (1 : String)");
 }
+/// An unnamed `by_cases p` binds a hygienic hypothesis, as at the pin (lean v4.32.0, each
+/// program run 2026-10-06): `assumption` finds it, a source `h` does not. The refusal is the
+/// pin's first error, verbatim. This test used to accept `f h` and `exact h` there.
 #[test]
 fn default_names_shadow_hygienically_and_dependent_contexts_survive() {
     check(
         r#"
         theorem default_name (p : Prop) [Decidable p] (f : p -> False) : Not p := by
           by_cases p
-          · exact fun unused => f h
-          · exact h
+          · exact fun unused => f unused
+          · assumption
         theorem dependent (p : Prop) [Decidable p] (h : Nat)
             (P : Nat -> Prop) (saved : P h) : P h := by
           by_cases h : p
           · exact saved
           · exact saved
     "#,
+    );
+    let source = "theorem default_name (p : Prop) [Decidable p] (f : p -> False) : Not p := by\n  by_cases p\n  · exact fun unused => f h\n  · exact h\n";
+    reject(source);
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let error = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err(source)
+        .to_string();
+    assert!(
+        error.contains("Unknown identifier `h`"),
+        "the pin refuses the default name with `Unknown identifier `h``: {error}"
     );
 }
 #[test]
@@ -242,7 +288,7 @@ fn local_decision_values_and_nested_proof_scopes_are_preserved() {
         r#"
         theorem available (p : Prop) (hp : p) : p := by
           let witness : Decidable p := Decidable.isTrue hp
-          decide
+          exact of_decide_eq_true rfl
         theorem nested : Not False := by
           have loc : Not False := by decide
           first | (have hidden : False := by decide; exact hidden) | exact loc
@@ -255,6 +301,10 @@ fn local_decision_values_and_nested_proof_scopes_are_preserved() {
           · decide
         "#,
     );
+    // `decide` itself refuses the goal `p` at the pin, local dictionary or not (2026-10-10).
+    reject_decide_with_free_variables(
+        "theorem available (p : Prop) (hp : p) : p := by\n  let witness : Decidable p := Decidable.isTrue hp\n  decide\n",
+    );
 }
 
 #[test]
@@ -265,7 +315,7 @@ fn dictionary_dependencies_close_hygienically_without_capturing_sibling_holes() 
           let witness : Decidable (P a) := Decidable.isTrue proof
           have saved : P a := by
             let proof := 23
-            decide
+            exact of_decide_eq_true rfl
           exact saved
         structure Later where
           proof : True
@@ -276,7 +326,7 @@ fn dictionary_dependencies_close_hygienically_without_capturing_sibling_holes() 
           · decide
           · exact Nat
           · exact 23
-        theorem built : build.value = 23 := by rfl
+        theorem built : build.value = (23 : Nat) := by rfl
         "#,
     );
 }
@@ -306,7 +356,7 @@ fn decision_tactics_compose_with_proposition_conditionals_and_scoped_holes() {
         theorem conditional (p : Prop) [Decidable p] (hp : p) : p := by
           refine if branch : p then ?_ else ?_
           · let witness : Decidable p := Decidable.isTrue branch
-            decide
+            exact of_decide_eq_true rfl
           · exact hp
         inductive Holds : Prop where | proof
         instance conditionalDictionary : Decidable Holds :=
@@ -317,6 +367,9 @@ fn decision_tactics_compose_with_proposition_conditionals_and_scoped_holes() {
           · exact if True then evidence else hp
           · exact hp
         "#,
+    );
+    reject_decide_with_free_variables(
+        "theorem conditional (p : Prop) [Decidable p] (hp : p) : p := by\n  refine if branch : p then ?_ else ?_\n  · let witness : Decidable p := Decidable.isTrue branch\n    decide\n  · exact hp\n",
     );
 }
 
@@ -335,8 +388,8 @@ fn a_reduced_dictionary_does_not_erase_ill_typed_arguments_or_lets() {
             SourceCheckLimits::new(limits),
         )
     };
-    // The pin refuses each `1 : String` while elaborating (no `OfNat String 1`);
-    // the false decision still reaches K1. Each twin must check.
+    // The pin refuses each `1 : String` while elaborating (no `OfNat String 1`),
+    // and the false decision too (see its row). Each twin must check.
     for (source, refusal, twin) in [
         (
             "theorem bad : True := by let witness : Decidable True := (fun ignored => Decidable.isTrue True.intro) (1 : String); decide",
@@ -348,9 +401,13 @@ fn a_reduced_dictionary_does_not_erase_ill_typed_arguments_or_lets() {
             ("elaboration", false, 1),
             "theorem bad : True := by have unused : String := \"one\"; decide",
         ),
+        // The pin refuses this while elaborating, not in the kernel: "Application type
+        // mismatch … `Eq.refl true` has type `true = true` but is expected to have type
+        // `decide False = true`" (v4.32.0, 2026-10-06). Since 5a3ff40e checks closed
+        // source equations at Default transparency, FrankenLean refuses it there too.
         (
             "theorem bad : False := of_decide_eq_true (Eq.refl true)",
-            ("kernel-rejection", true, 1),
+            ("elaboration", false, 1),
             "theorem bad : True := of_decide_eq_true (Eq.refl true)",
         ),
     ] {
@@ -503,6 +560,52 @@ fn decide_evaluates_the_pins_decidable_decide_against_the_real_prelude() {
             assert!(
                 negative.is_err() && rendered.contains("DecisionNotTrue"),
                 "{NEGATIVE} must be refused as a false decision: {rendered}"
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}
+
+/// The pin's `contradiction` decides a CLOSED NON-EQUATION hypothesis: its
+/// `contradictionCore` decide arm (vendored
+/// Lean/Meta/Tactic/Contradiction.lean:199) refutes any closed hypothesis
+/// whose synthesized decision computes `false`, through `of_decide_eq_false`,
+/// whatever the proposition's shape. Pin-audited 2026-10-07 (v4.32.0, with
+/// `import Init.Core`): `h : 2 < 1` and `h : 5 ≤ 2` are refuted, exit 0; a
+/// hypothesis that decides TRUE is not contradictory, exit 1 with
+/// "Tactic `contradiction` failed". Before the arm landed, FrankenLean
+/// refused both positives with "no supported contradictory evidence".
+#[test]
+fn contradiction_decides_a_closed_non_equation_hypothesis_as_the_pin() {
+    const POSITIVE_LT: &str = "theorem d (h : (2 : Nat) < 1) : False := by contradiction";
+    const POSITIVE_LE: &str = "theorem s (h : (5 : Nat) <= 2) : False := by contradiction";
+    const NEGATIVE: &str = "theorem n (h : (1 : Nat) < 2) : False := by contradiction";
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let engine = import_pinned(&lib, INIT_CORE);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            for positive in [POSITIVE_LT, POSITIVE_LE] {
+                let result =
+                    engine.check_source_files(&[positive.as_bytes()], &KVMap::new(), limits);
+                assert!(
+                    matches!(result, Ok(Outcome::Complete(_))),
+                    "{positive} must be admitted: {result:?}"
+                );
+            }
+            let before = engine.logical_root(&KVMap::new());
+            let negative = engine.check_source_files(&[NEGATIVE.as_bytes()], &KVMap::new(), limits);
+            let rendered = format!("{negative:?}");
+            assert!(
+                negative.is_err() && rendered.contains("NoContradiction"),
+                "{NEGATIVE} must keep the ordinary refusal: {rendered}"
             );
             assert_eq!(engine.logical_root(&KVMap::new()), before);
         })

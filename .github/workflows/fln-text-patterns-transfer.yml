@@ -1,0 +1,82 @@
+name: Checked String inference source transfer
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-text-patterns-transfer.yml']
+permissions:
+  contents: read
+jobs:
+  transfer:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 5473bb9e5e1b5e399663a2bec24a5df8c0c62abc
+          persist-credentials: false
+      - name: Transfer the exact locally verified source as immutable blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'string-inference-transfer'
+          root.mkdir()
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          def request(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(api + path, data=body, headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '1891e8e06d34ec39ed9b45d855ac6d3df300a133'
+          source = '97c54b74da11393f35c311941a8963cee1221f24'
+          obj = request('/git/blobs/' + source)
+          assert obj['encoding'] == 'base64'
+          encoded = base64.b64decode(obj['content'])
+          assert blob(encoded) == source
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'e4fe2f946be29640286b0f740ee85c30b007821d34caed2c95cedf22cddcddee'
+          manifest = {
+              'crates/fln-elab/src/constraint/unify/reduce.rs': ['3f5f48e188de363e11b8550d6768d903de563b79', '5a7d677a798c082bf87d3d4268c29eb4698d8926'],
+              'crates/fln-elab/src/constraint/unify/reduce/string.rs': [None, 'e03ba116c1571993259b795fb288c4f100017bd5'],
+              'crates/fln/tests/source_text_patterns.rs': ['97b0ea6d14ef2d11f0a6d04b18eb9fb3700f5e8a', 'dc468e578a0fbb1505d8972c8abcd54ab8ed8566'],
+          }
+          # Each path and both source identities are fixed before any mutation.
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
+          assert '\ndeleted file mode ' not in patch.decode()
+          for path, (before, after) in manifest.items():
+              file = pathlib.Path(path)
+              assert not file.is_symlink()
+              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
+          patch_file = root / 'string-inference.patch'
+          patch_file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', str(patch_file)], check=True)
+          subprocess.run(['git', 'apply', str(patch_file)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, (before, after) in manifest.items():
+              assert blob(pathlib.Path(path).read_bytes()) == after, path
+          for path, (before, after) in manifest.items():
+              result = request('/git/blobs', {'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode(), 'encoding': 'base64'})
+              assert result['sha'] == after, path
+              print(after, path)
+          # This job never creates a commit or updates a ref. The connected
+          # client reconciles current main and publishes the verified objects.
+          (root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: string-inference-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/string-inference-transfer
+          retention-days: 7
+          if-no-files-found: error

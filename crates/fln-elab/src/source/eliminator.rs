@@ -18,8 +18,12 @@
 //! solved out of scope and refused at the declaration's final scope check.
 //!
 //! What is implemented, mapped to the pin:
-//! - `shouldElabAsElim` for recursor constants (`isRec`). `casesOn`/`recOn`/
-//!   `brecOn` and `@[elab_as_elim]` are not wired here.
+//! - `shouldElabAsElim` for recursor constants (`isRec`) and definitions
+//!   explicitly tagged by the pin's auxiliary-recursion journal. Native
+//!   `casesOn`/`recOn` generation installs those tags only after admission;
+//!   imported tags follow the same checked ownership path. User-defined names
+//!   receive no eliminator semantics from their suffix. User `@[elab_as_elim]`
+//!   attributes and the pin's legacy untagged Eq helpers remain separate.
 //! - `elabAsElim?`: not under `@`, and not when the motive is supplied. An
 //!   application with any named argument keeps the ordinary elaborator.
 //! - `getElabElimExprInfo` (motive position and major positions, including the
@@ -51,6 +55,7 @@ pub(super) struct PostponedEliminator {
     arguments: Vec<Syntax>,
     info: ElimInfo,
     lctx: LocalContext,
+    options: KVMap,
 }
 
 fn eliminator(reason: &'static str) -> NatDefinitionElabError {
@@ -207,6 +212,15 @@ fn is_hole_syntax(syntax: &Syntax) -> bool {
 }
 
 impl Context {
+    pub(super) fn is_auxiliary_recursor(
+        &mut self,
+        name: &Name,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.auxiliary_cache
+            .contains(&self.txn.env, name)
+            .map_err(|error| failure(SourceInferenceError::AuxiliaryJournal(error)))
+    }
+
     /// `elabAsElim?`: the eliminator information when this application should
     /// be elaborated as an eliminator, and `None` for the ordinary elaborator.
     pub(super) fn eliminator_info(
@@ -221,10 +235,16 @@ impl Context {
         let ExprNode::Const { name, .. } = function.value.node() else {
             return Ok(None);
         };
-        let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(name) else {
+        let Some(info) = self.txn.env.find(name).cloned() else {
             return Ok(None);
         };
-        let declared = recursor.base.type_.clone();
+        let declared = match info {
+            ConstantInfo::Rec(recursor) => recursor.base.type_,
+            ConstantInfo::Defn(definition) if self.is_auxiliary_recursor(name)? => {
+                definition.base.type_
+            }
+            _ => return Ok(None),
+        };
         let Some(info) = elim_info(&declared) else {
             return Ok(None);
         };
@@ -292,6 +312,7 @@ impl Context {
                     arguments: arguments.to_vec(),
                     info,
                     lctx: self.txn.lctx.clone(),
+                    options: self.txn.options.clone(),
                 });
                 Ok(Typed {
                     value: hole,
@@ -323,6 +344,7 @@ impl Context {
                     continue;
                 }
                 let saved = std::mem::replace(&mut self.txn.lctx, record.lctx.clone());
+                let options = std::mem::replace(&mut self.txn.options, record.options);
                 let result = self.elaborate_eliminator(
                     record.function.clone(),
                     &record.arguments,
@@ -330,6 +352,7 @@ impl Context {
                     expected,
                 );
                 self.txn.lctx = saved;
+                self.txn.options = options;
                 let term = result?;
                 self.constrain(&record.hole, &term.value)?;
                 progressed = true;
@@ -542,7 +565,11 @@ impl Context {
 
     /// `kabstract`: every subterm structurally equal to `pattern` (after
     /// instantiation) becomes the variable of a new enclosing binder.
-    fn kabstract(&mut self, expr: &Expr, pattern: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(super) fn kabstract(
+        &mut self,
+        expr: &Expr,
+        pattern: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let expr = self.instantiate(expr)?;
         if expr.has_loose_bvars() {
             return Err(failure(SourceInferenceError::Scope));

@@ -9,10 +9,14 @@ can regenerate its own expectation is a mirror, not a golden. A tree-shape chang
 hand.
 
 The current producer authority is `fln-syntax@0.0.0` at commit
-`d5ecb96659c5830449c5f000d9d9a4b9cb320dc8`, with the token stream at schema
-`fln.vellum.token-stream/1` and the green tree at `fln.vellum.green-tree/1`. Re-derived on
-2026-07-26 at repository commit `b241943dec5c22c81d7bd51ab6e622ad8715fa86`, this producer
-commit resolves uniquely and is an ancestor of `refs/heads/main`.
+`cdae0e617a389b89a4219a04b47ae78cb20b6634`, with the token stream at schema
+`fln.vellum.token-stream/1` and the green tree at `fln.vellum.green-tree/1`. That commit made
+a doc comment one token over its whole body, as the pin's `commentBody` reads it; the previous
+producer, `d5ecb96659c5830449c5f000d9d9a4b9cb320dc8` (re-derived on 2026-07-26 at
+repository commit `b241943dec5c22c81d7bd51ab6e622ad8715fa86`), had frozen `unicode-and-doc` as the
+`/--` opener followed by two refused tokens inside an input the pin accepts. On 2026-10-07 the
+ceremony's `emit_corpus_for_review` was run at the new producer: that row's tokens and tree were
+reviewed and pasted, and the other seven rows were byte-identical apart from this stamp.
 
 The superseded producer anchor `d64218a954f8447b3f29c4ca230ae5d158d56dc9` remains a real
 commit object in this local repository only because the pre-filter-branch history is retained by
@@ -62,7 +66,7 @@ to a byte comparison. This field is where it shows up.
 | `crlf-two-lines` | two statements, CRLF | the interior CRLF, and the leading-trivia attachment across it |
 | `lone-cr-preserved` | two statements, lone CR | a lone CR **survives** normalization and is a lexical refusal |
 | `comment-and-trivia` | comment plus parens, CRLF | comment trivia and bracket tokens under normalization |
-| `unicode-and-doc` | doc comment, `α`, `λ` | multi-byte tokens, and `/--` as a token rather than trivia |
+| `unicode-and-doc` | doc comment, `α`, `λ` | multi-byte tokens, and a doc comment as one token over its whole body rather than trivia |
 
 Every nonempty row ending in LF also pins the terminal half of the attachment rule:
 the final token owns that final newline as trailing trivia and the epilogue is empty.

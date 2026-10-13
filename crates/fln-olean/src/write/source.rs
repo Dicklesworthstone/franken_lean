@@ -5,31 +5,48 @@
 //! arrays and records share the module's object and byte budgets.
 use super::*;
 use crate::source_extension_format as layout;
-use crate::source_extensions::ClassEntry;
+use crate::source_extensions::{
+    ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
+};
 use std::collections::HashSet;
+
+mod defaults;
+mod instances;
+mod namespaces;
+mod reducibility;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
     pub classes: Vec<ClassEntry>,
+    /// Chronological global/scoped entries, retaining repeated priority updates.
+    pub instances: Vec<InstanceEntry>,
+    /// Chronological module-owned defaults, preserving repeated registrations
+    /// and rows for candidates whose declarations belong to imported modules.
+    pub defaults: Vec<DefaultEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
     /// entries, one `Name` each. They are written sorted by `Name.quickLt`, the
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
     /// reading this module answers `isProtected` correctly.
     pub protected: Vec<Name>,
+    /// This module's own internally generated auxiliary recursors, written as
+    /// the pin's `auxRecExt` tag array in `Name.quickLt` order.
+    pub aux_recursors: Vec<Name>,
+    /// This module's final status for each owned declaration. The writer sorts
+    /// these by Name.quickLt for the pin's per-module binary search.
+    pub reducibility: Vec<ReducibilityEntry>,
 }
 
-/// Encode the supported source journals in the pinned physical layout. Empty
-/// metadata takes the original path and produces byte-identical basic modules.
+/// Encode source journals and the namespaces implied by local declarations.
+/// Empty journals with no qualified local declarations retain the original
+/// basic-module bytes. Explicit empty namespaces need a source namespace journal
+/// and are not inferred here; imported declarations are not re-exported.
 pub fn encode_module_with_source_metadata(
     input: ModuleWriteInput<'_>,
     metadata: &SourceMetadata,
     header: OleanWriteHeader<'_>,
     budget: WriteBudget,
 ) -> WResult<EncodedModule> {
-    if metadata.classes.is_empty() && metadata.protected.is_empty() {
-        return encode_module(input, header, budget);
-    }
-    encode_module_metadata(input, Some(metadata), header, budget)
+    namespaces::encode(input, metadata, header, budget)
 }
 
 impl Encoder {
@@ -70,14 +87,39 @@ impl Encoder {
 
     /// The module's extension blocks: one per non-empty supported journal.
     pub(super) fn source_entries(&mut self, metadata: &SourceMetadata) -> WResult<Obj> {
+        let blocks = self.source_blocks(metadata)?;
+        self.array(blocks)
+    }
+
+    fn source_blocks(&mut self, metadata: &SourceMetadata) -> WResult<Vec<Obj>> {
         let mut blocks = Vec::new();
         if !metadata.classes.is_empty() {
             blocks.push(self.class_block(&metadata.classes)?);
         }
-        if !metadata.protected.is_empty() {
-            blocks.push(self.protected_block(&metadata.protected)?);
+        if !metadata.instances.is_empty() {
+            blocks.push(self.instance_block(&metadata.instances)?);
         }
-        self.array(blocks)
+        if !metadata.defaults.is_empty() {
+            blocks.push(self.default_block(&metadata.defaults)?);
+        }
+        if !metadata.protected.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::PROTECTED_EXTENSION,
+                &metadata.protected,
+                "anonymous or duplicate protected declaration",
+            )?);
+        }
+        if !metadata.aux_recursors.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::AUX_RECURSOR_EXTENSION,
+                &metadata.aux_recursors,
+                "anonymous or duplicate auxiliary recursor",
+            )?);
+        }
+        if !metadata.reducibility.is_empty() {
+            blocks.push(self.reducibility_block(&metadata.reducibility)?);
+        }
+        Ok(blocks)
     }
 
     fn class_block(&mut self, classes: &[ClassEntry]) -> WResult<Obj> {
@@ -106,29 +148,30 @@ impl Encoder {
         self.ctor(0, vec![name, entries], &[])
     }
 
-    /// `protectedExt`'s entries: each a `Name`, in `Name.quickLt` order, as
-    /// `mkTagDeclarationExtension`'s `toArrayFn` writes them.
-    fn protected_block(&mut self, protected: &[Name]) -> WResult<Obj> {
-        self.source_array_bound(protected.len())?;
-        let mut sorted: Vec<&Name> = protected.iter().collect();
+    /// `TagDeclarationExtension` entries: each a `Name`, in `Name.quickLt`
+    /// order, as `mkTagDeclarationExtension`'s `toArrayFn` writes them.
+    fn tagged_names_block(
+        &mut self,
+        extension: &str,
+        tagged: &[Name],
+        invalid: &'static str,
+    ) -> WResult<Obj> {
+        self.source_array_bound(tagged.len())?;
+        let mut sorted: Vec<&Name> = tagged.iter().collect();
         sorted.sort_by(|left, right| left.quick_cmp(right));
         if sorted.iter().any(|name| name.is_anonymous())
             || sorted
                 .windows(2)
                 .any(|pair| pair[0].quick_cmp(pair[1]) == std::cmp::Ordering::Equal)
         {
-            return Err(WriteError::Contract {
-                what: "anonymous or duplicate protected declaration",
-            });
+            return Err(WriteError::Contract { what: invalid });
         }
         let mut entries = Vec::with_capacity(sorted.len());
         for name in sorted {
             entries.push(self.name(name)?);
         }
         let entries = self.array(entries)?;
-        let name = self.name(&Name::from_components(
-            layout::PROTECTED_EXTENSION.split('.'),
-        ))?;
+        let name = self.name(&Name::from_components(extension.split('.')))?;
         self.ctor(0, vec![name, entries], &[])
     }
 }
@@ -162,6 +205,7 @@ mod tests {
                 out_level_params: vec![2],
             }],
             protected: Vec::new(),
+            ..SourceMetadata::default()
         }
     }
     /// Protected names round-trip, alone and beside classes, in `Name.quickLt`
@@ -180,6 +224,7 @@ mod tests {
             let metadata = SourceMetadata {
                 classes: classes.clone(),
                 protected: names.clone(),
+                ..SourceMetadata::default()
             };
             let encoded = encode_module_with_source_metadata(
                 input(),
@@ -203,6 +248,7 @@ mod tests {
             let metadata = SourceMetadata {
                 classes: Vec::new(),
                 protected: bad,
+                ..SourceMetadata::default()
             };
             assert!(matches!(
                 encode_module_with_source_metadata(

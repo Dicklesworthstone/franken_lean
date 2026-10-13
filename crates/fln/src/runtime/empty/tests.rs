@@ -135,3 +135,89 @@ fn inhabited_families_collisions_and_budget_stops_cannot_register_empty_cases() 
     assert!(prep.empty_name(ValueType::Bool, ValueType::Nat).is_err());
     assert!(prep.empty_cases.is_empty());
 }
+
+#[test]
+fn nonreturning_elimination_does_not_require_an_unobservable_function_layout() {
+    let engine = checked(b"");
+    let natural = Expr::const_(name("Nat"), vec![]);
+    let false_type = Expr::const_(name("False"), vec![]);
+    let natural_motive = Expr::lam(
+        Name::anonymous(),
+        natural.clone(),
+        natural.clone(),
+        BinderInfo::Default,
+    );
+    let history = [natural_motive, Expr::const_(name("Nat.zero"), vec![])]
+        .into_iter()
+        .fold(
+            Expr::const_(name("Nat.below"), vec![Level::one()]),
+            Expr::app,
+        );
+    let result_type = Expr::forall_e(
+        Name::anonymous(),
+        history,
+        natural.clone(),
+        BinderInfo::Default,
+    );
+    let motive = Expr::lam(
+        Name::anonymous(),
+        false_type.clone(),
+        result_type,
+        BinderInfo::Default,
+    );
+    let head = Expr::const_(name("False.rec"), vec![Level::one()]);
+    let suffix = Expr::const_(name("PUnit.unit"), vec![Level::one()]);
+    let original = [motive.clone(), Expr::bvar(0).unwrap(), suffix.clone()]
+        .into_iter()
+        .fold(head.clone(), Expr::app);
+    let entry = name("impossibleHistory");
+    engine
+        .admit_declaration(
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: entry.clone(),
+                    level_params: vec![],
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        false_type.clone(),
+                        natural,
+                        BinderInfo::Default,
+                    ),
+                },
+                value: Expr::lam(Name::anonymous(), false_type, original, BinderInfo::Default),
+                hints: ReducibilityHints::Abbrev,
+                safety: fln_env::constants::DefinitionSafety::Safe,
+                all: vec![entry],
+            }),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let mut prep = Preparation::new(engine.environment(), IngressLimits::default());
+    let args = [motive, Expr::const_(name("Bool.false"), vec![]), suffix];
+    assert!(matches!(
+        prep.empty_recursor(&head, &args[..2]),
+        Err(IngressError::UnsupportedNode {
+            kind: "empty elimination result representation"
+        })
+    ));
+    let lowered = prep.empty_recursor(&head, &args).unwrap().unwrap();
+    assert_eq!(prep.empty_cases.len(), 1);
+    assert_eq!(prep.empty_cases[0].result, ValueType::Nat);
+    let ExprNode::LetE { value, body, .. } = lowered.node() else {
+        panic!("strict impossible major")
+    };
+    assert_eq!(value, &args[1]);
+    let (callee, arguments) = prep.spine(body).unwrap();
+    assert_eq!(
+        callee,
+        Expr::const_(prep.empty_cases[0].name.clone(), vec![])
+    );
+    assert_eq!(arguments, vec![Expr::bvar(0).unwrap()]);
+    assert!(
+        prep.constructors.is_empty(),
+        "the empty case never produces a value"
+    );
+}

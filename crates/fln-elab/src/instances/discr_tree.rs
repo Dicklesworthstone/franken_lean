@@ -44,9 +44,10 @@
 //! instance path keeps folded and that is now `reducible` has a smart-unfolding
 //! companion (one, `Std.Do.SVal`), which the rule already excludes.
 //!
-//! Instances without a stored path (those FrankenLean registered itself), paths
-//! that name a free variable, and paths whose root is not the goal's are never
-//! filtered. A query that exhausts its step allowance filters nothing.
+//! Native registrations use the same bounded path and prerequisite-order model
+//! as source-module export. Unsupported native models, paths that name a free
+//! variable, and paths whose root is not the goal's are never filtered. A query
+//! that exhausts its step allowance filters nothing.
 //!
 //! # Candidate order (bead `fln-vm35`)
 //!
@@ -289,7 +290,7 @@ impl Node {
     }
 }
 
-/// The pin's instance index over one registry's imported instances.
+/// The pin's instance index over one immutable registry view.
 #[derive(Debug, Default)]
 pub(crate) struct InstanceIndex {
     root: Node,
@@ -297,10 +298,14 @@ pub(crate) struct InstanceIndex {
     folded: BTreeSet<Name>,
     /// The first key of each indexed instance's path.
     roots: BTreeMap<Name, Key>,
+    /// Exact prerequisite order for supported native registrations. Imported
+    /// orders remain in their original, authoritative metadata journal.
+    native_synth_order: BTreeMap<Name, Vec<u32>>,
 }
 
-/// An [`InstanceRegistry`]'s index, built on first use. It is derived from the
-/// registry's imported metadata, so it takes no part in the registry's equality.
+/// A registry's lazy source-search index. It changes neither registry equality
+/// nor environment metadata, and is only published after every active native
+/// model has completed within its budget.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexCell(OnceLock<Arc<InstanceIndex>>);
 
@@ -312,44 +317,85 @@ impl PartialEq for IndexCell {
 impl Eq for IndexCell {}
 
 impl IndexCell {
-    pub(super) fn get(&self, registry: &InstanceRegistry) -> &InstanceIndex {
-        self.0
-            .get_or_init(|| Arc::new(InstanceIndex::build(registry)))
-            .as_ref()
+    pub(super) fn get<'a>(
+        &'a self,
+        registry: &InstanceRegistry,
+        env: &Environment,
+        work_left: &mut usize,
+    ) -> Result<&'a InstanceIndex, InstanceRegistryError> {
+        if let Some(index) = self.0.get() {
+            return Ok(index.as_ref());
+        }
+        // A resource failure never leaves a partial index or a cached miss.
+        let index = InstanceIndex::build_source(registry, env, work_left)?;
+        let _ = self.0.set(Arc::new(index));
+        Ok(self
+            .0
+            .get()
+            .expect("complete source index published")
+            .as_ref())
     }
 }
 
 impl InstanceIndex {
-    fn build(registry: &InstanceRegistry) -> Self {
-        let mut index = Self::default();
-        // A leaf keeps its values in insertion order, which for the pin is the
-        // order the instances were registered.
-        let registered: BTreeMap<&Name, usize> = registry
-            .instances
-            .values()
-            .chain(registry.scoped.values().flat_map(BTreeMap::values))
-            .flatten()
-            .map(|row| (&row.declaration, row.order))
-            .collect();
-        let mut imported: Vec<_> = registry.imported.instances.iter().collect();
-        imported.sort_by_key(|(declaration, _)| registered.get(declaration).copied());
-        for (declaration, parameters) in imported {
-            let keys = &parameters.keys;
-            let Some(first) = keys.first() else {
-                continue;
-            };
-            if keys.iter().any(|key| matches!(key, Key::FVar(..))) {
-                continue;
-            }
-            for key in &keys[1..] {
-                if let Key::Const(name, _) = key {
-                    index.folded.insert(name.clone());
-                }
-            }
-            index.roots.insert(declaration.clone(), first.clone());
-            index.root.insert(keys, declaration);
+    fn insert(&mut self, keys: &[Key], declaration: &Name) {
+        let Some(first) = keys.first() else {
+            return;
+        };
+        if keys.iter().any(|key| matches!(key, Key::FVar(..))) {
+            return;
         }
-        index
+        for key in &keys[1..] {
+            if let Key::Const(name, _) = key {
+                self.folded.insert(name.clone());
+            }
+        }
+        self.roots.insert(declaration.clone(), first.clone());
+        self.root.insert(keys, declaration);
+    }
+
+    fn build_source(
+        registry: &InstanceRegistry,
+        env: &Environment,
+        work_left: &mut usize,
+    ) -> Result<Self, InstanceRegistryError> {
+        let spend = |left: &mut usize| -> Result<(), InstanceRegistryError> {
+            *left = left.checked_sub(1).ok_or(InstanceRegistryError::Limit)?;
+            Ok(())
+        };
+        let mut rows = Vec::new();
+        // Only the active view participates. read_with_scopes has already
+        // interleaved namespace activation and global registration events.
+        for row in registry.instances.values().flatten() {
+            spend(work_left)?;
+            rows.push(row);
+        }
+        rows.sort_by_key(|row| row.order);
+        let mut index = Self::default();
+        for row in rows {
+            spend(work_left)?;
+            if let Some(parameters) = registry.imported.instances.get(&row.declaration) {
+                for _ in &parameters.keys {
+                    spend(work_left)?;
+                }
+                index.insert(&parameters.keys, &row.declaration);
+            } else if let Some(model) =
+                super::export::derive_index(env, registry, &row.declaration, work_left)?
+            {
+                for _ in &model.keys {
+                    spend(work_left)?;
+                }
+                index.insert(&model.keys, &row.declaration);
+                index
+                    .native_synth_order
+                    .insert(row.declaration.clone(), model.synth_order);
+            }
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn native_synth_order(&self, declaration: &Name) -> Option<&[u32]> {
+        self.native_synth_order.get(declaration).map(Vec::as_slice)
     }
 
     /// The rows of `rows` that the pin's `getUnify` may return for `goal`, in

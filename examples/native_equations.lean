@@ -1,16 +1,16 @@
 -- Equation-style declarations use the same checked matcher and recursion engine.
-inductive Seq (A : Type) where
+inductive Sequence (A : Type) where
   | nil
-  | cons (value : A) (tail : Seq A)
+  | cons (value : A) (tail : Sequence A)
 
-def append {A : Type} : Seq A -> Seq A -> Seq A
+def append {A : Type} : Sequence A -> Sequence A -> Sequence A
   | .nil, ys => ys
-  | .cons x xs, ys => Seq.cons x (append xs ys)
+  | .cons x xs, ys => Sequence.cons x (append xs ys)
 
-def numbers : Seq Nat := Seq.cons 2 (Seq.cons 3 Seq.nil)
-theorem append_value : append numbers (Seq.cons 4 Seq.nil) = Seq.cons 2 (Seq.cons 3 (Seq.cons 4 Seq.nil)) := by rfl
+def numbers : Sequence Nat := Sequence.cons 2 (Sequence.cons 3 Sequence.nil)
+theorem append_value : append numbers (Sequence.cons 4 Sequence.nil) = Sequence.cons 2 (Sequence.cons 3 (Sequence.cons 4 Sequence.nil)) := by rfl
 
-theorem append_right_nil {A : Type} (xs : Seq A) : append xs Seq.nil = xs := by
+theorem append_right_nil {A : Type} (xs : Sequence A) : append xs Sequence.nil = xs := by
   induction xs with
   | nil => rfl
   | cons x rest ih => simp only [append, ih]

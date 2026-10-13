@@ -24,6 +24,10 @@ pub(super) enum EliminationSyntax<'a> {
     Tactic(&'a [Syntax]),
     Match(matching::MatchParts<'a>),
     RecursiveMatch(matching::MatchParts<'a>),
+    /// Retain each live branch as another empty-matrix obligation.
+    EmptyMatrix(HashMap<Name, Vec<Name>>),
+    /// Recursive tactic patterns retain the ordinary cases removal semantics.
+    RCases(HashMap<Name, Vec<Name>>),
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -36,6 +40,7 @@ struct EliminationContext<'a> {
     equations: Option<&'a index_equations::IndexEquations>,
     recursive_source: bool,
     source_match: bool,
+    empty_fields: Option<&'a [Name]>,
 }
 
 /// The pinned `elimTarget` production retains an optional equation binder and
@@ -44,14 +49,46 @@ pub(super) fn target(
     args: &[Syntax],
     induction: bool,
 ) -> Result<(&Syntax, Option<&Syntax>), NatDefinitionElabError> {
-    let [keyword, target, _, _, _] = args else {
-        return Err(error(TacticError::MalformedScript));
+    let parts = tactic_parts(args, induction)?;
+    Ok((parts.target, parts.binder))
+}
+
+/// The slots of a `cases`/`induction` tactic as the pin builds them (`Init/Tactics.lean`):
+/// `"cases" sepBy1(elimTarget, ", ") (" using " ident)? (inductionAlts)?`, and for `induction`
+/// also `("generalizing" term:max+)?` before the alternatives. One target, no `using` and no
+/// `with` tactic are read; the rest is refused.
+pub(super) struct TacticParts<'a> {
+    pub(super) target: &'a Syntax,
+    /// The equation's name (`cases h : e`): an identifier or a `_` hole.
+    pub(super) binder: Option<&'a Syntax>,
+    pub(super) generalized: &'a [Syntax],
+    pub(super) scoped: bool,
+    pub(super) rows: &'a [Syntax],
+}
+
+pub(super) fn tactic_parts(
+    args: &[Syntax],
+    induction: bool,
+) -> Result<TacticParts<'_>, NatDefinitionElabError> {
+    let malformed = || error(TacticError::MalformedScript);
+    let (keyword, targets, using, generalizing, alternatives) = match (args, induction) {
+        ([keyword, targets, using, alternatives], false) => {
+            (keyword, targets, using, None, alternatives)
+        }
+        ([keyword, targets, using, generalizing, alternatives], true) => {
+            (keyword, targets, using, Some(generalizing), alternatives)
+        }
+        _ => return Err(malformed()),
     };
     expect_atom(
         keyword,
         if induction { "induction" } else { "cases" },
         "elimination tactic",
     )?;
+    expect_empty_null(using, "default eliminator")?;
+    let [target] = expect_null_args(targets, "elimination targets")? else {
+        return Err(malformed());
+    };
     let parts = expect_node(
         target,
         &parser_kind(&["Tactic", "elimTarget"]),
@@ -60,16 +97,66 @@ pub(super) fn target(
     )?;
     let binder = match expect_null_args(&parts[0], "elimination equation")? {
         [] => None,
-        [name, colon]
-            if matches!(name, Syntax::Ident { val, .. } if !val.is_anonymous())
-                || matches!(name, Syntax::Atom { val, .. } if val == "_") =>
-        {
+        [name, colon] => {
+            let [name] = expect_node(
+                name,
+                &Name::from_components(["Lean", "binderIdent"]),
+                1,
+                "elimination equation name",
+            )?
+            else {
+                return Err(malformed());
+            };
+            let hole = matches!(name, Syntax::Node { kind, .. }
+                if kind == &parser_kind(&["Term", "hole"]));
+            if !hole && !matches!(name, Syntax::Ident { val, .. } if !val.is_anonymous()) {
+                return Err(malformed());
+            }
             expect_atom(colon, ":", "elimination equation colon")?;
             Some(name)
         }
-        _ => return Err(error(TacticError::MalformedScript)),
+        _ => return Err(malformed()),
     };
-    Ok((&parts[1], binder))
+    let generalized = match generalizing {
+        None => &[][..],
+        Some(slot) => match expect_null_args(slot, "generalized locals")? {
+            [] => &[][..],
+            [keyword, names] => {
+                expect_atom(keyword, "generalizing", "generalizing keyword")?;
+                let names = expect_null_args(names, "generalized locals")?;
+                if names.is_empty() {
+                    return Err(error(TacticError::InvalidGeneralization));
+                }
+                names
+            }
+            _ => return Err(malformed()),
+        },
+    };
+    let (scoped, rows) = match expect_null_args(alternatives, "elimination alternatives")? {
+        [] => (false, &[][..]),
+        [alts] => {
+            let parts = expect_node(
+                alts,
+                &parser_kind(&["Tactic", "inductionAlts"]),
+                3,
+                "elimination alternatives",
+            )?;
+            expect_atom(&parts[0], "with", "elimination alternatives")?;
+            expect_empty_null(&parts[1], "no `with` tactic")?;
+            (
+                true,
+                expect_null_args(&parts[2], "elimination alternatives")?,
+            )
+        }
+        _ => return Err(malformed()),
+    };
+    Ok(TacticParts {
+        target: &parts[1],
+        binder,
+        generalized,
+        scoped,
+        rows,
+    })
 }
 
 pub(in crate::source) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
@@ -199,8 +286,9 @@ impl Context {
             equations,
             recursive_source,
             source_match,
+            empty_fields,
         } = context;
-        let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
+        let names = alternative.map_or(empty_fields.unwrap_or(&[]), |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
         let exact_fields = alternative.is_some_and(|alt| alt.exact_fields);
         let mut ctor = Expr::const_(constructor.base.name.clone(), levels.to_vec());
@@ -404,6 +492,16 @@ impl Context {
             work: Vec::new(),
             controls: Vec::new(),
         };
+        let refined = if parts.equation.is_none()
+            && (recursive
+                || parts.generated
+                    && !parts.is_conditional()
+                    && matches!(major.value.node(), ExprNode::FVar { .. }))
+        {
+            self.refined_discriminant(&parts, &major, &proof.target, recursive)?
+        } else {
+            None
+        };
         let local = if let Some(equation) = parts.equation {
             // Generalize with an actual Eq obligation. Each minor receives
             // `original = constructor ...`; the parent supplies Eq.refl for
@@ -425,39 +523,9 @@ impl Context {
                 .find(&id)
                 .cloned()
                 .ok_or_else(|| error(TacticError::EliminationLocal))?
-        } else if recursive
-            || parts.generated && matches!(major.value.node(), ExprNode::FVar { .. })
-        {
+        } else if let Some(local) = refined {
             if recursive {
                 self.recursive_match(&major.value);
-            }
-            let ExprNode::FVar { id } = major.value.node() else {
-                return Err(error(TacticError::EliminationLocal));
-            };
-            let mut local = self
-                .txn
-                .lctx
-                .find(id)
-                .cloned()
-                .ok_or_else(|| error(TacticError::EliminationLocal))?;
-            if parts.generated && !recursive {
-                // Matrix columns are checked single-evaluation lets. Follow
-                // exact aliases, not arbitrary reduction, so abstraction also
-                // refines later inputs whose types mention the original local.
-                let mut visited = HashSet::new();
-                while let Some(value) = &local.value {
-                    self.tick()?;
-                    let ExprNode::FVar { id } = value.node() else {
-                        break;
-                    };
-                    if !visited.insert(local.id.clone()) {
-                        return Err(error(TacticError::EliminationLocal));
-                    }
-                    let Some(original) = self.txn.lctx.find(id) else {
-                        break;
-                    };
-                    local = original.clone();
-                }
             }
             local
         } else {
@@ -489,6 +557,92 @@ impl Context {
         Ok(proof)
     }
 
+    /// The local a match on a free variable refines, or `None` when the pin would not refine it.
+    ///
+    /// The pin's match elaborator (vendored Lean/Elab/Match.lean, `generalize`, and
+    /// `mkMotive`) keeps the discriminant in scope. It refines it only where the motive
+    /// mentions it, abstracting it in the expected type, or where a later local depends on it
+    /// (`getFVarsToGeneralize … (ignoreLetDecls := true)`, which skips `let`s and
+    /// instance-implicit locals). When nothing does, every branch sees the outer context
+    /// unchanged. Refining anyway would replace the local in each branch's context, so a hole
+    /// made outside the match (`Id ?α`'s `?α`) could not be solved from inside a branch. A
+    /// recursive match always refines: its recursive calls are lowered on that local.
+    fn refined_discriminant(
+        &mut self,
+        parts: &matching::MatchParts<'_>,
+        major: &Typed,
+        target: &Expr,
+        recursive: bool,
+    ) -> Result<Option<LocalDecl>, NatDefinitionElabError> {
+        let ExprNode::FVar { id } = major.value.node() else {
+            return Err(error(TacticError::EliminationLocal));
+        };
+        let mut local = self
+            .txn
+            .lctx
+            .find(id)
+            .cloned()
+            .ok_or_else(|| error(TacticError::EliminationLocal))?;
+        if parts.generated && !recursive {
+            // Matrix columns are checked single-evaluation lets. Follow
+            // exact aliases, not arbitrary reduction, so abstraction also
+            // refines later inputs whose types mention the original local.
+            let mut visited = HashSet::new();
+            while let Some(value) = &local.value {
+                self.tick()?;
+                let ExprNode::FVar { id } = value.node() else {
+                    break;
+                };
+                if !visited.insert(local.id.clone()) {
+                    return Err(error(TacticError::EliminationLocal));
+                }
+                let Some(original) = self.txn.lctx.find(id) else {
+                    break;
+                };
+                local = original.clone();
+            }
+        }
+        if recursive {
+            return Ok(Some(local));
+        }
+        // The locals that depend on the discriminant, through non-`let` locals only.
+        let mut dependents = HashSet::from([local.id.clone()]);
+        let mut generalized = false;
+        let decls = self.txn.lctx.decls().to_vec();
+        for decl in decls.iter().skip_while(|decl| decl.id != local.id).skip(1) {
+            self.tick()?;
+            if decl.value.is_some() || decl.binder_info == BinderInfo::InstImplicit {
+                continue;
+            }
+            if self
+                .elimination_reads(&decl.type_)?
+                .iter()
+                .any(|id| dependents.contains(id))
+            {
+                dependents.insert(decl.id.clone());
+                generalized = true;
+            }
+        }
+        let motive = self
+            .elimination_reads(target)?
+            .iter()
+            .any(|id| dependents.contains(id));
+        Ok((generalized || motive).then_some(local))
+    }
+
+    /// Whether `target` certainly lives outside `Prop`: its sort is a successor level.
+    /// An unknown type or an unresolved level is not judged, so this never refuses
+    /// a goal that might still be a proposition.
+    fn goal_outside_prop(&mut self, target: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let target = self.instantiate(target)?;
+        let Some(sort) = self.known_type(&target)? else {
+            return Ok(false);
+        };
+        let sort = self.whnf(&sort)?;
+        Ok(matches!(sort.node(), ExprNode::Sort { level }
+            if matches!(level.view(), fln_core::level::LevelView::Succ(_))))
+    }
+
     pub(super) fn eliminate_proof_goal_with_indices<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -500,33 +654,19 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         let (target_name, explicit, scoped, rows) = match input {
             EliminationSyntax::Tactic(args) => {
-                let [_, _, generalizing, with, alternatives] = *args else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                let (expression, _) = target(args, induction)?;
-                let name = match expression {
+                let parts = tactic_parts(args, induction)?;
+                let name = match parts.target {
                     Syntax::Ident { val, .. } => val.clone(),
                     _ if selected.is_some() => Name::anonymous(),
                     _ => return Err(error(TacticError::EliminationLocal)),
                 };
-                let rows = expect_null_args(alternatives, "elimination alternatives")?;
-                let scoped = match expect_null_args(with, "elimination with")? {
-                    [] if rows.is_empty() => false,
-                    [keyword] => {
-                        expect_atom(keyword, "with", "elimination alternatives")?;
-                        true
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
-                };
-                (
-                    name,
-                    expect_null_args(generalizing, "generalized locals")?,
-                    scoped,
-                    rows,
-                )
+                (name, parts.generalized, parts.scoped, parts.rows)
             }
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
                 (Name::anonymous(), &[][..], true, &[][..])
+            }
+            EliminationSyntax::EmptyMatrix(_) | EliminationSyntax::RCases(_) => {
+                (Name::anonymous(), &[][..], false, &[][..])
             }
         };
         self.resolve_instances(false)?;
@@ -575,6 +715,11 @@ impl Context {
         let Some(ConstantInfo::Rec(rec)) = self.txn.env.find(&rec_name).cloned() else {
             return Err(error(TacticError::UnsupportedEliminator));
         };
+        // The pin's `induction` tactic applies the recursor itself; `cases` and `match`
+        // use `casesOn`, which its code generator compiles (`codegen.rs`).
+        if induction && matches!(input, EliminationSyntax::Tactic(_)) {
+            self.note_source_recursor(&rec_name);
+        }
         if family.is_unsafe
             || family.num_nested != 0
             || family.all.is_empty()
@@ -617,6 +762,14 @@ impl Context {
                     return Err(error(TacticError::InductionMotiveMismatch));
                 }
             }
+            // A recursor with no universe of its own eliminates only into `Prop`: the
+            // pin's `induction` refuses a goal that is certainly not a proposition while
+            // assigning the motive ("Type mismatch when assigning motive").
+            if rec.base.level_params.len() == family.base.level_params.len()
+                && self.goal_outside_prop(&goal.target)?
+            {
+                return Err(error(TacticError::InductionMotiveMismatch));
+            }
         }
         let recursive_source = matches!(input, EliminationSyntax::RecursiveMatch(_));
         if recursive_source && equations.is_none() {
@@ -653,8 +806,10 @@ impl Context {
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         if equations.is_none() {
-            if matches!(input, EliminationSyntax::Match(_))
-                && self.match_has_field_indices(&family)?
+            if matches!(
+                input,
+                EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix(_)
+            ) && self.match_has_field_indices(&family)?
             {
                 return self.eliminate_constrained_indices(
                     proof,
@@ -697,11 +852,8 @@ impl Context {
             if !induction {
                 return Err(error(TacticError::InvalidGeneralization));
             }
-            expect_atom(&explicit[0], "generalizing", "generalization keyword")?;
-            if explicit.len() == 1 {
-                return Err(error(TacticError::InvalidGeneralization));
-            }
-            for name in &explicit[1..] {
+            // The names alone: `tactic_parts` read the `generalizing` keyword.
+            for name in explicit {
                 self.tick()?;
                 let Syntax::Ident { val, .. } = name else {
                     return Err(error(TacticError::InvalidGeneralization));
@@ -909,55 +1061,84 @@ impl Context {
         }
         for row in rows {
             self.tick()?;
-            let fields = expect_node(
+            // `inductionAlt := inductionAltLHS+ " => " body`: each left-hand side is one
+            // constructor's alternative and they share the body (`| zero | succ m => t` runs `t`
+            // on both goals); `inductionAltLHS := "| " (("@"? ident) <|> hole) binderIdent*`.
+            let alternative = expect_node(
                 row,
                 &parser_kind(&["Tactic", "inductionAlt"]),
-                5,
+                2,
                 "elimination alternative",
             )?;
-            expect_atom(&fields[0], "|", "elimination alternative")?;
-            if !matches!(&fields[3], Syntax::Atom { val, .. } if val == "=>" || val == "↦") {
+            let sides = expect_null_args(&alternative[0], "alternative left-hand side")?;
+            if sides.is_empty() {
                 return Err(error(TacticError::MalformedScript));
             }
-            let Syntax::Ident { val, .. } = &fields[1] else {
+            let [arrow, body] = expect_null_args(&alternative[1], "alternative body")? else {
                 return Err(error(TacticError::MalformedScript));
             };
-            let ctor = if family.ctors.contains(val) {
-                val.clone()
-            } else {
-                name.append_core(val)
-            };
-            if !family.ctors.contains(&ctor) {
-                return Err(error(TacticError::EliminationCoverage));
+            if !matches!(arrow, Syntax::Atom { val, .. } if val == "=>" || val == "↦") {
+                return Err(error(TacticError::MalformedScript));
             }
-            let mut names = Vec::new();
-            let mut unique = HashSet::new();
-            for field in expect_null_args(&fields[2], "elimination binders")? {
+            for lhs in sides {
                 self.tick()?;
-                let name = match field {
-                    Syntax::Ident { val, .. } => val.clone(),
-                    Syntax::Atom { val, .. } if val == "_" => Name::anonymous(),
-                    _ => return Err(error(TacticError::MalformedScript)),
+                let lhs = expect_node(
+                    lhs,
+                    &parser_kind(&["Tactic", "inductionAltLHS"]),
+                    3,
+                    "alternative left-hand side",
+                )?;
+                expect_atom(&lhs[0], "|", "elimination alternative")?;
+                let constructor = expect_node(
+                    &lhs[1],
+                    &Name::from_components(["group"]),
+                    2,
+                    "alternative constructor",
+                )?;
+                expect_empty_null(&constructor[0], "constructor without `@`")?;
+                let Syntax::Ident { val, .. } = &constructor[1] else {
+                    return Err(error(TacticError::MalformedScript));
                 };
-                if !name.is_anonymous() && !unique.insert(name.clone()) {
-                    return Err(error(TacticError::EliminationArity));
+                let ctor = if family.ctors.contains(val) {
+                    val.clone()
+                } else {
+                    name.append_core(val)
+                };
+                if !family.ctors.contains(&ctor) {
+                    return Err(error(TacticError::EliminationCoverage));
                 }
-                names.push(name);
-            }
-            if scripts
-                .insert(
-                    ctor,
-                    Alternative {
-                        names,
-                        body: AlternativeBody::Script(&fields[4]),
-                        explicit_fields: false,
-                        exact_fields: false,
-                        whole: None,
-                    },
-                )
-                .is_some()
-            {
-                return Err(error(TacticError::EliminationCoverage));
+                let mut names = Vec::new();
+                let mut unique = HashSet::new();
+                for field in expect_null_args(&lhs[2], "elimination binders")? {
+                    self.tick()?;
+                    // `binderIdent := ident <|> hole`: `_` is a `Term.hole`.
+                    let name = match field {
+                        Syntax::Ident { val, .. } => val.clone(),
+                        Syntax::Node { kind, .. } if kind == &parser_kind(&["Term", "hole"]) => {
+                            Name::anonymous()
+                        }
+                        _ => return Err(error(TacticError::MalformedScript)),
+                    };
+                    if !name.is_anonymous() && !unique.insert(name.clone()) {
+                        return Err(error(TacticError::EliminationArity));
+                    }
+                    names.push(name);
+                }
+                if scripts
+                    .insert(
+                        ctor,
+                        Alternative {
+                            names,
+                            body: AlternativeBody::Script(body),
+                            explicit_fields: false,
+                            exact_fields: false,
+                            whole: None,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(error(TacticError::EliminationCoverage));
+                }
             }
         }
         if scoped
@@ -1012,7 +1193,17 @@ impl Context {
                     induction,
                     equations,
                     recursive_source,
-                    source_match: !matches!(input, EliminationSyntax::Tactic(_)),
+                    source_match: !matches!(
+                        input,
+                        EliminationSyntax::Tactic(_) | EliminationSyntax::RCases(_)
+                    ),
+                    empty_fields: match input {
+                        EliminationSyntax::EmptyMatrix(fields)
+                        | EliminationSyntax::RCases(fields) => {
+                            fields.get(&rule.ctor).map(Vec::as_slice)
+                        }
+                        _ => None,
+                    },
                 },
                 alternative,
                 &mut hypotheses,

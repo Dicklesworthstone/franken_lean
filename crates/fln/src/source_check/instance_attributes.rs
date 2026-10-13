@@ -24,6 +24,14 @@ pub(super) fn apply(
             limit: MAX_DECLARATIONS,
         });
     }
+    if attribute.is_default && attribute.scoped {
+        return Err(SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message: "default instances require global registration".into(),
+        });
+    }
     if attribute.scoped && scope.namespace.is_anonymous() {
         return Err(SourceCheckError::Scope {
             file,
@@ -42,15 +50,40 @@ pub(super) fn apply(
                 offset,
                 message: error.to_string(),
             })?
+            // The pin's words for a name nothing resolves (`realizeGlobalConstNoOverload`):
+            // the name as written, measured with plain, dotted and namespaced names.
             .ok_or_else(|| SourceCheckError::Scope {
                 file,
                 command,
                 offset,
-                message: format!(
-                    "unknown instance declaration `{}`",
-                    requested.to_display_string()
-                ),
+                message: format!("Unknown constant `{}`", requested.to_display_string()),
             })?;
+        if attribute.is_default {
+            next = fln_elab::instances::defaults::register(&next, &name, attribute.priority)
+                .map_err(|error| SourceCheckError::Command {
+                    file,
+                    command,
+                    offset,
+                    error: Box::new(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ),
+                    )),
+                })?;
+            continue;
+        }
+        // The standalone attribute does not acquire the `instance` command's
+        // implicitReducible default (Lean/ReducibilityAttrs.lean:205–220).
+        // Preserve an unrecorded declaration's previous status before the
+        // registry's native-instance fallback can start treating it as one.
+        let statuses = fln_elab::reducibility::table(&next)
+            .map_err(|error| reducibility::registry_error(error, (file, command, offset)))?;
+        let unrecorded_status = statuses
+            .get(&name)
+            .is_none()
+            .then(|| statuses.status(&name));
         next = if attribute.scoped {
             fln_elab::instances::scoped::register(
                 &next,
@@ -71,6 +104,10 @@ pub(super) fn apply(
                 )),
             )),
         })?;
+        if let Some(status) = unrecorded_status {
+            next = fln_elab::reducibility::register(&next, &name, status)
+                .map_err(|error| reducibility::registry_error(error, (file, command, offset)))?;
+        }
     }
     // A late name/type/registry refusal drops this entire speculative successor.
     Ok(next)

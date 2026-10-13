@@ -358,7 +358,7 @@ pub fn option_equality_decision_seed_declaration() -> Declaration {
         fv(&b),
     );
     definition(
-        "instDecidableEqOption",
+        "Option.instDecidableEq",
         vec![name("u")],
         &[&alpha, &dictionary, &a, &b],
         decision(terms.equality(fv(&a), fv(&b))),
@@ -418,7 +418,7 @@ mod tests {
     }
     fn dictionary(carrier: Expr, element_dictionary: Expr) -> Expr {
         app(
-            constant("instDecidableEqOption", vec![Level::zero()]),
+            constant("Option.instDecidableEq", vec![Level::zero()]),
             [carrier, element_dictionary],
         )
     }
@@ -527,7 +527,7 @@ mod tests {
             assert!(!term.has_loose_bvars());
         }
         let env = environment();
-        assert!(env.contains(&name("instDecidableEqOption")));
+        assert!(env.contains(&name("Option.instDecidableEq")));
     }
     #[test]
     fn a_dictionary_for_the_wrong_carrier_cannot_forge_an_option_decision() {
@@ -618,7 +618,7 @@ mod tests {
         for label in [
             "instDecidableEqNat",
             "instDecidableEqBool",
-            "instDecidableEqOption",
+            "Option.instDecidableEq",
             "instDecidableNot",
         ] {
             env = register_instance(&env, &name(label), 1000).unwrap();

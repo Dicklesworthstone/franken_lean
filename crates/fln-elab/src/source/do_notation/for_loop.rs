@@ -36,6 +36,9 @@ fn monad_argument() -> Syntax {
 
 pub(super) struct LoopHeader {
     name: Syntax,
+    /// The element binder's type, `(x : T)`, as the callback lambda's annotation; empty when the
+    /// binder is a bare name.
+    annotation: Syntax,
     witness: Option<Syntax>,
     collection: Syntax,
 }
@@ -52,7 +55,9 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoLoopResultType"])) {
+        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoLoopResultType"]))
+            || syntax.kind() == Some(&parser_kind(&["Term", "nativeDoStateLoopResultType"]))
+        {
             return self
                 .do_loop_result_argument(function, name, syntax)
                 .map(Some);
@@ -128,6 +133,9 @@ impl Context {
         expect_atom(&declaration[2], "in", "loop membership keyword")?;
         let collection = declaration.pop().expect("validated collection");
         let name = declaration.remove(1);
+        // `for (x : T) in xs`: the binder with the element type it fixes. The pin reads a loop
+        // binder as a term pattern (`doFor`), and an ascription pattern matches its variable.
+        let (name, annotation) = ascribed_binder(name);
         let name = if name.kind() == Some(&parser_kind(&["Term", "hole"])) {
             let parts = node(name, "hole", 1)?;
             expect_atom(&parts[0], "_", "ignored loop element")?;
@@ -145,6 +153,7 @@ impl Context {
         Ok((
             LoopHeader {
                 name,
+                annotation,
                 witness,
                 collection,
             },
@@ -175,6 +184,7 @@ impl Context {
     ) -> Result<Syntax, NatDefinitionElabError> {
         let LoopHeader {
             name,
+            annotation,
             witness,
             collection,
         } = header;
@@ -190,7 +200,7 @@ impl Context {
         } else {
             (["ForIn", "forIn"], callback)
         };
-        let callback = lambda(name, null(vec![]), callback)?;
+        let callback = lambda(name, annotation, callback)?;
         // The pin's elabForIn/elabForIn' checks the collection without a
         // callback-derived expected type and selects the iteration dictionary
         // before elaborating that callback (Lean/Elab/Extra.lean).
@@ -204,6 +214,30 @@ impl Context {
         );
         Ok(action)
     }
+}
+
+/// A loop binder `(x : T)`: `x` with the lambda annotation `: T`. Any other binder is returned as
+/// it is, with no annotation.
+fn ascribed_binder(binder: Syntax) -> (Syntax, Syntax) {
+    if binder.kind() == Some(&parser_kind(&["Term", "typeAscription"]))
+        && let Syntax::Node { args, .. } = &binder
+        && let [
+            _,
+            value @ Syntax::Ident { .. },
+            colon,
+            Syntax::Node { args: types, .. },
+            _,
+        ] = args.as_slice()
+        && matches!(colon, Syntax::Atom { val, .. } if val == ":")
+        && let [type_] = types.as_slice()
+    {
+        let specification = Syntax::node(
+            parser_kind(&["Term", "typeSpec"]),
+            vec![atom(":"), type_.clone()],
+        );
+        return (value.clone(), null(vec![specification]));
+    }
+    (binder, null(vec![]))
 }
 
 #[cfg(test)]

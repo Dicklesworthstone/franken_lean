@@ -61,10 +61,12 @@ fn polymorphic_matrix_recursion_keeps_uniform_parameters() {
 const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n";
 #[test]
 fn correlated_indexed_matrices_recurse_at_the_actual_child_index() {
+    // `ys`'s index field is `_`: with both named, the pin refuses the match ("Type mismatch",
+    // 2026-10-10; source_pattern_typing.rs).
     check(&format!("{VEC}
       def zipVec (n : Nat) (xs ys : Vec Nat n) : Vec Nat n := match xs, ys with
         | .nil, .nil => Vec.nil
-        | .cons k x xt, .cons j y yt => Vec.cons k (x + y) (zipVec k xt yt)
+        | .cons k x xt, .cons _ y yt => Vec.cons k (x + y) (zipVec k xt yt)
       theorem zipped : zipVec 2 (Vec.cons 1 1 (Vec.cons 0 2 Vec.nil)) (Vec.cons 1 3 (Vec.cons 0 4 Vec.nil)) = Vec.cons 1 4 (Vec.cons 0 6 Vec.nil) := by rfl"));
 }
 

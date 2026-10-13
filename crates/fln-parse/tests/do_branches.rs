@@ -5,6 +5,10 @@ use fln_parse::{parse_definition, parse_nat_definition};
 use fln_syntax::tree::Syntax;
 
 fn kind(label: &str) -> Name {
+    // The pin's term `if` is the root-namespace notation `termIfThenElse`.
+    if label == "termIfThenElse" {
+        return Name::from_components([label]);
+    }
     Name::from_components(["Lean", "Parser", "Term", label])
 }
 fn nodes<'a>(syntax: &'a Syntax, label: &str) -> Vec<&'a [Syntax]> {
@@ -81,12 +85,30 @@ fn outer_else_does_not_attach_to_a_more_indented_if_without_else() {
 
 #[test]
 fn else_if_layout_and_nearest_inline_else_remain_distinct() {
-    for source in [
-        "def run := do\n  if a then\n    first\n  else if b then\n    second\n  else\n    third\n  return 42",
-        "def run := do { if a then if b then first else second else third; return 42 }",
+    // `else if` is one `doIf` with an else-if clause (the pin's `group (group "else" "if") …`);
+    // an `if` in the `then` branch is a second `doIf`.
+    for (source, conditionals, clauses) in [
+        (
+            "def run := do\n  if a then\n    first\n  else if b then\n    second\n  else\n    third\n  return 42",
+            1,
+            1,
+        ),
+        (
+            "def run := do { if a then if b then first else second else third; return 42 }",
+            2,
+            0,
+        ),
     ] {
         let p = roundtrip(source);
-        assert_eq!(nodes(p.syntax(), "doIf").len(), 2);
+        assert_eq!(nodes(p.syntax(), "doIf").len(), conditionals, "{source}");
+        let else_ifs: usize = nodes(p.syntax(), "doIf")
+            .into_iter()
+            .map(|parts| match &parts[4] {
+                Syntax::Node { args, .. } => args.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(else_ifs, clauses, "{source}");
         assert_eq!(nodes(p.syntax(), "do").len(), 1);
     }
 }
@@ -114,7 +136,7 @@ fn expression_conditionals_and_nested_do_keep_their_own_grammar() {
     ] {
         let p = roundtrip(source);
         assert_eq!(nodes(p.syntax(), "doIf").len(), 1);
-        assert_eq!(nodes(p.syntax(), "ifThenElse").len(), 1);
+        assert_eq!(nodes(p.syntax(), "termIfThenElse").len(), 1);
     }
     for source in [
         "def run := if flag then 7",

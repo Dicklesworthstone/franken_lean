@@ -36,6 +36,9 @@ impl Preparation<'_> {
         if !closed(input) {
             return Ok(None);
         }
+        if let Some(value) = self.specializations.factory_values.get(input) {
+            return Ok(Some(value.clone()));
+        }
         let mut tasks = vec![Task::Value(input.clone())];
         let mut values = Vec::new();
         let limit = self.limits.max_nodes;
@@ -45,7 +48,31 @@ impl Preparation<'_> {
             match task {
                 Task::Value(expression) => {
                     let (head, arguments) = self.spine(&expression)?;
+                    // The checked IO world index is inert type metadata. Its
+                    // opaque carrier must not be evaluated while selecting a
+                    // monad-lifting dictionary, just as runtime type erasure
+                    // preserves the same admitted phantom index.
+                    if self.preserve_io_world_type(&head, &arguments)? {
+                        values.push(expression);
+                        continue;
+                    }
                     if let ExprNode::Const { name, levels } = head.node() {
+                        // A logical dictionary body must not supply executable
+                        // fields after implemented_by selected a different
+                        // value. Keep it on the ordinary runtime path instead
+                        // of substituting either body into the type telescope.
+                        if self.has_implementation(name)? {
+                            return Ok(None);
+                        }
+                        // A verified primitive is inert as a function value,
+                        // whether its logical declaration is an axiom or a
+                        // definition. Keep its name in dictionary fields so
+                        // executable calls still reach the exact intrinsic
+                        // contract, including the checked helper dependencies.
+                        if arguments.is_empty() && self.inert_native_function(&head)? {
+                            values.push(expression);
+                            continue;
+                        }
                         match self.environment.find(name) {
                             Some(ConstantInfo::Axiom(axiom))
                                 if !axiom.is_unsafe
@@ -59,9 +86,7 @@ impl Preparation<'_> {
                                 // Opaque types such as String are inert type
                                 // metadata, not executable axioms. A constant
                                 // producing a runtime value or proof is refused.
-                                if self.type_parameter(&type_)?
-                                    || arguments.is_empty() && self.inert_native_function(&head)
-                                {
+                                if self.type_parameter(&type_)? {
                                     values.push(expression);
                                     continue;
                                 }
@@ -235,9 +260,39 @@ impl Preparation<'_> {
         if values.len() != 1 {
             return Err(unsupported("instance factory result"));
         }
-        Ok(values.pop())
+        let value = values
+            .pop()
+            .ok_or_else(|| unsupported("instance factory result"))?;
+        if closed(&value) {
+            self.tick()?;
+            let entries = &mut self.specializations.factory_values;
+            let additional = usize::from(!entries.contains_key(input));
+            let observed = entries.len().saturating_add(additional);
+            if observed > self.limits.max_nodes {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::Nodes,
+                    limit: self.limits.max_nodes,
+                    observed,
+                });
+            }
+            entries
+                .try_reserve(additional)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::Nodes,
+                    requested: observed,
+                })?;
+            // This cache records completed administrative evaluation, not a
+            // kernel reduction or runtime result. The immutable environment
+            // and canonical private definitions keep its full input identity
+            // stable; every operand was checked before a successful insertion.
+            entries.insert(input.clone(), value.clone());
+        }
+        Ok(Some(value))
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_tests;

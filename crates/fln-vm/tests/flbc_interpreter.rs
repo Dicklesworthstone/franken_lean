@@ -71,6 +71,7 @@ const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnershi
             CallableResultOwnership::Scalar
         }
         fir::ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
+        fir::ValueType::Abi => CallableResultOwnership::Erased,
         fir::ValueType::String
         | fir::ValueType::Float
         | fir::ValueType::Float32
@@ -80,8 +81,7 @@ const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnershi
         | fir::ValueType::Ref
         | fir::ValueType::Thunk
         | fir::ValueType::Task
-        | fir::ValueType::Closure(_)
-        | fir::ValueType::Abi => CallableResultOwnership::Owned,
+        | fir::ValueType::Closure(_) => CallableResultOwnership::Owned,
     }
 }
 
@@ -983,6 +983,312 @@ fn callable_nat_result_accepts_scalar_or_mpz_but_scalar_contract_refuses_mpz() {
             ..
         }) if function == fid(0)
     ));
+}
+
+#[test]
+fn erased_callable_results_transfer_through_calls_and_terminal_replay() {
+    let _guard = lock();
+    for kind in ["scalar", "mpz", "negative-mpz", "string", "constructor"] {
+        for dynamic in [false, true] {
+            for terminal in [false, true] {
+                let mut code = vec![Instruction::String {
+                    dst: r(1),
+                    value: "owned-child".to_string(),
+                }];
+                match kind {
+                    "scalar" => code.push(Instruction::Nat {
+                        dst: r(0),
+                        value: 42,
+                    }),
+                    "mpz" | "negative-mpz" => {
+                        code.push(Instruction::NatBig {
+                            dst: r(0),
+                            limbs_le: vec![0, 1],
+                        });
+                        if kind == "negative-mpz" {
+                            code.push(intrinsic(r(0), "extern:Int.neg", vec![r(0)]));
+                        }
+                    }
+                    "string" => code.push(Instruction::String {
+                        dst: r(0),
+                        value: "erased-string".to_string(),
+                    }),
+                    "constructor" => code.push(Instruction::Ctor {
+                        dst: r(0),
+                        tag: 3,
+                        fields: vec![r(1)],
+                        scalar_bytes: Vec::new(),
+                    }),
+                    _ => unreachable!(),
+                }
+                if dynamic {
+                    code.push(Instruction::Closure {
+                        dst: r(2),
+                        function: fid(1),
+                        captures: Vec::new(),
+                        capture_ownership: Vec::new(),
+                    });
+                }
+                let args = vec![r(0)];
+                let argument_ownership = vec![ArgumentOwnership::Owned];
+                let result_ownership = CallableResultOwnership::Erased;
+                code.push(match (dynamic, terminal) {
+                    (false, false) => Instruction::Call {
+                        dst: r(3),
+                        function: fid(1),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                    (true, false) => Instruction::Apply {
+                        dst: r(3),
+                        closure: r(2),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                    (false, true) => Instruction::TailCall {
+                        function: fid(1),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                    (true, true) => Instruction::TailApply {
+                        closure: r(2),
+                        args,
+                        argument_ownership,
+                        result_ownership,
+                    },
+                });
+                if !terminal {
+                    code.push(Instruction::Return { src: r(3) });
+                }
+                let source = validated(vec![
+                    function_with_callable_result(0, Vec::new(), result_ownership, 4, code),
+                    function_with_callable_result(
+                        1,
+                        vec![ArgumentOwnership::Owned],
+                        result_ownership,
+                        1,
+                        vec![Instruction::Return { src: r(0) }],
+                    ),
+                ]);
+                let owned = insert_ownership(&source, OwnershipLimits::default())
+                    .expect("erased values have a checked transfer graph");
+                assert!(owned.witness().canonical_text().contains("result=erased"));
+                let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+                let decoded = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+                assert!(decoded.functions().iter().all(|function| {
+                    function.result_ownership == CallableResultOwnership::Erased
+                }));
+                let replay = validate_ownership_candidate(
+                    &source,
+                    decoded,
+                    owned.witness().clone(),
+                    OwnershipLimits::default(),
+                )
+                .expect("canonical replay independently validates erased transfers");
+                shadow::enable();
+                for program in [&source, replay.program()] {
+                    let completed = returned(execute(
+                        program,
+                        ExecutionLimits {
+                            max_stack_depth: if terminal { 1 } else { 2 },
+                            ..ExecutionLimits::default()
+                        },
+                        None,
+                    ));
+                    assert_eq!(
+                        completed.usage.peak_stack_depth,
+                        if terminal { 1 } else { 2 }
+                    );
+                    match kind {
+                        "scalar" => assert_eq!(completed.value.unbox(), 42),
+                        "mpz" => assert_eq!(nat_limbs(&completed.value), vec![0, 1]),
+                        "negative-mpz" => {
+                            let (_, size, limbs) = completed.value.mpz_view();
+                            assert!(size < 0);
+                            assert_eq!(limbs, &[0, 1]);
+                        }
+                        "string" => assert_eq!(string_contents(&completed.value), "erased-string"),
+                        "constructor" => {
+                            assert_eq!(value_kind(&completed.value), ValueKind::Ctor(3));
+                            assert_eq!(
+                                string_contents(&completed.value.ctor_child(0)),
+                                "owned-child"
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                let (events, live) = shadow::disable_and_drain();
+                assert_eq!(live, 0, "{kind}, dynamic={dynamic}, terminal={terminal}");
+                assert!(events.iter().all(|event| !matches!(
+                    event.kind,
+                    shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+                )));
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_dynamic_contracts_do_not_authorize_mismatches_or_overapplication() {
+    let _guard = lock();
+    for terminal in [false, true] {
+        for (callee_result, call_result, extra_argument, expected, actual) in [
+            (
+                CallableResultOwnership::Erased,
+                CallableResultOwnership::Owned,
+                false,
+                CallableResultOwnership::Erased,
+                CallableResultOwnership::Owned,
+            ),
+            (
+                CallableResultOwnership::Owned,
+                CallableResultOwnership::Erased,
+                false,
+                CallableResultOwnership::Owned,
+                CallableResultOwnership::Erased,
+            ),
+            (
+                CallableResultOwnership::OwnedOrScalar,
+                CallableResultOwnership::Erased,
+                false,
+                CallableResultOwnership::OwnedOrScalar,
+                CallableResultOwnership::Erased,
+            ),
+            (
+                CallableResultOwnership::Erased,
+                CallableResultOwnership::Erased,
+                true,
+                CallableResultOwnership::Owned,
+                CallableResultOwnership::Erased,
+            ),
+        ] {
+            let mut code = vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "retained-on-refusal".to_string(),
+                },
+                Instruction::Closure {
+                    dst: r(1),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+            ];
+            let mut args = vec![r(0)];
+            let mut argument_ownership = vec![ArgumentOwnership::Owned];
+            if extra_argument {
+                code.push(Instruction::String {
+                    dst: r(2),
+                    value: "extra-owned-argument".to_string(),
+                });
+                args.push(r(2));
+                argument_ownership.push(ArgumentOwnership::Owned);
+            }
+            code.push(if terminal {
+                Instruction::TailApply {
+                    closure: r(1),
+                    args,
+                    argument_ownership,
+                    result_ownership: call_result,
+                }
+            } else {
+                Instruction::Apply {
+                    dst: r(3),
+                    closure: r(1),
+                    args,
+                    argument_ownership,
+                    result_ownership: call_result,
+                }
+            });
+            if !terminal {
+                code.push(Instruction::Return { src: r(3) });
+            }
+            let source = validated(vec![
+                function_with_callable_result(0, Vec::new(), call_result, 4, code),
+                function_with_callable_result(
+                    1,
+                    vec![ArgumentOwnership::Owned],
+                    callee_result,
+                    1,
+                    vec![Instruction::Return { src: r(0) }],
+                ),
+            ]);
+            let owned = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+            let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+            let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+            shadow::enable();
+            for program in [&source, &replay] {
+                assert!(matches!(execute(program, ExecutionLimits::default(), None),
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                            function, expected: got_expected, actual: got_actual,
+                        }, ..
+                    }) if function == fid(1) && got_expected == expected && got_actual == actual
+                ));
+            }
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(
+                live, 0,
+                "dynamic result refusal releases untransferred operands"
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+            )));
+        }
+    }
+}
+
+#[test]
+fn nat_callable_union_still_refuses_strings_and_negative_mpz() {
+    let _guard = lock();
+    for negative_mpz in [false, true] {
+        let mut code = if negative_mpz {
+            vec![
+                Instruction::NatBig {
+                    dst: r(0),
+                    limbs_le: vec![0, 1],
+                },
+                intrinsic(r(1), "extern:Int.neg", vec![r(0)]),
+            ]
+        } else {
+            vec![Instruction::String {
+                dst: r(1),
+                value: "not-a-nat".to_string(),
+            }]
+        };
+        code.push(Instruction::Return { src: r(1) });
+        let source = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::OwnedOrScalar,
+            2,
+            code,
+        )]);
+        let expected_kind = if negative_mpz {
+            ValueKind::Mpz
+        } else {
+            ValueKind::String
+        };
+        shadow::enable();
+        assert!(matches!(execute(&source, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::CallableResultKind {
+                    function, expected: CallableResultOwnership::OwnedOrScalar, actual,
+                }, ..
+            }) if function == fid(0) && actual == expected_kind
+        ));
+        let (events, live) = shadow::disable_and_drain();
+        assert_eq!(live, 0, "Nat result refusal releases non-Nat objects");
+        assert!(events.iter().all(|event| !matches!(
+            event.kind,
+            shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+        )));
+    }
 }
 
 #[test]
@@ -2546,7 +2852,7 @@ fn core_linear_ownership_drops_dead_heap_values_at_their_final_use() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=inserted-linear result=owned source=3 emitted=4 drops=1 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2662,7 +2968,7 @@ fn straight_line_register_reuse_releases_each_value_epoch_without_leaking() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=inserted-linear-reuse result=owned source=7 emitted=9 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2795,7 +3101,7 @@ fn acyclic_cfg_register_reuse_executes_both_value_epochs_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=owned source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -2893,7 +3199,7 @@ fn cyclic_cfg_register_reuse_executes_zero_one_and_bounded_many_iterations() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=owned source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3059,7 +3365,7 @@ fn preowned_flbc_is_checked_before_golem_and_preserves_transfer_events() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=validated-existing-ownership result=owned source=7 emitted=7 drops=0 moves=0 existing_drops=2 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -3256,7 +3562,7 @@ fn fir_acyclic_cfg_ownership_executes_both_edges_with_balanced_marrow() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-acyclic-cfg result=owned source=9 emitted=18 drops=5 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3397,7 +3703,7 @@ fn fir_cyclic_cfg_ownership_returns_or_stops_bounded_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/15\n",
+                "flbc-ownership/16\n",
                 "function f0 mode=inserted-cyclic-cfg result=owned source=8 emitted=15 drops=3 moves=0 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3963,11 +4269,11 @@ fn typed_local_core_closures_execute_nat_and_string_captures_with_balanced_owner
     shadow::enable();
     let nat = returned(execute(&nat_program, ExecutionLimits::default(), None));
     assert_eq!(nat.value.unbox(), 42);
-    assert_eq!(nat.usage.peak_stack_depth, 2);
+    assert_eq!(nat.usage.peak_stack_depth, 1);
     drop(nat);
     let string = returned(execute(&string_program, ExecutionLimits::default(), None));
     assert_eq!(string_contents(&string.value), "core-golem");
-    assert_eq!(string.usage.peak_stack_depth, 2);
+    assert_eq!(string.usage.peak_stack_depth, 1);
     drop(string);
     let (events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "local closure execution releases every ABI object");
@@ -4452,7 +4758,9 @@ fn typed_core_partial_and_overapplication_execute_on_golem_and_marrow() {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                Instruction::Apply { args, .. } => Some(args.len()),
+                Instruction::Apply { args, .. } | Instruction::TailApply { args, .. } => {
+                    Some(args.len())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4736,11 +5044,11 @@ fn self_recursive_core_closures_return_acyclic_environments_and_stop_typed() {
         Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => {
                 assert!(usage.is_genuine_exhaustion());
-                assert_eq!(usage.allowed, 3);
-                assert_eq!(usage.observed, 4);
-                assert_eq!(usage.reason, ResourceReason::RecursionDepth { limit: 3 });
+                assert_eq!(usage.allowed, 100);
+                assert_eq!(usage.observed, 101);
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
-            other => panic!("expected recursive depth exhaustion, got {other:?}"),
+            other => panic!("expected recursive execution-step exhaustion, got {other:?}"),
         },
         other => panic!("expected recursive Inconclusive, got {other:?}"),
     }
@@ -4961,11 +5269,11 @@ fn mutual_recursive_core_closures_return_peers_and_stop_typed_without_cycles() {
         Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => {
                 assert!(usage.is_genuine_exhaustion());
-                assert_eq!(usage.allowed, 3);
-                assert_eq!(usage.observed, 4);
-                assert_eq!(usage.reason, ResourceReason::RecursionDepth { limit: 3 });
+                assert_eq!(usage.allowed, 100);
+                assert_eq!(usage.observed, 101);
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
-            other => panic!("expected mutual recursion depth exhaustion, got {other:?}"),
+            other => panic!("expected mutual recursion execution-step exhaustion, got {other:?}"),
         },
         other => panic!("expected mutual recursion Inconclusive, got {other:?}"),
     }
@@ -8868,7 +9176,7 @@ fn generated_array_ownership_transfers_exactly_and_refuses_drift_before_executio
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/15\n",
+            "flbc-ownership/16\n",
             "function f0 mode=inserted-linear result=owned source=6 emitted=8 drops=2 moves=0 redefs=0 edges=0 extern_consumes=2 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=2 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -10398,6 +10706,362 @@ fn float_intrinsics_execute_ieee_arithmetic_at_each_native_precision() {
 }
 
 #[test]
+fn float_unary_math_and_pow_atan2_execute_on_the_owned_numerics_plane() {
+    let _guard = lock();
+    // IEEE-exact rows: these goldens are definitional, independent of any
+    // libm, so they anchor the plane absolutely.
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        for (operation, input, expected) in [
+            ("sqrt", 4.0, 2.0_f64),
+            ("sqrt", 2.25, 1.5),
+            ("sqrt", -1.0, f64::NAN),
+            ("ceil", 2.1, 3.0),
+            ("ceil", -2.9, -2.0),
+            ("floor", 2.9, 2.0),
+            ("floor", -2.1, -3.0),
+            // Ties away from zero: the pin's extern symbol is C `round`.
+            ("round", 2.5, 3.0),
+            ("round", -2.5, -3.0),
+            ("round", 2.4, 2.0),
+        ] {
+            let value = run_float(
+                &format!("extern:{family}.{operation}"),
+                vec![float_operand(r(0), binary32, input)],
+                true,
+            );
+            let actual = float_contents(&value, binary32);
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "{family}.{operation}({input})");
+            } else {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{family}.{operation}({input})"
+                );
+            }
+        }
+    }
+    // Transcendental rows return fln-libm's exact bits at the row's own
+    // precision — the owned plane is the semantics owner (§6.8, D21). The
+    // window assertion keeps the wiring check from being purely circular,
+    // and the Float32 comparison fails if a row evaluates at the wrong width.
+    for (operation, input, low, high) in [
+        ("sin", 1.0, 0.841, 0.842),
+        ("cos", 1.0, 0.540, 0.541),
+        ("tan", 1.0, 1.557, 1.558),
+        ("asin", 0.5, 0.523, 0.524),
+        ("acos", 0.5, 1.047, 1.048),
+        ("atan", 1.0, 0.785, 0.786),
+        ("sinh", 1.0, 1.175, 1.176),
+        ("cosh", 1.0, 1.543, 1.544),
+        ("tanh", 1.0, 0.761, 0.762),
+        ("asinh", 1.0, 0.881, 0.882),
+        ("acosh", 2.0, 1.316, 1.317),
+        ("atanh", 0.5, 0.549, 0.550),
+        (
+            "exp",
+            1.0,
+            std::f64::consts::E - 1e-3,
+            std::f64::consts::E + 1e-3,
+        ),
+        ("exp2", 1.5, 2.828, 2.829),
+        ("log", 2.0, 0.693, 0.694),
+        ("log2", 5.0, 2.321, 2.322),
+        ("log10", 5.0, 0.698, 0.699),
+        ("cbrt", 2.0, 1.259, 1.260),
+    ] {
+        let wide = run_float(
+            &format!("extern:Float.{operation}"),
+            vec![float_operand(r(0), false, input)],
+            true,
+        );
+        let wide = float_contents(&wide, false);
+        assert!(
+            low < wide && wide < high,
+            "Float.{operation}({input}) = {wide}"
+        );
+        let owned = match operation {
+            "sin" => fln_libm::sin(input),
+            "cos" => fln_libm::cos(input),
+            "tan" => fln_libm::tan(input),
+            "asin" => fln_libm::asin(input),
+            "acos" => fln_libm::acos(input),
+            "atan" => fln_libm::atan(input),
+            "sinh" => fln_libm::sinh(input),
+            "cosh" => fln_libm::cosh(input),
+            "tanh" => fln_libm::tanh(input),
+            "asinh" => fln_libm::asinh(input),
+            "acosh" => fln_libm::acosh(input),
+            "atanh" => fln_libm::atanh(input),
+            "exp" => fln_libm::exp(input),
+            "exp2" => fln_libm::exp2(input),
+            "log" => fln_libm::log(input),
+            "log2" => fln_libm::log2(input),
+            "log10" => fln_libm::log10(input),
+            "cbrt" => fln_libm::cbrt(input),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            wide.to_bits(),
+            owned.to_bits(),
+            "Float.{operation}({input})"
+        );
+        let narrow = run_float(
+            &format!("extern:Float32.{operation}"),
+            vec![float_operand(r(0), true, input)],
+            true,
+        );
+        let narrow = float_contents(&narrow, true);
+        let owned32 = match operation {
+            "sin" => fln_libm::f32::sin(input as f32),
+            "cos" => fln_libm::f32::cos(input as f32),
+            "tan" => fln_libm::f32::tan(input as f32),
+            "asin" => fln_libm::f32::asin(input as f32),
+            "acos" => fln_libm::f32::acos(input as f32),
+            "atan" => fln_libm::f32::atan(input as f32),
+            "sinh" => fln_libm::f32::sinh(input as f32),
+            "cosh" => fln_libm::f32::cosh(input as f32),
+            "tanh" => fln_libm::f32::tanh(input as f32),
+            "asinh" => fln_libm::f32::asinh(input as f32),
+            "acosh" => fln_libm::f32::acosh(input as f32),
+            "atanh" => fln_libm::f32::atanh(input as f32),
+            "exp" => fln_libm::f32::exp(input as f32),
+            "exp2" => fln_libm::f32::exp2(input as f32),
+            "log" => fln_libm::f32::log(input as f32),
+            "log2" => fln_libm::f32::log2(input as f32),
+            "log10" => fln_libm::f32::log10(input as f32),
+            "cbrt" => fln_libm::f32::cbrt(input as f32),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            narrow.to_bits(),
+            f64::from(owned32).to_bits(),
+            "Float32.{operation}({input})"
+        );
+    }
+    // Domain edges leave the real line: the result is NaN, not a refusal.
+    for (operation, input) in [("log", -1.0), ("acosh", 0.5), ("atanh", 2.0), ("asin", 2.0)] {
+        let value = run_float(
+            &format!("extern:Float.{operation}"),
+            vec![float_operand(r(0), false, input)],
+            true,
+        );
+        assert!(
+            float_contents(&value, false).is_nan(),
+            "Float.{operation}({input})"
+        );
+    }
+    // pow(2, 10) is exact at both widths.
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let value = run_float(
+            &format!("extern:{family}.pow"),
+            vec![
+                float_operand(r(0), binary32, 2.0),
+                float_operand(r(1), binary32, 10.0),
+            ],
+            true,
+        );
+        assert_eq!(
+            float_contents(&value, binary32).to_bits(),
+            1024.0_f64.to_bits()
+        );
+    }
+    // atan2's first argument is y, as in the pin's `atan2 (y x : Float)`:
+    // atan2(1, 0) = +pi/2, while the swapped reading would give 0.
+    let quadrant = run_float(
+        "extern:Float.atan2",
+        vec![
+            float_operand(r(0), false, 1.0),
+            float_operand(r(1), false, 0.0),
+        ],
+        true,
+    );
+    let quadrant = float_contents(&quadrant, false);
+    assert!(
+        (quadrant - std::f64::consts::FRAC_PI_2).abs() < 1e-12,
+        "atan2(y=1, x=0) = {quadrant}"
+    );
+    assert_eq!(quadrant.to_bits(), fln_libm::atan2(1.0, 0.0).to_bits());
+    // frExp's pair result remains outside this adapter's supported shape.
+    let refusal = float_program(
+        "extern:Float.frExp",
+        vec![float_operand(r(0), false, 1.5)],
+        true,
+    );
+    assert!(matches!(
+        execute(&refusal, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::UnsupportedIntrinsic { .. },
+            ..
+        })
+    ));
+}
+
+fn float_scaling_program(binary32: bool, bits: u64, exponent: i64) -> ValidatedProgram {
+    let magnitude = if exponent < 0 {
+        exponent.unsigned_abs() - 1
+    } else {
+        exponent as u64
+    };
+    let row = if exponent < 0 {
+        "extern:Int.negSucc"
+    } else {
+        "extern:Int.ofNat"
+    };
+    let float_row = if binary32 {
+        "extern:Float32.scaleB"
+    } else {
+        "extern:Float.scaleB"
+    };
+    validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Owned,
+        4,
+        vec![
+            boxed_scalar(
+                r(0),
+                if binary32 {
+                    (bits as u32).to_ne_bytes().to_vec()
+                } else {
+                    bits.to_ne_bytes().to_vec()
+                },
+            ),
+            Instruction::Nat {
+                dst: r(1),
+                value: magnitude,
+            },
+            intrinsic(r(2), row, vec![r(1)]),
+            intrinsic(r(3), float_row, vec![r(0), r(2)]),
+            Instruction::Return { src: r(3) },
+        ],
+    )])
+}
+
+#[test]
+fn float_scaling_executes_and_replays_exact_binary_boundaries() {
+    let _guard = lock();
+    // These cells force the exponent through the ordinary Int constructor
+    // intrinsic and scale through its census row, including the transition
+    // from a tagged i32 to an mpz. No compiler constant folding participates.
+    for (binary32, bits, exponent, expected) in [
+        (false, 0x3ff0_0000_0000_0000, 3, 0x4020_0000_0000_0000),
+        (false, 0xbff8_0000_0000_0000, -1, 0xbfe8_0000_0000_0000),
+        (false, 0x3ff0_0000_0000_0000, -1075, 0),
+        // Just above halfway must survive. Scaling by two host
+        // multiplications can lose this low bit before the final rounding.
+        (false, 0x3ff0_0000_0000_0001, -1075, 1),
+        (false, 0x3ff8_0000_0000_0000, -1074, 2),
+        (false, 0x3fff_ffff_ffff_ffff, -1023, 0x0010_0000_0000_0000),
+        (false, 1, 1074, 0x3ff0_0000_0000_0000),
+        (false, 0x000f_ffff_ffff_ffff, 1, 0x001f_ffff_ffff_fffe),
+        (false, 0x7fef_ffff_ffff_ffff, 1, 0x7ff0_0000_0000_0000),
+        (false, 0x8000_0000_0000_0000, -5, 0x8000_0000_0000_0000),
+        (false, 0xbff0_0000_0000_0001, -1075, 0x8000_0000_0000_0001),
+        (true, 0x3f80_0000, 3, 0x4100_0000),
+        (true, 0xbfc0_0000, -1, 0xbf40_0000),
+        (true, 0x3f80_0000, -150, 0),
+        (true, 0x3f80_0001, -150, 1),
+        (true, 0x3fc0_0000, -149, 2),
+        (true, 0x3fff_ffff, -127, 0x0080_0000),
+        (true, 1, 149, 0x3f80_0000),
+        (true, 0x007f_ffff, 1, 0x00ff_fffe),
+        (true, 0x7f7f_ffff, 1, 0x7f80_0000),
+        (true, 0x8000_0000, -5, 0x8000_0000),
+        (true, 0xbf80_0001, -150, 0x8000_0001),
+    ] {
+        let program = float_scaling_program(binary32, bits, exponent);
+        let bytes = encode_canonical(&program, CodecLimits::default()).unwrap();
+        let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        for program in [&program, &replay] {
+            let execution = returned(execute(program, ExecutionLimits::default(), None));
+            let actual = if binary32 {
+                u64::from(execution.value.try_ctor_scalar_u32(0).unwrap())
+            } else {
+                execution.value.try_ctor_scalar_u64(0).unwrap()
+            };
+            assert_eq!(
+                actual, expected,
+                "binary32={binary32}, bits={bits:x}, exponent={exponent}"
+            );
+        }
+    }
+}
+
+#[test]
+fn float_scaling_preserves_the_pins_scalar_and_mpz_int_branches() {
+    let _guard = lock();
+    for (binary32, sign, infinity, nan, one) in [
+        (
+            false,
+            1_u64 << 63,
+            0x7ff0_0000_0000_0000,
+            0x7ff8_0000_0000_0000,
+            0x3ff0_0000_0000_0000,
+        ),
+        (true, 1_u64 << 31, 0x7f80_0000, 0x7fc0_0000, 0x3f80_0000),
+    ] {
+        for (bits, exponent, expected) in [
+            (sign, i64::from(i32::MIN), sign),
+            (sign, i64::from(i32::MIN) - 1, 0),
+            (infinity, i64::from(i32::MIN), infinity),
+            (infinity, i64::from(i32::MIN) - 1, 0),
+            (nan, i64::from(i32::MIN), nan),
+            (nan, i64::from(i32::MIN) - 1, 0),
+            (one | sign, i64::from(i32::MAX), infinity | sign),
+            (one | sign, i64::from(i32::MAX) + 1, infinity | sign),
+            (sign, i64::from(i32::MAX), sign),
+            (sign, i64::from(i32::MAX) + 1, 0),
+            (nan, i64::from(i32::MAX) + 1, nan),
+        ] {
+            let execution = returned(execute(
+                &float_scaling_program(binary32, bits, exponent),
+                ExecutionLimits::default(),
+                None,
+            ));
+            let actual = if binary32 {
+                u64::from(execution.value.try_ctor_scalar_u32(0).unwrap())
+            } else {
+                execution.value.try_ctor_scalar_u64(0).unwrap()
+            };
+            assert_eq!(
+                actual, expected,
+                "binary32={binary32}, bits={bits:x}, exponent={exponent}"
+            );
+        }
+        let row = if binary32 {
+            "extern:Float32.scaleB"
+        } else {
+            "extern:Float.scaleB"
+        };
+        let bad = float_program(
+            row,
+            vec![
+                float_operand(r(0), binary32, 1.0),
+                Instruction::String {
+                    dst: r(1),
+                    value: "not an Int".to_owned(),
+                },
+            ],
+            true,
+        );
+        assert!(matches!(
+            execute(&bad, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            })
+        ));
+        let recovered = returned(execute(
+            &float_scaling_program(binary32, one, 0),
+            ExecutionLimits::default(),
+            None,
+        ));
+        assert_eq!(float_contents(&recovered.value, binary32), 1.0);
+    }
+}
+
+#[test]
 fn float_intrinsics_compare_nan_and_signed_zero_without_total_ordering() {
     let _guard = lock();
     for (family, binary32) in [("Float", false), ("Float32", true)] {
@@ -11089,4 +11753,489 @@ fn float_to_string_results_compose_with_owned_strings_and_reclaim_stopped_result
         event.kind != shadow::EventKind::DoubleRelease
             && event.kind != shadow::EventKind::ForeignPointer
     }));
+}
+
+// Array updates deliberately retain an alias to the input across each owned
+// extern call. The result tuple makes a shared-input mutation observable.
+fn array_updates_program(row: &str, first: Instruction, second: Instruction) -> ValidatedProgram {
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: "alpha".into(),
+        },
+        Instruction::String {
+            dst: r(1),
+            value: "beta".into(),
+        },
+        Instruction::String {
+            dst: r(2),
+            value: "gamma".into(),
+        },
+        Instruction::Array {
+            dst: r(3),
+            items: vec![r(0), r(1), r(2)],
+        },
+        Instruction::Copy {
+            dst: r(4),
+            src: r(3),
+        },
+        first,
+        second,
+    ];
+    let arguments = match row {
+        "extern:Array.pop" => vec![r(3)],
+        "extern:Array.set" | "extern:Array.uset" => vec![r(3), r(5), r(2)],
+        _ => vec![r(3), r(5), r(6)],
+    };
+    code.push(intrinsic(r(7), row, arguments));
+    code.push(Instruction::Ctor {
+        dst: r(8),
+        tag: 0,
+        fields: vec![r(4), r(7)],
+        scalar_bytes: Vec::new(),
+    });
+    code.push(Instruction::Return { src: r(8) });
+    validated(vec![function(0, 0, 9, code)])
+}
+
+fn array_update_strings(array: &Obj) -> Vec<String> {
+    let (size, _) = array.array_view();
+    (0..size)
+        .map(|index| {
+            let child = array.array_child(index);
+            let (size, _, _, bytes) = child.try_string_view().expect("string array cell");
+            String::from_utf8(bytes[..size - 1].to_vec()).expect("UTF-8 cell")
+        })
+        .collect()
+}
+
+#[test]
+fn array_updates_preserve_shared_inputs_and_owned_heap_results() {
+    let _guard = lock();
+    for (row, expected) in [
+        ("extern:Array.pop", vec!["alpha", "beta"]),
+        ("extern:Array.set", vec!["gamma", "beta", "gamma"]),
+        ("extern:Array.uset", vec!["gamma", "beta", "gamma"]),
+        ("extern:Array.swap", vec!["gamma", "beta", "alpha"]),
+        (
+            "extern:Array.swapIfInBounds",
+            vec!["gamma", "beta", "alpha"],
+        ),
+    ] {
+        let first = if row == "extern:Array.uset" {
+            boxed_scalar(r(5), 0u64.to_ne_bytes().to_vec())
+        } else {
+            Instruction::Nat {
+                dst: r(5),
+                value: 0,
+            }
+        };
+        let program = array_updates_program(
+            row,
+            first,
+            Instruction::Nat {
+                dst: r(6),
+                value: 2,
+            },
+        );
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        let original = completed.value.ctor_child(0);
+        let updated = completed.value.ctor_child(1);
+        assert_eq!(
+            array_update_strings(&original),
+            ["alpha", "beta", "gamma"],
+            "{row}"
+        );
+        assert_eq!(array_update_strings(&updated), expected, "{row}");
+        let survivor = updated.array_child(0);
+        drop(completed);
+        drop(original);
+        drop(updated);
+        assert!(
+            survivor.try_string_view().is_some(),
+            "{row}: dangling returned cell"
+        );
+        assert_eq!(survivor.header().rc, 1, "{row}: leaked heap reference");
+    }
+}
+
+#[test]
+fn array_updates_refuse_erased_bad_bounds_without_truncating_nats() {
+    let _guard = lock();
+    for row in ["extern:Array.set", "extern:Array.swap", "extern:Array.uset"] {
+        for huge in [false, true] {
+            let first = if row == "extern:Array.uset" {
+                boxed_scalar(
+                    r(5),
+                    (if huge { u64::MAX } else { 3u64 }).to_ne_bytes().to_vec(),
+                )
+            } else if huge {
+                Instruction::NatBig {
+                    dst: r(5),
+                    limbs_le: vec![0, 1],
+                }
+            } else {
+                Instruction::Nat {
+                    dst: r(5),
+                    value: 3,
+                }
+            };
+            let program = array_updates_program(
+                row,
+                first,
+                Instruction::Nat {
+                    dst: r(6),
+                    value: 0,
+                },
+            );
+            match execute(&program, ExecutionLimits::default(), None) {
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::ArrayIndexOutOfBounds { size: 3, .. },
+                    ..
+                }) => {}
+                other => panic!("{row} must refuse invalid bounds: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn array_updates_total_swap_and_empty_pop_preserve_values() {
+    let _guard = lock();
+    for (first, second) in [(0, 0), (3, 0), (0, 3)] {
+        let program = array_updates_program(
+            "extern:Array.swapIfInBounds",
+            Instruction::Nat {
+                dst: r(5),
+                value: first,
+            },
+            Instruction::Nat {
+                dst: r(6),
+                value: second,
+            },
+        );
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(
+            array_update_strings(&completed.value.ctor_child(1)),
+            ["alpha", "beta", "gamma"]
+        );
+    }
+    let program = array_updates_program(
+        "extern:Array.swapIfInBounds",
+        Instruction::NatBig {
+            dst: r(5),
+            limbs_le: vec![0, 1],
+        },
+        Instruction::Nat {
+            dst: r(6),
+            value: 0,
+        },
+    );
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(
+        array_update_strings(&completed.value.ctor_child(1)),
+        ["alpha", "beta", "gamma"]
+    );
+    let empty = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Array {
+                dst: r(0),
+                items: Vec::new(),
+            },
+            intrinsic(r(1), "extern:Array.pop", vec![r(0)]),
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+    assert_eq!(
+        returned(execute(&empty, ExecutionLimits::default(), None))
+            .value
+            .array_view()
+            .0,
+        0
+    );
+}
+
+#[test]
+fn array_updates_swap_covers_every_index_pair() {
+    let _guard = lock();
+    for first in 0..3 {
+        for second in 0..3 {
+            let program = array_updates_program(
+                "extern:Array.swap",
+                Instruction::Nat {
+                    dst: r(5),
+                    value: first,
+                },
+                Instruction::Nat {
+                    dst: r(6),
+                    value: second,
+                },
+            );
+            let first_run = returned(execute(&program, ExecutionLimits::default(), None));
+            let mut expected = vec!["alpha", "beta", "gamma"];
+            expected.swap(first as usize, second as usize);
+            let actual = array_update_strings(&first_run.value.ctor_child(1));
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn array_construction_roundtrip_retains_order_aliases_and_payload_lifetimes() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        9,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "first".into(),
+            },
+            Instruction::String {
+                dst: r(1),
+                value: "second".into(),
+            },
+            Instruction::Array {
+                dst: r(2),
+                items: vec![r(0), r(1), r(0)],
+            },
+            Instruction::Copy {
+                dst: r(3),
+                src: r(2),
+            },
+            intrinsic(r(4), "extern:Array.toList", vec![r(2)]),
+            Instruction::Copy {
+                dst: r(5),
+                src: r(4),
+            },
+            intrinsic(r(6), "extern:Array.mk", vec![r(4)]),
+            Instruction::Ctor {
+                dst: r(7),
+                tag: 0,
+                fields: vec![r(3), r(5), r(6)],
+                scalar_bytes: Vec::new(),
+            },
+            Instruction::Return { src: r(7) },
+        ],
+    )]);
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    let original = completed.value.ctor_child(0);
+    let list = completed.value.ctor_child(1);
+    let rebuilt = completed.value.ctor_child(2);
+    assert_eq!(
+        array_update_strings(&original),
+        ["first", "second", "first"]
+    );
+    assert_eq!(array_update_strings(&rebuilt), ["first", "second", "first"]);
+    let mut cursor = list.clone_ref();
+    let mut count = 0;
+    while !cursor.is_scalar() {
+        assert_eq!(cursor.header().tag, 1);
+        assert_eq!(cursor.header().other, 2);
+        let child = cursor.ctor_child(0);
+        assert_eq!(
+            child.identity_token(),
+            original.array_child(count).identity_token()
+        );
+        cursor = cursor.ctor_child(1);
+        count += 1;
+    }
+    assert_eq!(cursor.unbox(), 0);
+    assert_eq!(count, 3);
+    let survivor = rebuilt.array_child(0);
+    drop(completed);
+    drop(original);
+    drop(list);
+    drop(rebuilt);
+    assert!(survivor.try_string_view().is_some());
+    assert_eq!(survivor.header().rc, 1);
+}
+
+#[test]
+fn array_construction_empty_roundtrip_uses_the_scalar_nil_representation() {
+    let _guard = lock();
+    let program = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Erased,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            intrinsic(r(1), "extern:Array.mk", vec![r(0)]),
+            intrinsic(r(2), "extern:Array.toList", vec![r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert!(completed.value.is_scalar());
+    assert_eq!(completed.value.unbox(), 0);
+}
+
+#[test]
+fn array_construction_rejects_malformed_lists_without_publishing_a_prefix() {
+    let _guard = lock();
+    for malformed in [
+        Instruction::Nat {
+            dst: r(1),
+            value: 1,
+        },
+        Instruction::Ctor {
+            dst: r(1),
+            tag: 0,
+            fields: vec![r(0), r(0)],
+            scalar_bytes: Vec::new(),
+        },
+        Instruction::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0)],
+            scalar_bytes: Vec::new(),
+        },
+        Instruction::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0), r(0), r(0)],
+            scalar_bytes: Vec::new(),
+        },
+        Instruction::String {
+            dst: r(1),
+            value: "not a list".into(),
+        },
+    ] {
+        let program = validated(vec![function(
+            0,
+            0,
+            4,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 0,
+                },
+                malformed,
+                // A valid cons preceding a bad tail must not be accepted either.
+                Instruction::Ctor {
+                    dst: r(2),
+                    tag: 1,
+                    fields: vec![r(0), r(1)],
+                    scalar_bytes: Vec::new(),
+                },
+                intrinsic(r(3), "extern:Array.mk", vec![r(2)]),
+                Instruction::Return { src: r(3) },
+            ],
+        )]);
+        match execute(&program, ExecutionLimits::default(), None) {
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::InvalidCtorObject,
+                ..
+            }) => {}
+            other => panic!("malformed list must refuse: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn array_construction_walks_long_lists_without_host_recursion() {
+    let _guard = lock();
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: "payload".into(),
+        },
+        Instruction::Nat {
+            dst: r(1),
+            value: 0,
+        },
+    ];
+    for _ in 0..10_000 {
+        code.push(Instruction::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0), r(1)],
+            scalar_bytes: Vec::new(),
+        });
+    }
+    code.extend([
+        intrinsic(r(2), "extern:Array.mk", vec![r(1)]),
+        intrinsic(r(3), "extern:Array.toList", vec![r(2)]),
+        intrinsic(r(4), "extern:Array.mk", vec![r(3)]),
+        intrinsic(r(5), "extern:Array.size", vec![r(4)]),
+        Instruction::Return { src: r(5) },
+    ]);
+    let program = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::OwnedOrScalar,
+        6,
+        code,
+    )]);
+    assert_eq!(
+        returned(execute(&program, ExecutionLimits::default(), None))
+            .value
+            .unbox(),
+        10_000
+    );
+}
+
+#[test]
+fn array_construction_empty_hints_validate_nats_without_unbounded_allocation() {
+    let _guard = lock();
+    for row in ["extern:Array.emptyWithCapacity", "extern:Array.mkEmpty"] {
+        for huge in [false, true] {
+            let hint = if huge {
+                Instruction::NatBig {
+                    dst: r(0),
+                    limbs_le: vec![0, 1],
+                }
+            } else {
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 16,
+                }
+            };
+            let program = validated(vec![function(
+                0,
+                0,
+                2,
+                vec![
+                    hint,
+                    intrinsic(r(1), row, vec![r(0)]),
+                    Instruction::Return { src: r(1) },
+                ],
+            )]);
+            assert_eq!(
+                returned(execute(&program, ExecutionLimits::default(), None))
+                    .value
+                    .array_view()
+                    .0,
+                0
+            );
+        }
+        let program = validated(vec![function(
+            0,
+            0,
+            2,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "bad hint".into(),
+                },
+                intrinsic(r(1), row, vec![r(0)]),
+                Instruction::Return { src: r(1) },
+            ],
+        )]);
+        match execute(&program, ExecutionLimits::default(), None) {
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            }) => {}
+            other => panic!("{row}: bad hint was not refused: {other:?}"),
+        }
+    }
 }

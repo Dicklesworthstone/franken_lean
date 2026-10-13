@@ -117,7 +117,7 @@ fn monad_operations_use_applied_factories_without_a_trusted_monad_evaluator() {
     );
     execute(
         &format!(
-            "{MONAD}def mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (n : Nat) => n + 1) 41 : Id Nat)"
+            "{MONAD}def mapping {{M : Type -> Type}} [Pure M] [Bind M] {{A B : Type}} (f : A -> B) (action : M A) : M B := do let x ← action; return (f x)\n#eval (mapping (M := Id) (fun (n : Nat) => n + 1) (41 : Nat) : Id Nat)"
         ),
         "42",
     );

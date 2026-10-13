@@ -57,14 +57,17 @@ fn later_prerequisite_can_revise_an_earlier_universe_only_choice() {
 }
 
 #[test]
-fn cached_universe_choice_resumes_without_changing_an_earlier_sibling() {
+fn cached_universe_answers_resume_every_waiting_sibling_before_new_generators() {
+    // Carrier.{?u} and Carrier.{?v} share a pinned mkTableKey. Both consume
+    // low before the fresh Allowed.{0} generator runs; its last waiter is
+    // the both-low branch, which resumes first (SynthInstance.step/resume).
     let source = format!(
         "{CLASSES}\nclass PairOut where\n  first : Nat\n  second : Nat\ninstance pair.{{u,v}} [first : Carrier.{{u}}] [second : Carrier.{{v}}] [ok : Allowed.{{v}}] : PairOut := PairOut.mk first.value second.value\n"
     );
     let base = checked(&seed(), &source);
     let result = checked(
         &base,
-        "def result : PairOut := inferInstance\ntheorem firstValue : result.first = 99 := by rfl\ntheorem secondValue : result.second = 7 := by rfl",
+        "def result : PairOut := inferInstance\ntheorem firstValue : result.first = 7 := by rfl\ntheorem secondValue : result.second = 7 := by rfl",
     );
     let batch = result
         .execute_source_definitions(
@@ -77,7 +80,7 @@ fn cached_universe_choice_resumes_without_changing_an_earlier_sibling() {
         .unwrap();
     assert_eq!(
         fln::closed_vm_value(&batch.executions.last().unwrap().exit).unwrap(),
-        Some(fln::ClosedVmValue::Scalar(106))
+        Some(fln::ClosedVmValue::Scalar(14))
     );
 }
 

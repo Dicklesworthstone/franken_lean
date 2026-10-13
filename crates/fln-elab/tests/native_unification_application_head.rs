@@ -121,7 +121,7 @@ fn recovers_a_checked_constructor_head_in_both_orientations() {
             };
             let report = txn.unify(&left, &right, budget()).unwrap();
             assert_eq!(report.expression_assignments, vec![f.clone()]);
-            assert_eq!(report.kernel_checks, 1);
+            assert_eq!(report.kernel_checks, 2);
             assert!(report.residual_metavariables.is_empty());
             assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&succ()));
             txn.unify(&Expr::app(Expr::mvar(f), number(91)), &number(92), budget())
@@ -145,7 +145,7 @@ fn recovers_a_type_constructor_applied_to_a_nonlocal_type() {
         )
         .unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&c));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn preserves_the_entire_partially_applied_prefix() {
         )
         .unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&candidate));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn dependent_prefix_parameters_are_not_dropped() {
         )
         .unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&candidate));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn repeated_rigid_arguments_are_valid_for_head_recovery() {
         )
         .unwrap();
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn reduces_a_matching_suffix_before_recovering_the_head() {
         .unify(&left, &Expr::app(succ(), beta(nat(), number(7))), budget())
         .unwrap();
     assert_eq!(report.expression_assignments, vec![f]);
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]
@@ -305,7 +305,7 @@ fn candidate_type_holes_are_inferred_in_the_same_batch() {
         .unwrap();
     assert!(report.expression_assignments.contains(&f));
     assert!(report.expression_assignments.contains(&type_id));
-    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.kernel_checks, 4);
     assert!(report.residual_metavariables.is_empty());
     txn.unify(&Expr::mvar(type_id), &pi(nat(), nat()), budget())
         .unwrap();
@@ -521,7 +521,7 @@ fn identical_suffix_holes_remain_unsolved_after_head_recovery() {
     // This report inventories conditional assignment checks, not every hole
     // in the input. The unresolved argument is not part of f's assigned value.
     assert!(report.residual_metavariables.is_empty());
-    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.kernel_checks, 2);
 }
 
 #[test]

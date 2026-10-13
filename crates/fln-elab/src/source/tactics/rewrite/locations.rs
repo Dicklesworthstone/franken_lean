@@ -87,10 +87,33 @@ impl Context {
                 Syntax::Node { kind, args, .. }
                     if kind == &parser_kind(&["Tactic", "locationType"]) =>
                 {
-                    let [Syntax::Atom { val, .. }] = args.as_slice() else {
+                    // `patternIgnore(token.«⊢»)` or `patternIgnore(group("|" "-"))`.
+                    let [Syntax::Node { kind, args, .. }] = args.as_slice() else {
                         return Err(error(TacticError::MalformedScript));
                     };
-                    if val != "⊢" && val != "|-" {
+                    let [
+                        Syntax::Node {
+                            kind: marker,
+                            args: atoms,
+                            ..
+                        },
+                    ] = args.as_slice()
+                    else {
+                        return Err(error(TacticError::MalformedScript));
+                    };
+                    let goal = match atoms.as_slice() {
+                        [Syntax::Atom { val, .. }] => {
+                            marker == &Name::from_components(["token", "⊢"]) && val == "⊢"
+                        }
+                        [
+                            Syntax::Atom { val: bar, .. },
+                            Syntax::Atom { val: dash, .. },
+                        ] => {
+                            marker == &Name::from_components(["group"]) && bar == "|" && dash == "-"
+                        }
+                        _ => false,
+                    };
+                    if kind != &Name::from_components(["patternIgnore"]) || !goal {
                         return Err(error(TacticError::MalformedScript));
                     }
                     result.target = true;
@@ -323,13 +346,7 @@ impl Context {
                     occurrence,
                     premises,
                 } = self
-                    .instantiate_rewrite_rule(
-                        term,
-                        &target,
-                        rule.reverse,
-                        false,
-                        &SimpRules::default(),
-                    )?
+                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                     .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
                 let replacement =
                     self.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
@@ -354,13 +371,7 @@ impl Context {
                     occurrence,
                     premises,
                 } = self
-                    .instantiate_rewrite_rule(
-                        term,
-                        &target,
-                        rule.reverse,
-                        false,
-                        &SimpRules::default(),
-                    )?
+                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                     .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
                 let (next, value) =
                     self.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
@@ -419,13 +430,7 @@ impl Context {
                         rule: term,
                         occurrence,
                         premises,
-                    }) = trial.instantiate_rewrite_rule(
-                        term,
-                        &target,
-                        rule.reverse,
-                        false,
-                        &SimpRules::default(),
-                    )?
+                    }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                     else {
                         return Ok(None);
                     };
@@ -457,13 +462,7 @@ impl Context {
                     rule: term,
                     occurrence,
                     premises,
-                }) = trial.instantiate_rewrite_rule(
-                    term,
-                    &target,
-                    rule.reverse,
-                    false,
-                    &SimpRules::default(),
-                )?
+                }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                 else {
                     return Ok(None);
                 };

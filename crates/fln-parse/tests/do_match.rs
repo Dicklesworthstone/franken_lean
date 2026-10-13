@@ -156,8 +156,10 @@ fn a_single_monadic_discriminant_preserves_its_arrow_and_branches() {
     for source in [
         "def bad := do match ← with | _ => return 7",
         "def bad := do match ← first, second with | _, _ => return 7",
-        "def bad := match ← first with | _ => 7",
     ] {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
+    // Outside `do`, `← first` is still a nested action term: the pin parses this and refuses it
+    // only when elaborating ("must be nested inside a `do` expression").
+    assert!(parse_definition("def bad := match ← first with | _ => 7".as_bytes()).is_ok());
 }

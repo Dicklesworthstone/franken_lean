@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::io::Write;
-
 #[cfg(test)]
 use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
@@ -14,21 +12,7 @@ use fln_core::outcome::BoundedText;
 use fln_core::pos::Position;
 
 pub(super) fn write_output(output: fln_cli::MultiplexerOutput) -> std::process::ExitCode {
-    if std::io::stdout()
-        .lock()
-        .write_all(output.stdout.as_bytes())
-        .is_err()
-    {
-        return std::process::ExitCode::from(1);
-    }
-    if std::io::stderr()
-        .lock()
-        .write_all(output.stderr.as_bytes())
-        .is_err()
-    {
-        return std::process::ExitCode::from(1);
-    }
-    std::process::ExitCode::from(output.exit_code)
+    fln_cli::write_output(output)
 }
 
 #[cfg(test)]

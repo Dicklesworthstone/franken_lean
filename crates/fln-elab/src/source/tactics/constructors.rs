@@ -5,6 +5,7 @@
 //! right constructor to T. Transporting identity along the supplied equality
 //! then proves T. No no-confusion axiom, guessed equality, or checking shortcut
 //! is introduced. Proof-valued families are deliberately excluded.
+use super::decision::{apps, constant};
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal, RecursorVal};
 use std::collections::HashSet;
@@ -752,12 +753,48 @@ impl Context {
         for row in rows {
             let name = match row {
                 Syntax::Ident { val, .. } if seen.insert(val.clone()) => val.clone(),
-                Syntax::Atom { val, .. } if val == "_" => Name::anonymous(),
+                // `ident <|> hole`: a `_` is a `Term.hole`.
+                Syntax::Node { kind, args, .. }
+                    if kind == &parser_kind(&["Term", "hole"])
+                        && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
+                {
+                    Name::anonymous()
+                }
                 _ => return Err(error(TacticError::MalformedScript)),
             };
             names.push(name);
         }
-        self.inject_named_proof_goal(proof, goal, name, &names)
+        let work = proof.work.len();
+        let before: HashSet<FVarId> = goal.lctx.decls().iter().map(|l| l.id.clone()).collect();
+        self.inject_named_proof_goal(proof, goal, name, &names)?;
+        // The pin's `evalInjection` ends with `tryAssumption` on the goal it leaves (vendored
+        // src/Lean/Elab/Tactic/Injection.lean): any hypothesis, a new equation or an older
+        // one, that proves it closes it, so a following tactic finds no goal. Only the tactic
+        // does this; `cases` reaches the same injection (`Meta.injection`) without it.
+        let left = (proof.work.len() > work)
+            .then(|| proof.work.pop_if(|w| matches!(w, Work::Goal(_))))
+            .flatten();
+        if let Some(Work::Goal(child)) = left {
+            self.txn.lctx = child.lctx.clone();
+            // The pin's `noConfusion` makes no equation for a proof field, so its
+            // `tryAssumption` cannot use one. This injection still makes them, unnamed; they
+            // are kept out of the search.
+            let mut proof_fields = HashSet::new();
+            for local in child.lctx.decls() {
+                if before.contains(&local.id) {
+                    continue;
+                }
+                let type_ = self.whnf(&local.type_)?;
+                if super::equality::proof_equation(&type_) {
+                    proof_fields.insert(local.id.clone());
+                }
+            }
+            match self.matching_assumption_except(&child, &proof_fields)? {
+                Some(value) => self.close_proof_goal(child, value)?,
+                None => proof.work.push(Work::Goal(child)),
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn inject_named_proof_goal(
@@ -817,12 +854,28 @@ impl Context {
             // typed heterogeneous equalities to a checked continuation instead.
             return self.inject_dependent_proof_goal(proof, goal, &equality, names);
         }
-        if equalities.is_empty() || names.len() > equalities.len() {
+        if equalities.is_empty() {
             return Err(error(TacticError::ConstructorEquality));
         }
-        for (i, equality) in equalities.into_iter().enumerate() {
+        // Names go, in order, to the equations the pin makes: never to a proof field's.
+        let named = equalities
+            .iter()
+            .filter(|e| !super::equality::proof_equation(&e.type_))
+            .count();
+        if names.len() > named {
+            return Err(error(TacticError::InjectionUnusedNames {
+                unused: names[named..].to_vec(),
+            }));
+        }
+        let mut next = names.iter();
+        for equality in equalities {
             let id = FVarId(self.fresh_name()?);
-            let name = names.get(i).cloned().unwrap_or_else(|| id.0.clone());
+            let given = if super::equality::proof_equation(&equality.type_) {
+                None
+            } else {
+                next.next().cloned()
+            };
+            let name = given.unwrap_or_else(|| id.0.clone());
             self.txn
                 .lctx
                 .add_let(id.clone(), name, equality.type_, equality.value);
@@ -836,6 +889,47 @@ impl Context {
 }
 
 impl Context {
+    /// Deriving reuses the same checked selector/transport proof as injection.
+    /// The caller supplies an actual constructor equality and a bounded field
+    /// index; a missing or dependent selector is never replaced with an axiom.
+    pub(in crate::source) fn constructor_injection_evidence(
+        &mut self,
+        evidence: &Typed,
+        index: usize,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let type_ = self.whnf(&evidence.type_)?;
+        let Some((_, alpha, lhs, rhs)) = equality_target(&type_) else {
+            return Ok(None);
+        };
+        let Some(family) = self.reasoning_family(&alpha, true)? else {
+            return Ok(None);
+        };
+        let Some(left) = self.equality_constructor(&lhs, &family)? else {
+            return Ok(None);
+        };
+        let Some(right) = self.equality_constructor(&rhs, &family)? else {
+            return Ok(None);
+        };
+        if left.name != right.name || index >= left.fields.len() || index >= right.fields.len() {
+            return Ok(None);
+        }
+        self.constructor_field_equality(evidence, &family, &left, &right, index)
+    }
+
+    /// A constructor clash is ordinary equality elimination into False.
+    pub(in crate::source) fn constructor_clash_evidence(
+        &mut self,
+        evidence: &Typed,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let false_ = Expr::const_(Name::from_components(["False"]), Vec::new());
+        Ok(self
+            .refute_index_evidence(evidence, &false_)?
+            .map(|value| Typed {
+                value,
+                type_: false_,
+            }))
+    }
+
     /// Only the generated index equation is considered here, not arbitrary
     /// assumptions in the user's context. Missing branches require explicit
     /// constructor/literal inconsistency in their retained equation premises.
@@ -877,7 +971,7 @@ impl Context {
         self.constructor_clash(&evidence, &family, &right.name, target)
     }
 
-    fn empty_evidence(
+    pub(super) fn empty_evidence(
         &mut self,
         evidence: &Typed,
         target: &Expr,
@@ -969,7 +1063,33 @@ impl Context {
                 type_: local.type_.clone(),
             })
             .collect();
-        let mut pending: std::collections::VecDeque<_> = original.iter().cloned().collect();
+        self.contradict_evidence_goal(goal, original)
+    }
+
+    /// Contradiction from an explicit set of checked evidence. Empty matches
+    /// pass only their discriminants and exposed constructor fields: the pin's
+    /// matcher closure does not capture unrelated ambient hypotheses.
+    pub(super) fn contradict_evidence_goal(
+        &mut self,
+        goal: ProofGoal,
+        original: Vec<Typed>,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        // The pin's `contradictionCore` (vendored Lean/Meta/Tactic/Contradiction.lean) refutes
+        // an `Eq` or `HEq` hypothesis by its HEAD constructors only; it never injects into
+        // fields. A nested clash it reaches only through `decide` (`Config.useDecide`,
+        // default true): for a hypothesis with no free variables whose `decide` evaluates
+        // to `false`. `HEq` has no `Decidable` instance, so an `HEq` never gets that far.
+        // So field descent is allowed only from a closed `Eq` hypothesis with a
+        // `Decidable` instance, where a nested clash is exactly a `false` decision.
+        let mut pending = std::collections::VecDeque::new();
+        for local in &original {
+            self.tick()?;
+            let descend = self.contradiction_may_descend(&local.type_)?;
+            pending.push_back((local.clone(), descend));
+        }
         let mut negative = Vec::new();
         for local in &original {
             self.tick()?;
@@ -999,11 +1119,12 @@ impl Context {
         // Pin every pair whose identities are memoized for this request. A
         // dropped temporary allocation can never be reused as an existing key.
         let mut roots = Vec::new();
-        while let Some(evidence) = pending.pop_front() {
+        while let Some((evidence, descend)) = pending.pop_front() {
             self.tick()?;
             if let Some(result) = self.empty_evidence(&evidence, &goal.target)? {
                 return self.close_proof_goal(goal, result);
             }
+            let heterogeneous = super::equality::heterogeneous_target(&evidence.type_).is_some();
             for (function, domain, body) in &negative {
                 self.tick()?;
                 if self.proof_types_match(&evidence.type_, domain)? {
@@ -1016,7 +1137,21 @@ impl Context {
                     }
                 }
             }
-            let Some(evidence) = self.homogeneous_equality_evidence(&evidence)? else {
+            let Some(evidence) = ({
+                let narrowed = self.homogeneous_equality_evidence(&evidence)?;
+                if narrowed.is_none() {
+                    // The pin's decide arm (Contradiction.lean:199): a closed
+                    // hypothesis whose synthesized decision computes `false`
+                    // is refuted through `of_decide_eq_false`, whatever its
+                    // shape — `h : 2 < 1` is the measured divergence. Scoped
+                    // to non-equality evidence so every equation keeps the
+                    // existing constructor machinery byte-for-byte.
+                    if let Some(result) = self.decided_false_evidence(&evidence, &goal.target)? {
+                        return self.close_proof_goal(goal, result);
+                    }
+                }
+                narrowed
+            }) else {
                 continue;
             };
             let type_ = evidence.type_.clone();
@@ -1026,12 +1161,24 @@ impl Context {
             let alpha = self.whnf(&alpha)?;
             let left = self.whnf(&left)?;
             let right = self.whnf(&right)?;
-            if !seen.insert((left.allocation_identity(), right.allocation_identity())) {
+            // The kind is part of the key: an `HEq` and an `Eq` between the same two
+            // terms are refuted by different rules, so meeting one must not hide the other
+            // (`have e := eq_of_heq h` shares `h`'s very allocations).
+            if !seen.insert((
+                left.allocation_identity(),
+                right.allocation_identity(),
+                heterogeneous,
+                descend,
+            )) {
                 continue;
             }
             roots.push((left.clone(), right.clone()));
-            if let Some(result) =
-                self.unequal_nat_literals(&evidence, &alpha, &left, &right, &goal.target)?
+            // Two distinct nonzero numerals share the head `Nat.succ`, so the pin refutes
+            // them only by `decide`, which an `HEq` never reaches. Zero against a
+            // successor is a head clash and is handled below for either kind.
+            if !heterogeneous
+                && let Some(result) =
+                    self.unequal_nat_literals(&evidence, &alpha, &left, &right, &goal.target)?
             {
                 return self.close_proof_goal(goal, result);
             }
@@ -1050,17 +1197,108 @@ impl Context {
                 {
                     return self.close_proof_goal(goal, result);
                 }
-            } else {
+            } else if descend {
                 for index in 0..left.fields.len() {
                     self.tick()?;
                     if let Some(proof) =
                         self.constructor_field_equality(&evidence, &family, &left, &right, index)?
                     {
-                        pending.push_back(proof);
+                        pending.push_back((proof, true));
                     }
                 }
             }
         }
         Err(error(TacticError::NoContradiction))
+    }
+
+    /// Whether `contradiction` may inject into a same-constructor equation `ty`: only
+    /// where the pin's `decide` branch would decide it. That needs a closed homogeneous
+    /// equation with a `Decidable` instance. The instance query runs on a clone, so a
+    /// missing instance costs its heartbeats and leaves no other state behind; a
+    /// resource stop still propagates.
+    fn contradiction_may_descend(&mut self, ty: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let ty = self.instantiate(ty)?;
+        if ty.has_fvar() || ty.has_expr_mvar() || ty.has_level_mvar() {
+            return Ok(false);
+        }
+        if super::equality::heterogeneous_target(&ty).is_some() || equality_target(&ty).is_none() {
+            return Ok(false);
+        }
+        let mut trial = self.clone();
+        let decided = trial.decision_dictionary(&ty);
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        match decided {
+            Ok(_) => Ok(true),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
+                Err(failure(SourceInferenceError::ResourceLimit))
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// The pin's `contradiction` decide arm (vendored
+    /// Lean/Meta/Tactic/Contradiction.lean:199): a hypothesis whose CLOSED type
+    /// has a `Decidable` instance computing `false` is refuted through
+    /// `of_decide_eq_false` and `absurd`, whatever the proposition's shape.
+    /// Available only where the pinned constants exist (a real `Init`
+    /// environment); the frozen seed dialect has neither, so the arm never
+    /// fires there and the seed dialect is unchanged. A failed instance query
+    /// or a `true` decision falls through to the ordinary refusal; resource
+    /// exhaustion keeps its typed outcome (FL-INV-07). The eligibility probe
+    /// runs on a clone so a failed query cannot leak instance state, and the
+    /// dictionary in the real proof term is re-synthesized on `self`.
+    fn decided_false_evidence(
+        &mut self,
+        evidence: &Typed,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let refute = Name::from_components(["of_decide_eq_false"]);
+        let absurd = Name::from_components(["absurd"]);
+        if !self.txn.env.contains(&refute) || !self.txn.env.contains(&absurd) {
+            return Ok(None);
+        }
+        let ty = self.instantiate(&evidence.type_)?;
+        if ty.has_fvar() || ty.has_expr_mvar() || ty.has_level_mvar() {
+            return Ok(None);
+        }
+        let mut trial = self.clone();
+        let decided = (|| -> Result<bool, NatDefinitionElabError> {
+            let dictionary = trial.decision_dictionary(&ty)?;
+            let computation = apps(trial.decide_constant(), [ty.clone(), dictionary]);
+            trial.decision_computes_false(computation)
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        match decided {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            Err(_) => return Ok(None),
+        }
+        let dictionary = self.decision_dictionary(&ty)?;
+        let sort = self
+            .known_type(target)?
+            .ok_or_else(|| error(TacticError::ExpectedProposition))?;
+        let sort = self.whnf(&sort)?;
+        let ExprNode::Sort { level } = sort.node() else {
+            return Ok(None);
+        };
+        let level = level.clone();
+        // Mirrors `decide_proof_goal`'s construction in the `false` direction:
+        // the kernel justifies `Eq.refl Bool Bool.false` at `decide p = false`
+        // by evaluating the decision, exactly as the `true` case is justified.
+        let reflexive = apps(
+            constant("Eq.refl", vec![Level::one()]),
+            [constant("Bool", vec![]), constant("Bool.false", vec![])],
+        );
+        let negation = apps(
+            Expr::const_(refute, vec![]),
+            [ty.clone(), dictionary, reflexive],
+        );
+        Ok(Some(apps(
+            Expr::const_(absurd, vec![level]),
+            [ty, target.clone(), evidence.value.clone(), negation],
+        )))
     }
 }

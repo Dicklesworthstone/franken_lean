@@ -80,8 +80,15 @@ fn all_branches_and_conditions_keep_type_obligations() {
 }
 #[test]
 fn conditional_types_and_refined_values_share_boolean_indices() {
+    // Instance resolution does not unfold the plain `def Ty`, so a bare numeral at
+    // `Ty true` has no `OfNat` instance. The pin: "failed to synthesize ... OfNat (Ty true)
+    // 7" (lean v4.32.0, 2026-10-06). A value of the unfolded type converts by
+    // definitional unfolding, and the pin accepts that program.
     check(
-        "def Ty (b : Bool) : Type := if b then Nat else String\n def val (b : Bool) : Ty b := match b with | true => 7 | false => \"text\"\n theorem t : val true = 7 := by rfl\n theorem f : val false = \"text\" := by rfl",
+        "def Ty (b : Bool) : Type := if b then Nat else String\n def val (b : Bool) : Ty b := match b with | true => (7 : Nat) | false => (\"text\" : String)\n theorem t : val true = (7 : Nat) := by rfl\n theorem f : val false = (\"text\" : String) := by rfl",
+    );
+    reject(
+        "def Ty (b : Bool) : Type := if b then Nat else String\n def val (b : Bool) : Ty b := match b with | true => 7 | false => \"text\"",
     );
 }
 #[test]
@@ -154,8 +161,8 @@ fn proposition_conditions_support_types_methods_and_nested_patterns() {
     check(
         r#"
         def Carrier : Type := if False then String else Nat
-        def inhabitant : Carrier := 31
-        theorem computed : inhabitant = 31 := by rfl
+        def inhabitant : Carrier := (31 : Nat)
+        theorem computed : inhabitant = (31 : Nat) := by rfl
         def callback : Nat -> Nat := if True then fun n => n + 1 else fun n => n + 2
         theorem function_result : callback 7 = 8 := by rfl
         structure Operation where
@@ -166,6 +173,9 @@ fn proposition_conditions_support_types_methods_and_nested_patterns() {
         theorem nested : mixed false = 19 := by rfl
     "#,
     );
+    // The bare numeral at the plain `def Carrier` has no `OfNat` instance: the pin says
+    // "failed to synthesize ... OfNat Carrier 31" (lean v4.32.0, 2026-10-06).
+    reject("def Carrier : Type := if False then String else Nat\ndef inhabitant : Carrier := 31");
 }
 
 #[test]

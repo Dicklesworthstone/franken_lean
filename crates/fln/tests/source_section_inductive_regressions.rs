@@ -178,9 +178,9 @@ mutual
   inductive Tree (tag : Nat) where
     | leaf (value : A)
     | node (children : Forest tag)
-  inductive Forest (label : Nat) where
+  inductive Forest (tag : Nat) where
     | nil (value : B)
-    | cons (head : Tree label) (tail : Forest label)
+    | cons (head : Tree tag) (tail : Forest tag)
 end
 end
 ";
@@ -217,9 +217,9 @@ fn mutual_header_dependencies_and_indexed_recursion_keep_lexical_locals() {
           inductive Tree (x : A) : Nat -> Type where
             | leaf (value : P x) : Tree x 0
             | node (n : Nat) (children : Forest x n) : Tree x (Nat.succ n)
-          inductive Forest (y : A) : Nat -> Type where
-            | nil : Forest y 0
-            | cons (n : Nat) (head : Tree y n) (tail : Forest y n) : Forest y (Nat.succ n)
+          inductive Forest (x : A) : Nat -> Type where
+            | nil : Forest x 0
+            | cons (n : Nat) (head : Tree x n) (tail : Forest x n) : Forest x (Nat.succ n)
         end
         end
         def value : Tree Nat (fun x => Bool) 7 0 := Tree.leaf true",
@@ -291,9 +291,9 @@ fn automatic_parameters_produce_the_same_checked_world_as_explicit_telescopes() 
       inductive Tree {A : Type u} (B : Type v) (tag : Nat) where
         | leaf (value : A)
         | node (children : Forest (A := A) B tag)
-      inductive Forest {A : Type u} (B : Type v) (label : Nat) where
+      inductive Forest {A : Type u} (B : Type v) (tag : Nat) where
         | nil (value : B)
-        | cons (head : Tree (A := A) B label) (tail : Forest (A := A) B label)
+        | cons (head : Tree (A := A) B tag) (tail : Forest (A := A) B tag)
     end",
     );
     assert_eq!(

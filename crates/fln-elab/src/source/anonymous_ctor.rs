@@ -11,11 +11,11 @@
 //!
 //! Fewer than `n` arguments is the pin's "Insufficient number of fields" error (the pin then
 //! fills sorries under `errToSorry`; an error is an error here). More than `n` arguments nest
-//! the extra ones into a `⟨…⟩` for the last field; that rewrite is not implemented, so it is
-//! refused, never approximated. The pin postpones elaboration while the expected type is
-//! unknown or a metavariable (`tryPostponeIfNoneOrMVar`); this elaborator has no postponement
-//! here, so it refuses where the pin would wait, which can refuse a program the pin accepts
-//! but never accepts one it rejects.
+//! the extra ones into a `⟨…⟩` for the last field ([`nest_fields`]), as at the pin, so
+//! `⟨1, 2, rfl⟩ : ∃ x y, x + y = 3` is `⟨1, ⟨2, rfl⟩⟩`. When the expected type is a
+//! metavariable, the application worklist postpones the containing argument
+//! (`tryPostponeIfNoneOrMVar`) until later arguments determine the constructor.
+//! An unresolved expected type retains its original diagnostic.
 use super::*;
 use fln_env::constants::{ConstantInfo, ConstructorVal};
 
@@ -151,6 +151,27 @@ impl Context {
         }
         self.constant(&ctor)
     }
+}
+
+/// The pin's nesting rewrite (`elabAnonymousCtor`, `BuiltinNotation.lean:62`): with `explicit`
+/// explicit fields and more `elements` (separators interleaved), the first `explicit - 1`
+/// stay and the rest become one `⟨…⟩` in the last field's place. `explicit` is at least 1.
+pub(super) fn nest_fields(elements: &[Syntax], explicit: usize) -> Syntax {
+    let keep = (explicit.saturating_sub(1)) * 2;
+    let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+    let ctor = |fields: Vec<Syntax>| {
+        Syntax::node(
+            parser_kind(&["Term", "anonymousCtor"]),
+            vec![
+                atom("⟨"),
+                Syntax::node(Name::from_components(["null"]), fields),
+                atom("⟩"),
+            ],
+        )
+    };
+    let mut outer: Vec<Syntax> = elements[..keep].to_vec();
+    outer.push(ctor(elements[keep..].to_vec()));
+    ctor(outer)
 }
 
 /// The number of explicit binders among a constructor's fields: the binders after its

@@ -1180,6 +1180,73 @@ fn w_rec_applied(major: Expr) -> Expr {
     )
 }
 
+#[test]
+fn equality_query_policy_can_keep_theorem_majors_opaque() {
+    let env = w_delta_env();
+    let theorem = TheoremVal {
+        base: ConstantVal {
+            name: n("queryProof"),
+            level_params: vec![],
+            type_: w_of_a(),
+        },
+        value: w_sup_proof(),
+        all: vec![n("queryProof")],
+    };
+    assert!(matches!(
+        check(&env, &Declaration::Thm(theorem.clone()), Budget::DEFAULT),
+        fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    let env = env.add_decl(ConstantInfo::Thm(theorem)).unwrap();
+    let proof = Expr::const_(n("queryProof"), vec![]);
+    let value = w_rec_applied(proof.clone());
+    let expected = Expr::const_(n("a"), vec![]);
+    let opaque = std::collections::BTreeSet::new();
+    for unfold_theorems in [false, true, false] {
+        let policy = fln_kernel::DefEqUnfolding {
+            opaque_definitions: &opaque,
+            unfold_theorems,
+        };
+        let verdict = fln_kernel::check_def_eq_with_unfolding(
+            &env,
+            &[],
+            &value,
+            &expected,
+            Budget::DEFAULT,
+            policy,
+        );
+        if unfold_theorems {
+            assert!(matches!(
+                verdict,
+                fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+            ));
+        } else {
+            assert!(matches!(
+                verdict,
+                fln_core::outcome::Outcome::Complete(Verdict::Rejected {
+                    class: RejectClass::NotDefEq,
+                    ..
+                })
+            ));
+        }
+        // Opaque proof bodies still have proof irrelevance at the same type.
+        assert!(matches!(
+            fln_kernel::check_def_eq_with_unfolding(
+                &env,
+                &[],
+                &proof,
+                &w_sup_proof(),
+                Budget::DEFAULT,
+                policy,
+            ),
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ));
+    }
+    assert!(matches!(
+        check_def_eq(&env, &[], &value, &expected, Budget::DEFAULT),
+        fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+    ));
+}
+
 /// The delta gate must admit theorems and REFUSE opaques, and this is the cell
 /// that keeps the second half true.
 ///

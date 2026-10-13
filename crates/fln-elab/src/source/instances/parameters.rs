@@ -16,8 +16,8 @@ enum ParameterMode {
 pub(super) struct PreparedTarget {
     pub target: Expr,
     pub expected: Expr,
-    /// Outputs and their exclusive universes are erased; bare unknown
-    /// semi-outputs are alpha-canonicalized. Never submitted to a checker.
+    /// Erased outputs use placeholders; known prerequisite outputs remain.
+    /// Bare unknown semi-outputs are alpha-canonicalized. Never a checker input.
     pub key: Expr,
 }
 
@@ -51,7 +51,7 @@ impl Context {
         trial.synth_pending_depth = trial.synth_pending_depth.saturating_add(1);
         let result = trial.search_instance(id.clone(), registry);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
-        if result? {
+        if result? == SearchResult::Solved {
             trial.txn.lctx = locals;
             trial.equations = equations;
             trial.synth_pending_depth = self.synth_pending_depth;
@@ -155,6 +155,7 @@ impl Context {
         &mut self,
         target: &Expr,
         registry: &InstanceRegistry,
+        erase_known_outputs: bool,
     ) -> Result<Option<PreparedTarget>, NatDefinitionElabError> {
         let mut head = target.clone();
         let mut arguments = Vec::new();
@@ -194,10 +195,11 @@ impl Context {
         if arguments.len() != modes.len() {
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         }
-        // Output-only universes must not filter candidate selection, even when
-        // the caller already knows them. Reconcile with the original target
-        // only after selecting the first successful candidate.
-        let (levels, key_levels) = if let Some(parameters) = imported {
+        // The outer request runs the pin's `preprocessOutParam`, even for
+        // known outputs. Prerequisites go directly to `tryResolve` instead:
+        // all their output values, repeated variables and dependent structure
+        // must constrain candidate selection, even when still unknown.
+        let (mut prepared_levels, mut key_levels) = if let Some(parameters) = imported {
             self.instance_explicit_output_levels(
                 &base.level_params,
                 levels,
@@ -206,6 +208,16 @@ impl Context {
         } else {
             self.instance_search_levels(&base.type_, &modes, &base.level_params, levels)?
         };
+        if !erase_known_outputs {
+            for ((prepared, key), original) in
+                prepared_levels.iter_mut().zip(&mut key_levels).zip(levels)
+            {
+                self.tick()?;
+                *prepared = original.clone();
+                *key = original.clone();
+            }
+        }
+        let levels = prepared_levels;
         let mut telescope = self.instantiate_params(&base.type_, &base.level_params, &levels)?;
         let mut prepared = Expr::const_(name.clone(), levels);
         let mut key = Expr::const_(name.clone(), key_levels);
@@ -228,19 +240,22 @@ impl Context {
                 self.synthesize_instance_input(&argument, registry)?;
                 argument = self.instantiate(&argument)?;
             }
+            let erase_output = mode == ParameterMode::Output && erase_known_outputs;
             let selected = match mode {
+                // An unknown input blocks the goal. A universe hole does not: the pin searches
+                // under `withNewMCtxDepth (allowLevelAssignments := true)`, so `Inhabited PUnit.{?u}`
+                // is answered by `instInhabitedPUnit.{?u}`.
                 ParameterMode::Input => {
-                    if argument.has_expr_mvar() || argument.has_level_mvar() {
+                    if argument.has_expr_mvar() {
                         return Ok(None);
                     }
                     argument.clone()
                 }
-                // Ignore even pre-existing output values during selection.
-                // Reconcile them only after the first successful candidate.
-                ParameterMode::Output => self.hole(binder_type.clone())?,
+                ParameterMode::Output if erase_output => self.hole(binder_type.clone())?,
+                ParameterMode::Output => argument.clone(),
                 ParameterMode::SemiOutput => argument.clone(),
             };
-            let key_argument = if mode == ParameterMode::Output {
+            let key_argument = if erase_output {
                 Expr::bvar(0).expect("fixed cycle-key placeholder")
             } else if mode == ParameterMode::SemiOutput
                 && let ExprNode::MVar { id } = argument.node()

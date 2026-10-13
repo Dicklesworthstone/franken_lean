@@ -1,15 +1,245 @@
 //! Native source simp sets, attached to immutable environment snapshots.
 //!
 //! This is a versioned source journal, not the Reference's serialized extension.
-//! Entries select existing safe definitions or equality lemmas; they carry no
+//! Entries select existing safe definitions or proposition lemmas; they carry no
 //! proof authority. The ordinary elaborator and both checkers validate all uses.
-use fln_core::{expr::ExprNode, name::Name};
+use fln_core::{
+    expr::{Expr, ExprNode},
+    level::{Level, LevelView},
+    name::Name,
+};
 use fln_env::{
     constants::{ConstantInfo, DefinitionSafety},
     environment::Environment,
     extensions::{CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance},
 };
 use std::collections::BTreeMap;
+mod imports;
+pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
+
+/// A `prio` tree's value: a decimal numeral, `default`/`low`/`mid`/`high` (1000, 100, 500 and
+/// 10000, vendored `src/Init/Notation.lean`), or either in parentheses. Priority arithmetic and
+/// other radixes are refused.
+pub(in crate::source) fn priority_value(
+    priority: &fln_syntax::tree::Syntax,
+) -> Result<u32, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let refuse = |expected| NatDefinitionElabError::UnexpectedSyntax { expected };
+    let Syntax::Node { kind, args, .. } = priority else {
+        return Err(refuse("numeric priority"));
+    };
+    let named = [
+        ("prioDefault", 1000),
+        ("prioLow", 100),
+        ("prioMid", 500),
+        ("prioHigh", 10000),
+    ];
+    if let Some((_, value)) = named
+        .iter()
+        .find(|(name, _)| kind == &Name::from_components([*name]))
+    {
+        return Ok(*value);
+    }
+    if kind == &Name::from_components(["prio(_)"]) {
+        let [_, inner, _] = args.as_slice() else {
+            return Err(refuse("parenthesized priority"));
+        };
+        return priority_value(inner);
+    }
+    let numeral = expect_node(
+        priority,
+        &Name::from_components(["num"]),
+        1,
+        "priority numeral",
+    )?;
+    let [Syntax::Atom { val, .. }] = numeral else {
+        return Err(refuse("decimal priority"));
+    };
+    if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse("decimal priority"));
+    }
+    val.parse::<u32>().map_err(|_| refuse("u32 priority"))
+}
+
+/// A code generator hint, which changes neither a verdict nor a value: `inline`, `noinline`,
+/// `always_inline` and `inline_if_reduce` (the pin's `inlineAttrs`, Lean/Compiler/InlineAttrs.lean),
+/// `Some(true)`, and `specialize` without arguments (Lean/Compiler/Specialize.lean), `Some(false)`.
+/// The `bool` says whether the pin's `checkIsDefinition` applies: the inlining kinds take only a
+/// definition or an opaque constant. These are enum and parametric attributes, so the pin refuses
+/// them `local` or `scoped`, and refuses an inlining kind with arguments. `macro_inline` evaluates
+/// arguments lazily, and `specialize f` names parameters the pin checks, so both stay refused.
+fn compiler_hint(
+    attribute: &fln_syntax::tree::Syntax,
+) -> Result<Option<bool>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    let requires_definition = match &instance[1] {
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "simple"]) => {
+            let [Syntax::Ident { val, .. }, argument] = args.as_slice() else {
+                return Ok(None);
+            };
+            if !["inline", "noinline", "always_inline", "inline_if_reduce"]
+                .iter()
+                .any(|hint| val == &Name::from_components([*hint]))
+            {
+                return Ok(None);
+            }
+            expect_empty_null(argument, "inlining attribute without arguments")?;
+            true
+        }
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "specialize"]) => {
+            let [keyword, arguments] = args.as_slice() else {
+                return Ok(None);
+            };
+            expect_atom(keyword, "specialize", "specialize attribute keyword")?;
+            expect_empty_null(arguments, "specialize attribute without arguments")?;
+            false
+        }
+        _ => return Ok(None),
+    };
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global compiler hint")?;
+    Ok(Some(requires_definition))
+}
+
+/// A reducibility attribute: `reducible`, `irreducible`, `semireducible`, `implicit_reducible` or its
+/// alias `instance_reducible` (vendored Lean/ReducibilityAttrs.lean). The pin refuses arguments
+/// (`ensureNoArgs`) and the `scoped` kind. `local` would need a section-scoped status, which this
+/// engine has no journal for, so it is refused too.
+fn reducibility_attribute(
+    attribute: &fln_syntax::tree::Syntax,
+) -> Result<Option<crate::reducibility::Reducibility>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    use crate::reducibility::Reducibility;
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    let Syntax::Node { kind, args, .. } = &instance[1] else {
+        return Ok(None);
+    };
+    if kind != &parser_kind(&["Attr", "simple"]) {
+        return Ok(None);
+    }
+    let [Syntax::Ident { val, .. }, argument] = args.as_slice() else {
+        return Ok(None);
+    };
+    let status = match val.to_display_string().as_str() {
+        "reducible" => Reducibility::Reducible,
+        "irreducible" => Reducibility::Irreducible,
+        "semireducible" => Reducibility::Semireducible,
+        "implicit_reducible" | "instance_reducible" => Reducibility::ImplicitReducible,
+        _ => return Ok(None),
+    };
+    expect_empty_null(argument, "reducibility attribute without arguments")?;
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global reducibility attribute")?;
+    Ok(Some(status))
+}
+
+/// The reducibility status a declaration's attributes give it, validated in order as the pin's
+/// `validate` does for a global attribute on a declaration of this file:
+/// - only a definition takes one ("is not a definition");
+/// - `reducible` and `implicit_reducible` need the status `semireducible`;
+/// - `irreducible` needs `semireducible` or `implicit_reducible`;
+/// - `semireducible` is refused ("declarations are `[semireducible]` by default").
+///
+/// `def` starts `semireducible` and `abbrev` `reducible`. An `instance` (`implicit_reducible`) is
+/// refused here, as is any other declaration: the pin's `isDefinition` admits a data instance, but
+/// its name is the instance command's, read elsewhere. Like `registration`, this only describes
+/// metadata, installed on the successor of ordinary declaration admission.
+pub fn reducibility(
+    syntax: &fln_syntax::tree::Syntax,
+) -> Result<Option<(Name, crate::reducibility::Reducibility)>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    use crate::reducibility::Reducibility;
+    let refuse = |expected| NatDefinitionElabError::UnexpectedSyntax { expected };
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    let mut requested = Vec::new();
+    for attribute in super::visibility::attributes(&modifiers[1])? {
+        if let Some(status) = reducibility_attribute(attribute)? {
+            requested.push(status);
+        }
+    }
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    let mut status = if declaration[1].kind() == Some(&parser_kind(&["Command", "definition"])) {
+        Reducibility::Semireducible
+    } else if declaration[1].kind() == Some(&parser_kind(&["Command", "abbrev"])) {
+        Reducibility::Reducible
+    } else {
+        return Err(refuse("a reducibility attribute on a `def` or an `abbrev`"));
+    };
+    for next in requested {
+        let allowed = match next {
+            Reducibility::Reducible | Reducibility::ImplicitReducible => {
+                status == Reducibility::Semireducible
+            }
+            Reducibility::Irreducible => matches!(
+                status,
+                Reducibility::Semireducible | Reducibility::ImplicitReducible
+            ),
+            Reducibility::Semireducible => false,
+        };
+        if !allowed {
+            return Err(refuse(
+                "a reducibility attribute the declaration's status admits",
+            ));
+        }
+        status = next;
+    }
+    let id = expect_node(
+        &expect_node(
+            &declaration[1],
+            declaration[1].kind().ok_or_else(|| refuse("declaration"))?,
+            if declaration[1].kind() == Some(&parser_kind(&["Command", "definition"])) {
+                5
+            } else {
+                4
+            },
+            "definition",
+        )?[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    let Syntax::Ident { val, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    if val.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    }
+    Ok(Some((val.clone(), status)))
+}
 
 /// Decode a canonical inline request. This only describes metadata: it must be
 /// installed on the successor of ordinary declaration admission, never before.
@@ -29,26 +259,42 @@ pub fn registration(
         7,
         "declaration modifiers",
     )?;
-    let attributes = match expect_null_args(&modifiers[1], "inline attributes")? {
-        [] => return Ok(None),
-        [attributes] => expect_node(
-            attributes,
-            &parser_kind(&["Term", "attributes"]),
-            3,
-            "inline attributes",
-        )?,
-        _ => {
+    instance_command::default_registration(syntax)?;
+    let mut simp = None;
+    let mut inlining = false;
+    for attribute in super::visibility::attributes(&modifiers[1])? {
+        if super::visibility::exposure_attribute(attribute)?.is_some()
+            || instance_command::default_attribute(attribute)?.is_some()
+        {
+            continue;
+        }
+        if let Some(requires_definition) = compiler_hint(attribute)? {
+            inlining |= requires_definition;
+            continue;
+        }
+        // Read by `reducibility`.
+        if reducibility_attribute(attribute)?.is_some() {
+            continue;
+        }
+        if simp.replace(attribute).is_some() {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "one simp attribute",
+                expected: "one simp attribute beside exposure attributes",
             });
         }
-    };
-    expect_atom(&attributes[0], "@[", "attribute opener")?;
-    expect_atom(&attributes[2], "]", "attribute closer")?;
-    let [attribute] = expect_null_args(&attributes[1], "attribute list")? else {
+    }
+    // The pin's `checkIsDefinition`: a definition (`def`, `abbrev`, `instance`) or an opaque
+    // constant; a theorem or an axiom is refused, "Declaration `d` is not a definition".
+    if inlining
+        && !["definition", "abbrev", "instance", "opaque"]
+            .iter()
+            .any(|kind| declaration[1].kind() == Some(&parser_kind(&["Command", kind])))
+    {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "one simp attribute",
+            expected: "an inlining attribute on a definition or an opaque constant",
         });
+    }
+    let Some(attribute) = simp else {
+        return Ok(None);
     };
     let instance = expect_node(
         attribute,
@@ -82,34 +328,7 @@ pub fn registration(
     };
     let priority = match expect_null_args(&parts[3], "simp priority")? {
         [] => 1000,
-        [priority] => {
-            let parts = expect_node(
-                priority,
-                &parser_kind(&["Priority", "numPrio"]),
-                1,
-                "numeric priority",
-            )?;
-            let numeral = expect_node(
-                &parts[0],
-                &Name::from_components(["num"]),
-                1,
-                "priority numeral",
-            )?;
-            let [Syntax::Atom { val, .. }] = numeral else {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "priority numeral",
-                });
-            };
-            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "decimal priority",
-                });
-            }
-            val.parse::<u32>()
-                .map_err(|_| NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "u32 priority",
-                })?
-        }
+        [priority] => priority_value(priority)?,
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "numeric priority",
@@ -146,13 +365,14 @@ pub fn registration(
 }
 
 const MAGIC: &[u8] = b"FLNSIMP\x01";
-// The pinned Init alone exports over 10,000 simp entries. Bound the journal
-// independently of theorem-telescope traversal, while retaining the old
-// 4096 * 16384 = 64 MiB maximum aggregate payload allowance.
-const MAX_ROWS: usize = 65_536;
-const MAX_TYPE_STEPS: usize = 4096;
+// Preserve the original bytes for ordinary source names. Internal names use
+// the shared tagged structural codec in a separately versioned payload, so a
+// private numeric component can never be mistaken for a source string "0".
+const STRUCTURAL_MAGIC: &[u8] = b"FLNSIMP\x02";
+// Auxiliary proofs add a new row form; existing v1/v2 rows keep their bytes.
+const PROOF_MAGIC: &[u8] = b"FLNSIMP\x03";
+const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 16384;
-const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimpSetError {
@@ -181,7 +401,10 @@ impl std::error::Error for SimpSetError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpEntry {
+    /// Attribute origin: erasure and explicit replacement act on this identity.
     pub declaration: Name,
+    /// Already oriented proof, distinct from the origin and never an unfolding.
+    pub proof: Option<Name>,
     pub priority: u32,
     pub reverse: bool,
     pub order: usize,
@@ -204,14 +427,20 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
         // a proposition. Forward rules can now compile its conclusion to True
         // or a final refutation to False; no new typing authority is added here.
         ConstantInfo::Thm(_) if !reverse => return Ok(()),
+        ConstantInfo::Axiom(a) if !a.is_unsafe && !reverse => {
+            return if is_proposition(env, &a.base.type_)? {
+                Ok(())
+            } else {
+                Err(SimpSetError::UnsupportedDeclaration(name.clone()))
+            };
+        }
         ConstantInfo::Thm(t) => &t.base.type_,
         ConstantInfo::Axiom(a) if !a.is_unsafe => &a.base.type_,
         _ => return Err(SimpSetError::UnsupportedDeclaration(name.clone())),
     };
-    // Reversed rules and axioms retain the bounded equality/Iff classifier.
-    // In particular a data-valued axiom is not classified as a proposition.
+    // Reversed rules retain the bounded equality/Iff classifier.
     let mut applications = 0;
-    for _ in 0..MAX_TYPE_STEPS {
+    for _ in 0..MAX_ROWS {
         match ty.node() {
             ExprNode::MData { expr, .. } => ty = expr,
             ExprNode::ForallE { body, .. } if applications == 0 => ty = body,
@@ -233,6 +462,111 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
         }
     }
     Err(SimpSetError::Limit)
+}
+
+/// The pin's `isPropQuick` / `isArrowProp` sufficient condition, extended to
+/// closed telescope variables. Inspect only already admitted types and require
+/// their instantiated result sort to be always zero. This does not reconstruct
+/// terms or grant proof authority. Aliases/projections needing normalization
+/// remain unsupported; the ordinary tactic driver still checks every use.
+fn is_proposition(env: &Environment, expression: &Expr) -> Result<bool, SimpSetError> {
+    let mut remaining = MAX_ROWS;
+    let mut spend = || -> Result<(), SimpSetError> {
+        remaining = remaining.checked_sub(1).ok_or(SimpSetError::Limit)?;
+        Ok(())
+    };
+    let mut locals = Vec::new();
+    let mut ty = expression;
+    let mut arity = 0usize;
+    let (mut head_type, parameters, arguments) = loop {
+        spend()?;
+        match ty.node() {
+            ExprNode::MData { expr, .. } => ty = expr,
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } if arity == 0 => {
+                locals.push(binder_type);
+                ty = body;
+            }
+            ExprNode::LetE { type_, body, .. } => {
+                locals.push(type_);
+                ty = body;
+            }
+            ExprNode::App { f, .. } => {
+                arity += 1;
+                ty = f;
+            }
+            ExprNode::Const { name, levels } => {
+                let Some(info) = env.find(name) else {
+                    return Ok(false);
+                };
+                let base = info.constant_val();
+                if base.level_params.len() != levels.len() {
+                    return Ok(false);
+                }
+                break (&base.type_, base.level_params.as_slice(), levels.as_slice());
+            }
+            ExprNode::BVar { idx } => {
+                let Some(index) = locals.len().checked_sub(*idx as usize + 1) else {
+                    return Ok(false);
+                };
+                break (locals[index], &[][..], &[][..]);
+            }
+            _ => return Ok(false),
+        }
+    };
+    loop {
+        spend()?;
+        match head_type.node() {
+            ExprNode::MData { expr, .. } | ExprNode::LetE { body: expr, .. } => head_type = expr,
+            ExprNode::ForallE { body, .. } if arity != 0 => {
+                arity -= 1;
+                head_type = body;
+            }
+            ExprNode::Sort { level } if arity == 0 => {
+                return always_zero(level, parameters, arguments, &mut spend);
+            }
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// Substitute declaration universe parameters once, with the same total meter
+/// as the expression walk. Substituted arguments are in the caller's universe
+/// context and must not be interpreted as the callee's parameters a second time.
+fn always_zero(
+    level: &Level,
+    parameters: &[Name],
+    arguments: &[Level],
+    spend: &mut impl FnMut() -> Result<(), SimpSetError>,
+) -> Result<bool, SimpSetError> {
+    let mut pending = vec![(level, true)];
+    while let Some((level, substitute)) = pending.pop() {
+        spend()?;
+        match level.view() {
+            LevelView::Zero => {}
+            LevelView::Max(left, right) => {
+                pending.extend([(right, substitute), (left, substitute)]);
+            }
+            LevelView::IMax(_, right) => pending.push((right, substitute)),
+            LevelView::Param(name) if substitute => {
+                let mut replacement = None;
+                for (parameter, argument) in parameters.iter().zip(arguments) {
+                    spend()?;
+                    if parameter == name {
+                        replacement = Some(argument);
+                        break;
+                    }
+                }
+                let Some(replacement) = replacement else {
+                    return Ok(false);
+                };
+                pending.push((replacement, false));
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], SimpSetError> {
     if bytes.len() < n {
@@ -269,13 +603,9 @@ fn read_name(bytes: &mut &[u8]) -> Result<Name, SimpSetError> {
 /// Read active rows in deterministic priority order (newer ties first).
 /// Corrupt entries and dangling references are errors, never an empty simp set.
 pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
-    read_journal(env).map(|(rows, _)| rows)
-}
-
-fn read_journal(env: &Environment) -> Result<(Vec<SimpEntry>, usize), SimpSetError> {
     let expected = descriptor();
     let Some(extension) = env.extension(&expected.name) else {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     };
     if extension.descriptor != expected {
         return Err(SimpSetError::Malformed);
@@ -283,22 +613,33 @@ fn read_journal(env: &Environment) -> Result<(Vec<SimpEntry>, usize), SimpSetErr
     if extension.len() > MAX_ROWS {
         return Err(SimpSetError::Limit);
     }
-    let mut active = BTreeMap::new();
-    let mut payload_bytes = 0usize;
+    let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
     for (order, row) in extension.entries().enumerate() {
         if row.payload.len() > MAX_BYTES {
             return Err(SimpSetError::Limit);
         }
-        payload_bytes = payload_bytes
-            .checked_add(row.payload.len())
-            .filter(|bytes| *bytes <= MAX_TOTAL_BYTES)
-            .ok_or(SimpSetError::Limit)?;
         let mut bytes: &[u8] = &row.payload;
-        if take(&mut bytes, MAGIC.len())? != MAGIC {
-            return Err(SimpSetError::Malformed);
-        }
+        let header = take(&mut bytes, MAGIC.len())?;
+        let proof_row = header == PROOF_MAGIC;
+        let structural = match header {
+            header if header == MAGIC => false,
+            header if header == STRUCTURAL_MAGIC || proof_row => true,
+            _ => return Err(SimpSetError::Malformed),
+        };
         let operation = take(&mut bytes, 1)?[0];
-        let declaration = read_name(&mut bytes)?;
+        let declaration = if structural {
+            crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?
+        } else {
+            read_name(&mut bytes)?
+        };
+        let proof = if proof_row {
+            if operation != 2 {
+                return Err(SimpSetError::Malformed);
+            }
+            Some(crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?)
+        } else {
+            None
+        };
         let priority = number(&mut bytes)?;
         let reverse = match take(&mut bytes, 1)?[0] {
             0 => false,
@@ -313,12 +654,16 @@ fn read_journal(env: &Environment) -> Result<(Vec<SimpEntry>, usize), SimpSetErr
                 validate(env, &declaration, reverse)?;
                 active.insert(
                     declaration.clone(),
-                    SimpEntry {
-                        declaration,
-                        priority,
-                        reverse,
-                        order,
-                    },
+                    BTreeMap::from([(
+                        None,
+                        SimpEntry {
+                            declaration,
+                            proof: None,
+                            priority,
+                            reverse,
+                            order,
+                        },
+                    )]),
                 );
             }
             1 if priority == 0 && !reverse => {
@@ -327,16 +672,40 @@ fn read_journal(env: &Environment) -> Result<(Vec<SimpEntry>, usize), SimpSetErr
                 }
                 active.remove(&declaration);
             }
+            2 if proof_row && !reverse => {
+                let proof = proof.ok_or(SimpSetError::Malformed)?;
+                if !env.contains(&declaration) {
+                    return Err(SimpSetError::UnknownDeclaration(declaration));
+                }
+                imports::validate_proof(env, &proof)?;
+                // A persisted theorem group replaces a prior ordinary source
+                // selection, but its auxiliary lemmas coexist with each other.
+                let group = active.entry(declaration.clone()).or_default();
+                group.remove(&None);
+                group.insert(
+                    Some(proof.clone()),
+                    SimpEntry {
+                        declaration,
+                        proof: Some(proof),
+                        priority,
+                        reverse,
+                        order,
+                    },
+                );
+            }
             _ => return Err(SimpSetError::Malformed),
         }
     }
-    let mut rows: Vec<SimpEntry> = active.into_values().collect();
+    let mut rows: Vec<SimpEntry> = active
+        .into_values()
+        .flat_map(BTreeMap::into_values)
+        .collect();
     rows.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
             .then_with(|| b.order.cmp(&a.order))
     });
-    Ok((rows, payload_bytes))
+    Ok(rows)
 }
 
 /// Add/update an already admitted rule, or erase it with `None`. The returned
@@ -346,94 +715,83 @@ pub fn update(
     declaration: &Name,
     rule: Option<(u32, bool)>,
 ) -> Result<Environment, SimpSetError> {
-    let (rows, mut payload_bytes) = read_journal(env)?;
+    let rows = read(env)?;
     let current = rows.iter().find(|r| &r.declaration == declaration);
     if !env.contains(declaration) {
         return Err(SimpSetError::UnknownDeclaration(declaration.clone()));
     }
     if let Some((priority, reverse)) = rule {
         validate(env, declaration, reverse)?;
-        if current.is_some_and(|r| r.priority == priority && r.reverse == reverse) {
+        if current
+            .is_some_and(|r| r.proof.is_none() && r.priority == priority && r.reverse == reverse)
+        {
             return Ok(env.clone());
         }
     } else if current.is_none() {
         return Ok(env.clone());
     }
-    append(env, declaration, rule, &mut payload_bytes)
+    append(env, source_payload(declaration, rule)?)
 }
 
-/// Apply a module's forward rules and erasures after declaration admission. Read the
-/// existing journal once. Unlike source-local `update`, retain even currently
-/// redundant operations: module replay may apply them after a different source
-/// prefix. Failure leaves the caller's snapshot untouched.
-pub fn register_module(
-    env: &Environment,
-    declarations: &[(Name, Option<u32>)],
-) -> Result<Environment, SimpSetError> {
-    let (_, mut payload_bytes) = read_journal(env)?;
-    let mut next = env.clone();
-    for (declaration, priority) in declarations {
-        if !next.contains(declaration) {
-            return Err(SimpSetError::UnknownDeclaration(declaration.clone()));
+fn source_payload(declaration: &Name, rule: Option<(u32, bool)>) -> Result<Vec<u8>, SimpSetError> {
+    let mut payload = if let Ok(parts) = super::components(declaration) {
+        if parts.is_empty() {
+            return Err(SimpSetError::Malformed);
         }
-        let rule = priority.map(|priority| (priority, false));
-        if rule.is_some() {
-            validate(&next, declaration, false)?;
+        let size = parts
+            .iter()
+            .try_fold(MAGIC.len() + 10, |n, s| n.checked_add(4 + s.len()))
+            .ok_or(SimpSetError::Limit)?;
+        if size > MAX_BYTES {
+            return Err(SimpSetError::Limit);
         }
-        next = append(&next, declaration, rule, &mut payload_bytes)?;
-    }
-    Ok(next)
-}
-
-fn append(
-    env: &Environment,
-    declaration: &Name,
-    rule: Option<(u32, bool)>,
-    payload_bytes: &mut usize,
-) -> Result<Environment, SimpSetError> {
-    let expected = descriptor();
-    if env
-        .extension(&expected.name)
-        .is_some_and(|ext| ext.len() >= MAX_ROWS)
-    {
-        return Err(SimpSetError::Limit);
-    }
-    let parts = super::components(declaration).map_err(|_| SimpSetError::Limit)?;
-    if parts.is_empty() {
-        return Err(SimpSetError::Malformed);
-    }
-    let size = parts
-        .iter()
-        .try_fold(MAGIC.len() + 10, |n, s| n.checked_add(4 + s.len()))
-        .ok_or(SimpSetError::Limit)?;
-    if size > MAX_BYTES {
-        return Err(SimpSetError::Limit);
-    }
-    let next_bytes = payload_bytes
-        .checked_add(size)
-        .filter(|bytes| *bytes <= MAX_TOTAL_BYTES)
-        .ok_or(SimpSetError::Limit)?;
-    let mut payload = MAGIC.to_vec();
-    payload.push(u8::from(rule.is_none()));
-    payload.extend((parts.len() as u32).to_le_bytes());
-    for part in parts {
-        payload.extend((part.len() as u32).to_le_bytes());
-        payload.extend(part.as_bytes());
-    }
+        let mut payload = MAGIC.to_vec();
+        payload.push(u8::from(rule.is_none()));
+        payload.extend((parts.len() as u32).to_le_bytes());
+        for part in parts {
+            payload.extend((part.len() as u32).to_le_bytes());
+            payload.extend(part.as_bytes());
+        }
+        payload
+    } else {
+        let mut payload = STRUCTURAL_MAGIC.to_vec();
+        payload.push(u8::from(rule.is_none()));
+        crate::instances::write_name(declaration, &mut payload).map_err(|error| match error {
+            crate::instances::InstanceRegistryError::Limit => SimpSetError::Limit,
+            _ => SimpSetError::Malformed,
+        })?;
+        if payload.len().saturating_add(5) > MAX_BYTES {
+            return Err(SimpSetError::Limit);
+        }
+        payload
+    };
     let (priority, reverse) = rule.unwrap_or((0, false));
     payload.extend(priority.to_le_bytes());
     payload.push(u8::from(reverse));
+    Ok(payload)
+}
+
+fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, SimpSetError> {
+    let expected = descriptor();
+    if payload.len() > MAX_BYTES {
+        return Err(SimpSetError::Limit);
+    }
+    if let Some(state) = env.extension(&expected.name) {
+        if state.descriptor != expected {
+            return Err(SimpSetError::Malformed);
+        }
+        if state.len() >= MAX_ROWS {
+            return Err(SimpSetError::Limit);
+        }
+    }
     let env = if env.extension(&expected.name).is_none() {
         env.register_extension(expected.clone())
             .map_err(|_| SimpSetError::Malformed)?
     } else {
         env.clone()
     };
-    let next = env
-        .push_extension_entry(&expected.name, payload)
-        .map_err(|_| SimpSetError::Malformed)?;
-    *payload_bytes = next_bytes;
-    Ok(next)
+    env.push_extension_entry(&expected.name, payload)
+        .map_err(|_| SimpSetError::Malformed)
 }
 
 #[cfg(test)]
@@ -476,8 +834,9 @@ mod tests {
             (&[0, 1, 0, 1, 0, 1, 0][..], atom("unknown")),
             (&[0, 1, 0, 1, 0, 1, 1][..], atom("↓")),
             (&[0, 1, 0, 1, 0, 1, 2, 0][..], atom("->")),
-            (&[0, 1, 0, 1, 0, 1, 3, 0, 0, 0][..], atom("4294967296")),
-            (&[0, 1, 0, 1, 0, 1, 3, 0, 0, 0][..], atom("-1")),
+            // The priority is the pin's `num` node itself (`numPrio` adds no node).
+            (&[0, 1, 0, 1, 0, 1, 3, 0, 0][..], atom("4294967296")),
+            (&[0, 1, 0, 1, 0, 1, 3, 0, 0][..], atom("-1")),
         ] {
             let mut syntax = parsed.syntax().clone();
             *child_mut(&mut syntax, path) = replacement;
@@ -511,5 +870,74 @@ mod tests {
                 .unwrap();
             assert_eq!(read(&env), Err(SimpSetError::Malformed));
         }
+    }
+
+    #[test]
+    fn structural_names_coexist_with_legacy_rows_and_erase_by_exact_identity() {
+        use fln_core::{expr::Expr, level::Level};
+        use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
+
+        let source_name = Name::from_components(["_private", "Main", "0", "rule"]);
+        let private_name = Name::str(
+            Name::num(Name::from_components(["_private", "Main"]), 0),
+            "rule",
+        );
+        let mut env = Environment::new();
+        for name in [&source_name, &private_name] {
+            env = env
+                .add_decl(ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: name.clone(),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::one()),
+                    },
+                    value: Expr::sort(Level::zero()),
+                    hints: ReducibilityHints::Abbrev,
+                    safety: DefinitionSafety::Safe,
+                    all: vec![name.clone()],
+                }))
+                .unwrap();
+        }
+        let legacy = update(&env, &source_name, Some((500, false))).unwrap();
+        let both = update(&legacy, &private_name, Some((1000, false))).unwrap();
+        let rows = read(&both).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| &row.declaration).collect::<Vec<_>>(),
+            [&private_name, &source_name]
+        );
+        let payloads: Vec<_> = both
+            .extension(&descriptor().name)
+            .unwrap()
+            .entries()
+            .map(|row| row.payload.clone())
+            .collect();
+        assert!(payloads[0].starts_with(MAGIC));
+        assert!(payloads[1].starts_with(STRUCTURAL_MAGIC));
+        assert_eq!(
+            legacy
+                .extension(&descriptor().name)
+                .unwrap()
+                .entries()
+                .next()
+                .unwrap()
+                .payload,
+            payloads[0]
+        );
+        let erased = update(&both, &private_name, None).unwrap();
+        assert_eq!(read(&erased).unwrap(), read(&legacy).unwrap());
+        assert_eq!(read(&both).unwrap(), rows);
+
+        // A partial tagged name is a malformed registry, not a missing rule.
+        let malformed = legacy
+            .push_extension_entry(
+                &descriptor().name,
+                STRUCTURAL_MAGIC
+                    .iter()
+                    .copied()
+                    .chain([0, 1, 0, 1, 0])
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(read(&malformed), Err(SimpSetError::Malformed));
     }
 }

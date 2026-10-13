@@ -1,8 +1,9 @@
 //! Known higher-order bodies execute through admission, native FIR and FLBC.
 #![forbid(unsafe_code)]
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, FlbcExecutionLimits, KVMap,
-    Outcome, VmExit, execute_flbc_artifact,
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits,
+    FlbcExecutionLimits, IngressError, KVMap, Name, Outcome, SourceCheckLimits, VmExit,
+    execute_flbc_artifact,
 };
 
 fn limits() -> EngineExecutionLimits {
@@ -46,12 +47,103 @@ const SPEND: &str =
     "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
+fn ordinary_higher_order_arguments_do_not_repeat_callback_annotation() {
+    execute(
+        "def use (f : (Nat -> Nat) -> Nat) : Nat := f (fun n => n)\n#eval use (fun g => g 42)",
+        "42",
+    );
+    execute(
+        "def use (f : (Nat -> Nat) -> Nat) : Nat := f (fun n => n)\n#eval let callback : (Nat -> Nat) -> Nat := fun g => g 42; use callback",
+        "42",
+    );
+    execute(
+        "#eval let callback : (Nat -> Nat) -> Nat := fun g => g 21; let forward : ((Nat -> Nat) -> Nat) -> Nat := fun f => f (fun n => n); callback (fun n => n) + forward callback",
+        "42",
+    );
+}
+
+#[test]
 fn known_staged_callbacks_execute_through_the_ordinary_higher_order_consumer() {
     execute(
         &format!(
             "{APPLY}#eval applyBoth (fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y) 20 21"
         ),
         "42",
+    );
+}
+
+fn assert_foreign_extern_is_not_inlined(definition: &str, target: &str, query: &str) {
+    let options = KVMap::new();
+    let clean = engine()
+        .check_source_files(
+            &[definition.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits().admission()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let clean_root = clean.logical_root(&options);
+    let decorated = Engine::from_environment(
+        fln_elab::externs::register(
+            clean.environment(),
+            &Name::from_components([target]),
+            vec![fln_elab::externs::ExternEntry::Standard {
+                backend: Name::from_components(["all"]),
+                symbol: "foreign_staged_function".to_owned(),
+            }],
+        )
+        .unwrap(),
+    );
+    let decorated_root = decorated.logical_root(&options);
+    // The source is checked and executes normally; only the selected extern
+    // policy makes the otherwise identical decorated definition unsupported.
+    let ordinary = clean
+        .execute_source_definitions(&[query.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    expect(&ordinary.executions.last().unwrap().exit, "42");
+    let mut error = decorated
+        .execute_source_definitions(&[query.as_bytes()], &options, limits())
+        .unwrap_err();
+    while let EngineExecutionError::BatchCommand { error: inner, .. } = error {
+        error = *inner;
+    }
+    assert!(
+        matches!(
+            error,
+            EngineExecutionError::Ingress(IngressError::UnsupportedNode {
+                kind: "native extern attribute does not match the supported ABI"
+            })
+        ),
+        "selected {target} metadata was bypassed: {error:?}"
+    );
+    assert_eq!(decorated.logical_root(&options), decorated_root);
+    assert_eq!(clean.logical_root(&options), clean_root);
+}
+
+#[test]
+fn selected_staged_callback_consumer_cannot_bypass_foreign_extern_metadata() {
+    assert_foreign_extern_is_not_inlined(
+        APPLY,
+        "applyBoth",
+        "#eval applyBoth (fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y) 20 21",
+    );
+    assert_foreign_extern_is_not_inlined(
+        APPLY,
+        "applyBoth",
+        "#eval let callback : Nat -> Nat -> Nat := fun (x : Nat) => let saved : Nat := x + 1; fun (y : Nat) => saved + y; let alias : Nat -> Nat -> Nat := callback; applyBoth alias 20 21",
+    );
+}
+
+#[test]
+fn selected_staged_producer_cannot_bypass_foreign_extern_metadata() {
+    assert_foreign_extern_is_not_inlined(
+        "def producer (x : Nat) : Nat -> Nat := let saved : Nat := x + 1; fun (y : Nat) => saved + y\n",
+        "producer",
+        "#eval producer 20 21",
     );
 }
 

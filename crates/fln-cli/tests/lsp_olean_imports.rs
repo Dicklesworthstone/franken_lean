@@ -299,8 +299,14 @@ fn an_editor_session_checks_and_hovers_against_imported_oleans() {
         "{:?}",
         rejected.source_check
     );
+    // The pin refuses `Ext.A P` (of type `P → P`, expected `P`) while elaborating:
+    // "Type mismatch" at the definition's column 40 (v4.32.0, measured 2026-10-07 on the
+    // same three definitions in one headerless file). So does FrankenLean now, as a
+    // refused conversion, in its own words.
     assert!(
-        rejected.diagnostics.contains("DefinitionTypeMismatch"),
+        rejected
+            .diagnostics
+            .contains("command 0, byte 34: frontend refused source: elaboration refused source"),
         "{}",
         rejected.diagnostics
     );

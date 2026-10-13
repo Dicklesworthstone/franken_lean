@@ -1,5 +1,6 @@
-//! Global and namespace-scoped instance attributes with decimal priorities.
-//! Local attributes and erasure are not approximated as persistent registrations.
+//! Global, namespace-scoped and local instance attributes, and global default candidates. A local
+//! instance is never a persistent registration: it holds until the enclosing scope ends. Erasure
+//! is not read.
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,6 +8,9 @@ pub struct InstanceAttribute {
     pub declarations: Vec<Name>,
     pub priority: u32,
     pub scoped: bool,
+    pub is_default: bool,
+    /// `attribute [local instance] x`: selected until the enclosing `section`/`namespace` ends.
+    pub local: bool,
 }
 
 /// Inspect the existing scope-command token stream, preserving original source
@@ -16,20 +20,36 @@ pub(super) fn parse(
     tokens: &[LexedToken],
 ) -> Result<Option<InstanceAttribute>, DefinitionParseError> {
     let is = |at: usize, text: &str| {
-        matches!(tokens.get(at).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == text)
+        tokens.get(at).is_some_and(|token| {
+            matches!(&token.kind, TokenKind::Symbol(_) | TokenKind::Ident(_))
+                && view.normalized().span_str(token.extent) == Some(text)
+        })
     };
     let scoped = is(2, "scoped");
-    let keyword = if scoped { 3 } else { 2 };
-    if !is(0, "attribute") || !is(1, "[") || !is(keyword, "instance") {
+    let local = is(2, "local");
+    let keyword = if scoped || local { 3 } else { 2 };
+    let is_default = is(keyword, "default_instance");
+    if !is(0, "attribute") || !is(1, "[") || !(is(keyword, "instance") || is_default) {
         return Ok(None);
     }
     let bad = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
         at: original_position(view, tokens, at),
         expected: NatDefinitionExpectation::EndOfCommand,
     };
+    // A local or scoped default instance is not read; a local instance is.
+    if is_default && (local || scoped) {
+        return Err(bad(2));
+    }
     let mut at = keyword + 1;
     let mut priority = 1000;
+    let mut depth = 0;
+    while is_default && is(at, "(") {
+        if depth >= 16 {
+            return Err(bad(at));
+        }
+        depth += 1;
+        at += 1;
+    }
     if matches!(
         tokens.get(at).map(|token| &token.kind),
         Some(TokenKind::Literal(LiteralKind::Nat))
@@ -42,6 +62,25 @@ pub(super) fn parse(
             return Err(bad(at));
         }
         priority = text.parse::<u32>().map_err(|_| bad(at))?;
+        at += 1;
+    } else if is_default && !is(at, "]") {
+        priority = if is(at, "default") {
+            1000
+        } else if is(at, "low") {
+            100
+        } else if is(at, "mid") {
+            500
+        } else if is(at, "high") {
+            10000
+        } else {
+            return Err(bad(at));
+        };
+        at += 1;
+    }
+    for _ in 0..depth {
+        if !is(at, ")") {
+            return Err(bad(at));
+        }
         at += 1;
     }
     if !is(at, "]") {
@@ -63,6 +102,8 @@ pub(super) fn parse(
         declarations,
         priority,
         scoped,
+        is_default,
+        local,
     }))
 }
 
@@ -126,6 +167,48 @@ mod tests {
     }
 
     #[test]
+    fn default_candidates_preserve_priority_and_refuse_unsupported_scopes() {
+        for (source, priority) in [
+            ("attribute [default_instance] d", 1000),
+            ("attribute [default_instance 0] d", 0),
+            ("attribute [default_instance 4294967295] d", u32::MAX),
+            ("attribute [default_instance default] d", 1000),
+            ("attribute [default_instance (low)] d", 100),
+            ("attribute [default_instance ((mid))] d", 500),
+            ("attribute [default_instance high] d", 10000),
+        ] {
+            let parsed = attribute(source);
+            assert!(parsed.is_default && !parsed.scoped, "{source}");
+            assert_eq!(parsed.priority, priority, "{source}");
+        }
+        assert!(!attribute("attribute [instance] d").is_default);
+        assert_eq!(
+            attribute("attribute [default_instance 7] A.«b.c» «default_instance»").declarations,
+            [
+                Name::from_components(["A", "b.c"]),
+                Name::from_components(["default_instance"])
+            ]
+        );
+        for source in [
+            "attribute [local default_instance] d",
+            "attribute [scoped default_instance] d",
+            "attribute [-default_instance] d",
+            "attribute [«default_instance»] d",
+            "attribute [default_instance 4294967296] d",
+            "attribute [default_instance -1] d",
+            "attribute [default_instance 0xff] d",
+            "attribute [default_instance 1_000] d",
+            "attribute [default_instance (7] d",
+            "attribute [default_instance ()] d",
+            "attribute [default_instance high + 1] d",
+            "attribute [default_instance, simp] d",
+            "attribute [default_instance]",
+        ] {
+            assert!(parse_command(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn malformed_and_unsupported_effects_never_disappear() {
         for source in [
             "attribute [instance]",
@@ -140,7 +223,6 @@ mod tests {
             "attribute [instance] d in",
             "attribute [instance] d := 0",
             "attribute [instance] d [simp]",
-            "attribute [local instance] d",
             "attribute [scoped instance]",
             "attribute [scoped instance 4294967296] d",
             "attribute [scoped instance, simp] d",
@@ -150,6 +232,16 @@ mod tests {
         ] {
             assert!(parse_command(source.as_bytes()).is_err(), "{source}");
         }
+    }
+
+    /// `local` (`attrKind`) is read beside `scoped`; `scoped local` is no kind.
+    #[test]
+    fn a_local_instance_attribute_is_read() {
+        let local = attribute("attribute [local instance 2000] d e");
+        assert!(local.local && !local.scoped);
+        assert_eq!(local.priority, 2000);
+        assert_eq!(local.declarations.len(), 2);
+        assert!(!attribute("attribute [instance] d").local);
     }
 
     #[test]

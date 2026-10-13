@@ -9,7 +9,11 @@ use crate::*;
 use fln_elab::instances::{self, InstanceRegistryError};
 use fln_olean::region::{OleanView, OpaqueExtensionBlock};
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[path = "imported/implemented_by.rs"]
+mod implemented_by;
+#[path = "imported/structures.rs"]
+mod structures;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {
@@ -25,6 +29,12 @@ pub struct SourceOleanImportLimits {
     /// same at every count ([`Engine::check_olean_modules_scheduled`]); only its
     /// wall time depends on it.
     pub jobs: OleanFrontierJobs,
+    /// How many threads run the import's work that is not a council: decoding
+    /// the closure and measuring its declarations when a `reuse-verified` record
+    /// is re-proved, and capturing each module's extension payloads. Each piece
+    /// reads only bytes the caller supplied, and the import is the same at every
+    /// count, so a caller may allow more here than council workers.
+    pub read_jobs: OleanFrontierJobs,
 }
 impl SourceOleanImportLimits {
     /// Capture may use as many bytes as the caller allows the artifacts
@@ -36,17 +46,12 @@ impl SourceOleanImportLimits {
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
-            // The pinned Init closure uses 96,786 discrimination and parameter
-            // cells when simp metadata is selected. Allow 131,072 cells; byte,
-            // object, entry and instance-key ceilings remain independent.
-            metadata: DecodeLimits {
-                max_indices: 1 << 17,
-                ..DecodeLimits::default()
-            },
+            metadata: DecodeLimits::default(),
             capture: OleanWalkBudget::default(),
             max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
             jobs: OleanFrontierJobs::SERIAL,
+            read_jobs: OleanFrontierJobs::SERIAL,
         }
     }
 }
@@ -63,17 +68,25 @@ pub struct SourceMetadataReport {
     /// `protected` declarations (the pin's `protectedExt`), activated so that an
     /// atomic identifier does not resolve to one.
     pub protected: usize,
+    /// Internal auxiliary-recursion tags (the pin's `auxRecExt`), activated
+    /// only for this module's own admitted definitions.
+    pub aux_recursors: usize,
+    /// Original structure fields and direct-parent metadata, validated against
+    /// this module's checked constructor and projection interfaces.
+    pub structures: usize,
     /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
     /// `instances` transparency instance selection runs at.
     pub reducibility: usize,
-    /// Decoded default simp entries, including forms not yet executable natively.
-    pub simps: usize,
-    /// Global forward post-phase rules installed in the native simp journal.
-    pub activated_simps: usize,
-    /// Entries whose scope, phase, proof form or erasure associations require
-    /// additional consumer support. Such modules also report `simpExtension`
-    /// in `uninterpreted`; decoding alone does not imply semantic support.
-    pub deferred_simps: usize,
+    /// Explicit native-call intentions (the pin's `Lean.externAttr`), retained
+    /// only for this module's own admitted declarations.
+    pub externs: usize,
+    /// Compatible executable replacements, bound to this module's own checked
+    /// declarations and to targets in its actual import closure.
+    pub implemented_by: usize,
+    /// Ordered initialization entries retained for executable-body classification.
+    /// No initialization action is executed by importing metadata.
+    pub regular_initializers: usize,
+    pub builtin_initializers: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -295,9 +308,17 @@ impl Engine {
             metadata::ALIAS_EXTENSION,
             metadata::PROTECTED_EXTENSION,
             metadata::REDUCIBILITY_EXTENSION,
-            metadata::SIMP_EXTENSION,
+            metadata::EXTERN_EXTENSION,
+            metadata::IMPLEMENTED_BY_EXTENSION,
+            metadata::AUX_RECURSOR_EXTENSION,
+            fln_olean::initializers::REGULAR_INIT_EXTENSION,
+            fln_olean::initializers::BUILTIN_INIT_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
+        let selected: Vec<_> = selected
+            .into_iter()
+            .chain([metadata::structure_extension_name()])
+            .collect();
         let mut blocks: Vec<_> = selected
             .iter()
             .map(|name| OpaqueExtensionBlock {
@@ -308,35 +329,17 @@ impl Engine {
         let mut reports = Vec::new();
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
+        // Each module's capture reads only its own parts, so the walks run
+        // `limits.read_jobs` at once; the cumulative byte allowance is charged below
+        // in replay order, exactly as when one walk followed another.
+        cancelled!("source-olean/capture");
+        let mut captures = capture_modules(&checked, &order, &inputs, &limits).into_iter();
         for &index in &order {
             cancelled!("source-olean/capture");
             let module = &checked.modules[index];
-            let input = inputs
-                .get(&module.name)
-                .ok_or(SourceOleanImportError::Internal(
-                    "checked module lost its artifact",
-                ))?;
-            let view = if module.decoded.module.is_module {
-                let (Some(server), Some(private)) = (input.server_artifact, input.private_artifact)
-                else {
-                    return Err(SourceOleanImportError::Internal(
-                        "checked module lost its companions",
-                    ));
-                };
-                OleanView::parse_with_dependencies(private, &[input.artifact, server])
-            } else {
-                OleanView::parse(input.artifact)
-            }
-            .map_err(|error| SourceOleanImportError::Capture {
-                module: module.name.clone(),
-                error,
-            })?;
-            let captured = view
-                .extension_payloads(limits.capture, capture_left)
-                .map_err(|error| SourceOleanImportError::Capture {
-                    module: module.name.clone(),
-                    error,
-                })?;
+            let captured = captures.next().ok_or(SourceOleanImportError::Internal(
+                "a replayed module has no capture",
+            ))??;
             let mut report = SourceMetadataReport {
                 module: module.name.clone(),
                 classes: 0,
@@ -345,10 +348,13 @@ impl Engine {
                 scoped_instances: 0,
                 aliases: 0,
                 protected: 0,
+                aux_recursors: 0,
+                structures: 0,
                 reducibility: 0,
-                simps: 0,
-                activated_simps: 0,
-                deferred_simps: 0,
+                externs: 0,
+                implemented_by: 0,
+                regular_initializers: 0,
+                builtin_initializers: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -376,7 +382,17 @@ impl Engine {
                         3 => report.aliases = block.entries.len(),
                         4 => report.protected = block.entries.len(),
                         5 => report.reducibility = block.entries.len(),
-                        _ => report.simps = block.entries.len(),
+                        6 => report.externs = block.entries.len(),
+                        7 => report.implemented_by = block.entries.len(),
+                        8 => report.aux_recursors = block.entries.len(),
+                        9 => report.regular_initializers = block.entries.len(),
+                        10 => report.builtin_initializers = block.entries.len(),
+                        11 => report.structures = block.entries.len(),
+                        _ => {
+                            return Err(SourceOleanImportError::Internal(
+                                "unknown selected metadata kind",
+                            ));
+                        }
                     }
                     // Move payloads, not copies. Decoding once gives all modules
                     // one cumulative byte/object/index allowance.
@@ -390,21 +406,56 @@ impl Engine {
         cancelled!("source-olean/before-metadata-decode");
         let decoded =
             metadata::decode(&blocks, limits.metadata).map_err(SourceOleanImportError::Decode)?;
+        let mut implementation_scopes = implemented_by::Scopes::new(
+            &checked,
+            &decoded.implemented_by,
+            limits.metadata.max_objects,
+        )?;
+        let mut structure_scopes =
+            structures::Scopes::new(&checked, &decoded.structures, limits.metadata.max_objects)?;
+        let mut structure_rows = decoded.structures.into_iter();
         let mut classes = decoded.classes.into_iter();
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
         let mut aliases = decoded.aliases.into_iter();
         let mut protected = decoded.protected.into_iter();
+        let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
-        let mut simps = decoded.simps.into_iter();
+        let mut externs = decoded.externs.into_iter();
+        let mut implementations = decoded.implemented_by.into_iter();
+        let mut regular_initializers = decoded.initializers.regular.into_iter();
+        let mut builtin_initializers = decoded.initializers.builtin.into_iter();
         let mut engine = checked.engine.clone();
+        let mut executable_opaques = (*engine.executable_opaques).clone();
+        let mut runtime_initializers = (*engine.runtime_initializers).clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
         // One activation for the whole closure: the registries are read once and
         // kept current, rather than re-read and re-validated before every row.
         let mut activation = R::new(engine.environment.clone());
-        for report in &mut reports {
+        for (&index, report) in order.iter().zip(&mut reports) {
             let before = activation.environment().clone();
+            if report.structures != 0 {
+                cancelled!("source-olean/structure");
+                let rows = match structures::module(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    report.structures,
+                    &mut structure_rows,
+                    &mut structure_scopes,
+                    &limits,
+                    cancellation,
+                )? {
+                    Outcome::Complete(rows) => rows,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                activation = activation.register_structures(&rows).map_err(|problem| {
+                    structures::error(&report.module, &report.module, problem)
+                })?;
+            }
             for _ in 0..report.classes {
                 cancelled!("source-olean/class");
                 let row = classes.next().ok_or(SourceOleanImportError::Internal(
@@ -540,6 +591,28 @@ impl Engine {
                     reason,
                 }
             })?;
+            if report.aux_recursors != 0 {
+                cancelled!("source-olean/auxiliary-recursor");
+                let tagged: Vec<Name> = aux_recursors.by_ref().take(report.aux_recursors).collect();
+                if tagged.len() != report.aux_recursors {
+                    return Err(SourceOleanImportError::Internal(
+                        "auxiliary-recursor count changed during decode",
+                    ));
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.aux_recursors,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for declaration in &tagged {
+                    cancelled!("source-olean/auxiliary-recursor-owner");
+                    owners.validate(activation.environment(), &report.module, declaration)?;
+                }
+                activation = activation
+                    .register_aux_recursors(&tagged)
+                    .map_err(|error| auxiliary_error(&report.module, error))?;
+            }
             for _ in 0..report.reducibility {
                 cancelled!("source-olean/reducibility");
                 let row = reducibility.next().ok_or(SourceOleanImportError::Internal(
@@ -564,77 +637,147 @@ impl Engine {
                         },
                     })?;
             }
-            let mut simp_rules = Vec::new();
-            for _ in 0..report.simps {
-                cancelled!("source-olean/simp");
-                let row = simps.next().ok_or(SourceOleanImportError::Internal(
-                    "simp count changed during decode",
-                ))?;
-                if let Some(rule) = native_simp_rule(activation.environment(), &row) {
-                    simp_rules.push((rule.0, Some(rule.1)));
-                    report.activated_simps += 1;
-                } else {
-                    report.deferred_simps += 1;
-                    // Reversed entries erase their forward counterpart in the
-                    // pin. A deferred global row must not leave an earlier rule
-                    // active, even when that rule came from another module.
-                    if row.scope.is_none()
-                        && let metadata::SimpKind::Theorem(theorem) = &row.kind
-                        && activation.environment().contains(&theorem.origin)
-                        && fln_elab::source::scope::components(&theorem.origin).is_ok()
-                    {
-                        simp_rules.push((theorem.origin.clone(), None));
+            if report.externs != 0 {
+                cancelled!("source-olean/extern-owner-index");
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.externs,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.externs {
+                    cancelled!("source-olean/extern");
+                    let row = externs.next().ok_or(SourceOleanImportError::Internal(
+                        "extern count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    activation = activation
+                        .register_extern(
+                            &row.declaration,
+                            row.entries.into_iter().map(extern_entry).collect(),
+                        )
+                        .map_err(|error| extern_error(&report.module, &row.declaration, error))?;
+                }
+            }
+            if report.implemented_by != 0 {
+                cancelled!("source-olean/implemented-by-owner-index");
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.implemented_by,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.implemented_by {
+                    cancelled!("source-olean/implemented-by");
+                    let row = implementations
+                        .next()
+                        .ok_or(SourceOleanImportError::Internal(
+                            "implemented_by count changed during decode",
+                        ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    implementation_scopes.validate(
+                        &checked,
+                        &self.environment,
+                        activation.environment(),
+                        index,
+                        &row,
+                    )?;
+                    activation = activation
+                        .register_implemented_by(&row.declaration, &row.implementation)
+                        .map_err(|error| {
+                            implemented_by::error(&report.module, &row.declaration, error)
+                        })?;
+                }
+            }
+            // Parametric attributes export their complete journal in the private
+            // part (Lean/Attributes.lean, registerParametricAttribute). Capture
+            // required that part for a module-system artifact, so absence here
+            // means no initializer, not a filtered public view. Each entry must
+            // belong to this module; a sibling cannot change another global's
+            // executable interpretation through forged initialization metadata.
+            for (count, rows) in [
+                (report.regular_initializers, &mut regular_initializers),
+                (report.builtin_initializers, &mut builtin_initializers),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    count,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..count {
+                    cancelled!("source-olean/initializer");
+                    let row = rows.next().ok_or(SourceOleanImportError::Internal(
+                        "initializer count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    validate_initializer(activation.environment(), &report.module, &row)?;
+                    if row.initializer.is_some() {
+                        runtime_initializers.insert(row.declaration);
                     }
                 }
             }
-            if report.deferred_simps != 0 {
-                report.uninterpreted.push(selected[6].clone());
-            }
-            activation = activation.register_simps(&simp_rules).map_err(|error| {
-                use fln_elab::source::scope::simp::SimpSetError;
-                let (declaration, reason) = match error {
-                    SimpSetError::UnknownDeclaration(name) => {
-                        (name, "a simp rule names no admitted declaration")
-                    }
-                    SimpSetError::UnsupportedDeclaration(name) => {
-                        (name, "a simp rule has no supported checked declaration")
-                    }
-                    SimpSetError::Limit => {
-                        return SourceOleanImportError::Limit("native simp journal");
-                    }
-                    SimpSetError::Malformed => {
-                        (report.module.clone(), "malformed native simp journal")
-                    }
-                };
-                SourceOleanImportError::Metadata {
-                    module: report.module.clone(),
-                    declaration,
-                    reason,
+            for constant in &checked.modules[index].decoded.constants {
+                cancelled!("source-olean/opaque-value");
+                if let ConstantInfo::Opaque(opaque) = constant
+                    && !opaque.is_unsafe
+                    && !runtime_initializers.contains(&opaque.base.name)
+                    && activation.environment().find(&opaque.base.name) == Some(constant)
+                {
+                    executable_opaques.insert(opaque.base.name.clone());
                 }
-            })?;
+            }
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
             );
         }
-        engine.environment = activation.finish().map_err(|_| {
-            SourceOleanImportError::Internal(
-                "the activated registries disagree with their kept state",
-            )
+        engine.environment = activation.finish().map_err(|problem| {
+            if problem == InstanceRegistryError::Limit {
+                SourceOleanImportError::Limit("activated registry readback")
+            } else {
+                SourceOleanImportError::Internal(
+                    "the activated registries disagree with their kept state",
+                )
+            }
         })?;
-        if classes.next().is_some()
+        // Validate the complete graph once. A later registration can introduce
+        // a cycle through an earlier module; no partial activation escapes it.
+        implemented_by::validate_journal(&engine.environment)?;
+        fln_elab::aux_recursors::AuxRecursors::read(&engine.environment)
+            .map_err(|error| auxiliary_error(&roots.first().cloned().unwrap_or_default(), error))?;
+        fln_elab::records::imported::ImportedStructures::read(&engine.environment).map_err(
+            |problem| {
+                structures::error(
+                    &roots.first().cloned().unwrap_or_default(),
+                    &roots.first().cloned().unwrap_or_default(),
+                    problem,
+                )
+            },
+        )?;
+        if structure_rows.next().is_some()
+            || classes.next().is_some()
             || instances.next().is_some()
             || defaults.next().is_some()
             || aliases.next().is_some()
             || protected.next().is_some()
+            || aux_recursors.next().is_some()
             || reducibility.next().is_some()
-            || simps.next().is_some()
+            || externs.next().is_some()
+            || implementations.next().is_some()
+            || regular_initializers.next().is_some()
+            || builtin_initializers.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
             ));
         }
         cancelled!("source-olean/before-publication");
+        engine.executable_opaques = std::sync::Arc::new(executable_opaques);
+        engine.runtime_initializers = std::sync::Arc::new(runtime_initializers);
         // Adding metadata changes the logical root, but not the declarations
         // represented by the retained independent-checker projection.
         if bound {
@@ -653,57 +796,68 @@ impl Engine {
     }
 }
 
-/// The source journal selects declarations, not arbitrary stored proof terms.
-/// Admit only forms it can represent without changing the proof's meaning or
-/// its erasure identity. Unsupported metadata remains reported on the module.
-fn native_simp_rule(env: &Environment, row: &metadata::SimpEntry) -> Option<(Name, u32)> {
-    use fln_env::constants::{ConstantInfo, DefinitionSafety};
-    if row.scope.is_some() {
-        return None;
-    }
-    let (name, priority) = match &row.kind {
-        metadata::SimpKind::Theorem(theorem)
-            if theorem.post && !theorem.permutation && !theorem.origin_reverse =>
-        {
-            let ConstantInfo::Thm(info) = env.find(&theorem.origin)? else {
-                return None;
+/// Every module's extension payloads, in replay `order`, `limits.read_jobs` modules
+/// at once. Each walk may use the whole capture allowance; the caller charges the
+/// cumulative allowance in order, so a closure over it is still refused.
+fn capture_modules(
+    checked: &CheckedOleanSet,
+    order: &[usize],
+    inputs: &BTreeMap<&Name, &OleanModuleInput<'_>>,
+    limits: &SourceOleanImportLimits,
+) -> Vec<Result<Vec<OpaqueExtensionBlock>>> {
+    let capture = |index: usize| -> Result<Vec<OpaqueExtensionBlock>> {
+        let module = &checked.modules[index];
+        let input = inputs
+            .get(&module.name)
+            .ok_or(SourceOleanImportError::Internal(
+                "checked module lost its artifact",
+            ))?;
+        let view = if module.decoded.module.is_module {
+            let (Some(server), Some(private)) = (input.server_artifact, input.private_artifact)
+            else {
+                return Err(SourceOleanImportError::Internal(
+                    "checked module lost its companions",
+                ));
             };
-            // mkSimpTheoremFromConst stores a bare constant even when its
-            // declaration is polymorphic. getValue freshens those universes;
-            // the native consumer's `constant` does the same.
-            let compact = theorem.level_params.is_empty()
-                && theorem.proof == Expr::const_(theorem.origin.clone(), vec![]);
-            let expanded = info.base.level_params.len() == theorem.level_params.len()
-                && theorem.proof
-                    == Expr::const_(
-                        theorem.origin.clone(),
-                        theorem
-                            .level_params
-                            .iter()
-                            .cloned()
-                            .map(Level::param)
-                            .collect(),
-                    );
-            if !compact && !expanded {
-                return None;
-            }
-            (&theorem.origin, theorem.priority)
+            OleanView::parse_with_dependencies(private, &[input.artifact, server])
+        } else {
+            OleanView::parse(input.artifact)
         }
-        metadata::SimpKind::Unfold(name) => {
-            let ConstantInfo::Defn(info) = env.find(name)? else {
-                return None;
-            };
-            if info.safety != DefinitionSafety::Safe {
-                return None;
-            }
-            (name, 1000)
-        }
-        _ => return None,
+        .map_err(|error| SourceOleanImportError::Capture {
+            module: module.name.clone(),
+            error,
+        })?;
+        view.extension_payloads(limits.capture, limits.max_capture_bytes)
+            .map_err(|error| SourceOleanImportError::Capture {
+                module: module.name.clone(),
+                error,
+            })
     };
-    // The source journal uses structural string components. Never flatten
-    // numeric/internal names into strings and accidentally select another name.
-    fln_elab::source::scope::components(name).ok()?;
-    Some((name.clone(), priority))
+    let threads = limits.read_jobs.threads.get().min(order.len());
+    if threads <= 1 {
+        return order.iter().map(|&index| capture(index)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::OnceLock<Result<Vec<OpaqueExtensionBlock>>>> =
+        order.iter().map(|_| std::sync::OnceLock::new()).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (Some(slot), Some(&index)) = (slots.get(at), order.get(at)) else {
+                        return;
+                    };
+                    let _ = slot.set(capture(index));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .zip(order)
+        .map(|(slot, &index)| slot.into_inner().unwrap_or_else(|| capture(index)))
+        .collect()
 }
 
 /// Who makes a closure's metadata registrations. Production makes them through one
@@ -736,15 +890,29 @@ trait Registrar: Sized {
         self,
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError>;
+    fn register_aux_recursors(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError>;
     fn register_reducibility(
         self,
         declaration: &Name,
         status: fln_elab::reducibility::Reducibility,
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
-    fn register_simps(
+    fn register_extern(
         self,
-        declarations: &[(Name, Option<u32>)],
-    ) -> std::result::Result<Self, fln_elab::source::scope::simp::SimpSetError>;
+        declaration: &Name,
+        entries: Vec<fln_elab::externs::ExternEntry>,
+    ) -> std::result::Result<Self, fln_elab::externs::ExternError>;
+    fn register_implemented_by(
+        self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError>;
+    fn register_structures(
+        self,
+        rows: &[fln_elab::records::imported::StructureEntry],
+    ) -> std::result::Result<Self, fln_elab::records::RecordError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -789,6 +957,12 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
         self.register_protected(declarations)
     }
+    fn register_aux_recursors(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
+        self.register_aux_recursors(declarations)
+    }
     fn register_reducibility(
         self,
         declaration: &Name,
@@ -796,14 +970,28 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
         self.register_reducibility(declaration, status)
     }
+    fn register_extern(
+        self,
+        declaration: &Name,
+        entries: Vec<fln_elab::externs::ExternEntry>,
+    ) -> std::result::Result<Self, fln_elab::externs::ExternError> {
+        self.register_extern(declaration, entries)
+    }
+    fn register_implemented_by(
+        self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
+        self.register_implemented_by(declaration, implementation)
+    }
+    fn register_structures(
+        self,
+        rows: &[fln_elab::records::imported::StructureEntry],
+    ) -> std::result::Result<Self, fln_elab::records::RecordError> {
+        self.register_structures(rows)
+    }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
-    }
-    fn register_simps(
-        self,
-        declarations: &[(Name, Option<u32>)],
-    ) -> std::result::Result<Self, fln_elab::source::scope::simp::SimpSetError> {
-        self.register_simps(declarations)
     }
 }
 
@@ -832,6 +1020,176 @@ fn reducibility_status(
         metadata::ReducibilityStatus::Semireducible => Reducibility::Semireducible,
         metadata::ReducibilityStatus::Irreducible => Reducibility::Irreducible,
         metadata::ReducibilityStatus::ImplicitReducible => Reducibility::ImplicitReducible,
+    }
+}
+
+/// Parametric attributes cannot be applied to an imported declaration at the pin.
+/// Retain the exact checked owner, rather than accepting any ambient name that
+/// happens to have the expected spelling. Both allocations are bounded before
+/// construction; the index exists only for a module with selected attribute rows.
+struct AttributeOwners<'a> {
+    declarations: Vec<&'a ConstantInfo>,
+    seen: HashSet<Name>,
+}
+
+impl<'a> AttributeOwners<'a> {
+    fn new(
+        constants: &'a [ConstantInfo],
+        rows: usize,
+        max_declarations: usize,
+        max_entries: usize,
+    ) -> Result<Self> {
+        if constants.len() > max_declarations {
+            return Err(SourceOleanImportError::Limit(
+                "attribute declaration ownership index",
+            ));
+        }
+        if rows > max_entries {
+            return Err(SourceOleanImportError::Limit("attribute ownership rows"));
+        }
+        let mut declarations = Vec::new();
+        declarations
+            .try_reserve_exact(constants.len())
+            .map_err(|_| {
+                SourceOleanImportError::Limit("attribute declaration ownership allocation")
+            })?;
+        declarations.extend(constants.iter());
+        declarations.sort_unstable_by(|left, right| {
+            left.constant_val().name.cmp(&right.constant_val().name)
+        });
+        if declarations
+            .windows(2)
+            .any(|pair| pair[0].constant_val().name == pair[1].constant_val().name)
+        {
+            return Err(SourceOleanImportError::Internal(
+                "checked module repeats an attribute owner declaration",
+            ));
+        }
+        let mut seen = HashSet::new();
+        seen.try_reserve(rows)
+            .map_err(|_| SourceOleanImportError::Limit("attribute ownership allocation"))?;
+        Ok(Self { declarations, seen })
+    }
+
+    fn validate(&mut self, env: &Environment, module: &Name, declaration: &Name) -> Result<()> {
+        let error = |reason| SourceOleanImportError::Metadata {
+            module: module.clone(),
+            declaration: declaration.clone(),
+            reason,
+        };
+        let position = self
+            .declarations
+            .binary_search_by(|info| info.constant_val().name.cmp(declaration))
+            .map_err(|_| {
+                error("an attribute does not belong to this module's checked declarations")
+            })?;
+        if env.find(declaration) != Some(self.declarations[position]) {
+            return Err(error(
+                "an attribute owner differs from its active admitted declaration",
+            ));
+        }
+        if !self.seen.insert(declaration.clone()) {
+            return Err(error("duplicate attribute for one module declaration"));
+        }
+        Ok(())
+    }
+}
+
+/// Match the pin's exact `IO T` / `IO Unit` attribute contract without reducing
+/// any body or running an action (Lean/Compiler/InitAttr.lean, getParam).
+fn validate_initializer(
+    env: &Environment,
+    module: &Name,
+    row: &fln_olean::initializers::InitEntry,
+) -> Result<()> {
+    fn io_argument(type_: &Expr) -> Option<&Expr> {
+        if let ExprNode::App { f, a } = type_.node()
+            && let ExprNode::Const { name, .. } = f.node()
+            && *name == Name::from_components(["IO"])
+        {
+            Some(a)
+        } else {
+            None
+        }
+    }
+    let error = |reason| SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration: row.declaration.clone(),
+        reason,
+    };
+    let owner = env
+        .find(&row.declaration)
+        .ok_or_else(|| error("an initialized declaration is not admitted"))?;
+    if let Some(initializer) = &row.initializer {
+        let action = env.find(initializer).ok_or_else(|| {
+            error("an initializer names no admitted declaration")
+        })?;
+        if io_argument(&action.constant_val().type_) != Some(&owner.constant_val().type_) {
+            return Err(error("an initializer must have type IO of its declaration's exact type"));
+        }
+    } else if !io_argument(&owner.constant_val().type_).is_some_and(|type_| {
+        matches!(type_.node(), ExprNode::Const { name, .. } if *name == Name::from_components(["Unit"]))
+    }) {
+        return Err(error("an anonymous initialization action must have type IO Unit"));
+    }
+    Ok(())
+}
+
+fn extern_entry(entry: metadata::ExternEntry) -> fln_elab::externs::ExternEntry {
+    use fln_elab::externs::ExternEntry;
+    match entry {
+        metadata::ExternEntry::Adhoc { backend } => ExternEntry::Adhoc { backend },
+        metadata::ExternEntry::Inline { backend, pattern } => {
+            ExternEntry::Inline { backend, pattern }
+        }
+        metadata::ExternEntry::Standard { backend, symbol } => {
+            ExternEntry::Standard { backend, symbol }
+        }
+        metadata::ExternEntry::Opaque => ExternEntry::Opaque,
+    }
+}
+
+fn extern_error(
+    module: &Name,
+    declaration: &Name,
+    error: fln_elab::externs::ExternError,
+) -> SourceOleanImportError {
+    use fln_elab::externs::ExternError;
+    let reason = match error {
+        ExternError::Limit => return SourceOleanImportError::Limit("extern attribute journal"),
+        ExternError::UnknownDeclaration(_) => "an extern attribute names no admitted declaration",
+        ExternError::Malformed => "malformed extern attribute journal",
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration: declaration.clone(),
+        reason,
+    }
+}
+
+fn auxiliary_error(
+    module: &Name,
+    error: fln_elab::aux_recursors::AuxRecursorError,
+) -> SourceOleanImportError {
+    use fln_elab::aux_recursors::AuxRecursorError;
+    let (declaration, reason) = match error {
+        AuxRecursorError::Limit => {
+            return SourceOleanImportError::Limit("auxiliary-recursor journal");
+        }
+        AuxRecursorError::UnknownDeclaration(name) => {
+            (name, "an auxiliary tag names no admitted declaration")
+        }
+        AuxRecursorError::NotDefinition(name) => (name, "an auxiliary tag names a non-definition"),
+        AuxRecursorError::Duplicate(name) => (
+            name,
+            "a definition is tagged as an auxiliary recursor twice",
+        ),
+        AuxRecursorError::Malformed => (module.clone(), "malformed auxiliary-recursor journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
+        reason,
     }
 }
 
@@ -911,6 +1269,10 @@ fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>>
 }
 
 #[cfg(test)]
+#[path = "imported/extern_tests.rs"]
+mod extern_tests;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use std::num::NonZeroUsize;
@@ -926,13 +1288,12 @@ pub(super) mod tests {
         let lib = std::env::var_os("FLN_REFERENCE_LIB")
             .map(std::path::PathBuf::from)
             .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .map(|home| {
-                        home.join(".elan/toolchains")
-                            .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
-                            .join("lib/lean")
-                    })
+                std::env::var_os("HOME").map(|home| {
+                    std::path::PathBuf::from(home)
+                        .join(".elan/toolchains")
+                        .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
+                        .join("lib/lean")
+                })
             })
             .filter(|lib| lib.join("Init/Prelude.olean").is_file());
         assert!(
@@ -982,11 +1343,13 @@ pub(super) mod tests {
     }
 
     pub(in crate::source_check::modules) fn limits(threads: usize) -> SourceOleanImportLimits {
+        let jobs = OleanFrontierJobs {
+            threads: NonZeroUsize::new(threads).expect("a positive thread count"),
+            worker_stack_bytes: STACK,
+        };
         SourceOleanImportLimits {
-            jobs: OleanFrontierJobs {
-                threads: NonZeroUsize::new(threads).expect("a positive thread count"),
-                worker_stack_bytes: STACK,
-            },
+            jobs,
+            read_jobs: jobs,
             ..SourceOleanImportLimits::new(OleanCheckLimits::new(
                 1 << 30,
                 Budget::for_stack_bytes(STACK),
@@ -1005,269 +1368,6 @@ pub(super) mod tests {
             &KVMap::new(),
             limits,
         )
-    }
-
-    #[test]
-    fn pinned_init_metadata_fits_the_source_import_budget() {
-        let Some(lib) = pinned_lib() else {
-            eprintln!("SKIP: pinned Reference lib/lean absent");
-            return;
-        };
-        let closure = closure(&lib, &["Init"]);
-        on_import_stack(|| {
-            let limits = limits(4);
-            let selected: BTreeSet<_> = [
-                metadata::CLASS_EXTENSION,
-                metadata::INSTANCE_EXTENSION,
-                metadata::DEFAULT_EXTENSION,
-                metadata::SIMP_EXTENSION,
-                metadata::ALIAS_EXTENSION,
-                metadata::PROTECTED_EXTENSION,
-                metadata::REDUCIBILITY_EXTENSION,
-            ]
-            .into_iter()
-            .map(n)
-            .collect();
-            let mut grouped = BTreeMap::<Name, Vec<Vec<u8>>>::new();
-            let mut bytes_left = limits.max_capture_bytes;
-            for (_, [exported, server, private]) in &closure {
-                let view = if private.is_empty() {
-                    OleanView::parse(exported)
-                } else {
-                    OleanView::parse_with_dependencies(private, &[exported, server])
-                }
-                .unwrap();
-                for block in view.extension_payloads(limits.capture, bytes_left).unwrap() {
-                    for payload in &block.entries {
-                        bytes_left = bytes_left.checked_sub(payload.len()).unwrap();
-                    }
-                    if selected.contains(&block.name) {
-                        grouped.entry(block.name).or_default().extend(block.entries);
-                    }
-                }
-            }
-            let blocks: Vec<_> = grouped
-                .into_iter()
-                .map(|(name, entries)| OpaqueExtensionBlock { name, entries })
-                .collect();
-            let decoded = metadata::decode(&blocks, limits.metadata).unwrap();
-            assert_eq!(decoded.simps.len(), 10_335);
-            let cells = decoded
-                .classes
-                .iter()
-                .map(|row| row.out_params.len() + row.out_level_params.len())
-                .sum::<usize>()
-                + decoded
-                    .instances
-                    .iter()
-                    .map(|row| row.synth_order.len())
-                    .sum::<usize>()
-                + decoded
-                    .simps
-                    .iter()
-                    .map(|row| match &row.kind {
-                        metadata::SimpKind::Theorem(theorem) => {
-                            theorem.level_params.len() + theorem.key_count
-                        }
-                        metadata::SimpKind::Unfold(_) => 0,
-                        metadata::SimpKind::UnfoldTheorems { theorems, .. } => theorems.len(),
-                    })
-                    .sum::<usize>();
-            eprintln!("Init source metadata index cells: {cells}");
-            assert!(cells > DecodeLimits::default().max_indices);
-            let exact = DecodeLimits {
-                max_indices: cells,
-                ..limits.metadata
-            };
-            assert!(metadata::decode(&blocks, exact).is_ok());
-            assert!(matches!(
-                metadata::decode(
-                    &blocks,
-                    DecodeLimits {
-                        max_indices: cells - 1,
-                        ..exact
-                    }
-                ),
-                Err(metadata::DecodeError::Limit {
-                    resource: "index cells"
-                })
-            ));
-        });
-    }
-
-    #[test]
-    fn pinned_init_defaults_close_reported_goals() {
-        let Some(lib) = pinned_lib() else {
-            eprintln!("SKIP: pinned Reference lib/lean absent");
-            return;
-        };
-        let closure = closure(&lib, &["Init"]);
-        let inputs = inputs(&closure);
-        on_import_stack(|| {
-            let receipt = import(&inputs, &[n("Init")], limits(4))
-                .expect("the pinned Init closure imports")
-                .into_complete()
-                .expect("Init import completes");
-            let totals = receipt.modules.iter().fold((0, 0, 0), |sum, report| {
-                (
-                    sum.0 + report.simps,
-                    sum.1 + report.activated_simps,
-                    sum.2 + report.deferred_simps,
-                )
-            });
-            eprintln!(
-                "Init simp rows: decoded={}, activated={}, deferred={}",
-                totals.0, totals.1, totals.2
-            );
-            let main = n("Main");
-            let source = b"import Init\n\
-                theorem imported_append (xs : List Nat) : (xs ++ []).length = xs.length := by simp\n\
-                theorem imported_add (n : Nat) : n + 0 = n := by simp\n";
-            let checked = receipt
-                .check_source_modules(
-                    &[SourceModuleInput {
-                        name: &main,
-                        source,
-                    }],
-                    &main,
-                    &KVMap::new(),
-                    super::super::SourceModuleCheckLimits::new(SourceCheckLimits::new(
-                        EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
-                    )),
-                    None,
-                )
-                .expect("the two reported imported-default goals elaborate")
-                .into_complete()
-                .expect("both goals pass the council");
-            assert_eq!(checked.checked.theorems, 2);
-        });
-    }
-
-    #[test]
-    fn pinned_prelude_defaults_reach_simp_but_not_simp_only() {
-        let root = n("Init.Prelude");
-        let input = OleanModuleInput {
-            name: &root,
-            artifact: include_bytes!(
-                "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean"
-            ),
-            server_artifact: Some(include_bytes!(
-                "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
-            )),
-            private_artifact: Some(include_bytes!(
-                "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
-            )),
-        };
-        on_import_stack(|| {
-            let receipt = import(&[input], std::slice::from_ref(&root), limits(1))
-                .expect("the checked-in pinned Prelude imports")
-                .into_complete()
-                .expect("Prelude import completes");
-            let base_root = receipt.engine.logical_root(&KVMap::new());
-            assert_eq!(receipt.modules.len(), 1);
-            assert_eq!(
-                (
-                    receipt.modules[0].simps,
-                    receipt.modules[0].activated_simps,
-                    receipt.modules[0].deferred_simps
-                ),
-                (3, 3, 0)
-            );
-            let check = |body: &str| {
-                let main = n("Main");
-                let source = format!("prelude\nimport Init.Prelude\n{body}\n");
-                receipt.check_source_modules(
-                    &[SourceModuleInput {
-                        name: &main,
-                        source: source.as_bytes(),
-                    }],
-                    &main,
-                    &KVMap::new(),
-                    super::super::SourceModuleCheckLimits::new(SourceCheckLimits::new(
-                        EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
-                    )),
-                    None,
-                )
-            };
-            for body in [
-                "theorem imported_default (n : Nat) : id n = n := by simp",
-                "theorem explicit_default (n : Nat) : id n = n := by simp only [id_eq]",
-            ] {
-                match check(body) {
-                    Ok(Outcome::Complete(_)) => {}
-                    Err(error) => panic!("{body}: {error}"),
-                    Ok(_) => panic!("{body}: source checking did not complete"),
-                }
-            }
-            for (body, expected) in [
-                (
-                    "theorem no_default (n : Nat) : id n = n := by simp only",
-                    "made no progress",
-                ),
-                (
-                    "theorem excluded (n : Nat) : id n = n := by simp [-id_eq]",
-                    "made no progress",
-                ),
-                (
-                    "attribute [-simp] id_eq\ntheorem erased (n : Nat) : id n = n := by simp",
-                    "made no progress",
-                ),
-                (
-                    "theorem false_goal : (0 : Nat) = 1 := by simp",
-                    "unsolved goals",
-                ),
-            ] {
-                let Err(super::super::SourceModuleCheckError::Source { error, .. }) = check(body)
-                else {
-                    panic!("expected a source refusal, not an import failure or nonanswer: {body}");
-                };
-                assert!(error.to_string().contains(expected), "{body}: {error}");
-                assert_eq!(receipt.engine.logical_root(&KVMap::new()), base_root);
-            }
-            // An external module can have an apparently redundant erasure when
-            // first captured, then follow a source module that enables the rule.
-            // Exercise the same suffix capture/replay used by ImportContexts.
-            use fln_elab::source::scope::simp;
-            let options = KVMap::new();
-            let source_limits =
-                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
-            let source_prefix = receipt
-                .checked
-                .engine
-                .check_source_files(&[b"attribute [simp] id_eq"], &options, source_limits)
-                .unwrap()
-                .into_complete()
-                .unwrap()
-                .engine;
-            assert!(
-                simp::read(source_prefix.environment())
-                    .unwrap()
-                    .iter()
-                    .any(|row| row.declaration == n("id_eq"))
-            );
-            let before = receipt.checked.engine.environment();
-            let after = simp::register_module(before, &[(n("id_eq"), None)]).unwrap();
-            let module = n("External");
-            let mut meter = super::super::Meter {
-                work: 0,
-                bytes: 0,
-                limits: super::super::SourceModuleCheckLimits::new(source_limits),
-            };
-            let export =
-                super::super::replay::Export::capture(&module, before, &after, vec![], &mut meter)
-                    .unwrap();
-            let replayed = export
-                .replay(source_prefix, &module, &options, &mut meter, None)
-                .unwrap()
-                .into_complete()
-                .unwrap();
-            assert!(
-                !simp::read(replayed.environment())
-                    .unwrap()
-                    .iter()
-                    .any(|row| row.declaration == n("id_eq"))
-            );
-        });
     }
 
     /// Run on a stack the `.olean` kernel budget is calibrated for, as the
@@ -1363,9 +1463,63 @@ pub(super) mod tests {
         });
     }
 
+    #[test]
+    fn pinned_opaque_identity_runs_after_complete_private_metadata() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let closure = closure(&lib, &["Init.Core"]);
+        let all = inputs(&closure);
+        let roots = [n("Init.Core")];
+        on_import_stack(|| {
+            let imported = import(&all, &roots, limits(1))
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert!(matches!(
+                imported.engine.environment().find(&n("Lean.opaqueId")),
+                Some(ConstantInfo::Opaque(_))
+            ));
+            let run = imported
+                .engine
+                .execute_source_commands_with_checks(
+                    b"#eval Lean.opaqueId 42",
+                    &KVMap::new(),
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let evaluation = run.batch.executions.last().unwrap();
+            assert_eq!(
+                closed_vm_value(&evaluation.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+            let replay =
+                execute_flbc_artifact(&evaluation.flbc_artifact, &KVMap::new(), Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+            // A public journal can omit initialized globals. Missing private
+            // metadata must fail before any opaque's value becomes executable.
+            let mut incomplete = all.clone();
+            let owner = incomplete
+                .iter_mut()
+                .find(|module| module.name == &roots[0])
+                .unwrap();
+            owner.private_artifact = None;
+            assert!(import(&incomplete, &roots, limits(1)).is_err());
+        });
+    }
+
     /// The per-call registration functions, one row at a time: the semantics a
     /// batched [`instances::imported::ImportActivation`] must equal.
-    struct Sequential(Environment);
+    pub(super) struct Sequential(Environment);
     impl Registrar for Sequential {
         fn new(env: Environment) -> Self {
             Sequential(env)
@@ -1407,6 +1561,12 @@ pub(super) mod tests {
         ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
             fln_elab::protected_names::register_module(&self.0, declarations).map(Sequential)
         }
+        fn register_aux_recursors(
+            self,
+            declarations: &[Name],
+        ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
+            fln_elab::aux_recursors::register_module(&self.0, declarations).map(Sequential)
+        }
         fn register_reducibility(
             self,
             declaration: &Name,
@@ -1414,20 +1574,28 @@ pub(super) mod tests {
         ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
             fln_elab::reducibility::register(&self.0, declaration, status).map(Sequential)
         }
+        fn register_extern(
+            self,
+            declaration: &Name,
+            entries: Vec<fln_elab::externs::ExternEntry>,
+        ) -> std::result::Result<Self, fln_elab::externs::ExternError> {
+            fln_elab::externs::register(&self.0, declaration, entries).map(Sequential)
+        }
+        fn register_implemented_by(
+            self,
+            declaration: &Name,
+            implementation: &Name,
+        ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
+            fln_elab::implemented_by::register(&self.0, declaration, implementation).map(Sequential)
+        }
+        fn register_structures(
+            self,
+            rows: &[fln_elab::records::imported::StructureEntry],
+        ) -> std::result::Result<Self, fln_elab::records::RecordError> {
+            fln_elab::records::imported::register(&self.0, rows).map(Sequential)
+        }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)
-        }
-        fn register_simps(
-            mut self,
-            declarations: &[(Name, Option<u32>)],
-        ) -> std::result::Result<Self, fln_elab::source::scope::simp::SimpSetError> {
-            for (name, priority) in declarations {
-                self.0 = fln_elab::source::scope::simp::register_module(
-                    &self.0,
-                    &[(name.clone(), *priority)],
-                )?;
-            }
-            Ok(self)
         }
     }
 
@@ -1549,7 +1717,19 @@ pub(super) mod tests {
                     }),
                 ),
                 (
-                    "a default candidate registered twice",
+                    "a non-instance declaration registered as a default",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("Nat.add");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_default(&declaration, 100)
+                            }),
+                            outcome::<Sequential>(env, |r| r.register_default(&declaration, 100)),
+                        )
+                    }),
+                ),
+                (
+                    "a default candidate registered twice is preserved",
                     Box::new(|env: &Environment| {
                         let declaration = n("instInhabitedNat");
                         (
@@ -1592,7 +1772,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 refused, 3,
-                "three planted rows are refused, the control is not"
+                "three invalid rows are refused; ordinary upserts and repeated defaults succeed"
             );
         });
     }

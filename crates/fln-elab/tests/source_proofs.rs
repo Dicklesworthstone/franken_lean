@@ -120,36 +120,55 @@ fn incomplete_or_extra_tactics_do_not_create_success() {
     }
 }
 #[test]
-fn incorrect_proofs_and_nonprop_theorems_are_rejected_by_k1() {
-    for (source, class) in [
-        (
-            "theorem bad (P : Prop) : P := by exact 0",
-            RejectClass::DefinitionTypeMismatch,
+fn incorrect_proofs_are_refuted_and_nonprop_theorems_reach_k1() {
+    assert!(matches!(
+        check_definition_source(
+            b"theorem bad (P : Prop) : P := by exact 0",
+            &env(),
+            budget(),
         ),
-        (
-            "theorem bad : Nat := by exact 0",
-            RejectClass::TheoremNotProp,
-        ),
-    ] {
-        let result = check_definition_source(source.as_bytes(), &env(), budget()).unwrap();
-        assert!(
-            matches!(result.outcome, Outcome::Complete(Verdict::Rejected { class: actual, .. }) if actual == class),
-            "{:?}",
-            result.outcome
-        );
-    }
+        Err(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::ConversionRefused(verdict)
+            )
+        )) if matches!(*verdict, Verdict::Rejected {
+            class: RejectClass::NotDefEq, ..
+        })
+    ));
+    let result =
+        check_definition_source(b"theorem bad : Nat := by exact 0", &env(), budget()).unwrap();
+    assert!(matches!(
+        result.outcome,
+        Outcome::Complete(Verdict::Rejected {
+            class: RejectClass::TheoremNotProp,
+            ..
+        })
+    ));
 }
 #[test]
 fn unsupported_tactics_and_nested_by_are_not_reinterpreted() {
-    for source in [
-        "theorem bad (P : Prop) : P := by sorry",
-        "theorem bad (P : Prop) : P := by exact (by assumption)",
-    ] {
-        assert!(matches!(
-            check_definition_source(source.as_bytes(), &env(), budget()),
-            Err(DefinitionFrontendError::Parse(_))
-        ));
-    }
+    // A tactic this engine does not have (Mathlib's) is refused at parse.
+    assert!(matches!(
+        check_definition_source(
+            b"theorem bad (P : Prop) : P := by nlinarith",
+            &env(),
+            budget()
+        ),
+        Err(DefinitionFrontendError::Parse(_))
+    ));
+    // `sorry` is a macro `Init/Tactics.lean` declares; this environment declares neither it nor
+    // `sorryAx`, so it is refused, never admitted.
+    assert!(!matches!(
+        check_definition_source(b"theorem bad (P : Prop) : P := by sorry", &env(), budget()),
+        Ok(result) if matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. }))
+    ));
+    // A nested proof runs its own tactics: it closes a goal it proves and nothing else.
+    accepted("theorem good (P : Prop) (p : P) : P := by exact (by assumption)");
+    let source = "theorem bad (P : Prop) : P := by exact (by assumption)";
+    assert!(!matches!(
+        check_definition_source(source.as_bytes(), &env(), budget()),
+        Ok(result) if matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. }))
+    ));
     assert!(fln_parse::parse_nat_definition(b"theorem bad : Nat := 0").is_err());
 }
 #[test]

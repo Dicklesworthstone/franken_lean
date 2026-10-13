@@ -21,6 +21,9 @@ impl Context {
         // The pin's `elabChange` (vendored Tactic/Change.lean:30-48) retries
         // after pending synthesis, and `runTermElab` applies default instances
         // before its final `isDefEq`, so `change 5 = 5` meets `2 + 3 = 5`.
+        // As the pin's `isDefEq`, assign what the written target and the goal determine
+        // (`change 0 + 0 = 0` at `(0 : Int) + 0 = 0` fixes `?α := Int`) before any default.
+        self.show_result_hint(&annotation.value, &goal.target)?;
         if !self.coercion_eq(&annotation.value, &goal.target)? {
             self.resolve_instances_with_defaults()?;
             self.flush(false)?;

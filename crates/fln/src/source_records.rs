@@ -1,6 +1,57 @@
 //! One source command may expand to multiple mutually dependent declarations.
 //! Preserve the ordinary per-declaration evidence and publish only a full batch.
 use super::*;
+use fln_kernel::verdict::Verdict;
+
+mod auxiliaries;
+mod elaboration;
+
+pub(crate) use elaboration::{
+    apply_admission_effects, apply_batch_effects, apply_execution_effects,
+};
+
+/// A candidate publication held off to the side until both module worlds and
+/// their extension journals are ready. Only the public module driver consumes it.
+pub(crate) struct PublicSourceAdmission {
+    pub(crate) public: DeclarationBatchAdmission,
+    pub(crate) private_implementation: Option<DeclarationBatchAdmission>,
+}
+
+/// Classify a closed declaration header without changing its declaration kind
+/// or granting publication authority. Publication of the complete declaration
+/// or its metadata still requires ordinary admission by both checkers.
+pub(super) fn declaration_is_proposition(
+    environment: &Environment,
+    base: &ConstantVal,
+    kernel: Budget,
+) -> Result<Outcome<bool>, EngineExecutionError> {
+    let opaque_definitions = BTreeSet::new();
+    let outcome = fln_kernel::check_type_with_unfolding(
+        environment,
+        &base.level_params,
+        &base.type_,
+        &Expr::sort(Level::zero()),
+        kernel,
+        fln_kernel::DefEqUnfolding {
+            opaque_definitions: &opaque_definitions,
+            unfold_theorems: true,
+        },
+    );
+    match outcome {
+        Outcome::Complete(Verdict::Accepted { .. }) => Ok(Outcome::Complete(true)),
+        Outcome::Complete(Verdict::Rejected {
+            class: RejectClass::NotDefEq,
+            ..
+        }) => Ok(Outcome::Complete(false)),
+        Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        other => Err(EngineExecutionError::Frontend(
+            DefinitionFrontendError::Elaborate(fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::TypeObligation(Box::new(other)),
+            )),
+        )),
+    }
+}
 
 /// Elaboration and admission share the same kernel nonanswer convention.
 /// Preserve the kernel's complete cause; other frontend errors stay
@@ -16,6 +67,11 @@ pub(crate) fn elaboration_outcome<T>(
         Ok(value) => return Ok(Outcome::Complete(value)),
         Err(error) => error,
     };
+    if let NatDefinitionElabError::Inference(SourceInferenceError::ArithmeticInconclusive(reason)) =
+        &error
+    {
+        return Ok(Outcome::Inconclusive((**reason).clone()));
+    }
     let kernel = match &error {
         NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)) => {
             Some(outcome.as_ref())
@@ -107,12 +163,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        self.admit_source_command_in_scope(
-            source,
-            options,
-            limits,
-            &fln_elab::source::scope::SourceScope::default(),
-        )
+        self.admit_source_command_in_scope(source, options, limits, &self.base_source_scope())
     }
 
     pub(crate) fn admit_source_command_in_scope(
@@ -122,7 +173,24 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        let parsed = match parse_scoped_command(source)? {
+        self.admit_parsed_command_in_scope(
+            source,
+            parse_scoped_command(source)?,
+            options,
+            limits,
+            scope,
+        )
+    }
+
+    fn admit_parsed_command_in_scope(
+        &self,
+        source: &[u8],
+        parsed: ScopedCommandSyntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let parsed = match parsed {
             ScopedCommandSyntax::Mutual(members) => {
                 return self.admit_scoped_inductives(&members, options, limits, scope);
             }
@@ -138,6 +206,7 @@ impl Engine {
                                 base_logical_root: root,
                                 result_logical_root: root,
                                 admissions: Vec::new(),
+                                local_instance: None,
                             })
                         }
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -148,6 +217,174 @@ impl Engine {
             ScopedCommandSyntax::Definition(parsed) => parsed,
         };
         self.admit_scoped_definition(source, parsed, options, limits, scope)
+    }
+
+    /// Public proof headers are elaborated in the public predecessor; their
+    /// hidden implementations pass both checkers in the full predecessor before
+    /// a safe signature is proposed to public admission. An explicitly exposed
+    /// proof instance additionally passes both checkers in the public world.
+    /// Every proof instance remains a theorem privately and an axiom publicly;
+    /// the module driver publishes only after metadata can be replayed atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_public_source_command_in_scope(
+        &self,
+        public: &Engine,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        public_scope: &fln_elab::source::scope::SourceScope,
+        private_scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
+        let parsed = match parse_scoped_command(source)? {
+            ScopedCommandSyntax::Definition(parsed)
+                if fln_elab::source::is_theorem(parsed.syntax())
+                    || fln_elab::source::instance_registration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                        .is_some() =>
+            {
+                parsed
+            }
+            parsed => {
+                return Ok(
+                    match public.admit_parsed_command_in_scope(
+                        source,
+                        parsed,
+                        options,
+                        limits,
+                        public_scope,
+                    )? {
+                        Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
+                            public,
+                            private_implementation: None,
+                        }),
+                        Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                    },
+                );
+            }
+        };
+        let worlds = fln_elab::source::TheoremWorlds {
+            public: public.environment(),
+            private: self.environment(),
+            public_scope,
+            private_scope,
+        };
+        let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
+        let candidate = if is_theorem {
+            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel)
+                .map(|declaration| (declaration, true, true))
+        } else {
+            fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
+                .map(|instance| {
+                    (
+                        instance.declaration,
+                        instance.proof_valued,
+                        instance.hidden_body,
+                    )
+                })
+        };
+        let (candidate, proof_valued, hidden_body) = match elaboration_outcome(candidate)? {
+            Outcome::Complete(candidate) => candidate,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        if !proof_valued {
+            if hidden_body
+                || !matches!(&candidate, Declaration::Defn(definition)
+                    if definition.safety == DefinitionSafety::Safe)
+            {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "a public data instance requires its exposed safe definition",
+                });
+            }
+            return Ok(
+                match public.admit_scoped_candidate(
+                    parsed.syntax(),
+                    candidate,
+                    false,
+                    options,
+                    limits,
+                    public_scope,
+                )? {
+                    Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
+                        public,
+                        private_implementation: None,
+                    }),
+                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                },
+            );
+        }
+        if !matches!(&candidate, Declaration::Thm(_)) {
+            return Err(EngineExecutionError::NotImplemented {
+                feature: "a public proof must retain its theorem declaration kind",
+            });
+        }
+        let candidate = if hidden_body {
+            candidate
+        } else {
+            // Expose changes the proof's checking world, not its exported
+            // declaration kind (Lean.AddDecl.addDeclCore). Obtain a real
+            // public council receipt before re-admitting its exact theorem in
+            // the private world. This scratch successor installs no metadata
+            // and cannot escape if either later admission fails.
+            let checked = match public
+                .admit_declarations(&[candidate], options, limits)
+                .map_err(EngineExecutionError::from)?
+            {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            let [admitted] = checked.admissions.as_slice() else {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "an exposed proof instance must admit exactly one public theorem",
+                });
+            };
+            admitted.declaration.clone()
+        };
+        let private_implementation = match self
+            .admit_declarations(&[candidate], options, limits)
+            .map_err(EngineExecutionError::from)?
+        {
+            Outcome::Complete(admitted) => admitted,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // Obtain the interface from the actual successful admission, never
+        // from an independently supplied or caller-authored signature.
+        let [admitted] = private_implementation.admissions.as_slice() else {
+            return Err(EngineExecutionError::NotImplemented {
+                feature: "a public proof must admit exactly one checked implementation",
+            });
+        };
+        let Declaration::Thm(theorem) = &admitted.declaration else {
+            return Err(EngineExecutionError::NotImplemented {
+                feature: "a public proof must preserve its checked theorem declaration",
+            });
+        };
+        let interface = Declaration::Axiom(AxiomVal {
+            base: theorem.base.clone(),
+            is_unsafe: false,
+        });
+        Ok(
+            match public.admit_scoped_candidate(
+                parsed.syntax(),
+                interface,
+                false,
+                options,
+                limits,
+                public_scope,
+            )? {
+                Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
+                    public,
+                    private_implementation: Some(private_implementation),
+                }),
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     fn admit_scoped_inductives(
@@ -179,8 +416,319 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        self.admit_declarations(&[candidate], options, limits)
-            .map_err(EngineExecutionError::from)
+        let result = self
+            .admit_declarations(&[candidate], options, limits)
+            .map_err(EngineExecutionError::from)?;
+        self.finish_source_inductive_auxiliaries(result, options, limits)
+    }
+
+    /// Admit a scoped candidate before applying its declaration attributes. This
+    /// also handles a checked proof's safe public interface: attribute replay
+    /// uses the identical name and signature, without exposing its proof.
+    fn admit_scoped_candidate(
+        &self,
+        syntax: &fln_syntax::tree::Syntax,
+        declaration: Declaration,
+        irreducible: bool,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let default_priorities = fln_elab::source::default_instance_registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let registration = fln_elab::source::instance_registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let instance_namespace = fln_elab::source::instance_registration_is_scoped(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .then_some(&scope.namespace);
+        let local = fln_elab::source::instance_registration_is_local(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let simp = fln_elab::source::scope::simp::registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let reducibility = fln_elab::source::scope::simp::reducibility(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let noncomputable = fln_elab::source::noncomputable_registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let protected = fln_elab::source::protected_registration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .map(|name| scope.declaration_name(&name))
+            .transpose()
+            .map_err(|error| {
+                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::NameScope(error),
+                    ),
+                ))
+            })?;
+        let result = self
+            .admit_declarations(&[declaration], options, limits)
+            .map_err(EngineExecutionError::from)?;
+        Ok(match result {
+            Outcome::Complete(mut batch) => {
+                apply_batch_effects(&mut batch, irreducible, options)?;
+                if let Some((name, priority)) = registration {
+                    // Definitions, proof theorems and exported interfaces all
+                    // retain the exact admitted generated instance name.
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "an instance command must admit exactly one declaration",
+                        });
+                    };
+                    let declared = match &admitted.declaration {
+                        Declaration::Defn(definition) => &definition.base.name,
+                        Declaration::Thm(theorem) => &theorem.base.name,
+                        Declaration::Axiom(interface) if !interface.is_unsafe => {
+                            &interface.base.name
+                        }
+                        _ => {
+                            return Err(EngineExecutionError::NotImplemented {
+                                feature: "an instance command must preserve its checked declaration or proof interface",
+                            });
+                        }
+                    };
+                    let name = if name.is_anonymous() {
+                        declared.clone()
+                    } else {
+                        scope.declaration_name(&name).map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::NameScope(error),
+                                ),
+                            ))
+                        })?
+                    };
+                    if &name != declared {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "instance metadata must name the completed checked declaration",
+                        });
+                    }
+                    batch.engine = match batch.engine.register_checked_source_instance(
+                        &name,
+                        priority,
+                        instance_namespace,
+                        local,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    batch.local_instance = local.then_some((name, priority));
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if !default_priorities.is_empty() {
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "default instance attributes require one checked declaration",
+                        });
+                    };
+                    batch.engine = batch.engine.register_checked_source_defaults(
+                        &admitted.declaration,
+                        &default_priorities,
+                    )?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if let Some((name, priority, reverse)) = simp {
+                    let name = scope.declaration_name(&name).map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                    batch.engine.environment = fln_elab::source::scope::simp::update(
+                        batch.engine.environment(),
+                        &name,
+                        Some((priority, reverse)),
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::SimpSet(error),
+                            ),
+                        ))
+                    })?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if let Some((name, status)) = reducibility {
+                    let name = scope.declaration_name(&name).map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                    batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if let Some(name) = noncomputable {
+                    let name = scope.declaration_name(&name).map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                    batch.engine.environment = tag_noncomputable(&batch.engine, &name)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if let Some(name) = protected {
+                    batch.engine.environment = tag_protected(&batch.engine, &name)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                Outcome::Complete(batch)
+            }
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        })
+    }
+
+    /// Register defaults under the actual checked declaration identity, including
+    /// anonymous instances, private names and a public proof's safe interface.
+    pub(super) fn register_checked_source_defaults(
+        &self,
+        declaration: &Declaration,
+        priorities: &[u32],
+    ) -> Result<Self, EngineExecutionError> {
+        let name = match declaration {
+            Declaration::Defn(definition) => &definition.base.name,
+            Declaration::Thm(theorem) => &theorem.base.name,
+            Declaration::Opaque(value) if !value.is_unsafe => &value.base.name,
+            Declaration::Axiom(interface) if !interface.is_unsafe => &interface.base.name,
+            _ => {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "default instance metadata requires a checked safe declaration",
+                });
+            }
+        };
+        let mut next = self.clone();
+        for &priority in priorities {
+            next.environment =
+                fln_elab::instances::defaults::register(next.environment(), name, priority)
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ))
+                    })?;
+        }
+        Ok(next)
+    }
+
+    /// Metadata follows a completed admission. Native instance fallback is
+    /// implicitReducible, so proof instances need an explicit semireducible row;
+    /// data instances retain the pin's automatic reducibility behavior.
+    pub(super) fn register_checked_source_instance(
+        &self,
+        name: &Name,
+        priority: u32,
+        namespace: Option<&Name>,
+        local: bool,
+        kernel: Budget,
+    ) -> Result<Outcome<Engine>, EngineExecutionError> {
+        if namespace.is_some_and(Name::is_anonymous) {
+            return Err(EngineExecutionError::Frontend(
+                DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "scoped instances inside a non-root namespace",
+                    },
+                ),
+            ));
+        }
+        let base = self
+            .environment()
+            .find(name)
+            .ok_or(EngineExecutionError::NotImplemented {
+                feature: "instance metadata requires an already admitted declaration",
+            })?
+            .constant_val();
+        let proof = match declaration_is_proposition(self.environment(), base, kernel)? {
+            Outcome::Complete(proof) => proof,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let mut engine = self.clone();
+        let registry_error = |error| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                ),
+            ))
+        };
+        let registered = if local {
+            // The pin rejects uninferable instance parameters at declaration
+            // time. Reuse the same bounded telescope/index derivation used by
+            // native search; an unsupported model cannot become a local effect.
+            let registry = fln_elab::instances::InstanceRegistry::read(engine.environment())
+                .map_err(registry_error)?;
+            let mut work_left = usize::try_from(kernel.steps)
+                .unwrap_or(usize::MAX)
+                .min(1_000_000);
+            if fln_elab::instances::export::derive_index(
+                engine.environment(),
+                &registry,
+                name,
+                &mut work_left,
+            )
+            .map_err(registry_error)?
+            .is_none()
+            {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "a local instance requires a supported inferable telescope and index",
+                });
+            }
+            // Validate the same checked class and declaration as a persistent
+            // instance, without publishing its selection beyond the scope.
+            fln_elab::instances::scoped::ActiveScopes::default()
+                .register_local(engine.environment(), name, priority)
+                .map(|()| engine.environment().clone())
+        } else {
+            match namespace {
+                Some(namespace) => fln_elab::instances::scoped::register(
+                    engine.environment(),
+                    namespace,
+                    name,
+                    priority,
+                ),
+                None => {
+                    fln_elab::instances::register_instance(engine.environment(), name, priority)
+                }
+            }
+        };
+        engine.environment = registered.map_err(registry_error)?;
+        if proof || local {
+            engine.environment = fln_elab::reducibility::register(
+                engine.environment(),
+                name,
+                if proof {
+                    fln_elab::reducibility::Reducibility::Semireducible
+                } else {
+                    // Local data instances have no persistent instance row
+                    // from which the usual implicit-reducibility fallback
+                    // could be derived. The status belongs to the declaration.
+                    fln_elab::reducibility::Reducibility::ImplicitReducible
+                },
+            )
+            .map_err(|error| {
+                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::Unification(Box::new(
+                            fln_elab::constraint::unify::UnificationError::Reducibility(error),
+                        )),
+                    ),
+                ))
+            })?;
+        }
+        Ok(Outcome::Complete(engine))
     }
 
     fn admit_scoped_definition(
@@ -191,10 +739,19 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        if fln_elab::source::is_inductive(parsed.syntax()) {
+        let deriving =
+            match elaboration_outcome(fln_elab::source::deriving::prepare(parsed.syntax()))? {
+                Outcome::Complete(request) => request,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        let syntax = deriving
+            .as_ref()
+            .map_or_else(|| parsed.syntax(), |request| &request.syntax);
+        if fln_elab::source::is_inductive(syntax) {
             let candidate =
                 match elaboration_outcome(fln_elab::source::scope::elaborate_inductive(
-                    parsed.syntax(),
+                    syntax,
                     self.environment(),
                     limits.kernel,
                     fln_elab::records::RecordBudget::default(),
@@ -204,101 +761,38 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-            return self
+            let result = self
                 .admit_declarations(&[candidate], options, limits)
-                .map_err(EngineExecutionError::from);
+                .map_err(EngineExecutionError::from)?;
+            let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+            return self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope);
         }
-        if !fln_elab::source::is_record(parsed.syntax()) {
-            if scope != &fln_elab::source::scope::SourceScope::default() {
-                let declaration =
-                    match elaboration_outcome(fln_elab::source::scope::elaborate_definition(
+        if !fln_elab::source::is_record(syntax) {
+            if scope != &fln_elab::source::scope::SourceScope::default()
+                || fln_elab::source::instance_registration_is_local(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
+            {
+                let elaborated = match elaboration_outcome(
+                    fln_elab::source::scope::elaborate_definition_with_effects(
                         parsed.syntax(),
                         self.environment(),
                         limits.kernel,
                         scope,
-                    ))? {
-                        Outcome::Complete(declaration) => declaration,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    };
-                let registration = fln_elab::source::instance_registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?;
-                let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?;
-                let protected = fln_elab::source::protected_registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?
-                    .map(|name| scope.declaration_name(&name))
-                    .transpose()
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::NameScope(error),
-                            ),
-                        ))
-                    })?;
-                let result = self
-                    .admit_declarations(&[declaration], options, limits)
-                    .map_err(EngineExecutionError::from)?;
-                return Ok(match result {
-                    Outcome::Complete(mut batch) => {
-                        if let Some((name, priority)) = registration {
-                            let name = scope.declaration_name(&name).map_err(|error| {
-                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::NameScope(error),
-                                    ),
-                                ))
-                            })?;
-                            batch.engine.environment = fln_elab::instances::register_instance(
-                                batch.engine.environment(),
-                                &name,
-                                priority,
-                            )
-                            .map_err(|error| {
-                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::InstanceRegistry(
-                                            error,
-                                        ),
-                                    ),
-                                ))
-                            })?;
-                            batch.result_logical_root = batch.engine.logical_root(options);
-                        }
-                        if let Some((name, priority, reverse)) = simp {
-                            let name = scope.declaration_name(&name).map_err(|error| {
-                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::NameScope(error),
-                                    ),
-                                ))
-                            })?;
-                            batch.engine.environment = fln_elab::source::scope::simp::update(
-                                batch.engine.environment(),
-                                &name,
-                                Some((priority, reverse)),
-                            )
-                            .map_err(|error| {
-                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::SimpSet(error),
-                                    ),
-                                ))
-                            })?;
-                            batch.result_logical_root = batch.engine.logical_root(options);
-                        }
-                        if let Some(name) = protected {
-                            batch.engine.environment = tag_protected(&batch.engine, &name)?;
-                            batch.result_logical_root = batch.engine.logical_root(options);
-                        }
-                        Outcome::Complete(batch)
-                    }
-                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-                });
+                    ),
+                )? {
+                    Outcome::Complete(declaration) => declaration,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                return self.admit_scoped_candidate(
+                    parsed.syntax(),
+                    elaborated.declaration,
+                    elaborated.irreducible,
+                    options,
+                    limits,
+                    scope,
+                );
             }
             return Ok(
                 match self.admit_source_declaration(source, options, limits)? {
@@ -307,14 +801,15 @@ impl Engine {
                         base_logical_root: admitted.base_logical_root,
                         result_logical_root: admitted.result_logical_root,
                         admissions: vec![admitted],
+                        local_instance: None,
                     }),
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 },
             );
         }
-        let record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
-            parsed.syntax(),
+        let mut record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
+            syntax,
             self.environment(),
             limits.kernel,
             fln_elab::records::RecordBudget::default(),
@@ -324,11 +819,107 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let result = self
+        let mut result = self
             .admit_declarations(&record.declarations, options, limits)
             .map_err(EngineExecutionError::from)?;
-        Ok(match result {
+        if let Outcome::Complete(batch) = &result {
+            // The pin emits proof projections as theorems, not definitions
+            // (Lean/Meta/Structure.lean:99–116). Ask K1 under its supplied budget
+            // against each projection's exact, already checked predecessor;
+            // the actual declaration name is still fresh in that environment.
+            // Defaults are ordinary definitions even when they return proofs.
+            let mut predecessor = self;
+            let mut proof_projection = false;
+            for (index, admission) in batch.admissions.iter().enumerate() {
+                if let Declaration::Defn(definition) = &admission.declaration
+                    && !record
+                        .defaults
+                        .iter()
+                        .any(|default| default.helper == definition.base.name)
+                {
+                    let theorem = Declaration::Thm(TheoremVal {
+                        base: definition.base.clone(),
+                        value: definition.value.clone(),
+                        all: definition.all.clone(),
+                    });
+                    match fln_kernel::check(predecessor.environment(), &theorem, limits.kernel) {
+                        Outcome::Complete(Verdict::Accepted { .. }) => {
+                            record.declarations[index] = theorem;
+                            proof_projection = true;
+                        }
+                        Outcome::Complete(Verdict::Rejected {
+                            class: RejectClass::TheoremNotProp,
+                            ..
+                        }) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                        other => {
+                            return Err(EngineExecutionError::Frontend(
+                                DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::TypeObligation(
+                                            Box::new(other),
+                                        ),
+                                    ),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                predecessor = &admission.engine;
+            }
+            if proof_projection {
+                // The classification probe grants no publication authority.
+                // Recheck the corrected batch from the original predecessor so
+                // both checkers certify every final declaration's actual kind.
+                result = self
+                    .admit_declarations(&record.declarations, options, limits)
+                    .map_err(EngineExecutionError::from)?;
+            }
+        }
+        // Complete the declaration stream before adding any record journals,
+        // so adjacent council receipts retain their exact predecessor roots.
+        let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+        let result = match result {
             Outcome::Complete(mut batch) => {
+                // Projection hints and reducibility status are different facts.
+                // Non-class data projections are reducible, class fields remain
+                // semireducible, and parent instances are implicitReducible.
+                // Default helpers remain semireducible despite Abbrev hints
+                // (Lean/Elab/Structure.lean:1363–1386).
+                for declaration in &record.declarations {
+                    let Declaration::Defn(definition) = declaration else {
+                        continue;
+                    };
+                    let status = if record.parent_instances.contains(&definition.base.name) {
+                        fln_elab::reducibility::Reducibility::ImplicitReducible
+                    } else if record.is_class
+                        || record
+                            .defaults
+                            .iter()
+                            .any(|default| default.helper == definition.base.name)
+                    {
+                        fln_elab::reducibility::Reducibility::Semireducible
+                    } else {
+                        fln_elab::reducibility::Reducibility::Reducible
+                    };
+                    batch.engine.environment = fln_elab::reducibility::register(
+                        batch.engine.environment(),
+                        &definition.base.name,
+                        status,
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::Unification(Box::new(
+                                    fln_elab::constraint::unify::UnificationError::Reducibility(
+                                        error,
+                                    ),
+                                )),
+                            ),
+                        ))
+                    })?;
+                }
                 batch.engine.environment = fln_elab::records::defaults::register_defaults(
                     batch.engine.environment(),
                     &record.defaults,
@@ -365,25 +956,102 @@ impl Engine {
                     })?;
                 }
                 for parent in &record.parent_instances {
-                    batch.engine.environment = fln_elab::instances::register_instance(
-                        batch.engine.environment(),
+                    batch.engine = match batch.engine.register_checked_source_instance(
                         parent,
                         1000,
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
-                            ),
-                        ))
-                    })?;
+                        None,
+                        false,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
                 }
                 batch.result_logical_root = batch.engine.logical_root(options);
                 Outcome::Complete(batch)
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-        })
+        };
+        self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope)
+    }
+
+    fn finish_source_deriving(
+        &self,
+        result: Outcome<DeclarationBatchAdmission>,
+        request: Option<&fln_elab::source::deriving::DerivingRequest>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let Some(request) = request.filter(|request| !request.handlers.is_empty()) else {
+            return Ok(result);
+        };
+        let mut batch = match result {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let frontend = |reason| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(reason),
+            ))
+        };
+        let type_name = scope
+            .declaration_name(&request.type_name)
+            .map_err(|error| frontend(fln_elab::source::SourceInferenceError::NameScope(error)))?;
+        for handler in &request.handlers {
+            let derived = match elaboration_outcome(fln_elab::source::deriving::elaborate_handler(
+                handler,
+                &type_name,
+                request.is_record,
+                batch.engine.environment(),
+                limits.kernel,
+                scope,
+            ))? {
+                Outcome::Complete(derived) => derived,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            let mut successor = match batch
+                .engine
+                .admit_declarations(&derived.declarations, options, limits)
+                .map_err(EngineExecutionError::from)?
+            {
+                Outcome::Complete(successor) => successor,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            successor.engine.environment = fln_elab::instances::register_instance(
+                successor.engine.environment(),
+                &derived.instance,
+                1000,
+            )
+            .map_err(|error| {
+                frontend(fln_elab::source::SourceInferenceError::InstanceRegistry(
+                    error,
+                ))
+            })?;
+            successor.engine.environment = fln_elab::reducibility::register(
+                successor.engine.environment(),
+                &derived.instance,
+                fln_elab::reducibility::Reducibility::ImplicitReducible,
+            )
+            .map_err(|error| {
+                frontend(fln_elab::source::SourceInferenceError::Unification(
+                    Box::new(fln_elab::constraint::unify::UnificationError::Reducibility(
+                        error,
+                    )),
+                ))
+            })?;
+            // Include every checked helper and dictionary in the ordinary
+            // admission stream. Module export/replay must see the whole command.
+            batch.admissions.extend(successor.admissions);
+            batch.engine = successor.engine;
+            batch.result_logical_root = batch.engine.logical_root(options);
+        }
+        Ok(Outcome::Complete(batch))
     }
 }
 
@@ -410,11 +1078,15 @@ pub(crate) fn parse_scoped_command(
     {
         return Ok(ScopedCommandSyntax::Mutual(members));
     }
+    // Under an entered grammar (`source_check::grammar`), the file's notations are expanded
+    // before the elaborator reads the tree.
     let parsed = fln_parse::parse_definition(source)
+        .and_then(fln_parse::ParsedDefinition::expanded)
         .map_err(DefinitionFrontendError::Parse)
         .map_err(EngineExecutionError::Frontend)?;
     if fln_elab::source::scope::is_example(parsed.syntax()) {
         let parsed = fln_parse::parse_source_command(source)
+            .and_then(fln_parse::ParsedSourceCommand::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         return Ok(ScopedCommandSyntax::Example(parsed));
@@ -437,6 +1109,39 @@ pub(crate) fn tag_protected(
                 ),
             ))
         })
+}
+
+/// Tag an admitted `noncomputable def` (`scope`'s `noncomputable_registration`), as the pin's
+/// `addNoncomputable`: the runtime catalog never binds it.
+pub(crate) fn tag_noncomputable(
+    engine: &Engine,
+    name: &Name,
+) -> Result<Environment, EngineExecutionError> {
+    fln_elab::noncomputable::register(engine.environment(), name).map_err(|_| {
+        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a noncomputable tag on an admitted declaration",
+            },
+        ))
+    })
+}
+
+/// Record a `@[reducible]`-style attribute's status for an admitted declaration of this module
+/// (`scope::simp::reducibility` validated it), as the pin's `setReducibilityStatus`.
+pub(crate) fn set_reducibility(
+    engine: &Engine,
+    name: &Name,
+    status: fln_elab::reducibility::Reducibility,
+) -> Result<Environment, EngineExecutionError> {
+    fln_elab::reducibility::register(engine.environment(), name, status).map_err(|error| {
+        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::Unification(Box::new(
+                    fln_elab::constraint::unify::UnificationError::Reducibility(error),
+                )),
+            ),
+        ))
+    })
 }
 
 #[cfg(test)]

@@ -1,0 +1,63 @@
+name: Offline development inputs
+
+# Read-only transport for development environments without network access or
+# Rust. These are inputs, not test results; exporting them makes no correctness
+# or conformance claim and never changes a branch or a dependency pin.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/offline-development-inputs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Export exact source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/offline-source"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/offline-source/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/offline-source/source-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/offline-source/source-tree.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/offline-source/tree.txt"
+          cd "$RUNNER_TEMP/offline-source"
+          sha256sum source.tar.gz source-commit.txt source-tree.txt tree.txt > SHA256SUMS
+      - name: Retain source inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: offline-source-${{ github.sha }}
+          path: ${{ runner.temp }}/offline-source
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+      - name: Export configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p "$RUNNER_TEMP/offline-compiler"
+          toolchain="$(rustc --print sysroot)"
+          tar -C "$toolchain" -czf "$RUNNER_TEMP/offline-compiler/compiler.tar.gz" bin lib
+          rustc -Vv > "$RUNNER_TEMP/offline-compiler/compiler.txt"
+          printf '%s\n' "$channel" > "$RUNNER_TEMP/offline-compiler/channel.txt"
+          cd "$RUNNER_TEMP/offline-compiler"
+          sha256sum compiler.tar.gz compiler.txt channel.txt > SHA256SUMS
+      - name: Retain compiler inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: offline-compiler-${{ github.sha }}
+          path: ${{ runner.temp }}/offline-compiler
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error

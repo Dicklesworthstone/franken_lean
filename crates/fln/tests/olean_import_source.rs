@@ -134,6 +134,63 @@ fn source_importing_the_real_prelude_checks_against_council_admitted_declaration
         .expect("the source checks against the imported Prelude");
         assert_eq!(checked.checked.theorems, 1);
 
+        // fln-snv7: the exact programs are accepted/refused by Lean 4.32.0
+        // with this explicit import. Reuse the real admitted Prelude rather
+        // than relying on the source seed's Nat and numeral dictionaries.
+        let predicates = "prelude
+import Init.Prelude
+mutual
+  inductive Even : Nat -> Prop where
+    | zero : Even 0
+    | succ (n : Nat) (h : Odd n) : Even (Nat.succ n)
+  inductive Odd : Nat -> Prop where
+    | succ (n : Nat) (h : Even n) : Odd (Nat.succ n)
+end
+";
+        let positive = format!(
+            "{predicates}
+theorem evenTwo : Even 2 := Even.succ 1 (Odd.succ 0 Even.zero)
+theorem preserve (n : Nat) (h : Even n) : Even n :=
+  @Even.rec (fun n _ => Even n) (fun n _ => Odd n)
+    Even.zero (fun n h ih => Even.succ n ih) (fun n h ih => Odd.succ n ih) n h"
+        );
+        let root = prelude.logical_root(&KVMap::new());
+        let predicate_checked = check(&prelude, &positive)
+            .unwrap_or_else(|error| panic!("real-Prelude mutual predicates: {error:?}"))
+            .into_complete()
+            .expect("both checkers admit the mutual predicate proofs");
+        assert_eq!(predicate_checked.checked.theorems, 2);
+        for name in ["Even.rec", "Odd.rec", "evenTwo", "preserve"] {
+            assert!(
+                predicate_checked
+                    .checked
+                    .engine
+                    .environment()
+                    .contains(&Name::from_components(name.split('.'))),
+                "{name}"
+            );
+        }
+        let forbidden = format!(
+            "{predicates}
+def reveal (n : Nat) (h : Even n) : Nat :=
+  @Even.rec (fun _ _ => Nat) (fun _ _ => Nat)
+    0 (fun n h ih => ih) (fun n h ih => ih) n h"
+        );
+        match check(&prelude, &forbidden) {
+            Err(SourceModuleCheckError::Source { error, .. }) => {
+                assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+            }
+            other => panic!("forbidden large elimination must be refused: {other:?}"),
+        }
+        assert_eq!(prelude.logical_root(&KVMap::new()), root);
+        for name in ["Even", "Odd", "reveal"] {
+            assert!(
+                !prelude
+                    .environment()
+                    .contains(&Name::from_components([name]))
+            );
+        }
+
         // The same source against a base that never admitted the module: the
         // import is unsatisfied, not silently served by whatever is present.
         let empty = Engine::from_environment(Environment::new());

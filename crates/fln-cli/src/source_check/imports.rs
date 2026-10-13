@@ -11,6 +11,7 @@
 //! instead ([`fln::source_check::modules::reuse`]); every output names which.
 use super::*;
 pub(super) mod editor;
+pub(super) mod execution;
 mod metadata;
 mod reuse;
 use fln::source_check::modules::imported::SourceOleanImport;
@@ -97,6 +98,12 @@ pub(super) struct Loaded {
     olean_roots: Vec<Name>,
 }
 impl Loaded {
+    /// Whether the `.olean` closure holds `module`. Every module here is reached from the
+    /// entry, so this is the entry's world.
+    pub(super) fn reaches(&self, module: &Name) -> bool {
+        self.oleans.iter().any(|olean| &olean.name == module)
+    }
+
     /// The base engine source is checked against: the council-admitted
     /// `.olean` closure when the source imports one, else `seed()`. `jobs`
     /// closure modules are checked at once, each worker on a stack of the
@@ -108,6 +115,11 @@ impl Loaded {
         posture: ImportPosture,
     ) -> Result<(fln::Engine, Option<OleanBase>), Failure> {
         if self.oleans.is_empty() {
+            if matches!(&self.inputs, Inputs::Modules { sources, .. }
+                if sources.iter().any(|source| parse_source_header(source).is_ok_and(|header| header.module_system)))
+            {
+                return Ok((fln::Engine::builder().build_empty(), None));
+            }
             return seed().map(|engine| (engine, None));
         }
         let inputs: Vec<fln::OleanModuleInput<'_>> = self
@@ -137,6 +149,15 @@ impl Loaded {
                     max_roots: MAX_IMPORTS,
                     jobs: fln::OleanFrontierJobs {
                         threads: jobs,
+                        worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
+                    },
+                    // Work that is no council (re-proving a record, capturing each
+                    // module's extension payloads) is not held to the council's
+                    // worker count: the `lean` door keeps one council worker for a
+                    // cold Init, and a warm one decodes, measures and captures Init's
+                    // 601 modules in parallel.
+                    read_jobs: fln::OleanFrontierJobs {
+                        threads: jobs.max(crate::default_import_jobs()),
                         worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
                     },
                     ..fln::source_check::modules::imported::SourceOleanImportLimits::new(limits)
@@ -180,9 +201,10 @@ impl Loaded {
         }
     }
 
-    /// Refuse unparseable source before any import is admitted, with the error
-    /// [`Self::check`] would report (`fln::source_check::preflight_source_files`).
-    pub(super) fn preflight(&self) -> Result<(), Failure> {
+    /// Refuse unparseable source before admitting imports. Native source modules
+    /// replay their dependency grammars before parsing consumers, just as the
+    /// actual checker does; independent files keep their separate grammars.
+    pub(super) fn preflight(&self, limits: fln::SourceCheckLimits) -> Result<(), Failure> {
         match &self.inputs {
             Inputs::Files(sources) => {
                 let inputs: Vec<_> = sources.iter().map(Vec::as_slice).collect();
@@ -197,18 +219,24 @@ impl Loaded {
                 })
             }
             Inputs::Modules { names, sources } => {
-                for (name, source) in names.iter().zip(sources) {
-                    fln::source_check::preflight_source_module(name, source).map_err(|error| {
-                        let (class, authority, exit) = error.disposition();
-                        Failure {
-                            class,
-                            authority,
-                            exit,
-                            detail: error.to_string(),
-                        }
-                    })?;
-                }
-                Ok(())
+                let inputs: Vec<_> = names
+                    .iter()
+                    .zip(sources)
+                    .map(|(name, source)| SourceModuleInput { name, source })
+                    .collect();
+                fln::source_check::modules::execution::preflight_source_program(
+                    &inputs,
+                    SourceModuleCheckLimits::new(limits),
+                )
+                .map_err(|error| {
+                    let (class, authority, exit) = error.disposition();
+                    Failure {
+                        class,
+                        authority,
+                        exit,
+                        detail: error.to_string(),
+                    }
+                })
             }
         }
     }
@@ -277,15 +305,72 @@ impl Loaded {
 
 pub(super) fn load(
     paths: &[PathBuf],
+    sources: Vec<Vec<u8>>,
+    total_bytes: usize,
+    max_bytes: usize,
+) -> Result<Loaded, Failure> {
+    load_with_implicit_init(
+        paths,
+        sources,
+        total_bytes,
+        max_bytes,
+        false,
+        EntryOrigin::File,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum EntryOrigin {
+    File,
+    StandardInput,
+}
+
+/// Ordinary Lean execution gives every non-prelude source module an implicit
+/// Init edge. Keep the actual bytes intact for budgets and diagnostic offsets.
+pub(super) fn load_lean(
+    paths: &[PathBuf],
+    sources: Vec<Vec<u8>>,
+    total_bytes: usize,
+    max_bytes: usize,
+) -> Result<Loaded, Failure> {
+    load_with_implicit_init(
+        paths,
+        sources,
+        total_bytes,
+        max_bytes,
+        true,
+        EntryOrigin::File,
+    )
+}
+
+/// Standard input is a retained virtual module rooted at the current directory.
+/// The pin names this module `_stdin`; a real `stdin.lean` remains importable.
+/// Its source bytes never come from, or replace, a file on disk.
+fn load_lean_stdin(source: Vec<u8>, max_bytes: usize) -> Result<Loaded, Failure> {
+    let total_bytes = source.len();
+    load_with_implicit_init(
+        &[PathBuf::from("_stdin.lean")],
+        vec![source],
+        total_bytes,
+        max_bytes,
+        true,
+        EntryOrigin::StandardInput,
+    )
+}
+
+fn load_with_implicit_init(
+    paths: &[PathBuf],
     mut sources: Vec<Vec<u8>>,
     mut total_bytes: usize,
     max_bytes: usize,
+    implicit_init: bool,
+    origin: EntryOrigin,
 ) -> Result<Loaded, Failure> {
-    let mut has_headers = false;
+    let mut has_headers = implicit_init;
     for (path, source) in paths.iter().zip(&sources) {
         let header = parse_source_header(source)
             .map_err(|error| Failure::input(format!("{}: {error}", path.display())))?;
-        has_headers |= !header.imports.is_empty() || header.prelude;
+        has_headers |= !header.imports.is_empty() || header.prelude || header.module_system;
     }
     if !has_headers {
         return Ok(Loaded {
@@ -317,7 +402,10 @@ pub(super) fn load(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let root = std::fs::canonicalize(parent).map_err(|e| Failure::io(parent, e))?;
-    let entry_path = std::fs::canonicalize(entry).map_err(|e| Failure::io(entry, e))?;
+    let entry_path = match origin {
+        EntryOrigin::File => std::fs::canonicalize(entry).map_err(|e| Failure::io(entry, e))?,
+        EntryOrigin::StandardInput => root.join("_stdin.lean"),
+    };
     if !entry_path.starts_with(&root) {
         return Err(Failure::input("source entry escaped its module root"));
     }
@@ -330,12 +418,21 @@ pub(super) fn load(
     let mut olean_roots: Vec<Name> = Vec::new();
     let mut source_imports = BTreeMap::new();
     while cursor < sources.len() {
-        let header = parse_source_header(&sources[cursor]).map_err(|error| {
+        let mut header = parse_source_header(&sources[cursor]).map_err(|error| {
             Failure::input(format!(
                 "module `{}`: {error}",
                 names[cursor].to_display_string()
             ))
         })?;
+        fln::source_check::modules::validate_source_header(&names[cursor], &header).map_err(
+            |error| {
+                let (class, authority, exit) = error.disposition();
+                Failure::new(class, &error.to_string(), authority, exit)
+            },
+        )?;
+        if (implicit_init || header.module_system) && !header.prelude {
+            header.imports.insert(0, Name::from_components(["Init"]));
+        }
         import_rows = import_rows
             .checked_add(header.imports.len())
             .filter(|n| *n <= MAX_IMPORTS)
@@ -781,6 +878,97 @@ fn checked_module_path(
 mod tests {
     use super::*;
     use fln_olean::region::OleanView;
+
+    #[test]
+    fn main_loader_keeps_original_sources_and_implicit_init_edges_per_module() {
+        // This checks filesystem discovery only. The empty local Init module
+        // supplies no declarations and is never used as a native IO fixture.
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Directory(std::env::temp_dir().join(format!("fln-main-import-{nonce}")));
+        std::fs::create_dir(&directory.0).unwrap();
+        let path = directory.0.join("Main.lean");
+        let init = b"prelude\n".to_vec();
+        let local = b"-- ordinary dependency\n".to_vec();
+        std::fs::write(directory.0.join("Init.lean"), &init).unwrap();
+        std::fs::write(directory.0.join("Local.lean"), &local).unwrap();
+
+        let source = b"-- original UTF-8: \xce\xbb\n".to_vec();
+        std::fs::write(&path, &source).unwrap();
+        let loaded = load_lean(
+            std::slice::from_ref(&path),
+            vec![source.clone()],
+            source.len(),
+            4096,
+        )
+        .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+        let Inputs::Modules { names, sources } = loaded.inputs else {
+            panic!("main needs a module graph");
+        };
+        assert_eq!(
+            names,
+            [
+                Name::from_components(["Main"]),
+                Name::from_components(["Init"])
+            ]
+        );
+        assert_eq!(sources, [source.clone(), init.clone()]);
+        assert_eq!(loaded.total_bytes, source.len() + init.len());
+        assert!(loaded.oleans.is_empty());
+        assert!(matches!(
+            load(
+                std::slice::from_ref(&path),
+                vec![source.clone()],
+                source.len(),
+                4096
+            )
+            .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail))
+            .inputs,
+            Inputs::Files(_)
+        ));
+
+        // Prelude applies to this file; its ordinary dependency still imports
+        // Init. No prefix is inserted into either file's byte stream.
+        let source = b"prelude\nimport Local\n".to_vec();
+        std::fs::write(&path, &source).unwrap();
+        let loaded = load_lean(
+            std::slice::from_ref(&path),
+            vec![source.clone()],
+            source.len(),
+            4096,
+        )
+        .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+        let Inputs::Modules { names, sources } = loaded.inputs else {
+            panic!("expected graph");
+        };
+        assert_eq!(
+            names,
+            [
+                Name::from_components(["Main"]),
+                Name::from_components(["Local"]),
+                Name::from_components(["Init"])
+            ]
+        );
+        assert_eq!(sources, [source.clone(), local.clone(), init.clone()]);
+        let error = load_lean(
+            &[path],
+            vec![source.clone()],
+            source.len(),
+            source.len() + local.len() + init.len() - 1,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.class, "resource");
+        assert_eq!(error.exit, 3);
+    }
 
     /// The capture ceiling check-source gives the importer must hold the
     /// pinned `Init` closure's extension payloads, or `import Init` is a

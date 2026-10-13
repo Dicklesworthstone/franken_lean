@@ -7,8 +7,18 @@ pub(super) fn parse(
     view: &SourceView,
     tokens: &[LexedToken],
 ) -> Result<Syntax, DefinitionParseError> {
-    let (groups, end) = bounded_binders(view, tokens, 1, DefinitionGrammar::Scalar)?;
-    if groups.is_empty() || end != tokens.len() {
+    parse_until(view, tokens, tokens.len())
+}
+
+/// The binders of `variable` from token 1 to `stop` (an `in`, for `variable … in <command>`),
+/// each leaf read in the whole command.
+pub(super) fn parse_until(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    stop: usize,
+) -> Result<Syntax, DefinitionParseError> {
+    let (groups, end) = bounded_binders(view, &tokens[..stop], 1, DefinitionGrammar::Scalar)?;
+    if groups.is_empty() || end != stop {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, end),
             expected: NatDefinitionExpectation::EndOfCommand,

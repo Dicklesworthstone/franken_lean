@@ -73,8 +73,8 @@ fn decision_elimination_can_return_proofs_functions_and_types() {
         def function : Nat -> Nat := ite True (fun n => n + 1) (fun n => n + 2)
         theorem applied : function 7 = 8 := by rfl
         def Carrier : Type := ite True Nat Bool
-        def inhabitant : Carrier := 23
-        theorem checked : inhabitant = 23 := by rfl
+        def inhabitant : Carrier := (23 : Nat)
+        theorem checked : inhabitant = (23 : Nat) := by rfl
     "#,
     );
 }

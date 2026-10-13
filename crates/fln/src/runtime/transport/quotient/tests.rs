@@ -282,3 +282,26 @@ fn scalar_overapplication_is_not_dropped_and_argument_budgets_remain_enforced() 
         })
     ));
 }
+
+#[test]
+fn only_a_complete_quotient_check_is_cached() {
+    let environment = environment(false);
+    let mut bounded = Preparation::new(
+        &environment,
+        IngressLimits {
+            max_nodes: 1,
+            ..IngressLimits::default()
+        },
+    );
+    assert!(matches!(
+        bounded.check_quotient_family(),
+        Err(IngressError::ResourceLimit { .. })
+    ));
+    assert!(!bounded.quotient_family_checked);
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    preparation.check_quotient_family().unwrap();
+    assert!(preparation.quotient_family_checked);
+    let visited = preparation.visited;
+    preparation.check_quotient_family().unwrap();
+    assert_eq!(preparation.visited, visited);
+}

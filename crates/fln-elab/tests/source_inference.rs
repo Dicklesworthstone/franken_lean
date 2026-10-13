@@ -140,16 +140,21 @@ fn expected_result_infers_an_implicit_with_no_explicit_value_argument() {
     );
 }
 #[test]
-fn wrong_closed_result_still_receives_the_ordinary_kernel_rejection() {
+fn wrong_closed_result_receives_a_concrete_conversion_rejection() {
     let env = env();
-    // `polyId Type : Type 1` under `Type`: two sorts, not a rigid mismatch, so the
-    // body reaches the kernel, which rejects it (the pin: "Application type mismatch").
-    let result = check_definition_source(b"def bad : Type := polyId Type", &env, budget()).unwrap();
+    // `polyId Type : Type 1` under `Type`: the closed conversion query now
+    // preserves its concrete refusal before constructing a bad declaration.
+    // An unsupported equation or resource stop is not this negative answer.
     assert!(matches!(
-        result.outcome,
-        Outcome::Complete(Verdict::Rejected { .. })
+        check_definition_source(b"def bad : Type := polyId Type", &env, budget()),
+        Err(DefinitionFrontendError::Elaborate(
+            NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::ConversionRefused(verdict)
+            )
+        )) if matches!(*verdict, Verdict::Rejected {
+            class: fln_kernel::verdict::RejectClass::NotDefEq, ..
+        })
     ));
-    assert_eq!(check(&env, &result.declaration, budget()), result.outcome);
     // `polyId Nat : Type` under `Nat` is rigidly not `Nat`: refused while elaborating, as
     // the pin refuses it (fln-azxg).
     assert!(matches!(

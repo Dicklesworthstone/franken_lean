@@ -10,7 +10,11 @@ struct TempDir(std::path::PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        Self::under(&std::env::temp_dir(), label)
+    }
+
+    fn under(base: &std::path::Path, label: &str) -> Self {
+        let dir = base.join(format!(
             "fln-cli-verbs-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -27,6 +31,13 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Whether `fln doctor` takes `dir` for a franken_lean checkout: an ancestor holding both
+/// `SUITE.lock` and `Cargo.toml`, the rule its checkout-pins check applies.
+fn inside_a_checkout(dir: &std::path::Path) -> bool {
+    dir.ancestors()
+        .any(|dir| dir.join("SUITE.lock").is_file() && dir.join("Cargo.toml").is_file())
 }
 
 fn doctor_json(cwd: &std::path::Path, elan_home: Option<&std::path::Path>) -> (i32, String) {
@@ -92,7 +103,17 @@ fn doctor_fails_when_run_in_a_checkout_pinned_to_another_reference() {
 
 #[test]
 fn doctor_reports_a_missing_reference_toolchain_without_failing() {
-    let outside = TempDir::new("doctor-outside");
+    // rch rewrites TMPDIR into the synced worktree on its workers, so the system temp
+    // directory can itself sit inside a checkout; `/tmp` is the fallback outside one.
+    let mut outside = TempDir::new("doctor-outside");
+    if inside_a_checkout(&outside.0) {
+        outside = TempDir::under(std::path::Path::new("/tmp"), "doctor-outside");
+    }
+    assert!(
+        !inside_a_checkout(&outside.0),
+        "no directory outside a checkout: {}",
+        outside.0.display()
+    );
     let empty_elan = TempDir::new("doctor-elan");
     let (code, stdout) = doctor_json(&outside.0, Some(&empty_elan.0));
     assert_eq!(
@@ -469,6 +490,33 @@ fn multiplexer_goals_verb_inspects_proof_goals() {
     assert!(json_stdout.contains("\"goals\""), "{json_stdout}");
 }
 
+/// `intro` on `Tower (n + 1)` names the domain the pin names: smart unfolding reaches the
+/// alternative `Tower k → Tower k`, and the match reads the offset `n + 1` as `Nat.succ n`
+/// (`cleanupNatOffsetMajor`). The pin's goal there is `n : Nat`, `x : Tower n`, `⊢ Tower n`
+/// (`trace_state`, 2026-10-10); neither the recursor nor the seed `Nat.add` may show.
+#[test]
+fn goals_after_intro_on_a_recursive_type_name_the_folded_domain() {
+    let (_dir, file_path) = temp_file(
+        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef t (n : Nat) : Tower (n + 1) := by\n  intro x\n  exact x\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["goals", "--line", "4", "--col", "2"])
+        .arg(&file_path)
+        .output()
+        .expect("run fln goals");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("x : (Tower n)\n"), "{stdout}");
+    assert!(stdout.contains("⊢ (Tower n)"), "{stdout}");
+    for internal in ["Nat.rec", "PProd", "Nat.add"] {
+        assert!(!stdout.contains(internal), "{stdout}");
+    }
+}
+
 #[test]
 fn leanc_personality_respects_cli_transcripts() {
     // leanc --version
@@ -490,14 +538,30 @@ fn leanc_personality_respects_cli_transcripts() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Usage: leanc"));
 
-    // leanc --fln-census-unknown
-    let output = Command::new(env!("CARGO_BIN_EXE_leanc"))
-        .arg("--fln-census-unknown")
-        .output()
-        .expect("run leanc --fln-census-unknown");
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("unrecognized command-line option"));
+    // An option leanc does not define belongs to the C compiler, as at the pin
+    // (whose leanc hands it to clang). So leanc's answer must be the host
+    // compiler's own answer, for the census's probe string and for any other
+    // string alike. This used to assert a message leanc made up for the probe
+    // string only (bead fln-front-door-residuals-0f6x).
+    for unknown in ["--fln-census-unknown", "--some-other-unknown-flag"] {
+        let ours = Command::new(env!("CARGO_BIN_EXE_leanc"))
+            .env_remove("LEAN_CC")
+            .arg(unknown)
+            .output()
+            .expect("run leanc with an unknown option");
+        match Command::new("cc").arg(unknown).output() {
+            Ok(host) => {
+                assert_eq!(ours.status.code(), host.status.code(), "{unknown}");
+                assert_eq!(ours.stderr, host.stderr, "{unknown}");
+                assert!(!ours.status.success(), "{unknown}");
+            }
+            Err(_) => {
+                let stderr = String::from_utf8_lossy(&ours.stderr);
+                assert_eq!(ours.status.code(), Some(1), "{unknown}");
+                assert!(stderr.contains("is unavailable"), "{unknown}: {stderr}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -566,14 +630,155 @@ fn lake_personality_respects_cli_transcripts() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Build targets and output results"));
 
-    // lake --fln-census-unknown help
+    // lake --fln-census-unknown help: the pin's exact words (see the table in
+    // `lake_refuses_every_option_the_pin_does_not_define`).
     let output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--fln-census-unknown", "help"])
         .output()
         .expect("run lake --fln-census-unknown help");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("unknown option"));
+    assert_eq!(
+        stderr,
+        "error: unknown long option '--fln-census-unknown'\n"
+    );
+}
+
+/// Bead `fln-front-door-residuals-0f6x`. `lake` used to give the pin's
+/// unknown-option error only for the literal string the CLI census probes with,
+/// and exit 0 for every other unknown option. The option set now comes from the
+/// extracted census, so any string the pin does not define is refused.
+///
+/// Each row is the pinned `lake` v4.32.0's own first stderr line and exit code
+/// for that argv, recorded on 2026-10-07. The last three rows are the other
+/// direction: options the pin DOES define must not be refused, and a value the
+/// pin attaches to an option must not be read as a command.
+#[test]
+fn lake_refuses_every_option_the_pin_does_not_define() {
+    let rows: [(&[&str], &str); 9] = [
+        (
+            &["--fln-census-unknown", "help"],
+            "error: unknown long option '--fln-census-unknown'",
+        ),
+        (&["--zzz=1", "help"], "error: unknown long option '--zzz'"),
+        (&["--unknown"], "error: unknown long option '--unknown'"),
+        (&["-Zfoo", "help"], "error: unknown short option '-Z'"),
+        (&["help", "--zzz"], "error: unknown long option '--zzz'"),
+        (&["build", "-Z"], "error: unknown short option '-Z'"),
+        (&["-K", "a=b", "zzz"], "error: unknown command 'zzz'"),
+        (
+            &["--log-level", "info", "zzz"],
+            "error: unknown command 'zzz'",
+        ),
+        (
+            &["-q", "-v", "--wfail", "zzz"],
+            "error: unknown command 'zzz'",
+        ),
+    ];
+    for (argv, expected) in rows {
+        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+            .args(argv)
+            .output()
+            .expect("run lake");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        eprintln!(
+            "lake {argv:?}: exit={:?} stderr={stderr:?}",
+            output.status.code()
+        );
+        assert_eq!(output.status.code(), Some(1), "{argv:?}");
+        assert_eq!(stderr.lines().next(), Some(expected), "{argv:?}");
+        assert!(output.stdout.is_empty(), "{argv:?}");
+    }
+}
+
+/// A command the pin has and this build does not is the typed not-implemented
+/// exit. It used to exit 1 with "requires Lake workspace configuration", which
+/// reads as the user's mistake.
+#[test]
+fn lake_commands_without_an_implementation_say_so() {
+    for command in ["test", "query", "lint", "lean"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg(command)
+            .output()
+            .expect("run lake");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        eprintln!(
+            "lake {command}: exit={:?} stderr={stderr:?}",
+            output.status.code()
+        );
+        assert_eq!(output.status.code(), Some(5), "{command}");
+        assert!(
+            stderr.starts_with(&format!("lake {command}: not implemented")),
+            "{command}: {stderr}"
+        );
+    }
+}
+
+/// `fln why-trusts` stops at `--max-nodes`. A stopped walk has not seen the
+/// closure, so "axioms: none" from it is not an answer: the exit must be the
+/// inconclusive one. It used to be 0.
+#[test]
+fn a_why_trusts_walk_cut_short_is_inconclusive_not_an_answer() {
+    let temp = TempDir::new("why-trusts-limit");
+    let source = temp.0.join("Main.lean");
+    let snapshot = temp.0.join("main.olean");
+    std::fs::write(
+        &source,
+        "def base : Nat := 6 * 7\ndef answer : Nat := base + 1\n#eval answer\n",
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--emit-olean-snapshot"])
+        .arg(&snapshot)
+        .arg(&source)
+        .output()
+        .expect("run fln run");
+    assert!(run.status.success(), "{run:?}");
+
+    let complete = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["why-trusts", "answer"])
+        .arg(&snapshot)
+        .output()
+        .expect("run fln why-trusts");
+    let complete_stdout = String::from_utf8(complete.stdout).expect("utf8 stdout");
+    eprintln!(
+        "complete: exit={:?} {complete_stdout:?}",
+        complete.status.code()
+    );
+    assert_eq!(complete.status.code(), Some(0), "{complete_stdout}");
+    let complete_axioms = complete_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("axioms: "))
+        .unwrap_or_else(|| panic!("a complete walk states its axioms: {complete_stdout}"));
+    assert!(!complete_stdout.contains("(partial)"), "{complete_stdout}");
+    assert!(!complete_stdout.contains("truncated"), "{complete_stdout}");
+
+    let cut = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["why-trusts", "--max-nodes", "1", "answer"])
+        .arg(&snapshot)
+        .output()
+        .expect("run fln why-trusts --max-nodes 1");
+    let cut_stdout = String::from_utf8(cut.stdout).expect("utf8 stdout");
+    let cut_stderr = String::from_utf8(cut.stderr).expect("utf8 stderr");
+    eprintln!(
+        "cut: exit={:?} {cut_stdout:?} {cut_stderr:?}",
+        cut.status.code()
+    );
+    assert_eq!(cut.status.code(), Some(3), "{cut_stdout}");
+    let cut_axioms = cut_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("axioms (partial): "))
+        .unwrap_or_else(|| panic!("a cut walk labels its axioms partial: {cut_stdout}"));
+    assert!(
+        cut_stdout.contains("truncated by --max-nodes"),
+        "{cut_stdout}"
+    );
+    assert!(cut_stderr.contains("inconclusive"), "{cut_stderr}");
+    // Why the exit code matters: on this very snapshot the complete walk
+    // reaches an axiom and the one-node walk reaches none. Exit 0 with
+    // "axioms: none" was a false answer to a trust question.
+    assert_ne!(complete_axioms, "none", "{complete_stdout}");
+    assert_eq!(cut_axioms, "none", "{cut_stdout}");
 }
 
 #[test]
@@ -814,46 +1019,101 @@ rev = "v4.32.0"
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("lakefile.toml"), toml_content).unwrap();
 
-    // 1. lake update
+    // 1. lake update with a requirement: nothing can fetch it, so the answer
+    // is the typed not-implemented exit and NO manifest. This step used to
+    // assert exit 0 and a manifest naming "batteries", which the binary wrote
+    // by copying the requested rev (bead fln-front-door-residuals-0f6x).
     let update_output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--dir", pkg_dir.to_str().unwrap(), "update"])
         .output()
         .expect("run lake update");
-    assert!(
-        update_output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&update_output.stderr)
+    let update_stderr = String::from_utf8_lossy(&update_output.stderr);
+    assert_eq!(
+        update_output.status.code(),
+        Some(5),
+        "stderr: {update_stderr}"
     );
-    assert!(pkg_dir.join("lake-manifest.json").exists());
+    assert!(update_output.stdout.is_empty());
+    assert!(
+        update_stderr.contains("lake update: not implemented")
+            && update_stderr.contains("batteries")
+            && update_stderr.contains("no manifest was written"),
+        "{update_stderr}"
+    );
+    assert!(!pkg_dir.join("lake-manifest.json").exists());
 
-    let manifest_content = std::fs::read_to_string(pkg_dir.join("lake-manifest.json")).unwrap();
-    assert!(manifest_content.contains("\"name\": \"my_project\""));
-    assert!(manifest_content.contains("\"batteries\""));
-
-    // 2. lake update --json
+    // 2. lake update --json: the same refusal, typed.
     let update_json = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--dir", pkg_dir.to_str().unwrap(), "--json", "update"])
         .output()
         .expect("run lake update --json");
-    assert!(update_json.status.success());
-    let update_json_stdout = String::from_utf8(update_json.stdout).expect("utf8 stdout");
-    assert!(update_json_stdout.contains("\"schema\":\"fln.lake-update/1\""));
-    assert!(update_json_stdout.contains("\"package\":\"my_project\""));
+    assert_eq!(update_json.status.code(), Some(5));
+    let update_json_stderr = String::from_utf8(update_json.stderr).expect("utf8 stderr");
+    assert!(update_json_stderr.contains("\"status\":\"not_implemented\""));
+    assert!(update_json_stderr.contains("\"command\":\"lake update\""));
+    assert!(!pkg_dir.join("lake-manifest.json").exists());
 
-    // 3. lake env (bare)
+    // 2b. With no requirements there is nothing to resolve: exit 0 and a
+    // manifest with an empty package list.
+    let bare_dir = temp_parent.join("bare_project");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    std::fs::write(
+        bare_dir.join("lakefile.toml"),
+        "name = \"bare_project\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let bare_update = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir", bare_dir.to_str().unwrap(), "--json", "update"])
+        .output()
+        .expect("run lake update without requirements");
+    assert!(bare_update.status.success(), "{bare_update:?}");
+    let bare_stdout = String::from_utf8(bare_update.stdout).expect("utf8 stdout");
+    assert!(bare_stdout.contains("\"schema\":\"fln.lake-update/1\""));
+    assert!(bare_stdout.contains("\"packages_count\":0"));
+    let manifest_content = std::fs::read_to_string(bare_dir.join("lake-manifest.json")).unwrap();
+    assert!(manifest_content.contains("\"name\": \"bare_project\""));
+
+    // 3. lake env. The sysroot is where the toolchain is installed. A test
+    // binary is in no toolchain layout, so with LEAN_SYSROOT unset there is
+    // nothing to report: it used to print `LEAN_SYSROOT=/usr/local` and exit 0.
+    let env_unknown = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("env")
+        .env_remove("LEAN_SYSROOT")
+        .output()
+        .expect("run lake env");
+    assert_eq!(env_unknown.status.code(), Some(5), "{env_unknown:?}");
+    assert!(env_unknown.stdout.is_empty());
+    let env_unknown_stderr = String::from_utf8(env_unknown.stderr).expect("utf8 stderr");
+    assert!(env_unknown_stderr.starts_with("lake env: not implemented: "));
+    assert!(!env_unknown_stderr.contains("/usr/local"));
+    // A command is not run in an invented environment either.
+    let env_unknown_run = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["env", "echo", "must_not_run"])
+        .env_remove("LEAN_SYSROOT")
+        .output()
+        .expect("run lake env echo without a sysroot");
+    assert_eq!(env_unknown_run.status.code(), Some(5));
+    assert!(env_unknown_run.stdout.is_empty());
+
+    let sysroot = temp_parent.join("sysroot");
     let env_output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .arg("env")
+        .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env");
     assert!(env_output.status.success());
     let env_stdout = String::from_utf8(env_output.stdout).expect("utf8 stdout");
-    assert!(env_stdout.contains("LEAN_SYSROOT="));
-    assert!(env_stdout.contains("LEAN_PATH="));
+    assert!(env_stdout.contains(&format!("LEAN_SYSROOT={}\n", sysroot.display())));
+    assert!(env_stdout.contains(&format!(
+        "LEAN_PATH={}\n",
+        sysroot.join("lib").join("lean").display()
+    )));
     assert!(env_stdout.contains("ELAN_TOOLCHAIN="));
 
     // 4. lake env echo hello
     let env_echo = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["env", "echo", "testing_lake_env_propagation"])
+        .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env echo");
     assert!(env_echo.status.success());
@@ -863,6 +1123,7 @@ rev = "v4.32.0"
     // 5. lake env with nonexistent command exits 255
     let env_missing = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["env", "nonexistent_command_12345_xyz"])
+        .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env missing");
     assert_eq!(env_missing.status.code(), Some(255));
@@ -1487,4 +1748,158 @@ fn olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude() {
         robot.contains("\"outcome\":\"complete\",\"parts\":3,"),
         "{robot}"
     );
+}
+
+/// Every file under `root` by relative path, without `.git` and
+/// `lean-toolchain`.
+fn scaffold_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name != ".git" {
+                    pending.push(path);
+                }
+            } else if name != "lean-toolchain" {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                out.insert(relative, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// `lake new` writes the pin's `std` tree, refuses the templates it does not
+/// write, and `lake clean` removes the directory the package builds into.
+///
+/// Where the pinned toolchain is installed, the pinned `lake new demo` runs
+/// beside ours and every file is compared. Two things are left out of the
+/// comparison and are differences, not agreements: `lean-toolchain`, because
+/// the pin writes the toolchain name its launcher gave it, and `.git`, because
+/// this implementation spawns git only to fetch dependencies. Typed skip
+/// without the pin; `FLN_REQUIRE_REFERENCE` turns the skip into a failure.
+#[test]
+fn lake_new_writes_the_tree_the_pinned_lake_writes() {
+    let guard = TempDir::new("lake-new-pin");
+    let root = guard.0.clone();
+    let ours_parent = root.join("ours");
+    std::fs::create_dir_all(&ours_parent).unwrap();
+    let lake = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&ours_parent)
+            .args(args)
+            .output()
+            .expect("run lake")
+    };
+
+    let created = lake(&["new", "demo"]);
+    assert!(created.status.success(), "{created:?}");
+    let ours = scaffold_tree(&ours_parent.join("demo"));
+    assert_eq!(
+        ours.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            ".github/workflows/lean_action_ci.yml",
+            ".gitignore",
+            "Demo.lean",
+            "Demo/Basic.lean",
+            "Main.lean",
+            "README.md",
+            "lakefile.toml",
+        ]
+    );
+    // The line the old scaffold got wrong: the pin indents the body of `main`.
+    assert_eq!(
+        String::from_utf8_lossy(&ours["Main.lean"]),
+        "import Demo\n\ndef main : IO Unit :=\n  IO.println s!\"Hello, {hello}!\"\n"
+    );
+
+    // A template the pin has and this does not write: said so, and nothing made.
+    // It used to exit 0 and write the default project whatever was asked for.
+    let math = lake(&["new", "mathy", "math"]);
+    assert_eq!(math.status.code(), Some(5), "{math:?}");
+    assert!(
+        String::from_utf8_lossy(&math.stderr)
+            .starts_with("lake new: not implemented: the `math` template")
+    );
+    assert!(!ours_parent.join("mathy").exists());
+    // A template the pin does not have: the pin's own words.
+    let unknown = lake(&["new", "x", "zzz"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&unknown.stderr),
+        "error: unknown package template `zzz`\n"
+    );
+    assert!(!ours_parent.join("x").exists());
+
+    // `lake clean` removes the configured build directory. It used to remove
+    // `.lake/build` whatever the package said, and report success.
+    let cleaned = lake(&["new", "cleanme"]);
+    assert!(cleaned.status.success(), "{cleaned:?}");
+    let package = ours_parent.join("cleanme");
+    std::fs::write(
+        package.join("lakefile.toml"),
+        "name = \"cleanme\"\nbuildDir = \"out\"\n\n[[lean_lib]]\nname = \"Cleanme\"\n",
+    )
+    .unwrap();
+    for built in ["out/lib", ".lake/build/lib"] {
+        std::fs::create_dir_all(package.join(built)).unwrap();
+    }
+    let clean = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&package)
+        .arg("clean")
+        .output()
+        .expect("run lake clean");
+    assert!(clean.status.success(), "{clean:?}");
+    assert!(
+        !package.join("out").exists(),
+        "the configured build directory survived"
+    );
+    assert!(
+        package.join(".lake/build").exists(),
+        "another directory was removed"
+    );
+
+    let pinned = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| {
+            home.join(".elan/toolchains")
+                .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                .join("bin/lake")
+        })
+        .filter(|lake| lake.is_file());
+    let Some(pinned) = pinned else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned lake is absent"
+        );
+        println!("SKIP: no pinned lake; the scaffold was not compared with the pin's");
+        return;
+    };
+    let pin_parent = root.join("pin");
+    std::fs::create_dir_all(&pin_parent).unwrap();
+    let theirs = Command::new(&pinned)
+        .args(["new", "demo"])
+        .current_dir(&pin_parent)
+        .output()
+        .expect("run the pinned lake new");
+    assert!(theirs.status.success(), "{theirs:?}");
+    let theirs = scaffold_tree(&pin_parent.join("demo"));
+    assert_eq!(
+        ours.keys().collect::<Vec<_>>(),
+        theirs.keys().collect::<Vec<_>>(),
+        "the two scaffolds hold different files"
+    );
+    for (path, bytes) in &theirs {
+        assert!(
+            &ours[path] == bytes,
+            "{path} differs from the pin's:\nours: {:?}\npin:  {:?}",
+            String::from_utf8_lossy(&ours[path]),
+            String::from_utf8_lossy(bytes)
+        );
+    }
 }

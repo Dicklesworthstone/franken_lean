@@ -20,8 +20,12 @@ impl Mode {
         }
     }
 }
+/// The pin's `syntax (name := cdot) cdotTk tacticSeqIndentGt : tactic` (`Init/NotationExtra.lean`).
+pub(super) fn is_cdot(kind: &Name) -> bool {
+    kind == &Name::from_components(["Lean", "cdot"])
+}
 pub(super) fn mode(kind: &Name) -> Option<Mode> {
-    if kind == &parser_kind(&["Tactic", "cdot"]) {
+    if is_cdot(kind) {
         Some(Mode::Solve)
     } else if kind == &parser_kind(&["Tactic", "focus"]) {
         Some(Mode::Focus)
@@ -45,6 +49,80 @@ pub(super) struct Frame<'a> {
     after: Option<Vec<&'a Syntax>>,
 }
 impl Context {
+    /// Options wrap the whole visible goal frontier, not just its main goal.
+    /// In particular an enclosed all_goals still sees the caller's siblings,
+    /// and an unfinished body returns its goals to the outer sequence.
+    pub(super) fn start_tactic_options<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        args: &'a [Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let (syntax, options) = self.enter_source_options(args)?;
+        let body = self.proof_instructions(syntax)?;
+        let boundary = proof
+            .work
+            .iter()
+            .rposition(|work| {
+                matches!(
+                    work,
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
+                )
+            })
+            .map_or(0, |position| position + 1);
+        let scope = OptionScope {
+            options,
+            instructions: std::mem::replace(&mut proof.instructions, body),
+            cursor: proof.cursor + 1,
+        };
+        proof.cursor = 0;
+        proof
+            .work
+            .insert(boundary, Work::EndOptions(Box::new(scope)));
+        Ok(())
+    }
+
+    pub(super) fn finish_tactic_options<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        scope: OptionScope<'a>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if proof.cursor != proof.instructions.len() {
+            return Err(error(TacticError::NoGoals));
+        }
+        self.txn.options = scope.options;
+        proof.instructions = scope.instructions;
+        proof.cursor = scope.cursor;
+        Ok(())
+    }
+
+    pub(super) fn suspend_tactic_options(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: &ProofGoal,
+    ) -> Result<bool, NatDefinitionElabError> {
+        for position in (0..proof.work.len()).rev() {
+            self.tick()?;
+            match &proof.work[position] {
+                Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_) => {
+                    return Ok(false);
+                }
+                Work::EndOptions(_) => {
+                    let Work::EndOptions(scope) = proof.work.remove(position) else {
+                        unreachable!("option boundary");
+                    };
+                    self.finish_tactic_options(proof, *scope)?;
+                    proof.work.push(Work::Goal(goal.clone()));
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn start_goal_control<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -63,8 +141,26 @@ impl Context {
         left: &'a Syntax,
         right: &'a Syntax,
     ) -> Result<(), NatDefinitionElabError> {
-        let left = self.proof_instructions(left)?;
-        let right = self.proof_instructions(right)?;
+        // The pin's operands are single tactics (or a parenthesized sequence); a sequence is
+        // what this elaborator's own syntax may still hold.
+        let operand = |this: &mut Self, syntax: &'a Syntax| {
+            if syntax.kind() == Some(&parser_kind(&["Tactic", "tacticSeq"])) {
+                return this.proof_instructions(syntax);
+            }
+            if let Syntax::Node { kind, args, .. } = syntax
+                && kind == &parser_kind(&["Tactic", "paren"])
+            {
+                let [open, body, close] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(open, "(", "tactic sequence opening")?;
+                expect_atom(close, ")", "tactic sequence closing")?;
+                return this.proof_instructions(body);
+            }
+            Ok(vec![syntax])
+        };
+        let left = operand(self, left)?;
+        let right = operand(self, right)?;
         if right.is_empty() {
             return Err(error(TacticError::MalformedScript));
         }
@@ -109,7 +205,9 @@ impl Context {
         for work in proof.work.iter().rev() {
             self.tick()?;
             match work {
-                Work::EndScript(..) | Work::EndAttempt(_) => return Ok(false),
+                Work::EndScript(..) | Work::EndAttempt(_) | Work::EndOptions(_) => {
+                    return Ok(false);
+                }
                 Work::EndControl(index) => {
                     boundary = Some(*index);
                     break;

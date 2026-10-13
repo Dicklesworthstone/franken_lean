@@ -68,7 +68,7 @@ impl Drop for Project {
 fn checked_libraries_load_nested_imports_records_and_automation_once() {
     let p = Project::new();
     let common = "namespace Library\nstructure Box where\n  value : Nat\ndef wrap.{u} {A : Sort u} (x : A) : A := x\n@[simp] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\nend Library";
-    let main = "\u{feff}-- 🤖 original file\r\nimport Left Right\r\nopen Library\r\ndef record : Box := { value := 9 }\r\ntheorem use : wrap record.value = 9 := by simp [record]";
+    let main = "\u{feff}-- 🤖 original file\r\nimport Left\r\nimport Right\r\nopen Library\r\ndef record : Box := { value := 9 }\r\ntheorem use : wrap record.value = 9 := by simp [record]";
     p.write("Lib/Common.lean", common);
     p.write("Left.lean", "import Lib.Common\ndef left := 1");
     p.write("Right.lean", "import Lib.Common\ndef right := 2");
@@ -96,7 +96,7 @@ fn isolated_module_elaboration_preserves_instance_choices() {
         "instance seven : Inhabited Nat := Inhabited.mk 7",
     );
     p.write("Independent.lean", "def chosen : Nat := default");
-    p.write("Main.lean", "import Choice Independent\ntheorem original : chosen = 0 := by rfl\ntheorem current : (default : Nat) = 7 := by rfl");
+    p.write("Main.lean", "import Choice\nimport Independent\ntheorem original : chosen = 0 := by rfl\ntheorem current : (default : Nat) = 7 := by rfl");
     p.complete();
     p.write("Independent.lean", "def stolen : Nat := seven.default");
     p.refused();
@@ -131,7 +131,7 @@ fn quoted_structural_names_are_not_split_on_literal_dots() {
     p.write("A/B.lean", "def nested := 9");
     p.write(
         "Main.lean",
-        "import «A.B» A.B\ntheorem a : literal = 7 := by rfl\ntheorem b : nested = 9 := by rfl",
+        "import «A.B»\nimport A.B\ntheorem a : literal = 7 := by rfl\ntheorem b : nested = 9 := by rfl",
     );
     assert!(p.complete().contains("\"files\":3"));
 }

@@ -34,9 +34,10 @@
 //! *previous* event was, as when typing a `-` before an existing `-` turns two tokens into a
 //! line comment.
 
+use crate::literal::LiteralKind;
 use crate::source::{BytePos, ByteSpan, SourceText};
-use crate::token::{LexedToken, TokenError, TokenTable, lex_token};
-use crate::trivia::scan_trivia;
+use crate::token::{LexedToken, TokenError, TokenKind, TokenTable, lex_token};
+use crate::trivia::{opens_doc_comment, scan_doc_comment, scan_trivia};
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 
@@ -200,6 +201,29 @@ fn lex_from_bounded(
                 if stop.0 >= end {
                     break;
                 }
+                // A doc comment's body is `commentBody`, which no token table can express:
+                // the whole comment is one token, named by its opener, and its extent
+                // covers everything the scan read, as every unbounded construct's does.
+                if opens_doc_comment(text, stop) {
+                    let next = push_doc_comment(text, stop, &mut events);
+                    if over(&events) {
+                        return (events, true);
+                    }
+                    if next.0 <= stop.0 {
+                        break;
+                    }
+                    at = next;
+                    continue;
+                }
+                // `h.1.isEmpty`: digits right after a projection's `.` are a field index, read
+                // as digits alone, never the numeral `1.isEmpty` would begin.
+                if let Some(next) = push_field_index(text, stop, &mut events) {
+                    if over(&events) {
+                        return (events, true);
+                    }
+                    at = next;
+                    continue;
+                }
                 match lex_token(text, table, stop) {
                     Ok(token) => {
                         let next = token.extent.end();
@@ -257,6 +281,82 @@ fn lex_from_bounded(
         }
     }
     (events, false)
+}
+
+/// Push the event for the doc comment opening at `stop`, returning where the driver resumes.
+/// Out of line, and the event is built here rather than returned, so nothing of it occupies the
+/// driver's frame: parsers run the driver on small host stacks.
+#[inline(never)]
+fn push_doc_comment(text: &SourceText, stop: BytePos, events: &mut Vec<Event>) -> BytePos {
+    match scan_doc_comment(text, stop) {
+        Ok(next) => {
+            events.push(Event::Token(LexedToken {
+                kind: TokenKind::Symbol(text.as_str()[stop.0..stop.0 + 3].to_owned()),
+                extent: span(stop, next),
+            }));
+            next
+        }
+        Err(error) => {
+            let resume = crate::recover::resume_after_trivia_error(text, error);
+            events.push(Event::Refused {
+                error: RunError::Trivia(error),
+                skipped: span(stop, resume),
+            });
+            resume
+        }
+    }
+}
+
+/// A field index, as the pin's `proj` reads one: `"." >> checkNoWsBefore >> (fieldIdx <|>
+/// rawIdent)` (vendored `src/Lean/Parser/Term.lean`), where `fieldIdxFn` takes a nonzero digit
+/// and then digits, and nothing else. So in `h.1.isEmpty` the `1` is a field index and the
+/// `.isEmpty` the next projection, where the generic numeral would read `1.` and refuse the
+/// identifier after its decimal point. The `.` must touch both the term before it (an
+/// identifier, a numeral or a closing bracket) and the digits. Pushes the index and returns
+/// its end; `None` leaves `stop` to the ordinary lexer. Out of line, so it adds nothing to the
+/// driver's frame.
+#[inline(never)]
+fn push_field_index(text: &SourceText, stop: BytePos, events: &mut Vec<Event>) -> Option<BytePos> {
+    let bytes = text.as_bytes();
+    if !bytes
+        .get(stop.0)
+        .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+    {
+        return None;
+    }
+    let mut tokens = events
+        .iter()
+        .rev()
+        .filter(|event| !matches!(event, Event::Trivia(span) if span.len_bytes() == 0));
+    let Some(Event::Token(dot)) = tokens.next() else {
+        return None;
+    };
+    if !matches!(&dot.kind, TokenKind::Symbol(symbol) if symbol == ".") || dot.extent.end() != stop
+    {
+        return None;
+    }
+    let Some(Event::Token(before)) = tokens.next() else {
+        return None;
+    };
+    let projectable = match &before.kind {
+        TokenKind::Ident(_) | TokenKind::Literal(LiteralKind::Nat) => true,
+        // `(·.1.foo)`: the cdot stands for the function's argument, projected.
+        TokenKind::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]" | "}" | "⟩" | "⦄" | "·"),
+        TokenKind::Literal(_) => false,
+    };
+    if !projectable || before.extent.end() != dot.extent.start() {
+        return None;
+    }
+    let mut end = stop.0;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    let next = BytePos(end);
+    events.push(Event::Token(LexedToken {
+        kind: TokenKind::Literal(LiteralKind::Nat),
+        extent: span(stop, next),
+    }));
+    Some(next)
 }
 
 /// Skip one scalar past a token refusal, so the driver always advances.
@@ -318,9 +418,9 @@ pub fn relex_incremental(
     //
     // So the restart backs up by the lexer's actual lookahead bound:
     //   * `max_token_len`, covering every trie walk;
-    //   * `LITERAL_LOOKAHEAD`, covering the fixed two-character probes — the `..` after a
-    //     numeral, the `''` that is not a char literal, `--` and `/-`, the backtick's
-    //     following character;
+    //   * `LITERAL_LOOKAHEAD`, covering the fixed probes — the `..` after a numeral, the
+    //     `''` that is not a char literal, `--` and `/-`, the backtick's following
+    //     character, and the three-byte doc comment opener `/--` or `/-!`;
     //   * a backward walk over `#`* and an `r`, the one *unbounded* probe in the lexer
     //     (`isRawStrLitStart` reads arbitrarily many `#`s before deciding), so an `r###x`
     //     whose `x` becomes a quote is re-lexed from the `r`.
@@ -334,7 +434,7 @@ pub fn relex_incremental(
         .position(|event| event.extent().end().0 >= edited.start().0)
         .unwrap_or(old.events.len());
 
-    const LITERAL_LOOKAHEAD: usize = 2;
+    const LITERAL_LOOKAHEAD: usize = 3;
     let lookback = table.max_token_len().max(LITERAL_LOOKAHEAD);
     let mut safe_before = edited.start().0.saturating_sub(lookback);
     safe_before = extend_back_over_raw_string_opener(new_text, safe_before);
@@ -718,5 +818,86 @@ mod tests {
                 assert!(!message.is_empty(), "{raw:?}: empty diagnostic message");
             }
         }
+    }
+
+    /// A doc comment is one token named by its opener, however much prose its body holds,
+    /// and an incremental re-lex agrees with a full one when an edit opens, closes or enters
+    /// one.
+    #[test]
+    fn a_doc_comment_is_one_token_and_relexes_like_a_full_run() {
+        let text = text_of("/-- it's `x` -/\ndef f := 1\n/-! a /- b -/ c -/");
+        let run = lex_run(&text, &table());
+        assert!(run.accepted(), "{run:?}");
+        let tokens: Vec<_> = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Token(token) => Some(token),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens[0].kind, TokenKind::Symbol("/--".to_owned()));
+        assert_eq!(tokens[0].extent, span(BytePos(0), BytePos(15)));
+        assert_eq!(tokens.len(), 6, "{tokens:?}");
+        assert_eq!(tokens[5].kind, TokenKind::Symbol("/-!".to_owned()));
+        assert!(!lex_run(&text_of("def /-- open"), &table()).accepted());
+        for (old, at, len, insert) in [
+            ("/- c -/ def", 2, 0, "-"),
+            ("/-- c -/ def", 2, 1, ""),
+            ("/-- c -/ def", 6, 2, ""),
+            ("/-- c def", 6, 0, "-/"),
+            ("def /-- a -/ f", 9, 0, " /- x -/"),
+        ] {
+            let new = [&old[..at], insert, &old[at + len..]].concat();
+            let new_text = text_of(&new);
+            let before = lex_run(&text_of(old), &table());
+            let edited = ByteSpan::new(BytePos(at), BytePos(at + len)).expect("forward span");
+            let (incremental, _) =
+                relex_incremental(&before, edited, insert.len(), &new_text, &table());
+            assert_eq!(
+                incremental,
+                lex_run(&new_text, &table()),
+                "{old:?} -> {new:?}"
+            );
+        }
+    }
+
+    /// Digits right after a projection's touching `.` are a field index, so `h.1.isEmpty`
+    /// lexes; a `.` with space before it, a leading zero, or a decimal numeral are unchanged.
+    #[test]
+    fn a_digit_after_a_touching_projection_dot_is_a_field_index() {
+        let table = TokenTable::from_tokens([".", "(", ")", ":=", "·"]);
+        let tokens = |raw: &str| {
+            let run = lex_run(&text_of(raw), &table);
+            let accepted = run.accepted();
+            let shapes: Vec<String> = run
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Token(token) => {
+                        Some(raw[token.extent.start().0..token.extent.end().0].to_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (accepted, shapes.join(" "))
+        };
+        assert_eq!(
+            tokens("h.1.isEmpty_eq"),
+            (true, "h . 1 . isEmpty_eq".to_owned())
+        );
+        assert_eq!(tokens("(p).2.impl"), (true, "( p ) . 2 . impl".to_owned()));
+        assert_eq!(tokens("m.12.e"), (true, "m . 12 . e".to_owned()));
+        // The cdot's argument, projected (`Init/Data/Iterators/Consumers/Monadic/Collect.lean`).
+        assert_eq!(
+            tokens("(·.1.steps)"),
+            (true, "( · . 1 . steps )".to_owned())
+        );
+        assert_eq!(tokens("x := 0.5"), (true, "x := 0.5".to_owned()));
+        assert!(
+            !tokens("h .1.isEmpty").0,
+            "a `.` after space is no projection"
+        );
+        assert!(!tokens("h.0.isEmpty").0, "fieldIdx takes no leading zero");
     }
 }

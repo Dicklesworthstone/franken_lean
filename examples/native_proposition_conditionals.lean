@@ -11,8 +11,8 @@ theorem recover (p : Prop) [Decidable p] (hp : p) : p := by
   · exact hp
 
 def Carrier : Type := if Not True then String else Nat
-def inhabitant : Carrier := 23
-theorem inhabitant_ok : inhabitant = 23 := by rfl
+def inhabitant : Carrier := (23 : Nat)
+theorem inhabitant_ok : inhabitant = (23 : Nat) := by rfl
 
 def callback : Nat -> Nat := if True then fun n => n + 1 else fun n => n + 2
 theorem callback_ok : callback 7 = 8 := by rfl

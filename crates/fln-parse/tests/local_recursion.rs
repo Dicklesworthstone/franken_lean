@@ -36,7 +36,8 @@ fn incomplete_or_unsupported_recursive_groups_do_not_lose_tokens() {
         "def n : Nat := let rec f (n : Nat) : Nat := n;",
         "def n : Nat := let rec f (n : Nat) : Nat := ; 0",
         "def n : Nat := let rec f (n : Nat) : Nat := n, g (n : Nat) : Nat := n; g 0",
-        "def n : Nat := let rec f (n : Nat) : Nat := n termination_by n; f 0",
+        // A fixpoint annotation is not read (`termination_by` is: a reference row).
+        "def n : Nat := let rec f (n : Nat) : Nat := n partial_fixpoint; f 0",
     ] {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }

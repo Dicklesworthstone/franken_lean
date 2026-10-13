@@ -342,7 +342,7 @@ fn inspection_cannot_contaminate_later_checking_or_accept_false_proofs() {
 
 const MUTUAL_DATA: &str = "mutual
   inductive Tree (A : Type) where | node (value : A) (children : Forest A)
-  inductive Forest (B : Type) where | nil | cons (head : Tree B) (tail : Forest B)
+  inductive Forest (A : Type) where | nil | cons (head : Tree A) (tail : Forest A)
 end";
 
 #[test]

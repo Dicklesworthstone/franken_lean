@@ -110,7 +110,7 @@ fn query(ctx: &mut Context, registry: &InstanceRegistry) -> (Frame, MVarId, MVar
     };
     let ambient = ctx.txn.lctx.clone();
     let frame = ctx
-        .instance_frame(root.clone(), registry, &ambient, None)
+        .instance_frame(root.clone(), registry, &ambient, None, true)
         .unwrap()
         .unwrap();
     let ExprNode::MVar { id: alpha } = alpha.node() else {
@@ -133,6 +133,8 @@ fn path(ctx: &Context) -> [Frame; 1] {
         cursor: 0,
         chosen: None,
         children: vec![],
+        size: 0,
+        parent_size: 0,
         resumable: false,
         replay_first: false,
         returned: false,
@@ -183,7 +185,7 @@ fn cached_dictionary_answers_fill_fresh_dependent_outputs_without_copying_assign
         assert!(!ctx.txn.mvars.is_assigned(&d));
         assert_eq!(
             table.lookup(&mut ctx, &frame, &path).unwrap(),
-            Some(Answer::Solved(value()))
+            Some(Answer::Solved(value(), 1))
         );
         assert_eq!(
             ctx.txn.mvars.get_assigned_expr(&alpha),
@@ -287,7 +289,7 @@ fn dependent_key_aliases_use_saved_assignments_not_later_search_results() {
     };
     let ambient = ctx.txn.lctx.clone();
     let frame = ctx
-        .instance_frame(id.clone(), &registry, &ambient, None)
+        .instance_frame(id.clone(), &registry, &ambient, None, true)
         .unwrap()
         .unwrap();
     let before = key(&mut ctx, &frame, &path)
