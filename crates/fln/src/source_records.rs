@@ -570,14 +570,13 @@ impl Engine {
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if let Some(name) = noncomputable {
-                    let name = scope.declaration_name(&name).map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::NameScope(error),
-                            ),
-                        ))
-                    })?;
-                    batch.engine.environment = tag_noncomputable(&batch.engine, &name)?;
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "noncomputable metadata requires one checked declaration",
+                        });
+                    };
+                    batch.engine.environment =
+                        tag_noncomputable(&batch.engine, &admitted.declaration, &name, scope)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if let Some(name) = protected {
@@ -1111,13 +1110,45 @@ pub(crate) fn tag_protected(
         })
 }
 
-/// Tag an admitted `noncomputable def` (`scope`'s `noncomputable_registration`), as the pin's
-/// `addNoncomputable`: the runtime catalog never binds it.
+/// Bind a source noncomputable request to the declaration that just passed the council.
+/// Anonymous instances take their generated name from that admission. Named requests must
+/// match it after namespace/private-name expansion; an unrelated existing declaration is
+/// never a valid substitute. The journal only removes a runtime binding, not proof authority.
 pub(crate) fn tag_noncomputable(
     engine: &Engine,
-    name: &Name,
+    declaration: &Declaration,
+    requested: &Name,
+    scope: &fln_elab::source::scope::SourceScope,
 ) -> Result<Environment, EngineExecutionError> {
-    fln_elab::noncomputable::register(engine.environment(), name).map_err(|_| {
+    let declared = match declaration {
+        Declaration::Defn(value) => &value.base.name,
+        Declaration::Thm(value) => &value.base.name,
+        Declaration::Opaque(value) => &value.base.name,
+        // Public proof/opaque interfaces retain the checked declaration's exact name.
+        Declaration::Axiom(value) if !value.is_unsafe => &value.base.name,
+        _ => {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "noncomputable metadata requires one checked declaration",
+            });
+        }
+    };
+    let name = if requested.is_anonymous() {
+        declared.clone()
+    } else {
+        scope.declaration_name(requested).map_err(|error| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::NameScope(error),
+                ),
+            ))
+        })?
+    };
+    if &name != declared {
+        return Err(EngineExecutionError::UnexpectedPublication {
+            detail: "noncomputable metadata must name the completed checked declaration",
+        });
+    }
+    fln_elab::noncomputable::register(engine.environment(), &name).map_err(|_| {
         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
             fln_elab::NatDefinitionElabError::UnexpectedSyntax {
                 expected: "a noncomputable tag on an admitted declaration",

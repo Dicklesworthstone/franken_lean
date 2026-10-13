@@ -93,8 +93,10 @@ mod tests {
     fn budget_stops_do_not_cache_a_partial_noncomputable_view() {
         let env = environment();
         let head = Expr::const_(name("secret"), vec![]);
-        let mut limits = IngressLimits::default();
-        limits.max_nodes = 0;
+        let limits = IngressLimits {
+            max_nodes: 0,
+            ..IngressLimits::default()
+        };
         let mut preparation = Preparation::new(&env, limits);
         for _ in 0..2 {
             assert!(matches!(

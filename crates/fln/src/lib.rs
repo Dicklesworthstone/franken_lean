@@ -6946,17 +6946,12 @@ impl Engine {
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some(name) = noncomputable {
-                    let name = fln_elab::source::scope::SourceScope::default()
-                        .declaration_name(&name)
-                        .map_err(|error| {
-                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                fln_elab::NatDefinitionElabError::Inference(
-                                    fln_elab::source::SourceInferenceError::NameScope(error),
-                                ),
-                            ))
-                        })?;
-                    admitted.engine.environment =
-                        source_records::tag_noncomputable(&admitted.engine, &name)?;
+                    admitted.engine.environment = source_records::tag_noncomputable(
+                        &admitted.engine,
+                        &admitted.declaration,
+                        &name,
+                        &self.base_source_scope(),
+                    )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some(name) = protected {
@@ -7821,7 +7816,7 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_some();
-            // A `noncomputable def` is checked, never compiled (the pin's `noncomputableExt`).
+            // A noncomputable declaration is checked, never compiled (the pin's `noncomputableExt`).
             let is_noncomputable = parsed.kind() == fln_parse::SourceCommandKind::Definition
                 && fln_elab::source::noncomputable_registration(parsed.syntax())
                     .map_err(DefinitionFrontendError::Elaborate)

@@ -262,6 +262,7 @@ impl Preparation<'_> {
                         work.push(Frame::Visit(replacement, expected));
                         continue;
                     }
+                    self.check_noncomputable_head(&expr)?;
                     match expr.node() {
                         ExprNode::App { .. } => {
                             let (head, args) = self.spine(&expr)?;
@@ -270,6 +271,7 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(replacement, expected));
                                 continue;
                             }
+                            self.check_noncomputable_head(&head)?;
                             if let Some(inlined) = self.lazy_conditional(&head, &args)? {
                                 reserve(&mut work, self.limits.max_nodes)?;
                                 work.push(Frame::Visit(inlined, expected));

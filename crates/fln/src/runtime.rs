@@ -21,6 +21,7 @@ mod io_result;
 mod mutual;
 mod nat;
 mod native_intrinsics;
+mod noncomputable;
 mod partial;
 mod projections;
 mod proofs;
@@ -49,6 +50,7 @@ pub(super) struct Preparation<'a> {
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
+    noncomputable: Option<BTreeSet<Name>>,
     /// Opaques whose values may run; see `Engine::executable_opaques`. None
     /// unless the caller names its engine's set.
     executable_opaques: Option<&'a BTreeSet<Name>>,
@@ -147,6 +149,7 @@ impl<'a> Preparation<'a> {
             visited: 0,
             externs: None,
             implementations: None,
+            noncomputable: None,
             executable_opaques: None,
             runtime_initializers: None,
             native_intrinsics: native_intrinsics::Store::default(),

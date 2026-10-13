@@ -2,7 +2,8 @@
 //! directly (bead `franken_lean-z8j.1.6.6`): "code generator does not support recursor
 //! `T.rec` yet, consider using 'match ... with' and/or structural recursion".
 //!
-//! The pin compiles every `def`, `instance` and `example` (not a theorem). Lowering
+//! The pin compiles `def`, `instance` and `example` unless marked `noncomputable`,
+//! and never a theorem. Lowering
 //! (vendored `src/Lean/Compiler/LCNF/ToLCNF.lean:817`, `visitApp`) first rewrites a
 //! constant through its `@[csimp]` replacement, then handles `Eq.rec`, `HEq.rec`,
 //! `And.rec`/`Iff.rec`, `False.rec`/`Empty.rec`, `casesOn`, constructors, `noConfusion`
