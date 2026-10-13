@@ -1,0 +1,35 @@
+name: Native proof integration inputs
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-proof-work-session.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Export exact integration inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/native-proof-inputs"
+          mkdir -p "$evidence"
+          git archive --format=tar.gz HEAD > "$evidence/source.tar.gz"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$evidence/tree.txt"
+          git ls-tree -r HEAD > "$evidence/files.txt"
+          sha256sum "$evidence/source.tar.gz" > "$evidence/SHA256SUMS"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-proof-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/native-proof-inputs
+          retention-days: 2
+          if-no-files-found: error
