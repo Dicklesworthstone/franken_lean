@@ -457,7 +457,15 @@ fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, InstanceRe
 #[derive(Clone, Default)]
 pub(crate) struct RegistryCache {
     last: std::cell::RefCell<Option<(RegistryKey, std::sync::Arc<InstanceRegistry>)>>,
+    /// The last [`InstanceRegistry::read_with_scopes`] view, keyed also by the scopes it read.
+    scoped: std::cell::RefCell<ScopedEntry>,
 }
+
+type ScopedEntry = Option<(
+    RegistryKey,
+    scoped::ActiveScopes,
+    std::sync::Arc<InstanceRegistry>,
+)>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RegistryKey {
@@ -496,6 +504,32 @@ impl RegistryCache {
         }
         let registry = std::sync::Arc::new(InstanceRegistry::read(env)?);
         *self.last.borrow_mut() = Some((key, std::sync::Arc::clone(&registry)));
+        Ok(registry)
+    }
+
+    /// [`InstanceRegistry::read_with_scopes`], read again only when what [`Self::read`] reads
+    /// or the active scopes change. Elaborating one term reads the scoped view at every
+    /// instance-resolution pass, and each read validated every imported instance row again.
+    pub(crate) fn read_with_scopes(
+        &self,
+        env: &Environment,
+        scopes: &scoped::ActiveScopes,
+    ) -> Result<std::sync::Arc<InstanceRegistry>, InstanceRegistryError> {
+        let key = RegistryKey {
+            rows: env
+                .extension(&extension_name())
+                .map(|extension| extension.content_digest().0),
+            imported: imported::journal_digest(env),
+            constants: env.len(),
+        };
+        if let Some((cached, cached_scopes, registry)) = self.scoped.borrow().as_ref()
+            && *cached == key
+            && cached_scopes == scopes
+        {
+            return Ok(std::sync::Arc::clone(registry));
+        }
+        let registry = std::sync::Arc::new(InstanceRegistry::read_with_scopes(env, scopes)?);
+        *self.scoped.borrow_mut() = Some((key, scopes.clone(), std::sync::Arc::clone(&registry)));
         Ok(registry)
     }
 }
@@ -784,6 +818,58 @@ mod tests {
             .unwrap();
         assert!(cache.read(&broken).is_err());
         assert!(cache.read(&broken).is_err());
+    }
+    #[test]
+    fn a_cached_scoped_view_is_reread_exactly_when_its_environment_or_scopes_change() {
+        use fln_core::level::Level;
+        use fln_env::constants::{AxiomVal, ConstantVal};
+        let axiom = |name: &str| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components([name]),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            })
+        };
+        let class = Name::from_components(["C"]);
+        let base = Environment::new().add_decl(axiom("C")).unwrap();
+        let none = scoped::ActiveScopes::default();
+        let cache = RegistryCache::default();
+        let before = cache.read_with_scopes(&base, &none).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &cache.read_with_scopes(&base, &none).unwrap()),
+            "an unchanged environment and scope set is not re-read"
+        );
+        // A new journal row is seen, and a rollback is answered as it was.
+        let registered = register_class(&base, &class).unwrap();
+        let after = cache.read_with_scopes(&registered, &none).unwrap();
+        assert!(after.is_class(&class));
+        assert!(
+            !cache
+                .read_with_scopes(&base, &none)
+                .unwrap()
+                .is_class(&class)
+        );
+        // A different scope set over the same environment re-reads, and every answer is a
+        // fresh read's.
+        let mut opened = none.clone();
+        opened
+            .activate(&registered, &Name::from_components(["N"]))
+            .unwrap();
+        let scoped_view = cache.read_with_scopes(&registered, &opened).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&after, &scoped_view));
+        assert_eq!(
+            *scoped_view,
+            InstanceRegistry::read_with_scopes(&registered, &opened).unwrap()
+        );
+        // A failed read is not kept.
+        let broken = registered
+            .push_extension_entry(&extension_name(), b"FLNINST\x02".to_vec())
+            .unwrap();
+        assert!(cache.read_with_scopes(&broken, &none).is_err());
+        assert!(cache.read_with_scopes(&broken, &none).is_err());
     }
     #[test]
     fn empty_or_unadmitted_registrations_cannot_supply_instances() {

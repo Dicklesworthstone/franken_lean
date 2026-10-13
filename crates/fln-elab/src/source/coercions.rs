@@ -3,7 +3,6 @@
 //! grants proof authority: the final declaration still needs kernel admission.
 use super::instances::{nonmatch, registry_error};
 use super::*;
-use crate::instances::InstanceRegistry;
 use fln_env::constants::ConstantInfo;
 
 mod expand;
@@ -332,9 +331,10 @@ impl Context {
         &mut self,
         target: Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         let saved = self.txn.lctx.clone();
         let suspended = std::mem::take(&mut self.equations);
         let hole = self.instance_hole(target)?;
@@ -506,9 +506,10 @@ impl Context {
             return Ok(false);
         }
         let class = Name::from_components(["CoeFun"]);
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         if !self.txn.env.contains(&class)
             || registry.imported_class_parameters(&class).is_none()
             || !registry.candidates(&class).is_empty()
