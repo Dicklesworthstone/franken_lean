@@ -112,7 +112,7 @@ impl Context {
         let ExprNode::Const { name, .. } = expression.node() else {
             return Ok(None);
         };
-        let Some(type_) = self.txn.env.find(name).map(|c| c.type_().clone()) else {
+        let Some(type_) = self.txn.env.find(name).map(|c| c.constant_val().type_.clone()) else {
             return Ok(None);
         };
         let mut result = type_;

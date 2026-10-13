@@ -74,6 +74,7 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 mod modules;
+mod quotation;
 pub use modules::NativeSyntaxModule;
 
 /// A `ParserDescr` (`Init/Prelude.lean`, `inductive ParserDescr`), one variant per constructor,
@@ -1532,7 +1533,7 @@ impl FileGrammar {
                         Syntax::Node { args, .. } => args
                             .first()
                             .and_then(ident_name)
-                            .map(|name| (position, name))
+                            .map(|name| (vec![position], name))
                             .ok_or("a notation variable"),
                         _ => Err("a notation variable"),
                     })
@@ -1541,6 +1542,7 @@ impl FileGrammar {
                     variables,
                     rhs: rhs.clone(),
                     prechecked: true,
+                    pattern: None,
                 });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
@@ -1590,10 +1592,13 @@ impl FileGrammar {
                 };
                 // `expandMixfix`'s notation: `f lhs rhs` (or `f arg`) over the operand children,
                 // its variables the macro's own hygienic names.
-                let variables: Vec<(usize, Name)> = match fixity.as_str() {
-                    "prefix" => vec![(1, mixfix_variable("arg"))],
-                    "postfix" => vec![(0, mixfix_variable("arg"))],
-                    _ => vec![(0, mixfix_variable("lhs")), (2, mixfix_variable("rhs"))],
+                let variables: Vec<(Vec<usize>, Name)> = match fixity.as_str() {
+                    "prefix" => vec![(vec![1], mixfix_variable("arg"))],
+                    "postfix" => vec![(vec![0], mixfix_variable("arg"))],
+                    _ => vec![
+                        (vec![0], mixfix_variable("lhs")),
+                        (vec![2], mixfix_variable("rhs")),
+                    ],
                 };
                 let arguments = variables
                     .iter()
@@ -1606,6 +1611,7 @@ impl FileGrammar {
                     ),
                     variables,
                     prechecked: true,
+                    pattern: None,
                 });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
@@ -1645,7 +1651,7 @@ impl FileGrammar {
                     };
                     let named = if let Some([variable, _]) = null_args(binder) {
                         let variable = ident_name(variable).ok_or("a macro variable")?;
-                        variables.push((position, macro_variable(&variable)));
+                        variables.push((vec![position], macro_variable(&variable)));
                         true
                     } else {
                         false
@@ -1667,6 +1673,7 @@ impl FileGrammar {
                         variables,
                         rhs,
                         prechecked: false,
+                        pattern: None,
                     });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
@@ -1796,22 +1803,15 @@ impl FileGrammar {
             .flatten()
             .and_then(|(pattern, rhs)| {
                 let (kind, category, children) = quotation_root(pattern)?;
-                let mut variables = Vec::new();
-                for (position, child) in children.iter().enumerate() {
-                    match child {
-                        Syntax::Atom { .. } => {}
-                        _ => {
-                            variables.push((position, macro_variable(&antiquotation_name(child)?)))
-                        }
-                    }
-                }
+                let variables = quotation::variables(children).ok()?;
                 let rhs = macro_template(rhs, &category, &variables).ok()?;
                 Some((
-                    kind,
+                    kind.clone(),
                     NotationRule {
                         variables,
                         rhs,
                         prechecked: false,
+                        pattern: Some(Syntax::node(kind, children.to_vec())),
                     },
                 ))
             });
@@ -2332,7 +2332,8 @@ impl Expander {
         if depth > MAX_EXPANSION_DEPTH {
             return Err("notation expands past the expansion depth");
         }
-        // Children first, by an explicit stack: a term's depth is the user's.
+        // A macro sees the original syntax of its arguments, not their expansions.
+        // Ordinary (non-macro) children are still walked on an explicit stack.
         enum Task<'a> {
             Visit(&'a Syntax),
             Build(fln_syntax::source::SourceInfo, &'a Name, usize),
@@ -2342,26 +2343,29 @@ impl Expander {
         while let Some(task) = tasks.pop() {
             match task {
                 Task::Visit(Syntax::Node { info, kind, args }) => {
+                    if let Some(rule) = self.rules.get(kind) {
+                        if !quotation::matches(rule, args)? {
+                            return Err("no matching quoted macro rule");
+                        }
+                        let expansion = self.instantiate(rule, args)?;
+                        built.push(self.expand_at(&expansion, depth + 1)?);
+                        continue;
+                    }
+                    if self.interpolation_kinds.contains(kind) {
+                        let expansion = self.expand_interpolation(args)?;
+                        built.push(self.expand_at(&expansion, depth + 1)?);
+                        continue;
+                    }
                     tasks.push(Task::Build(*info, kind, args.len()));
                     tasks.extend(args.iter().rev().map(Task::Visit));
                 }
                 Task::Visit(leaf) => built.push(leaf.clone()),
                 Task::Build(info, kind, count) => {
                     let args = built.split_off(built.len() - count);
-                    let node = match self.rules.get(kind).cloned() {
-                        Some(rule) => {
-                            let expansion = self.instantiate(&rule, &args)?;
-                            self.expand_at(&expansion, depth + 1)?
-                        }
-                        None if self.interpolation_kinds.contains(kind) => {
-                            let expansion = self.expand_interpolation(&args)?;
-                            self.expand_at(&expansion, depth + 1)?
-                        }
-                        None => Syntax::Node {
-                            info,
-                            kind: kind.clone(),
-                            args,
-                        },
+                    let node = Syntax::Node {
+                        info,
+                        kind: kind.clone(),
+                        args,
                     };
                     built.push(node);
                 }
@@ -2462,8 +2466,8 @@ impl Expander {
         let bound: BTreeMap<&Name, &Syntax> = rule
             .variables
             .iter()
-            .map(|(position, name)| {
-                args.get(*position)
+            .map(|(path, name)| {
+                quotation::at_path(args, path)
                     .map(|child| (name, child))
                     .ok_or("a notation node without its operand")
             })
@@ -2520,12 +2524,14 @@ impl Expander {
 /// `expandMixfix`'s notation (`f lhs rhs`, `f arg`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotationRule {
-    /// Child position, and the variable it binds.
-    pub variables: Vec<(usize, Name)>,
+    /// Child-index path from the node's arguments, and the variable it binds.
+    pub variables: Vec<(Vec<usize>, Name)>,
     pub rhs: Syntax,
     /// Whether the pin prechecks the template's names where it is declared: a notation's are,
     /// a `macro`'s or `macro_rules`' are not (an unknown name is refused only where it is used).
     pub prechecked: bool,
+    /// Original quoted pattern. `None` is an unconditional notation/macro template.
+    pub pattern: Option<Syntax>,
 }
 
 /// Expansions nest no deeper: a notation whose template reaches itself is refused.
@@ -2664,6 +2670,11 @@ fn antiquotation_name(syntax: &Syntax) -> Option<Name> {
         {
             Some(val.clone())
         }
+        [Syntax::Atom { .. }, escapes, Syntax::Atom { val, .. }, _]
+            if val == "_" && null_args(escapes).is_some_and(<[Syntax]>::is_empty) =>
+        {
+            Some(Name::from_components(["_"]))
+        }
         _ => None,
     }
 }
@@ -2675,7 +2686,7 @@ fn antiquotation_name(syntax: &Syntax) -> Option<Name> {
 fn macro_template(
     rhs: &Syntax,
     category: &Name,
-    variables: &[(usize, Name)],
+    variables: &[(Vec<usize>, Name)],
 ) -> Result<Syntax, &'static str> {
     let quotation = match components(category).as_slice() {
         [term] if term == "term" => ["Lean", "Parser", "Term", "quot"],

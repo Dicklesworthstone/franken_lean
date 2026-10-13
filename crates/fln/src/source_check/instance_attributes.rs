@@ -18,6 +18,14 @@ pub(super) fn apply(
     command: usize,
     offset: usize,
 ) -> Result<Environment, SourceCheckError> {
+    if attribute.erase {
+        return Err(SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message: "instance erasure requires the source scope driver".into(),
+        });
+    }
     if attribute.declarations.len() > MAX_DECLARATIONS {
         return Err(SourceCheckError::Limit {
             resource: "instance attribute declarations",

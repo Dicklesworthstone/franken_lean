@@ -1,0 +1,107 @@
+//! Native matching of quoted syntax, before expansion of its arguments.
+//!
+//! Anchors: Lean/Elab/Quotation.lean (`getHeadInfo`) and Init/Prelude.lean
+//! (`Syntax.matchesIdent`, `matchesLit`) at SUITE.lock's Reference. Names compare
+//! modulo macro scopes; atoms are significant only inside the built-in literals.
+//! This is a bounded quotation interpreter, not execution of arbitrary MacroM.
+use super::*;
+
+pub(super) fn at_path<'a>(args: &'a [Syntax], path: &[usize]) -> Option<&'a Syntax> {
+    let (first, rest) = path.split_first()?;
+    let mut current = args.get(*first)?;
+    for index in rest {
+        current = node_args(current)?.get(*index)?;
+    }
+    Some(current)
+}
+
+pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, &'static str> {
+    let mut tasks: Vec<_> = children
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, child)| (child, vec![index]))
+        .collect();
+    let mut variables = Vec::new();
+    let mut bound = BTreeSet::new();
+    let mut visited = 0;
+    while let Some((pattern, path)) = tasks.pop() {
+        visited += 1;
+        if visited > MAX_TEMPLATE_NODES || path.len() > MAX_DESCR_DEPTH {
+            return Err("a quoted macro pattern past the node or depth budget");
+        }
+        if let Some(name) = antiquotation_name(pattern) {
+            if name == Name::from_components(["_"]) {
+                continue;
+            }
+            let name = macro_variable(&name);
+            if !bound.insert(name.clone()) {
+                return Err("a repeated quoted macro pattern variable");
+            }
+            variables.push((path, name));
+            continue;
+        }
+        if let Syntax::Node { kind, args, .. } = pattern {
+            let leaf = components(kind).last().cloned().unwrap_or_default();
+            if leaf.contains("antiquot") || matches!(leaf.as_str(), "quot" | "quotSeq") {
+                return Err(
+                    "a splice, expression antiquotation or nested quotation in a macro pattern",
+                );
+            }
+            for (index, child) in args.iter().enumerate().rev() {
+                let mut path = path.clone();
+                path.push(index);
+                tasks.push((child, path));
+            }
+        }
+    }
+    Ok(variables)
+}
+
+pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'static str> {
+    let Some(pattern) = &rule.pattern else {
+        return Ok(true);
+    };
+    let Some(patterns) = node_args(pattern) else {
+        return Err("a quoted macro pattern without a syntax node");
+    };
+    if patterns.len() != args.len() {
+        return Ok(false);
+    }
+    let mut pending: Vec<_> = patterns
+        .iter()
+        .zip(args)
+        .map(|(p, a)| (p, a, false))
+        .collect();
+    let mut visited = 0;
+    while let Some((pattern, value, literal)) = pending.pop() {
+        visited += 1;
+        if visited > MAX_TEMPLATE_NODES {
+            return Err("quoted macro matching past the node budget");
+        }
+        if antiquotation_name(pattern).is_some() {
+            continue;
+        }
+        match (pattern, value) {
+            (Syntax::Missing, Syntax::Missing) => {}
+            (Syntax::Atom { val: a, .. }, Syntax::Atom { val: b, .. }) if !literal || a == b => {}
+            (Syntax::Ident { val: a, .. }, Syntax::Ident { val: b, .. })
+                if a.erase_macro_scopes() == b.erase_macro_scopes() => {}
+            (
+                Syntax::Node {
+                    kind: a, args: pa, ..
+                },
+                Syntax::Node {
+                    kind: b, args: va, ..
+                },
+            ) if a == b && pa.len() == va.len() => {
+                let literal = ["num", "str", "char", "name", "scientific"]
+                    .iter()
+                    .any(|name| *a == Name::from_components([*name]));
+                pending.extend(pa.iter().zip(va).map(|(p, a)| (p, a, literal)));
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}

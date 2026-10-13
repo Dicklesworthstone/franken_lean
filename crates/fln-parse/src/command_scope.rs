@@ -629,12 +629,21 @@ fn generic_in(
     let explicit_open = keyword == "open"
         && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(");
     // A global `attribute [a] x in …` is not one: the pin refuses it ("Despite the `in`, the
-    // attribute … is added globally"). A `local` one scopes to the body.
+    // attribute … is added globally"). A `local` one scopes to the body. Instance
+    // erasure is state-only as well: the pin applies eraseAttr without adding a
+    // global attribute (Lean/Elab/Declaration.lean and Linter/GlobalAttributeIn.lean).
     let local_attribute = keyword == "attribute"
         && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "local");
+    let instance_erasure = keyword == "attribute"
+        && matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "[")
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "-")
+        && tokens
+            .get(3)
+            .is_some_and(|token| view.normalized().span_str(token.extent) == Some("instance"));
     if !matches!(keyword, "variable" | "universe" | "include" | "omit")
         && !explicit_open
         && !local_attribute
+        && !instance_erasure
     {
         return None;
     }

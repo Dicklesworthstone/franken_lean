@@ -402,6 +402,35 @@ pub(crate) fn apply_module_control_command(
         scopes.current.local_simp.extend(rules);
         return Ok(Outcome::Complete(()));
     }
+    // Erasure changes only the lexical selection state. In particular it must
+    // not enter the persistent registration branch below or a module export.
+    if let ScopeCommand::Instance(attribute) = &control
+        && attribute.erase
+    {
+        let (file, command, offset) = position;
+        if attribute.local || attribute.scoped || attribute.is_default {
+            return Err(SourceCheckError::Scope {
+                file,
+                command,
+                offset,
+                message: "instance erasure has no registration kind".into(),
+            });
+        }
+        if attribute.declarations.len() > 4096 {
+            return Err(SourceCheckError::Limit {
+                resource: "instance erasure declarations",
+                limit: 4096,
+            });
+        }
+        scopes
+            .erase_instance_attribute(
+                engine.environment(),
+                public.as_ref().map(|world| world.engine().environment()),
+                &attribute.declarations,
+            )
+            .map_err(|error| error.into_source(file, command, offset))?;
+        return Ok(Outcome::Complete(()));
+    }
     // `attribute [local instance] x`: selected until the enclosing scope ends, as a `local
     // instance` declaration is; nothing is written to the persistent registration journal.
     if let ScopeCommand::Instance(attribute) = &control

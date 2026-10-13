@@ -6,6 +6,7 @@ set -euo pipefail
 patches=scripts/patches/instance-selection
 core=(crates/fln-elab/src/instances.rs crates/fln-elab/src/instances/scoped.rs)
 frontend=(
+  crates/fln-parse/src/command_scope.rs
   crates/fln-parse/src/command_scope/instances.rs
   crates/fln-parse/src/command_scope/instances/erasure.rs
   crates/fln/src/source_check.rs
@@ -55,23 +56,21 @@ publish() {
   return 1
 }
 
-# Stage one: native availability and cache/index isolation. It compiles before
-# the frontend knows about erasure, and lands only after its own tests pass.
-git apply --check "$patches/0002-scoped-reuse.patch"
-git apply "$patches/0002-scoped-reuse.patch"
-git apply --check "$patches/0003-lexical-erasure.patch"
-git apply "$patches/0003-lexical-erasure.patch"
-rustfmt --edition 2024 --config skip_children=true "${core[@]}"
-git diff --check
+# The native backend was published by the first successful stage of run
+# 38391343275. Its ancestry is the checkpoint, not the presence of a test name.
+# Re-run its unchanged gate on this tree before continuing the frontend.
+if ! git merge-base --is-ancestor 39c27e56627529e93fb9883209b204cf7628e755 HEAD; then
+  echo 'This continuation requires the validated native erasure backend.' >&2
+  exit 1
+fi
 gate_core
-git add -- "${core[@]}"
-git commit -m 'feat(elab): implement snapshot-isolated lexical instance erasure' -m 'Reuse validated registry views, reset scope-specific indexes, preserve reducibility metadata, and restore erased candidates on later registrations without changing their original tie position. Native elaborator library tests, facade library compilation and strict elaborator library Clippy passed on this stage with the repository-pinned compiler.'
-publish gate_core
 
 # Stage two: the actual source command, atomic public/private scope handling,
 # and executable source-to-council regression cells.
 git apply --check "$patches/0004-source-erasure.patch"
 git apply "$patches/0004-source-erasure.patch"
+git apply --check "$patches/0005-erasure-in.patch"
+git apply "$patches/0005-erasure-in.patch"
 rustfmt --edition 2024 --config skip_children=true "${frontend[@]}"
 git diff --check
 gate_frontend

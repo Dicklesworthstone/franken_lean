@@ -6,6 +6,8 @@ use fln_elab::source::scope::{SourceScope, components};
 use fln_parse::command_scope::ScopeCommand;
 use std::collections::BTreeSet;
 
+mod instance_erasure;
+
 #[derive(Clone)]
 struct Frame {
     label: Option<String>,

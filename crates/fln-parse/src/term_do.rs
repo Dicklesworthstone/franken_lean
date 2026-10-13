@@ -48,6 +48,12 @@ enum Statement {
         keyword: usize,
         position: BytePos,
     },
+    /// The body has closed at `until`; the next term is the postcondition.
+    RepeatUntil {
+        keyword: usize,
+        until: usize,
+        position: BytePos,
+    },
     /// `return` with no value: no term follows on its line (`doReturn`'s `checkLineEq`). Its
     /// keyword is the frame's one leaf, as a jump's is.
     BareReturn {
@@ -153,6 +159,7 @@ pub(super) fn bare_return(view: &SourceView, tokens: &[LexedToken], at: usize, e
         || newline(view, tokens, at + 1)
         || closing(tokens, at + 1)
         || word(tokens, at + 1, ";")
+        || word(tokens, at + 1, "until")
 }
 fn closing(tokens: &[LexedToken], at: usize) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind),
@@ -475,7 +482,7 @@ impl Prefix {
         } else {
             // These belong to doElem, not ordinary term application. Unsupported
             // control forms must not be laundered into calls to user declarations.
-            // `until` closes `repeat … until c` (`doRepeatUntil`), which is not read yet.
+            // `until` is consumed only by the repeat whose body just closed.
             for unsupported in ["until", "catch", "finally", "let_expr"] {
                 if word(tokens, at, unsupported) {
                     return Err(refuse(view, tokens, at));
@@ -533,7 +540,10 @@ impl Prefix {
                 word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-")
             }
             Phase::ForBinder => word(tokens, at, "in"),
-            Phase::Value => word(tokens, at, ";"),
+            // An unbraced nested do can end at an enclosing repeat's marker.
+            // Only Statement::Repeat consumes it; an orphan reaches the term
+            // driver unchanged and is refused rather than made an identifier.
+            Phase::Value => word(tokens, at, ";") || word(tokens, at, "until"),
             Phase::Collection => word(tokens, at, "do"),
             Phase::Done => false,
         }
@@ -687,6 +697,36 @@ impl Prefix {
                     });
                 }
                 Syntax::node(parser_kind(&["Term", "doRepeat"]), args.clone())
+            }
+            Statement::RepeatUntil {
+                keyword,
+                until,
+                position,
+            } => {
+                let invalid = || NatDefinitionParseError::OutsideSeedGrammar {
+                    at: position,
+                    expected: NatDefinitionExpectation::ScalarValue,
+                };
+                let mut body = self.collection.take().ok_or_else(invalid)?;
+                let Syntax::Node { kind, args, .. } = &mut body else {
+                    return Err(invalid());
+                };
+                if *kind != parser_kind(&["Term", "do"])
+                    || args.len() != 2
+                    || !matches!(&args[0], Syntax::Atom { val, .. } if val == "repeat")
+                {
+                    return Err(invalid());
+                }
+                let body = args.pop().expect("checked repeat sequence");
+                Syntax::node(
+                    parser_kind(&["Term", "doRepeatUntil"]),
+                    vec![
+                        atom(leaves, keyword, "repeat")?,
+                        body,
+                        atom(leaves, until, "until")?,
+                        value,
+                    ],
+                )
             }
             Statement::While {
                 keyword,
@@ -1120,6 +1160,20 @@ impl Prefix {
         if self.phase != Phase::Value {
             return Err(refuse(view, tokens, at));
         }
+        if word(tokens, at, "until")
+            && let Statement::Repeat { keyword, position } = self.statement
+        {
+            if at + 1 >= end {
+                return Err(refuse(view, tokens, at + 1));
+            }
+            self.collection = Some(expression);
+            self.statement = Statement::RepeatUntil {
+                keyword,
+                until: at,
+                position,
+            };
+            return Ok((self, at + 1));
+        }
         if self.term_element {
             self.item(leaves, expression, None)?;
             self.phase = Phase::Done;
@@ -1140,6 +1194,15 @@ impl Prefix {
             }
         ) && !is_failure_value(&expression);
         self.item(leaves, expression, semi)?;
+        if word(tokens, at, "until") {
+            // Leave the marker for the parent repeat. It cannot cross braces
+            // or supply the missing continuation of a body-local binding.
+            if self.braces.is_some() || binding {
+                return Err(refuse(view, tokens, at));
+            }
+            self.phase = Phase::Done;
+            return Ok((self, at));
+        }
         if let Some((_, close)) = &mut self.braces {
             if next < end && word(tokens, next, "}") {
                 if binding {

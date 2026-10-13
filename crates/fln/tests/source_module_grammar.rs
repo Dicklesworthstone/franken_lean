@@ -78,6 +78,38 @@ fn session_checked(
 const BRACKETS: &str = "notation \"⟪\" x \"⟫\" => Nat.add x x\n";
 
 #[test]
+fn nested_quoted_patterns_survive_module_journals_and_direct_engine_reentry() {
+    let base = engine();
+    let imported = checked(&base, &[
+        ("Main", "import Lib\ntheorem t : select! (Nat.add 5 6) = (5 : Nat) := rfl"),
+        ("Lib", "syntax \"select! \" term:max : term\nmacro_rules | `(select! (Nat.add $x $y)) => `($x)"),
+    ]).checked.engine;
+    let options = KVMap::new();
+    let before = imported.logical_root(&options);
+    let good = imported
+        .check_source_files(
+            &[b"theorem afterReload : select! (Nat.add 7 8) = (7 : Nat) := rfl"],
+            &options,
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(good.theorems, 1);
+    for source in [
+        b"theorem bad : select! (Nat.add 7 8) = (8 : Nat) := rfl".as_slice(),
+        b"theorem bad : select! (Nat.mul 7 8) = (7 : Nat) := rfl",
+    ] {
+        assert!(
+            imported
+                .check_source_files(&[source], &options, limits().source)
+                .is_err()
+        );
+    }
+    assert_eq!(imported.logical_root(&options), before);
+}
+
+#[test]
 fn direct_engine_entry_points_preserve_imported_interpolation_grammar() {
     let base = engine();
     let imported = checked(
