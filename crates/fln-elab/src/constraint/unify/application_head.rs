@@ -8,6 +8,12 @@
 //! scope, occurs, typing, resource and K1 barriers as an ordinary assignment.
 use super::*;
 
+struct SuffixEta {
+    domains: (Expr, Expr),
+    bodies: (Expr, Expr),
+    locals: LocalContext,
+}
+
 impl Engine<'_> {
     pub(super) fn recover_application_head(
         &mut self,
@@ -140,6 +146,35 @@ impl Engine<'_> {
             if std::ptr::eq(left.node(), right.node()) {
                 continue;
             }
+            if self.budget.proof_irrelevance {
+                let mut obligations = VecDeque::new();
+                match self.proof_irrelevance(&left, &right, locals, &mut obligations) {
+                    Ok(true) => {
+                        // K1 validates BOTH original proofs, but may unfold more
+                        // than this caller allows. Retain every type equation
+                        // and compare it here without assigning argument holes.
+                        for (a, b, context) in obligations {
+                            self.meter.node()?;
+                            let type_scope = contexts.len();
+                            contexts.push(context);
+                            pending.push((a, b, type_scope));
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(UnificationError::Deferred(_)) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(eta) = self.application_suffix_eta(&left, &right, locals)? {
+                let body_scope = contexts.len();
+                contexts.push(eta.locals);
+                pending.push((eta.bodies.0, eta.bodies.1, body_scope));
+                // Check the neutral function's domain too. Merely applying it
+                // to a fresh local can hide an ill-typed eta expansion.
+                pending.push((eta.domains.0, eta.domains.1, scope));
+                continue;
+            }
             match (left.node(), right.node()) {
                 (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
                 (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) if a == b => {}
@@ -234,6 +269,62 @@ impl Engine<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Open one lambda against a neutral function, using its actual domain as
+    /// an additional conversion obligation. No function hole is solved here.
+    fn application_suffix_eta(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<SuffixEta>, UnificationError> {
+        let (lambda, other, reverse) = match (left.node(), right.node()) {
+            // Paired lambdas use the ordinary binder rule below.
+            (ExprNode::Lam { .. }, ExprNode::Lam { .. }) => return Ok(None),
+            (ExprNode::Lam { .. }, _) => (left, right, false),
+            (_, ExprNode::Lam { .. }) => (right, left, true),
+            _ => return Ok(None),
+        };
+        let ExprNode::Lam {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = lambda.node()
+        else {
+            unreachable!("selected lambda");
+        };
+        let Some(other_type) = self.eta_neutral_type(other, locals)? else {
+            return Ok(None);
+        };
+        let ExprNode::ForallE {
+            binder_type: other_domain,
+            ..
+        } = other_type.node()
+        else {
+            return Ok(None);
+        };
+        let id = self.fresh()?;
+        let argument = Expr::fvar(id.clone());
+        let body = self.substitute(body, &argument)?;
+        let applied = Expr::app(other.clone(), argument);
+        self.scan(&applied)?;
+        for _ in locals.decls() {
+            self.meter.node()?;
+        }
+        let mut inner = locals.clone();
+        inner.add_param(id.clone(), id.0, binder_type.clone(), *binder_info);
+        let (domains, bodies) = if reverse {
+            ((other_domain.clone(), binder_type.clone()), (applied, body))
+        } else {
+            ((binder_type.clone(), other_domain.clone()), (body, applied))
+        };
+        Ok(Some(SuffixEta {
+            domains,
+            bodies,
+            locals: inner,
+        }))
     }
 
     /// Normalize identities only. In particular, `max ?u 0 = ?u` may succeed
