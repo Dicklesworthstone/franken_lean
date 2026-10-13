@@ -1,18 +1,33 @@
 name: Native runtime reliability
+
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-runtime-reliability.yml']
+    paths:
+      - 'crates/fln-elab/src/seed.rs'
+      - 'crates/fln-elab/src/seed/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/tests/runtime_*.rs'
+      - 'crates/fln/tests/source_*decisions.rs'
+      - 'crates/fln-cli/tests/source_equality_decisions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/native-runtime-reliability.yml'
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: native-runtime-reliability-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  publish:
-    if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'fix(runtime): execute verified runtime publication'
+  regressions:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: write
     env:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: '1'
@@ -22,29 +37,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-          fetch-depth: 0
-      - name: Validate and publish the two reviewed runtime increments
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
+          persist-credentials: false
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
+      - name: Canonical seed streaming and small-stack runtime preparation
         run: |
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          sha = '25dd662bc74a11a8fda0b8430fb3bdda1dfd9a33'
-          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
-              headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent':'OpenAI File Downloader, XaiImageApiFetch/1.0'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              data = json.load(response)
-          assert data['encoding'] == 'base64'
-          content = base64.b64decode(data['content'])
-          assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
-          script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'publish-runtime.py'
-          script.write_bytes(content)
-          subprocess.run(['python', str(script)], check=True)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: runtime-reliability-${{ github.sha }}
-          path: ${{ runner.temp }}/runtime-reliability
-          retention-days: 7
-          if-no-files-found: error
+          cargo test --locked -p fln-elab seed_stream_and_early_drop_fit_a_small_stack_without_changing_declarations
+          cargo test --locked -p fln --lib nested_lexical_contexts_prepare_mutual_groups_on_a_small_host_stack
+          cargo test --locked -p fln --lib runtime::decisions::tests
+      - name: Runtime contracts and installed equality execution
+        run: |
+          cargo test --locked -p fln --test runtime_conditionals --test runtime_logic_decisions --test runtime_nat_decisions --test source_equality_decisions --test source_generic_decisions --test source_option_decisions --no-fail-fast
+          cargo test --locked -p fln-cli --test source_equality_decisions
+      - name: Lint all runtime consumers and compile the workspace
+        run: |
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
