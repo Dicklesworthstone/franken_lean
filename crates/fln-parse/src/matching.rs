@@ -529,7 +529,8 @@ fn plan(
                 }
             }
             // A syntax quotation closes with `)` (`quotations`).
-            "(" | "`(" | "`(tactic|" | "`(conv|" => delimiters.push(")"),
+            "(" => delimiters.push(")"),
+            quote if crate::quotations::opens(quote) => delimiters.push(")"),
             "{" | ".{" => delimiters.push("}"),
             "[" => delimiters.push("]"),
             "⦃" => delimiters.push("⦄"),

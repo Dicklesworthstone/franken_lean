@@ -134,6 +134,7 @@ impl FileGrammar {
         }
         for (name, behavior) in &module.categories {
             self.categories.insert(name.clone(), *behavior);
+            self.native_categories.insert(name.clone());
             let LeafView::Str(suffix) = name.leaf_view() else {
                 unreachable!("validated above")
             };

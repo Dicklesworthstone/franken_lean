@@ -61,7 +61,7 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
                 _ => None,
             })
             .and_then(quotation_root);
-        let Some((kind, category, children)) = target else {
+        let Some((kind, _category, children)) = target else {
             malformed = true;
             continue;
         };
@@ -71,7 +71,7 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
             continue;
         }
         let translated = quotation::variables(children).and_then(|variables| {
-            macro_template(rhs, &category, &variables).map(|rhs| NotationRule {
+            macro_rule_template(rhs, &variables).map(|rhs| NotationRule {
                 variables,
                 rhs,
                 prechecked: false,

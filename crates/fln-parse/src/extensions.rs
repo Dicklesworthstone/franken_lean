@@ -73,6 +73,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+mod categories;
+pub(crate) use categories::{category_for_quotation, parse_category_quotation};
 mod macro_rules;
 mod modules;
 mod quotation;
@@ -742,6 +744,9 @@ impl ExtensionInfix {
 #[derive(Debug)]
 pub struct ActiveGrammar {
     table: TokenTable,
+    /// Categories introduced by native source, never guessed from a node kind.
+    source_categories: BTreeSet<Name>,
+    category_decls: BTreeMap<Name, Vec<usize>>,
     decls: Vec<Arc<SyntaxDecl>>,
     infix: BTreeMap<String, ExtensionInfix>,
     /// Each [`ExtensionInfix`]'s node kinds, the most recently added parser first.
@@ -959,8 +964,19 @@ impl ActiveGrammar {
             );
             infix_kinds.push(entries.into_iter().rev().map(|(_, kind)| kind).collect());
         }
+        let mut category_decls: BTreeMap<Name, Vec<usize>> = BTreeMap::new();
+        for (index, decl) in decls.iter().enumerate() {
+            if let Some(category) = &decl.category {
+                category_decls
+                    .entry(category.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
         ActiveGrammar {
+            category_decls,
             table: TokenTable::from_tokens(tokens),
+            source_categories: BTreeSet::new(),
             decls,
             infix,
             infix_kinds,
@@ -1114,6 +1130,7 @@ pub struct FileGrammar {
     native_imported: Vec<Arc<SyntaxDecl>>,
     native_scoped: BTreeMap<Name, Vec<Arc<SyntaxDecl>>>,
     native_abbreviations: BTreeSet<Name>,
+    native_categories: BTreeSet<Name>,
     /// Inherited suffix length per native syntax kind. Source registrations
     /// prepend to it; exports retain only the file's own prefix, so diamond
     /// imports do not replay a dependency's macros as new registrations.
@@ -1220,6 +1237,7 @@ impl FileGrammar {
             native_imported: Vec::new(),
             native_scoped: BTreeMap::new(),
             native_abbreviations: BTreeSet::new(),
+            native_categories: BTreeSet::new(),
             native_rule_counts: BTreeMap::new(),
             scoped,
             scoped_tokens,
@@ -1464,6 +1482,12 @@ impl FileGrammar {
             }
         }
         let mut grammar = ActiveGrammar::new(tokens, decls);
+        grammar
+            .source_categories
+            .extend(self.native_categories.iter().cloned());
+        grammar
+            .source_categories
+            .extend(self.declared_categories.keys().cloned());
         grammar.imports_entered = self.imports_entered;
         grammar.expander = Some(self.expander());
         grammar.docs = docs;
@@ -2554,19 +2578,41 @@ fn macro_variable(base: &Name) -> Name {
 /// The node a quotation pattern holds (`` `(k $x "a" $y) ``, `` `(tactic| k $x) ``): its kind,
 /// the quotation's category, and its children.
 fn quotation_root(pattern: &Syntax) -> Option<(Name, Name, &[Syntax])> {
-    let category = if kind_is(pattern, &["Lean", "Parser", "Term", "quot"]) {
-        "term"
-    } else if kind_is(pattern, &["Lean", "Parser", "Tactic", "quot"]) {
-        "tactic"
-    } else {
+    let (category, contents) = quotation_contents(pattern)?;
+    let Syntax::Node { kind, args, .. } = contents else {
         return None;
     };
-    match node_args(pattern)? {
-        [_, Syntax::Node { kind, args, .. }, _] => Some((
-            kind.clone(),
-            Name::from_components([category]),
-            args.as_slice(),
-        )),
+    Some((kind.clone(), category, args))
+}
+
+/// Read the pin's three quotation envelopes without erasing the category.
+/// Source category quoters have a Term.quot around a `<category>.quot` node
+/// (Elab.Syntax.declareSyntaxCatQuotParser); dynamic quoters carry its name.
+fn quotation_contents(quotation: &Syntax) -> Option<(Name, &Syntax)> {
+    let args = node_args(quotation)?;
+    if kind_is(quotation, &["Lean", "Parser", "Term", "dynamicQuot"]) {
+        let [_, category, _, contents, _] = args else {
+            return None;
+        };
+        return Some((ident_name(category)?, contents));
+    }
+    if kind_is(quotation, &["Lean", "Parser", "Tactic", "quot"]) {
+        let [_, contents, _] = args else {
+            return None;
+        };
+        return Some((Name::from_components(["tactic"]), contents));
+    }
+    if !kind_is(quotation, &["Lean", "Parser", "Term", "quot"]) {
+        return None;
+    }
+    match args {
+        [_, contents, _] => Some((Name::from_components(["term"]), contents)),
+        [Syntax::Node { kind, args, .. }] if kind.leaf_view() == LeafView::Str("quot") => {
+            let [_, contents, _] = args.as_slice() else {
+                return None;
+            };
+            Some((kind.parent(), contents))
+        }
         _ => None,
     }
 }
@@ -2604,17 +2650,30 @@ fn macro_template(
     category: &Name,
     variables: &[(Vec<usize>, Name)],
 ) -> Result<Syntax, &'static str> {
-    let quotation = match components(category).as_slice() {
-        [term] if term == "term" => ["Lean", "Parser", "Term", "quot"],
-        [tactic] if tactic == "tactic" => ["Lean", "Parser", "Tactic", "quot"],
-        _ => return Err("a macro of a category other than term or tactic"),
-    };
-    if !kind_is(rhs, &quotation) {
+    let (actual, contents) =
+        quotation_contents(rhs).ok_or("a macro whose right-hand side is not a quotation")?;
+    if actual != *category {
         return Err("a macro whose right-hand side is not a quotation of its category");
     }
-    let Some([_, contents, _]) = node_args(rhs) else {
-        return Err("a quotation's shape");
-    };
+    checked_template(contents, variables)
+}
+
+/// `macro_rules` produces a raw Macro (Syntax -> MacroM Syntax), not a
+/// TSyntax of its input category. The resulting syntax is elaborated normally;
+/// a template of another category is not by itself an ill-typed declaration.
+fn macro_rule_template(
+    rhs: &Syntax,
+    variables: &[(Vec<usize>, Name)],
+) -> Result<Syntax, &'static str> {
+    let (_, contents) =
+        quotation_contents(rhs).ok_or("a macro rule whose right-hand side is not a quotation")?;
+    checked_template(contents, variables)
+}
+
+fn checked_template(
+    contents: &Syntax,
+    variables: &[(Vec<usize>, Name)],
+) -> Result<Syntax, &'static str> {
     let mut pending = vec![contents];
     let mut checked = 0_usize;
     while let Some(syntax) = pending.pop() {
@@ -2634,7 +2693,9 @@ fn macro_template(
                 }
                 continue;
             }
-            if leaf.contains("antiquot") || matches!(leaf.as_str(), "quot" | "quotSeq") {
+            if leaf.contains("antiquot")
+                || matches!(leaf.as_str(), "quot" | "quotSeq" | "dynamicQuot")
+            {
                 return Err("a splice or a nested quotation in a macro template");
             }
             pending.extend(args);
@@ -3685,13 +3746,13 @@ impl Run<'_> {
             {
                 return Some(next);
             }
-            if !OPENERS.contains(&opener.as_str()) {
+            if !OPENERS.contains(&opener.as_str()) && !crate::quotations::opens(&opener) {
                 return Some(at + 1);
             }
             let mut depth = 0usize;
             for index in at..end {
                 let text = self.text(index).unwrap_or_default();
-                if OPENERS.contains(&text.as_str()) {
+                if OPENERS.contains(&text.as_str()) || crate::quotations::opens(&text) {
                     depth += 1;
                 } else if CLOSERS.contains(&text.as_str()) {
                     depth -= 1;
@@ -3713,7 +3774,7 @@ impl Run<'_> {
             if depth == 0 && index > at && stops.is_some_and(|stops| stops.contains(&text)) {
                 return Some(index);
             }
-            if OPENERS.contains(&text.as_str()) {
+            if OPENERS.contains(&text.as_str()) || crate::quotations::opens(&text) {
                 depth += 1;
             } else if CLOSERS.contains(&text.as_str()) {
                 if depth == 0 {
@@ -3727,6 +3788,10 @@ impl Run<'_> {
 
     fn parse(&self, descr: &Descr, at: usize, end: usize, follow: &Follow, depth: usize) -> Parsed {
         if depth > MAX_DESCR_DEPTH {
+            categories::stop();
+            return None;
+        }
+        if !categories::tick() {
             return None;
         }
         match descr {
@@ -3801,6 +3866,9 @@ impl Run<'_> {
                 Some((vec![null_node(items)], next))
             }
             Descr::Cat(category, prec) => {
+                if active().is_some_and(|g| g.source_categories.contains(category)) {
+                    return self.category(category, *prec, at, end, follow, depth + 1);
+                }
                 let stop = self.term_end(at, end, *prec, follow)?;
                 let syntax = match simple(category).as_deref() {
                     Some("term") => {

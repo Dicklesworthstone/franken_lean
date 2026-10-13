@@ -75,6 +75,7 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionP
 /// Whether `symbol` opens a quotation.
 pub(crate) fn opens(symbol: &str) -> bool {
     matches!(symbol, "`(" | "`(tactic|" | "`(conv|")
+        || crate::extensions::category_for_quotation(symbol).is_some()
 }
 
 /// The `)` that closes the group opened at `open` (a `(` or a quotation), before `end`.
@@ -127,6 +128,17 @@ pub(crate) fn quotation(
                 nested_term(leaves, view, tokens, inner)?,
                 leaves.leaf(close)?,
             ],
+        )
+    } else if let Some(category) = crate::extensions::category_for_quotation(open) {
+        let body =
+            crate::extensions::parse_category_quotation(leaves, view, tokens, inner, &category)
+                .ok_or_else(|| refuse(view, tokens, start))?;
+        Syntax::node(
+            parser_kind(&["Term", "quot"]),
+            vec![Syntax::node(
+                Name::str(category, "quot"),
+                vec![leaves.leaf(start)?, body, leaves.leaf(close)?],
+            )],
         )
     } else if open == "`(conv|" {
         // `conv.quot := "`(conv|" conv ")"`, one conv tactic, as the term the pin reads it as: a
@@ -200,7 +212,12 @@ fn dynamic_quotation(
                 _ => return Err(refuse(view, tokens, inner.start)),
             }
         }
-        _ => return Err(refuse(view, tokens, start + 1)),
+        _ => {
+            let category = crate::extensions::rendered_name(category)
+                .ok_or_else(|| refuse(view, tokens, start + 1))?;
+            crate::extensions::parse_category_quotation(leaves, view, tokens, inner, &category)
+                .ok_or_else(|| refuse(view, tokens, start + 1))?
+        }
     };
     Ok(Syntax::node(
         parser_kind(&["Term", "dynamicQuot"]),
@@ -286,7 +303,7 @@ fn tactic_quotation(
 }
 
 /// Where an antiquotation stands, which decides its kind when it has no name.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Position {
     Term,
     Tactic,
@@ -297,6 +314,8 @@ pub(crate) enum Position {
     RwRuleSeq,
     /// A token parser accepts only its own annotation, or an anonymous capture.
     Token(&'static str),
+    /// A source-defined category uses the same pseudo-kind convention as term.
+    Category(Name),
 }
 
 /// The antiquotation at `start` inside a quotation, ending by `end`: its tree and the token after
@@ -351,6 +370,11 @@ pub(crate) fn antiquotation(
             .span_str(tokens[next + 1].extent)
             .unwrap_or_default();
         let kind = match (position, spelled) {
+            (Position::Category(expected), actual)
+                if crate::extensions::rendered_name(actual).as_ref() == Some(&expected) =>
+            {
+                Name::str(Name::str(expected, "pseudo"), "antiquot")
+            }
             (Position::Token(expected), actual) if expected == actual => {
                 Name::from_components([expected, "antiquot"])
             }
@@ -378,6 +402,7 @@ pub(crate) fn antiquotation(
         (kind, name)
     } else {
         let kind = match position {
+            Position::Category(name) => Name::str(Name::str(name, "pseudo"), "antiquot"),
             Position::Token(name) => Name::from_components([name, "antiquot"]),
             Position::Term => Name::from_components(["term", "pseudo", "antiquot"]),
             Position::Tactic => Name::from_components(["tactic", "pseudo", "antiquot"]),
