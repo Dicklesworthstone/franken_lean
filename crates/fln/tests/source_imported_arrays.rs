@@ -216,7 +216,15 @@ fn dependencies(
     environment: &Environment,
     implementation: &fln_elab::implemented_by::ImplementedByTable,
 ) -> BTreeSet<Name> {
-    let mut pending: Vec<_> = MODEL_ROOTS.into_iter().map(name).collect();
+    dependencies_from_roots(environment, implementation, &MODEL_ROOTS)
+}
+
+fn dependencies_from_roots(
+    environment: &Environment,
+    implementation: &fln_elab::implemented_by::ImplementedByTable,
+    roots: &[&str],
+) -> BTreeSet<Name> {
+    let mut pending: Vec<_> = roots.iter().copied().map(name).collect();
     let mut found = BTreeSet::new();
     let mut nodes = 0usize;
     while let Some(label) = pending.pop() {
@@ -480,6 +488,142 @@ fn actual_imported_array_iteration_executes_replays_and_preserves_authority() {
         assert!(
             failures.is_empty(),
             "all 43 Array evaluations and every authority control must succeed:\n{}",
+            failures.join("\n"),
+        );
+    });
+}
+
+#[test]
+fn dump_pinned_array_fold_model() {
+    with_actual_import(false, |engine| {
+        const ROOTS: [&str; 7] = [
+            "Array.foldlM",
+            "Array.foldlMUnsafe",
+            "List.foldlM",
+            "List.extract",
+            "Array",
+            "List",
+            "Monad",
+        ];
+        let environment = engine.environment();
+        let implementation = fln_elab::implemented_by::ImplementedByTable::read(environment)
+            .expect("actual implemented_by journal");
+        assert_eq!(
+            implementation.get(&name("Array.foldlM")),
+            Some(&name("Array.foldlMUnsafe")),
+        );
+        for label in ["Array.foldlM", "List.foldlM", "List.extract"] {
+            assert!(
+                matches!(environment.find(&name(label)), Some(ConstantInfo::Defn(value))
+                    if value.safety == DefinitionSafety::Safe),
+                "{label} is an actual safe definition",
+            );
+        }
+        assert!(
+            matches!(environment.find(&name("Array.foldlMUnsafe")), Some(ConstantInfo::Defn(value))
+                if value.safety == DefinitionSafety::Unsafe),
+            "the pin selects an unsafe runtime body for Array.foldlM",
+        );
+        let found = dependencies_from_roots(environment, &implementation, &ROOTS);
+        let externs =
+            fln_elab::externs::ExternTable::read(environment).expect("actual extern journal");
+        let mut rows: Vec<_> = found
+            .iter()
+            .map(|label| {
+                format!(
+                    "{}\t{}",
+                    encoded_name(label),
+                    environment
+                        .entry(label)
+                        .expect("actual dependency entry")
+                        .digest()
+                        .to_hex(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(rows.len(), found.len());
+        eprintln!("FLN_ARRAY_FOLD_DEPENDENCIES_BEGIN");
+        for row in rows {
+            eprintln!("{row}");
+        }
+        eprintln!("FLN_ARRAY_FOLD_DEPENDENCIES_END");
+        eprintln!("FLN_ARRAY_FOLD_DEPENDENCY_METADATA_BEGIN");
+        for label in &found {
+            if let Some(companion) = potential_companion(environment.find(label).unwrap()) {
+                let selected = if environment.contains(&companion) {
+                    encoded_name(&companion)
+                } else {
+                    "-".to_owned()
+                };
+                eprintln!("companion\t{}\t{selected}", encoded_name(label));
+            }
+            if let Some(target) = implementation.get(label) {
+                eprintln!(
+                    "implemented_by\t{}\t{}",
+                    encoded_name(label),
+                    encoded_name(target)
+                );
+            }
+            if let Some(entries) = externs.get(label) {
+                eprintln!("extern\t{}\t{entries:?}", encoded_name(label));
+            }
+        }
+        eprintln!("FLN_ARRAY_FOLD_DEPENDENCY_METADATA_END");
+        for label in ROOTS {
+            eprintln!("FLN_ARRAY_FOLD_ROOT_DEBUG_BEGIN\t{label}");
+            let text: Vec<_> = format!("{:?}", environment.find(&name(label)).unwrap())
+                .chars()
+                .collect();
+            for (index, chunk) in text.chunks(3000).enumerate() {
+                eprintln!("{index:06}\t{}", chunk.iter().collect::<String>());
+            }
+            eprintln!("FLN_ARRAY_FOLD_ROOT_DEBUG_END\t{label}");
+        }
+    });
+}
+
+#[path = "source_imported_arrays/folds.rs"]
+mod folds;
+
+#[test]
+fn actual_imported_array_folds_execute_replay_and_preserve_authority() {
+    with_actual_import(true, |engine| {
+        let before = engine.logical_root(&KVMap::new());
+        folds::exact_model(engine);
+        let implementations =
+            fln_elab::implemented_by::ImplementedByTable::read(engine.environment()).unwrap();
+        assert_eq!(
+            implementations.get(&name("Array.foldlM")),
+            Some(&name("Array.foldlMUnsafe")),
+        );
+        let mut failures = Vec::new();
+        for (label, source, count) in [
+            (
+                "bounded and higher-order Array folds",
+                include_str!("source_imported_arrays/folds.lean"),
+                13,
+            ),
+            (
+                "Array fold Monad sequencing and short-circuit",
+                include_str!("source_imported_arrays/fold_effects.lean"),
+                14,
+            ),
+        ] {
+            collect_case_failure(&mut failures, label, || {
+                execution::program(engine, label, source, count);
+            });
+        }
+        collect_case_failure(&mut failures, "Array fold source rollback", || {
+            folds::source_rollback(engine);
+        });
+        collect_case_failure(&mut failures, "Array fold VM budget and recovery", || {
+            folds::execution_budget(engine);
+        });
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        assert!(
+            failures.is_empty(),
+            "all 27 Array fold evaluations and every rollback/resource control must succeed:\n{}",
             failures.join("\n"),
         );
     });

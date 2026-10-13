@@ -197,6 +197,58 @@ impl Preparation<'_> {
         }
     }
 
+    /// Expose checked higher-order helpers before inspecting their minors. A
+    /// matcher may rebind an unchanged callback before forwarding it recursively.
+    /// Use only the ordinary safe-body and inert-beta paths: no recursive stage
+    /// is prepared or published while this entry is still being validated.
+    fn partial_callback_expose(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        self.check_initialized_head(head)?;
+        if let Some(replacement) = self.implemented_by_call(head, arguments)? {
+            return Ok(Some(replacement));
+        }
+        if let Some(applied) = self.static_apply(head, arguments)? {
+            return Ok(Some(applied));
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        let safe = match self.environment.find(name) {
+            Some(ConstantInfo::Defn(definition)) => definition.safety == DefinitionSafety::Safe,
+            Some(_) => false,
+            None => self
+                .specialized_definition(name)
+                .is_some_and(|definition| definition.safety == DefinitionSafety::Safe),
+        };
+        if !safe {
+            return Ok(None);
+        }
+        // Check before static specialization removes the original helper name.
+        // Even a supported native extern keeps its ordinary executable path;
+        // this inspection must never substitute its stored logical body.
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(name).is_some())
+        {
+            return Ok(None);
+        }
+        if let Some(specialized) = self.specialize_call(head, arguments)? {
+            return Ok(Some(specialized));
+        }
+        self.specialize_staged_callback(head, arguments)
+    }
+
     fn partial_callback_body(
         &mut self,
         entry: &Entry,
@@ -256,6 +308,13 @@ impl Preparation<'_> {
                     match expression.node() {
                         ExprNode::App { .. } => {
                             let (head, arguments) = self.spine(&expression)?;
+                            if let Some(exposed) =
+                                self.partial_callback_expose(&head, &arguments)?
+                            {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Work::Visit(exposed, depth));
+                                continue;
+                            }
                             reserve(&mut work, self.limits.max_nodes)?;
                             work.push(Work::Apply(arguments.len(), false));
                             for argument in arguments.into_iter().rev() {
@@ -289,6 +348,21 @@ impl Preparation<'_> {
                             body,
                             non_dep,
                         } => {
+                            // A bound variable already denotes an evaluated
+                            // value. Removing only this alias preserves strict
+                            // work and exposes the original callback slot; a
+                            // computed initializer must retain its let and ABI.
+                            let mut alias = value;
+                            while let ExprNode::MData { expr, .. } = alias.node() {
+                                self.tick()?;
+                                alias = expr;
+                            }
+                            if matches!(alias.node(), ExprNode::BVar { .. }) {
+                                let exposed = self.substitution(body, value)?;
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Work::Visit(exposed, depth));
+                                continue;
+                            }
                             let nested = depth.saturating_add(1);
                             self.producer_depth(nested)?;
                             reserve(&mut work, self.limits.max_nodes)?;

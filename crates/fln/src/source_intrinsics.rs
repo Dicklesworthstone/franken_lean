@@ -8,6 +8,7 @@
 
 use super::*;
 use std::collections::HashSet;
+pub(super) mod array_fold;
 pub(super) mod array_iteration;
 pub(super) mod float;
 pub(super) mod io;

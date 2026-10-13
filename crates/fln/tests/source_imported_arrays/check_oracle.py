@@ -89,7 +89,9 @@ def main():
     directory = pathlib.Path(__file__).resolve().parent
     check(arguments.lean, directory / "programs.lean", 23)
     check(arguments.lean, directory / "effects.lean", 20)
-    print("FLN_ARRAY_ORACLE: 43 passed; no skipped or unmarked evaluations")
+    check(arguments.lean, directory / "folds.lean", 13)
+    check(arguments.lean, directory / "fold_effects.lean", 14)
+    print("FLN_ARRAY_ORACLE: 70 passed; no skipped or unmarked evaluations")
 
 
 if __name__ == "__main__":

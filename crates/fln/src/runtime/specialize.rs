@@ -169,6 +169,34 @@ impl Preparation<'_> {
         Ok(())
     }
 
+    /// Register only the fully model-checked bounded Array fold template.
+    /// It uses the ordinary private callable and universe specialization paths.
+    pub(super) fn remember_array_fold_definition(
+        &mut self,
+        definition: DefinitionVal,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let name = &definition.base.name;
+        if name != &Name::from_components(["_fln_runtime_array_foldlM"])
+            || self.environment.contains(name)
+            || self.has_private_callable(name)
+        {
+            return Err(unsupported("Array fold private callable name collision"));
+        }
+        let observed = self.specializations.definitions.len().saturating_add(1);
+        if observed > self.limits.fir.max_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.fir.max_functions,
+                observed,
+            });
+        }
+        self.specializations
+            .definitions
+            .insert(name.clone(), definition);
+        Ok(())
+    }
+
     pub(crate) fn specialized_definition(&self, name: &Name) -> Option<DefinitionVal> {
         self.specializations.definitions.get(name).cloned()
     }
