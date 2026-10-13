@@ -7834,6 +7834,8 @@ impl Engine {
                 || has_inline_simp
                 || has_inline_default
                 || is_noncomputable
+                || (scope.noncomputable_section
+                    && parsed.kind() == fln_parse::SourceCommandKind::Definition)
             {
                 let admission = match grammar
                     .enter(|| {
@@ -7916,6 +7918,7 @@ impl Engine {
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
                                 irreducible: false,
+                                noncomputable: false,
                             },
                             presentation,
                         )
@@ -7961,7 +7964,13 @@ impl Engine {
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
                 irreducible,
+                noncomputable,
             } = elaborated;
+            if noncomputable {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "a noncomputable section declaration escaped its admission-only route",
+                });
+            }
             // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
             // a later command's atomic name does not reach it through its namespace, an `open` or
             // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).

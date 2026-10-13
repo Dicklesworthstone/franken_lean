@@ -25,6 +25,10 @@ pub struct SourceScope {
     /// `@[expose] section`'s inherited definition-body default. A declaration's
     /// own `expose`/`no_expose` attributes override this on its effective clone.
     pub expose_definitions: bool,
+    /// The pin's inherited `noncomputable section`: declaration code-generation
+    /// failures may mark the checked declaration noncomputable. Queries still
+    /// require executable code, and successful definitions are not blanket-tagged.
+    pub noncomputable_section: bool,
     pub opened: Vec<Name>,
     /// `open X (a b)`'s `OpenDecl.explicit a X.a`, each with `opened.len()` when it was added,
     /// so resolution reads simple and explicit open declarations in one order, as the pin's
@@ -799,6 +803,7 @@ mod tests {
             private_module: None,
             public_declarations: false,
             expose_definitions: false,
+            noncomputable_section: false,
             opened: vec![n("O")],
             explicit_opens: Vec::new(),
             universes: vec![],
@@ -990,6 +995,7 @@ mod tests {
             private_module: None,
             public_declarations: false,
             expose_definitions: false,
+            noncomputable_section: false,
             namespace: n(namespace),
             opened: opened.iter().map(|o| n(o)).collect(),
             explicit_opens: Vec::new(),
@@ -1065,6 +1071,7 @@ mod tests {
             private_module: None,
             public_declarations: false,
             expose_definitions: false,
+            noncomputable_section: false,
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
             explicit_opens: Vec::new(),

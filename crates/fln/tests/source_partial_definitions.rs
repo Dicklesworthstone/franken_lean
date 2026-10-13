@@ -227,7 +227,15 @@ fn a_partial_companion_cannot_launder_noncomputable_execution() {
     let source = "noncomputable def hiddenValue (n : Nat) : Nat := n + 23\n\
         partial def disguised (n : Nat) : Nat := \
         if n == 0 then hiddenValue n else disguised (n - 1)";
-    let admitted = checked(&base, source);
+    assert!(
+        base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(budget()))
+        )
+        .is_err()
+    );
+    let admitted = checked(&base, &format!("noncomputable section\n{source}\nend\n"));
     assert!(
         admitted
             .execute_source_definitions(

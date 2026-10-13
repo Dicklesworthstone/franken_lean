@@ -26,7 +26,7 @@ pub fn elaborate_group(
     environment: &Environment,
     kernel: Budget,
     scope: &SourceScope,
-) -> Result<Vec<Declaration>, NatDefinitionElabError> {
+) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     if members.is_empty() || members.len() > 8 {
         return Err(refusal("one to eight mutual partial definitions"));
     }
@@ -118,6 +118,7 @@ pub fn elaborate_group(
     };
     let mut bodies = Vec::new();
     let mut universes = Vec::new();
+    let mut failed_codegen = Vec::new();
     for (member, scope) in members.iter().zip(&scopes) {
         let mut context = Context::scoped(environment, kernel, scope);
         context.txn.budget = meter.txn.budget.clone();
@@ -135,6 +136,7 @@ pub fn elaborate_group(
         reopen_captures(&mut context, &mut body.base.type_, Some(&mut body.value))?;
         universes.push((context.level_params.clone(), context.explicit_levels));
         meter.txn.budget = context.txn.budget;
+        failed_codegen.push(context.noncomputable_definition);
         bodies.push(body);
     }
 
@@ -174,6 +176,7 @@ pub fn elaborate_group(
     }
     let mut remaining = vec![true; names.len()];
     let mut declarations = Vec::new();
+    let mut noncomputable = BTreeSet::new();
     while remaining.iter().any(|pending| *pending) {
         // A sink SCC has no unadmitted dependency outside itself. Source order
         // breaks ties, so hash iteration never decides admission order.
@@ -238,12 +241,18 @@ pub fn elaborate_group(
                     all: logical_group.clone(),
                 }));
                 definition.all = implementation_group.clone();
+                if failed_codegen[index] {
+                    noncomputable.insert(definition.base.name.clone());
+                }
                 implementations.push(definition);
             } else {
                 definition.base.name = names[index].clone();
                 definition.all = logical_group.clone();
                 definition.safety = DefinitionSafety::Safe;
                 definition.hints = ReducibilityHints::Regular(1);
+                if failed_codegen[index] {
+                    noncomputable.insert(definition.base.name.clone());
+                }
                 declarations.push(Declaration::Defn(definition));
             }
             remaining[index] = false;
@@ -252,7 +261,13 @@ pub fn elaborate_group(
             declarations.push(Declaration::Mutual(implementations));
         }
     }
-    Ok(declarations)
+    Ok(ElaboratedPartial {
+        declarations,
+        noncomputable,
+        scope: scope.clone(),
+        budget: meter.txn.budget,
+        kernel,
+    })
 }
 
 impl Context {

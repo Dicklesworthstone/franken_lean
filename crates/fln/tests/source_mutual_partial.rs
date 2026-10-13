@@ -240,7 +240,11 @@ mutual
   partial def second (n : Nat) : Nat := first n
 end
 "#;
-    let admitted = checked(&base, source);
+    // Executable dependencies now fail at source compilation, not only #eval.
+    // A noncomputable section permits the logical declarations but never
+    // grants their companions permission to run.
+    refuses(&base, source);
+    let admitted = checked(&base, &format!("noncomputable section\n{source}\nend\n"));
     for name in ["first", "second"] {
         let request = format!("#eval {name} 2");
         assert!(

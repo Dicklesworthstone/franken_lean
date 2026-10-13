@@ -3,8 +3,102 @@
 //! `addAndCompilePartial` and Basic.lean `addAndCompilePartialRec`. Neither a
 //! logical inhabitant alone nor a recursive body alone is a source publication.
 use super::*;
+use fln_env::constants::ConstantInfo;
+use std::collections::BTreeSet;
 mod group;
 pub use group::elaborate_group;
+#[cfg(test)]
+mod codegen_tests;
+
+/// A complete partial-definition command and its deferred compilation effects.
+/// The declarations are untrusted candidates until the caller's whole council
+/// batch succeeds. Compilation metadata is recorded only on that successor.
+pub struct ElaboratedPartial {
+    declarations: Vec<Declaration>,
+    noncomputable: BTreeSet<Name>,
+    scope: SourceScope,
+    budget: ElabBudget,
+    kernel: Budget,
+}
+
+impl ElaboratedPartial {
+    /// The entire atomic admission batch, including logical interfaces.
+    pub fn declarations(&self) -> &[Declaration] {
+        &self.declarations
+    }
+
+    /// Record supported, section-suppressed compilation failures on the actual
+    /// admitted executable declarations, never on a recursive logical witness.
+    ///
+    /// Components are already in dependency order. Rechecking their executable
+    /// references against the admitted environment propagates earlier failures
+    /// without inventing temporary axioms or confusing erased proofs/types with
+    /// runtime dependencies. Like `CoreM.compileDecls`, a failed mutual compiler
+    /// unit marks every executable member. All work spends the original command
+    /// budget; a failure exposes neither the partial successor nor a tag prefix.
+    pub fn record_codegen(
+        &self,
+        admitted: &Environment,
+    ) -> Result<Environment, NatDefinitionElabError> {
+        if self.noncomputable.is_empty() {
+            return Ok(admitted.clone());
+        }
+        if !self.scope.noncomputable_section {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let mut context = Context::scoped(admitted, self.kernel, &self.scope);
+        context.txn.budget = self.budget.clone();
+        context.validate_codegen_metadata()?;
+        for declaration in &self.declarations {
+            context.tick()?;
+            let definitions = match declaration {
+                Declaration::Defn(definition) => std::slice::from_ref(definition),
+                Declaration::Mutual(definitions) => definitions.as_slice(),
+                // This is the checked logical inhabitant, not executable code.
+                Declaration::Opaque(_) => continue,
+                _ => return Err(failure(SourceInferenceError::Scope)),
+            };
+            let mut failed = false;
+            for definition in definitions {
+                context.tick()?;
+                // The API may not stamp an unrelated declaration under the
+                // same name if handed a different successor by an embedder.
+                if context.txn.env.find(&definition.base.name)
+                    != Some(&ConstantInfo::Defn(definition.clone()))
+                {
+                    return Err(failure(SourceInferenceError::Scope));
+                }
+                failed |= self.noncomputable.contains(&definition.base.name);
+            }
+            if !failed {
+                for definition in definitions {
+                    context.level_params = definition.base.level_params.clone();
+                    if context.check_definition_codegen(&Typed {
+                        type_: definition.base.type_.clone(),
+                        value: definition.value.clone(),
+                    })? {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if failed {
+                for definition in definitions {
+                    context.tick()?;
+                    context.txn.env =
+                        crate::noncomputable::register(&context.txn.env, &definition.base.name)
+                            .map_err(|error| match error {
+                                crate::noncomputable::NoncomputableError::Limit => {
+                                    failure(SourceInferenceError::ResourceLimit)
+                                }
+                                other => failure(SourceInferenceError::NoncomputableJournal(other)),
+                            })?;
+                }
+            }
+        }
+        Ok(context.txn.env)
+    }
+}
 
 #[derive(Clone, Default)]
 pub(super) struct State {
@@ -68,7 +162,7 @@ pub fn elaborate(
     environment: &Environment,
     kernel: Budget,
     scope: &SourceScope,
-) -> Result<Vec<Declaration>, NatDefinitionElabError> {
+) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     validate(syntax)?;
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope);
@@ -76,10 +170,28 @@ pub fn elaborate(
     let candidate = definition_in_context(syntax, &mut context)?;
     let Declaration::Mutual(ref definitions) = candidate else {
         // The pin uses its nonrecursive path when no self-reference survives.
-        return Ok(vec![candidate]);
+        let mut noncomputable = BTreeSet::new();
+        if context.noncomputable_definition {
+            let Declaration::Defn(definition) = &candidate else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            noncomputable.insert(definition.base.name.clone());
+        }
+        return Ok(ElaboratedPartial {
+            declarations: vec![candidate],
+            noncomputable,
+            scope,
+            budget: context.txn.budget,
+            kernel,
+        });
     };
     let [implementation] = definitions.as_slice() else {
         return Err(failure(SourceInferenceError::Scope));
+    };
+    let noncomputable = if context.noncomputable_definition {
+        BTreeSet::from([implementation.base.name.clone()])
+    } else {
+        BTreeSet::new()
     };
     let reference = context
         .partial
@@ -102,7 +214,13 @@ pub fn elaborate(
         is_unsafe: false,
         all: vec![name],
     });
-    Ok(vec![logical, candidate])
+    Ok(ElaboratedPartial {
+        declarations: vec![logical, candidate],
+        noncomputable,
+        scope,
+        budget: inhabitant_context.txn.budget,
+        kernel,
+    })
 }
 
 fn validate(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {

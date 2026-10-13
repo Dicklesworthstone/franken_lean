@@ -22,6 +22,8 @@ pub enum ScopeCommand {
         name: Option<Name>,
         public: bool,
         expose: bool,
+        /// Suppress declaration code-generation failures, not elaboration or checking.
+        noncomputable: bool,
     },
     End(Option<Name>),
     Open(Vec<Name>),
@@ -524,7 +526,7 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     if keyword == "#exit" && tokens.len() == 1 {
         return Ok(Some(ScopeCommand::Exit));
     }
-    if matches!(keyword.as_str(), "public" | "@[")
+    if matches!(keyword.as_str(), "public" | "noncomputable" | "@[")
         && let Some(section) = trees::modified_section(&view, &tokens)
     {
         return Ok(Some(section));
@@ -1184,6 +1186,7 @@ mod tests {
                     name,
                     public,
                     expose,
+                    noncomputable: false,
                 }),
                 "{source}"
             );
@@ -1197,6 +1200,7 @@ mod tests {
                 name: Some(Name::from_components(["A", "B"])),
                 public: true,
                 expose: true,
+                noncomputable: false,
             })
         );
         let mut joined = Vec::new();
@@ -1210,7 +1214,7 @@ mod tests {
     #[test]
     fn unsupported_or_escaped_section_modifiers_are_never_consumed_as_scope_flags() {
         for source in [
-            "public noncomputable section",
+            "public noncomputable meta section",
             "@[expose] public meta section",
             "public @[expose] section",
             "@[local expose] public section",

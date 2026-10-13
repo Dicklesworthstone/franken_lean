@@ -144,6 +144,30 @@ impl EngineBuilder {
 }
 
 impl Engine {
+    fn admit_partial_result(
+        &self,
+        partial: &fln_elab::source::partial::ElaboratedPartial,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let mut batch = match self.admit_declarations(partial.declarations(), options, limits)? {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // The private successor has already passed both checkers in its entirety.
+        // Failed dependency analysis or metadata publication drops it wholesale.
+        match elaboration_outcome(partial.record_codegen(batch.engine.environment()))? {
+            Outcome::Complete(environment) => {
+                batch.engine.environment = environment;
+                batch.result_logical_root = batch.engine.logical_root(options);
+                Ok(Outcome::Complete(batch))
+            }
+            Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        }
+    }
+
     /// Build the native source environment with the staged coercion library.
     /// Every class, eliminator, projection and composition instance passes both
     /// checking engines before any of its registrations become observable.
@@ -205,9 +229,7 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
-                    return self
-                        .admit_declarations(&declarations, options, limits)
-                        .map_err(EngineExecutionError::from);
+                    return self.admit_partial_result(&declarations, options, limits);
                 }
                 return self.admit_scoped_inductives(&members, options, limits, scope);
             }
@@ -290,7 +312,7 @@ impl Engine {
         let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
         let candidate = if is_theorem {
             fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel)
-                .map(|declaration| (declaration, true, true))
+                .map(|declaration| (declaration, true, true, false))
         } else {
             fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
                 .map(|instance| {
@@ -298,14 +320,16 @@ impl Engine {
                         instance.declaration,
                         instance.proof_valued,
                         instance.hidden_body,
+                        instance.noncomputable,
                     )
                 })
         };
-        let (candidate, proof_valued, hidden_body) = match elaboration_outcome(candidate)? {
-            Outcome::Complete(candidate) => candidate,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
+        let (candidate, proof_valued, hidden_body, inferred_noncomputable) =
+            match elaboration_outcome(candidate)? {
+                Outcome::Complete(candidate) => candidate,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
         if !proof_valued {
             if hidden_body
                 || !matches!(&candidate, Declaration::Defn(definition)
@@ -320,6 +344,7 @@ impl Engine {
                     parsed.syntax(),
                     candidate,
                     false,
+                    inferred_noncomputable,
                     options,
                     limits,
                     public_scope,
@@ -390,6 +415,7 @@ impl Engine {
                 parsed.syntax(),
                 interface,
                 false,
+                false,
                 options,
                 limits,
                 public_scope,
@@ -442,11 +468,13 @@ impl Engine {
     /// Admit a scoped candidate before applying its declaration attributes. This
     /// also handles a checked proof's safe public interface: attribute replay
     /// uses the identical name and signature, without exposing its proof.
+    #[allow(clippy::too_many_arguments)]
     fn admit_scoped_candidate(
         &self,
         syntax: &fln_syntax::tree::Syntax,
         declaration: Declaration,
         irreducible: bool,
+        inferred_noncomputable: bool,
         options: &KVMap,
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
@@ -586,7 +614,8 @@ impl Engine {
                     batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                if let Some(name) = noncomputable {
+                if noncomputable.is_some() || inferred_noncomputable {
+                    let name = noncomputable.unwrap_or_else(Name::anonymous);
                     let [admitted] = batch.admissions.as_slice() else {
                         return Err(EngineExecutionError::NotImplemented {
                             feature: "noncomputable metadata requires one checked declaration",
@@ -768,9 +797,7 @@ impl Engine {
             };
             // One ordinary council batch: a failed companion never publishes
             // the logical default as a successful executable definition.
-            return self
-                .admit_declarations(&declarations, options, limits)
-                .map_err(EngineExecutionError::from);
+            return self.admit_partial_result(&declarations, options, limits);
         }
         let deriving =
             match elaboration_outcome(fln_elab::source::deriving::prepare(parsed.syntax()))? {
@@ -822,6 +849,7 @@ impl Engine {
                     parsed.syntax(),
                     elaborated.declaration,
                     elaborated.irreducible,
+                    elaborated.noncomputable,
                     options,
                     limits,
                     scope,

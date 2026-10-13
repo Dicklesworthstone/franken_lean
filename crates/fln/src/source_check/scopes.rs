@@ -571,6 +571,7 @@ impl Scopes {
                 name,
                 public,
                 expose,
+                noncomputable,
             } => {
                 let labels = match name {
                     Some(name) => {
@@ -592,6 +593,7 @@ impl Scopes {
                     });
                     self.current.public_declarations |= public;
                     self.current.expose_definitions |= expose;
+                    self.current.noncomputable_section |= noncomputable;
                 }
             }
             ScopeCommand::End(label) => {
@@ -789,6 +791,7 @@ mod tests {
                 name: Some(n("Outer.Inner")),
                 public: true,
                 expose: true,
+                noncomputable: false,
             })
             .unwrap();
         assert!(scopes.current.public_declarations);
@@ -819,6 +822,7 @@ mod tests {
                 name: None,
                 public: true,
                 expose: false,
+                noncomputable: false,
             })
             .unwrap();
         let public = scopes.current.clone();
@@ -827,6 +831,7 @@ mod tests {
                 name: None,
                 public: false,
                 expose: true,
+                noncomputable: false,
             })
             .unwrap();
         assert!(scopes.current.public_declarations);
@@ -847,6 +852,7 @@ mod tests {
             name: Some(n("A.B")),
             public: true,
             expose: true,
+            noncomputable: false,
         };
         assert_eq!(scopes.check_limits(&command), Err(("scope depth", 256)));
         assert!(!scopes.current.public_declarations);

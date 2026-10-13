@@ -131,6 +131,12 @@ pub enum SourceInferenceError {
     UnsupportedRecursor(Name),
     /// A generated recOn has no compiled LCNF signature at the pin.
     AuxiliaryNotCompiled(Name),
+    /// A surviving executable reference has no compiled implementation.
+    NoncomputableDependency(Name),
+    /// Invalid dependency metadata cannot become a suppressed compiler failure.
+    NoncomputableJournal(crate::noncomputable::NoncomputableError),
+    ExternJournal(crate::externs::ExternError),
+    ImplementedByJournal(crate::implemented_by::ImplementedByError),
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     Option(scope::options::OptionRefusal),
@@ -369,6 +375,14 @@ impl std::fmt::Display for SourceInferenceError {
                 "Failed to find LCNF signature for {}",
                 name.to_display_string()
             ),
+            Self::NoncomputableDependency(name) => write!(
+                f,
+                "failed to compile definition, consider marking it as 'noncomputable' because it depends on '{}'",
+                name.to_display_string()
+            ),
+            Self::NoncomputableJournal(error) => write!(f, "{error}"),
+            Self::ExternJournal(error) => write!(f, "{error}"),
+            Self::ImplementedByJournal(error) => write!(f, "{error}"),
             Self::InvalidInstanceBinder => write!(
                 f,
                 "instance binder must end in a registered class with inferable parameters"
@@ -560,6 +574,9 @@ struct Context {
     // Enabled only by the batch-only partial-definition entry point. A recursive
     // body needs its opaque logical interface AND its executable companion.
     partial: Option<partial::State>,
+    // A supported compiler refusal suppressed by a noncomputable section.
+    // Only the successful declaration result can carry it to post-admission metadata.
+    noncomputable_definition: bool,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -641,6 +658,7 @@ impl Context {
             well_founded: None,
             well_founded_definition: false,
             partial: None,
+            noncomputable_definition: false,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_coercions: Vec::new(),
@@ -4426,6 +4444,7 @@ pub struct PublicInstance {
     pub declaration: Declaration,
     pub proof_valued: bool,
     pub hidden_body: bool,
+    pub noncomputable: bool,
 }
 
 /// Elaborate a public instance once, choosing its body world from the resolved
@@ -4442,6 +4461,7 @@ pub fn elaborate_public_instance(
     Ok(PublicInstance {
         proof_valued: matches!(&declaration, Declaration::Thm(_)),
         hidden_body: context.private_instance_body,
+        noncomputable: context.noncomputable_definition,
         declaration,
     })
 }
@@ -4604,6 +4624,9 @@ pub struct ElaboratedDeclaration {
     /// The definition actually used well-founded lowering. A source spelling or
     /// a body mentioning `WellFounded.Nat.fix` does not set this effect.
     pub irreducible: bool,
+    /// An actual supported code-generation refusal suppressed by the enclosing
+    /// noncomputable section, not merely the presence of that section.
+    pub noncomputable: bool,
 }
 
 fn definition_scoped(
@@ -4628,6 +4651,7 @@ fn definition_scoped_with_effects(
     Ok(ElaboratedDeclaration {
         declaration,
         irreducible: context.well_founded_definition,
+        noncomputable: context.noncomputable_definition,
     })
 }
 
@@ -5211,7 +5235,7 @@ fn definition_in_context_named(
     // These still pass ordinary term elaboration and council admission, but a missing
     // runtime recursor implementation is irrelevant when no code may be generated.
     if !is_theorem && !proof_instance && !is_noncomputable {
-        context.check_compiled_recursors(&term)?;
+        context.noncomputable_definition = context.check_definition_codegen(&term)?;
     }
     let type_ = instance_type.unwrap_or(term.type_);
     let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;

@@ -26,7 +26,8 @@
 //! require an executable recursor.
 //!
 //! Executing such recursors is FrankenLean's `frontier` lane: an engine in that mode
-//! sets [`SourceScope::frontier_recursors`] and this check is skipped. Its artifacts
+//! sets [`SourceScope::frontier_recursors`] and the recursor restriction is skipped.
+//! Noncomputable dependencies remain non-executable in every mode. Its artifacts
 //! carry the frontier mode, which default consumers refuse (D-18).
 //!
 //! The csimp set is derived, never remembered: `csimp_recursors.tsv` is generated from
@@ -36,6 +37,8 @@
 use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::{BTreeSet, HashSet};
+
+mod dependencies;
 
 const CSIMP_TABLE: &str = include_str!("../seed/csimp_recursors.tsv");
 const CSIMP_SCHEMA: &str = "schema fln-seed-csimp-recursors/1";
@@ -140,6 +143,33 @@ fn auxiliary_origin(name: &Name) -> Option<(Name, Name)> {
 }
 
 impl Context {
+    /// Deferred compilation effects must validate the admitted successor's
+    /// metadata even when the original body already had a known compiler error.
+    pub(super) fn validate_codegen_metadata(&mut self) -> Result<(), NatDefinitionElabError> {
+        dependencies::Dependencies::read(self).map(|_| ())
+    }
+
+    /// `noncomputable section` suppresses only a known declaration compiler
+    /// refusal. Parsing, typing, resource stops, malformed metadata and faults
+    /// are not compiler failures and must never be converted to this effect.
+    /// Evaluation calls `check_compiled_recursors` directly, so the section
+    /// cannot turn a failed `#eval` into an admitted but unexecuted query.
+    /// Partial batches carry this effect to their exact admitted companions.
+    pub(super) fn check_definition_codegen(
+        &mut self,
+        term: &Typed,
+    ) -> Result<bool, NatDefinitionElabError> {
+        match self.check_compiled_recursors(term) {
+            Ok(()) => Ok(false),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::UnsupportedRecursor(_)
+                | SourceInferenceError::AuxiliaryNotCompiled(_)
+                | SourceInferenceError::NoncomputableDependency(_),
+            )) if self.source_scope.noncomputable_section => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Track both ordinary constants and constants with explicit universe arguments.
     /// Elaboration's own eliminations construct their recursor constants directly.
     pub(super) fn note_resolved_recursor(
@@ -177,16 +207,14 @@ impl Context {
         &mut self,
         term: &Typed,
     ) -> Result<(), NatDefinitionElabError> {
-        if self.source_scope.frontier_recursors {
-            return Ok(());
-        }
         let named: Vec<Name> = self
             .source_recursors
             .iter()
-            .filter(|name| !compiles(name))
+            .filter(|name| !self.source_scope.frontier_recursors && !compiles(name))
             .cloned()
             .collect();
-        if named.is_empty() {
+        let dependencies = dependencies::Dependencies::read(self)?;
+        if named.is_empty() && dependencies.is_empty() {
             return Ok(());
         }
         // Proof declarations and type formers have no runtime body. This is
@@ -202,7 +230,7 @@ impl Context {
             }
         }
         let saved = self.txn.lctx.clone();
-        let result = self.check_compiled_value(&term.value, &named);
+        let result = self.check_compiled_value(&term.value, &named, &dependencies);
         // A refusal may unwind past pending Restore tasks. Temporary binders
         // are analysis only and must never escape, including on budget stops.
         self.txn.lctx = saved;
@@ -230,6 +258,7 @@ impl Context {
         &mut self,
         value: &Expr,
         named: &[Name],
+        dependencies: &dependencies::Dependencies,
     ) -> Result<(), NatDefinitionElabError> {
         enum Work {
             Visit(Expr),
@@ -273,6 +302,7 @@ impl Context {
                     }
                     args.reverse();
                     if let ExprNode::Const { name, levels } = head.node() {
+                        dependencies.check(name)?;
                         if named.contains(name) && self.compiled_application(name, levels, &args)? {
                             if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
                                 return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(

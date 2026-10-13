@@ -2,8 +2,8 @@
 //!
 //! [`super::parse`] reads what a scope command does to the environment; this module reads how the
 //! pin's parser builds it. The two accept the same commands except where the checker does not
-//! model what the tree says: `noncomputable` and `meta` sections retain their trees
-//! for explicit refusal. Public and exposure section flags have both a typed
+//! model what the tree says: `meta` sections retain their trees
+//! for explicit refusal. Public, exposure and noncomputable section flags have both a typed
 //! command and the original pin-shaped syntax tree.
 use super::*;
 
@@ -197,7 +197,7 @@ fn section_parts(view: &SourceView, tokens: &[LexedToken]) -> Option<SectionPart
 /// are refused by the ordinary source-command path.
 pub(super) fn modified_section(view: &SourceView, tokens: &[LexedToken]) -> Option<ScopeCommand> {
     let parts = section_parts(view, tokens)?;
-    if parts.keyword == 0 || parts.slots[1].is_some() || parts.slots[2].is_some() {
+    if parts.keyword == 0 || parts.slots[2].is_some() {
         return None;
     }
     let name = parts.name.map(|at| match &tokens[at].kind {
@@ -208,6 +208,7 @@ pub(super) fn modified_section(view: &SourceView, tokens: &[LexedToken]) -> Opti
         name,
         public: parts.slots[0].is_some(),
         expose: parts.expose,
+        noncomputable: parts.slots[1].is_some(),
     })
 }
 
@@ -531,5 +532,68 @@ fn first_leaf_info(syntax: &mut Syntax) -> Option<&mut SourceInfo> {
     match node {
         Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => Some(info),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod noncomputable_section_tests {
+    use super::*;
+
+    #[test]
+    fn section_flags_preserve_the_pin_tree_and_original_command_boundaries() {
+        for (source, public, expose) in [
+            ("noncomputable section", false, false),
+            ("public noncomputable section", true, false),
+            ("@[expose] public noncomputable section", true, true),
+        ] {
+            assert_eq!(
+                super::super::parse(source.as_bytes()).unwrap(),
+                Some(ScopeCommand::SectionWithModifiers {
+                    name: None,
+                    public,
+                    expose,
+                    noncomputable: true,
+                })
+            );
+            assert_eq!(
+                tree(source.as_bytes()).unwrap().unwrap().kind(),
+                Some(&parser_kind(&["Command", "section"]))
+            );
+        }
+        let source = b"/- leading -/\r\n@[expose]\r\npublic\r\nnoncomputable\r\nsection A.B\r\ndef x := 7\r\nend B\r\nend A\r\n";
+        let commands = super::super::partition(source).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(
+            super::super::parse(commands[0].1).unwrap(),
+            Some(ScopeCommand::SectionWithModifiers {
+                noncomputable: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            source
+        );
+    }
+
+    #[test]
+    fn escaped_and_unsupported_modifiers_do_not_acquire_section_authority() {
+        for source in [
+            "«noncomputable» section",
+            "noncomputable meta section",
+            "noncomputable public section",
+            "noncomputable noncomputable section",
+        ] {
+            assert!(
+                !matches!(
+                    super::super::parse(source.as_bytes()),
+                    Ok(Some(ScopeCommand::SectionWithModifiers { .. }))
+                ),
+                "{source}"
+            );
+        }
     }
 }
