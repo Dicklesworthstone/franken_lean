@@ -7,7 +7,7 @@ impl Context {
         &mut self,
         local: &LocalDecl,
         rule: &SimpRule<'_>,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let target = self.instantiate(&local.type_)?;
         match self.unfold_simp_rule(rule, &target)? {
@@ -66,7 +66,7 @@ impl Context {
         let mut rules = self.simp_rules(&selection)?;
         let mut hypotheses = Vec::new();
         let mut selected = HashSet::new();
-        for rule in &rules {
+        for rule in &rules.selected {
             self.tick()?;
             if let SimpRule::Local(id) = rule {
                 selected.insert(id.clone());
@@ -89,7 +89,7 @@ impl Context {
                 continue;
             }
             if selected.insert(local.id.clone()) {
-                rules.push(SimpRule::Local(local.id.clone()));
+                rules.selected.push(SimpRule::Local(local.id.clone()));
             }
             // Shadowed and inaccessible locals may provide evidence by ID,
             // but must never redirect a source-visible simplification location.
@@ -134,14 +134,14 @@ impl Context {
         proof: &mut ProofState<'_>,
         initial: &ProofGoal,
         locations: super::super::locations::RewriteLocations,
-        mut rules: Vec<SimpRule<'_>>,
+        mut rules: SimpRules<'_>,
         saturate: bool,
     ) -> Result<(), NatDefinitionElabError> {
         let mut protected = HashSet::new();
         if locations.all {
             // Preserve explicitly selected evidence for the entire traversal.
             // Automatically selected locals are remapped after each transport.
-            for rule in &rules {
+            for rule in &rules.selected {
                 self.tick()?;
                 if !matches!(rule, SimpRule::Explicit(_)) {
                     continue;
@@ -189,12 +189,15 @@ impl Context {
                         .ok_or_else(|| error(TacticError::RewriteLocation))?;
                     let mut advanced = false;
                     // Self evidence is also unavailable for premise discharge.
-                    let active: Vec<_> = rules
-                        .iter()
-                        .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
-                        .cloned()
-                        .collect();
-                    for rule in &active {
+                    let active = self.index_simp_rules(
+                        rules
+                            .selected
+                            .iter()
+                            .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
+                            .cloned()
+                            .collect(),
+                    )?;
+                    for rule in &active.selected {
                         self.tick()?;
                         let original = self.rewrite_trial();
                         let Some(replacement) = self.simp_hypothesis_step(&local, rule, &active)?
@@ -221,7 +224,7 @@ impl Context {
                             .ok_or_else(|| failure(SourceInferenceError::Scope))?
                             .id
                             .clone();
-                        for rule in &mut rules {
+                        for rule in &mut rules.selected {
                             self.tick()?;
                             if let SimpRule::Local(id) = rule
                                 && id == &local.id

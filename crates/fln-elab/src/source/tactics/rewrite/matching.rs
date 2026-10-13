@@ -87,6 +87,69 @@ impl Context {
         }
     }
 
+    pub(super) fn rewrite_types_have_distinct_heads(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(matches!(
+            (self.rigid_rewrite_type_head(left)?, self.rigid_rewrite_type_head(right)?),
+            (Some(left), Some(right)) if left != right
+        ))
+    }
+
+    /// A syntactic telescope prefix suffices to recognize a partial constant
+    /// application's function type. Substitution cannot erase a literal Pi or
+    /// Sort at this position. Other result shapes require actual inference.
+    fn rigid_rewrite_constant_result(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
+        let mut head = expression;
+        let mut arguments = 0usize;
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, .. } => {
+                    arguments = arguments
+                        .checked_add(1)
+                        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                    head = f;
+                }
+                ExprNode::MData { expr, .. } => head = expr,
+                _ => break,
+            }
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(info) = self.txn.env.find(name).cloned() else {
+            return Ok(None);
+        };
+        let base = info.constant_val();
+        if levels.len() != base.level_params.len() {
+            return Ok(None);
+        }
+        let mut result = &base.type_;
+        loop {
+            self.tick()?;
+            match result.node() {
+                ExprNode::MData { expr, .. } => result = expr,
+                ExprNode::ForallE { body, .. } if arguments > 0 => {
+                    arguments -= 1;
+                    result = body;
+                }
+                ExprNode::ForallE { .. } if arguments == 0 => {
+                    return Ok(Some(RigidTypeHead::Forall));
+                }
+                ExprNode::Sort { .. } if arguments == 0 => {
+                    return Ok(Some(RigidTypeHead::Sort));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
     pub(super) fn rewrite_trial(&self) -> Self {
         self.clone()
     }
@@ -115,15 +178,55 @@ impl Context {
         }
     }
 
-    /// Match both the term and its type. `constrain` contributes universe
-    /// equations, while the explicit equations also check closed mismatches
-    /// (ordinary source elaboration leaves those to final declaration checking).
+    /// Prepare a selection equation without starting ordinary inference. Keep
+    /// its scoped-conversion and universe obligations, but never let a failed
+    /// candidate retry by unfolding every safe definition before selection runs.
+    /// The result records whether solving can make this pair newly ground.
+    fn prepare_rewrite_selection(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let actual = self.instantiate(actual)?;
+        let expected = self.instantiate(expected)?;
+        let open = actual.has_expr_mvar()
+            || expected.has_expr_mvar()
+            || actual.has_level_mvar()
+            || expected.has_level_mvar();
+        if !open {
+            self.check_scoped_equation(&actual, &expected)?;
+        } else if let (Some(left), Some(right)) =
+            (self.known_type(&actual)?, self.known_type(&expected)?)
+            && (left.has_level_mvar() || right.has_level_mvar())
+        {
+            self.equations.push(SourceEquation::selection(left, right));
+        }
+        self.equations
+            .push(SourceEquation::selection(actual, expected));
+        Ok(open)
+    }
+
+    /// Match both term and carrier in one selection batch, including closed
+    /// mismatches that ordinary inference leaves to final declaration checking.
     fn match_rewrite_occurrence(
         &mut self,
         pattern: &Expr,
         alpha: &Expr,
         occurrence: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        // Sorts, dependent function types and saturated admitted inductives
+        // are rigid as terms too. Distinct heads cannot become equal through
+        // conversion; avoid inferring and solving that impossible occurrence.
+        if self.rewrite_types_have_distinct_heads(pattern, occurrence)? {
+            return Ok(false);
+        }
+        if let (Some(actual), Some(expected)) = (
+            self.rigid_rewrite_constant_result(occurrence)?,
+            self.rigid_rewrite_type_head(alpha)?,
+        ) && actual != expected
+        {
+            return Ok(false);
+        }
         let Some(type_) = self.known_type(occurrence)? else {
             return Ok(false);
         };
@@ -131,29 +234,34 @@ impl Context {
         // partially applied functions, not values of the rule's carrier type.
         // Do not unify their large proof terms after their types already have
         // irreconcilable rigid heads. This accepts nothing and assigns no hole.
-        if let (Some(actual), Some(expected)) = (
-            self.rigid_rewrite_type_head(&type_)?,
-            self.rigid_rewrite_type_head(alpha)?,
-        ) && actual != expected
-        {
+        if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
         }
-        self.constrain(&type_, alpha)?;
-        self.constrain(occurrence, pattern)?;
-        self.equations
-            .push(SourceEquation::selection(type_, alpha.clone()));
-        self.equations.push(SourceEquation::selection(
-            occurrence.clone(),
-            pattern.clone(),
-        ));
+        let open_type = self.prepare_rewrite_selection(&type_, alpha)?;
+        let open_term = self.prepare_rewrite_selection(occurrence, pattern)?;
         self.flush(true)?;
+        for (was_open, actual, expected) in
+            [(open_type, &type_, alpha), (open_term, occurrence, pattern)]
+        {
+            if was_open {
+                let actual = self.instantiate(actual)?;
+                let expected = self.instantiate(expected)?;
+                if !actual.has_expr_mvar()
+                    && !expected.has_expr_mvar()
+                    && !actual.has_level_mvar()
+                    && !expected.has_level_mvar()
+                {
+                    self.check_scoped_equation(&actual, &expected)?;
+                }
+            }
+        }
         Ok(true)
     }
 
     fn discharge_rewrite_premises(
         &mut self,
         holes: &[MVarId],
-        selected_rules: &[SimpRule<'_>],
+        selected_rules: &SimpRules<'_>,
     ) -> Result<bool, NatDefinitionElabError> {
         loop {
             let before = self.txn.mvars.assignments().len();
@@ -219,7 +327,7 @@ impl Context {
         target: &Expr,
         reverse: bool,
         inside_out: bool,
-        selected_rules: &[SimpRule<'_>],
+        selected_rules: &SimpRules<'_>,
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
@@ -479,6 +587,76 @@ mod outcome_tests {
             env = publication.environment;
         }
         Context::new(&env, budget)
+    }
+
+    #[test]
+    fn selection_does_not_retry_an_irrelevant_definition_at_inference_transparency() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        let source = format!(
+            "def costly (n : Nat) : Nat := {}n{}",
+            "Nat.succ (".repeat(128),
+            ")".repeat(128)
+        );
+        let declaration =
+            crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                .unwrap()
+                .declaration;
+        let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+            panic!("definition admission did not complete");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("definition was rejected");
+        };
+        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+            checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+        else {
+            panic!("definition publication did not complete");
+        };
+        ctx.txn.env = publication.environment;
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let costly = Expr::const_(Name::from_components(["costly"]), vec![]);
+        let hole = ctx.hole(nat.clone()).unwrap();
+        let pattern = Expr::app(costly.clone(), hole.clone());
+        let before = ctx.txn.clone();
+        let mut trial = ctx.rewrite_trial();
+        trial.txn.budget.max_heartbeats = trial.txn.budget.heartbeats_consumed + 512;
+        let problem = trial
+            .match_rewrite_occurrence(&pattern, &nat, &zero)
+            .unwrap_err();
+        assert!(Context::rewrite_nonmatch(&problem), "{problem:?}");
+        ctx.charge_rewrite_trial(&trial);
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+
+        let mut same_head = ctx.rewrite_trial();
+        assert!(
+            same_head
+                .match_rewrite_occurrence(&pattern, &nat, &Expr::app(costly, zero.clone()),)
+                .unwrap()
+        );
+        assert_eq!(same_head.instantiate(&hole).unwrap(), zero);
+
+        // Ordinary source conversion still unfolds safe definitions; selection
+        // alone must avoid the expensive second attempt on an irrelevant rule.
+        let mut expanded = zero.clone();
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            expanded = Expr::app(succ.clone(), expanded);
+        }
+        ctx.constrain(&pattern, &expanded).unwrap();
+        assert_eq!(ctx.instantiate(&hole).unwrap(), zero);
     }
 
     #[test]

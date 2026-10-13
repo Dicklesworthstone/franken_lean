@@ -146,8 +146,13 @@ pub fn registration(
 }
 
 const MAGIC: &[u8] = b"FLNSIMP\x01";
-const MAX_ROWS: usize = 4096;
+// The pinned Init alone exports over 10,000 simp entries. Bound the journal
+// independently of theorem-telescope traversal, while retaining the old
+// 4096 * 16384 = 64 MiB maximum aggregate payload allowance.
+const MAX_ROWS: usize = 65_536;
+const MAX_TYPE_STEPS: usize = 4096;
 const MAX_BYTES: usize = 16384;
+const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimpSetError {
@@ -206,7 +211,7 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
     // Reversed rules and axioms retain the bounded equality/Iff classifier.
     // In particular a data-valued axiom is not classified as a proposition.
     let mut applications = 0;
-    for _ in 0..MAX_ROWS {
+    for _ in 0..MAX_TYPE_STEPS {
         match ty.node() {
             ExprNode::MData { expr, .. } => ty = expr,
             ExprNode::ForallE { body, .. } if applications == 0 => ty = body,
@@ -264,9 +269,13 @@ fn read_name(bytes: &mut &[u8]) -> Result<Name, SimpSetError> {
 /// Read active rows in deterministic priority order (newer ties first).
 /// Corrupt entries and dangling references are errors, never an empty simp set.
 pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
+    read_journal(env).map(|(rows, _)| rows)
+}
+
+fn read_journal(env: &Environment) -> Result<(Vec<SimpEntry>, usize), SimpSetError> {
     let expected = descriptor();
     let Some(extension) = env.extension(&expected.name) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     if extension.descriptor != expected {
         return Err(SimpSetError::Malformed);
@@ -275,10 +284,15 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
         return Err(SimpSetError::Limit);
     }
     let mut active = BTreeMap::new();
+    let mut payload_bytes = 0usize;
     for (order, row) in extension.entries().enumerate() {
         if row.payload.len() > MAX_BYTES {
             return Err(SimpSetError::Limit);
         }
+        payload_bytes = payload_bytes
+            .checked_add(row.payload.len())
+            .filter(|bytes| *bytes <= MAX_TOTAL_BYTES)
+            .ok_or(SimpSetError::Limit)?;
         let mut bytes: &[u8] = &row.payload;
         if take(&mut bytes, MAGIC.len())? != MAGIC {
             return Err(SimpSetError::Malformed);
@@ -322,7 +336,7 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
             .cmp(&a.priority)
             .then_with(|| b.order.cmp(&a.order))
     });
-    Ok(rows)
+    Ok((rows, payload_bytes))
 }
 
 /// Add/update an already admitted rule, or erase it with `None`. The returned
@@ -332,7 +346,7 @@ pub fn update(
     declaration: &Name,
     rule: Option<(u32, bool)>,
 ) -> Result<Environment, SimpSetError> {
-    let rows = read(env)?;
+    let (rows, mut payload_bytes) = read_journal(env)?;
     let current = rows.iter().find(|r| &r.declaration == declaration);
     if !env.contains(declaration) {
         return Err(SimpSetError::UnknownDeclaration(declaration.clone()));
@@ -345,6 +359,38 @@ pub fn update(
     } else if current.is_none() {
         return Ok(env.clone());
     }
+    append(env, declaration, rule, &mut payload_bytes)
+}
+
+/// Apply a module's forward rules and erasures after declaration admission. Read the
+/// existing journal once. Unlike source-local `update`, retain even currently
+/// redundant operations: module replay may apply them after a different source
+/// prefix. Failure leaves the caller's snapshot untouched.
+pub fn register_module(
+    env: &Environment,
+    declarations: &[(Name, Option<u32>)],
+) -> Result<Environment, SimpSetError> {
+    let (_, mut payload_bytes) = read_journal(env)?;
+    let mut next = env.clone();
+    for (declaration, priority) in declarations {
+        if !next.contains(declaration) {
+            return Err(SimpSetError::UnknownDeclaration(declaration.clone()));
+        }
+        let rule = priority.map(|priority| (priority, false));
+        if rule.is_some() {
+            validate(&next, declaration, false)?;
+        }
+        next = append(&next, declaration, rule, &mut payload_bytes)?;
+    }
+    Ok(next)
+}
+
+fn append(
+    env: &Environment,
+    declaration: &Name,
+    rule: Option<(u32, bool)>,
+    payload_bytes: &mut usize,
+) -> Result<Environment, SimpSetError> {
     let expected = descriptor();
     if env
         .extension(&expected.name)
@@ -363,6 +409,10 @@ pub fn update(
     if size > MAX_BYTES {
         return Err(SimpSetError::Limit);
     }
+    let next_bytes = payload_bytes
+        .checked_add(size)
+        .filter(|bytes| *bytes <= MAX_TOTAL_BYTES)
+        .ok_or(SimpSetError::Limit)?;
     let mut payload = MAGIC.to_vec();
     payload.push(u8::from(rule.is_none()));
     payload.extend((parts.len() as u32).to_le_bytes());
@@ -379,8 +429,11 @@ pub fn update(
     } else {
         env.clone()
     };
-    env.push_extension_entry(&expected.name, payload)
-        .map_err(|_| SimpSetError::Malformed)
+    let next = env
+        .push_extension_entry(&expected.name, payload)
+        .map_err(|_| SimpSetError::Malformed)?;
+    *payload_bytes = next_bytes;
+    Ok(next)
 }
 
 #[cfg(test)]

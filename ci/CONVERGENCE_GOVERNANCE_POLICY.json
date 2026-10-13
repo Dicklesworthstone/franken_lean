@@ -28,6 +28,13 @@
   ],
   "exceptions": [],
   "registry": [
+    {"id": "fln-scoped-unknown-name-route-bl77", "class": "implementation", "workstream": "W2", "gate": "G1"},
+    {"id": "fln-peer-header-incremental-4t82", "class": "implementation", "workstream": "W3", "gate": "G1"},
+    {"id": "fln-test-safety-boundaries-o8zu", "class": "verification", "workstream": "W1", "gate": "G0"},
+    {"id": "fln-workflow-python-isolation-1gl3", "class": "verification", "workstream": "W1", "gate": "G0"},
+    {"id": "fln-guard-lifetime-char-boundary-zydy", "class": "verification", "workstream": "W1", "gate": "G0"},
+    {"id": "fln-ersf", "class": "implementation", "workstream": "W4", "gate": "G2"},
+    {"id": "fln-zp28", "class": "implementation", "workstream": "W2", "gate": "G1"},
     {"id": "franken_lean-shgs", "class": "verification", "workstream": "W3", "gate": "G1"},
     {"id": "fln-4hol", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "fln-lst4", "class": "verification", "workstream": "W3", "gate": "G1"},

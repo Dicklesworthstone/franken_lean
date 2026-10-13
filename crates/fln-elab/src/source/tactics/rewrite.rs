@@ -3,7 +3,7 @@
 mod locations;
 mod matching;
 mod simplify;
-use simplify::SimpRule;
+use simplify::SimpRules;
 
 pub(in crate::source) struct RewriteMatch {
     rule: Typed,
@@ -251,7 +251,13 @@ impl Context {
             occurrence,
             premises,
         } = self
-            .instantiate_rewrite_rule(rule, &original_target, reverse, false, &[])?
+            .instantiate_rewrite_rule(
+                rule,
+                &original_target,
+                reverse,
+                false,
+                &SimpRules::default(),
+            )?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
         let (next_goal, value) = self.rewrite_transport(&goal, rule, &occurrence, reverse)?;
         proof.work.push(Work::Close(goal, value));

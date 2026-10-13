@@ -536,6 +536,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Install the supported default simp rules in this module's journal window.
+    /// This changes search metadata only; every use still constructs a checked proof.
+    pub fn register_simps(
+        mut self,
+        declarations: &[(Name, Option<u32>)],
+    ) -> Result<Self, crate::source::scope::simp::SimpSetError> {
+        self.env = crate::source::scope::simp::register_module(&self.env, declarations)?;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {

@@ -234,6 +234,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn premise_unfolding_refreshes_names_exposed_by_definitions_and_assignments() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let mut env = Environment::new();
+        for source in [
+            "def Hidden : Type := Prop",
+            "def Reveal : Type := Hidden",
+            "def Absent : Type := Prop",
+        ] {
+            let declaration = crate::check_definition_source(source.as_bytes(), &env, budget)
+                .unwrap()
+                .declaration;
+            let Outcome::Complete(admitted) = admit(&env, declaration, budget) else {
+                panic!("definition admission did not complete");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("definition was rejected");
+            };
+            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+            else {
+                panic!("definition publication did not complete");
+            };
+            env = publication.environment;
+        }
+        let reveal = Expr::const_(Name::from_components(["Reveal"]), vec![]);
+        for through_hole in [false, true] {
+            for include_hidden in [false, true] {
+                let mut ctx = Context::new(&env, budget);
+                let sibling = ctx.hole(Expr::sort(Level::one())).unwrap();
+                let input = if through_hole {
+                    let hole = ctx.hole(Expr::sort(Level::one())).unwrap();
+                    ctx.txn
+                        .unify(&hole, &reveal, UnificationBudget::new(budget))
+                        .unwrap();
+                    assert!(matches!(hole.node(), ExprNode::MVar { .. }));
+                    assert_eq!(ctx.instantiate(&hole).unwrap(), reveal);
+                    hole
+                } else {
+                    reveal.clone()
+                };
+                let selected = ["Absent", "Reveal", "Hidden"]
+                    .into_iter()
+                    .take(if include_hidden { 3 } else { 2 })
+                    .map(|name| {
+                        SimpRule::Global(scope::simp::SimpEntry {
+                            declaration: Name::from_components([name]),
+                            priority: 1000,
+                            reverse: false,
+                            order: 0,
+                        })
+                    })
+                    .collect();
+                let rules = ctx.index_simp_rules(selected).unwrap();
+                let before = ctx.txn.mvars.clone();
+                let expected = if include_hidden {
+                    Expr::sort(Level::zero())
+                } else {
+                    Expr::const_(Name::from_components(["Hidden"]), vec![])
+                };
+                assert_eq!(ctx.simp_premise_target(&input, &rules).unwrap(), expected);
+                assert_eq!(ctx.instantiate(&sibling).unwrap(), sibling);
+                assert_eq!(ctx.txn.mvars, before);
+                assert_eq!(ctx.txn.env, env);
+            }
+        }
+    }
+
+    #[test]
     fn unfolding_selects_only_the_requested_global_even_below_binders() {
         let name = Name::from_components(["selected"]);
         let other = Name::from_components(["unselected"]);

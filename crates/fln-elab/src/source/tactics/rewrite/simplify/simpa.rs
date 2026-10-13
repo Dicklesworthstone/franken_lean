@@ -87,7 +87,7 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
         term: Typed,
     ) -> Result<(), NatDefinitionElabError> {
         self.resolve_instances(false)?;
@@ -122,7 +122,7 @@ impl Context {
             }
             history.push(target);
             let mut changed = false;
-            for rule in rules {
+            for rule in &rules.selected {
                 self.tick()?;
                 let original = self.rewrite_trial();
                 let Some(replacement) = self.simp_hypothesis_step(&local, rule, rules)? else {

@@ -36,7 +36,13 @@ impl SourceOleanImportLimits {
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
-            metadata: DecodeLimits::default(),
+            // The pinned Init closure uses 96,786 discrimination and parameter
+            // cells when simp metadata is selected. Allow 131,072 cells; byte,
+            // object, entry and instance-key ceilings remain independent.
+            metadata: DecodeLimits {
+                max_indices: 1 << 17,
+                ..DecodeLimits::default()
+            },
             capture: OleanWalkBudget::default(),
             max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
@@ -60,6 +66,14 @@ pub struct SourceMetadataReport {
     /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
     /// `instances` transparency instance selection runs at.
     pub reducibility: usize,
+    /// Decoded default simp entries, including forms not yet executable natively.
+    pub simps: usize,
+    /// Global forward post-phase rules installed in the native simp journal.
+    pub activated_simps: usize,
+    /// Entries whose scope, phase, proof form or erasure associations require
+    /// additional consumer support. Such modules also report `simpExtension`
+    /// in `uninterpreted`; decoding alone does not imply semantic support.
+    pub deferred_simps: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -281,6 +295,7 @@ impl Engine {
             metadata::ALIAS_EXTENSION,
             metadata::PROTECTED_EXTENSION,
             metadata::REDUCIBILITY_EXTENSION,
+            metadata::SIMP_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
         let mut blocks: Vec<_> = selected
@@ -331,6 +346,9 @@ impl Engine {
                 aliases: 0,
                 protected: 0,
                 reducibility: 0,
+                simps: 0,
+                activated_simps: 0,
+                deferred_simps: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -357,7 +375,8 @@ impl Engine {
                         2 => report.defaults = block.entries.len(),
                         3 => report.aliases = block.entries.len(),
                         4 => report.protected = block.entries.len(),
-                        _ => report.reducibility = block.entries.len(),
+                        5 => report.reducibility = block.entries.len(),
+                        _ => report.simps = block.entries.len(),
                     }
                     // Move payloads, not copies. Decoding once gives all modules
                     // one cumulative byte/object/index allowance.
@@ -377,6 +396,7 @@ impl Engine {
         let mut aliases = decoded.aliases.into_iter();
         let mut protected = decoded.protected.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
+        let mut simps = decoded.simps.into_iter();
         let mut engine = checked.engine.clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
@@ -544,6 +564,54 @@ impl Engine {
                         },
                     })?;
             }
+            let mut simp_rules = Vec::new();
+            for _ in 0..report.simps {
+                cancelled!("source-olean/simp");
+                let row = simps.next().ok_or(SourceOleanImportError::Internal(
+                    "simp count changed during decode",
+                ))?;
+                if let Some(rule) = native_simp_rule(activation.environment(), &row) {
+                    simp_rules.push((rule.0, Some(rule.1)));
+                    report.activated_simps += 1;
+                } else {
+                    report.deferred_simps += 1;
+                    // Reversed entries erase their forward counterpart in the
+                    // pin. A deferred global row must not leave an earlier rule
+                    // active, even when that rule came from another module.
+                    if row.scope.is_none()
+                        && let metadata::SimpKind::Theorem(theorem) = &row.kind
+                        && activation.environment().contains(&theorem.origin)
+                        && fln_elab::source::scope::components(&theorem.origin).is_ok()
+                    {
+                        simp_rules.push((theorem.origin.clone(), None));
+                    }
+                }
+            }
+            if report.deferred_simps != 0 {
+                report.uninterpreted.push(selected[6].clone());
+            }
+            activation = activation.register_simps(&simp_rules).map_err(|error| {
+                use fln_elab::source::scope::simp::SimpSetError;
+                let (declaration, reason) = match error {
+                    SimpSetError::UnknownDeclaration(name) => {
+                        (name, "a simp rule names no admitted declaration")
+                    }
+                    SimpSetError::UnsupportedDeclaration(name) => {
+                        (name, "a simp rule has no supported checked declaration")
+                    }
+                    SimpSetError::Limit => {
+                        return SourceOleanImportError::Limit("native simp journal");
+                    }
+                    SimpSetError::Malformed => {
+                        (report.module.clone(), "malformed native simp journal")
+                    }
+                };
+                SourceOleanImportError::Metadata {
+                    module: report.module.clone(),
+                    declaration,
+                    reason,
+                }
+            })?;
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
@@ -560,6 +628,7 @@ impl Engine {
             || aliases.next().is_some()
             || protected.next().is_some()
             || reducibility.next().is_some()
+            || simps.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
@@ -582,6 +651,59 @@ impl Engine {
             contexts,
         }))
     }
+}
+
+/// The source journal selects declarations, not arbitrary stored proof terms.
+/// Admit only forms it can represent without changing the proof's meaning or
+/// its erasure identity. Unsupported metadata remains reported on the module.
+fn native_simp_rule(env: &Environment, row: &metadata::SimpEntry) -> Option<(Name, u32)> {
+    use fln_env::constants::{ConstantInfo, DefinitionSafety};
+    if row.scope.is_some() {
+        return None;
+    }
+    let (name, priority) = match &row.kind {
+        metadata::SimpKind::Theorem(theorem)
+            if theorem.post && !theorem.permutation && !theorem.origin_reverse =>
+        {
+            let ConstantInfo::Thm(info) = env.find(&theorem.origin)? else {
+                return None;
+            };
+            // mkSimpTheoremFromConst stores a bare constant even when its
+            // declaration is polymorphic. getValue freshens those universes;
+            // the native consumer's `constant` does the same.
+            let compact = theorem.level_params.is_empty()
+                && theorem.proof == Expr::const_(theorem.origin.clone(), vec![]);
+            let expanded = info.base.level_params.len() == theorem.level_params.len()
+                && theorem.proof
+                    == Expr::const_(
+                        theorem.origin.clone(),
+                        theorem
+                            .level_params
+                            .iter()
+                            .cloned()
+                            .map(Level::param)
+                            .collect(),
+                    );
+            if !compact && !expanded {
+                return None;
+            }
+            (&theorem.origin, theorem.priority)
+        }
+        metadata::SimpKind::Unfold(name) => {
+            let ConstantInfo::Defn(info) = env.find(name)? else {
+                return None;
+            };
+            if info.safety != DefinitionSafety::Safe {
+                return None;
+            }
+            (name, 1000)
+        }
+        _ => return None,
+    };
+    // The source journal uses structural string components. Never flatten
+    // numeric/internal names into strings and accidentally select another name.
+    fln_elab::source::scope::components(name).ok()?;
+    Some((name.clone(), priority))
 }
 
 /// Who makes a closure's metadata registrations. Production makes them through one
@@ -619,6 +741,10 @@ trait Registrar: Sized {
         declaration: &Name,
         status: fln_elab::reducibility::Reducibility,
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
+    fn register_simps(
+        self,
+        declarations: &[(Name, Option<u32>)],
+    ) -> std::result::Result<Self, fln_elab::source::scope::simp::SimpSetError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -672,6 +798,12 @@ impl Registrar for instances::imported::ImportActivation {
     }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
+    }
+    fn register_simps(
+        self,
+        declarations: &[(Name, Option<u32>)],
+    ) -> std::result::Result<Self, fln_elab::source::scope::simp::SimpSetError> {
+        self.register_simps(declarations)
     }
 }
 
@@ -791,12 +923,16 @@ pub(super) mod tests {
     }
 
     pub(in crate::source_check::modules) fn pinned_lib() -> Option<std::path::PathBuf> {
-        let lib = std::env::var_os("HOME")
+        let lib = std::env::var_os("FLN_REFERENCE_LIB")
             .map(std::path::PathBuf::from)
-            .map(|home| {
-                home.join(".elan/toolchains")
-                    .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
-                    .join("lib/lean")
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .map(|home| {
+                        home.join(".elan/toolchains")
+                            .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
+                            .join("lib/lean")
+                    })
             })
             .filter(|lib| lib.join("Init/Prelude.olean").is_file());
         assert!(
@@ -869,6 +1005,269 @@ pub(super) mod tests {
             &KVMap::new(),
             limits,
         )
+    }
+
+    #[test]
+    fn pinned_init_metadata_fits_the_source_import_budget() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let closure = closure(&lib, &["Init"]);
+        on_import_stack(|| {
+            let limits = limits(4);
+            let selected: BTreeSet<_> = [
+                metadata::CLASS_EXTENSION,
+                metadata::INSTANCE_EXTENSION,
+                metadata::DEFAULT_EXTENSION,
+                metadata::SIMP_EXTENSION,
+                metadata::ALIAS_EXTENSION,
+                metadata::PROTECTED_EXTENSION,
+                metadata::REDUCIBILITY_EXTENSION,
+            ]
+            .into_iter()
+            .map(n)
+            .collect();
+            let mut grouped = BTreeMap::<Name, Vec<Vec<u8>>>::new();
+            let mut bytes_left = limits.max_capture_bytes;
+            for (_, [exported, server, private]) in &closure {
+                let view = if private.is_empty() {
+                    OleanView::parse(exported)
+                } else {
+                    OleanView::parse_with_dependencies(private, &[exported, server])
+                }
+                .unwrap();
+                for block in view.extension_payloads(limits.capture, bytes_left).unwrap() {
+                    for payload in &block.entries {
+                        bytes_left = bytes_left.checked_sub(payload.len()).unwrap();
+                    }
+                    if selected.contains(&block.name) {
+                        grouped.entry(block.name).or_default().extend(block.entries);
+                    }
+                }
+            }
+            let blocks: Vec<_> = grouped
+                .into_iter()
+                .map(|(name, entries)| OpaqueExtensionBlock { name, entries })
+                .collect();
+            let decoded = metadata::decode(&blocks, limits.metadata).unwrap();
+            assert_eq!(decoded.simps.len(), 10_335);
+            let cells = decoded
+                .classes
+                .iter()
+                .map(|row| row.out_params.len() + row.out_level_params.len())
+                .sum::<usize>()
+                + decoded
+                    .instances
+                    .iter()
+                    .map(|row| row.synth_order.len())
+                    .sum::<usize>()
+                + decoded
+                    .simps
+                    .iter()
+                    .map(|row| match &row.kind {
+                        metadata::SimpKind::Theorem(theorem) => {
+                            theorem.level_params.len() + theorem.key_count
+                        }
+                        metadata::SimpKind::Unfold(_) => 0,
+                        metadata::SimpKind::UnfoldTheorems { theorems, .. } => theorems.len(),
+                    })
+                    .sum::<usize>();
+            eprintln!("Init source metadata index cells: {cells}");
+            assert!(cells > DecodeLimits::default().max_indices);
+            let exact = DecodeLimits {
+                max_indices: cells,
+                ..limits.metadata
+            };
+            assert!(metadata::decode(&blocks, exact).is_ok());
+            assert!(matches!(
+                metadata::decode(
+                    &blocks,
+                    DecodeLimits {
+                        max_indices: cells - 1,
+                        ..exact
+                    }
+                ),
+                Err(metadata::DecodeError::Limit {
+                    resource: "index cells"
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn pinned_init_defaults_close_reported_goals() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let closure = closure(&lib, &["Init"]);
+        let inputs = inputs(&closure);
+        on_import_stack(|| {
+            let receipt = import(&inputs, &[n("Init")], limits(4))
+                .expect("the pinned Init closure imports")
+                .into_complete()
+                .expect("Init import completes");
+            let totals = receipt.modules.iter().fold((0, 0, 0), |sum, report| {
+                (
+                    sum.0 + report.simps,
+                    sum.1 + report.activated_simps,
+                    sum.2 + report.deferred_simps,
+                )
+            });
+            eprintln!(
+                "Init simp rows: decoded={}, activated={}, deferred={}",
+                totals.0, totals.1, totals.2
+            );
+            let main = n("Main");
+            let source = b"import Init\n\
+                theorem imported_append (xs : List Nat) : (xs ++ []).length = xs.length := by simp\n\
+                theorem imported_add (n : Nat) : n + 0 = n := by simp\n";
+            let checked = receipt
+                .check_source_modules(
+                    &[SourceModuleInput {
+                        name: &main,
+                        source,
+                    }],
+                    &main,
+                    &KVMap::new(),
+                    super::super::SourceModuleCheckLimits::new(SourceCheckLimits::new(
+                        EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
+                    )),
+                    None,
+                )
+                .expect("the two reported imported-default goals elaborate")
+                .into_complete()
+                .expect("both goals pass the council");
+            assert_eq!(checked.checked.theorems, 2);
+        });
+    }
+
+    #[test]
+    fn pinned_prelude_defaults_reach_simp_but_not_simp_only() {
+        let root = n("Init.Prelude");
+        let input = OleanModuleInput {
+            name: &root,
+            artifact: include_bytes!(
+                "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean"
+            ),
+            server_artifact: Some(include_bytes!(
+                "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
+            )),
+            private_artifact: Some(include_bytes!(
+                "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
+            )),
+        };
+        on_import_stack(|| {
+            let receipt = import(&[input], std::slice::from_ref(&root), limits(1))
+                .expect("the checked-in pinned Prelude imports")
+                .into_complete()
+                .expect("Prelude import completes");
+            let base_root = receipt.engine.logical_root(&KVMap::new());
+            assert_eq!(receipt.modules.len(), 1);
+            assert_eq!(
+                (
+                    receipt.modules[0].simps,
+                    receipt.modules[0].activated_simps,
+                    receipt.modules[0].deferred_simps
+                ),
+                (3, 3, 0)
+            );
+            let check = |body: &str| {
+                let main = n("Main");
+                let source = format!("prelude\nimport Init.Prelude\n{body}\n");
+                receipt.check_source_modules(
+                    &[SourceModuleInput {
+                        name: &main,
+                        source: source.as_bytes(),
+                    }],
+                    &main,
+                    &KVMap::new(),
+                    super::super::SourceModuleCheckLimits::new(SourceCheckLimits::new(
+                        EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
+                    )),
+                    None,
+                )
+            };
+            for body in [
+                "theorem imported_default (n : Nat) : id n = n := by simp",
+                "theorem explicit_default (n : Nat) : id n = n := by simp only [id_eq]",
+            ] {
+                match check(body) {
+                    Ok(Outcome::Complete(_)) => {}
+                    Err(error) => panic!("{body}: {error}"),
+                    Ok(_) => panic!("{body}: source checking did not complete"),
+                }
+            }
+            for (body, expected) in [
+                (
+                    "theorem no_default (n : Nat) : id n = n := by simp only",
+                    "made no progress",
+                ),
+                (
+                    "theorem excluded (n : Nat) : id n = n := by simp [-id_eq]",
+                    "made no progress",
+                ),
+                (
+                    "attribute [-simp] id_eq\ntheorem erased (n : Nat) : id n = n := by simp",
+                    "made no progress",
+                ),
+                (
+                    "theorem false_goal : (0 : Nat) = 1 := by simp",
+                    "unsolved goals",
+                ),
+            ] {
+                let Err(super::super::SourceModuleCheckError::Source { error, .. }) = check(body)
+                else {
+                    panic!("expected a source refusal, not an import failure or nonanswer: {body}");
+                };
+                assert!(error.to_string().contains(expected), "{body}: {error}");
+                assert_eq!(receipt.engine.logical_root(&KVMap::new()), base_root);
+            }
+            // An external module can have an apparently redundant erasure when
+            // first captured, then follow a source module that enables the rule.
+            // Exercise the same suffix capture/replay used by ImportContexts.
+            use fln_elab::source::scope::simp;
+            let options = KVMap::new();
+            let source_limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            let source_prefix = receipt
+                .checked
+                .engine
+                .check_source_files(&[b"attribute [simp] id_eq"], &options, source_limits)
+                .unwrap()
+                .into_complete()
+                .unwrap()
+                .engine;
+            assert!(
+                simp::read(source_prefix.environment())
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.declaration == n("id_eq"))
+            );
+            let before = receipt.checked.engine.environment();
+            let after = simp::register_module(before, &[(n("id_eq"), None)]).unwrap();
+            let module = n("External");
+            let mut meter = super::super::Meter {
+                work: 0,
+                bytes: 0,
+                limits: super::super::SourceModuleCheckLimits::new(source_limits),
+            };
+            let export =
+                super::super::replay::Export::capture(&module, before, &after, vec![], &mut meter)
+                    .unwrap();
+            let replayed = export
+                .replay(source_prefix, &module, &options, &mut meter, None)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert!(
+                !simp::read(replayed.environment())
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.declaration == n("id_eq"))
+            );
+        });
     }
 
     /// Run on a stack the `.olean` kernel budget is calibrated for, as the
@@ -1017,6 +1416,18 @@ pub(super) mod tests {
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)
+        }
+        fn register_simps(
+            mut self,
+            declarations: &[(Name, Option<u32>)],
+        ) -> std::result::Result<Self, fln_elab::source::scope::simp::SimpSetError> {
+            for (name, priority) in declarations {
+                self.0 = fln_elab::source::scope::simp::register_module(
+                    &self.0,
+                    &[(name.clone(), *priority)],
+                )?;
+            }
+            Ok(self)
         }
     }
 

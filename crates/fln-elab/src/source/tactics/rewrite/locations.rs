@@ -323,7 +323,13 @@ impl Context {
                     occurrence,
                     premises,
                 } = self
-                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    .instantiate_rewrite_rule(
+                        term,
+                        &target,
+                        rule.reverse,
+                        false,
+                        &SimpRules::default(),
+                    )?
                     .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
                 let replacement =
                     self.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
@@ -348,7 +354,13 @@ impl Context {
                     occurrence,
                     premises,
                 } = self
-                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    .instantiate_rewrite_rule(
+                        term,
+                        &target,
+                        rule.reverse,
+                        false,
+                        &SimpRules::default(),
+                    )?
                     .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
                 let (next, value) =
                     self.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
@@ -407,7 +419,13 @@ impl Context {
                         rule: term,
                         occurrence,
                         premises,
-                    }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    }) = trial.instantiate_rewrite_rule(
+                        term,
+                        &target,
+                        rule.reverse,
+                        false,
+                        &SimpRules::default(),
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -439,7 +457,13 @@ impl Context {
                     rule: term,
                     occurrence,
                     premises,
-                }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                }) = trial.instantiate_rewrite_rule(
+                    term,
+                    &target,
+                    rule.reverse,
+                    false,
+                    &SimpRules::default(),
+                )?
                 else {
                     return Ok(None);
                 };

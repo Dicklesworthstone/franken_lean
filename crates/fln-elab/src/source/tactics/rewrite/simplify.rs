@@ -32,7 +32,56 @@ impl SimpRule<'_> {
     }
 }
 
+/// Preserve selection order while indexing the rules that can unfold a type.
+/// The theorem set can be large; rescanning it for every candidate theorem is
+/// quadratic work even when none of those entries can unfold anything.
+#[derive(Default)]
+pub(in crate::source) struct SimpRules<'a> {
+    selected: Vec<SimpRule<'a>>,
+    unfolding: Vec<usize>,
+    global_unfolding: HashSet<Name>,
+    explicit_unfolding: bool,
+}
+
 impl Context {
+    fn index_simp_rules<'a>(
+        &mut self,
+        selected: Vec<SimpRule<'a>>,
+    ) -> Result<SimpRules<'a>, NatDefinitionElabError> {
+        let mut unfolding = Vec::new();
+        let mut global_unfolding = HashSet::new();
+        let mut explicit_unfolding = false;
+        for (index, rule) in selected.iter().enumerate() {
+            self.tick()?;
+            let candidate = match rule {
+                // Explicit names can denote local lets, and local identities
+                // may change during hypothesis transport. Resolve them at use.
+                SimpRule::Explicit(_) => {
+                    explicit_unfolding = true;
+                    true
+                }
+                SimpRule::Local(_) => false,
+                SimpRule::Global(entry) => {
+                    !entry.reverse
+                        && matches!(self.txn.env.find(&entry.declaration),
+                            Some(fln_env::constants::ConstantInfo::Defn(definition))
+                                if definition.safety == DefinitionSafety::Safe)
+                }
+            };
+            if candidate {
+                unfolding.push(index);
+                if let SimpRule::Global(entry) = rule {
+                    global_unfolding.insert(entry.declaration.clone());
+                }
+            }
+        }
+        Ok(SimpRules {
+            selected,
+            unfolding,
+            global_unfolding,
+            explicit_unfolding,
+        })
+    }
     /// Recognize a refutation only when the antecedent is known to be a
     /// proposition. An unknown sort is not permission to guess Prop.
     pub(super) fn simp_negated_proposition(
@@ -239,7 +288,7 @@ impl Context {
     fn simp_rules<'a>(
         &mut self,
         args: &'a [Syntax],
-    ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
+    ) -> Result<SimpRules<'a>, NatDefinitionElabError> {
         self.tick()?;
         let [keyword, config, discharger, only, arguments, location] = args else {
             return Err(error(TacticError::MalformedScript));
@@ -279,7 +328,7 @@ impl Context {
         }
         let arguments = expect_null_args(arguments, "optional simp rule list")?;
         if arguments.is_empty() {
-            return Ok(defaults);
+            return self.index_simp_rules(defaults);
         }
         let [open, rows, close] = arguments else {
             return Err(error(TacticError::MalformedScript));
@@ -391,11 +440,13 @@ impl Context {
         }
         // Explicit arguments have precedence; registered rules follow in their
         // stable priority/registration order. `only` leaves this tail empty.
-        Ok(rules
-            .into_iter()
-            .map(|(_, rule)| rule)
-            .chain(defaults)
-            .collect())
+        self.index_simp_rules(
+            rules
+                .into_iter()
+                .map(|(_, rule)| rule)
+                .chain(defaults)
+                .collect(),
+        )
     }
 
     fn restore_simp_trial(&mut self, mut original: Self) {
@@ -403,20 +454,96 @@ impl Context {
         *self = original;
     }
 
+    /// An admitted monomorphic theorem's matching obligations depend on its
+    /// type and direction, not on which proof constant inhabits that type.
+    /// Reuse only a completed nonmatch for this exact goal/context snapshot.
+    /// Hashes choose a bucket; metered structural comparison and exact equality
+    /// (including binder annotations) establish identity, never the hash alone.
+    fn previously_failed_simp_type(
+        &mut self,
+        rule: &SimpRule<'_>,
+        failed: &HashMap<(u64, bool), Vec<Expr>>,
+    ) -> Result<(bool, Option<Expr>), NatDefinitionElabError> {
+        let SimpRule::Global(entry) = rule else {
+            return Ok((false, None));
+        };
+        let Some(fln_env::constants::ConstantInfo::Thm(theorem)) =
+            self.txn.env.find(&entry.declaration)
+        else {
+            return Ok((false, None));
+        };
+        if !theorem.base.level_params.is_empty() {
+            return Ok((false, None));
+        }
+        let type_ = theorem.base.type_.clone();
+        if let Some(previous) = failed.get(&(type_.hash(), entry.reverse)) {
+            for candidate in previous {
+                if self.rewrite_same(candidate, &type_)? && candidate == &type_ {
+                    return Ok((true, None));
+                }
+            }
+        }
+        Ok((false, Some(type_)))
+    }
+
     /// Only selected definitions participate in conversion of a side condition.
     fn simp_premise_target(
         &mut self,
         target: &Expr,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut target = target.clone();
         for _ in 0..MAX_SIMPLIFICATION_STEPS {
+            let mut names = None::<HashSet<Name>>;
+            let mut absent_normalized = false;
             let mut changed = false;
-            for rule in rules {
+            for &index in &rules.unfolding {
                 self.tick()?;
-                if let UnfoldResult::Changed(next) = self.unfold_simp_rule(rule, &target)? {
-                    target = next;
-                    changed = true;
+                let rule = &rules.selected[index];
+                if names.is_none() {
+                    names = Some(self.simp_constant_names(&target)?);
+                }
+                let absent = matches!(rule, SimpRule::Global(entry)
+                    if names.as_ref().is_some_and(|names| !names.contains(&entry.declaration)));
+                if absent && absent_normalized {
+                    continue;
+                }
+                match self.unfold_simp_rule(rule, &target)? {
+                    UnfoldResult::Changed(next) => {
+                        target = next;
+                        changed = true;
+                        names = None;
+                        absent_normalized = false;
+                    }
+                    // An absent global still normalizes beta/zeta/iota redexes.
+                    // Only a real unchanged pass permits skipping later absent
+                    // globals. Changes above refresh both this fact and names.
+                    UnfoldResult::Unchanged if absent => {
+                        absent_normalized = true;
+                        // Once normalization has actually left this target
+                        // unchanged, a disjoint name set proves that every
+                        // remaining global would take the same absent shortcut.
+                        // Explicit rules still resolve dynamically. Inspect the
+                        // smaller name set, charging every lookup so HashSet's
+                        // traversal order cannot change the work count.
+                        if !rules.explicit_unfolding
+                            && let Some(names) = &names
+                            && names.len() < rules.global_unfolding.len()
+                        {
+                            let mut all_absent = true;
+                            for name in names {
+                                self.tick()?;
+                                all_absent &= !rules.global_unfolding.contains(name);
+                            }
+                            if all_absent {
+                                break;
+                            }
+                        }
+                    }
+                    // Explicit terms resolve against the current local context;
+                    // never carry the shortcut across their work.
+                    _ if matches!(rule, SimpRule::Explicit(_)) => absent_normalized = false,
+                    _ => {}
                 }
             }
             if !changed {
@@ -426,15 +553,47 @@ impl Context {
         Err(failure(SourceInferenceError::ResourceLimit))
     }
 
+    fn simp_constant_names(
+        &mut self,
+        root: &Expr,
+    ) -> Result<HashSet<Name>, NatDefinitionElabError> {
+        let mut names = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut pending = vec![root];
+        while let Some(term) = pending.pop() {
+            if !seen.insert(term.allocation_identity()) {
+                continue;
+            }
+            self.tick()?;
+            if let ExprNode::Const { name, .. } = term.node() {
+                names.insert(name.clone());
+            }
+            pending.extend(children(term).into_iter().flatten());
+        }
+        Ok(names)
+    }
+
     fn simp_selected_proof(
         &mut self,
         target: &Expr,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        for rule in rules {
+        for rule in &rules.selected {
             self.tick()?;
             let selected = self.selected_simp_term(rule)?;
+            // Selected unfolding cannot change a rigid Sort, Forall or admitted
+            // inductive head. Reject that mismatch before walking every node
+            // of an unrelated theorem type through the unfolding selections.
+            if self.rewrite_types_have_distinct_heads(&selected.type_, target)? {
+                continue;
+            }
             let type_ = self.simp_premise_target(&selected.type_, rules)?;
+            // A completed rewrite search may leave an unsolvable target. Do
+            // not send every unrelated fact through conversion merely to
+            // rediscover that their admitted inductive heads differ.
+            if self.rewrite_types_have_distinct_heads(&type_, target)? {
+                continue;
+            }
             let Some(universe) = self.known_type(&type_)? else {
                 continue;
             };
@@ -458,7 +617,7 @@ impl Context {
         &mut self,
         id: &MVarId,
         target: &Expr,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let target = self.simp_premise_target(target, rules)?;
         if let Some(value) = self.simp_selected_proof(&target, rules)? {
@@ -473,7 +632,7 @@ impl Context {
         if let Some(value) = self.simp_reflexivity(&goal)? {
             return Ok(Some(value));
         }
-        if rules.is_empty() {
+        if rules.selected.is_empty() {
             return Ok(None);
         }
         let original = self.rewrite_trial();
@@ -490,7 +649,7 @@ impl Context {
     fn rewrite_simp_premise(
         &mut self,
         target: &Expr,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let (root, mut goal) = self.proof_goal(target.clone())?;
         let mut parents = Vec::new();
@@ -499,11 +658,24 @@ impl Context {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
-            for rule in rules {
+            let mut failed = HashMap::<(u64, bool), Vec<Expr>>::new();
+            for rule in &rules.selected {
                 self.tick()?;
+                let (seen, type_) = self.previously_failed_simp_type(rule, &failed)?;
+                if seen {
+                    continue;
+                }
                 let original = self.rewrite_trial();
-                let Some((next_goal, value)) = self.simp_step(&goal, rule, &[])? else {
+                let Some((next_goal, value)) =
+                    self.simp_step(&goal, rule, &SimpRules::default())?
+                else {
                     self.restore_simp_trial(original);
+                    if let Some(type_) = type_ {
+                        failed
+                            .entry((type_.hash(), rule.reverse()))
+                            .or_default()
+                            .push(type_);
+                    }
                     continue;
                 };
                 if parents.len() >= MAX_SIMPLIFICATION_STEPS {
@@ -545,7 +717,7 @@ impl Context {
         &mut self,
         goal: &ProofGoal,
         rule: &SimpRule<'_>,
-        premise_rules: &[SimpRule<'_>],
+        premise_rules: &SimpRules<'_>,
     ) -> Result<Option<(ProofGoal, Expr)>, NatDefinitionElabError> {
         let target = self.instantiate(&goal.target)?;
         match self.unfold_simp_rule(rule, &target)? {
@@ -593,6 +765,7 @@ impl Context {
         &mut self,
         goal: &ProofGoal,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let original = self.rewrite_trial();
         let target = self.whnf_with_transparency(
             &goal.target,
             UnificationTransparency::Abbreviations,
@@ -609,6 +782,7 @@ impl Context {
             self.automatic_reflexivity_candidate(goal, false)?
         };
         let Some(candidate) = candidate else {
+            self.restore_simp_trial(original);
             return Ok(None);
         };
         let target = self.instantiate(&goal.target)?;
@@ -628,6 +802,7 @@ impl Context {
             Err(error) => {
                 let error = failure(SourceInferenceError::Unification(Box::new(error)));
                 if Self::rewrite_nonmatch(&error) {
+                    self.restore_simp_trial(original);
                     Ok(None)
                 } else {
                     Err(error)
@@ -655,7 +830,7 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
-        rules: &[SimpRule<'_>],
+        rules: &SimpRules<'_>,
         mut steps: usize,
         completion: Option<&Typed>,
     ) -> Result<(), NatDefinitionElabError> {
@@ -664,12 +839,23 @@ impl Context {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
-            for rule in rules {
+            let mut failed = HashMap::<(u64, bool), Vec<Expr>>::new();
+            for rule in &rules.selected {
                 self.tick()?;
+                let (seen, type_) = self.previously_failed_simp_type(rule, &failed)?;
+                if seen {
+                    continue;
+                }
                 let original = self.rewrite_trial();
                 let transition = self.simp_step(&goal, rule, rules)?;
                 let Some((next_goal, value)) = transition else {
                     self.restore_simp_trial(original);
+                    if let Some(type_) = type_ {
+                        failed
+                            .entry((type_.hash(), rule.reverse()))
+                            .or_default()
+                            .push(type_);
+                    }
                     continue;
                 };
                 if steps >= MAX_SIMPLIFICATION_STEPS {
@@ -699,9 +885,9 @@ impl Context {
                     return Err(error(TacticError::NoMatchingAssumption));
                 }
                 self.close_proof_goal(goal, completion.value.clone())?;
-            } else if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
-                self.close_proof_goal(goal, value)?;
             } else if let Some(value) = self.simp_reflexivity(&goal)? {
+                self.close_proof_goal(goal, value)?;
+            } else if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
                 self.close_proof_goal(goal, value)?;
             } else if steps > 0 {
                 // Simplification can expose a non-reflexive remaining goal.

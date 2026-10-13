@@ -36,6 +36,178 @@ const WRAP: &str = "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
     theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n";
 
 #[test]
+fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
+    let mut source = String::from(
+        "def wrap (n : Nat) : Nat := n\n\
+         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\n",
+    );
+    for index in 0..34 {
+        source.push_str(&format!(
+            "@[simp] def unrelated_def_{index} (n : Nat) : Nat := n\n"
+        ));
+    }
+    for index in 0..4000 {
+        source.push_str(&format!(
+            "@[simp] theorem unrelated_{index} : True := True.intro\n"
+        ));
+    }
+    source.push_str("theorem use_default (n : Nat) : wrap n = n := by simp\n");
+    let result = checked(&engine(), &[&source]);
+    assert_eq!(result.theorems, 4002);
+    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);
+    for source in [
+        "attribute [-simp] unwrap\ntheorem missing_rule (n : Nat) : wrap n = n := by simp",
+        "theorem false_goal : (0 : Nat) = 1 := by simp",
+    ] {
+        let error = result
+            .engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        let diagnostic = format!("{error}");
+        assert!(
+            diagnostic.contains("simp only made no progress")
+                || diagnostic.contains("unsolved goals"),
+            "{diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn identical_failed_rules_are_reconsidered_after_unfolding_changes_the_goal() {
+    let result = checked(
+        &engine(),
+        &["def outer (n : Nat) : Nat := n\n\
+           def inner (n : Nat) : Nat := outer n\n\
+           @[simp] theorem peel_first (n : Nat) : outer n = n := by rfl\n\
+           @[simp] theorem peel_second (n : Nat) : outer n = n := by rfl\n\
+           attribute [simp] inner\n\
+           theorem after_unfold (n : Nat) : inner n = n := by simp"],
+    );
+    assert_eq!(result.theorems, 3);
+    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 3);
+}
+
+#[test]
+fn imported_rule_batch_retains_operations_and_is_atomic() {
+    let base = checked(&engine(), &[WRAP]).engine;
+    let wrap = Name::from_components(["wrap"]);
+    let unwrap = Name::from_components(["unwrap"]);
+    let rows = [
+        (wrap.clone(), Some(900)),
+        (unwrap.clone(), Some(1000)),
+        (wrap.clone(), None),
+        (wrap.clone(), Some(1000)),
+    ];
+    let mut sequential = base.environment().clone();
+    for (name, priority) in &rows {
+        sequential = simp::update(&sequential, name, priority.map(|p| (p, false))).unwrap();
+    }
+    let batched = simp::register_module(base.environment(), &rows).unwrap();
+    assert_eq!(batched, sequential);
+    assert_eq!(simp::read(&batched).unwrap()[0].declaration, wrap);
+    let repeated = simp::register_module(&batched, &[(unwrap.clone(), Some(1000))]).unwrap();
+    assert_ne!(
+        repeated, batched,
+        "a repeated import still exports a journal operation"
+    );
+    assert_eq!(simp::read(&repeated).unwrap()[0].declaration, unwrap);
+    let absent_erasure =
+        simp::register_module(base.environment(), &[(unwrap.clone(), None)]).unwrap();
+    assert_ne!(
+        &absent_erasure,
+        base.environment(),
+        "an absent rule still exports its tombstone"
+    );
+    assert!(simp::read(&absent_erasure).unwrap().is_empty());
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+    let bad = [
+        (unwrap, Some(1000)),
+        (Name::from_components(["missing"]), Some(1000)),
+    ];
+    assert!(matches!(
+        simp::register_module(base.environment(), &bad),
+        Err(simp::SimpSetError::UnknownDeclaration(_))
+    ));
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+}
+
+#[test]
+fn imported_journal_handles_standard_library_scale_and_keeps_a_hard_row_bound() {
+    let base = checked(&engine(), &[WRAP]).engine;
+    let declaration = Name::from_components(["unwrap"]);
+    let rows = vec![(declaration, Some(1000)); 65_536];
+    let full = simp::register_module(base.environment(), &rows).unwrap();
+    let active = simp::read(&full).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].order, 65_535);
+    assert!(matches!(
+        simp::register_module(&full, &rows[..1]),
+        Err(simp::SimpSetError::Limit)
+    ));
+    let journal = Name::from_components(["FrankenLean", "sourceSimp", "v1"]);
+    let payload = full
+        .extension(&journal)
+        .unwrap()
+        .entries()
+        .next()
+        .unwrap()
+        .payload
+        .clone();
+    let hostile = full.push_extension_entry(&journal, payload).unwrap();
+    assert!(matches!(
+        simp::read(&hostile),
+        Err(simp::SimpSetError::Limit)
+    ));
+    assert_eq!(simp::read(&full).unwrap(), active);
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+}
+
+#[test]
+fn imported_journal_keeps_the_aggregate_payload_budget() {
+    let text = "x".repeat(1024);
+    let source = format!("def {text} (n : Nat) : Nat := n");
+    let base = checked(&engine(), &[&source]).engine;
+    let name = Name::from_components([text.as_str()]);
+    let operation = (name.clone(), Some(1000));
+    let one = simp::register_module(base.environment(), std::slice::from_ref(&operation)).unwrap();
+    let journal = Name::from_components(["FrankenLean", "sourceSimp", "v1"]);
+    let payload = one
+        .extension(&journal)
+        .unwrap()
+        .entries()
+        .next()
+        .unwrap()
+        .payload
+        .clone();
+    let count = (64 * 1024 * 1024) / payload.len();
+    assert!(
+        count < 65_536,
+        "exercise bytes before the independent row limit"
+    );
+    let full = simp::register_module(base.environment(), &vec![operation.clone(); count]).unwrap();
+    assert_eq!(simp::read(&full).unwrap().len(), 1);
+    assert!(matches!(
+        simp::register_module(&full, &[operation]),
+        Err(simp::SimpSetError::Limit)
+    ));
+    assert!(matches!(
+        simp::update(&full, &name, Some((900, false))),
+        Err(simp::SimpSetError::Limit)
+    ));
+    // A journal constructed outside the native writer must obey the same bound.
+    let hostile = full.push_extension_entry(&journal, payload).unwrap();
+    assert!(matches!(
+        simp::read(&hostile),
+        Err(simp::SimpSetError::Limit)
+    ));
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+}
+
+#[test]
 fn inline_simp_attributes_are_registered_only_after_checked_admission() {
     let base = engine();
     let result = checked(
