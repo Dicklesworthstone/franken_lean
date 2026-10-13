@@ -26,12 +26,16 @@ impl Scratch {
     fn new() -> Self {
         loop {
             let path = std::env::temp_dir().join(format!(
-                "fln-ir-files-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+                "fln-ir-files-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
             ));
             match std::fs::create_dir(&path) {
                 Ok(()) => return Self(path),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!(/* ubs:ignore -- test-only diagnostic. */ "scratch: {error}"),
+                Err(error) => panic!(
+                    /* ubs:ignore -- test-only diagnostic. */ "scratch: {error}"
+                ),
             }
         }
     }
@@ -55,33 +59,58 @@ impl Drop for Scratch {
 /// The wrapper header is synthetic: this is not a Reference byte-identity test.
 fn isolated(declaration: Option<&str>) -> Vec<u8> {
     let view = OleanView::parse(NAT).unwrap();
-    let blocks = view.extension_payloads(WalkBudget::default(), 1 << 30).unwrap();
+    let blocks = view
+        .extension_payloads(WalkBudget::default(), 1 << 30)
+        .unwrap();
     let decoded = decode_ir(&blocks, IrDecodeLimits::default()).unwrap();
     let extension = name("Lean.IR.declMapExt");
     let block = blocks.iter().find(|block| block.name == extension).unwrap();
-    let entries = declaration.map(|wanted| {
-        let index = decoded.decls.iter().position(|d| d.name() == &name(wanted)).unwrap();
-        materialize(&block.entries[index], 0).unwrap()
-    }).into_iter().collect::<Vec<_>>();
+    let entries = declaration
+        .map(|wanted| {
+            let index = decoded
+                .decls
+                .iter()
+                .position(|d| d.name() == &name(wanted))
+                .unwrap();
+            materialize(&block.entries[index], 0).unwrap()
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     let extensions = if declaration.is_some() {
-        vec![ModuleExtensionInput { name: &extension, entries: &entries }]
+        vec![ModuleExtensionInput {
+            name: &extension,
+            entries: &entries,
+        }]
     } else {
         vec![]
     };
     encode_module_with_extensions(
-        ModuleWriteInput { is_module: false, imports: &[], constants: &[], extra_const_names: &[] },
+        ModuleWriteInput {
+            is_module: false,
+            imports: &[],
+            constants: &[],
+            extra_const_names: &[],
+        },
         &extensions,
         OleanWriteHeader {
-            version: 2, flags: 1, lean_version: "4.32.0",
-            githash: "0123456789abcdef0123456789abcdef01234567", base_addr: 0x20_000,
+            version: 2,
+            flags: 1,
+            lean_version: "4.32.0",
+            githash: "0123456789abcdef0123456789abcdef01234567",
+            base_addr: 0x20_000,
         },
         WriteBudget::default(),
-    ).unwrap().bytes
+    )
+    .unwrap()
+    .bytes
 }
 
 fn command(args: &[&str], paths: &[PathBuf]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fln-ir-check"))
-        .args(args).args(paths).output().unwrap()
+        .args(args)
+        .args(paths)
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -98,7 +127,11 @@ fn real_declaration_passes_file_validation_and_the_native_command() {
     let dot = String::from_utf8(output.stdout).unwrap();
     assert!(dot.starts_with("digraph IR {\n"));
     assert!(dot.contains("Nat.instTransLe"));
-    assert!(String::from_utf8(output.stderr).unwrap().contains("1 declarations"));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("1 declarations")
+    );
     assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
 }
 
@@ -147,7 +180,11 @@ fn duplicate_paths_and_empty_input_do_not_manufacture_a_closure() {
     let dir = Scratch::new();
     let path = dir.write("closed.ir", &isolated(Some("Nat.instTransLe")));
     assert!(matches!(
-        check_ir_files(&[path.clone(), path], &BTreeMap::new(), IrFileLimits::default()),
+        check_ir_files(
+            &[path.clone(), path],
+            &BTreeMap::new(),
+            IrFileLimits::default()
+        ),
         Err(IrFileError::DuplicateInput(_)),
     ));
     assert!(matches!(
@@ -163,11 +200,15 @@ fn cumulative_input_byte_limit_accepts_the_exact_boundary() {
     let b = isolated(Some("Nat.instTransLt"));
     let paths = [dir.write("a.ir", &a), dir.write("b.ir", &b)];
     let exact = IrFileLimits {
-        max_total_bytes: (a.len() + b.len()) as u64, ..IrFileLimits::default()
+        max_total_bytes: (a.len() + b.len()) as u64,
+        ..IrFileLimits::default()
     };
     let result = check_ir_files(&paths, &BTreeMap::new(), exact).unwrap();
     assert_eq!(result.checked.summary().declarations, 2);
-    let below = IrFileLimits { max_total_bytes: exact.max_total_bytes - 1, ..exact };
+    let below = IrFileLimits {
+        max_total_bytes: exact.max_total_bytes - 1,
+        ..exact
+    };
     let failure = check_ir_files(&paths, &BTreeMap::new(), below).unwrap_err();
     assert!(failure.is_inconclusive());
     assert!(matches!(failure, IrFileError::Limit { .. }));
@@ -182,11 +223,19 @@ fn expanded_payload_budget_is_shared_across_files() {
     ];
     let measured = check_ir_files(&paths, &BTreeMap::new(), IrFileLimits::default()).unwrap();
     let exact = IrFileLimits {
-        max_payload_bytes: measured.captured_payload_bytes, ..IrFileLimits::default()
+        max_payload_bytes: measured.captured_payload_bytes,
+        ..IrFileLimits::default()
     };
     check_ir_files(&paths, &BTreeMap::new(), exact).unwrap();
-    let below = IrFileLimits { max_payload_bytes: exact.max_payload_bytes - 1, ..exact };
-    assert!(check_ir_files(&paths, &BTreeMap::new(), below).unwrap_err().is_inconclusive());
+    let below = IrFileLimits {
+        max_payload_bytes: exact.max_payload_bytes - 1,
+        ..exact
+    };
+    assert!(
+        check_ir_files(&paths, &BTreeMap::new(), below)
+            .unwrap_err()
+            .is_inconclusive()
+    );
 }
 
 #[test]
@@ -198,11 +247,22 @@ fn file_declaration_and_work_limits_remain_inconclusive() {
     let mut work = IrFileLimits::default();
     work.validation.max_work = 0;
     for limits in [
-        IrFileLimits { max_files: 0, ..IrFileLimits::default() },
-        IrFileLimits { max_file_bytes: 0, ..IrFileLimits::default() },
-        declarations, work,
+        IrFileLimits {
+            max_files: 0,
+            ..IrFileLimits::default()
+        },
+        IrFileLimits {
+            max_file_bytes: 0,
+            ..IrFileLimits::default()
+        },
+        declarations,
+        work,
     ] {
-        assert!(check_ir_files(&paths, &BTreeMap::new(), limits).unwrap_err().is_inconclusive());
+        assert!(
+            check_ir_files(&paths, &BTreeMap::new(), limits)
+                .unwrap_err()
+                .is_inconclusive()
+        );
     }
 }
 
@@ -211,29 +271,53 @@ fn dot_is_independent_of_file_enumeration_and_obeys_exact_output_limit() {
     let dir = Scratch::new();
     let a = dir.write("a.ir", &isolated(Some("Nat.instTransLe")));
     let b = dir.write("b.ir", &isolated(Some("Nat.instTransLt")));
-    let first = check_ir_files(&[a.clone(), b.clone()], &BTreeMap::new(), IrFileLimits::default()).unwrap();
+    let first = check_ir_files(
+        &[a.clone(), b.clone()],
+        &BTreeMap::new(),
+        IrFileLimits::default(),
+    )
+    .unwrap();
     let second = check_ir_files(&[b, a], &BTreeMap::new(), IrFileLimits::default()).unwrap();
     let dot = ir_graph_dot(&first.checked, 100_000).unwrap();
     assert_eq!(dot, ir_graph_dot(&second.checked, dot.len()).unwrap());
-    assert!(ir_graph_dot(&first.checked, dot.len() - 1).unwrap_err().is_inconclusive());
+    assert!(
+        ir_graph_dot(&first.checked, dot.len() - 1)
+            .unwrap_err()
+            .is_inconclusive()
+    );
 }
 
 #[test]
 fn dot_ids_do_not_merge_distinct_names_with_the_same_display_text() {
     use fln_olean::ir::{IrArg, IrBody, IrDecl, IrModule, IrTerminal, IrType};
     use fln_olean::ir_validate::{IrValidationLimits, build_validated_ir_call_graph};
-    let names = [Name::str(Name::anonymous(), "A.B"), name("A.B"), name("Quote\"\\\n")];
+    let names = [
+        Name::str(Name::anonymous(), "A.B"),
+        name("A.B"),
+        name("Quote\"\\\n"),
+    ];
     let module = IrModule {
-        decls: names.into_iter().map(|name| IrDecl::Function {
-            name, params: vec![], result: IrType::Erased,
-            body: IrBody { stmts: vec![], terminal: Box::new(IrTerminal::Ret(IrArg::Erased)) },
-            sorry_dep: None,
-        }).collect(),
+        decls: names
+            .into_iter()
+            .map(|name| IrDecl::Function {
+                name,
+                params: vec![],
+                result: IrType::Erased,
+                body: IrBody {
+                    stmts: vec![],
+                    terminal: Box::new(IrTerminal::Ret(IrArg::Erased)),
+                },
+                sorry_dep: None,
+            })
+            .collect(),
         uninterpreted: vec![],
     };
     let checked = build_validated_ir_call_graph(
-        &[("unused-path", &module)], &BTreeMap::new(), IrValidationLimits::default(),
-    ).unwrap();
+        &[("unused-path", &module)],
+        &BTreeMap::new(),
+        IrValidationLimits::default(),
+    )
+    .unwrap();
     let dot = ir_graph_dot(&checked, 100_000).unwrap();
     assert_eq!(dot.matches("fln_kind=\"function\"").count(), 3);
     for index in 0..3 {
@@ -246,7 +330,12 @@ fn dot_ids_do_not_merge_distinct_names_with_the_same_display_text() {
 #[test]
 fn command_reports_usage_and_does_not_publish_on_output_exhaustion() {
     assert!(command(&["--help"], &[]).status.success());
-    for args in [vec![], vec!["--unknown"], vec!["--max-work"], vec!["--max-work", "-1"]] {
+    for args in [
+        vec![],
+        vec!["--unknown"],
+        vec!["--max-work"],
+        vec!["--max-work", "-1"],
+    ] {
         assert_eq!(command(&args, &[]).status.code(), Some(2));
     }
     let dir = Scratch::new();
@@ -259,8 +348,14 @@ fn command_reports_usage_and_does_not_publish_on_output_exhaustion() {
 #[test]
 fn missing_input_directory_and_corrupt_container_have_distinct_outcomes() {
     let dir = Scratch::new();
-    assert_eq!(command(&[], &[dir.0.join("absent.ir")]).status.code(), Some(5));
-    assert_eq!(command(&[], std::slice::from_ref(&dir.0)).status.code(), Some(5));
+    assert_eq!(
+        command(&[], &[dir.0.join("absent.ir")]).status.code(),
+        Some(5)
+    );
+    assert_eq!(
+        command(&[], std::slice::from_ref(&dir.0)).status.code(),
+        Some(5)
+    );
     let bad = dir.write("bad.ir", b"not an IR container");
     let output = command(&["--dot"], &[bad]);
     assert_eq!(output.status.code(), Some(1));

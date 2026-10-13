@@ -51,7 +51,9 @@ impl ReplacementCopies {
                 continue;
             }
             // Price owned payloads before copying, not after allocating them.
-            instantiator.control.output(level_owned_units(node), index)?;
+            instantiator
+                .control
+                .output(level_owned_units(node), index)?;
             let mapped = |child: &LevelId| {
                 self.shared
                     .get(&child.index())

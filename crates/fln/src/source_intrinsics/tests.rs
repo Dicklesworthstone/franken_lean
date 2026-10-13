@@ -336,11 +336,7 @@ fn hygienic_equality_family_executes_checked_transport() {
         Expr::lam(name("proof"), equation, nat.clone(), BinderInfo::Default),
         BinderInfo::Default,
     );
-    let proof = transport_application(
-        "Eq.refl",
-        vec![Level::one()],
-        &[nat.clone(), value.clone()],
-    );
+    let proof = transport_application("Eq.refl", vec![Level::one()], &[nat.clone(), value.clone()]);
     let transport = transport_application(
         "Eq.rec",
         vec![Level::one(), Level::one()],
@@ -396,7 +392,14 @@ fn hygienic_quotient_family_executes_checked_representatives() {
     let lifted = transport_application(
         "Quot.lift",
         vec![Level::one(), Level::one()],
-        &[nat.clone(), relation, nat, function, respects, representative],
+        &[
+            nat.clone(),
+            relation,
+            nat,
+            function,
+            respects,
+            representative,
+        ],
     );
     assert_eq!(execute_transport(&engine, lifted), 42);
 }
@@ -431,7 +434,10 @@ fn metadata_is_transparent_when_comparing_transport_models() {
                 visited: &mut 0,
                 limits: IngressLimits::default(),
             }
-            .info(&ConstantInfo::Quot(annotated), &ConstantInfo::Quot(expected))
+            .info(
+                &ConstantInfo::Quot(annotated),
+                &ConstantInfo::Quot(expected)
+            )
             .unwrap()
         );
     }

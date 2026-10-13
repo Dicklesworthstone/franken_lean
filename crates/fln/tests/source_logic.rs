@@ -797,7 +797,8 @@ fn shared_match_alternatives_cover_every_group() {
 fn tactic_fields_are_filled_by_their_tactic() {
     check("structure BT3 where\n  x : Nat\n  h : x = x := by rfl\ndef b3 : BT3 := { x := 1 }\n");
     let (engine, limits) = engine();
-    let source = "structure BT4 where\n  x : Nat\n  h : x = x + 1 := by rfl\ndef b4 : BT4 := { x := 1 }\n";
+    let source =
+        "structure BT4 where\n  x : Nat\n  h : x = x + 1 := by rfl\ndef b4 : BT4 := { x := 1 }\n";
     assert!(
         !matches!(
             engine.check_source_files(
@@ -842,7 +843,9 @@ fn local_equations_are_refused_not_misread() {
 fn equivalence_is_has_equiv() {
     let class = "class HasEquiv (α : Type) where\n  Equiv : α → α → Prop\n\
                  instance trivialEquiv : HasEquiv Nat := { Equiv := fun _ _ => True }\n";
-    check(&format!("{class}theorem eq1 : (2 : Nat) ≈ 3 := True.intro\n"));
+    check(&format!(
+        "{class}theorem eq1 : (2 : Nat) ≈ 3 := True.intro\n"
+    ));
     let (engine, limits) = engine();
     let source = format!("{class}theorem eq2 : (2 : Nat) ≈ 2 := rfl\n");
     assert!(
@@ -994,7 +997,10 @@ fn where_termination_hints_are_refused_not_dropped() {
             Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
             Ok(_) => {}
             Err(error) => {
-                assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}");
+                assert!(
+                    format!("{error:?}").contains("Elaborate"),
+                    "{source}\n{error:?}"
+                );
             }
         }
     }
@@ -1032,10 +1038,17 @@ fn matches_is_the_boolean_match() {
 fn the_coercion_arrow_is_refused_after_parsing() {
     let (engine, limits) = engine();
     let source = "def up (n : Nat) : Nat := ↑n\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1067,10 +1080,17 @@ fn definition_deriving_is_refused_after_parsing() {
     check("def Plain := Nat\n");
     let (engine, limits) = engine();
     let source = "def Derived := Nat\nderiving Inhabited\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1081,10 +1101,17 @@ fn inductive_modifiers_are_refused_after_parsing() {
     check("/-- doc -/\ninductive Documented where\n  | a\n");
     let (engine, limits) = engine();
     let source = "private inductive Hidden where\n  | a\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1093,11 +1120,19 @@ fn inductive_modifiers_are_refused_after_parsing() {
 #[test]
 fn tactic_pattern_bindings_are_refused_after_parsing() {
     let (engine, limits) = engine();
-    let source = "theorem tp (p q : Prop) (h : And p q) : p := by\n  have ⟨hp, hq⟩ := h\n  exact hp\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    let source =
+        "theorem tp (p q : Prop) (h : And p q) : p := by\n  have ⟨hp, hq⟩ := h\n  exact hp\n";
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 

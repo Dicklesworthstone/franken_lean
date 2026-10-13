@@ -702,14 +702,11 @@ pub fn instantiate_level_parameters_with(
         Ok(Err(refusal)) => return InstantiationOutcome::Refused(refusal),
         Err(halt) => return halted(halt),
     };
-    let root = match instantiator.map_subject_root(
-        level.nodes(),
-        level.root(),
-        &mut BTreeMap::new(),
-    ) {
-        Ok(root) => root,
-        Err(halt) => return halted(halt),
-    };
+    let root =
+        match instantiator.map_subject_root(level.nodes(), level.root(), &mut BTreeMap::new()) {
+            Ok(root) => root,
+            Err(halt) => return halted(halt),
+        };
     InstantiationOutcome::Complete(WireLevel::from_parts(instantiator.levels, root))
 }
 

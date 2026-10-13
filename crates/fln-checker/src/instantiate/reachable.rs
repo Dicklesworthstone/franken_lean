@@ -10,15 +10,13 @@ mod replacements;
 
 use std::collections::BTreeSet;
 
-use replacements::ReplacementCopies;
 use super::*;
+use replacements::ReplacementCopies;
 
 fn level_children(node: &LevelNode) -> [Option<LevelId>; 2] {
     match node {
         LevelNode::Succ(child) => [Some(*child), None],
-        LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
-            [Some(*left), Some(*right)]
-        }
+        LevelNode::Max(left, right) | LevelNode::IMax(left, right) => [Some(*left), Some(*right)],
         LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => [None, None],
     }
 }
@@ -182,7 +180,12 @@ impl Instantiator<'_, '_> {
             self.control.step(index)?;
             let node = term.nodes().get(index).ok_or_else(|| missing(index))?;
             Self::validate_expression(index, node)?;
-            work.extend(expression_children(node).into_iter().flatten().map(ExprId::index));
+            work.extend(
+                expression_children(node)
+                    .into_iter()
+                    .flatten()
+                    .map(ExprId::index),
+            );
         }
 
         let mut mapping = BTreeMap::<usize, ExprId>::new();
@@ -231,13 +234,19 @@ impl Instantiator<'_, '_> {
                 }
                 ExprNode::Sort { level } => {
                     *level = self.map_subject_root_cached(
-                        term.levels(), *level, &mut level_map, &mut replacements,
+                        term.levels(),
+                        *level,
+                        &mut level_map,
+                        &mut replacements,
                     )?;
                 }
                 ExprNode::Constant { levels, .. } => {
                     for level in levels {
                         *level = self.map_subject_root_cached(
-                            term.levels(), *level, &mut level_map, &mut replacements,
+                            term.levels(),
+                            *level,
+                            &mut level_map,
+                            &mut replacements,
                         )?;
                     }
                 }

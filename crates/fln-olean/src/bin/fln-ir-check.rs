@@ -1,9 +1,7 @@
 //! Native, read-only validation of a supplied IR file closure.
 #![forbid(unsafe_code)]
 
-use fln_olean::ir_files::{
-    IrFileLimits, check_ir_files, check_ir_files_with_types, ir_graph_dot,
-};
+use fln_olean::ir_files::{IrFileLimits, check_ir_files, check_ir_files_with_types, ir_graph_dot};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -42,7 +40,8 @@ fn host_size(value: u64, flag: &str) -> Result<usize> {
 
 fn write_stdout(text: &str) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(text.as_bytes())
+    stdout
+        .write_all(text.as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(|error| (5, format!("stdout: {error}")))
 }
@@ -76,37 +75,55 @@ fn run() -> Result<()> {
             }
             Some("--max-payload-bytes") => {
                 limits.max_payload_bytes = host_size(
-                    number(&mut args, "--max-payload-bytes")?, "--max-payload-bytes",
+                    number(&mut args, "--max-payload-bytes")?,
+                    "--max-payload-bytes",
                 )?;
             }
             Some("--max-output-bytes") => {
                 max_output = host_size(
-                    number(&mut args, "--max-output-bytes")?, "--max-output-bytes",
+                    number(&mut args, "--max-output-bytes")?,
+                    "--max-output-bytes",
                 )?;
             }
             Some("--max-work") => {
                 limits.validation.max_work = number(&mut args, "--max-work")?;
             }
             Some(flag) if flag.starts_with('-') => {
-                return Err((2, format!("unknown option {flag:?}; use -- before a filename beginning with '-'")));
+                return Err((
+                    2,
+                    format!("unknown option {flag:?}; use -- before a filename beginning with '-'"),
+                ));
             }
             _ => paths.push(PathBuf::from(arg)),
         }
     }
     if paths.is_empty() {
-        return Err((2, "at least one IR file is required; use --help for usage".into()));
+        return Err((
+            2,
+            "at least one IR file is required; use --help for usage".into(),
+        ));
     }
     let result = if structural_only {
         check_ir_files(&paths, &BTreeMap::new(), limits)
     } else {
         check_ir_files_with_types(&paths, &BTreeMap::new(), limits)
-    }.map_err(|error| (if error.is_inconclusive() { 5 } else { 1 }, error.to_string()))?;
+    }
+    .map_err(|error| {
+        (
+            if error.is_inconclusive() { 5 } else { 1 },
+            error.to_string(),
+        )
+    })?;
     let summary = result.checked.summary();
     let mut message = format!(
         "IR structurally valid: {} files, {} declarations, {} externs, {} direct edges, {} unresolved closure calls; {} input bytes, {} captured payload bytes\n",
-        summary.modules, summary.declarations, summary.extern_declarations,
-        result.checked.graph().edge_count(), summary.dynamic_calls,
-        result.input_bytes, result.captured_payload_bytes,
+        summary.modules,
+        summary.declarations,
+        summary.extern_declarations,
+        result.checked.graph().edge_count(),
+        summary.dynamic_calls,
+        result.input_bytes,
+        result.captured_payload_bytes,
     );
     match result.representation {
         Some(types) => message.push_str(&format!(
@@ -117,10 +134,12 @@ fn run() -> Result<()> {
     }
     if dot {
         // Construct the complete bounded report before publishing a single byte.
-        let output = ir_graph_dot(&result.checked, max_output)
-            .map_err(|error| (5, error.to_string()))?;
+        let output =
+            ir_graph_dot(&result.checked, max_output).map_err(|error| (5, error.to_string()))?;
         write_stdout(&output)?;
-        io::stderr().lock().write_all(message.as_bytes())
+        io::stderr()
+            .lock()
+            .write_all(message.as_bytes())
             .map_err(|error| (5, format!("stderr: {error}")))?;
         Ok(())
     } else {

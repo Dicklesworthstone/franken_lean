@@ -48,11 +48,22 @@ pub enum IrFileError {
     EmptyInput,
     DuplicateInput(PathBuf),
     NonRegularFile(PathBuf),
-    Limit { resource: &'static str },
-    Io { path: PathBuf, source: io::Error },
-    Container { path: PathBuf, source: RegionError },
+    Limit {
+        resource: &'static str,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Container {
+        path: PathBuf,
+        source: RegionError,
+    },
     MissingIrBlock(PathBuf),
-    Decode { path: PathBuf, source: IrDecodeError },
+    Decode {
+        path: PathBuf,
+        source: IrDecodeError,
+    },
     Validation(IrValidatedGraphError),
     Representation(IrTypeValidationError),
 }
@@ -192,7 +203,9 @@ fn check_files(
     for path in ordered {
         let bytes = read_file(
             path,
-            limits.max_file_bytes.min(limits.max_total_bytes - input_bytes),
+            limits
+                .max_file_bytes
+                .min(limits.max_total_bytes - input_bytes),
         )?;
         input_bytes += bytes.len() as u64;
         let container_error = |source| IrFileError::Container {
@@ -202,7 +215,10 @@ fn check_files(
         let view = OleanView::parse(&bytes).map_err(container_error)?;
         let remaining = limits.max_payload_bytes - payload_bytes;
         let blocks = view
-            .extension_payloads(WalkBudget::default(), remaining.min(limits.decode.max_bytes))
+            .extension_payloads(
+                WalkBudget::default(),
+                remaining.min(limits.decode.max_bytes),
+            )
             .map_err(container_error)?;
         // decode_ir intentionally accepts an absent IR block as empty. A file
         // validation command must not call an unrelated .olean a checked IR file.
@@ -240,8 +256,10 @@ fn check_files(
     let checked = build_validated_ir_call_graph(&inputs, census_externs, limits.validation)
         .map_err(IrFileError::Validation)?;
     let representation = if check_types {
-        Some(check_after_structure(&modules, *checked.summary(), limits.validation)
-            .map_err(IrFileError::Representation)?)
+        Some(
+            check_after_structure(&modules, *checked.summary(), limits.validation)
+                .map_err(IrFileError::Representation)?,
+        )
     } else {
         None
     };
@@ -311,7 +329,8 @@ pub fn ir_graph_dot(
     ids.extend(0..count);
     ids.sort_unstable_by(|a, b| graph.name(*a).cmp(graph.name(*b)));
     let mut remap = Vec::new();
-    remap.try_reserve_exact(graph.len())
+    remap
+        .try_reserve_exact(graph.len())
         .map_err(|_| limit("DOT index allocation"))?;
     remap.resize(graph.len(), 0);
     for (rank, id) in ids.iter().enumerate() {
@@ -321,7 +340,9 @@ pub fn ir_graph_dot(
         text: String::new(),
         cap: max_bytes,
     };
-    out.push("digraph IR {\n  // Structural validation only; closure-value calls have no static edge.\n")?;
+    out.push(
+        "digraph IR {\n  // Structural validation only; closure-value calls have no static edge.\n",
+    )?;
     out.push(&format!(
         "  graph [fln_dynamic_calls=\"{}\"];\n",
         checked.summary().dynamic_calls,
@@ -337,9 +358,15 @@ pub fn ir_graph_dot(
         };
         out.push(&format!(", fln_kind=\"{kind}\"];\n"))?;
         let mut targets = Vec::new();
-        targets.try_reserve_exact(graph.callees(id).len())
+        targets
+            .try_reserve_exact(graph.callees(id).len())
             .map_err(|_| limit("DOT edge allocation"))?;
-        targets.extend(graph.callees(id).iter().map(|target| remap[*target as usize]));
+        targets.extend(
+            graph
+                .callees(id)
+                .iter()
+                .map(|target| remap[*target as usize]),
+        );
         targets.sort_unstable();
         for target in targets {
             out.push(&format!("  n{rank} -> n{target};\n"))?;

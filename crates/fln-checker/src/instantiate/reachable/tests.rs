@@ -217,7 +217,10 @@ fn substitution_remains_simultaneous_and_repeated_roots_stay_shared() {
             name: name("c"),
             levels: vec![lid(0), lid(1), lid(0)],
         }],
-        vec![LevelNode::Parameter(name("u")), LevelNode::Parameter(name("v"))],
+        vec![
+            LevelNode::Parameter(name("u")),
+            LevelNode::Parameter(name("v")),
+        ],
         eid(0),
     );
     let result = complete(instantiate_term_parameters(
@@ -258,10 +261,16 @@ fn unchanged_maximum_is_literal_but_changed_ancestors_use_smart_constructors() {
     let changed = complete(instantiate_level_parameters(
         &subject,
         &[name("u")],
-        &[WireLevel::from_parts(vec![LevelNode::Parameter(name("v"))], lid(0))],
+        &[WireLevel::from_parts(
+            vec![LevelNode::Parameter(name("v"))],
+            lid(0),
+        )],
         TermBudget::unlimited(),
     ));
-    assert_eq!(changed.node(changed.root()), Some(&LevelNode::Parameter(name("v"))));
+    assert_eq!(
+        changed.node(changed.root()),
+        Some(&LevelNode::Parameter(name("v")))
+    );
 }
 
 #[test]
@@ -285,7 +294,10 @@ fn compact_term_agrees_with_the_previous_whole_arena_implementation() {
         eid(2),
     );
     let parameters = [name("u")];
-    let values = [WireLevel::from_parts(vec![LevelNode::Parameter(name("v"))], lid(0))];
+    let values = [WireLevel::from_parts(
+        vec![LevelNode::Parameter(name("v"))],
+        lid(0),
+    )];
     assert_eq!(
         complete(instantiate_term_parameters(
             &term,
@@ -302,7 +314,11 @@ fn generated_level_dags_agree_with_the_previous_implementation() {
     let parameters = [name("u"), name("v")];
     let values = [
         WireLevel::from_parts(
-            vec![LevelNode::Zero, LevelNode::Parameter(name("v")), LevelNode::Max(lid(0), lid(1))],
+            vec![
+                LevelNode::Zero,
+                LevelNode::Parameter(name("v")),
+                LevelNode::Max(lid(0), lid(1)),
+            ],
             lid(2),
         ),
         WireLevel::from_parts(vec![LevelNode::Zero, LevelNode::Succ(lid(0))], lid(1)),
@@ -310,7 +326,9 @@ fn generated_level_dags_agree_with_the_previous_implementation() {
     for seed in 0_u64..128 {
         let mut state = seed;
         let mut next = |bound: usize| {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             (state % bound as u64) as usize
         };
         let mut nodes = vec![
@@ -432,12 +450,18 @@ fn all_resource_limits_remain_typed_nonanswers() {
 #[test]
 fn cancellation_at_each_reachable_checkpoint_never_publishes_partial_output() {
     let term = WireExpr::from_parts(
-        vec![ExprNode::Constant { name: name("c"), levels: vec![lid(0), lid(0)] }],
+        vec![ExprNode::Constant {
+            name: name("c"),
+            levels: vec![lid(0), lid(0)],
+        }],
         vec![LevelNode::Parameter(name("u"))],
         eid(0),
     );
     let parameters = [name("u")];
-    let values = [WireLevel::from_parts(vec![LevelNode::Zero, LevelNode::Succ(lid(0))], lid(1))];
+    let values = [WireLevel::from_parts(
+        vec![LevelNode::Zero, LevelNode::Succ(lid(0))],
+        lid(1),
+    )];
     let mut total = 0;
     complete(instantiate_term_parameters_with(
         &term,

@@ -43,7 +43,9 @@ fn do_else_if_clauses_are_the_nested_conditionals() {
                else if n = 1 then\n    return 2\n  else\n    return 3\n";
     checked(
         &base,
-        &format!("{de1}theorem de1_one : de1 1 = 2 := by rfl\ntheorem de1_two : de1 7 = 3 := by rfl\n"),
+        &format!(
+            "{de1}theorem de1_one : de1 1 = 2 := by rfl\ntheorem de1_two : de1 7 = 3 := by rfl\n"
+        ),
     );
     let source = format!("{de1}theorem de1_wrong : de1 1 = 3 := by rfl\n");
     assert!(
@@ -124,7 +126,10 @@ fn pattern_reassignment_is_refused_after_parsing() {
     match engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits()) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 /// A `while` loop parses as the pin's `doWhile` and is the pin's `for _ in Loop.mk do …`
@@ -137,7 +142,10 @@ fn while_loops_are_refused_after_parsing() {
     match engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits()) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 #[test]

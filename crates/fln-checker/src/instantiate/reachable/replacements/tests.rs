@@ -25,9 +25,15 @@ fn two_sorts() -> WireExpr {
         vec![
             ExprNode::Sort { level: lid(0) },
             ExprNode::Sort { level: lid(1) },
-            ExprNode::Apply { function: eid(0), argument: eid(1) },
+            ExprNode::Apply {
+                function: eid(0),
+                argument: eid(1),
+            },
         ],
-        vec![LevelNode::Parameter(name("u")), LevelNode::Parameter(name("v"))],
+        vec![
+            LevelNode::Parameter(name("u")),
+            LevelNode::Parameter(name("v")),
+        ],
         eid(2),
     )
 }
@@ -150,13 +156,14 @@ fn shared_cache_does_not_hide_a_corrupt_later_replacement() {
         TermBudget::unlimited(),
         &mut || false,
     );
-    assert_eq!(outcome, InstantiationOutcome::InternalFault(
-        InstantiationFault::NonBackwardLevelReference {
+    assert_eq!(
+        outcome,
+        InstantiationOutcome::InternalFault(InstantiationFault::NonBackwardLevelReference {
             input: InstantiationInput::Replacement { index: 1 },
             parent: 1,
             child: 1,
-        },
-    ));
+        },)
+    );
     assert!(matches!(
         instantiate_term_parameters_from_level_roots_with(
             &two_sorts(),
@@ -192,7 +199,10 @@ fn cancellation_remains_observable_while_smart_constructors_reuse_ancestors() {
             polls == depth + 20
         },
     );
-    assert!(matches!(outcome, InstantiationOutcome::Inconclusive(TermStop::Cancelled { .. })));
+    assert!(matches!(
+        outcome,
+        InstantiationOutcome::Inconclusive(TermStop::Cancelled { .. })
+    ));
 }
 
 #[test]
@@ -203,15 +213,32 @@ fn shared_copy_cancellation_never_publishes_partial_terms() {
     let roots = [lid(1), lid(1)];
     let mut total = 0;
     complete(instantiate_term_parameters_from_level_roots_with(
-        &subject, &parameters, &source, &roots, TermBudget::unlimited(),
-        &mut || { total += 1; false },
+        &subject,
+        &parameters,
+        &source,
+        &roots,
+        TermBudget::unlimited(),
+        &mut || {
+            total += 1;
+            false
+        },
     ));
     for stop_at in 1..=total {
         let mut polls = 0;
         let outcome = instantiate_term_parameters_from_level_roots_with(
-            &subject, &parameters, &source, &roots, TermBudget::unlimited(),
-            &mut || { polls += 1; polls == stop_at },
+            &subject,
+            &parameters,
+            &source,
+            &roots,
+            TermBudget::unlimited(),
+            &mut || {
+                polls += 1;
+                polls == stop_at
+            },
         );
-        assert!(matches!(outcome, InstantiationOutcome::Inconclusive(TermStop::Cancelled { .. })));
+        assert!(matches!(
+            outcome,
+            InstantiationOutcome::Inconclusive(TermStop::Cancelled { .. })
+        ));
     }
 }

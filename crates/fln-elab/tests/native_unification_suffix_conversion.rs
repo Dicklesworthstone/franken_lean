@@ -85,10 +85,7 @@ fn recovers_head_through_nested_beta_zeta_and_metadata_in_either_orientation() {
         let h = local(&mut txn, "h", pi(nat(), nat()));
         let g = local(&mut txn, "g", pi(nat(), nat()));
         let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::Natural);
-        let left_arg = Expr::app(
-            h.clone(),
-            Expr::mdata(KVMap::new(), beta(zeta(numeral(7)))),
-        );
+        let left_arg = Expr::app(h.clone(), Expr::mdata(KVMap::new(), beta(zeta(numeral(7)))));
         let right_arg = Expr::app(h, numeral(7));
         let left = Expr::app(Expr::mvar(f.clone()), left_arg);
         let right = Expr::app(g.clone(), right_arg);
@@ -111,7 +108,12 @@ fn recovers_the_complete_partial_head_and_preserves_suffix_order() {
     let mut txn = transaction();
     let h = local(&mut txn, "h", pi(nat(), nat()));
     let g = local(&mut txn, "g", pi(nat(), pi(nat(), pi(nat(), nat()))));
-    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())), MetavarKind::Natural);
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(nat(), pi(nat(), nat())),
+        MetavarKind::Natural,
+    );
     let left = Expr::app(
         Expr::app(
             Expr::mvar(f.clone()),
@@ -188,7 +190,12 @@ fn synthetic_opaque_heads_remain_unassigned() {
     let mut txn = transaction();
     let h = local(&mut txn, "h", pi(nat(), nat()));
     let g = local(&mut txn, "g", pi(nat(), nat()));
-    let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::SyntheticOpaque);
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(nat(), nat()),
+        MetavarKind::SyntheticOpaque,
+    );
     let left = Expr::app(Expr::mvar(f), Expr::app(h.clone(), beta(numeral(7))));
     let right = Expr::app(g, Expr::app(h, numeral(7)));
     let before = txn.clone();
