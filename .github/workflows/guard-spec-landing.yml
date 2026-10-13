@@ -12,6 +12,7 @@ on:
       - crates/fln-cli/src/guard_messages.rs
       - crates/fln-parse/tests/guard_spec_lexing.rs
       - .github/patches/apply_guard_filters.py
+      - crates/fln-cli/tests/lean_guard_spec_parity.rs
 
 permissions:
   contents: write
@@ -33,6 +34,17 @@ jobs:
           fetch-depth: 0
       - name: Install the repository's pinned toolchain
         run: rustup show active-toolchain
+      - name: Install checksum-verified Lean oracle and standard library
+        run: |
+          set -euo pipefail
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 -o "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          mkdir -p "$HOME/.elan/toolchains"
+          ln -s "$RUNNER_TEMP/lean-4.32.0-linux" "$HOME/.elan/toolchains/leanprover--lean4---v4.32.0"
+          test -f "$HOME/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean/Init.olean"
+          echo "FLN_GUARD_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
       - name: Apply native source integration
         run: |
           python3 -I .github/patches/apply_guard_spec.py
@@ -45,7 +57,8 @@ jobs:
             crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
             crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs \
             crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs \
-            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs
+            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs \
+            crates/fln-cli/tests/lean_guard_spec_parity.rs
           git diff --check
       - name: Test native specification policies
         run: |
@@ -57,6 +70,7 @@ jobs:
         run: |
           cargo test -p fln-cli --lib guard_
           cargo test -p fln-cli --test lean_guard_msgs
+          cargo test -p fln-cli --test lean_guard_spec_parity
       - name: Check production libraries with strict Clippy
         run: cargo clippy -p fln-parse -p fln -p fln-cli --lib -- -D warnings
       - name: Commit tested integration directly to main
@@ -67,7 +81,8 @@ jobs:
             crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
             crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs \
             crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs \
-            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs
+            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs \
+            crates/fln-cli/tests/lean_guard_spec_parity.rs
           if git diff --cached --quiet; then
             echo 'The tested integration is already on main.'
             exit 0
