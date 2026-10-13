@@ -8,6 +8,10 @@ on:
       - .github/patches/apply_guard_spec.py
       - crates/fln-parse/src/command_scope/guard_spec.rs
       - crates/fln-cli/src/guard_spec_tests.rs
+      - crates/fln-cli/src/guard_filter_tests.rs
+      - crates/fln-cli/src/guard_messages.rs
+      - crates/fln-parse/tests/guard_spec_lexing.rs
+      - .github/patches/apply_guard_filters.py
 
 permissions:
   contents: write
@@ -30,33 +34,45 @@ jobs:
       - name: Install the repository's pinned toolchain
         run: rustup show active-toolchain
       - name: Apply native source integration
-        run: python3 -I .github/patches/apply_guard_spec.py
+        run: |
+          python3 -I .github/patches/apply_guard_spec.py
+          python3 -I .github/patches/apply_guard_filters.py
       - name: Format only the changed Rust files
         run: |
           rustfmt --edition 2024 --config skip_children=true \
             crates/fln-parse/src/command_scope.rs \
             crates/fln-parse/src/command_scope/guard_spec.rs \
             crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
-            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs
+            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs \
+            crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs \
+            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs
           git diff --check
       - name: Test native specification policies
-        run: cargo test -p fln-parse --lib guard_spec::tests
+        run: |
+          cargo test -p fln-parse --lib guard_spec::tests
+          cargo test -p fln-parse --test guard_spec_lexing
       - name: Test engine guard and refusal boundaries
         run: cargo test -p fln --test source_guard_msgs
       - name: Test real command rendering with specifications
-        run: cargo test -p fln-cli --lib guard_spec_tests
+        run: |
+          cargo test -p fln-cli --lib guard_
+          cargo test -p fln-cli --test lean_guard_msgs
+      - name: Check production libraries with strict Clippy
+        run: cargo clippy -p fln-parse -p fln -p fln-cli --lib -- -D warnings
       - name: Commit tested integration directly to main
         run: |
           set -euo pipefail
           git add crates/fln-parse/src/command_scope.rs \
             crates/fln-parse/src/command_scope/guard_spec.rs \
             crates/fln/src/lib.rs crates/fln/tests/source_guard_msgs.rs \
-            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs
+            crates/fln-cli/src/lib.rs crates/fln-cli/src/guard_spec_tests.rs \
+            crates/fln-cli/src/guard_filter_tests.rs crates/fln-cli/src/guard_messages.rs \
+            crates/fln-parse/tests/guard_spec_lexing.rs crates/fln-cli/tests/lean_guard_msgs.rs
           if git diff --cached --quiet; then
             echo 'The tested integration is already on main.'
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(lean): integrate tested native guard comparison specifications'
+          git commit -m 'feat(lean): integrate tested native message filtering'
           git push origin HEAD:main
