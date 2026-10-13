@@ -1,0 +1,129 @@
+name: Prepare partial definition source
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/partial-source-transfer.yml']
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Prepare bounded identity-checked source without running it or moving a branch
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, io, json, os, pathlib, re, subprocess, tempfile, urllib.request
+          repository = os.environ['GITHUB_REPOSITORY']
+          assert repository == 'Dicklesworthstone/franken_lean'
+          request_blob = '4f7e1f07b1b65aeda68b3eb66c72423d30891cb9'
+          def oid(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def api(path, data=None):
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + repository + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          def blob(sha, limit=2_000_000):
+              assert re.fullmatch('[0-9a-f]{40}', sha)
+              entry = api('/git/blobs/' + sha)
+              assert entry['encoding'] == 'base64' and entry['size'] <= limit
+              data = base64.b64decode(entry['content'])
+              assert len(data) <= limit and oid(data) == sha
+              return data
+          wrapper = json.loads(blob(request_blob, 1_000_000))
+          assert set(wrapper) == {'parts', 'gzip_blob'} and 0 < len(wrapper['parts']) <= 8
+          compressed = b''.join(blob(part, 1_000_000) for part in wrapper['parts'])
+          assert len(compressed) <= 1_000_000 and oid(compressed) == wrapper['gzip_blob']
+          with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+              raw = stream.read(2_000_001)
+          assert len(raw) <= 2_000_000
+          manifest = json.loads(raw)
+          files = manifest['files']
+          assert isinstance(files, dict) and 0 < len(files) <= 64
+          root = pathlib.Path(tempfile.mkdtemp(prefix='fln-partial-source-', dir=os.environ['RUNNER_TEMP']))
+          originals = {}
+          for path, identities in files.items():
+              assert re.fullmatch(r'crates/[A-Za-z0-9_-]+/(src|tests)/[A-Za-z0-9_./-]+\.rs', path)
+              assert '..' not in pathlib.PurePosixPath(path).parts
+              assert re.fullmatch('[0-9a-f]{40}', identities['after'])
+              target = root / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              before = identities['before']
+              originals[path] = None if before is None else blob(before)
+              if before is not None:
+                  target.write_bytes(originals[path])
+          patch = manifest['patch'].encode()
+          rows = subprocess.check_output(['git', 'apply', '--numstat', '-'], input=patch, cwd=root).decode().splitlines()
+          stats = [row.split('\t') for row in rows]
+          assert len(stats) == len(files) and {row[2] for row in stats} == set(files)
+          assert all(row[0].isdigit() and row[1].isdigit() for row in stats)
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, cwd=root, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, cwd=root, check=True)
+          base = api('/git/ref/heads/main')['object']['sha']
+          assert re.fullmatch('[0-9a-f]{40}', base)
+          out = root / 'prepared'
+          out.mkdir()
+          receipt = {'base': base, 'request_blob': request_blob, 'branch_updated': False, 'files': {}}
+          prepared = {}
+          for path, identities in files.items():
+              target = root / path
+              assert target.is_file() and not target.is_symlink()
+              candidate = target.read_bytes()
+              assert oid(candidate) == identities['after']
+              candidate.decode('utf-8')
+              try:
+                  current = api('/contents/' + path + '?ref=' + base)
+              except urllib.error.HTTPError as error:
+                  if error.code != 404 or identities['before'] is not None:
+                      raise
+                  current = None
+              current_sha = None if current is None else current['sha']
+              if current is not None:
+                  assert current['type'] == 'file'
+                  current_bytes = blob(current_sha)
+                  if current_bytes == candidate:
+                      pass
+                  elif originals[path] is None:
+                      raise RuntimeError('new path already exists: ' + path)
+                  elif current_bytes != originals[path]:
+                      left = root / 'merge-candidate'
+                      ancestor = root / 'merge-ancestor'
+                      right = root / 'merge-current'
+                      left.write_bytes(candidate)
+                      ancestor.write_bytes(originals[path])
+                      right.write_bytes(current_bytes)
+                      candidate = subprocess.check_output(['git', 'merge-file', '-p', str(left), str(ancestor), str(right)])
+              assert len(candidate) <= 2_000_000
+              candidate.decode('utf-8')
+              destination = out / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_bytes(candidate)
+              prepared[path] = candidate
+              receipt['files'][path] = {'before': current_sha, 'after': oid(candidate), 'tested_candidate': identities['after']}
+          # Store immutable content only. Any concurrent merge still needs local
+          # review/testing and an explicit guarded connector branch publication.
+          for path, data in prepared.items():
+              result = api('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert result['sha'] == receipt['files'][path]['after']
+          (out / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('directory=' + str(out) + '\n')
+          print(json.dumps(receipt))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: partial-source-${{ github.run_id }}
+          path: ${{ steps.prepare.outputs.directory }}
+          retention-days: 2
+          if-no-files-found: error
