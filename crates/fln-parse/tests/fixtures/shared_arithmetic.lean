@@ -1,0 +1,36 @@
+def circuit (start : Nat) : Nat :=
+  let n0 : Nat := start
+  let n1 : Nat := Nat.add n0 n0
+  let n2 : Nat := Nat.add n1 n1
+  let n3 : Nat := Nat.add n2 n2
+  let n4 : Nat := Nat.add n3 n3
+  let n5 : Nat := Nat.add n4 n4
+  let n6 : Nat := Nat.add n5 n5
+  let n7 : Nat := Nat.add n6 n6
+  let n8 : Nat := Nat.add n7 n7
+  let n9 : Nat := Nat.add n8 n8
+  let n10 : Nat := Nat.add n9 n9
+  let n11 : Nat := Nat.add n10 n10
+  let n12 : Nat := Nat.add n11 n11
+  let n13 : Nat := Nat.add n12 n12
+  let n14 : Nat := Nat.add n13 n13
+  let n15 : Nat := Nat.add n14 n14
+  let n16 : Nat := Nat.add n15 n15
+  let n17 : Nat := Nat.add n16 n16
+  let n18 : Nat := Nat.add n17 n17
+  let n19 : Nat := Nat.add n18 n18
+  let n20 : Nat := Nat.add n19 n19
+  let n21 : Nat := Nat.add n20 n20
+  let n22 : Nat := Nat.add n21 n21
+  let n23 : Nat := Nat.add n22 n22
+  let n24 : Nat := Nat.add n23 n23
+  let n25 : Nat := Nat.add n24 n24
+  let n26 : Nat := Nat.add n25 n25
+  let n27 : Nat := Nat.add n26 n26
+  let n28 : Nat := Nat.add n27 n27
+  let n29 : Nat := Nat.add n28 n28
+  let n30 : Nat := Nat.add n29 n29
+  let n31 : Nat := Nat.add n30 n30
+  let n32 : Nat := Nat.add n31 n31
+  n32
+theorem computes : circuit 3 = 12884901888 := by rfl
