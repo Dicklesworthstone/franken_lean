@@ -1,10 +1,15 @@
 name: fln LSP versioned diagnostics landing
 
+# Manual only (bead fln-invalid-yaml-landing-workflows-waaq). This file never
+# parsed: the `'''` that closes `tests` below sat at column 0, which ends the
+# `run: |` block scalar, so GitHub recorded a failed zero-job run on every push and
+# this landing never executed. It used to trigger on a push of this very file and
+# then push a 2026-09-01 patch to main as github-actions[bot]. Making it parse
+# under that trigger would have published six-week-old code without any gate, so
+# it now runs only when someone dispatches it deliberately, after checking that its
+# payload still applies and is still wanted.
 on:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/fln-lsp-versioned-diagnostics-landing.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -316,7 +321,7 @@ jobs:
               );
           }
 
-'''
+          '''
               tests = "\n".join(
                   line[10:] if line.startswith("          ") else line
                   for line in tests.splitlines()
