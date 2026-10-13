@@ -39,7 +39,8 @@ jobs:
           cargo clippy --locked -p fln-elab -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
   reproduction-inputs:
-    if: github.event_name == 'push' && github.event.head_commit.message == 'test(elab): execute native matrix regressions and retain pinned reproduction inputs'
+    if: >-
+      github.event_name == 'push' && contains(github.event.head_commit.message, 'retain pinned reproduction inputs')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
