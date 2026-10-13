@@ -890,6 +890,10 @@ jobs:
             --test lake_module_build --test check_olean_progress_crash \
             --test olean_header_pin --no-fail-fast || rc=1
           cargo test --locked -p fln-olean --no-fail-fast || rc=1
+          # The kernel's 13-case Reference differential, including its
+          # Reference-REJECTED cases (D23: accepting one is release-blocking). Until
+          # this line it ran nowhere with the pin installed (bead fln-lst4).
+          cargo test --locked -p fln-kernel --test reference_differential --no-fail-fast || rc=1
           exit "$rc"
 
       - name: run the reduced reject-side mutant lane (fln-kernel-reject-side-at-scale-bemc)
