@@ -70,7 +70,7 @@ fn visibility_overrides_preserve_module_identity_and_do_not_mutate_defaults() {
 }
 
 #[test]
-fn hidden_public_bodies_and_public_mutual_groups_remain_explicit_refusals() {
+fn hidden_bodies_and_split_visibility_refuse_while_public_data_groups_select_exports() {
     let mut public = module();
     public.public_declarations = true;
     public.expose_definitions = true;
@@ -80,14 +80,38 @@ fn hidden_public_bodies_and_public_mutual_groups_remain_explicit_refusals() {
         "@[no_expose] def hidden (a : Type) (x : a) : a := x",
         "@[expose] public theorem proof (p : Prop) (h : p) : p := h",
         "@[no_expose] public theorem proof (p : Prop) (h : p) : p := h",
-        "mutual inductive A where | mk inductive B where | mk end",
-        "mutual inductive A where | mk public inductive B where | mk end",
+        "mutual\n  public inductive A where | mk\n  private inductive B where | mk\nend",
     ] {
         assert!(
             public.for_command_source(source.as_bytes()).is_err(),
             "{source}"
         );
     }
+    // A uniformly public data bundle now selects the exported predecessor.
+    // Explicit visibility and inherited defaults agree; neither mutates the
+    // lexical section or grants access to a private sibling.
+    for source in [
+        "mutual inductive A where | mk inductive B where | mk end",
+        "mutual\n  inductive A where | mk\n  public inductive B where | mk\nend",
+    ] {
+        let selected = public
+            .for_command_source(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+        assert!(selected.exports_declaration());
+        assert_eq!(selected.private_module, public.private_module);
+        assert_eq!(selected.declaration_name(&n("A")).unwrap(), n("API.A"));
+    }
+    let selected = public
+        .for_command_source(
+            b"mutual\n  private inductive A where | mk\n  private inductive B where | mk\nend",
+        )
+        .unwrap();
+    assert!(!selected.exports_declaration());
+    assert!(public.exports_declaration());
+    assert_eq!(
+        selected.declaration_name(&n("A")).unwrap(),
+        private(&n("API.A"))
+    );
     assert!(
         module()
             .for_command_source(b"public def hidden (a : Type) (x : a) : a := x")

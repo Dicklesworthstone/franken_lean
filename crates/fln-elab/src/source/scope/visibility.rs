@@ -212,8 +212,8 @@ impl SourceScope {
     }
 
     /// Source-command counterpart to [`Self::for_declaration`]. It preserves the
-    /// existing atomic private-mutual route and never turns queries/examples into
-    /// exported declarations merely because they occur inside a public section.
+    /// atomic mutual route, exporting complete uniformly public data bundles.
+    /// Queries/examples never become exports just by being in a public section.
     pub fn for_command_source(&self, source: &[u8]) -> Result<Self, NatDefinitionFrontendError> {
         if fln_parse::command_scope::parse(source)?.is_some() {
             let mut effective = self.clone();
@@ -221,17 +221,33 @@ impl SourceScope {
             return Ok(effective);
         }
         if let Some(members) = fln_parse::command_scope::mutual::parse(source)? {
-            let mut exports = self.exports_declaration();
+            let mut exported = 0;
+            let mut inductive = true;
             for member in &members {
-                exports |= self.for_declaration(member)?.exports_declaration();
+                exported += usize::from(self.for_declaration(member)?.exports_declaration());
+                let declaration = expect_node(
+                    member,
+                    &parser_kind(&["Command", "declaration"]),
+                    2,
+                    "mutual declaration",
+                )?;
+                inductive &= declaration[1].kind() == Some(&parser_kind(&["Command", "inductive"]));
             }
-            if exports {
+            if exported != 0 && (exported != members.len() || !inductive) {
                 return Err(refused(
-                    "private mutual blocks; public mutual export is not yet supported",
+                    "uniformly public mutual inductives or wholly private mutual blocks",
                 )
                 .into());
             }
-            return Ok(self.clone());
+            // A complete public data bundle has one exported predecessor and
+            // one ordinary atomic admission. Never export a private sibling or
+            // expose a partial implementation just because another member is
+            // public. Explicit private members also override a public section.
+            let mut effective = self.clone();
+            if effective.private_module.is_some() {
+                effective.public_declarations = exported != 0;
+            }
+            return Ok(effective);
         }
         let parsed = fln_parse::parse_source_command(source)?;
         if parsed.syntax().kind() == Some(&parser_kind(&["Command", "declaration"])) {
