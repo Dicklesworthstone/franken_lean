@@ -20,6 +20,7 @@ use fln_core::expr::NatLit;
 use fln_core::level::LevelView;
 
 pub mod format;
+mod print;
 use format::Format;
 
 /// Why a term could not be printed the pin's way.
@@ -707,19 +708,44 @@ impl<'a> Printer<'a> {
     /// Whether `e` is a proof: its type is a proposition. The type is read from the head's
     /// type, which suffices for a constant or a bound variable at the head.
     fn is_proof(&self, e: &Expr) -> bool {
+        Self::proof_in(self.env, &self.types, e)
+    }
+
+    /// [`Printer::is_proof`] for `e` under the binder types `scope` (innermost last). A `fun`
+    /// is a proof when its body is one: its type is a `∀` into the body's type.
+    fn proof_in(env: &Environment, scope: &[Expr], e: &Expr) -> bool {
+        let mut local: Vec<Expr> = Vec::new();
+        let mut e = e;
+        while let ExprNode::Lam {
+            binder_type, body, ..
+        } = e.node()
+        {
+            local.push(binder_type.clone());
+            e = body;
+        }
         let (head, _) = spine(e);
         match head.node() {
-            ExprNode::Const { name, .. } => self
-                .env
+            ExprNode::Const { name, .. } => env
                 .find(name)
-                .is_some_and(|info| Self::prop_in(self.env, &[], &info.constant_val().type_)),
+                .is_some_and(|info| Self::prop_in(env, &[], &info.constant_val().type_)),
+            // A binder's type is relative to the binders outside it.
             ExprNode::BVar { idx } => {
                 let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
-                // A binder's type is relative to the binders outside it.
-                self.types
-                    .len()
-                    .checked_sub(idx + 1)
-                    .is_some_and(|at| Self::prop_in(self.env, &self.types[..at], &self.types[at]))
+                if idx < local.len() {
+                    let at = local.len() - 1 - idx;
+                    let outside = scope
+                        .iter()
+                        .chain(&local[..at])
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    Self::prop_in(env, &outside, &local[at])
+                } else {
+                    let outer = idx - local.len();
+                    scope
+                        .len()
+                        .checked_sub(outer + 1)
+                        .is_some_and(|at| Self::prop_in(env, &scope[..at], &scope[at]))
+                }
             }
             _ => false,
         }
@@ -803,17 +829,47 @@ impl<'a> Printer<'a> {
                 let mut binders = Format::Nil;
                 let mut body = e;
                 let depth = self.names.len();
+                // `delabLamAux` (vendored `PrettyPrinter/Delaborator/Builtins.lean:954-1006`)
+                // with binder types hidden: an explicit binder is its name, an implicit group
+                // `{a b}` and a strict one `⦃a b⦄`. `shouldGroupWithNext` groups a binder
+                // with the next when the binder infos agree and the domains are equal as
+                // terms. An instance binder shows its type, which is not reproduced.
+                let mut group: Vec<String> = Vec::new();
                 while let ExprNode::Lam {
                     binder_name: name,
                     binder_type,
                     body: inner,
-                    ..
+                    binder_info,
                 } = body.node()
                 {
+                    if *binder_info == BinderInfo::InstImplicit {
+                        self.unbind_to(depth);
+                        return Err(Unsupported("an instance-implicit `fun` binder"));
+                    }
                     let shown = self.bound_name(name, inner);
-                    binders = binders.then(Format::Line).then(Format::text(shown.clone()));
-                    self.bind(shown, binder_type);
+                    self.bind(shown.clone(), binder_type);
                     body = inner;
+                    if *binder_info == BinderInfo::Default {
+                        binders = binders.then(Format::Line).then(Format::text(shown));
+                        continue;
+                    }
+                    group.push(shown);
+                    let grouped = matches!(inner.node(), ExprNode::Lam {
+                        binder_type: next_type,
+                        binder_info: next_info,
+                        ..
+                    } if next_info == binder_info && next_type == binder_type);
+                    if !grouped {
+                        let (open, close) = if *binder_info == BinderInfo::Implicit {
+                            ("{", "}")
+                        } else {
+                            ("⦃", "⦄")
+                        };
+                        let names = std::mem::take(&mut group).join(" ");
+                        binders = binders
+                            .then(Format::Line)
+                            .then(Format::text(format!("{open}{names}{close}")));
+                    }
                 }
                 let printed = self.doc(body, 0);
                 self.unbind_to(depth);
@@ -943,6 +999,50 @@ impl<'a> Printer<'a> {
                     outer,
                 ));
             }
+            // `coeDelaborator` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1230-1260`): a
+            // function the `coe` attribute registers is `↑x` of its first explicit argument
+            // when applied to exactly that many arguments. The pinned `Init` registers four:
+            // `Nat.cast` (`Init/Data/Cast.lean:69`), `Int.cast` (`Init/Data/Int/Basic.lean:453`),
+            // `Fin.val` (`Init/Prelude.lean:2321`), `Subarray.copy`
+            // (`Init/Data/Slice/Array/Iterator.lean:88`).
+            if matches!(
+                text.as_str(),
+                "Nat.cast" | "Int.cast" | "Fin.val" | "Subarray.copy"
+            ) && let Some(coercee) = self
+                .binder_infos(name)
+                .iter()
+                .position(|info| *info == BinderInfo::Default)
+            {
+                if args.len() == coercee + 1 {
+                    let shown = self.doc(&args[coercee], MAX_PREC)?;
+                    return Ok(node(Format::text("↑").then(shown)));
+                }
+                if args.len() > coercee + 1 {
+                    return Err(Unsupported("an applied coercion"));
+                }
+            }
+            // `delabSorry` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1515-1542`): a
+            // labeled sorry, `sorryAx (Lean.Name → α) synthetic tag`, and a plain one,
+            // `sorryAx α synthetic`, both print `sorry`; arguments beyond are applied after it.
+            if text == "sorryAx" && args.len() >= 2 {
+                let labeled = matches!(args[0].node(), ExprNode::ForallE { binder_type, .. }
+                    if matches!(binder_type.node(), ExprNode::Const { name, .. }
+                        if name.to_display_string() == "Lean.Name"));
+                let consumed = if labeled { 3 } else { 2 };
+                if args.len() == consumed {
+                    return Ok(Format::text("sorry"));
+                }
+                return Err(Unsupported("an applied sorry"));
+            }
+            // A structure's constructor, fully applied, is `{ x := a, … }` at the pin, or
+            // `⟨a, …⟩` for a type tagged `pp_using_anonymous_constructor`, which is not decoded.
+            if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
+                && args.len() == (ctor.num_params + ctor.num_fields) as usize
+                && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
+                && self.structure_like(inductive)
+            {
+                return Err(Unsupported("a structure instance"));
+            }
             let infos = self.binder_infos(name);
             // Generalized field notation: `C.f r …` is `r.f …` when `r` is `C.f`'s first
             // explicit argument and has type `C …` (never on a numeric literal).
@@ -1008,10 +1108,59 @@ impl<'a> Printer<'a> {
             return None;
         };
         let namespace = name.parent();
-        if namespace.is_anonymous() {
+        // `fieldNotationCandidate?` / `generalizedFieldInfo` (vendored
+        // `PrettyPrinter/Delaborator/FieldNotation.lean:76-137`): never in `Function`, never on
+        // a theorem, never on `pp_nodot` (in `Init` only `List.toArrayImpl`,
+        // `Init/Data/List/ToArrayImpl.lean:35`).
+        if namespace.is_anonymous()
+            || namespace.to_display_string() == "Function"
+            || name.to_display_string() == "List.toArrayImpl"
+        {
             return None;
         }
-        let receiver = infos.iter().position(|info| *info == BinderInfo::Default)?;
+        let signature = &self.env.find(name)?.constant_val().type_;
+        if Self::prop_in(self.env, &[], signature) {
+            return None;
+        }
+        // The first parameter whose type is an application of the namespace is the receiver;
+        // it must be explicit, and no explicit parameter may come before it. A `motive` before
+        // it stops field notation.
+        let mut type_ = signature;
+        let mut receiver = None;
+        for index in 0..args.len() {
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = type_.node()
+            else {
+                return None;
+            };
+            if binder_name.to_display_string() == "motive" {
+                return None;
+            }
+            let explicit = infos.get(index) == Some(&BinderInfo::Default);
+            // `isAppOfBaseName` reads the type after `cleanupAnnotations` (`@& Nat` is `Nat`).
+            let mut domain = binder_type;
+            while let ExprNode::MData { expr, .. } = domain.node() {
+                domain = expr;
+            }
+            if matches!(spine(domain).0.node(),
+                ExprNode::Const { name: head, .. } if *head == namespace)
+            {
+                if !explicit {
+                    return None;
+                }
+                receiver = Some(index);
+                break;
+            }
+            if explicit {
+                return None;
+            }
+            type_ = body;
+        }
+        let receiver = receiver?;
         let arg = args.get(receiver)?;
         let literal = matches!(arg.node(), ExprNode::Lit { .. })
             || matches!(spine(arg).0.node(),
@@ -1019,23 +1168,7 @@ impl<'a> Printer<'a> {
         if literal {
             return None;
         }
-        // The receiver binder's type, from the constant's signature.
-        let mut type_ = &self.env.find(name)?.constant_val().type_;
-        for _ in 0..receiver {
-            let ExprNode::ForallE { body, .. } = type_.node() else {
-                return None;
-            };
-            type_ = body;
-        }
-        let ExprNode::ForallE { binder_type, .. } = type_.node() else {
-            return None;
-        };
-        match spine(binder_type).0.node() {
-            ExprNode::Const { name: head, .. } if *head == namespace => {
-                Some((receiver, escaped_part(field, false)))
-            }
-            _ => None,
-        }
+        Some((receiver, escaped_part(field, false)))
     }
 
     /// A bare constant: `@c` when it has implicit binders the pin would otherwise fill.
@@ -1166,7 +1299,12 @@ impl<'a> Printer<'a> {
         else {
             unreachable!("pi called on a pi")
         };
-        let dependent = body.has_loose_bvar(0);
+        let proposition = self.is_prop(e);
+        // `delabForallBinders` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1020-1031`): a
+        // binder shows its name when it is dependent, and also (RFC #1834, `pp.foralls`) when
+        // it is explicit, in a proposition, and its domain is not a proposition.
+        let dependent = body.has_loose_bvar(0)
+            || (proposition && *binder_info == BinderInfo::Default && !self.is_prop(binder_type));
         // A non-dependent explicit binder is an arrow (or an implication): `arrow` is
         // `term " → " term`, the token's trailing space a line.
         if !dependent && *binder_info == BinderInfo::Default {
@@ -1187,7 +1325,6 @@ impl<'a> Printer<'a> {
                 outer,
             ));
         }
-        let proposition = self.is_prop(e);
         // Group consecutive binders with one type and one binder kind.
         let depth = self.names.len();
         let mut groups: Vec<Format> = Vec::new();
@@ -1202,7 +1339,10 @@ impl<'a> Printer<'a> {
             else {
                 break self.doc(current, ARROW_PREC);
             };
-            let dependent = body.has_loose_bvar(0);
+            let dependent = body.has_loose_bvar(0)
+                || (proposition
+                    && *binder_info == BinderInfo::Default
+                    && !self.is_prop(binder_type));
             if !dependent && *binder_info == BinderInfo::Default {
                 break self.pi(current, ARROW_PREC);
             }
@@ -1220,7 +1360,11 @@ impl<'a> Printer<'a> {
                 binder_info: other_info,
             } = next.node()
             {
-                if other_info != binder_info || !other_body.has_loose_bvar(0) {
+                let other_dependent = other_body.has_loose_bvar(0)
+                    || (proposition
+                        && *other_info == BinderInfo::Default
+                        && !self.is_prop(other_type));
+                if other_info != binder_info || !other_dependent {
                     break;
                 }
                 let same = !other_type.has_loose_bvar(0)

@@ -826,6 +826,163 @@ fn synth_prints_the_instance_it_finds() {
     assert!(refused.stdout.is_empty(), "{refused:?}");
 }
 
+/// `#print` (`Lean/Elab/Print.lean`) for constants the file declares: the header with its
+/// attributes (`@[reducible]` for an `abbrev`, `@[defeq]` for a `:= rfl` body), the value after
+/// `:=` and a line, an inductive's constructors, a string, and `#print axioms`. The values also
+/// pin the printer: `{α}` for an implicit `fun` binder, a proof under `fun` shown in full (the
+/// root is a proof), no field notation on a theorem (`Nat.add_zero n`) but through `@&`
+/// (`n.pred`), `∀` binders named per RFC #1834, and `↑` for `Init`'s `@[coe]` functions.
+/// The expected text is the pinned v4.32.0's stdout for the same file
+/// (2026-10-12). A constant the door cannot print the pin's way (here, a structure instance) is
+/// refused, never printed otherwise.
+#[test]
+fn print_shows_declarations_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-print");
+    let shown = workspace.write(
+        "Print.lean",
+        "prelude\nimport Init.Core\n\
+         universe u\n\
+         def ident {α : Sort u} (a : α) : α := a\n\
+         def double (n : Nat) : Nat := n + n\n\
+         theorem double_zero : double 0 = 0 := rfl\n\
+         theorem by_tac (p : Prop) (h : p) : p := by exact h\n\
+         abbrev Two : Nat := 2\n\
+         @[irreducible] def hid : Nat := 5\n\
+         axiom Magic : Nat\n\
+         opaque secret : Nat\n\
+         inductive Vec (α : Type u) : Nat → Type u where\n\
+         \x20 | nil : Vec α 0\n\
+         \x20 | cons (a : α) {n : Nat} (v : Vec α n) : Vec α (n + 1)\n\
+         protected def Vec.pick : Nat := 0\n\
+         theorem keep (p q : Prop) (h : p) (k : p → q) : q := k h\n\
+         theorem nz (n : Nat) : n + 0 = n := Nat.add_zero n\n\
+         def prev (n : Nat) : Nat := Nat.pred n\n\
+         #print ident\n#print sig double\n#print double_zero\n#print by_tac\n#print Two\n\
+         #print hid\n#print Magic\n#print secret\n#print Vec\n#print Vec.pick\n\
+         #print keep\n#print nz\n#print prev\n\
+         #print \"hello there\"\n#print axioms double\n#print axioms Magic\n",
+    );
+    let ours = lean_door(&workspace, &shown, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            "def ident.{u} : {α : Sort u} → α → α :=\nfun {α} a => a\n\
+             def double : Nat → Nat\n\
+             @[defeq] theorem double_zero : double 0 = 0 :=\nrfl\n\
+             theorem by_tac : ∀ (p : Prop), p → p :=\nfun p h => h\n\
+             @[reducible] def Two : Nat :=\n2\n\
+             @[irreducible] def hid : Nat :=\n5\n\
+             axiom Magic : Nat\n\
+             opaque secret : Nat\n\
+             inductive Vec.{u} : Type u → Nat → Type u\nnumber of parameters: 1\n\
+             constructors:\nVec.nil : {α : Type u} → Vec α 0\n\
+             Vec.cons : {α : Type u} → α → {n : Nat} → Vec α n → Vec α (n + 1)\n\
+             protected def Vec.pick : Nat :=\n0\n\
+             theorem keep : ∀ (p q : Prop), p → (p → q) → q :=\nfun p q h k => k h\n\
+             theorem nz : ∀ (n : Nat), n + 0 = n :=\nfun n => Nat.add_zero n\n\
+             def prev : Nat → Nat :=\nfun n => n.pred\n\
+             hello there\n\
+             'double' does not depend on any axioms\n\
+             'Magic' depends on axioms: [Magic]\n",
+            ""
+        ),
+        "{ours:?}"
+    );
+    // In a proposition an explicit binder whose domain is not a proposition keeps its name
+    // (RFC #1834); outside one, or over a proposition, it is an arrow.
+    let binders = workspace.write(
+        "Binders.lean",
+        "prelude\nimport Init.Core\nset_option linter.unusedVariables false\n\
+         def natToType : Nat → Type := fun _ => Nat\n\
+         theorem a1 (n : Nat) (elem : natToType n) (c : Char) : n = n := rfl\n\
+         theorem a2 : ∀ (n : Nat), Nat → n = n := fun n _ => rfl\n\
+         theorem a3 (p : Prop) (h : p) (k : Nat) : p := h\n\
+         theorem a4 (n m : Nat) (h : n = m) : m = n := h.symm\n\
+         def a5 (n : Nat) (k : Nat → Prop) : Prop := k n\n\
+         #check @a1\n#check @a2\n#check @a3\n#check @a4\n#check @a5\n\
+         #check ∀ (x : Nat) (y : Nat), x = y\n#check (Nat → Nat) → True\n",
+    );
+    let named = lean_door(&workspace, &binders, &lib);
+    assert_eq!(
+        (named.code, named.stdout.as_str()),
+        (
+            0,
+            "a1 : ∀ (n : Nat) (elem : natToType n) (c : Char), n = n\n\
+             a2 : ∀ (n a : Nat), n = n\n\
+             a3 : ∀ (p : Prop), p → ∀ (k : Nat), p\n\
+             a4 : ∀ (n m : Nat), n = m → m = n\n\
+             a5 : Nat → (Nat → Prop) → Prop\n\
+             ∀ (x y : Nat), x = y : Prop\n\
+             ∀ (a : Nat → Nat), True : Prop\n"
+        ),
+        "{named:?}"
+    );
+    // A function the pinned `Init` registers with `@[coe]` is `↑x` (`coeDelaborator`).
+    let coercions = workspace.write(
+        "Coercions.lean",
+        "prelude\nimport Init.Data.Int.Basic\n\
+         def f1 (a : Int) (b c : Nat) : Int := a + (b - c)\n\
+         def f2 (a : Int) (b c : Nat) : Int := b - c + a\n\
+         #print f1\n#print f2\n#check fun (n : Nat) => (n : Int)\n",
+    );
+    let coerced = lean_door(&workspace, &coercions, &lib);
+    assert_eq!(
+        (coerced.code, coerced.stdout.as_str()),
+        (
+            0,
+            "def f1 : Int → Nat → Nat → Int :=\nfun a b c => a + (↑b - ↑c)\n\
+             def f2 : Int → Nat → Nat → Int :=\nfun a b c => ↑b - ↑c + a\n\
+             fun n => ↑n : Nat → Int\n"
+        ),
+        "{coerced:?}"
+    );
+    // Axioms sort by `Name.cmp`, prefixes first: `aa` before `Ba.x`, which a sort of the
+    // printed names would invert.
+    let axioms = workspace.write(
+        "Axioms.lean",
+        "prelude\nimport Init.Core\naxiom Ba.x : Nat\naxiom aa : Nat\n\
+         theorem both : Ba.x + aa = Ba.x + aa := rfl\n#print axioms both\n",
+    );
+    let sorted = lean_door(&workspace, &axioms, &lib);
+    assert_eq!(
+        (sorted.code, sorted.stdout.as_str()),
+        (0, "'both' depends on axioms: [aa, Ba.x]\n"),
+        "{sorted:?}"
+    );
+    // A labeled `sorryAx (Lean.Name → Nat) false tag` is `sorry` (`delabSorry`).
+    let sorry = workspace.write(
+        "Sorry.lean",
+        "prelude\nimport Init.Core\ndef later : Nat := sorry\n#print later\n",
+    );
+    let printed = lean_door(&workspace, &sorry, &lib);
+    assert_eq!(printed.code, 0, "{printed:?}");
+    assert!(
+        printed
+            .stdout
+            .ends_with(":3:4: warning: declaration uses `sorry`\ndef later : Nat :=\nsorry\n"),
+        "{printed:?}"
+    );
+    // An imported constant's `defeq` and `meta` tags are not decoded, so its header is refused;
+    // the pin prints `@[defeq] protected theorem Nat.add_zero : ∀ (n : Nat), n + 0 = n`.
+    let imported = workspace.write(
+        "Imported.lean",
+        "prelude\nimport Init.Core\n#print sig Nat.add_zero\n",
+    );
+    let refused_import = lean_door(&workspace, &imported, &lib);
+    assert_eq!(refused_import.code, 5, "{refused_import:?}");
+    assert!(refused_import.stdout.is_empty(), "{refused_import:?}");
+    // The pin prints `{ default := 7 }`; this door does not reproduce structure instances.
+    let instance = workspace.write(
+        "Instance.lean",
+        "prelude\nimport Init.Core\ninstance foo : Inhabited Nat := ⟨7⟩\n#print foo\n",
+    );
+    let refused = lean_door(&workspace, &instance, &lib);
+    assert_eq!(refused.code, 5, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
 /// `#exit` is the pin's terminal command (`elabExit`, `Parser.isTerminalCommand`): it warns
 /// and the file ends there. The pinned binary beside the library is compared when present.
 #[test]

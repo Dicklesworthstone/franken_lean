@@ -11693,9 +11693,10 @@ fn lean_evaluation_line(
 
 fn render_lean_source_check_line(
     checked: &fln::SourceCheck,
-    environment: &fln::Environment,
+    engine: &fln::Engine,
     printer: &mut fln::pretty::Printer<'_>,
 ) -> Result<String, MultiplexerOutput> {
+    let environment = engine.environment();
     let Some(term) = checked.parsed.query_term_normalized() else {
         return Err(source_failure(
             "internal-fault",
@@ -11715,15 +11716,13 @@ fn render_lean_source_check_line(
             4,
         ));
     }
-    // `#synth C` prints the instance it found and nothing else (`logInfo val`).
-    if checked
+    let kind = checked
         .parsed
         .syntax()
         .kind()
-        .map(fln::Name::to_display_string)
-        .as_deref()
-        == Some("Lean.Parser.Command.synth")
-    {
+        .map(fln::Name::to_display_string);
+    // `#synth C` prints the instance it found and nothing else (`logInfo val`).
+    if kind.as_deref() == Some("Lean.Parser.Command.synth") {
         let fln::Declaration::Defn(definition) = &checked.declaration else {
             return Err(source_failure(
                 "internal-fault",
@@ -11743,6 +11742,13 @@ fn render_lean_source_check_line(
                 CAPABILITY_NOT_IMPLEMENTED_EXIT,
             )),
         };
+    }
+    if let Some(form) = kind
+        .as_deref()
+        .and_then(|kind| kind.strip_prefix("Lean.Parser.Command."))
+        .filter(|form| matches!(*form, "print" | "printSig" | "printAxioms" | "printEqns"))
+    {
+        return render_lean_print(form, checked, engine, printer);
     }
     // `#check c` for a constant prints its signature (`delabConstWithSignature`);
     // any other term prints as `term : type`.
@@ -11778,6 +11784,73 @@ fn render_lean_source_check_line(
             SourcePresentation::Lean,
             CAPABILITY_NOT_IMPLEMENTED_EXIT,
         )),
+    }
+}
+
+/// `#print` (vendored `Lean/Elab/Print.lean`). `#print "text"` prints the text. `#print c` and
+/// `#print sig c` print a constant this source declared; an imported one is refused, because
+/// the `defeq`, `backward_defeq` and `meta` tags its header may carry are not decoded from its
+/// `.olean`. `#print axioms c` prints the axioms `c` reaches. `#print equations` is refused.
+fn render_lean_print(
+    form: &str,
+    checked: &fln::SourceCheck,
+    engine: &fln::Engine,
+    printer: &mut fln::pretty::Printer<'_>,
+) -> Result<String, MultiplexerOutput> {
+    let refuse = |what: &str| {
+        Err(source_failure(
+            "capability",
+            &format!("#print cannot print {what} the way the pin does"),
+            false,
+            SourcePresentation::Lean,
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        ))
+    };
+    let fln::Declaration::Defn(definition) = &checked.declaration else {
+        return Err(source_failure(
+            "internal-fault",
+            "a #print query did not produce a definition candidate",
+            false,
+            SourcePresentation::Lean,
+            4,
+        ));
+    };
+    if form == "printEqns" {
+        return refuse("equation theorems");
+    }
+    if let fln::ExprNode::Lit {
+        literal: fln::Literal::Str(text),
+    } = definition.value.node()
+    {
+        // `logInfoAt tk s.getString`; a message ends with a newline.
+        return if form == "print" {
+            Ok(if text.ends_with('\n') {
+                text.clone()
+            } else {
+                format!("{text}\n")
+            })
+        } else {
+            refuse("a string")
+        };
+    }
+    let fln::ExprNode::Const { name, .. } = definition.value.node() else {
+        return refuse("a term that is not a constant");
+    };
+    let printed = if form == "printAxioms" {
+        printer.print_axioms(name)
+    } else {
+        let local = match engine.imported_environment() {
+            Some(imported) => !imported.contains(name),
+            None => engine.imported_modules().is_empty(),
+        };
+        if !local {
+            return refuse("an imported constant, whose `defeq` and `meta` tags are not decoded,");
+        }
+        printer.print_constant(name, form == "printSig")
+    };
+    match printed {
+        Ok(text) => Ok(format!("{text}\n")),
+        Err(fln::pretty::Unsupported(what)) => refuse(what),
     }
 }
 
@@ -12162,7 +12235,7 @@ fn render_lean_source_commands(
                 }
                 let line = match render_lean_source_check_line(
                     check,
-                    completed.batch.engine.environment(),
+                    &completed.batch.engine,
                     // The scope at the `#check`, not at the end of the file: its namespace and
                     // `open`s decide how a constant is named.
                     &mut fln::pretty::Printer::in_scope(

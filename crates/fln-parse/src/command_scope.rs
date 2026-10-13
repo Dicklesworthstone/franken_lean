@@ -496,6 +496,7 @@ fn declaration(s: &str) -> bool {
             | "#eval"
             | "#guard"
             | "#synth"
+            | "#print"
     )
 }
 
@@ -1539,6 +1540,66 @@ mod tests {
                 .as_deref(),
             Some("Lean.Parser.Command.synth")
         );
+    }
+
+    /// `#print` starts a command, and each of its forms reads as the pin's node
+    /// (`Lean/Parser/Command.lean:594-603`), a query of the `#check` kind.
+    #[test]
+    fn print_starts_a_command_and_reads_each_form_as_the_pins_node() {
+        let source = b"def x : Nat := 1\n#print x\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].1, b"#print x\n");
+        let kind = |text: &[u8]| {
+            let parsed = crate::parse_source_command(text).unwrap();
+            assert_eq!(parsed.kind(), crate::SourceCommandKind::Check);
+            let Syntax::Node { kind, args, .. } = parsed.syntax() else {
+                panic!("#print is a node");
+            };
+            // The `nonReservedSymbol` word is an atom of the node, as in the pin's tree; a
+            // string argument is a `str` node.
+            let word = match args.get(1) {
+                Some(Syntax::Atom { val, .. }) => val.clone(),
+                Some(Syntax::Node { kind, .. }) => kind.to_display_string(),
+                _ => String::new(),
+            };
+            (
+                kind.to_display_string(),
+                args.len(),
+                word,
+                parsed.query_term_normalized().unwrap().to_owned(),
+            )
+        };
+        let print = |form: &str, arity, word: &str, term: &str| {
+            (
+                format!("Lean.Parser.Command.{form}"),
+                arity,
+                word.to_owned(),
+                term.to_owned(),
+            )
+        };
+        assert_eq!(kind(b"#print x"), print("print", 2, "", "x"));
+        assert_eq!(kind(b"#print \"hi\""), print("print", 2, "str", "\"hi\""));
+        assert_eq!(
+            kind(b"#print axioms Nat.add"),
+            print("printAxioms", 3, "axioms", "Nat.add")
+        );
+        assert_eq!(kind(b"#print sig x"), print("printSig", 3, "sig", "x"));
+        assert_eq!(
+            kind(b"#print equations x"),
+            print("printEqns", 3, "equations", "x")
+        );
+        assert_eq!(kind(b"#print eqns x"), print("printEqns", 3, "eqns", "x"));
+        // The longest match: a form's word alone is an identifier to print.
+        assert_eq!(kind(b"#print axioms"), print("print", 2, "", "axioms"));
+        for refused in [
+            &b"#print"[..],
+            b"#print x y",
+            b"#print axioms \"s\"",
+            b"#print 1",
+        ] {
+            assert!(crate::parse_source_command(refused).is_err());
+        }
     }
 
     #[test]

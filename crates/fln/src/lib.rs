@@ -4605,6 +4605,12 @@ impl Engine {
         &self.imported_modules
     }
 
+    /// The environment the named imports alone produced, when they were admitted over an
+    /// empty base: a constant it holds came from an `.olean`, not from source.
+    pub fn imported_environment(&self) -> Option<&Environment> {
+        self.imported_environment.as_ref()
+    }
+
     /// The deterministic identity of this snapshot under the caller's exact
     /// elaboration-relevant options.
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {

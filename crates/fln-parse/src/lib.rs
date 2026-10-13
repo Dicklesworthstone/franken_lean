@@ -4525,6 +4525,79 @@ fn deriving_command(
     })
 }
 
+/// `#print` (`Lean/Parser/Command.lean:594-603`): `#print ident`, `#print "text"`, and the
+/// `nonReservedSymbol` forms `#print axioms ident`, `#print sig ident` and
+/// `#print equations ident` / `#print eqns ident`. Each is a scratch query of the `#check`
+/// kind: it prints, and publishes nothing. A word that names a form but has no identifier
+/// after it is the plain `#print ident` of that word, as the pin's longest match makes it.
+fn print_command(
+    view: SourceView,
+    tokens: &[LexedToken],
+) -> Result<ParsedSourceCommand, DefinitionParseError> {
+    let word = |at: usize| match tokens.get(at).map(|t| &t.kind) {
+        Some(TokenKind::Ident(name)) => Some(name.to_display_string()),
+        _ => None,
+    };
+    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens.get(at).map_or_else(
+            || {
+                tokens
+                    .last()
+                    .map_or(BytePos(0), |last| view.to_original(last.extent.end()))
+            },
+            |token| view.to_original(token.extent.start()),
+        ),
+        expected: NatDefinitionExpectation::DefinitionKeyword,
+    };
+    let form = match word(1).as_deref() {
+        Some("axioms") if tokens.len() == 3 => Some("printAxioms"),
+        Some("sig") if tokens.len() == 3 => Some("printSig"),
+        Some("equations" | "eqns") if tokens.len() == 3 => Some("printEqns"),
+        _ => None,
+    };
+    let argument = if form.is_some() { 2 } else { 1 };
+    let argument_ok = match tokens.get(argument).map(|t| &t.kind) {
+        Some(TokenKind::Ident(_)) => true,
+        Some(TokenKind::Literal(LiteralKind::Str)) => form.is_none(),
+        _ => false,
+    };
+    if !argument_ok {
+        return Err(refuse(argument));
+    }
+    if tokens.len() != argument + 1 {
+        return Err(refuse(argument + 1));
+    }
+    let leaves = Leaves::build(view.normalized(), tokens)?;
+    let mut children = vec![leaves.leaf(0)?];
+    if form.is_some() {
+        // A `nonReservedSymbol` is an atom in the pin's tree, though it lexes as a word.
+        let leaf = leaves.leaf(1)?;
+        let Syntax::Ident { info, val, .. } = &leaf else {
+            return Err(refuse(1));
+        };
+        children.push(Syntax::atom(*info, val.to_display_string()));
+    }
+    let leaf = leaves.leaf(argument)?;
+    children.push(match tokens.get(argument).map(|token| &token.kind) {
+        Some(TokenKind::Literal(LiteralKind::Str)) => {
+            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaf])
+        }
+        _ => leaf,
+    });
+    let query_term = tokens
+        .get(argument)
+        .map(|token| token.extent)
+        .ok_or_else(|| refuse(argument))?;
+    let epilogue = leaves.attachment().epilogue();
+    Ok(ParsedSourceCommand {
+        kind: SourceCommandKind::Check,
+        source_view: view,
+        syntax: Syntax::node(parser_kind(&["Command", form.unwrap_or("print")]), children),
+        epilogue,
+        query_term: Some(query_term),
+    })
+}
+
 /// `export N (a b …)` (`Command.export`, `"export " ident " (" ident+ ")"`). The checker does not
 /// make the aliases: it refuses the command.
 #[inline(never)]
@@ -4912,6 +4985,17 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     epilogue,
                     query_term: Some(query_term),
                 })
+            }
+            TokenKind::Symbol(symbol) if symbol == "#print" => {
+                let tokens = run
+                    .events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Token(token) => Some(token),
+                        Event::Trivia(_) | Event::Refused { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                print_command(view, &tokens)
             }
             TokenKind::Symbol(symbol) if symbol == "deriving" => {
                 let tokens = run
@@ -6462,8 +6546,8 @@ mod nat_definition_tests {
         assert!(empty.imports.is_empty());
         assert!(empty.commands.is_empty());
 
-        // `#print` parses at the pin and not here.
-        let unsupported = partition_source_module(b"#print answer")
+        // `#reduce` parses at the pin and not here.
+        let unsupported = partition_source_module(b"#reduce answer")
             .expect("the header parser leaves an unsupported body to the command parser");
         assert!(unsupported.imports.is_empty());
         assert_eq!(unsupported.commands.len(), 1);

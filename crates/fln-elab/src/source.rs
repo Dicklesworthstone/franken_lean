@@ -5388,24 +5388,49 @@ fn query_term(
         })?;
         return Ok((term, Vec::new()));
     }
-    let parts = expect_node(
-        syntax,
-        &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),
-        2,
-        if evaluate {
-            "Lean.Parser.Command.eval"
-        } else {
-            "Lean.Parser.Command.check"
-        },
-    )?;
-    expect_atom(
-        &parts[0],
-        if evaluate { "#eval" } else { "#check" },
-        "query keyword",
-    )?;
-    let mut term = context.term(&parts[1], None)?;
+    // `#print` (`Lean/Elab/Print.lean`): its identifier or string is elaborated as `#check`
+    // elaborates a term, and the caller prints from the constant or literal the candidate is.
+    let printed = (!evaluate)
+        .then(|| {
+            ["print", "printSig", "printAxioms", "printEqns"]
+                .into_iter()
+                .find(|form| syntax.kind() == Some(&parser_kind(&["Command", form])))
+        })
+        .flatten();
+    let argument = match printed {
+        Some(form) => {
+            let arity = if form == "print" { 2 } else { 3 };
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Command", form]),
+                arity,
+                "Lean.Parser.Command.print",
+            )?;
+            expect_atom(&parts[0], "#print", "print keyword")?;
+            &parts[arity - 1]
+        }
+        None => {
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),
+                2,
+                if evaluate {
+                    "Lean.Parser.Command.eval"
+                } else {
+                    "Lean.Parser.Command.check"
+                },
+            )?;
+            expect_atom(
+                &parts[0],
+                if evaluate { "#eval" } else { "#check" },
+                "query keyword",
+            )?;
+            &parts[1]
+        }
+    };
+    let mut term = context.term(argument, None)?;
     if evaluate {
-        let (head, explicit) = context.explicit_application_head(&parts[1])?;
+        let (head, explicit) = context.explicit_application_head(argument)?;
         if !explicit
             && (matches!(head, Syntax::Ident { .. })
                 || head.kind() == Some(&parser_kind(&["Term", "explicitUniv"])))
