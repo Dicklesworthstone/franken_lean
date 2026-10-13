@@ -1,0 +1,81 @@
+name: Native repeat-until regressions
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/repeat-until-regressions.yml'
+      - 'crates/fln-parse/src/term_do.rs'
+      - 'crates/fln-parse/tests/do_repeat_until.rs'
+      - 'crates/fln-elab/src/source/do_notation/repeat.rs'
+      - 'crates/fln-elab/src/source/do_notation/repeat/**'
+      - 'crates/fln/tests/source_repeat_until.rs'
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Bootstrap exports immutable, hash-verified blobs only; it never moves a ref.
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Reconstruct the exact offline-tested parser increment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -I <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          endpoint = f'https://api.github.com/repos/{repo}/git/blobs/238427073a82422fde280573531d5094247033fd'
+          req = urllib.request.Request(endpoint, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(req) as r:
+              patch = base64.b64decode(json.load(r)['content'])
+          assert hashlib.sha256(patch).hexdigest() == '9f2d04358a440fdbe9c53ede881e4004b26ec220675a6db7b2320b9906f8aebe'
+          path = 'crates/fln-parse/src/term_do.rs'
+          actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+          if actual != '8f8f1a06694f2787cf7605356d65ec2dd6df3f5b':
+              assert actual == '54db0133191acef29b8169596d6da2ef6a7a20fa', 'overlapping parser change'
+              assert not pathlib.Path('crates/fln-parse/tests/do_repeat_until.rs').exists()
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          expected = {path: '8f8f1a06694f2787cf7605356d65ec2dd6df3f5b', 'crates/fln-parse/tests/do_repeat_until.rs': '753546513ba6ea1de5ae9ff2c12a53ac49223133'}
+          for path, sha in expected.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'repeat-until-blobs.json').write_text(json.dumps(expected))
+          PY
+      - name: Install the repository-pinned compiler
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Check native parser and do elaboration
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-parse --no-fail-fast
+          cargo test --locked -p fln-elab --lib source::do_notation
+          cargo clippy --locked -p fln-parse -p fln-elab --all-targets -- -D warnings
+          rustfmt --edition 2024 --check crates/fln-parse/src/term_do.rs crates/fln-parse/tests/do_repeat_until.rs crates/fln-elab/src/source/do_notation/repeat.rs
+          git diff --check
+      - name: Export verified immutable source objects without publishing a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -I <<'PY'
+          import base64, json, os, pathlib, urllib.request
+          expected = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'repeat-until-blobs.json').read_text())
+          endpoint = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs'
+          for path, sha in expected.items():
+              data = json.dumps({'encoding': 'base64', 'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode()}).encode()
+              req = urllib.request.Request(endpoint, data=data, method='POST', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req) as r:
+                  assert json.load(r)['sha'] == sha
+          print('REPEAT_UNTIL_VERIFIED_BLOBS=' + json.dumps(expected, sort_keys=True))
+          PY

@@ -5,13 +5,14 @@
 //! before `mut` variables are threaded, as a macro expands before its element elaborates: an action
 //! in the condition runs on every iteration, and the loop's reassignments are an ordinary loop's.
 use super::*;
+mod until;
 
 fn is(syntax: &Syntax, kind: &str) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", kind]))
 }
 
 pub(in crate::source) fn is_while_loop(syntax: &Syntax) -> bool {
-    is(syntax, "doWhile") || is(syntax, "doRepeat")
+    is(syntax, "doWhile") || is(syntax, "doRepeat") || is(syntax, "doRepeatUntil")
 }
 
 fn sequence(element: Syntax) -> Syntax {
@@ -108,6 +109,8 @@ impl Context {
                         while_loop(node)?
                     } else if is(&node, "doRepeat") {
                         repeat_loop(node)?
+                    } else if is(&node, "doRepeatUntil") {
+                        until::expand(node)?
                     } else {
                         node
                     });
