@@ -42,6 +42,8 @@ pub enum InstanceRegistryError {
     UnknownClass(Name),
     InvalidInstance(Name),
     DuplicateInstance(Name),
+    /// Erasure requires an instance active in the current lexical view.
+    NotAnInstance(Name),
 }
 
 impl std::fmt::Display for InstanceRegistryError {
@@ -69,6 +71,11 @@ impl std::fmt::Display for InstanceRegistryError {
             Self::InvalidInstance(n) => {
                 write!(f, "{} is not a safe class instance", n.to_display_string())
             }
+            Self::NotAnInstance(n) => write!(
+                f,
+                "`{}` does not have [instance] attribute",
+                n.to_display_string()
+            ),
             Self::DuplicateInstance(n) => write!(
                 f,
                 "instance {} is already registered",
@@ -99,6 +106,13 @@ pub struct InstanceRegistry {
     imported: imported::Metadata,
     /// Dormant namespace registrations, in their original journal order.
     scoped: BTreeMap<Name, BTreeMap<Name, Vec<InstanceEntry>>>,
+    /// Last registration event and persistent scope of each journal instance.
+    /// Priority updates preserve search order but still clear a prior lexical
+    /// erasure, so their event position is distinct from `InstanceEntry::order`.
+    updates: BTreeMap<Name, (usize, Option<Name>)>,
+    /// Erased global/local rows retained only for `native_instances`: erasure
+    /// changes candidate availability, never a declaration's reducibility.
+    inactive: Vec<InstanceEntry>,
     /// The pin's discrimination tree over `imported`, built on first use.
     index: discr_tree::IndexCell,
 }
@@ -314,6 +328,8 @@ impl InstanceRegistry {
                         .or_default(),
                     None => self.instances.entry(class).or_default(),
                 };
+                self.updates
+                    .insert(declaration.clone(), (order, scope.clone()));
                 if let Some((previous_scope, slot)) = positions.get(&declaration) {
                     if tag == 1 || previous_scope != &scope {
                         return Err(InstanceRegistryError::Malformed);
@@ -344,6 +360,16 @@ impl InstanceRegistry {
     pub fn is_class(&self, name: &Name) -> bool {
         self.classes.contains(name)
     }
+    /// Whether this already validated view currently offers the declaration.
+    /// Dormant scoped registrations, erased instances, and default-only
+    /// candidates are not active ordinary instances.
+    pub fn is_instance(&self, declaration: &Name) -> bool {
+        self.instances
+            .values()
+            .flatten()
+            .any(|row| &row.declaration == declaration)
+    }
+
     pub fn candidates(&self, class: &Name) -> &[InstanceEntry] {
         self.instances.get(class).map_or(&[], Vec::as_slice)
     }
@@ -376,6 +402,7 @@ impl InstanceRegistry {
             .values()
             .chain(self.scoped.values().flat_map(|classes| classes.values()))
             .flatten()
+            .chain(self.inactive.iter())
             .map(|entry| &entry.declaration)
             .filter(|name| !self.imported.instances.contains_key(*name))
     }
@@ -511,8 +538,12 @@ impl RegistryCache {
         {
             return Ok(std::sync::Arc::clone(registry));
         }
-        let registry = std::sync::Arc::new(InstanceRegistry::read_with_scopes(env, scopes)?);
-        *self.scoped.borrow_mut() = Some((env.clone(), scopes.clone(), std::sync::Arc::clone(&registry)));
+        let registry = InstanceRegistry::read_cached_with_scopes(self, env, scopes)?;
+        *self.scoped.borrow_mut() = Some((
+            env.clone(),
+            scopes.clone(),
+            std::sync::Arc::clone(&registry),
+        ));
         Ok(registry)
     }
 }
