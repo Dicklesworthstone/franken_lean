@@ -274,7 +274,7 @@ impl Context {
                 .add_let(id.clone(), id.0.clone(), instance_type, instance_value);
         }
         let mut value = None;
-        for components in [&["default"][..], &["Classical", "ofNonempty"][..]] {
+        'strategies: for components in [&["default"][..], &["Classical", "ofNonempty"][..]] {
             if !self
                 .txn
                 .env
@@ -282,7 +282,6 @@ impl Context {
             {
                 continue;
             }
-            let snapshot = self.clone();
             let syntax = Syntax::Ident {
                 info: fln_syntax::source::SourceInfo::None,
                 raw_val: fln_syntax::source::ByteSpan::default(),
@@ -294,29 +293,46 @@ impl Context {
                 ),
                 preresolved: Vec::new(),
             };
-            let attempt = self
-                .term(&syntax, Some(remaining.clone()))
-                .and_then(|term| self.finish(term));
-            match attempt {
-                Ok(term) => {
-                    value = Some(term.value);
+            // Instance search uses `instances` transparency. A semireducible
+            // return-type alias may hide an otherwise available witness. Try
+            // every alias before unfolding it, including intermediate aliases
+            // with their own instances; full whnf would skip those providers.
+            // Exhaust this Inhabited path before trying Nonempty at the original
+            // result type (the pin's MkInhabitantForAux? strategy order).
+            let mut target = remaining.clone();
+            loop {
+                self.tick()?;
+                let snapshot = self.clone();
+                let attempt = self
+                    .term(&syntax, Some(target.clone()))
+                    .and_then(|term| self.finish(term));
+                match attempt {
+                    Ok(term) => {
+                        value = Some(term.value);
+                        break 'strategies;
+                    }
+                    Err(error)
+                        if instances::nonmatch(&error)
+                            || matches!(
+                                error,
+                                NatDefinitionElabError::Inference(
+                                    SourceInferenceError::InstanceSynthesisRequired
+                                        | SourceInferenceError::UnresolvedHoles { .. }
+                                )
+                            ) =>
+                    {
+                        let spent = self.txn.budget.heartbeats_consumed;
+                        *self = snapshot;
+                        self.txn.budget.heartbeats_consumed = spent;
+                    }
+                    Err(error) => return Err(error),
+                }
+                let reduced =
+                    self.whnf_with_transparency(&target, UnificationTransparency::None, true)?;
+                let Some(unfolded) = self.unfold_head_definition(&reduced)? else {
                     break;
-                }
-                Err(error)
-                    if instances::nonmatch(&error)
-                        || matches!(
-                            error,
-                            NatDefinitionElabError::Inference(
-                                SourceInferenceError::InstanceSynthesisRequired
-                                    | SourceInferenceError::UnresolvedHoles { .. }
-                            )
-                        ) =>
-                {
-                    let spent = self.txn.budget.heartbeats_consumed;
-                    *self = snapshot;
-                    self.txn.budget.heartbeats_consumed = spent;
-                }
-                Err(error) => return Err(error),
+                };
+                target = unfolded;
             }
         }
         let mut value = value.ok_or(NatDefinitionElabError::UnexpectedSyntax {

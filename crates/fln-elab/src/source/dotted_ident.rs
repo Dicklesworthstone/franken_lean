@@ -220,7 +220,7 @@ impl Context {
     /// `unfoldDefinition?` at the default transparency: when the head is a safe definition
     /// that is not `@[irreducible]`, its value at the head's levels, applied to the head's
     /// arguments.
-    fn unfold_head_definition(
+    pub(super) fn unfold_head_definition(
         &mut self,
         type_: &Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
