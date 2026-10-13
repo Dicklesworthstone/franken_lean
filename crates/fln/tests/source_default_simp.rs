@@ -701,8 +701,10 @@ fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
 "
         ));
     }
-    source.push_str("theorem use_default (n : Nat) : wrap n = n := by simp
-");
+    source.push_str(
+        "theorem use_default (n : Nat) : wrap n = n := by simp
+",
+    );
     let result = checked(&engine(), &[&source]);
     assert_eq!(result.theorems, 4002);
     assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);

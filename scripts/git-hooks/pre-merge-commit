@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Merge commits run pre-merge-commit, never pre-commit, so before this file every
+# guard in pre-commit was blind to merges. This runs pre-commit for them, every
+# half included, as git's own sample pre-merge-commit does (bead
+# fln-fmt-check-at-commit-time-ofo5). Measured on 2026-10-13: unformatted code reached
+# main through a merge (9e3bdcb3), and merge 708d616b took one parent's
+# ci/VERIFICATION_MANIFEST.jsonl wholesale, dropping 8 rows and leaving the manifest
+# invalid. pre-commit chains .git/hooks/pre-merge-commit in this mode.
+FLN_HOOK_MODE=merge exec "$(dirname "${BASH_SOURCE[0]}")/pre-commit" "$@"
