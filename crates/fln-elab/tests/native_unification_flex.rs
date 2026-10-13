@@ -310,21 +310,29 @@ fn a_blocked_flexible_equation_is_not_a_success_or_a_committed_alias() {
 }
 
 #[test]
-fn same_head_without_a_solution_stays_deferred() {
+fn same_head_without_a_chosen_value_retains_an_unresolved_obligation() {
     let mut txn = transaction();
     let x = local(&mut txn, "x", nat());
     let y = local(&mut txn, "y", nat());
     let f = goal(&mut txn, "f", function_type());
     let before = txn.clone();
-    assert!(matches!(
-        txn.unify(
+    let report = txn
+        .unify(
             &Expr::app(Expr::mvar(f.clone()), x),
-            &Expr::app(Expr::mvar(f), y),
+            &Expr::app(Expr::mvar(f.clone()), y),
             budget(),
-        ),
-        Err(UnificationError::Deferred(_))
-    ));
-    assert_semantics_unchanged(&txn, &before);
+        )
+        .unwrap();
+    assert_eq!(report.expression_assignments, vec![f.clone()]);
+    assert_eq!(report.residual_metavariables.len(), 1);
+    let residual = &report.residual_metavariables[0];
+    assert!(!txn.mvars.is_assigned(residual));
+    assert_eq!(txn.mvars.get_decl(residual).unwrap().type_, nat());
+    assert!(txn.mvars.get_assigned_expr(&f).unwrap().has_expr_mvar());
+    assert_eq!(txn.env, before.env);
+    assert_eq!(txn.lctx, before.lctx);
+    assert_eq!(txn.constraints, before.constraints);
+    assert_eq!(txn.universes, before.universes);
 }
 
 #[test]

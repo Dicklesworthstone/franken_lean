@@ -5,12 +5,12 @@
 //! declared, typed residual, never an assumed proof. K1 checks every assignment
 //! through the parent's existing barrier. The original equation is replayed.
 //!
-//! The bounded fragment uses distinct local arguments outside the captured
-//! metavariable context. A shared argument whose domain cannot be scoped in
-//! the residual is dropped along with its dependents, after checking the
-//! original argument types. An escaping result still refuses pruning. Captured-
-//! argument, nonpattern and opaque cases retain their postponement behavior;
-//! this is not full Lean unification.
+//! The bounded fragment uses distinct local arguments, including captured
+//! locals when the original signature is independent of those arguments.
+//! A shared argument whose domain cannot be scoped in the residual is dropped
+//! along with its dependents, after checking the original argument types.
+//! Captured-signature dependencies, escaping results, nonpatterns and opaque
+//! cases still defer; this is not full Lean unification.
 //!
 //! Distinct heads share the intersection of their local arguments, even when
 //! the argument orders or arities differ. The residual captures only their
@@ -20,6 +20,8 @@
 //! sibling holes can depend on one residual restricted to their common parent.
 //! A bare/applied pair uses that same construction with an empty telescope on
 //! the bare side. The shared residual remains an obligation, including in Prop.
+mod captured;
+
 use super::*;
 use crate::constraint::ConstraintKind;
 use crate::mvar::MetavarDecl;
@@ -48,6 +50,9 @@ impl Engine<'_> {
         let Some(right) = self.pruning_pattern(right, locals)? else {
             return Ok(false);
         };
+        if !self.captured_pruning_compatible(&left, &right, locals)? {
+            return Ok(false);
+        }
         let same_head = left.declaration.id == right.declaration.id;
         if same_head && left.binders.len() != right.binders.len() {
             return Ok(false);
@@ -300,12 +305,12 @@ impl Engine<'_> {
             let ExprNode::FVar { id } = argument.node() else {
                 return Ok(None);
             };
-            // A local captured by the hole is not a Miller-pattern parameter.
-            // Keep those equations for ordinary assignment/reduction instead.
+            // Captured arguments are checked against the original signature
+            // and exact lexical binding before either parent can be assigned.
             let Some(local) = locals.find(id) else {
                 return Ok(None);
             };
-            if local.is_let() || declaration.lctx.contains(id) || !distinct.insert(id.clone()) {
+            if local.is_let() || !distinct.insert(id.clone()) {
                 return Ok(None);
             }
             type_ = self.whnf(&type_, locals)?;
