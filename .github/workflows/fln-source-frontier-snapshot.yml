@@ -8,7 +8,15 @@ on:
       - 'crates/fln/src/runtime/**'
       - 'crates/fln-comp/src/fir.rs'
       - 'crates/fln-comp/src/fir/**'
+      - 'crates/fln-parse/**'
+      - 'crates/fln/src/source_check/grammar/**'
+      - 'crates/fln/tests/source_quoted*.rs'
   workflow_dispatch:
+    inputs:
+      patch_blob:
+        description: Optional gzip JSON source patch blob; creates immutable blobs only, never moves a branch
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
@@ -33,3 +41,103 @@ jobs:
           path: target/frontier-snapshot
           retention-days: 2
           compression-level: 0
+  prepare-source-patch:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.patch_blob != '') ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, 'prepare-source-patch: '))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare identity-verified Rust source blobs without publishing a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, io, json, os, pathlib, re, subprocess, urllib.request
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          def object_id(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+
+          def api(path, data=None):
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          blob = (event.get('inputs') or {}).get('patch_blob', '')
+          if not blob:
+              matches = re.findall(r'^prepare-source-patch: ([0-9a-f]{40})$',
+                                   (event.get('head_commit') or {}).get('message', ''), re.M)
+              assert len(matches) == 1, 'expected one identity-bound patch request'
+              blob = matches[0]
+          assert re.fullmatch(r'[0-9a-f]{40}', blob), 'invalid patch identity'
+          encoded = api('/git/blobs/' + blob)
+          assert encoded['encoding'] == 'base64' and encoded['size'] <= 1_000_000
+          compressed = base64.b64decode(encoded['content'])
+          assert object_id(compressed) == blob, 'patch blob identity mismatch'
+          with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+              raw = stream.read(2_000_001)
+          assert len(raw) <= 2_000_000, 'patch exceeds decoded size limit'
+          manifest = json.loads(raw)
+          files = manifest['files']
+          assert isinstance(files, dict) and 0 < len(files) <= 64
+          base = git('rev-parse', 'HEAD')
+          for path, identities in files.items():
+              assert re.fullmatch(r'crates/[A-Za-z0-9_-]+/(src|tests)/[A-Za-z0-9_./-]+\.rs', path)
+              target = pathlib.Path(path)
+              assert '..' not in target.parts and not target.is_symlink()
+              assert not any(parent.is_symlink() for parent in target.parents)
+              assert re.fullmatch(r'[0-9a-f]{40}', identities['after'])
+              before = identities['before']
+              if before is None:
+                  assert not target.exists(), 'new path already exists: ' + path
+              else:
+                  assert re.fullmatch(r'[0-9a-f]{40}', before)
+                  assert git('rev-parse', 'HEAD:' + path) == before, 'stale base: ' + path
+                  assert target.is_file() and object_id(target.read_bytes()) == before
+          patch = manifest['patch'].encode()
+          stats = subprocess.check_output(['git', 'apply', '--numstat', '-'], input=patch).decode()
+          rows = [row.split('\t') for row in stats.splitlines()]
+          assert len(rows) == len(files) and {row[2] for row in rows} == set(files)
+          assert all(row[0].isdigit() and row[1].isdigit() for row in rows)
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, identities in files.items():
+              target = pathlib.Path(path)
+              assert target.is_file() and not target.is_symlink(), 'deletions are forbidden'
+              data = target.read_bytes()
+              data.decode('utf-8')
+              assert object_id(data) == identities['after'], 'candidate identity mismatch: ' + path
+              result = api('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert result['sha'] == identities['after']
+          subprocess.run(['git', 'add', '--', *files], check=True)
+          tree = git('write-tree')
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-patch'
+          out.mkdir()
+          (out / 'receipt.json').write_text(json.dumps(
+              {'base': base, 'tree': tree, 'patch_blob': blob, 'files': files, 'branch_updated': False}, indent=2))
+          subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(out / 'source.tar.gz'), tree], check=True)
+          print(json.dumps({'base': base, 'tree': tree, 'files': files, 'branch_updated': False}))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-patch-${{ github.sha }}
+          path: ${{ runner.temp }}/source-patch
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
