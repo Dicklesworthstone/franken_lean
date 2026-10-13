@@ -115,8 +115,8 @@ fn partial_linkage_requires_both_checked_halves_and_exact_telescope() {
 
 /// The pin compiles an opaque from its value unless a companion, extern or init
 /// attribute selects otherwise (`toDecl`). Here the value runs only for an opaque
-/// the engine admitted from a handed declaration, never over a companion, an
-/// unsafe opaque, or an extern row the native catalogs did not take.
+/// the engine admitted from a handed declaration, never over a companion or an
+/// extern row the native catalogs did not take. Unsafe values retain their mark.
 #[test]
 fn an_opaque_value_runs_only_when_its_engine_admitted_it() {
     let (logical, executable) = pair("hidden");
@@ -170,9 +170,16 @@ fn an_opaque_value_runs_only_when_its_engine_admitted_it() {
     let unsafe_world = Environment::new()
         .add_decl(ConstantInfo::Opaque(unsafe_logical))
         .unwrap();
+    assert_eq!(selected(&unsafe_world, None, &label).unwrap(), None);
     assert_eq!(
         selected(&unsafe_world, Some(&admitted), &label).unwrap(),
-        None
+        Some(DefinitionVal {
+            base: logical.base.clone(),
+            value: logical.value.clone(),
+            hints: ReducibilityHints::Opaque,
+            safety: DefinitionSafety::Unsafe,
+            all: vec![label.clone()],
+        })
     );
     // A supported extern row the native catalogs did not bind is not replaced
     // by the value, and an unsupported one is refused outright.

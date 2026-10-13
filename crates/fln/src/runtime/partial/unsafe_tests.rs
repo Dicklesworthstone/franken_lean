@@ -84,3 +84,50 @@ fn unsafe_lookup_remains_inside_the_existing_ingress_budget() {
         Err(IngressError::ResourceLimit { .. })
     ));
 }
+
+#[test]
+fn unsafe_opaque_execution_requires_explicit_value_authority() {
+    let definition = definition();
+    let opaque = OpaqueVal {
+        base: definition.base.clone(),
+        value: definition.value.clone(),
+        all: definition.all.clone(),
+        is_unsafe: true,
+    };
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Opaque(opaque.clone()))
+        .unwrap();
+    let name = &opaque.base.name;
+    assert!(
+        Preparation::new(&environment, IngressLimits::default())
+            .executable_definition(name)
+            .unwrap()
+            .is_none()
+    );
+    let allowed = BTreeSet::from([name.clone()]);
+    let executable = Preparation::new(&environment, IngressLimits::default())
+        .with_executable_opaques(&allowed)
+        .executable_definition(name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(executable.safety, DefinitionSafety::Unsafe);
+    assert_eq!(executable.base, opaque.base);
+    assert_eq!(executable.value, opaque.value);
+    assert!(
+        Preparation::new(&environment, IngressLimits::default())
+            .with_executable_opaques(&allowed)
+            .with_runtime_initializers(&allowed)
+            .executable_definition(name)
+            .unwrap()
+            .is_none()
+    );
+    let (_, companion) = tests::pair("unsafeBody");
+    let malformed = environment.add_decl(ConstantInfo::Defn(companion)).unwrap();
+    assert!(
+        Preparation::new(&malformed, IngressLimits::default())
+            .with_executable_opaques(&allowed)
+            .executable_definition(name)
+            .unwrap()
+            .is_none()
+    );
+}

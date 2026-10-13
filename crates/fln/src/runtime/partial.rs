@@ -71,9 +71,7 @@ impl Preparation<'_> {
             {
                 (requested.parent(), None, None)
             }
-            Some(ConstantInfo::Opaque(opaque)) if !opaque.is_unsafe => {
-                (requested.clone(), None, Some(opaque))
-            }
+            Some(ConstantInfo::Opaque(opaque)) => (requested.clone(), None, Some(opaque)),
             Some(_) => return Ok(None),
             None => return Ok(self.specialized_definition(requested)),
         };
@@ -213,7 +211,11 @@ impl Preparation<'_> {
             base: opaque.base.clone(),
             value: opaque.value.clone(),
             hints: ReducibilityHints::Opaque,
-            safety: DefinitionSafety::Safe,
+            safety: if opaque.is_unsafe {
+                DefinitionSafety::Unsafe
+            } else {
+                DefinitionSafety::Safe
+            },
             all: opaque.all.clone(),
         }))
     }
