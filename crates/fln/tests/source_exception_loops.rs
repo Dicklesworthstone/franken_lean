@@ -79,6 +79,100 @@ def continues : Logged Nat := do
 }
 
 #[test]
+fn bare_nested_loop_blocks_forward_exits_without_running_the_outer_suffix() {
+    execute(
+        &base(),
+        r#"
+def nestedStop : Logged Nat := do
+  for n in items do
+    do
+      note n
+      break
+    note 9
+  return 7
+def nestedContinue : Logged Nat := do
+  for n in items do
+    do
+      note n
+      continue
+    note 9
+  return 7
+def nestedFallthrough : Logged Nat := do
+  for n in items do
+    do
+      note n
+    note 9
+  return 7
+#eval observed nestedStop
+#eval observed nestedContinue
+#eval observed nestedFallthrough
+"#,
+        &["1007", "12007", "1929007"],
+    );
+}
+
+#[test]
+fn nested_loop_blocks_keep_cleanup_order_and_the_outer_lexical_scope() {
+    execute(
+        &base(),
+        r#"
+def nestedCleanup (stop : Bool) : Logged Nat := do
+  for n in items do
+    try
+      do
+        note n
+        do
+          if stop then break else continue
+    finally
+      note 3
+    note 9
+  return 7
+def nestedScope : Logged Nat := do
+  for n in items do
+    do
+      let n := 4
+      note n
+    note n
+  return 7
+#eval observed (nestedCleanup true)
+#eval observed (nestedCleanup false)
+#eval observed nestedScope
+"#,
+        &["13007", "1323007", "4142007"],
+    );
+}
+
+#[test]
+fn nested_cleanup_blocks_preserve_typing_and_term_do_scope_boundaries() {
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        // A discarded loop action still has to return Unit.
+        "def bad : Logged Nat := do { for n in items do { try { do { mark n } } finally { note 3 }; note 9 }; return 7 }",
+        // Parenthesized term-do owns a distinct loop scope.
+        "def bad : Logged Nat := do { for n in items do { try { (do { break } : Logged PUnit) } finally { note 3 } }; return 7 }",
+        // Dead branches are not permission to skip type checking.
+        "def bad : Logged Nat := do { for n in items do { try { do { if false then note true else continue } } finally { note 3 } }; return 7 }",
+        // Inner local bindings cannot escape into the outer continuation.
+        "def bad : Logged Nat := do { for n in items do { try { do { let hidden := n; note hidden }; note hidden } finally { note 3 } }; return 7 }",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+    execute(
+        &engine,
+        "def recovered : Logged Nat := do { for n in items do { try { do { note n; continue } } finally { note 3 }; note 9 }; return 7 }\n#eval observed recovered",
+        &["1323007"],
+    );
+}
+
+#[test]
 fn conditional_exits_and_normal_completion_do_not_replay_the_suffix() {
     execute(
         &base(),

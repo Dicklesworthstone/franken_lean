@@ -19,6 +19,7 @@ fn skip() -> Syntax {
 }
 
 pub(super) enum Header {
+    Nested,
     Proposition(Vec<Syntax>),
     Binding(Box<super::fallback::Header>),
     Match(Box<super::matching::MatchHeader>),
@@ -35,6 +36,12 @@ impl Context {
         header: Header,
         mut bodies: Vec<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if let Header::Nested = header {
+            if bodies.len() != 1 {
+                return Err(invalid());
+            }
+            return bodies.pop().ok_or_else(invalid);
+        }
         if let Header::Match(header) = header {
             return self.finish_do_match(*header, bodies);
         }
@@ -49,6 +56,7 @@ impl Context {
         let no = bodies.pop().expect("else branch");
         let yes = bodies.pop().expect("then branch");
         match header {
+            Header::Nested => unreachable!("handled nested block"),
             Header::Match(_) => unreachable!("handled match header"),
             Header::Exception(_) => unreachable!("handled exception header"),
             Header::Binding(header) => self.finish_do_fallback(*header, yes, no),
@@ -76,6 +84,7 @@ pub(super) struct Branches {
 pub(super) fn is_compound(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", "doIf"]))
         || syntax.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+        || syntax.kind() == Some(&parser_kind(&["Term", "doNested"]))
         || fallback::is_binding(syntax)
 }
 
@@ -83,6 +92,19 @@ pub(super) fn split(
     context: &mut Context,
     syntax: Syntax,
 ) -> Result<Branches, NatDefinitionElabError> {
+    if syntax.kind() == Some(&parser_kind(&["Term", "doNested"])) {
+        let mut parts = node(syntax, "doNested", 2)?;
+        let body = parts.pop().expect("nested sequence");
+        expect_atom(&parts[0], "do", "nested block keyword")?;
+        // A bare block shares the surrounding loop target. Route its one arm
+        // through the same signal worklist as conditional/exception arms, so
+        // break and continue cross cleanup without running the outer suffix.
+        // The join's continuation stays outside the block's local binders.
+        return Ok(Branches {
+            header: Header::Nested,
+            arms: vec![Some(body)],
+        });
+    }
     if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoTry"])) {
         return context.split_loop_exception(syntax);
     }
@@ -427,6 +449,91 @@ mod tests {
                 &Name::from_components(["_root_", "ForInStep", "yield"])
             ) >= 3
         );
+    }
+
+    #[test]
+    fn nested_blocks_share_signals_but_cannot_discard_malformed_source() {
+        let targets = control::LoopTargets::new(&normal()).unwrap();
+        for stop in [false, true] {
+            let input = term("doNested", vec![atom("do"), sequence(jump(stop))]);
+            let result = context()
+                .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                .unwrap();
+            let join = expect_node(
+                &result,
+                &parser_kind(&["Term", "nativeDoBind"]),
+                2,
+                "nested join",
+            )
+            .unwrap();
+            assert_eq!(join[0], targets.signal(Some(stop)));
+            assert_eq!(count(&result, &Name::from_components(["suffix"])), 1);
+        }
+        for invalid in [
+            term("doNested", vec![]),
+            term("doNested", vec![atom("wrong"), sequence(action("body"))]),
+            term("doNested", vec![atom("do"), block(vec![], false)]),
+            term(
+                "doNested",
+                vec![atom("do"), sequence(action("body")), named("discarded")],
+            ),
+        ] {
+            assert!(
+                context()
+                    .expand_do_conditional(invalid, Some(named("suffix")), Some(&targets))
+                    .is_err()
+            );
+        }
+        assert!(
+            context()
+                .finish_do_condition(Header::Nested, vec![])
+                .is_err()
+        );
+        assert!(
+            context()
+                .finish_do_condition(Header::Nested, vec![named("one"), named("two")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deep_nested_loop_blocks_use_the_metered_heap_worklist() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut input = jump(false);
+                for _ in 0..1024 {
+                    input = term("doNested", vec![atom("do"), sequence(input)]);
+                }
+                let targets = control::LoopTargets::new(&normal()).unwrap();
+                let mut stopped = context();
+                stopped.txn.budget.max_heartbeats = 10;
+                assert!(matches!(
+                    stopped.expand_do_conditional(
+                        input.clone(),
+                        Some(named("suffix")),
+                        Some(&targets)
+                    ),
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::ResourceLimit
+                    ))
+                ));
+                let output = context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .unwrap();
+                let join = expect_node(
+                    &output,
+                    &parser_kind(&["Term", "nativeDoBind"]),
+                    2,
+                    "only the outermost block needs a join",
+                )
+                .unwrap();
+                assert_eq!(join[0], targets.signal(Some(false)));
+                assert_eq!(count(&output, &Name::from_components(["suffix"])), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
     #[test]
     fn ordinary_terminal_conditionals_keep_their_result_without_loop_signals() {
