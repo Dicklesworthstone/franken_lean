@@ -101,28 +101,54 @@ impl Context {
         Ok(actual != expected)
     }
 
+    /// Inspect the type skeleton after EXACTLY the supplied arguments. A bare
+    /// constant or partial application can still be function-valued; stripping
+    /// its entire telescope would falsely discard rewrites of that function.
+    /// Only the stable outer constructors recognized by rigid_rewrite_type_head
+    /// are used. A dependent result headed by a bound variable, alias or redex
+    /// stays unknown: this filter neither substitutes arguments nor unfolds.
     fn rigid_rewrite_constant_result(
         &mut self,
         expression: &Expr,
     ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
-        let mut expression = expression;
-        while let ExprNode::App { f, .. } = expression.node() {
-            expression = f;
+        let mut head = expression;
+        let mut arguments = 0_u64;
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, .. } => {
+                    arguments = arguments
+                        .checked_add(1)
+                        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                    head = f;
+                }
+                ExprNode::MData { expr, .. } => head = expr,
+                _ => break,
+            }
         }
-        let ExprNode::Const { name, .. } = expression.node() else {
+        let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
-        let Some(type_) = self
-            .txn
-            .env
-            .find(name)
-            .map(|c| c.constant_val().type_.clone())
-        else {
+        let Some(info) = self.txn.env.find(name) else {
             return Ok(None);
         };
-        let mut result = type_;
-        while let ExprNode::ForallE { body, .. } = result.node() {
-            result = body.clone();
+        let base = info.constant_val();
+        if levels.len() != base.level_params.len() {
+            return Ok(None);
+        }
+        let mut result = base.type_.clone();
+        while arguments != 0 {
+            self.tick()?;
+            match result.node() {
+                ExprNode::ForallE { body, .. } => {
+                    result = body.clone();
+                    arguments -= 1;
+                }
+                ExprNode::MData { expr, .. } => result = expr.clone(),
+                // Overapplication and reducible/unknown telescope tails must
+                // go to ordinary type reconstruction, never guessed arity.
+                _ => return Ok(None),
+            }
         }
         self.rigid_rewrite_type_head(&result)
     }
@@ -879,5 +905,87 @@ mod outcome_tests {
                 fln_core::expr::NatLit::from_u64(0)
             ))
         );
+    }
+
+    #[test]
+    fn constant_result_discrimination_preserves_partial_function_types() {
+        let mut ctx = context();
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&succ).unwrap(),
+            Some(RigidTypeHead::Forall)
+        );
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&Expr::app(succ.clone(), zero.clone()))
+                .unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Nat"])))
+        );
+        let wrapped = Expr::mdata(KVMap::new(), succ.clone());
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&wrapped).unwrap(),
+            Some(RigidTypeHead::Forall)
+        );
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&Expr::app(wrapped, zero.clone()))
+                .unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Nat"])))
+        );
+        for unknown in [
+            Expr::app(Expr::app(succ, zero.clone()), zero),
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![Level::one()]),
+            Expr::const_(Name::from_components(["absent"]), vec![]),
+        ] {
+            assert_eq!(ctx.rigid_rewrite_constant_result(&unknown).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn constant_result_discrimination_leaves_dependent_results_unknown() {
+        let mut ctx = context();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let constructor = Expr::const_(Name::from_components(["Eq", "refl"]), vec![Level::one()]);
+        // The unsupplied value binder remains a function type, not Eq.
+        let partial = Expr::app(constructor, nat.clone());
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&partial).unwrap(),
+            Some(RigidTypeHead::Forall)
+        );
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&Expr::app(partial, zero))
+                .unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Eq"])))
+        );
+        // The result of this fully applied recursor is headed by its motive,
+        // not the recursor's name or the function type of a partial application.
+        let recursor = Expr::const_(Name::from_components(["Nat", "rec"]), vec![Level::one()]);
+        let mut applied = recursor;
+        for _ in 0..4 {
+            applied = Expr::app(applied, nat.clone());
+        }
+        assert_eq!(ctx.rigid_rewrite_constant_result(&applied).unwrap(), None);
+    }
+
+    #[test]
+    fn constant_result_spine_walk_is_metered_without_semantic_mutation() {
+        let mut ctx = context();
+        let before = ctx.txn.clone();
+        let mut term = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            term = Expr::mdata(KVMap::new(), term);
+        }
+        ctx.txn.budget.max_heartbeats = ctx.txn.budget.heartbeats_consumed + 32;
+        let problem = ctx.rigid_rewrite_constant_result(&term).unwrap_err();
+        assert!(matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+        ));
+        assert!(!Context::rewrite_nonmatch(&problem));
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+        assert_eq!(ctx.txn.lctx, before.lctx);
+        assert!(ctx.equations.is_empty());
     }
 }
