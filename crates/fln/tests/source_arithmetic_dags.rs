@@ -88,3 +88,73 @@ fn a_wrong_result_cannot_publish_a_theorem_and_corrected_source_recovers() {
         .unwrap();
     assert_eq!(base.logical_root(&options), original);
 }
+
+fn wrapped_circuit(depth: u32, start: u64, expected: u64) -> String {
+    let mut source = String::from(
+        "def passthrough (n : Nat) : Nat := n\ndef circuit (start : Nat) : Nat :=\n  let n0 : Nat := start\n",
+    );
+    for n in 1..=depth {
+        source.push_str(&format!(
+            "  let n{n} : Nat := passthrough (Nat.add n{} n{})\n",
+            n - 1,
+            n - 1
+        ));
+    }
+    source.push_str(&format!(
+        "  n{depth}\ntheorem computes : circuit {start} = {expected} := by rfl\n"
+    ));
+    source
+}
+
+#[test]
+fn shared_arithmetic_behind_definition_applications_keeps_its_demand_identity() {
+    let base = base();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let source = include_str!("../../fln-parse/tests/fixtures/shared_arithmetic_wrapped.lean");
+    let checked = base
+        .check_source_files(&[source.as_bytes()], &options, bounded())
+        .unwrap_or_else(|error| panic!("{error:?}"))
+        .into_complete()
+        .expect("both checking engines must complete");
+    assert_eq!(checked.theorems, 1);
+    assert_eq!(base.logical_root(&options), before);
+}
+
+#[test]
+fn remembered_definition_demands_do_not_assume_identity_bodies() {
+    let base = base();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    for increments in [true, false, true] {
+        let expected = (5_u64 << 28) + if increments { (1 << 28) - 1 } else { 0 };
+        let mut source = wrapped_circuit(28, 5, expected);
+        if increments {
+            source = source.replacen(
+                "def passthrough (n : Nat) : Nat := n",
+                "def passthrough (n : Nat) : Nat := Nat.succ n",
+                1,
+            );
+        }
+        let checked = base
+            .check_source_files(&[source.as_bytes()], &options, bounded())
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .into_complete()
+            .expect("both checkers must establish this body's result");
+        assert_eq!(checked.theorems, 1);
+        assert_eq!(base.logical_root(&options), before);
+        let wrong = source.replace(
+            &format!("= {expected} := by rfl"),
+            &format!("= {} := by rfl", expected + 1),
+        );
+        let error = base
+            .check_source_files(&[wrong.as_bytes()], &options, bounded())
+            .unwrap_err();
+        assert_eq!(
+            error.disposition().2,
+            1,
+            "wrong value must reject: {error:?}"
+        );
+        assert_eq!(base.logical_root(&options), before);
+    }
+}

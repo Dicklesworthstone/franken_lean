@@ -1628,6 +1628,11 @@ fn reduce_inner(
                         .ok_or(Halt::Fault(NatReductionFault::ValueStack {
                             operation: parsed.operation,
                         }))?;
+                // Remember the demand, not only a newly materialized arithmetic
+                // root. Beta/zeta/delta and metadata normalization may move that
+                // root into a different arena, while repeated operands still
+                // refer to their original immutable source cursor.
+                memo.remember(current_operand(frame)?, &value, &mut control)?;
                 frame.values[usize::from(frame.next_operand)] = Some(value);
                 if frame.next_operand + 1 < frame.operation.arity() {
                     frame.next_operand += 1;
@@ -1674,11 +1679,7 @@ fn reduce_inner(
                                 progress: control.progress,
                             });
                         }
-                        Executed::Natural(value) => {
-                            let value = Arc::new(value);
-                            memo.remember(frame.cursor, &value, &mut control)?;
-                            EvalState::Natural(value)
-                        }
+                        Executed::Natural(value) => EvalState::Natural(Arc::new(value)),
                         Executed::Boolean(_) => EvalState::NonNatural,
                     }
                 }

@@ -529,4 +529,117 @@ mod tests {
             .join()
             .unwrap();
     }
+    fn wrapped_doubling(depth: usize, kind: u8) -> WireExpr {
+        use crate::wire::BinderStyle;
+        let nat_name = WireName::from_parts(vec![NamePart::Text("Nat".into())]);
+        let mut nodes = vec![
+            op("add"),
+            nat(1),
+            ExprNode::Constant {
+                name: nat_name,
+                levels: vec![],
+            },
+            ExprNode::Bound { index: 0 },
+        ];
+        let identity = push(
+            &mut nodes,
+            ExprNode::Lambda {
+                binder_name: WireName::default(),
+                binder_type: id(2),
+                body: id(3),
+                style: BinderStyle::Default,
+            },
+        );
+        let mut root = id(1);
+        for n in 0..depth {
+            let partial = app(&mut nodes, id(0), root);
+            root = app(&mut nodes, partial, root);
+            if n + 1 != depth {
+                root = match kind {
+                    0 => push(
+                        &mut nodes,
+                        ExprNode::Metadata {
+                            entries: vec![],
+                            expression: root,
+                        },
+                    ),
+                    1 => app(&mut nodes, identity, root),
+                    _ => push(
+                        &mut nodes,
+                        ExprNode::Let {
+                            declaration_name: WireName::default(),
+                            type_: id(2),
+                            value: root,
+                            body: id(3),
+                            non_dependent: false,
+                        },
+                    ),
+                };
+            }
+        }
+        WireExpr::from_parts(nodes, vec![], root)
+    }
+    #[test]
+    fn normalized_shared_operands_retain_their_original_demand_identity() {
+        for kind in 0..3 {
+            let term = wrapped_doubling(24, kind);
+            let mut budget = NatReductionBudget::unlimited();
+            budget.max_steps = 10_000;
+            let result = value(reduce_nat(
+                &term,
+                &literal(0),
+                &WhnfContext::default(),
+                budget,
+            ));
+            assert_eq!(result.term.node(result.term.root()), Some(&nat(1 << 24)));
+            assert_eq!(
+                result.progress.numeric_reductions, 24,
+                "wrapper kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_demand_reuse_observes_every_cancellation_checkpoint() {
+        use std::cell::Cell;
+        for kind in 0..3 {
+            let term = wrapped_doubling(5, kind);
+            let other = literal(0);
+            let polls = Cell::new(0);
+            value(reduce_nat_with(
+                &term,
+                &other,
+                &WhnfContext::default(),
+                NatReductionBudget::unlimited(),
+                || {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            ));
+            for stop_at in 1..=polls.get() {
+                let mut called = 0;
+                let stopped = reduce_nat_with(
+                    &term,
+                    &other,
+                    &WhnfContext::default(),
+                    NatReductionBudget::unlimited(),
+                    || {
+                        called += 1;
+                        called == stop_at
+                    },
+                );
+                assert!(
+                    matches!(stopped, NatReductionOutcome::Inconclusive(_)),
+                    "wrapper {kind}, checkpoint {stop_at}: {stopped:?}"
+                );
+            }
+            let result = value(reduce_nat(
+                &term,
+                &other,
+                &WhnfContext::default(),
+                NatReductionBudget::unlimited(),
+            ));
+            assert_eq!(result.term.node(result.term.root()), Some(&nat(32)));
+        }
+    }
 }
