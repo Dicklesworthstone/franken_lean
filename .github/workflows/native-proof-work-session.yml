@@ -1,35 +1,101 @@
-name: Native proof integration inputs
+name: Native indexed unfolding validation
 on:
   push:
     branches: [main]
     paths: ['.github/workflows/native-proof-work-session.yml']
-  workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  snapshot:
+  indexed-unfolding:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Export exact integration inputs
+      - name: Apply the exact locally tested patch
+        shell: python
+        run: |
+          import base64, gzip, hashlib, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'indexed-unfolding'
+          root.mkdir()
+          encoded = '''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'''
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '54df26766936c221a0181a5a2c0a9e489990eb0204ac695be3bc856fc7f8e6c9'
+          (root / 'patch.diff').write_bytes(patch)
+          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          subprocess.run(['git', 'apply', '--check', str(root / 'patch.diff')], check=True)
+          subprocess.run(['git', 'apply', str(root / 'patch.diff')], check=True)
+      - name: Install pinned compilers and oracle
         shell: bash
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/native-proof-inputs"
-          mkdir -p "$evidence"
-          git archive --format=tar.gz HEAD > "$evidence/source.tar.gz"
-          git rev-parse HEAD > "$evidence/commit.txt"
-          git rev-parse 'HEAD^{tree}' > "$evidence/tree.txt"
-          git ls-tree -r HEAD > "$evidence/files.txt"
-          sha256sum "$evidence/source.tar.gz" > "$evidence/SHA256SUMS"
+          rustup show active-toolchain
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 -o "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_SMART_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Check transport gates, existing recursion, imported collections and real commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee "$RUNNER_TEMP/indexed-unfolding/validation.log") 2>&1
+          rustc -Vv
+          cargo test --locked -p fln-elab --lib source::reduce::
+          cargo test --locked -p fln --test source_indexed_smart_unfolding --test source_dependent_index_recursion --test source_recursion --test source_imported_collections --test source_numeral_carriers --no-fail-fast
+          cargo test --locked -p fln-cli --test source_indexed_smart_unfolding --test source_constrained_simplification --no-fail-fast
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --lib -- -D warnings
+          cargo check --locked --workspace --all-targets
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/selected_k_tests.rs crates/fln/tests/source_indexed_smart_unfolding.rs crates/fln-cli/tests/source_indexed_smart_unfolding.rs
+          git diff --check
+      - name: Export tested Git objects without moving main
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'indexed-unfolding'
+          expected = {
+              'crates/fln-cli/tests/source_indexed_smart_unfolding.rs': 'ff64aeab62feb23eb385d1ac68e822af63f13290',
+              'crates/fln-elab/src/source/reduce.rs': '6fc7503a0be91c19eb324faaa33c2c5b67889033',
+              'crates/fln-elab/src/source/reduce/selected_k_tests.rs': '7b35c18105c767a6c461f80dbd6526af804296e6',
+              'crates/fln/tests/source_indexed_smart_unfolding.rs': 'd8221d5fdcfaf0b1c2001c1f7d92efb581eb3d24',
+              'docs/NATIVE_INDUCTION.md': 'b2a0ff4b501fa66c1f99aae0d3554671a79be2c4',
+              'examples/native_indexed_smart_unfolding.lean': '34891c13a499dc6a9a19f51928d989531c72898d',
+          }
+          def post(endpoint, value):
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint, data=json.dumps(value).encode(), headers={'Accept':'application/vnd.github+json','Content-Type':'application/json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          entries = []
+          for path, sha in expected.items():
+              content = pathlib.Path(path).read_bytes()
+              assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha, path
+              assert post('blobs', {'content':content.decode(), 'encoding':'utf-8'})['sha'] == sha
+              entries.append({'path':path, 'mode':'100644', 'type':'blob', 'sha':sha})
+          subprocess.run(['git', 'add', '--', *expected], check=True)
+          actual = subprocess.check_output(['git','diff','--cached','--name-only'], text=True).splitlines()
+          assert sorted(actual) == sorted(expected)
+          base_tree = subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip()
+          tree = post('trees', {'base_tree':base_tree, 'tree':entries})['sha']
+          assert tree == subprocess.check_output(['git','write-tree'], text=True).strip()
+          record = {'parent':(root/'base.txt').read_text().strip(),'tree':tree,'files':entries,'reference':'8c9756b28d64dab099da31a4c09229a9e6a2ef35','ref_changed':False}
+          (root/'tested-tree.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          name: native-proof-inputs-${{ github.sha }}
-          path: ${{ runner.temp }}/native-proof-inputs
-          retention-days: 2
-          if-no-files-found: error
+          name: indexed-unfolding-${{ github.sha }}
+          path: ${{ runner.temp }}/indexed-unfolding
+          retention-days: 7
+          if-no-files-found: warn
