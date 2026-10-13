@@ -72,17 +72,24 @@ impl FileGrammar {
             return Err("an imported macro rule has no syntax declaration in its module");
         }
         for (kind, rule) in &module.rules {
-            if let Some(pattern) = &rule.pattern {
-                let Syntax::Node {
-                    kind: pattern_kind,
-                    args,
-                    ..
-                } = pattern
-                else {
-                    return Err("an imported macro pattern is not a syntax node");
-                };
-                if pattern_kind != kind || quotation::variables(args)? != rule.variables {
-                    return Err("an imported macro pattern has inconsistent captures");
+            if rule.fallbacks.len() >= MAX_TEMPLATE_NODES
+                || rule.fallbacks.iter().any(|rule| !rule.fallbacks.is_empty())
+            {
+                return Err("an imported macro has a nested or oversized fallback chain");
+            }
+            for rule in rule.cases() {
+                if let Some(pattern) = &rule.pattern {
+                    let Syntax::Node {
+                        kind: pattern_kind,
+                        args,
+                        ..
+                    } = pattern
+                    else {
+                        return Err("an imported macro pattern is not a syntax node");
+                    };
+                    if pattern_kind != kind || quotation::variables(args)? != rule.variables {
+                        return Err("an imported macro pattern has inconsistent captures");
+                    }
                 }
             }
         }

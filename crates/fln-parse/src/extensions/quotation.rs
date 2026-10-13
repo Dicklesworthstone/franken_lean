@@ -80,6 +80,12 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
             return Err("quoted macro matching past the node budget");
         }
         if antiquotation_name(pattern).is_some() {
+            // The pin's getHeadInfo checks explicit concrete kinds, even for
+            // anonymous captures. A category's pseudo kind (for example term)
+            // is not an actual node kind and remains an unconditional capture.
+            if !capture_kind_matches(pattern, value)? {
+                return Ok(false);
+            }
             continue;
         }
         match (pattern, value) {
@@ -104,4 +110,29 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
         }
     }
     Ok(true)
+}
+
+fn capture_kind_matches(pattern: &Syntax, value: &Syntax) -> Result<bool, &'static str> {
+    let Syntax::Node { kind, args, .. } = pattern else {
+        return Err("a quoted capture without an antiquotation node");
+    };
+    let [_, _, _, annotation] = args.as_slice() else {
+        return Err("a quoted capture with malformed antiquotation children");
+    };
+    if null_args(annotation).is_some_and(<[Syntax]>::is_empty) {
+        return Ok(true);
+    }
+    if !kind_is(annotation, &["antiquotName"]) {
+        return Err("a quoted capture with a malformed kind annotation");
+    }
+    let expected = kind.parent();
+    if components(&expected).last().map(String::as_str) == Some("pseudo") {
+        return Ok(true);
+    }
+    Ok(match value {
+        Syntax::Node { kind, .. } => *kind == expected,
+        Syntax::Ident { .. } => expected == Name::from_components(["ident"]),
+        Syntax::Atom { .. } => expected == Name::from_components(["atom"]),
+        Syntax::Missing => expected == Name::from_components(["missing"]),
+    })
 }

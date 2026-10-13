@@ -617,3 +617,84 @@ fn module_system_grammar_keeps_an_explicit_phase_and_visibility_boundary() {
     assert!(base.environment().is_empty());
     assert!(imported.engine.environment().is_empty());
 }
+
+#[test]
+fn ordered_macro_fallbacks_replay_their_distinct_source_buffers() {
+    let library = r#"
+namespace Earlier
+def α : Nat := 10
+syntax "remember! " term:max : term
+macro_rules | `(remember! $x) => `(Nat.add $x α)
+end Earlier
+namespace Later
+def α : Nat := 90
+macro_rules
+  | `(remember! 0) => `((17 : Nat))
+  | `(remember! 1) => `((19 : Nat))
+end Later
+"#
+    .replace('\n', "\r\n");
+    let base = engine();
+    let result = checked(
+        &base,
+        &[
+            ("Lib", &library),
+            (
+                "Main",
+                "import Lib\ntheorem a : remember! 2 = 12 := rfl\ntheorem b : remember! 0 = 17 := rfl\ntheorem c : remember! 1 = 19 := rfl",
+            ),
+        ],
+    );
+    let resumed = result.checked.engine;
+    assert_eq!(
+        resumed
+            .check_source_files(
+                &[b"theorem resumed : remember! 3 = 13 := rfl"],
+                &KVMap::new(),
+                limits().source,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .theorems,
+        1
+    );
+    assert!(
+        resumed
+            .check_source_files(
+                &[b"theorem wrong : remember! 3 = 93 := rfl"],
+                &KVMap::new(),
+                limits().source,
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn an_imported_macro_override_does_not_silently_keep_an_old_native_rule() {
+    let base = engine();
+    let result = checked(
+        &base,
+        &[
+            (
+                "Lib",
+                "syntax \"imported! \" term:max : term\nmacro_rules | `(imported! $x) => `((8 : Nat))",
+            ),
+            ("Main", "import Lib\ntheorem t : imported! 0 = 8 := rfl"),
+        ],
+    );
+    assert!(
+        result
+            .checked
+            .engine
+            .check_source_files(
+                &[br#"
+macro_rules | `(imported! $x) => do pure `((9 : Nat))
+theorem wrong : imported! 0 = 8 := rfl
+"#],
+                &KVMap::new(),
+                limits().source
+            )
+            .is_err()
+    );
+}

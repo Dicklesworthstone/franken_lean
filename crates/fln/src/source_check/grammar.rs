@@ -29,12 +29,12 @@
 //! implemented.
 //!
 //! A `macro`, and `macro_rules` for a syntax the file declared, expand the same way
-//! (`fln_parse::extensions`): one rule per kind, its template a quotation of the macro's category
-//! with `$x` for the variables; their names are not prechecked (the pin refuses an unknown one
-//! only where it is used). A `macro` this does not translate (a `do` block, a sequence of
-//! tactics, a splice) registers its syntax without a rule, `elab` is not read, and a second rule
-//! for one kind removes the first (the pin tries the newest first): in each case the uses reach
-//! the elaborator unexpanded and are refused there. Artifact syntax is entered only where its
+//! (`fln_parse::extensions`): quoted clauses try in textual order, with newer registrations
+//! before older fallbacks. Nested captures retain the syntax they matched before expansion.
+//! Template names are not prechecked (the pin refuses an unknown one only where it is used).
+//! A `macro` this does not translate (a `do` block, a sequence of tactics, a splice) registers
+//! its syntax without a rule; an unsupported `macro_rules` registration blocks older rules
+//! rather than silently retaining their meaning. `elab` is not read. Artifact syntax is entered only where its
 //! native expansion is implemented and its module has been admitted. The other census
 //! registrations remain absent: their expansions are not in the census, so their uses would
 //! reach the elaborator unexpanded, and terms the hand grammar reads, such as `{}`, would become
@@ -257,29 +257,24 @@ impl SourceGrammar {
         if !declaring {
             return Ok(false);
         }
-        let before: BTreeMap<Name, NotationRule> = self
-            .file
-            .rules()
-            .map(|(kind, rule)| (kind.clone(), rule.clone()))
-            .collect();
         self.file
             .declare(syntax)
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
-        // Each rule the command added or replaced is pre-resolved where it is declared.
+        // Resolve only fresh clauses. Older fallbacks keep their definition-site
+        // names and source buffers, even when this registration is in a new scope.
         let mut templates = Vec::new();
         for (kind, rule) in self.file.rules() {
-            if before.get(kind) != Some(rule) {
-                templates.push((kind.clone(), preresolve(rule, &resolve)?));
+            for (index, case) in rule.cases().enumerate() {
+                if case.source.is_none() {
+                    templates.push((kind.clone(), index, preresolve(case, &resolve)?));
+                }
             }
         }
-        for (kind, template) in templates {
-            self.file.set_rule_template(&kind, template);
-            // Raw identifier spans address the parser's normalized view,
-            // including inside multiline CRLF quotations.
-            self.rule_sources.insert(
-                kind,
-                Arc::from(parsed.source_view().normalized().as_bytes()),
-            );
+        let source: Arc<[u8]> = Arc::from(parsed.source_view().normalized().as_bytes());
+        for (kind, index, template) in templates {
+            self.file
+                .set_rule_template(&kind, index, template, Arc::clone(&source));
+            self.rule_sources.insert(kind, Arc::clone(&source));
         }
         self.declared_syntax = true;
         if self.module_system {

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 mod descriptions;
 
-const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x02";
+const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x03";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
@@ -146,6 +146,89 @@ fn encode(
     Ok(payload.into())
 }
 
+// Each clause has a separate lossless syntax codec and source buffer. Spans in
+// older fallback templates never address the later registration's command text.
+fn encode_case(
+    rule: &NotationRule,
+    source: &[u8],
+) -> Result<(Syntax, usize), EngineExecutionError> {
+    if source.len() > MAX_ROW_BYTES {
+        return Err(limit("native grammar source bytes", MAX_ROW_BYTES));
+    }
+    let variables = rule
+        .variables
+        .iter()
+        .map(|(path, name)| {
+            node(
+                "variable",
+                vec![node("path", path.iter().map(atom).collect()), ident(name)],
+            )
+        })
+        .collect();
+    let dump = pin_syntax::print(
+        &PinTrees {
+            header: node(
+                "template",
+                vec![node("variables", variables), atom(rule.prechecked)],
+            ),
+            commands: std::iter::once(rule.rhs.clone())
+                .chain(rule.pattern.iter().cloned())
+                .collect(),
+            messages: Vec::new(),
+        },
+        source,
+    )
+    .map_err(|_| malformed())?;
+    let bytes = source
+        .len()
+        .checked_add(dump.len())
+        .filter(|bytes| *bytes <= MAX_ROW_BYTES)
+        .ok_or_else(|| limit("native grammar rule bytes", MAX_ROW_BYTES))?;
+    let source = std::str::from_utf8(source).map_err(|_| malformed())?;
+    Ok((node("rule", vec![atom(source), atom(dump)]), bytes))
+}
+
+fn decode_case(row: &Syntax) -> Result<NotationRule, EngineExecutionError> {
+    let [source, dump] = children(row, "rule")? else {
+        return Err(malformed());
+    };
+    let source = as_text(source)?.as_bytes();
+    let trees = pin_syntax::read(as_text(dump)?, source).map_err(|_| malformed())?;
+    if !trees.messages.is_empty() {
+        return Err(malformed());
+    }
+    let [variables, prechecked] = children(&trees.header, "template")? else {
+        return Err(malformed());
+    };
+    let variables = children(variables, "variables")?
+        .iter()
+        .map(|value| {
+            let [path, name] = children(value, "variable")? else {
+                return Err(malformed());
+            };
+            let path = children(path, "path")?
+                .iter()
+                .map(|index| as_u32(index).map(|index| index as usize))
+                .collect::<Result<Vec<_>, _>>()?;
+            if path.is_empty() {
+                return Err(malformed());
+            }
+            Ok((path, as_name(name)?))
+        })
+        .collect::<Result<Vec<_>, EngineExecutionError>>()?;
+    let ([rhs] | [rhs, _]) = trees.commands.as_slice() else {
+        return Err(malformed());
+    };
+    Ok(NotationRule {
+        variables,
+        rhs: rhs.clone(),
+        prechecked: as_bool(prechecked)?,
+        pattern: trees.commands.get(1).cloned(),
+        source: Some(Arc::from(source)),
+        fallbacks: Vec::new(),
+    })
+}
+
 pub(super) fn publish(
     environment: &Environment,
     module: &NativeSyntaxModule,
@@ -182,18 +265,23 @@ pub(super) fn publish(
     }
     for decl in &module.declarations {
         let descr = descriptions::encode(&decl.descr)?;
-        let rule = module.rules.get(&decl.decl);
-        let variables = rule.map_or_else(Vec::new, |rule| {
-            rule.variables
-                .iter()
-                .map(|(path, name)| {
-                    node(
-                        "variable",
-                        vec![node("path", path.iter().map(atom).collect()), ident(name)],
-                    )
-                })
-                .collect()
-        });
+        let mut rules = Vec::new();
+        let mut rule_bytes = 0usize;
+        if let Some(rule) = module.rules.get(&decl.decl) {
+            for case in rule.cases() {
+                let source = case
+                    .source
+                    .as_deref()
+                    .or_else(|| sources.get(&decl.decl).map(AsRef::as_ref))
+                    .unwrap_or(&[]);
+                let (row, bytes) = encode_case(case, source)?;
+                rule_bytes = rule_bytes
+                    .checked_add(bytes)
+                    .filter(|bytes| *bytes <= MAX_ROW_BYTES)
+                    .ok_or_else(|| limit("native grammar rule bytes", MAX_ROW_BYTES))?;
+                rules.push(row);
+            }
+        }
         let header = node(
             "declaration",
             vec![
@@ -204,19 +292,10 @@ pub(super) fn publish(
                 atom(decl.priority),
                 optional_name(decl.scope.as_ref()),
                 descr,
-                node("variables", variables),
-                atom(rule.is_some_and(|rule| rule.prechecked)),
+                node("rules", rules),
             ],
         );
-        let source = sources
-            .get(&decl.decl)
-            .map_or(&[][..], |source| source.as_ref());
-        let trees = rule.map_or_else(Vec::new, |rule| {
-            std::iter::once(rule.rhs.clone())
-                .chain(rule.pattern.iter().cloned())
-                .collect()
-        });
-        payloads.push(encode(header, &trees, source)?);
+        payloads.push(encode(header, &[], &[])?);
     }
     let mut result = environment.clone();
     if result.extension(&name()).is_none() {
@@ -312,8 +391,7 @@ pub(super) fn load(
                 priority,
                 scope,
                 descr,
-                variables,
-                prechecked,
+                rules,
             ] = children(&trees.header, "declaration")?
             else {
                 return Err(malformed());
@@ -328,36 +406,17 @@ pub(super) fn load(
                 scope: as_optional_name(scope)?,
                 descr: descriptions::decode(descr)?,
             }));
-            let variables = children(variables, "variables")?
+            if !trees.commands.is_empty() {
+                return Err(malformed());
+            }
+            let mut cases = children(rules, "rules")?
                 .iter()
-                .map(|value| {
-                    let [path, name] = children(value, "variable")? else {
-                        return Err(malformed());
-                    };
-                    let path = children(path, "path")?
-                        .iter()
-                        .map(|index| as_u32(index).map(|index| index as usize))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if path.is_empty() {
-                        return Err(malformed());
-                    }
-                    Ok((path, as_name(name)?))
-                })
-                .collect::<Result<Vec<_>, EngineExecutionError>>()?;
-            match trees.commands.as_slice() {
-                [] if variables.is_empty() && !as_bool(prechecked)? => {}
-                [rhs] | [rhs, _] => {
-                    module.rules.insert(
-                        name,
-                        Arc::new(NotationRule {
-                            variables,
-                            rhs: rhs.clone(),
-                            prechecked: as_bool(prechecked)?,
-                            pattern: trees.commands.get(1).cloned(),
-                        }),
-                    );
-                }
-                _ => return Err(malformed()),
+                .map(decode_case)
+                .collect::<Result<Vec<_>, _>>()?;
+            if !cases.is_empty() {
+                let mut head = cases.remove(0);
+                head.fallbacks = cases;
+                module.rules.insert(name, Arc::new(head));
             }
         }
         file.import_native(&module)
@@ -407,6 +466,8 @@ mod tests {
             rhs,
             prechecked: true,
             pattern: None,
+            source: Some(Arc::clone(&source)),
+            fallbacks: Vec::new(),
         });
         let declaration = Arc::new(SyntaxDecl {
             module: owner.clone(),
@@ -505,6 +566,7 @@ mod tests {
             Arc::<[u8]>::from(&MAGIC[..MAGIC.len() - 1]),
             Arc::from([MAGIC, &[255; 8]].concat()),
             Arc::from(b"FLNSOURCEGRAMMAR\x01".as_slice()),
+            Arc::from(b"FLNSOURCEGRAMMAR\x02".as_slice()),
         ] {
             let env = Environment::new()
                 .register_extension(descriptor())

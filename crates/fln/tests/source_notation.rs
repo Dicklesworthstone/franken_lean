@@ -215,15 +215,17 @@ fn macro_names_are_resolved_where_declared_and_checked_where_used() {
     );
 }
 
-/// The pin tries a kind's rules newest first: here the second `macro_rules` gives 6 and the pin
-/// accepts. One rule per kind is kept here, so the second removes the first and the use is
-/// refused rather than read by the older rule (which would give 4).
+/// The pin tries a kind's rules newest first: the second registration gives 6.
+/// Reject the old result rather than treating both expansions as valid.
 #[test]
-fn a_second_rule_for_one_kind_is_refused_not_read_by_the_first() {
-    refused(
-        "def myAdd (a b : Nat) : Nat := Nat.add a b\nsyntax \"trip \" term:max : term\n\
-         macro_rules | `(trip $x) => `(myAdd $x $x)\n\
-         macro_rules | `(trip $x) => `(myAdd $x (myAdd $x $x))\n\
-         theorem v : trip (2 : Nat) = 6 := rfl\n",
-    );
+fn a_second_rule_for_one_kind_takes_precedence_over_the_first() {
+    let source = r#"
+def myAdd (a b : Nat) : Nat := Nat.add a b
+syntax "trip " term:max : term
+macro_rules | `(trip $x) => `(myAdd $x $x)
+macro_rules | `(trip $x) => `(myAdd $x (myAdd $x $x))
+theorem v : trip (2 : Nat) = 6 := rfl
+"#;
+    accepted(source);
+    refused(&source.replace("= 6 := rfl", "= 4 := rfl"));
 }

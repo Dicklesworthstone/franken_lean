@@ -73,6 +73,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+mod macro_rules;
 mod modules;
 mod quotation;
 pub use modules::NativeSyntaxModule;
@@ -1543,6 +1544,8 @@ impl FileGrammar {
                     rhs: rhs.clone(),
                     prechecked: true,
                     pattern: None,
+                    source: None,
+                    fallbacks: Vec::new(),
                 });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
@@ -1612,6 +1615,8 @@ impl FileGrammar {
                     variables,
                     prechecked: true,
                     pattern: None,
+                    source: None,
+                    fallbacks: Vec::new(),
                 });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
@@ -1674,6 +1679,8 @@ impl FileGrammar {
                         rhs,
                         prechecked: false,
                         pattern: None,
+                        source: None,
+                        fallbacks: Vec::new(),
                     });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
@@ -1698,143 +1705,9 @@ impl FileGrammar {
         Ok(Some(decl))
     }
 
-    /// `macro_rules` for a syntax this file declared: one alternative, its pattern the kind's
-    /// node with each child an atom or an antiquotation, its right-hand side a quotation. The
-    /// pin tries a kind's rules newest first, falling back on failure; this keeps one rule per
-    /// kind, so a second one for a kind (or one this does not translate, for a kind with a rule)
-    /// removes the rule, and the kind's uses are refused unexpanded rather than read by an older
-    /// rule. Rules for other kinds are not this file's to read here.
+    /// Interpret the file's quoted macro registrations without executing MacroM.
     fn declare_macro_rules(&mut self, args: &[Syntax]) {
-        let [_, _, attr_kind, _, opt_kind, alternatives] = args else {
-            return;
-        };
-        // A source override changes an imported macro's meaning even when this expander
-        // cannot translate the new rule. Stop using its native expansion, including when
-        // the command contains several alternatives. Anonymous source batches do not export
-        // a grammar journal, so the export refusal below cannot protect their executions.
-        // An explicit kind also permits an identifier pattern, with no quotation root.
-        // Resolve it as `checkSyntaxNodeKindAtNamespaces`: the nearest registered syntax
-        // kind wins, without open aliases or special handling for `_root_`.
-        let explicit_kind = null_args(opt_kind).and_then(|args| match args {
-            [_, _, _, kind, _] => ident_name(kind),
-            _ => None,
-        });
-        let explicit_kind = explicit_kind.and_then(|name| {
-            let mut namespace = self.top().namespace.clone();
-            loop {
-                let candidate = namespace.append_core(&name);
-                let registered = self
-                    .imported
-                    .iter()
-                    .chain(&self.native_imported)
-                    .chain(&self.declared)
-                    .chain(self.scoped.values().flatten())
-                    .chain(self.native_scoped.values().flatten())
-                    .any(|decl| matches!(&decl.descr, Descr::Node { kind, .. } if *kind == candidate));
-                if registered {
-                    break Some(candidate);
-                }
-                if namespace.is_anonymous() {
-                    break None;
-                }
-                namespace = namespace.parent();
-            }
-        });
-        let mut overridden = explicit_kind
-            .as_ref()
-            .is_some_and(|kind| Arc::make_mut(&mut self.interpolation_kinds).remove(kind));
-        if let Some(alternatives) = node_args(alternatives)
-            .and_then(<[Syntax]>::first)
-            .and_then(null_args)
-        {
-            for alternative in alternatives {
-                let Some([_, groups, _, _]) = node_args(alternative) else {
-                    continue;
-                };
-                let Some(groups) = null_args(groups) else {
-                    continue;
-                };
-                for group in groups {
-                    let Some(patterns) = null_args(group) else {
-                        continue;
-                    };
-                    for pattern in patterns {
-                        if let Some((kind, ..)) = quotation_root(pattern) {
-                            overridden |=
-                                Arc::make_mut(&mut self.interpolation_kinds).remove(&kind);
-                        }
-                    }
-                }
-            }
-        }
-        if overridden {
-            self.generation += 1;
-            self.native_export_refusal =
-                Some("source module export of macro_rules for imported syntax");
-        }
-        if attr_kind_of(attr_kind) != Ok(AttrKind::Global) {
-            // The current single-rule expander has no independent scoped rule
-            // stack. Do not export a local/scoped override as a global macro.
-            self.native_export_refusal =
-                Some("source module export of scoped or local macro_rules");
-        }
-        let target = node_args(alternatives)
-            .and_then(<[Syntax]>::first)
-            .and_then(null_args)
-            .and_then(|alternatives| match alternatives {
-                [alternative] => Some(alternative),
-                _ => None,
-            })
-            .and_then(node_args)
-            .and_then(|alternative| match alternative {
-                [_, groups, _, rhs] => Some((groups, rhs)),
-                _ => None,
-            })
-            .and_then(|(groups, rhs)| match null_args(groups) {
-                Some([group]) => match null_args(group) {
-                    Some([pattern]) => Some((pattern, rhs)),
-                    _ => None,
-                },
-                _ => None,
-            });
-        let kind = target.and_then(|(pattern, _)| quotation_root(pattern).map(|(kind, ..)| kind));
-        let rule = (null_args(opt_kind).is_some_and(<[Syntax]>::is_empty))
-            .then_some(target)
-            .flatten()
-            .and_then(|(pattern, rhs)| {
-                let (kind, category, children) = quotation_root(pattern)?;
-                let variables = quotation::variables(children).ok()?;
-                let rhs = macro_template(rhs, &category, &variables).ok()?;
-                Some((
-                    kind.clone(),
-                    NotationRule {
-                        variables,
-                        rhs,
-                        prechecked: false,
-                        pattern: Some(Syntax::node(kind, children.to_vec())),
-                    },
-                ))
-            });
-        if kind.as_ref().is_some_and(|kind| {
-            self.constants.contains(kind) && !self.declared.iter().any(|decl| decl.decl == *kind)
-        }) {
-            self.native_export_refusal =
-                Some("source module export of macro_rules for imported syntax");
-        }
-        let Some(kind) = kind.filter(|kind| self.declared.iter().any(|decl| decl.decl == *kind))
-        else {
-            return;
-        };
-        self.generation += 1;
-        let rules = Arc::make_mut(&mut self.rules);
-        match rule {
-            Some((_, rule)) if !rules.contains_key(&kind) => {
-                rules.insert(kind, Arc::new(rule));
-            }
-            _ => {
-                rules.remove(&kind);
-            }
-        }
+        macro_rules::declare(self, args);
     }
 
     fn expander(&self) -> Expander {
@@ -1855,11 +1728,27 @@ impl FileGrammar {
     /// Replace the template of the rule for `kind`: the caller's pre-resolved copy, its
     /// identifiers naming what they named where the notation was declared. `false` when no rule
     /// expands `kind`.
-    pub fn set_rule_template(&mut self, kind: &Name, rhs: Syntax) -> bool {
+    pub fn set_rule_template(
+        &mut self,
+        kind: &Name,
+        index: usize,
+        rhs: Syntax,
+        source: Arc<[u8]>,
+    ) -> bool {
         let Some(rule) = Arc::make_mut(&mut self.rules).get_mut(kind) else {
             return false;
         };
-        Arc::make_mut(rule).rhs = rhs;
+        let head = Arc::make_mut(rule);
+        let rule = if index == 0 {
+            head
+        } else {
+            let Some(rule) = head.fallbacks.get_mut(index - 1) else {
+                return false;
+            };
+            rule
+        };
+        rule.rhs = rhs;
+        rule.source = Some(source);
         self.generation += 1;
         true
     }
@@ -2344,10 +2233,15 @@ impl Expander {
             match task {
                 Task::Visit(Syntax::Node { info, kind, args }) => {
                     if let Some(rule) = self.rules.get(kind) {
-                        if !quotation::matches(rule, args)? {
-                            return Err("no matching quoted macro rule");
+                        let mut selected = None;
+                        for candidate in rule.cases() {
+                            if quotation::matches(candidate, args)? {
+                                selected = Some(candidate);
+                                break;
+                            }
                         }
-                        let expansion = self.instantiate(rule, args)?;
+                        let selected = selected.ok_or("no matching quoted macro rule")?;
+                        let expansion = self.instantiate(selected, args)?;
                         built.push(self.expand_at(&expansion, depth + 1)?);
                         continue;
                     }
@@ -2532,6 +2426,16 @@ pub struct NotationRule {
     pub prechecked: bool,
     /// Original quoted pattern. `None` is an unconditional notation/macro template.
     pub pattern: Option<Syntax>,
+    /// Source buffer addressed by this clause's quotation spans, after pre-resolution.
+    pub source: Option<Arc<[u8]>>,
+    /// Remaining clauses in execution order. Each entry is a leaf, not another chain.
+    pub fallbacks: Vec<NotationRule>,
+}
+
+impl NotationRule {
+    pub fn cases(&self) -> impl Iterator<Item = &Self> {
+        std::iter::once(self).chain(&self.fallbacks)
+    }
 }
 
 /// Expansions nest no deeper: a notation whose template reaches itself is refused.
