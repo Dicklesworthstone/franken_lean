@@ -12,6 +12,7 @@ use std::ops::Range;
 mod conv;
 mod elimination;
 pub(super) use elimination::calculation;
+mod guard_hyp;
 mod locations;
 mod rcases;
 
@@ -360,6 +361,7 @@ pub(crate) fn tactic(
             "decreasing_tactic",
             // `syntax (name := guardTarget) "guard_target " equal term : tactic` (`Init/Guard.lean:75`).
             "guard_target",
+            "guard_hyp",
             // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`).
             "admit",
         ]
@@ -405,6 +407,7 @@ pub(crate) fn tactic(
         "suffices" => suffices(leaves, view, tokens, range, atom),
         "change" => change(leaves, view, tokens, range, atom),
         "guard_target" => guard_target(leaves, view, tokens, range, atom),
+        "guard_hyp" => guard_hyp::parse(leaves, view, tokens, range, atom),
         // `"specialize " term` (`Init/Tactics.lean`) has `exact`'s shape.
         "exact" | "apply" | "refine" | "specialize" | "show" => {
             term_tactic(leaves, view, tokens, range, keyword, atom)

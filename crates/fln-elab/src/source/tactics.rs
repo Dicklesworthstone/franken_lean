@@ -18,6 +18,7 @@ pub(in crate::source) mod eliminate;
 mod empty;
 mod equality;
 mod guard;
+mod guard_hyp;
 mod index_equations;
 mod omega;
 mod rcases;
@@ -38,6 +39,12 @@ pub enum TacticError {
     /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
     /// expected to be …").
     GuardTargetMismatch,
+    /// `guard_hyp` must refer to a local, not a constant or computed expression.
+    GuardHypExpectedLocal,
+    GuardHypTypeMismatch(Name),
+    GuardHypValueMismatch(Name),
+    GuardHypNotLet(Name),
+    GuardHypMissingValue(Name),
     ExpectedGoal,
     ExpectedProposition,
     /// A non-identifier simp argument whose type does not conclude in a proposition (the
@@ -114,6 +121,25 @@ impl std::fmt::Display for TacticError {
                 f,
                 "guard_target: the main goal is not what it was expected to be"
             ),
+            Self::GuardHypExpectedLocal => {
+                write!(f, "guard_hyp: expected a local hypothesis")
+            }
+            Self::GuardHypTypeMismatch(name) => write!(
+                f,
+                "guard_hyp: hypothesis `{}` has a different type",
+                name.to_display_string()
+            ),
+            Self::GuardHypValueMismatch(name) => write!(
+                f,
+                "guard_hyp: hypothesis `{}` has a different value",
+                name.to_display_string()
+            ),
+            Self::GuardHypNotLet(name) => {
+                write!(f, "`{}` is not a let binding", name.to_display_string())
+            }
+            Self::GuardHypMissingValue(name) => {
+                write!(f, "`{}` is a let binding", name.to_display_string())
+            }
             Self::ExpectedGoal => write!(f, "by proof requires an expected type"),
             Self::ExpectedProposition => write!(f, "decision requires a proposition"),
             Self::InvalidSimpTheorem => {
@@ -776,6 +802,9 @@ impl Context {
                 if !self.guard_target_matches(&goal, relation, expected)? {
                     return Err(error(TacticError::GuardTargetMismatch));
                 }
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "guardHyp"]) {
+                self.guard_hypothesis(&goal, args)?;
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "fail"]) {
                 return Err(error(TacticError::ExplicitFailure));

@@ -82,13 +82,24 @@ impl Context {
         self.resolve_instances_with_defaults()?;
         self.flush(false)?;
         let value = self.instantiate(&elaborated.value)?;
+        self.guard_expr_matches(&value, &target, relation)
+    }
+
+    /// The shared guard comparison. Callers own the snapshot that prevents
+    /// comparison-only assignments from changing the proof state.
+    pub(super) fn guard_expr_matches(
+        &mut self,
+        value: &Expr,
+        target: &Expr,
+        relation: Relation,
+    ) -> Result<bool, NatDefinitionElabError> {
         match relation {
-            Relation::Syntactic => self.expr_eqv(consume_mdata(&value), consume_mdata(&target)),
-            Relation::Alpha => self.expr_eqv(&value, &target),
+            Relation::Syntactic => self.expr_eqv(consume_mdata(value), consume_mdata(target)),
+            Relation::Alpha => self.expr_eqv(value, target),
             Relation::DefEq(transparency) => {
                 let mut budget = UnificationBudget::new(self.kernel);
                 budget.transparency = transparency;
-                self.proof_types_match_with_budget(&value, &target, budget)
+                self.proof_types_match_with_budget(value, target, budget)
             }
         }
     }
