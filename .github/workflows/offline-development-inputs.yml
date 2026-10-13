@@ -29,9 +29,10 @@ jobs:
           git archive --format=tar.gz HEAD > "$RUNNER_TEMP/offline-source/source.tar.gz"
           git rev-parse HEAD > "$RUNNER_TEMP/offline-source/source-commit.txt"
           git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/offline-source/source-tree.txt"
+          git cat-file commit HEAD > "$RUNNER_TEMP/offline-source/commit-object.txt"
           git ls-tree -r HEAD > "$RUNNER_TEMP/offline-source/tree.txt"
           cd "$RUNNER_TEMP/offline-source"
-          sha256sum source.tar.gz source-commit.txt source-tree.txt tree.txt > SHA256SUMS
+          sha256sum source.tar.gz source-commit.txt source-tree.txt commit-object.txt tree.txt > SHA256SUMS
       - name: Retain source inputs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
