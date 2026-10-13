@@ -154,7 +154,7 @@ impl Engine {
     }
 
     /// Admit one definition, theorem, instance, structure, class or inductive command,
-    /// including a complete `mutual ... end` inductive group.
+    /// including a complete `mutual ... end` inductive or partial-definition group.
     /// A record's block and projections all pass K1 and the independent checker
     /// before class metadata is registered. No failed prefix is exposed.
     pub fn admit_source_command(
@@ -192,6 +192,23 @@ impl Engine {
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
             ScopedCommandSyntax::Mutual(members) => {
+                if members.iter().any(fln_elab::source::partial::is_partial) {
+                    let declarations = match elaboration_outcome(
+                        fln_elab::source::partial::elaborate_group(
+                            &members,
+                            self.environment(),
+                            limits.kernel,
+                            scope,
+                        ),
+                    )? {
+                        Outcome::Complete(declarations) => declarations,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    return self
+                        .admit_declarations(&declarations, options, limits)
+                        .map_err(EngineExecutionError::from);
+                }
                 return self.admit_scoped_inductives(&members, options, limits, scope);
             }
             ScopedCommandSyntax::Example(parsed) => {
@@ -1073,7 +1090,7 @@ impl Engine {
 
 /// The syntax of one command on the checked source path.
 pub(crate) enum ScopedCommandSyntax {
-    /// A complete `mutual` group (or a lone inductive inside one).
+    /// A complete `mutual` group, including a single supported member.
     Mutual(Vec<fln_syntax::tree::Syntax>),
     /// An `example`, checked and discarded.
     Example(fln_parse::ParsedSourceCommand),

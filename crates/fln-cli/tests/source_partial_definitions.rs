@@ -78,3 +78,67 @@ fn installed_partial_recursion_executes_and_replays_without_logical_unfolding() 
     );
     assert!(recovered.contains("\"finalValue\":6"), "{recovered}");
 }
+
+#[test]
+fn installed_mutual_partial_group_replays_both_companions_and_refuses_late_failure() {
+    let root =
+        std::env::temp_dir().join(format!("fln-source-mutual-partial-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("Mutual.lean");
+    let artifact = root.join("Mutual.flbc");
+    let group = "mutual\npartial def ping (n : Nat) : Nat := if n == 0 then 7 else pong (n - 1)\npartial def pong (n : Nat) : Nat := if n == 0 then 13 else ping (n - 1)\nend\n";
+    std::fs::write(&source, group).unwrap();
+    let checked = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(checked.contains("\"executed\":false"), "{checked}");
+    let good = format!("{group}#eval ping 5\n");
+    std::fs::write(&source, &good).unwrap();
+    let output = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["run", "--json", "--emit-flbc"])
+            .arg(&artifact)
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(output.contains("\"finalValue\":13"), "{output}");
+    let retained = std::fs::read(&artifact).unwrap();
+    let replay = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["flbc", "run", "--json"])
+            .arg(&artifact)
+            .output()
+            .unwrap(),
+    );
+    assert!(replay.contains("\"returnValue\":13"), "{replay}");
+    let failed = root.join("Refused.flbc");
+    std::fs::write(
+        &source,
+        format!("{good}theorem noUnfold : ping 0 = 7 := by rfl\n"),
+    )
+    .unwrap();
+    let refusal = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--emit-flbc"])
+        .arg(&failed)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(refusal.stdout.is_empty());
+    assert!(!failed.exists());
+    assert_eq!(std::fs::read(&artifact).unwrap(), retained);
+    std::fs::write(&source, &good).unwrap();
+    let recovered = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["run", "--json"])
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(recovered.contains("\"finalValue\":13"), "{recovered}");
+}

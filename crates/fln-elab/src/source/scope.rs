@@ -506,6 +506,11 @@ impl Context {
                     .as_ref()
                     .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
                 || (self.defining.as_ref() == Some(candidate) && !held_back_recursion(candidate))
+                || self
+                    .partial
+                    .as_ref()
+                    .and_then(|state| state.group.as_ref())
+                    .is_some_and(|group| group.names.contains(candidate))
         };
         // Locals first: the pin's `resolveLocalName` runs before `resolveGlobalName`
         // (vendored `src/Lean/Elab/Term.lean`, `resolveName`), so a local, or the

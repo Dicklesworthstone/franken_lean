@@ -1,8 +1,8 @@
-//! Atomic source groups for the native mutual-inductive elaborator.
+//! Atomic source groups for native mutual-inductive and partial elaboration.
 //!
 //! The pin's Command.mutual encloses commands between `mutual` and `end`.
-//! This door accepts one to eight inductive declarations; function groups,
-//! nested groups and scope changes remain unsupported, never sequentialized.
+//! This door accepts one to eight inductive declarations or partial definitions;
+//! mixed groups, nested groups and scope changes are never sequentialized.
 //! Members use the ordinary declaration parser over their exact source bytes.
 use super::*;
 
@@ -69,6 +69,34 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
         return Ok(None);
     }
     let end = block_end(&view, &tokens, 0)?;
+    if end + 1 == tokens.len() && end > 1 && word(&view, &tokens[1], "partial") {
+        // Retain the first member's indentation. Starting at its first token
+        // would make it column zero and absorb later indented declarations.
+        let start = view.to_original(tokens[0].extent.end());
+        let stop = view.to_original(tokens[end].extent.start());
+        let commands = super::partition(&source[start.0..stop.0])
+            .map_err(|error| error.with_original_offset(start))?;
+        if commands.is_empty() || commands.len() > 8 {
+            return Err(refusal(&view, &tokens, end));
+        }
+        let mut members = Vec::new();
+        for (offset, bytes) in commands {
+            let member_view = SourceView::of(
+                &SourceText::from_utf8(bytes).map_err(NatDefinitionParseError::Source)?,
+            );
+            let member_tokens = super::tokens(&member_view)?;
+            if member_tokens.len() < 2
+                || !word(&member_view, &member_tokens[0], "partial")
+                || !word(&member_view, &member_tokens[1], "def")
+            {
+                return Err(refusal(&view, &tokens, end));
+            }
+            let parsed = parse_definition(bytes)
+                .map_err(|error| error.with_original_offset(BytePos(start.0 + offset.0)))?;
+            members.push(parsed.syntax);
+        }
+        return Ok(Some(members));
+    }
     if end + 1 != tokens.len() || end == 1 || !word(&view, &tokens[1], "inductive") {
         return Err(refusal(&view, &tokens, end));
     }
@@ -104,6 +132,57 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_groups_preserve_indentation_trivia_and_lexical_boundaries() {
+        let source = "-- 🦀\r\nnamespace N\r\nmutual\r\n  partial def a (n : Nat) : Nat := if n == 0 then 7 else b (n - 1)\r\n  /- partial def fake := end -/\r\n  partial def b (n : Nat) : Nat := a n\r\nend\r\ndef z : Nat := a 0\r\nend N\r\n";
+        let pieces = super::super::partition(source.as_bytes()).unwrap();
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(
+            pieces
+                .iter()
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            source.as_bytes()
+        );
+        let members = parse(pieces[1].1).unwrap().unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(parse(pieces[2].1).unwrap().is_none());
+        assert!(matches!(
+            super::super::parse(pieces[3].1).unwrap(),
+            Some(ScopeCommand::End(Some(_)))
+        ));
+    }
+
+    #[test]
+    fn partial_groups_do_not_hide_mixed_or_oversized_commands() {
+        for source in [
+            "mutual\npartial def a : Nat := 1\naxiom b : Nat\nend",
+            "mutual\npartial def a : Nat := 1\nnamespace N\nend\nend",
+            "mutual\npartial def a : Nat := 1\nmutual\npartial def b : Nat := 2\nend\nend",
+            "mutual\npartial def a : Nat := 1\ndef b : Nat := 2\nend",
+            "mutual\npartial def a : Nat := 1\nend N",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
+        let source = format!(
+            "mutual\n{}end",
+            (0..9)
+                .map(|i| format!("  partial def p{i} : Nat := {i}\n"))
+                .collect::<String>()
+        );
+        assert!(parse(source.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn partial_member_diagnostics_retain_original_crlf_unicode_offsets() {
+        let source = "-- 🦀\r\nmutual\r\n  partial def a (n : Nat) : Nat := n\r\n  partial def b : Nat := if true then )\r\nend";
+        let error = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(
+            error.primary_offset().unwrap().0,
+            source.rfind(')').unwrap()
+        );
+    }
 
     #[test]
     fn groups_keep_member_bytes_and_surrounding_scope_boundaries() {

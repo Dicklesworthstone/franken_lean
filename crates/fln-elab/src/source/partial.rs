@@ -3,10 +3,13 @@
 //! `addAndCompilePartial` and Basic.lean `addAndCompilePartialRec`. Neither a
 //! logical inhabitant alone nor a recursive body alone is a source publication.
 use super::*;
+mod group;
+pub use group::elaborate_group;
 
 #[derive(Clone, Default)]
 pub(super) struct State {
     pub reference: Option<Reference>,
+    pub group: Option<group::Group>,
 }
 
 #[derive(Clone)]
@@ -66,30 +69,7 @@ pub fn elaborate(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Vec<Declaration>, NatDefinitionElabError> {
-    let declaration = expect_node(
-        syntax,
-        &parser_kind(&["Command", "declaration"]),
-        2,
-        "partial definition",
-    )?;
-    expect_node(
-        &declaration[1],
-        &parser_kind(&["Command", "definition"]),
-        5,
-        "partial def",
-    )?;
-    let modifiers = expect_node(
-        &declaration[0],
-        &parser_kind(&["Command", "declModifiers"]),
-        7,
-        "declaration modifiers",
-    )?;
-    validate_modifier(&modifiers[6])?;
-    // Attribute effects need a separate checked registration path. Do not
-    // silently discard them or publish a noncomputable body as executable.
-    for &index in &[1_usize, PROTECTED_SLOT, NONCOMPUTABLE_SLOT, 5] {
-        expect_empty_null(&modifiers[index], "unattributed safe partial definition")?;
-    }
+    validate(syntax)?;
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope);
     context.partial = Some(State::default());
@@ -123,6 +103,34 @@ pub fn elaborate(
         all: vec![name],
     });
     Ok(vec![logical, candidate])
+}
+
+fn validate(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "partial definition",
+    )?;
+    expect_node(
+        &declaration[1],
+        &parser_kind(&["Command", "definition"]),
+        5,
+        "partial def",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    validate_modifier(&modifiers[6])?;
+    // Attribute effects need a separate checked registration path. Do not
+    // silently discard them or publish a noncomputable body as executable.
+    for &index in &[1_usize, PROTECTED_SLOT, NONCOMPUTABLE_SLOT, 5] {
+        expect_empty_null(&modifiers[index], "unattributed safe partial definition")?;
+    }
+    Ok(())
 }
 
 impl Context {

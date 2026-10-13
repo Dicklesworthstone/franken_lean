@@ -704,6 +704,9 @@ impl Context {
     }
 
     fn constant(&mut self, name: &Name) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(term) = self.partial_group_reference(name)? {
+            return Ok(term);
+        }
         let info = self
             .txn
             .env
@@ -4923,8 +4926,18 @@ fn definition_in_context_named(
     // atomic name in the header restores the header's state, becomes an implicit local of a
     // fresh type, and the header is elaborated again. Never the definition's own name
     // (MutualDef.lean:213). See `auto_bound_name` for which names.
+    let mut own_names = own_short_name(name);
+    if let Some(group) = context
+        .partial
+        .as_ref()
+        .and_then(|state| state.group.as_ref())
+    {
+        for name in &group.names {
+            own_names.extend(own_short_name(name));
+        }
+    }
     let (autos, (mut parameters, mut expected)) =
-        context.with_auto_bound_implicits(&own_short_name(name), |context| {
+        context.with_auto_bound_implicits(&own_names, |context| {
             let parameters = context.bind_parameters(&signature[0])?;
             let expected = if is_theorem || is_instance || is_opaque || is_axiom {
                 let parts = expect_node(
@@ -4994,7 +5007,13 @@ fn definition_in_context_named(
         return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
-    if is_axiom {
+    if is_axiom
+        || context
+            .partial
+            .as_ref()
+            .and_then(|state| state.group.as_ref())
+            .is_some_and(|group| group.header_only)
+    {
         let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         return axiom_from_header(context, name, parameters, expected);
     }
@@ -5133,6 +5152,7 @@ fn definition_in_context_named(
     context.resume_postponed_eliminators(true)?;
     context.flush(true)?;
     context.complete_local_functions()?;
+    context.close_partial_group_references(&mut term)?;
     let section_parameters = if let Some(selected) = theorem_section_parameters {
         selected
     } else {
@@ -5229,7 +5249,7 @@ fn definition_in_context_named(
     } else if context
         .partial
         .as_ref()
-        .is_some_and(|state| state.reference.is_some())
+        .is_some_and(|state| state.reference.is_some() || state.group.is_some())
     {
         base.name = Name::str(name.clone(), "_unsafe_rec");
         Ok(Declaration::Mutual(vec![DefinitionVal {
