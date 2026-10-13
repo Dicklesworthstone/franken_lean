@@ -6,6 +6,8 @@
 //! untouched subject is not normalized. That is the KR-105 operation needed
 //! before unfolding without borrowing K1's nodes or substitution implementation.
 
+mod reachable;
+
 use std::collections::{BTreeMap, HashMap};
 
 use crate::term::{TermBudget, TermLimit, TermStop};
@@ -252,6 +254,7 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         }))
     }
 
+    #[cfg(test)]
     fn prior_level(
         mapping: &[MappedLevel],
         input: InstantiationInput,
@@ -500,6 +503,7 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         Ok(mapped_root)
     }
 
+    #[cfg(test)]
     fn map_subject_levels(&mut self, source: &[LevelNode]) -> Result<Vec<LevelId>, Halt> {
         let input = InstantiationInput::Subject;
         let mut mapping = Vec::new();
@@ -611,6 +615,7 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         }
     }
 
+    #[cfg(test)]
     fn copy_expressions(
         &mut self,
         term: &WireExpr,
@@ -697,18 +702,13 @@ pub fn instantiate_level_parameters_with(
         Ok(Err(refusal)) => return InstantiationOutcome::Refused(refusal),
         Err(halt) => return halted(halt),
     };
-    let mapping = match instantiator.map_subject_levels(level.nodes()) {
-        Ok(mapping) => mapping,
+    let root = match instantiator.map_subject_root(
+        level.nodes(),
+        level.root(),
+        &mut BTreeMap::new(),
+    ) {
+        Ok(root) => root,
         Err(halt) => return halted(halt),
-    };
-    let root = match mapping.get(level.root().index()).copied() {
-        Some(root) => root,
-        None => {
-            return InstantiationOutcome::InternalFault(InstantiationFault::MissingLevel {
-                input: InstantiationInput::Subject,
-                index: level.root().index(),
-            });
-        }
     };
     InstantiationOutcome::Complete(WireLevel::from_parts(instantiator.levels, root))
 }
@@ -770,23 +770,9 @@ fn instantiate_term_from_values_with(
         Ok(Err(refusal)) => return InstantiationOutcome::Refused(refusal),
         Err(halt) => return halted(halt),
     };
-    let level_map = match instantiator.map_subject_levels(term.levels()) {
-        Ok(mapping) => mapping,
+    let (nodes, root) = match instantiator.copy_subject_root(term) {
+        Ok(result) => result,
         Err(halt) => return halted(halt),
-    };
-    let nodes = match instantiator.copy_expressions(term, &level_map) {
-        Ok(nodes) => nodes,
-        Err(halt) => return halted(halt),
-    };
-    let root = match ExprId::from_index(term.root().index())
-        .filter(|root| nodes.get(root.index()).is_some())
-    {
-        Some(root) => root,
-        None => {
-            return InstantiationOutcome::InternalFault(InstantiationFault::MissingExpression {
-                index: term.root().index(),
-            });
-        }
     };
     InstantiationOutcome::Complete(WireExpr::from_parts(nodes, instantiator.levels, root))
 }
