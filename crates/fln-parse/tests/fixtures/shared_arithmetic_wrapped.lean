@@ -1,0 +1,33 @@
+def passthrough (n : Nat) : Nat := n
+def circuit (start : Nat) : Nat :=
+  let n0 : Nat := start
+  let n1 : Nat := passthrough (Nat.add n0 n0)
+  let n2 : Nat := passthrough (Nat.add n1 n1)
+  let n3 : Nat := passthrough (Nat.add n2 n2)
+  let n4 : Nat := passthrough (Nat.add n3 n3)
+  let n5 : Nat := passthrough (Nat.add n4 n4)
+  let n6 : Nat := passthrough (Nat.add n5 n5)
+  let n7 : Nat := passthrough (Nat.add n6 n6)
+  let n8 : Nat := passthrough (Nat.add n7 n7)
+  let n9 : Nat := passthrough (Nat.add n8 n8)
+  let n10 : Nat := passthrough (Nat.add n9 n9)
+  let n11 : Nat := passthrough (Nat.add n10 n10)
+  let n12 : Nat := passthrough (Nat.add n11 n11)
+  let n13 : Nat := passthrough (Nat.add n12 n12)
+  let n14 : Nat := passthrough (Nat.add n13 n13)
+  let n15 : Nat := passthrough (Nat.add n14 n14)
+  let n16 : Nat := passthrough (Nat.add n15 n15)
+  let n17 : Nat := passthrough (Nat.add n16 n16)
+  let n18 : Nat := passthrough (Nat.add n17 n17)
+  let n19 : Nat := passthrough (Nat.add n18 n18)
+  let n20 : Nat := passthrough (Nat.add n19 n19)
+  let n21 : Nat := passthrough (Nat.add n20 n20)
+  let n22 : Nat := passthrough (Nat.add n21 n21)
+  let n23 : Nat := passthrough (Nat.add n22 n22)
+  let n24 : Nat := passthrough (Nat.add n23 n23)
+  let n25 : Nat := passthrough (Nat.add n24 n24)
+  let n26 : Nat := passthrough (Nat.add n25 n25)
+  let n27 : Nat := passthrough (Nat.add n26 n26)
+  let n28 : Nat := passthrough (Nat.add n27 n27)
+  n28
+theorem computes : circuit 5 = 1342177280 := by rfl
