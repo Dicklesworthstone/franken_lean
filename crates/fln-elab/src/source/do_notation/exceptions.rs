@@ -3,6 +3,8 @@
 //! privileged execution path is introduced by this syntax expansion.
 use super::*;
 mod exits;
+mod values;
+pub(super) use values::ValueRegion;
 
 pub(super) struct ExceptionRegion {
     handlers: Vec<(Syntax, Vec<Syntax>)>,

@@ -40,6 +40,15 @@ pub(in crate::source) fn join_parts(
     Ok((val.clone(), suffix, body))
 }
 
+type Packets = Option<std::rc::Rc<ReturnPacket>>;
+
+/// Persistent scope stack: cloning a branch must not copy all enclosing
+/// exception scopes. Each return walks and meters only the packets it emits.
+struct ReturnPacket {
+    resume: Syntax,
+    outer: Packets,
+}
+
 struct Block {
     statements: Vec<Syntax>,
     result: Option<Syntax>,
@@ -48,6 +57,7 @@ struct Block {
     loop_scope: Option<loop_returns::LoopScope>,
     completion: Option<Syntax>,
     nested: bool,
+    packets: Packets,
 }
 impl Block {
     fn new(
@@ -68,6 +78,7 @@ impl Block {
             loop_scope,
             completion: None,
             nested: false,
+            packets: None,
         })
     }
 }
@@ -77,6 +88,7 @@ enum Task {
     Block(Block),
     Resume(Block),
     FinishException(exceptions::ExceptionRegion, usize),
+    FinishValueException(Box<exceptions::ValueRegion>, usize),
     Conditional(
         Syntax,
         Option<Syntax>,
@@ -84,6 +96,7 @@ enum Task {
         Option<loop_returns::LoopScope>,
         Option<Syntax>,
         bool,
+        Packets,
     ),
     FinishNested(Option<(Syntax, Syntax)>),
     FinishLoop(Box<loop_returns::LoopBuild>),
@@ -211,22 +224,33 @@ impl Context {
                     let bodies = values.split_off(start);
                     values.push(self.finish_exception_region(region, bodies)?);
                 }
+                Task::FinishValueException(build, start) => {
+                    let bodies = values.split_off(start);
+                    values.push(self.finish_value_exception(*build, bodies)?);
+                }
                 Task::FinishLoop(build) => {
                     let body = values.pop().ok_or_else(invalid)?;
                     values.push(self.finish_returning_loop(*build, body)?);
                 }
-                Task::Conditional(syntax, suffix, require_unit, loop_scope, completion, nested) => {
-                    self.returning_branches(
-                        syntax,
-                        suffix,
-                        require_unit,
-                        loop_scope,
-                        completion,
-                        nested,
-                        &mut work,
-                        values.len(),
-                    )?
-                }
+                Task::Conditional(
+                    syntax,
+                    suffix,
+                    require_unit,
+                    loop_scope,
+                    completion,
+                    nested,
+                    packets,
+                ) => self.returning_branches(
+                    syntax,
+                    suffix,
+                    require_unit,
+                    loop_scope,
+                    completion,
+                    nested,
+                    packets,
+                    &mut work,
+                    values.len(),
+                )?,
                 Task::Finish(header, start, join, nested) => {
                     self.finish_returning_branches(header, start, join, nested, &mut values)?
                 }
@@ -273,6 +297,7 @@ impl Context {
         loop_scope: Option<loop_returns::LoopScope>,
         completion: Option<Syntax>,
         nested: bool,
+        packets: Packets,
         work: &mut Vec<Task>,
         start: usize,
     ) -> Result<(), NatDefinitionElabError> {
@@ -292,6 +317,7 @@ impl Context {
                         Block::new(sequence, next.clone(), require_unit, loop_scope.clone())?;
                     block.completion = completion.clone();
                     block.nested = nested;
+                    block.packets = packets.clone();
                     Task::Block(block)
                 }
                 None => Task::Value(next.clone().unwrap_or_else(|| match &completion {
@@ -343,6 +369,11 @@ impl Context {
         block.terminal = false;
         let element = sequence_element(statement)?;
         if element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
+            && ((block.completion.is_some() && block.result.is_none()) || block.packets.is_some())
+            && block.loop_scope.is_none()
+        {
+            self.returning_value_try(block, element, work, values.len())
+        } else if element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
             && block.result.is_none()
             && block.loop_scope.is_none()
         {
@@ -357,6 +388,39 @@ impl Context {
         } else {
             self.returning_element(block, element, terminal, work)
         }
+    }
+
+    #[inline(never)]
+    fn returning_value_try(
+        &mut self,
+        mut block: Block,
+        element: Syntax,
+        work: &mut Vec<Task>,
+        start: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        let (build, sequences) =
+            self.prepare_value_exception(element, block.result.take(), block.completion.clone())?;
+        let packets = Some(std::rc::Rc::new(ReturnPacket {
+            resume: build.resume.clone(),
+            outer: block.packets.clone(),
+        }));
+        let normal = build.normal.clone();
+        let cleanup = build.cleanup;
+        let last = sequences.len() - 1;
+        let nested = block.nested;
+        work.push(Task::Resume(block));
+        work.push(Task::FinishValueException(Box::new(build), start));
+        for (index, sequence) in sequences.into_iter().enumerate().rev() {
+            self.tick()?;
+            let mut inner = Block::new(sequence, None, false, None)?;
+            if !cleanup || index != last {
+                inner.completion = Some(normal.clone());
+                inner.packets = packets.clone();
+                inner.nested = nested;
+            }
+            work.push(Task::Block(inner));
+        }
+        Ok(())
     }
 
     #[inline(never)]
@@ -408,6 +472,7 @@ impl Context {
         let mut inner = Block::new(nested.sequence, None, false, block.loop_scope.clone())?;
         inner.completion = nested.completion;
         inner.nested = true;
+        inner.packets = block.packets.clone();
         work.push(Task::Resume(block));
         work.push(Task::FinishNested(nested.join));
         work.push(Task::Block(inner));
@@ -421,6 +486,11 @@ impl Context {
         element: Syntax,
         work: &mut Vec<Task>,
     ) -> Result<(), NatDefinitionElabError> {
+        // A returning loop needs to carry the packet's return carrier in its
+        // own accumulator. Keep that boundary explicit until it is represented.
+        if block.packets.is_some() {
+            return Err(invalid());
+        }
         if block.result.is_none()
             && let Some(completion) = &block.completion
         {
@@ -447,7 +517,7 @@ impl Context {
     fn returning_element(
         &mut self,
         mut block: Block,
-        element: Syntax,
+        mut element: Syntax,
         terminal: bool,
         work: &mut Vec<Task>,
     ) -> Result<(), NatDefinitionElabError> {
@@ -457,6 +527,26 @@ impl Context {
             // than disappearing before ordinary checking.
             if !terminal {
                 return Err(invalid());
+            }
+            if block.packets.is_some() {
+                let mut parts = node(element, "doReturn", 2)?;
+                expect_atom(&parts[0], "return", "return keyword")?;
+                let mut payload = children(parts.pop().expect("return payload"))?;
+                if payload.len() != 1 {
+                    return Err(invalid());
+                }
+                let mut value = payload.pop().expect("one return value");
+                let mut packets = Vec::new();
+                let mut scope = block.packets.as_deref();
+                while let Some(packet) = scope {
+                    self.tick()?;
+                    packets.push(&packet.resume);
+                    scope = packet.outer.as_deref();
+                }
+                for resume in packets.into_iter().rev() {
+                    value = self.exception_return_packet(value, resume)?;
+                }
+                element = term("doReturn", vec![parts.remove(0), null(vec![value])]);
             }
             if let Some(scope) = &block.loop_scope {
                 block.result = Some(if scope.targets.return_state.is_empty() {
@@ -500,6 +590,7 @@ fn returning_conditional(block: Block, element: Syntax, work: &mut Vec<Task>) {
     let loop_scope = block.loop_scope.clone();
     let completion = suffix.is_none().then(|| block.completion.clone()).flatten();
     let nested = block.nested;
+    let packets = block.packets.clone();
     work.push(Task::Resume(block));
     work.push(Task::Conditional(
         element,
@@ -508,6 +599,7 @@ fn returning_conditional(block: Block, element: Syntax, work: &mut Vec<Task>) {
         loop_scope,
         completion,
         nested,
+        packets,
     ));
 }
 

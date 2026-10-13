@@ -55,6 +55,11 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoContinuationType"])) {
+            return self
+                .do_exception_type_argument(function, name, syntax)
+                .map(Some);
+        }
         if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoLoopResultType"]))
             || syntax.kind() == Some(&parser_kind(&["Term", "nativeDoStateLoopResultType"]))
         {
