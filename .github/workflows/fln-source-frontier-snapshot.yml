@@ -89,6 +89,24 @@ jobs:
           assert encoded['encoding'] == 'base64' and encoded['size'] <= 1_000_000
           compressed = base64.b64decode(encoded['content'])
           assert object_id(compressed) == blob, 'patch blob identity mismatch'
+          if compressed.startswith(b'{'):
+              wrapper = json.loads(compressed)
+              assert set(wrapper) == {'parts', 'gzip_blob'}, 'invalid multipart patch'
+              assert isinstance(wrapper['parts'], list) and 0 < len(wrapper['parts']) <= 8
+              assert re.fullmatch(r'[0-9a-f]{40}', wrapper['gzip_blob'])
+              chunks = []
+              total = 0
+              for part in wrapper['parts']:
+                  assert re.fullmatch(r'[0-9a-f]{40}', part)
+                  entry = api('/git/blobs/' + part)
+                  assert entry['encoding'] == 'base64' and entry['size'] <= 1_000_000
+                  chunk = base64.b64decode(entry['content'])
+                  assert object_id(chunk) == part, 'patch part identity mismatch'
+                  total += len(chunk)
+                  assert total <= 1_000_000, 'multipart patch exceeds size limit'
+                  chunks.append(chunk)
+              compressed = b''.join(chunks)
+              assert object_id(compressed) == wrapper['gzip_blob'], 'combined patch identity mismatch'
           with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
               raw = stream.read(2_000_001)
           assert len(raw) <= 2_000_000, 'patch exceeds decoded size limit'

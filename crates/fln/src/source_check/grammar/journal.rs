@@ -13,12 +13,14 @@ use std::sync::Arc;
 
 mod descriptions;
 
-const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x01";
+const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x02";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
 
 fn name() -> Name {
+    // Keep the extension identity stable: the payload version rejects stale
+    // journals rather than silently ignoring an older extension's syntax.
     Name::from_components(["FrankenLean", "sourceGrammar", "v1"])
 }
 
@@ -111,7 +113,7 @@ fn as_optional_name(value: &Syntax) -> Result<Option<Name>, EngineExecutionError
 
 fn encode(
     header: Syntax,
-    rhs: Option<&Syntax>,
+    trees: &[Syntax],
     source: &[u8],
 ) -> Result<Arc<[u8]>, EngineExecutionError> {
     if source.len() > MAX_ROW_BYTES {
@@ -120,7 +122,7 @@ fn encode(
     let dump = pin_syntax::print(
         &PinTrees {
             header,
-            commands: rhs.cloned().into_iter().collect(),
+            commands: trees.to_vec(),
             messages: Vec::new(),
         },
         source,
@@ -170,11 +172,11 @@ pub(super) fn publish(
     // Even local-only syntax creates parser/macro declarations in the pin.
     // Keep its use visible to the artifact-support gate without exporting any
     // local parser or macro activation to downstream modules.
-    payloads.push(encode(node("usage", Vec::new()), None, &[])?);
+    payloads.push(encode(node("usage", Vec::new()), &[], &[])?);
     for (category, behavior) in &module.categories {
         payloads.push(encode(
             node("category", vec![ident(category), atom(*behavior as u8)]),
-            None,
+            &[],
             &[],
         )?);
     }
@@ -184,7 +186,12 @@ pub(super) fn publish(
         let variables = rule.map_or_else(Vec::new, |rule| {
             rule.variables
                 .iter()
-                .map(|(index, name)| node("variable", vec![atom(index), ident(name)]))
+                .map(|(path, name)| {
+                    node(
+                        "variable",
+                        vec![node("path", path.iter().map(atom).collect()), ident(name)],
+                    )
+                })
                 .collect()
         });
         let header = node(
@@ -204,7 +211,12 @@ pub(super) fn publish(
         let source = sources
             .get(&decl.decl)
             .map_or(&[][..], |source| source.as_ref());
-        payloads.push(encode(header, rule.map(|rule| &rule.rhs), source)?);
+        let trees = rule.map_or_else(Vec::new, |rule| {
+            std::iter::once(rule.rhs.clone())
+                .chain(rule.pattern.iter().cloned())
+                .collect()
+        });
+        payloads.push(encode(header, &trees, source)?);
     }
     let mut result = environment.clone();
     if result.extension(&name()).is_none() {
@@ -319,21 +331,29 @@ pub(super) fn load(
             let variables = children(variables, "variables")?
                 .iter()
                 .map(|value| {
-                    let [index, name] = children(value, "variable")? else {
+                    let [path, name] = children(value, "variable")? else {
                         return Err(malformed());
                     };
-                    Ok((as_u32(index)? as usize, as_name(name)?))
+                    let path = children(path, "path")?
+                        .iter()
+                        .map(|index| as_u32(index).map(|index| index as usize))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if path.is_empty() {
+                        return Err(malformed());
+                    }
+                    Ok((path, as_name(name)?))
                 })
                 .collect::<Result<Vec<_>, EngineExecutionError>>()?;
             match trees.commands.as_slice() {
                 [] if variables.is_empty() && !as_bool(prechecked)? => {}
-                [rhs] => {
+                [rhs] | [rhs, _] => {
                     module.rules.insert(
                         name,
                         Arc::new(NotationRule {
                             variables,
                             rhs: rhs.clone(),
                             prechecked: as_bool(prechecked)?,
+                            pattern: trees.commands.get(1).cloned(),
                         }),
                     );
                 }
@@ -383,9 +403,10 @@ mod tests {
             ],
         };
         let rule = Arc::new(NotationRule {
-            variables: vec![(1, Name::num(Name::anonymous(), 3))],
+            variables: vec![(vec![1], Name::num(Name::anonymous(), 3))],
             rhs,
             prechecked: true,
+            pattern: None,
         });
         let declaration = Arc::new(SyntaxDecl {
             module: owner.clone(),
@@ -483,6 +504,7 @@ mod tests {
         for payload in [
             Arc::<[u8]>::from(&MAGIC[..MAGIC.len() - 1]),
             Arc::from([MAGIC, &[255; 8]].concat()),
+            Arc::from(b"FLNSOURCEGRAMMAR\x01".as_slice()),
         ] {
             let env = Environment::new()
                 .register_extension(descriptor())
@@ -493,7 +515,7 @@ mod tests {
         }
         let source = vec![0; MAX_ROW_BYTES + 1];
         assert!(matches!(
-            encode(node("usage", vec![]), None, &source),
+            encode(node("usage", vec![]), &[], &source),
             Err(EngineExecutionError::SourceScopeLimit { .. })
         ));
         let mut descr =

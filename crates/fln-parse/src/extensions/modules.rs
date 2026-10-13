@@ -71,6 +71,21 @@ impl FileGrammar {
         if module.rules.keys().any(|kind| !names.contains(kind)) {
             return Err("an imported macro rule has no syntax declaration in its module");
         }
+        for (kind, rule) in &module.rules {
+            if let Some(pattern) = &rule.pattern {
+                let Syntax::Node {
+                    kind: pattern_kind,
+                    args,
+                    ..
+                } = pattern
+                else {
+                    return Err("an imported macro pattern is not a syntax node");
+                };
+                if pattern_kind != kind || quotation::variables(args)? != rule.variables {
+                    return Err("an imported macro pattern has inconsistent captures");
+                }
+            }
+        }
         for (name, behavior) in &module.categories {
             self.categories.insert(name.clone(), *behavior);
             let LeafView::Str(suffix) = name.leaf_view() else {
