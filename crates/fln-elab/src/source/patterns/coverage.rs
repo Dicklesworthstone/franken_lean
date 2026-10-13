@@ -2,30 +2,39 @@
 use super::*;
 
 impl Context {
-    /// A fallback is unreachable only when the resolved heads are exactly the
-    /// constructors of one admitted family. This is a decision-tree fact, not
-    /// a typing judgment: the ordinary match backend must still check every
-    /// generated constructor branch against the actual discriminant.
+    /// A fallback is unreachable only when the heads are exactly the
+    /// constructors of one admitted family, anchored by an explicit head.
+    /// Relative siblings are checked against that family, not guessed from
+    /// their spelling. This is a decision-tree fact, not a typing judgment:
+    /// the ordinary match backend must still check every generated constructor
+    /// branch against the actual discriminant.
     pub(super) fn matrix_constructors_exhaustive(
         &mut self,
         heads: &[usize],
         arena: &[Pattern<'_>],
         canonical: &HashMap<Head, Head>,
     ) -> Result<bool, NatDefinitionElabError> {
-        let Some(&first) = heads.first() else {
-            return Ok(false);
-        };
-        let Pattern::Constructor(constructor) = &arena[first] else {
-            return Ok(false);
-        };
-        let first = &canonical[&constructor.head];
-        if first.relative {
-            return Ok(false);
+        let mut family = None;
+        for &pattern in heads {
+            self.tick()?;
+            let Pattern::Constructor(constructor) = &arena[pattern] else {
+                return Ok(false);
+            };
+            let head = &canonical[&constructor.head];
+            if head.relative {
+                continue;
+            }
+            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&head.name) else {
+                return Ok(false);
+            };
+            family = Some(constructor.induct.clone());
+            break;
         }
-        let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&first.name) else {
+        let Some(family) = family else {
+            // Without an explicit anchor, only the typed match backend knows
+            // the family. An all-relative head set is not coverage evidence.
             return Ok(false);
         };
-        let family = constructor.induct.clone();
         let Some(ConstantInfo::Induct(inductive)) = self.txn.env.find(&family) else {
             return Ok(false);
         };
@@ -46,10 +55,15 @@ impl Context {
                 return Ok(false);
             };
             let head = &canonical[&constructor.head];
-            if head.relative || !missing.remove(&head.name) {
+            let name = if head.relative {
+                family.append_core(&head.name)
+            } else {
+                head.name.clone()
+            };
+            if !missing.remove(&name) {
                 return Ok(false);
             }
-            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&head.name) else {
+            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&name) else {
                 return Ok(false);
             };
             if constructor.induct != family {

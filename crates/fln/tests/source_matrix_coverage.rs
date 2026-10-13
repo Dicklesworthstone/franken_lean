@@ -147,3 +147,93 @@ fn constructor_completeness_never_erases_live_missing_or_foreign_cases() {
         reject(source);
     }
 }
+
+#[test]
+fn recursive_literal_splits_share_coverage_with_relative_successor_patterns() {
+    check(
+        "def foo : Nat -> Nat -> Nat -> Nat
+          | _, _, 0 => 1
+          | 0, _, _ => 2
+          | n, d, .succ k => foo n d k
+        theorem overlap : foo 0 7 0 = 1 := by rfl
+        theorem fallback : foo 0 7 4 = 2 := by rfl
+        theorem recursiveResult : foo 3 7 4 = 1 := by rfl",
+    );
+}
+
+#[test]
+fn recursive_literal_matrices_execute_after_checked_admission() {
+    use fln::{EngineExecutionLimits, VmExit};
+    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits.admission())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = "def foo : Nat -> Nat -> Nat -> Nat
+        | _, _, 0 => 1
+        | 0, d, _ => d
+        | n, d, k+1 => foo n d k
+      #eval foo 0 9 0
+      #eval foo 0 9 4
+      #eval foo 3 9 4";
+    let output = engine
+        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits)
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("matrix admission and native execution must complete");
+    assert_eq!(output.executions.len(), 3);
+    for (execution, expected) in output.executions.iter().zip(["1", "9", "1"]) {
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("recursive matrix execution must return");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn relative_constructor_siblings_use_an_explicit_family_anchor_in_either_order() {
+    for (yes, no) in [("Bool.true", ".false"), (".true", "Bool.false")] {
+        check(&format!(
+            "def code (b : Bool) (n : Nat) : Nat := match b, n with
+              | _, 0 => 10
+              | {yes}, Nat.succ k => k + 20
+              | {no}, Nat.succ k => k + 30
+            theorem trueZero : code true 0 = 10 := by rfl
+            theorem falseZero : code false 0 = 10 := by rfl
+            theorem trueSucc : code true 4 = 23 := by rfl
+            theorem falseSucc : code false 4 = 33 := by rfl"
+        ));
+    }
+}
+
+#[test]
+fn relative_coverage_anchors_do_not_capture_namespace_shadowing() {
+    check(
+        "namespace Shadow
+        inductive Bool where | true | false | extra
+        def code (b : _root_.Bool) (n : Nat) : Nat := match b, n with
+          | _, 0 => 10
+          | _root_.Bool.true, Nat.succ k => k + 20
+          | .false, Nat.succ k => k + 30
+        theorem trueZero : code _root_.Bool.true 0 = 10 := by rfl
+        theorem falseZero : code _root_.Bool.false 0 = 10 := by rfl
+        theorem trueSucc : code _root_.Bool.true 4 = 23 := by rfl
+        theorem falseSucc : code _root_.Bool.false 4 = 33 := by rfl
+        end Shadow",
+    );
+}
+
+#[test]
+fn relative_constructor_coverage_does_not_supply_a_discriminant_type() {
+    for source in [
+        "inductive Other where | true | false\ndef bad (b : Other) (n : Nat) : Nat := match b, n with | _, 0 => 1 | Bool.true, Nat.succ k => 2 | .false, Nat.succ k => 3",
+        "inductive Tag where | left | right | other\ndef bad (t : Tag) (n : Nat) : Nat := match t, n with | Tag.left, _ => 1 | .right, _ => 2 | _, Nat.succ k => k",
+        "inductive Tag where | left | right | other\ndef bad (t : Tag) (n : Nat) : Nat := match t, n with | .left, _ => 1 | .right, _ => 2 | _, Nat.succ k => k",
+        "def bad (b : Bool) (n : Nat) : Nat := match b, n with | _, 0 => 1 | Bool.true, Nat.succ k => 2 | .missing, Nat.succ k => 3",
+    ] {
+        reject(source);
+    }
+}
