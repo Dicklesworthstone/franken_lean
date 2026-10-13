@@ -149,8 +149,8 @@ pub(crate) fn quotation(
 }
 
 /// `Term.dynamicQuot := "`(" ident "|" … ")"`, a quotation of the category or parser `ident`
-/// names, read for `term` and for the numerals of `prec` and `prio` (`(prec| 1024)`, and
-/// `$n:num` in their place); any other is refused.
+/// names: the term category, token parsers from Parser.Extra, and the bounded
+/// prec/prio forms. Token quotations retain the primitive shape, not a term wrapper.
 fn dynamic_quotation(
     leaves: &Leaves,
     view: &SourceView,
@@ -165,6 +165,17 @@ fn dynamic_quotation(
     let inner = start + 3..close;
     let body = match category {
         "term" => nested_term(leaves, view, tokens, inner)?,
+        name @ ("ident" | "num" | "str" | "char" | "scientific" | "name") => {
+            let Some((syntax, next)) =
+                primitive(leaves, view, tokens, inner.start, inner.end, name)?
+            else {
+                return Err(refuse(view, tokens, inner.start));
+            };
+            if next != inner.end {
+                return Err(refuse(view, tokens, next));
+            }
+            syntax
+        }
         "prec" | "prio"
             if inner.len() == 1
                 && matches!(
@@ -284,6 +295,8 @@ pub(crate) enum Position {
     ConvSeq,
     OptConfig,
     RwRuleSeq,
+    /// A token parser accepts only its own annotation, or an anonymous capture.
+    Token(&'static str),
 }
 
 /// The antiquotation at `start` inside a quotation, ending by `end`: its tree and the token after
@@ -327,12 +340,20 @@ pub(crate) fn antiquotation(
         && touching(tokens, next - 1, next)
         && touching(tokens, next, next + 1)
         && matches!(tokens[next + 1].kind, TokenKind::Ident(_));
+    // An immediate colon belongs to the antiquotation, even when the name
+    // after it is missing or malformed. Never return a truncated capture.
+    if !named && next < end && text(tokens, next) == Some(":") && touching(tokens, next - 1, next) {
+        return Err(refuse(view, tokens, next));
+    }
     let (kind, name) = if named {
         let spelled = view
             .normalized()
             .span_str(tokens[next + 1].extent)
             .unwrap_or_default();
         let kind = match (position, spelled) {
+            (Position::Token(expected), actual) if expected == actual => {
+                Name::from_components([expected, "antiquot"])
+            }
             (Position::Term, "term") => Name::from_components(["term", "pseudo", "antiquot"]),
             (Position::Tactic, "tactic") => Name::from_components(["tactic", "pseudo", "antiquot"]),
             (Position::OptConfig, "optConfig") => {
@@ -357,6 +378,7 @@ pub(crate) fn antiquotation(
         (kind, name)
     } else {
         let kind = match position {
+            Position::Token(name) => Name::from_components([name, "antiquot"]),
             Position::Term => Name::from_components(["term", "pseudo", "antiquot"]),
             Position::Tactic => Name::from_components(["tactic", "pseudo", "antiquot"]),
             Position::TacticSeq => {
@@ -396,4 +418,50 @@ pub(crate) fn antiquotation(
         ),
         next,
     )))
+}
+
+/// The token parsers shared by dynamic quotations and declared syntax slots.
+/// Parser.Extra wraps each primitive in Basic.withAntiquot. Only quotation
+/// depth enables captures; ordinary syntax still requires the exact token kind.
+pub(crate) fn primitive(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+    parser: &str,
+) -> Result<Option<(Syntax, usize)>, NatDefinitionParseError> {
+    let (name, literal) = match parser {
+        "ident" => ("ident", None),
+        "num" => ("num", Some(LiteralKind::Nat)),
+        "str" => ("str", Some(LiteralKind::Str)),
+        "char" => ("char", Some(LiteralKind::Char)),
+        "scientific" => ("scientific", Some(LiteralKind::Scientific)),
+        "name" => ("name", Some(LiteralKind::Name)),
+        _ => return Ok(None),
+    };
+    if start >= end {
+        return Ok(None);
+    }
+    if let Some(capture) = antiquotation(leaves, view, tokens, start, end, Position::Token(name))? {
+        return Ok(Some(capture));
+    }
+    let Some(token) = tokens.get(start) else {
+        return Ok(None);
+    };
+    let matches = match (literal, &token.kind) {
+        (None, TokenKind::Ident(_)) => true,
+        (Some(expected), TokenKind::Literal(actual)) => expected == *actual,
+        _ => false,
+    };
+    if !matches {
+        return Ok(None);
+    }
+    let leaf = leaves.leaf(start)?;
+    let syntax = if literal.is_none() {
+        leaf
+    } else {
+        Syntax::node(Name::from_components([name]), vec![leaf])
+    };
+    Ok(Some((syntax, start + 1)))
 }
