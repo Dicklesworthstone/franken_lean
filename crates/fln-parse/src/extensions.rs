@@ -1032,6 +1032,13 @@ fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
     }
     match descr {
         Descr::Symbol(_) | Descr::NonReservedSymbol(..) | Descr::UnicodeSymbol(..) => true,
+        // Token parsers have a bounded endpoint too, including their complete
+        // antiquotation when quoted. They do not greedily consume a trailing
+        // term. Keep the enclosing node's precedence/application checks.
+        Descr::Const(name) => matches!(
+            simple(name).as_deref(),
+            Some("ident" | "num" | "str" | "char" | "scientific" | "name")
+        ),
         Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
             ends_with_atom(body, depth + 1)
         }
@@ -3971,21 +3978,18 @@ impl Run<'_> {
         }
         let token = &self.tokens[at];
         match (alias.as_str(), &token.kind) {
-            ("ident", TokenKind::Ident(_)) => Some((vec![self.leaves.leaf(at).ok()?], at + 1)),
-            ("num", TokenKind::Literal(LiteralKind::Nat)) => Some((
-                vec![Syntax::node(
-                    Name::str(Name::anonymous(), "num"),
-                    vec![self.leaves.leaf(at).ok()?],
-                )],
-                at + 1,
-            )),
-            ("str", TokenKind::Literal(LiteralKind::Str)) => Some((
-                vec![Syntax::node(
-                    Name::str(Name::anonymous(), "str"),
-                    vec![self.leaves.leaf(at).ok()?],
-                )],
-                at + 1,
-            )),
+            (alias @ ("ident" | "num" | "str" | "char" | "scientific" | "name"), _) => {
+                let (syntax, next) = crate::quotations::primitive(
+                    self.leaves,
+                    self.view,
+                    self.tokens,
+                    at,
+                    end,
+                    alias,
+                )
+                .ok()??;
+                Some((vec![syntax], next))
+            }
             ("hole", TokenKind::Symbol(symbol)) if symbol == "_" => Some((
                 vec![Syntax::node(
                     Name::from_components(["Lean", "Parser", "Term", "hole"]),
