@@ -6,9 +6,11 @@
 //! through the parent's existing barrier. The original equation is replayed.
 //!
 //! The bounded fragment uses distinct local arguments outside the captured
-//! metavariable context. Dropping an argument that a retained domain or result
-//! depends on is refused. Captured-argument, nonpattern and opaque cases keep
-//! their existing postponement behavior; this is not full Lean unification.
+//! metavariable context. A shared argument whose domain cannot be scoped in
+//! the residual is dropped along with its dependents, after checking the
+//! original argument types. An escaping result still refuses pruning. Captured-
+//! argument, nonpattern and opaque cases retain their postponement behavior;
+//! this is not full Lean unification.
 //!
 //! Distinct heads share the intersection of their local arguments, even when
 //! the argument orders or arities differ. The residual captures only their
@@ -109,20 +111,27 @@ impl Engine<'_> {
         {
             return Ok(false);
         }
-        let mut residual_type = left.result_type.clone();
-        for &index in retained.iter().rev() {
-            let (id, domain, style) = &left.binders[index];
-            self.scan(&residual_type)?;
-            residual_type = residual_type
-                .abstract_fvar(id, 0)
-                .map_err(|_| UnificationError::ExpressionScope)?;
-            residual_type = Expr::forall_e(id.0.clone(), domain.clone(), residual_type, *style);
-        }
-        // This also checks retained binder domains. In the dependent fragment,
-        // intersection is legal only when its entire telescope is well-scoped.
-        let free = self.scan(&residual_type)?.fvars;
-        if residual_type.has_loose_bvars() || free.iter().any(|id| !common.contains(id)) {
-            return Ok(false);
+        let mut residual_type = self.pruning_telescope(&left, &retained)?;
+        if !self.pruning_type_in_scope(&residual_type, &common)? {
+            // An intersection need not be dependency-closed: a shared x : A
+            // may outlive the private A on which its domain depends. Discard x
+            // (and any later argument depending on x), not the whole equation.
+            // Only this new fallback checks the argument types; the existing
+            // already-scoped path and its conversion behavior are unchanged.
+            let closed = self.dependency_closed_pruning(&left, &retained, &common)?;
+            if closed.len() == retained.len()
+                || !self.pruning_arguments_typed(&left, locals)?
+                || !self.pruning_arguments_typed(&right, locals)?
+            {
+                return Ok(false);
+            }
+            residual_type = self.pruning_telescope(&left, &closed)?;
+            // Domain dependencies may be dropped; a result dependency cannot.
+            // No type parameter or inhabitant is invented to repair an escape.
+            if !self.pruning_type_in_scope(&residual_type, &common)? {
+                return Ok(false);
+            }
+            retained = closed;
         }
         let assignments = if same_head { 1 } else { 2 };
         if self.generation().saturating_add(assignments) > self.budget.max_assignments {
@@ -168,6 +177,84 @@ impl Engine<'_> {
                 .map_err(UnificationError::Metavariable)?;
             self.awakened.extend(awakened);
             self.assigned.push(id);
+        }
+        Ok(true)
+    }
+
+    /// Keep the greatest syntactically dependency-closed subset of the shared
+    /// telescope, in its original order. A binder can depend only on earlier
+    /// binders or captured locals; omitting one therefore propagates forward.
+    fn dependency_closed_pruning(
+        &mut self,
+        pattern: &PruningPattern,
+        candidates: &[usize],
+        common: &LocalContext,
+    ) -> Result<Vec<usize>, UnificationError> {
+        let mut available = HashSet::new();
+        let mut closed = Vec::new();
+        for &index in candidates {
+            self.meter.node()?;
+            let (id, domain, _) = &pattern.binders[index];
+            let free = self.scan(domain)?.fvars;
+            let mut scoped = !domain.has_loose_bvars();
+            for dependency in &free {
+                self.meter.node()?;
+                scoped &= common.contains(dependency) || available.contains(dependency);
+            }
+            if scoped {
+                available.insert(id.clone());
+                closed.push(index);
+            }
+        }
+        Ok(closed)
+    }
+
+    fn pruning_telescope(
+        &mut self,
+        pattern: &PruningPattern,
+        retained: &[usize],
+    ) -> Result<Expr, UnificationError> {
+        let mut type_ = pattern.result_type.clone();
+        for &index in retained.iter().rev() {
+            let (id, domain, style) = &pattern.binders[index];
+            self.scan(&type_)?;
+            type_ = type_
+                .abstract_fvar(id, 0)
+                .map_err(|_| UnificationError::ExpressionScope)?;
+            type_ = Expr::forall_e(id.0.clone(), domain.clone(), type_, *style);
+        }
+        Ok(type_)
+    }
+
+    fn pruning_type_in_scope(
+        &mut self,
+        type_: &Expr,
+        common: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        let free = self.scan(type_)?.fvars;
+        Ok(!type_.has_loose_bvars() && free.iter().all(|id| common.contains(id)))
+    }
+
+    /// Erasing a dependent argument must not hide a malformed application.
+    /// For example, ?f A x = ?f B x with x : A and distinct local types A/B
+    /// is not licensed by assigning ?f a constant function. Check BOTH original
+    /// spines before the new fallback can erase that disagreement. This bounded
+    /// guard uses conversion without assignments; anything still unequal defers.
+    fn pruning_arguments_typed(
+        &mut self,
+        pattern: &PruningPattern,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        for (id, domain, _) in &pattern.binders {
+            self.meter.node()?;
+            let Some(local) = locals.find(id) else {
+                return Ok(false);
+            };
+            let expected = self.whnf(domain, locals)?;
+            let actual = self.whnf(&local.type_, locals)?;
+            if !same_terms(&expected, &actual, &mut self.meter)? {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
