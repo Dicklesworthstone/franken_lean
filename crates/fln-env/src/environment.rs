@@ -9,7 +9,10 @@
 //! separate **operational-metadata root** — two hosts producing the same trusted
 //! environment share a logical root even when their operational manifests differ.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::Expr;
@@ -300,10 +303,9 @@ impl PreparedDeclarationAdmission {
         // `CollisionBudget::max_expanded_weight` is now a `u64` limit and the numbers fit by
         // construction (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`). Deleting it
         // is how that bead proves it closed the gap instead of papering it.
-        let digests = env.digests.insert(
-            name.clone(),
-            NamedDigest::new(&name, self.provisional_digest),
-        );
+        let digests = env
+            .digests
+            .insert(name.clone(), NamedDigest::new(self.provisional_digest));
         env.constants
             .try_insert_with_budget(
                 name,
@@ -954,21 +956,42 @@ impl EnvironmentEntry {
     }
 }
 
-/// A constant's content digest with its name's canonical bytes, both computed once when the
-/// constant is inserted. [`Environment::logical_root`] sorts and streams these; building a
-/// map of freshly encoded names on every call was most of its cost.
-#[derive(Debug, Clone, PartialEq)]
+/// A constant's content digest, with a slot for its name's canonical bytes.
+/// [`Environment::logical_root`] sorts and streams those bytes; building a map of freshly
+/// encoded names on every call was most of its cost (d6534e44).
+///
+/// The bytes are encoded the first time `logical_root` asks, not at insertion. Insertion is
+/// on `fln_kernel::check`'s path, and the name encoder is identity hashing that
+/// `tcb_inventory` keeps out of the trust base: encoding at insertion put six functions inside
+/// it and pushed the reachable set over its declared budget. The slot is shared through an
+/// `Arc`, so the encoding happens once for every environment holding the entry, including
+/// the copies a persistent-map path copy makes.
+#[derive(Debug, Clone)]
 struct NamedDigest {
     digest: Digest,
-    canonical: Arc<[u8]>,
+    canonical: Arc<OnceLock<Arc<[u8]>>>,
 }
 
 impl NamedDigest {
-    fn new(name: &Name, digest: Digest) -> Self {
+    fn new(digest: Digest) -> Self {
         NamedDigest {
             digest,
-            canonical: name.to_canonical_bytes().into(),
+            canonical: Arc::default(),
         }
+    }
+
+    /// `name`'s canonical bytes; `name` is this entry's key.
+    fn canonical(&self, name: &Name) -> &[u8] {
+        self.canonical
+            .get_or_init(|| name.to_canonical_bytes().into())
+    }
+}
+
+/// Equal when the digests are: the canonical bytes are a function of the key, and whether
+/// they have been encoded yet is a cache state, not a property of the environment.
+impl PartialEq for NamedDigest {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
     }
 }
 
@@ -1027,7 +1050,7 @@ impl Environment {
         Ok(Environment {
             digests: self
                 .digests
-                .insert(name.clone(), NamedDigest::new(&name, entry.digest)),
+                .insert(name.clone(), NamedDigest::new(entry.digest)),
             constants: self.constants.insert(name, entry.info),
             extensions: self.extensions.clone(),
         })
@@ -1151,9 +1174,7 @@ impl Environment {
         }
         let digest = Environment::decl_content_digest(&info);
         Ok(Environment {
-            digests: self
-                .digests
-                .insert(name.clone(), NamedDigest::new(&name, digest)),
+            digests: self.digests.insert(name.clone(), NamedDigest::new(digest)),
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
         })
@@ -1210,7 +1231,7 @@ impl Environment {
         // longer anywhere local for either to go.
         let digests = self.digests.insert(
             name.clone(),
-            NamedDigest::new(&name, Environment::decl_content_digest(&info)),
+            NamedDigest::new(Environment::decl_content_digest(&info)),
         );
         self.constants
             .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
@@ -1616,13 +1637,14 @@ impl Environment {
     /// and nothing else (wall-clock, paths, and schedule have no way in).
     ///
     /// The same root as a [`fln_hash::root::LogicalRootBuilder`] given every declaration and
-    /// extension: both streams sorted by canonical name bytes, which every declaration carries
-    /// from its insertion, so no name is encoded and no map is built here.
+    /// extension: both streams sorted by canonical name bytes. A declaration's bytes are
+    /// encoded on the first call that needs them and kept with its digest, so later calls
+    /// encode no name and build no map.
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
         let mut decls: Vec<(&[u8], &Digest)> = self
             .digests
             .iter()
-            .map(|(_, named)| (&*named.canonical, &named.digest))
+            .map(|(name, named)| (named.canonical(name), &named.digest))
             .collect();
         decls.sort_unstable_by(|left, right| left.0.cmp(right.0));
         let mut extensions: Vec<(Vec<u8>, Digest)> = self
@@ -2627,6 +2649,37 @@ mod tests {
         for env in [&plain, &budgeted, &committed, &extended] {
             assert_eq!(env.logical_root(&options), recomputed(env, &options));
         }
+    }
+
+    /// The canonical-name slot is a cache. An environment whose slots `logical_root` has
+    /// filled equals one built the same way whose slots are still empty, a copy taken before
+    /// the fill gives the same root, and a successor of the filled environment equals one
+    /// built from scratch.
+    #[test]
+    fn filling_the_canonical_name_cache_changes_neither_equality_nor_the_root() {
+        let options = KVMap::new();
+        let build = |names: &[&str]| {
+            names.iter().fold(Environment::new(), |env, name| {
+                env.add_decl(axiom(name)).expect("a fresh name is admitted")
+            })
+        };
+        let filled = build(&["a", "b"]);
+        let copy_before_fill = filled.clone();
+        let never_filled = build(&["a", "b"]);
+        let root = filled.logical_root(&options);
+        assert_eq!(
+            filled, never_filled,
+            "a filled cache must not make environments unequal"
+        );
+        assert_eq!(copy_before_fill.logical_root(&options), root);
+        assert_eq!(never_filled.logical_root(&options), root);
+        let successor = filled.add_decl(axiom("c")).expect("adds");
+        let from_scratch = build(&["a", "b", "c"]);
+        assert_eq!(successor, from_scratch);
+        assert_eq!(
+            successor.logical_root(&options),
+            from_scratch.logical_root(&options)
+        );
     }
 
     #[test]
