@@ -1,0 +1,214 @@
+Subject: [PATCH] Integrate checked source partial definitions
+
+Reconciled with main ec6660ff. Preserve existing noncomputable isolation.
+Both the opaque interface and recursive executable declaration go through
+Engine::admit_declarations, which runs the existing two kernel checkers.
+No kernel rule, resource limit, workflow, or authentication code changes.
+Legacy single-declaration APIs refuse to silently drop required companions.
+The native partial, module, noncomputable, and erasure regressions passed.
+
+diff --git a/crates/fln-elab/src/source/recursion.rs b/crates/fln-elab/src/source/recursion.rs
+index 9e287aeb5f36895e107ba8c0604880bf1b65e932..20f30d596b8008597e278813bf72a25826fbe2fd 100644
+--- a/crates/fln-elab/src/source/recursion.rs
++++ b/crates/fln-elab/src/source/recursion.rs
+@@ -121,6 +121,9 @@ pub(super) struct StructuralHint<'a> {
+ }
+ 
+ pub(super) enum TerminationHint<'a> {
++    /// A source partial definition keeps a checked opaque logical interface
++    /// and a separately checked recursive executable body.
++    Partial,
+     Structural(StructuralHint<'a>),
+     /// Only safe definitions enter the structural-then-well-founded fallback.
+     Automatic,
+@@ -569,6 +572,18 @@ impl Context {
+     ) -> Result<Typed, NatDefinitionElabError> {
+         self.defining = Some(name.clone());
+         let snapshot = self.clone();
++        if matches!(hint, Some(TerminationHint::Partial)) {
++            // The self header must exist before tactics choose an alternative.
++            // Trying a body with an unknown self first can turn a successful
++            // recursive branch into a failure and silently choose another value.
++            let result = self.partial_definition_body(name, parameters, syntax, expected);
++            if result.is_err() {
++                let spent = self.txn.budget.heartbeats_consumed;
++                *self = snapshot;
++                self.txn.budget.heartbeats_consumed = spent;
++            }
++            return result;
++        }
+         match self.term(syntax, expected.clone()) {
+             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
+                 found,
+diff --git a/crates/fln-elab/src/source/scope.rs b/crates/fln-elab/src/source/scope.rs
+index 6deb294fb1277fd204add140d577b2007ebe8b68..86b45597a11465c2b962e2ce6d04e770b127cc05 100644
+--- a/crates/fln-elab/src/source/scope.rs
++++ b/crates/fln-elab/src/source/scope.rs
+@@ -505,6 +505,10 @@ impl Context {
+                     .well_founded
+                     .as_ref()
+                     .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
++                || self
++                    .partial_definition
++                    .as_ref()
++                    .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
+                 || (self.defining.as_ref() == Some(candidate) && !held_back_recursion(candidate))
+         };
+         // Locals first: the pin's `resolveLocalName` runs before `resolveGlobalName`
+diff --git a/crates/fln/src/lib.rs b/crates/fln/src/lib.rs
+index 9b7abcf9c36ec4a7180b61602f42ce2c953ae4b8..fc0f7471862e2092c08a89a7287f10c5d7f36c16 100644
+--- a/crates/fln/src/lib.rs
++++ b/crates/fln/src/lib.rs
+@@ -6846,16 +6846,17 @@ impl Engine {
+                     ),
+                 ))
+             })?;
++        let irreducible = elaborated.irreducible;
++        let declaration = elaborated
++            .into_single()
++            .map_err(DefinitionFrontendError::Elaborate)
++            .map_err(EngineExecutionError::Frontend)?;
+         let result = self
+-            .admit_declaration(elaborated.declaration, options, limits)
++            .admit_declaration(declaration, options, limits)
+             .map_err(EngineExecutionError::from)?;
+         Ok(match result {
+             Outcome::Complete(mut admitted) => {
+-                source_records::apply_admission_effects(
+-                    &mut admitted,
+-                    elaborated.irreducible,
+-                    options,
+-                )?;
++                source_records::apply_admission_effects(&mut admitted, irreducible, options)?;
+                 if let Some((name, priority)) = registration {
+                     // A proof instance is admitted as a theorem. Both it and
+                     // a data definition register the actual completed name,
+@@ -7914,6 +7915,7 @@ impl Engine {
+                         (
+                             fln_elab::source::ElaboratedDeclaration {
+                                 declaration,
++                                executable_companions: Vec::new(),
+                                 irreducible: false,
+                             },
+                             presentation,
+@@ -7959,6 +7961,7 @@ impl Engine {
+             };
+             let fln_elab::source::ElaboratedDeclaration {
+                 declaration,
++                executable_companions,
+                 irreducible,
+             } = elaborated;
+             // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
+@@ -8057,8 +8060,10 @@ impl Engine {
+                 || is_proof_definition
+                 || uses_sorry
+             {
++                let mut declarations = vec![declaration];
++                declarations.extend(executable_companions);
+                 let mut admission = match engine
+-                    .admit_declarations(&[declaration], options, limits.admission())
++                    .admit_declarations(&declarations, options, limits.admission())
+                     .map_err(|error| EngineExecutionError::BatchCommand {
+                         index: command_index,
+                         error: Box::new(error.into()),
+@@ -8711,14 +8716,15 @@ impl Engine {
+             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+         };
++        let irreducible = elaborated.irreducible;
++        let declaration = elaborated
++            .into_single()
++            .map_err(DefinitionFrontendError::Elaborate)
++            .map_err(EngineExecutionError::Frontend)?;
+         Ok(
+-            match self.execute_definition(elaborated.declaration, options, limits)? {
++            match self.execute_definition(declaration, options, limits)? {
+                 Outcome::Complete(mut execution) => {
+-                    source_records::apply_execution_effects(
+-                        &mut execution,
+-                        elaborated.irreducible,
+-                        options,
+-                    )?;
++                    source_records::apply_execution_effects(&mut execution, irreducible, options)?;
+                     Outcome::Complete(execution)
+                 }
+                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+diff --git a/crates/fln/src/source_records.rs b/crates/fln/src/source_records.rs
+index 3767b62b6f81ed7b0b7026a5bc313a8aa5243738..9bacc5e92fde4db3ee13da3b8a7f31b65da0a4c6 100644
+--- a/crates/fln/src/source_records.rs
++++ b/crates/fln/src/source_records.rs
+@@ -301,8 +301,11 @@ impl Engine {
+             return Ok(
+                 match public.admit_scoped_candidate(
+                     parsed.syntax(),
+-                    candidate,
+-                    false,
++                    fln_elab::source::ElaboratedDeclaration {
++                        declaration: candidate,
++                        executable_companions: Vec::new(),
++                        irreducible: false,
++                    },
+                     options,
+                     limits,
+                     public_scope,
+@@ -371,8 +374,11 @@ impl Engine {
+         Ok(
+             match public.admit_scoped_candidate(
+                 parsed.syntax(),
+-                interface,
+-                false,
++                fln_elab::source::ElaboratedDeclaration {
++                    declaration: interface,
++                    executable_companions: Vec::new(),
++                    irreducible: false,
++                },
+                 options,
+                 limits,
+                 public_scope,
+@@ -428,8 +434,7 @@ impl Engine {
+     fn admit_scoped_candidate(
+         &self,
+         syntax: &fln_syntax::tree::Syntax,
+-        declaration: Declaration,
+-        irreducible: bool,
++        elaborated: fln_elab::source::ElaboratedDeclaration,
+         options: &KVMap,
+         limits: EngineAdmissionLimits,
+         scope: &fln_elab::source::scope::SourceScope,
+@@ -468,8 +473,15 @@ impl Engine {
+                     ),
+                 ))
+             })?;
++        let fln_elab::source::ElaboratedDeclaration {
++            declaration,
++            executable_companions,
++            irreducible,
++        } = elaborated;
++        let mut declarations = vec![declaration];
++        declarations.extend(executable_companions);
+         let result = self
+-            .admit_declarations(&[declaration], options, limits)
++            .admit_declarations(&declarations, options, limits)
+             .map_err(EngineExecutionError::from)?;
+         Ok(match result {
+             Outcome::Complete(mut batch) => {
+@@ -768,6 +780,9 @@ impl Engine {
+         }
+         if !fln_elab::source::is_record(syntax) {
+             if scope != &fln_elab::source::scope::SourceScope::default()
++                || fln_elab::source::is_partial_definition(parsed.syntax())
++                    .map_err(DefinitionFrontendError::Elaborate)
++                    .map_err(EngineExecutionError::Frontend)?
+                 || fln_elab::source::instance_registration_is_local(parsed.syntax())
+                     .map_err(DefinitionFrontendError::Elaborate)
+                     .map_err(EngineExecutionError::Frontend)?
+@@ -786,8 +801,7 @@ impl Engine {
+                 };
+                 return self.admit_scoped_candidate(
+                     parsed.syntax(),
+-                    elaborated.declaration,
+-                    elaborated.irreducible,
++                    elaborated,
+                     options,
+                     limits,
+                     scope,
