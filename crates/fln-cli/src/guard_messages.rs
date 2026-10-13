@@ -11,7 +11,11 @@ pub(super) type Guards<'a> = std::collections::BTreeMap<usize, Buffer<'a>>;
 
 impl<'a> Buffer<'a> {
     pub fn new(spec: &'a GuardSpec) -> Self {
-        Self { spec, checked: Vec::new(), from_check: false }
+        Self {
+            spec,
+            checked: Vec::new(),
+            from_check: false,
+        }
     }
 
     /// False delegates to the original positioned/import-aware warning sink.
@@ -30,7 +34,8 @@ impl<'a> Buffer<'a> {
     pub fn info(&mut self, line: &str, from_check: bool, stdout: &mut String) {
         match self.spec.action(Severity::Info) {
             Action::Check => {
-                self.checked.push(super::guard_message("info", line.trim_end_matches('\n')));
+                self.checked
+                    .push(super::guard_message("info", line.trim_end_matches('\n')));
                 self.from_check |= from_check;
             }
             Action::Drop => {}
@@ -58,8 +63,13 @@ mod tests {
     use fln_parse::command_scope::guard_spec::Filter;
 
     fn spec(action: Action) -> GuardSpec {
-        GuardSpec { filters: vec![Filter { action, severity: Some(Severity::Info) }],
-            ..GuardSpec::default() }
+        GuardSpec {
+            filters: vec![Filter {
+                action,
+                severity: Some(Severity::Info),
+            }],
+            ..GuardSpec::default()
+        }
     }
 
     #[test]
@@ -72,9 +82,14 @@ mod tests {
             stdout.push_str("after\n");
             assert_eq!(buffer.from_check, action == Action::Check);
             assert_eq!(buffer.checked.len(), usize::from(action == Action::Check));
-            assert_eq!(stdout, if action == Action::Pass {
-                "before\nx : Nat\nafter\n"
-            } else { "before\nafter\n" });
+            assert_eq!(
+                stdout,
+                if action == Action::Pass {
+                    "before\nx : Nat\nafter\n"
+                } else {
+                    "before\nafter\n"
+                }
+            );
         }
     }
 
@@ -85,8 +100,11 @@ mod tests {
         let mut discarded = Vec::new();
         let mut stdout = String::new();
         let mut budget = crate::source_evaluation::FormattedOutputBudget::new(1);
-        let result = budget.append("a message too large", &mut stdout,
-            buffer.evaluation_target(&mut discarded));
+        let result = budget.append(
+            "a message too large",
+            &mut stdout,
+            buffer.evaluation_target(&mut discarded),
+        );
         assert!(result.is_err());
         assert!(stdout.is_empty() && buffer.checked.is_empty());
     }

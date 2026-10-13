@@ -10,6 +10,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
+mod guard_filter_tests;
+mod guard_messages;
+#[cfg(test)]
 mod guard_spec_tests;
 mod lake_build;
 mod output;
@@ -11987,11 +11990,12 @@ pub(crate) enum WarningSink<'a> {
 fn emit_lean_warning(
     warning: &fln::SourceWarning,
     sink: WarningSink<'_>,
-    guarded: &mut std::collections::BTreeMap<usize, (Vec<String>, bool)>,
+    guarded: &mut guard_messages::Guards<'_>,
     stdout: &mut String,
 ) -> Result<(), MultiplexerOutput> {
-    if let Some((messages, _)) = guarded.get_mut(&warning.command_index) {
-        messages.push(guard_message("warning", &warning.message));
+    if let Some(guard) = guarded.get_mut(&warning.command_index)
+        && guard.warning(&warning.message)
+    {
         return Ok(());
     }
     match sink {
@@ -12069,11 +12073,39 @@ fn render_lean_source_commands(
     // `#guard_msgs` (bead `fln-guard-msgs-lls1`): a guarded command's messages are collected
     // as the pin's `messageToString` renders them and judged below, never printed.
     // Each guard's messages, and whether a `#check` rendering is among them.
-    let mut guarded: std::collections::BTreeMap<usize, (Vec<String>, bool)> = completed
-        .guards
-        .iter()
-        .map(|guard| (guard.command_index, (Vec::new(), false)))
-        .collect();
+    let mut guarded = guard_messages::Guards::new();
+    for guard in &completed.guards {
+        if guard.command_index >= completed.command_count
+            || guarded.contains_key(&guard.command_index)
+        {
+            return source_failure(
+                "internal-fault",
+                "duplicate or out-of-range message guard",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        }
+        // Defensive checks for callers retaining or constructing public batches.
+        if guard.spec.positions
+            || guard
+                .spec
+                .action(fln_parse::command_scope::guard_spec::Severity::Error)
+                == fln_parse::command_scope::guard_spec::Action::Drop
+        {
+            return source_failure(
+                "capability",
+                "message positions and dropping error messages are not implemented",
+                false,
+                SourcePresentation::Lean,
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            );
+        }
+        guarded.insert(
+            guard.command_index,
+            guard_messages::Buffer::new(&guard.spec),
+        );
+    }
     // Warnings interleave with the outputs in command order, as the pin logs them.
     let mut warnings = completed.warnings.iter().peekable();
     for output in &completed.outputs {
@@ -12156,9 +12188,11 @@ fn render_lean_source_commands(
                     Some(source_evaluation::PresentedEvaluation::Text(text)) => {
                         // Repr/ToString already constructed the pure or IO result
                         // Format. Apply the same bounded exact-text presentation.
-                        let messages = guarded
-                            .get_mut(&command_index)
-                            .map(|(messages, _)| messages);
+                        let mut discarded = Vec::new();
+                        let messages = match guarded.get_mut(&command_index) {
+                            Some(guard) => guard.evaluation_target(&mut discarded),
+                            None => None,
+                        };
                         if let Err(error) = formatted_output.append(&text, &mut stdout, messages) {
                             return error.failure(command_index, SourcePresentation::Lean);
                         }
@@ -12182,15 +12216,13 @@ fn render_lean_source_commands(
                     }
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
-                if let Some((messages, _)) = guarded.get_mut(&command_index) {
+                if let Some(guard) = guarded.get_mut(&command_index) {
                     // An IO action's output was written while it ran, not returned here.
                     if matches!(value, SourceFinalValue::IoUnit) {
                         return io_guard_refusal(command_index);
                     }
                     match lean_evaluation_line(command_index, &value) {
-                        Ok(line) => {
-                            messages.push(guard_message("info", line.trim_end_matches('\n')))
-                        }
+                        Ok(line) => guard.info(&line, false, &mut stdout),
                         Err(refused) => return refused,
                     }
                     continue;
@@ -12247,9 +12279,8 @@ fn render_lean_source_commands(
                     Err(error) => return error,
                 };
                 // A guarded `#check` contributes the line this door prints for it.
-                if let Some((messages, from_check)) = guarded.get_mut(&command_index) {
-                    messages.push(guard_message("info", line.trim_end_matches('\n')));
-                    *from_check = true;
+                if let Some(guard) = guarded.get_mut(&command_index) {
+                    guard.info(&line, true, &mut stdout);
                     continue;
                 }
                 stdout.push_str(&line);
@@ -12264,8 +12295,17 @@ fn render_lean_source_commands(
     // The pin sorts individual messages before joining and trimming, then applies the
     // selected whitespace and substring policy. No policy changes execution authority.
     for guard in &completed.guards {
-        let (messages, from_check) = guarded.remove(&guard.command_index).unwrap_or_default();
-        let produced = guard.spec.combine(messages);
+        let Some(messages) = guarded.remove(&guard.command_index) else {
+            return source_failure(
+                "internal-fault",
+                "message guard lost its collector",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        };
+        let from_check = messages.from_check;
+        let produced = guard.spec.combine(messages.checked);
         if !guard.spec.matches(&guard.expected, &produced) {
             // This door's `#check` line is the pin's on the shapes measured, but its pretty
             // printer is not proven equal to the pin's in general: a mismatch there may be

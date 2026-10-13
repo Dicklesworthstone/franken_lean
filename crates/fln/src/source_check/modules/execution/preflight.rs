@@ -227,9 +227,8 @@ mod tests {
             name: &name,
             source: source.as_bytes(),
         };
-        let admission = crate::EngineAdmissionLimits::new(crate::Budget::for_stack_bytes(
-            2 * 1024 * 1024,
-        ));
+        let admission =
+            crate::EngineAdmissionLimits::new(crate::Budget::for_stack_bytes(2 * 1024 * 1024));
         check(
             &[input],
             SourceModuleCheckLimits::new(SourceCheckLimits::new(admission)),

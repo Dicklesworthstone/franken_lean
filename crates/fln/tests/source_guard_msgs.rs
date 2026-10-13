@@ -67,7 +67,7 @@ fn doors_without_a_judge_and_unjudgeable_guards_are_not_implemented() {
     for source in [
         "/-- error: boom -/\n#guard_msgs in\n#eval 2 + 2\n",
         "/-- warning: unused -/\n#guard_msgs in\ndef x : Nat := 1\n",
-        "/-- info: 4 -/\n#guard_msgs (drop warning) in\n#eval 2 + 2\n",
+        "/-- info: 4 -/\n#guard_msgs (drop error) in\n#eval 2 + 2\n",
         "#guard_msgs in\n#guard_msgs in\n#eval 2 + 2\n",
     ] {
         let error = engine

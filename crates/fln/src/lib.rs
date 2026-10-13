@@ -7509,10 +7509,12 @@ impl Engine {
                         if spec.positions {
                             return Err(not_implemented("`#guard_msgs` with message positions"));
                         }
-                        if !spec.filters.is_empty() {
-                            return Err(not_implemented(
-                                "`#guard_msgs` with a filtering specification",
-                            ));
+                        // We cannot recover and reproduce failed command diagnostics yet.
+                        // Never implement `drop error` by ignoring a failed computation.
+                        if spec.action(fln_parse::command_scope::guard_spec::Severity::Error)
+                            == fln_parse::command_scope::guard_spec::Action::Drop
+                        {
+                            return Err(not_implemented("`#guard_msgs` dropping error messages"));
                         }
                         if guards
                             .last()

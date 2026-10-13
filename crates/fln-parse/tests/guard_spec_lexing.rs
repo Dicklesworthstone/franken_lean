@@ -1,8 +1,12 @@
 //! Real lexer/header boundaries for native message specifications.
-use fln_parse::command_scope::{self, ScopeCommand, guard_spec::{self, Action, Severity, Whitespace}};
+use fln_parse::command_scope::{
+    self, ScopeCommand,
+    guard_spec::{self, Action, Severity, Whitespace},
+};
 
 fn parsed(source: &str) -> Result<guard_spec::GuardSpec, fln_parse::DefinitionParseError> {
-    let ScopeCommand::GuardMsgs { body, .. } = command_scope::parse(source.as_bytes())?.unwrap() else {
+    let ScopeCommand::GuardMsgs { body, .. } = command_scope::parse(source.as_bytes())?.unwrap()
+    else {
         panic!("not a guard: {source}");
     };
     assert!(source[body..].starts_with("#eval"));
@@ -26,14 +30,23 @@ fn comments_unicode_and_crlf_preserve_the_guarded_body() {
 
 #[test]
 fn no_spec_and_empty_spec_have_identical_defaults() {
-    assert_eq!(parsed("#guard_msgs in\n#eval 4\n").unwrap(),
-        parsed("#guard_msgs () in\n#eval 4\n").unwrap());
+    assert_eq!(
+        parsed("#guard_msgs in\n#eval 4\n").unwrap(),
+        parsed("#guard_msgs () in\n#eval 4\n").unwrap()
+    );
 }
 
 #[test]
 fn malformed_specifications_are_not_silently_replaced_with_defaults() {
-    for spec in ["whitespace := wide", "substring := 1", "drop infos", "info warning",
-        "unknown := true", "info,", "whitespace := exact, whitespace := invalid"] {
+    for spec in [
+        "whitespace := wide",
+        "substring := 1",
+        "drop infos",
+        "info warning",
+        "unknown := true",
+        "info,",
+        "whitespace := exact, whitespace := invalid",
+    ] {
         let source = format!("/-- info: 4 -/\n#guard_msgs ({spec}) in\n#eval 4\n");
         assert!(parsed(&source).is_err(), "{source}");
     }
