@@ -2,6 +2,7 @@
 //! declaration parser; this layer partitions original bytes without rewriting.
 use super::*;
 pub mod attributes;
+pub mod guard_spec;
 pub mod imports;
 pub mod instances;
 pub mod modifiers;

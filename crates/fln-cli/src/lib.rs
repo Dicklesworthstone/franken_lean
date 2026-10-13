@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod guard_spec_tests;
 mod lake_build;
 mod output;
 mod source_check;
@@ -12186,14 +12188,12 @@ fn render_lean_source_commands(
             return failure;
         }
     }
-    // The pin's `elabGuardMsgs`, default spec: the checked messages joined by `---\n` and
-    // ASCII-trimmed, compared with the expected text after `WhitespaceMode.normalized`
-    // (line breaks become spaces). A pass prints nothing; a failure is the pin's error.
+    // The pin sorts individual messages before joining and trimming, then applies the
+    // selected whitespace and substring policy. No policy changes execution authority.
     for guard in &completed.guards {
         let (messages, from_check) = guarded.remove(&guard.command_index).unwrap_or_default();
-        let joined = messages.join("---\n");
-        let produced = joined.trim_ascii();
-        if guard.expected.replace('\n', " ") != produced.replace('\n', " ") {
+        let produced = guard.spec.combine(messages);
+        if !guard.spec.matches(&guard.expected, &produced) {
             // This door's `#check` line is the pin's on the shapes measured, but its pretty
             // printer is not proven equal to the pin's in general: a mismatch there may be
             // this rendering, so it is a non-answer, never a rejection.

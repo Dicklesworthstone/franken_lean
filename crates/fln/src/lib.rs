@@ -7443,8 +7443,8 @@ impl Engine {
                     }
                     // The guarded command runs as written, as the pin's `runAndCollectMessages`
                     // runs it; its messages are judged by the presentation, against `expected`.
-                    // A spec (`(drop …)`, `(whitespace := …)`, …) is not read, and a guard inside
-                    // a guard would judge one command twice: both are refused, never ignored.
+                    // Retain the parsed policy for the judge. A nested guard and unavailable
+                    // message sources remain explicit capability refusals.
                     ScopeCommand::GuardMsgs {
                         expected,
                         specified,
@@ -7482,8 +7482,31 @@ impl Engine {
                                 at: Some(original_offset),
                             });
                         }
-                        if specified {
-                            return Err(not_implemented("`#guard_msgs` with a specification"));
+                        let spec = if specified {
+                            grammar
+                                .enter(|| {
+                                    fln_parse::command_scope::guard_spec::parse(
+                                        command_source,
+                                        body,
+                                    )
+                                })
+                                .map_err(|error| EngineExecutionError::BatchCommand {
+                                    index: command_index,
+                                    error: Box::new(EngineExecutionError::Frontend(
+                                        DefinitionFrontendError::Parse(error),
+                                    )),
+                                    at: Some(original_offset),
+                                })?
+                        } else {
+                            fln_parse::command_scope::guard_spec::GuardSpec::default()
+                        };
+                        if spec.positions {
+                            return Err(not_implemented("`#guard_msgs` with message positions"));
+                        }
+                        if !spec.filters.is_empty() {
+                            return Err(not_implemented(
+                                "`#guard_msgs` with a filtering specification",
+                            ));
                         }
                         if guards
                             .last()
@@ -7509,6 +7532,7 @@ impl Engine {
                         guards.push(SourceGuard {
                             command_index,
                             expected,
+                            spec,
                         });
                         queue.push_front(Step::Command(
                             command_index,
@@ -11786,6 +11810,8 @@ pub fn constant_uses_sorry(info: &ConstantInfo) -> bool {
 pub struct SourceGuard {
     pub command_index: usize,
     pub expected: String,
+    /// Parsed comparison/filter policy, retained for the presentation that judges messages.
+    pub spec: fln_parse::command_scope::guard_spec::GuardSpec,
 }
 
 /// A closed dependency graph followed by its selected entry command stream.

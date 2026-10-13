@@ -42,6 +42,7 @@ fn guards_are_reported_at_their_commands_and_the_command_still_runs() {
         [SourceGuard {
             command_index: 1,
             expected: "info: 4".to_owned(),
+            spec: Default::default(),
         }]
     );
     assert_eq!(completed.execution_command_indices, [0, 1, 2]);

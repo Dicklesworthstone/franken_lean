@@ -3,14 +3,25 @@
 //! Mirrors `Lean/Elab/GuardMsgs.lean`: the first filter and first occurrence
 //! of an option win. Unmatched severities pass only when a filter is present.
 //! Parsing a specification grants no authority to capture unavailable messages.
-use super::{tokens, BytePos, DefinitionParseError, NatDefinitionExpectation,
-    NatDefinitionParseError, SourceText, SourceView};
+use super::{
+    BytePos, DefinitionParseError, NatDefinitionExpectation, NatDefinitionParseError, SourceText,
+    SourceView, tokens,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action { Check, Drop, Pass }
+pub enum Action {
+    Check,
+    Drop,
+    Pass,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity { Info, Warning, Error, Trace }
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+    Trace,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Filter {
@@ -20,7 +31,12 @@ pub struct Filter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Whitespace { Exact, #[default] Normalized, Lax }
+pub enum Whitespace {
+    Exact,
+    #[default]
+    Normalized,
+    Lax,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GuardSpec {
@@ -33,10 +49,17 @@ pub struct GuardSpec {
 
 impl GuardSpec {
     pub fn action(&self, severity: Severity) -> Action {
-        self.filters.iter()
+        self.filters
+            .iter()
             .find(|filter| filter.severity.is_none_or(|selected| selected == severity))
             .map_or_else(
-                || if self.filters.is_empty() { Action::Check } else { Action::Pass },
+                || {
+                    if self.filters.is_empty() {
+                        Action::Check
+                    } else {
+                        Action::Pass
+                    }
+                },
                 |filter| filter.action,
             )
     }
@@ -44,7 +67,9 @@ impl GuardSpec {
     /// Messages already carry their severity and final newline. Sort before
     /// joining, not after normalization; retain duplicate messages.
     pub fn combine(&self, mut messages: Vec<String>) -> String {
-        if self.sorted { messages.sort(); }
+        if self.sorted {
+            messages.sort();
+        }
         messages.join("---\n").trim_ascii().to_owned()
     }
 
@@ -52,7 +77,11 @@ impl GuardSpec {
     pub fn matches(&self, expected: &str, produced: &str) -> bool {
         let expected = self.whitespace.apply(expected);
         let produced = self.whitespace.apply(produced);
-        if self.substring { produced.contains(&expected) } else { expected == produced }
+        if self.substring {
+            produced.contains(&expected)
+        } else {
+            expected == produced
+        }
     }
 }
 
@@ -63,8 +92,11 @@ impl Whitespace {
             Self::Normalized => text.replace('\n', " "),
             // The pin's Char.isWhitespace is NOT Unicode whitespace and does
             // not include vertical tab or form feed (Init/Data/Char/Basic.lean).
-            Self::Lax => text.split([' ', '\t', '\r', '\n'])
-                .filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" "),
+            Self::Lax => text
+                .split([' ', '\t', '\r', '\n'])
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
         }
     }
 }
@@ -74,7 +106,8 @@ impl Whitespace {
 /// are not lexed again, so an extension in the guarded command is irrelevant.
 pub fn parse(source: &[u8], body: usize) -> Result<GuardSpec, DefinitionParseError> {
     let bad_offset = |at| NatDefinitionParseError::OutsideSeedGrammar {
-        at: BytePos(at), expected: NatDefinitionExpectation::EndOfCommand,
+        at: BytePos(at),
+        expected: NatDefinitionExpectation::EndOfCommand,
     };
     let header = source.get(..body).ok_or_else(|| bad_offset(source.len()))?;
     let original = SourceText::from_utf8(header).map_err(NatDefinitionParseError::Source)?;
@@ -82,19 +115,29 @@ pub fn parse(source: &[u8], body: usize) -> Result<GuardSpec, DefinitionParseErr
     let lexed = tokens(&view)?;
     let mut words = Vec::with_capacity(lexed.len());
     for token in &lexed {
-        words.push(view.normalized().as_str()
-            .get(token.extent.start().0..token.extent.end().0)
-            .ok_or_else(|| bad_offset(view.to_original(token.extent.start()).0))?);
+        words.push(
+            view.normalized()
+                .as_str()
+                .get(token.extent.start().0..token.extent.end().0)
+                .ok_or_else(|| bad_offset(view.to_original(token.extent.start()).0))?,
+        );
     }
     let mut at = usize::from(words.first().is_some_and(|word| word.starts_with("/--")));
     let result = parse_words(&words, &mut at);
-    result.map_err(|index| bad_offset(lexed.get(index)
-        .map_or(body, |token| view.to_original(token.extent.start()).0)))
+    result.map_err(|index| {
+        bad_offset(
+            lexed
+                .get(index)
+                .map_or(body, |token| view.to_original(token.extent.start()).0),
+        )
+    })
 }
 
 fn parse_words(words: &[&str], at: &mut usize) -> Result<GuardSpec, usize> {
     fn take(words: &[&str], at: &mut usize, wanted: &str) -> Result<(), usize> {
-        if words.get(*at) != Some(&wanted) { return Err(*at); }
+        if words.get(*at) != Some(&wanted) {
+            return Err(*at);
+        }
         *at += 1;
         Ok(())
     }
@@ -108,8 +151,11 @@ fn parse_words(words: &[&str], at: &mut usize) -> Result<GuardSpec, usize> {
                 let key = *words.get(*at).ok_or(*at)?;
                 *at += 1;
                 let option = match key {
-                    "whitespace" => Some(0), "ordering" => Some(1),
-                    "positions" => Some(2), "substring" => Some(3), _ => None,
+                    "whitespace" => Some(0),
+                    "ordering" => Some(1),
+                    "positions" => Some(2),
+                    "substring" => Some(3),
+                    _ => None,
                 };
                 if let Some(slot) = option {
                     take(words, at, ":=")?;
@@ -126,12 +172,17 @@ fn parse_words(words: &[&str], at: &mut usize) -> Result<GuardSpec, usize> {
                             }
                         }
                         (1, "exact" | "sorted") => {
-                            if !seen[slot] { spec.sorted = value == "sorted"; }
+                            if !seen[slot] {
+                                spec.sorted = value == "sorted";
+                            }
                         }
                         (2 | 3, "true" | "false") => {
                             if !seen[slot] {
-                                if slot == 2 { spec.positions = value == "true"; }
-                                else { spec.substring = value == "true"; }
+                                if slot == 2 {
+                                    spec.positions = value == "true";
+                                } else {
+                                    spec.substring = value == "true";
+                                }
                             }
                         }
                         _ => return Err(*at),
@@ -140,22 +191,34 @@ fn parse_words(words: &[&str], at: &mut usize) -> Result<GuardSpec, usize> {
                     *at += 1;
                 } else {
                     let action = match key {
-                        "check" => Some(Action::Check), "drop" => Some(Action::Drop),
-                        "pass" => Some(Action::Pass), _ => None,
+                        "check" => Some(Action::Check),
+                        "drop" => Some(Action::Drop),
+                        "pass" => Some(Action::Pass),
+                        _ => None,
                     };
                     let severity = if action.is_some() {
                         let word = *words.get(*at).ok_or(*at)?;
                         *at += 1;
                         word
-                    } else { key };
-                    let severity = match severity {
-                        "all" => None, "info" => Some(Severity::Info),
-                        "warning" => Some(Severity::Warning), "error" => Some(Severity::Error),
-                        "trace" => Some(Severity::Trace), _ => return Err(*at - 1),
+                    } else {
+                        key
                     };
-                    spec.filters.push(Filter { action: action.unwrap_or(Action::Check), severity });
+                    let severity = match severity {
+                        "all" => None,
+                        "info" => Some(Severity::Info),
+                        "warning" => Some(Severity::Warning),
+                        "error" => Some(Severity::Error),
+                        "trace" => Some(Severity::Trace),
+                        _ => return Err(*at - 1),
+                    };
+                    spec.filters.push(Filter {
+                        action: action.unwrap_or(Action::Check),
+                        severity,
+                    });
                 }
-                if words.get(*at) == Some(&")") { break; }
+                if words.get(*at) == Some(&")") {
+                    break;
+                }
                 take(words, at, ",")?;
                 // A separator requires another element; no silently skipped tokens.
             }
@@ -163,7 +226,9 @@ fn parse_words(words: &[&str], at: &mut usize) -> Result<GuardSpec, usize> {
         take(words, at, ")")?;
     }
     take(words, at, "in")?;
-    if *at != words.len() { return Err(*at); }
+    if *at != words.len() {
+        return Err(*at);
+    }
     Ok(spec)
 }
 
@@ -181,10 +246,40 @@ mod tests {
     #[test]
     fn defaults_and_first_occurrence_are_the_pins() {
         assert_eq!(read(&[]).unwrap(), GuardSpec::default());
-        let spec = read(&["whitespace", ":=", "exact", ",", "whitespace", ":=", "lax",
-            ",", "ordering", ":=", "sorted", ",", "ordering", ":=", "exact",
-            ",", "substring", ":=", "true", ",", "substring", ":=", "false",
-            ",", "positions", ":=", "false", ",", "positions", ":=", "true"]).unwrap();
+        let spec = read(&[
+            "whitespace",
+            ":=",
+            "exact",
+            ",",
+            "whitespace",
+            ":=",
+            "lax",
+            ",",
+            "ordering",
+            ":=",
+            "sorted",
+            ",",
+            "ordering",
+            ":=",
+            "exact",
+            ",",
+            "substring",
+            ":=",
+            "true",
+            ",",
+            "substring",
+            ":=",
+            "false",
+            ",",
+            "positions",
+            ":=",
+            "false",
+            ",",
+            "positions",
+            ":=",
+            "true",
+        ])
+        .unwrap();
         assert_eq!(spec.whitespace, Whitespace::Exact);
         assert!(spec.sorted && spec.substring && !spec.positions);
         assert_eq!(spec.action(Severity::Warning), Action::Check);
@@ -205,8 +300,14 @@ mod tests {
     #[test]
     fn modes_sort_whole_messages_and_retain_duplicates() {
         let spec = read(&["ordering", ":=", "sorted"]).unwrap();
-        assert_eq!(spec.combine(vec!["info: z\n".into(), "info: a\n".into(), "info: a\n".into()]),
-            "info: a\n---\ninfo: a\n---\ninfo: z");
+        assert_eq!(
+            spec.combine(vec![
+                "info: z\n".into(),
+                "info: a\n".into(),
+                "info: a\n".into()
+            ]),
+            "info: a\n---\ninfo: a\n---\ninfo: z"
+        );
         assert!(spec.matches("info: a b", "info: a\nb"));
         assert!(!spec.matches("info: a b", "info: a  b"));
         let exact = read(&["whitespace", ":=", "exact"]).unwrap();
@@ -224,11 +325,26 @@ mod tests {
     #[test]
     fn malformed_and_unknown_specifications_are_not_defaults() {
         for words in [
-            vec!["whitespace", ":=", "other"], vec!["substring", ":=", "1"],
-            vec!["unknown", ":=", "true"], vec!["drop"], vec!["drop", "other"],
-            vec!["info", "warning"], vec!["info", ","], vec![","],
-            vec!["whitespace", ":=", "exact", ",", "whitespace", ":=", "unknown"],
+            vec!["whitespace", ":=", "other"],
+            vec!["substring", ":=", "1"],
+            vec!["unknown", ":=", "true"],
+            vec!["drop"],
+            vec!["drop", "other"],
+            vec!["info", "warning"],
+            vec!["info", ","],
+            vec![","],
+            vec![
+                "whitespace",
+                ":=",
+                "exact",
+                ",",
+                "whitespace",
+                ":=",
+                "unknown",
+            ],
             vec!["(", ")"],
-        ] { assert!(read(&words).is_err(), "{words:?}"); }
+        ] {
+            assert!(read(&words).is_err(), "{words:?}");
+        }
     }
 }
