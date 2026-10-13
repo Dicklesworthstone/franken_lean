@@ -286,6 +286,9 @@ impl Context {
                 )));
             }
         }
+        if let Some(group) = self.partial.as_mut().and_then(|state| state.group.as_mut()) {
+            group.captures = selected.clone();
+        }
         Ok(selected)
     }
 

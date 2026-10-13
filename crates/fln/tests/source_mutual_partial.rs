@@ -211,7 +211,7 @@ end
 }
 
 #[test]
-fn companion_collisions_and_unavailable_capture_telescopes_are_explicit_refusals() {
+fn companion_collisions_refuse_and_unused_section_variables_preserve_arity() {
     let base = checked(&engine(), "def pong._unsafe_rec (n : Nat) : Nat := n");
     refuses(&base, CYCLE);
     assert!(
@@ -220,12 +220,14 @@ fn companion_collisions_and_unavailable_capture_telescopes_are_explicit_refusals
             .contains(&Name::from_components(["ping"]))
     );
     run(&base, "#eval pong._unsafe_rec 19", "19");
-    // Section capture closure across the SCC is not yet implemented. No
-    // accidental free local or extra public parameter is silently accepted.
-    refuses(
+    // An unused section variable is not an extra public argument. The
+    // group's ordinary arity and its recursive execution are preserved.
+    let captured = checked(
         &engine(),
         &format!("section\nvariable (offset : Nat)\n{CYCLE}end"),
     );
+    run(&captured, "#eval ping 5", "13");
+    refuses(&captured, "theorem invalid : ping 0 = 7 := by rfl");
 }
 
 #[test]

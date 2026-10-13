@@ -2,7 +2,7 @@
 //! axioms; every recursive occurrence is a typed private local until closure.
 //! The pin partitions dependencies into SCCs before choosing partial/nonrec.
 use super::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Default)]
 pub(in crate::source) struct Group {
@@ -10,6 +10,9 @@ pub(in crate::source) struct Group {
     pub header_only: bool,
     headers: Vec<ConstantVal>,
     calls: Vec<(FVarId, Expr)>,
+    /// The exact identities closed by the current declaration, never guessed
+    /// from binder names (which may be shadowed by ordinary parameters).
+    pub captures: Vec<LocalDecl>,
 }
 
 fn refusal(expected: &'static str) -> NatDefinitionElabError {
@@ -27,12 +30,21 @@ pub fn elaborate_group(
     if members.is_empty() || members.len() > 8 {
         return Err(refusal("one to eight mutual partial definitions"));
     }
-    // A shared capture telescope needs the union of every member's used section
-    // variables, not separate per-body selection. Refuse until that is available.
-    if !scope.variables.is_empty() {
-        return Err(refusal("explicit parameters on mutual partial definitions"));
-    }
     let mut meter = Context::scoped(environment, kernel, scope);
+    // Section locals have one meaning throughout the group. Their universes
+    // cannot be independently instantiated at a peer occurrence. Declaration-
+    // local polymorphism remains fresh at each occurrence as before.
+    let section_types: Vec<_> = scope
+        .variables
+        .locals()
+        .decls()
+        .iter()
+        .map(|local| local.type_.clone())
+        .collect();
+    let fixed_levels: BTreeSet<_> = meter
+        .declaration_levels(&section_types)?
+        .into_iter()
+        .collect();
     let mut names = Vec::new();
     let mut scopes = Vec::new();
     let mut reserved = HashSet::new();
@@ -86,18 +98,26 @@ pub fn elaborate_group(
             ..State::default()
         });
         // This header-only return is just data. It NEVER enters an Environment.
-        let Declaration::Axiom(header) = definition_in_context(member, &mut context)? else {
+        let Declaration::Axiom(mut header) = definition_in_context(member, &mut context)? else {
             return Err(refusal("a complete mutual partial header"));
         };
+        // Reopen precisely the section prefix. Peer references see the written
+        // parameters, not the later implicit closure-conversion arguments.
+        reopen_captures(&mut context, &mut header.base.type_, None)?;
+        header
+            .base
+            .level_params
+            .retain(|level| !fixed_levels.contains(level));
         meter.txn.budget = context.txn.budget;
         headers.push(header.base);
     }
     let group = Group {
         names: names.clone(),
-        headers,
+        headers: headers.clone(),
         ..Group::default()
     };
     let mut bodies = Vec::new();
+    let mut universes = Vec::new();
     for (member, scope) in members.iter().zip(&scopes) {
         let mut context = Context::scoped(environment, kernel, scope);
         context.txn.budget = meter.txn.budget.clone();
@@ -111,8 +131,15 @@ pub fn elaborate_group(
         if body.len() != 1 {
             return Err(refusal("one body per mutual partial definition"));
         }
+        let mut body = body.pop().expect("one body");
+        reopen_captures(&mut context, &mut body.base.type_, Some(&mut body.value))?;
+        universes.push((context.level_params.clone(), context.explicit_levels));
         meter.txn.budget = context.txn.budget;
-        bodies.push(body.pop().expect("one body"));
+        bodies.push(body);
+    }
+
+    if !scope.variables.is_empty() {
+        close_shared_captures(&mut meter, &headers, &mut bodies, &universes, &fixed_levels)?;
     }
 
     let executable: Vec<_> = names
@@ -179,13 +206,15 @@ pub fn elaborate_group(
         for &index in &component {
             meter.tick()?;
             let mut definition = bodies[index].clone();
-            definition.value = map(&mut meter, &definition.value, &|expr| {
+            definition.value = map(&mut meter, &definition.value, &|_, expr| {
                 let ExprNode::Const { name, levels } = expr.node() else {
-                    return None;
+                    return Ok(None);
                 };
-                let target = executable.iter().position(|candidate| candidate == name)?;
-                (!recursive || !component.contains(&target))
-                    .then(|| Expr::const_(names[target].clone(), levels.clone()))
+                let Some(target) = executable.iter().position(|candidate| candidate == name) else {
+                    return Ok(None);
+                };
+                Ok((!recursive || !component.contains(&target))
+                    .then(|| Expr::const_(names[target].clone(), levels.clone())))
             })?;
             if recursive {
                 if !matches!(
@@ -277,12 +306,153 @@ impl Context {
         let calls: HashMap<_, _> = group.calls.iter().cloned().collect();
         // The signature must not depend on a recursive function. Closing only
         // values lets the existing free-variable guard reject such a signature.
-        term.value = map(self, &term.value, &|expr| match expr.node() {
-            ExprNode::FVar { id } => calls.get(id).cloned(),
-            _ => None,
+        term.value = map(self, &term.value, &|_, expr| {
+            Ok(match expr.node() {
+                ExprNode::FVar { id } => calls.get(id).cloned(),
+                _ => None,
+            })
         })?;
         Ok(())
     }
+}
+
+/// Individual declaration elaboration already checks and closes its selected
+/// section variables. Reopen that exact prefix as private candidate data so
+/// the group can compute a common, dependency-closed telescope afterwards.
+fn reopen_captures(
+    context: &mut Context,
+    type_: &mut Expr,
+    mut value: Option<&mut Expr>,
+) -> Result<(), NatDefinitionElabError> {
+    let captures = context
+        .partial
+        .as_ref()
+        .and_then(|state| state.group.as_ref())
+        .ok_or_else(|| failure(SourceInferenceError::Scope))?
+        .captures
+        .clone();
+    for local in captures {
+        context.tick()?;
+        let ExprNode::ForallE {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = type_.node()
+        else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        if binder_type != &local.type_ || binder_info != &local.binder_info {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        *type_ = context.substitute(body, &Expr::fvar(local.id.clone()))?;
+        if let Some(value) = &mut value {
+            let ExprNode::Lam {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = value.node()
+            else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            if binder_type != &local.type_ || binder_info != &local.binder_info {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            **value = context.substitute(body, &Expr::fvar(local.id.clone()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The pin's MutualClosure closes every main definition over the same used
+/// section variables *before* dependency partitioning. A peer-only dependency
+/// is therefore captured by its callers without exposing extra source args.
+fn close_shared_captures(
+    context: &mut Context,
+    headers: &[ConstantVal],
+    bodies: &mut [DefinitionVal],
+    universes: &[(Vec<Name>, usize)],
+    fixed_levels: &BTreeSet<Name>,
+) -> Result<(), NatDefinitionElabError> {
+    let mut roots = Vec::new();
+    for body in bodies.iter() {
+        context.tick()?;
+        roots.extend([body.base.type_.clone(), body.value.clone()]);
+    }
+    let captures = context.section_parameters(&roots, false)?;
+    let capture_types: Vec<_> = captures.iter().map(|local| local.type_.clone()).collect();
+    for (body, (levels, explicit)) in bodies.iter_mut().zip(universes) {
+        context.tick()?;
+        context.level_params = levels.clone();
+        context.explicit_levels = *explicit;
+        let mut roots = capture_types.clone();
+        roots.extend([body.base.type_.clone(), body.value.clone()]);
+        body.base.level_params = context.declaration_levels(&roots)?;
+    }
+    let signatures: Vec<_> = bodies.iter().map(|body| body.base.clone()).collect();
+    for body in bodies {
+        body.value = map(context, &body.value, &|context, expr| {
+            let ExprNode::Const { name, levels } = expr.node() else {
+                return Ok(None);
+            };
+            let Some(target) = signatures.iter().position(|base| &base.name == name) else {
+                return Ok(None);
+            };
+            let header = &headers[target];
+            if levels.len() != header.level_params.len() {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            let mut actual = Vec::new();
+            for parameter in &signatures[target].level_params {
+                context.tick()?;
+                let level = if fixed_levels.contains(parameter) {
+                    Level::param(parameter.clone())
+                } else {
+                    let index = header
+                        .level_params
+                        .iter()
+                        .position(|name| name == parameter)
+                        .ok_or_else(|| refusal("peer universes determined by the mutual header"))?;
+                    levels[index].clone()
+                };
+                actual.push(level);
+            }
+            let mut replacement = Expr::const_(name.clone(), actual);
+            for local in &captures {
+                context.tick()?;
+                replacement = Expr::app(replacement, Expr::fvar(local.id.clone()));
+            }
+            Ok(Some(replacement))
+        })?;
+        for local in captures.iter().rev() {
+            context.tick()?;
+            let abstract_ = |expr: &Expr| {
+                expr.abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))
+            };
+            body.base.type_ = Expr::forall_e(
+                local.user_name.clone(),
+                local.type_.clone(),
+                abstract_(&body.base.type_)?,
+                local.binder_info,
+            );
+            body.value = Expr::lam(
+                local.user_name.clone(),
+                local.type_.clone(),
+                abstract_(&body.value)?,
+                local.binder_info,
+            );
+        }
+        if body.base.type_.has_fvar()
+            || body.value.has_fvar()
+            || body.base.type_.has_loose_bvars()
+            || body.value.has_loose_bvars()
+        {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+    }
+    Ok(())
 }
 
 fn children(expr: &Expr) -> Vec<&Expr> {
@@ -307,7 +477,7 @@ fn children(expr: &Expr) -> Vec<&Expr> {
 fn map(
     context: &mut Context,
     root: &Expr,
-    replace: &impl Fn(&Expr) -> Option<Expr>,
+    replace: &impl Fn(&mut Context, &Expr) -> Result<Option<Expr>, NatDefinitionElabError>,
 ) -> Result<Expr, NatDefinitionElabError> {
     let mut pending = vec![(root, false)];
     let mut done = HashMap::new();
@@ -317,7 +487,7 @@ fn map(
         if done.contains_key(&key) {
             continue;
         }
-        if let Some(value) = replace(expr) {
+        if let Some(value) = replace(context, expr)? {
             done.insert(key, value);
             continue;
         }
