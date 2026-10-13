@@ -56,7 +56,7 @@ impl Preparation<'_> {
             // Recognition includes the proof-field aliases and the closed
             // representative. A same-named foreign family cannot acquire this
             // erasure, and a failed check never fills the cached guard.
-            for expected in fln_elab::seed::source_seed_declarations() {
+            for expected in fln_elab::seed::source_seed_declarations_iter() {
                 self.tick()?;
                 match expected {
                     Declaration::Inductive(block)
@@ -122,7 +122,7 @@ impl Preparation<'_> {
         // Use the same candidates admitted by the source seed. Checking only
         // the instance wrapper would miss a replaced carrier decEq dependency;
         // checking only decEq would miss changed eliminator rules.
-        for expected in fln_elab::seed::source_seed_declarations() {
+        for expected in fln_elab::seed::source_seed_declarations_iter() {
             self.tick()?;
             let canonical = match expected {
                 Declaration::Axiom(expected)
