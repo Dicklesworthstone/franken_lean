@@ -20,8 +20,10 @@
 //! tactic applies. Each relevant application of such a recursor in the elaborated value
 //! is refused. Not established, and stated: a definition that names `T.rec` only in a
 //! proof but also matches on `T` in data is refused here and accepted by the pin; a
-//! data-valued recursor application nested inside a proof or type argument, or in code
-//! the pin's simplifier deletes, is refused here and erased there.
+//! recursor application in code the pin's simplifier deletes can still be refused here.
+//! Nested proof and type subtrees are classified before their bodies are visited, as
+//! ToLCNF.visit/visitAppArg do; data computations inside those erased subtrees never
+//! require an executable recursor.
 //!
 //! Executing such recursors is FrankenLean's `frontier` lane: an engine in that mode
 //! sets [`SourceScope::frontier_recursors`] and this check is skipped. Its artifacts
@@ -199,11 +201,65 @@ impl Context {
                 return Ok(());
             }
         }
+        let saved = self.txn.lctx.clone();
+        let result = self.check_compiled_value(&term.value, &named);
+        // A refusal may unwind past pending Restore tasks. Temporary binders
+        // are analysis only and must never escape, including on budget stops.
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// ToLCNF.visit/visitAppArg erase proofs and type formers before inspecting
+    /// their executable subexpressions. Unknown types are not evidence of
+    /// erasure: retain the conservative recursor walk in that case.
+    fn codegen_erased(&mut self, value: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let Some(type_) = self.known_type(value)? else {
+            return Ok(false);
+        };
+        if type_former_motive(&type_) {
+            return Ok(true);
+        }
+        let Some(sort) = self.known_type(&type_)? else {
+            return Ok(false);
+        };
+        let sort = self.whnf(&sort)?;
+        Ok(matches!(sort.node(), ExprNode::Sort { level } if level.is_zero()))
+    }
+
+    fn check_compiled_value(
+        &mut self,
+        value: &Expr,
+        named: &[Name],
+    ) -> Result<(), NatDefinitionElabError> {
+        enum Work {
+            Visit(Expr),
+            OpenLet(Name, Expr, Expr, Expr),
+            Restore(LocalContext),
+        }
+        // Every binder is opened with a fresh local identity. Exact expression
+        // keys therefore cannot confuse one de Bruijn node used in two scopes,
+        // and retaining expressions prevents allocation-address reuse.
         let mut seen = HashSet::new();
-        let mut work = vec![term.value.clone()];
-        while let Some(expr) = work.pop() {
+        let mut work = vec![Work::Visit(value.clone())];
+        while let Some(task) = work.pop() {
             self.tick()?;
-            if !seen.insert(expr.allocation_identity()) {
+            let expr = match task {
+                Work::Restore(saved) => {
+                    self.txn.lctx = saved;
+                    continue;
+                }
+                Work::OpenLet(name, type_, value, body) => {
+                    let saved = self.txn.lctx.clone();
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_let(id.clone(), name, type_, value);
+                    let body = self.substitute(&body, &Expr::fvar(id))?;
+                    work.push(Work::Restore(saved));
+                    work.push(Work::Visit(body));
+                    continue;
+                }
+                Work::Visit(expr) => expr,
+            };
+            if !seen.insert(expr.clone()) || self.codegen_erased(&expr)? {
                 continue;
             }
             match expr.node() {
@@ -211,6 +267,7 @@ impl Context {
                     let mut args = Vec::new();
                     let mut head = &expr;
                     while let ExprNode::App { f, a } = head.node() {
+                        self.tick()?;
                         args.push(a.clone());
                         head = f;
                     }
@@ -227,18 +284,49 @@ impl Context {
                             )));
                         }
                     } else {
-                        work.push(head.clone());
+                        work.push(Work::Visit(head.clone()));
                     }
-                    work.extend(args);
+                    work.extend(args.into_iter().map(Work::Visit));
                 }
-                // Binder and let types are types: erased.
-                ExprNode::Lam { body, .. } => work.push(body.clone()),
-                ExprNode::LetE { value, body, .. } => {
-                    work.push(value.clone());
-                    work.push(body.clone());
+                // Domains are erased; bodies are opened rather than walking
+                // loose bvars without the telescope that gives them meaning.
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => {
+                    let saved = self.txn.lctx.clone();
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_param(
+                        id.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    );
+                    let body = self.substitute(body, &Expr::fvar(id))?;
+                    work.push(Work::Restore(saved));
+                    work.push(Work::Visit(body));
+                }
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    ..
+                } => {
+                    // The value is checked outside its own binding, then the
+                    // body sees the checked let for dependent type inference.
+                    work.push(Work::OpenLet(
+                        decl_name.clone(),
+                        type_.clone(),
+                        value.clone(),
+                        body.clone(),
+                    ));
+                    work.push(Work::Visit(value.clone()));
                 }
                 ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
-                    work.push(expr.clone());
+                    work.push(Work::Visit(expr.clone()));
                 }
                 _ => {}
             }
@@ -371,6 +459,57 @@ mod tests {
             "rows out of byte order"
         );
         assert_eq!(parse_csimp(&format!("{CSIMP_SCHEMA}\nNat.rec")), None);
+    }
+
+    #[test]
+    fn codegen_locals_are_restored_at_every_heartbeat_stop() {
+        let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let name = Name::from_components(["x"]);
+        let term = Typed {
+            type_: Expr::forall_e(name.clone(), nat.clone(), nat.clone(), BinderInfo::Default),
+            value: Expr::lam(
+                name.clone(),
+                nat.clone(),
+                Expr::let_e(
+                    name.clone(),
+                    nat.clone(),
+                    Expr::bvar(0).unwrap(),
+                    Expr::bvar(0).unwrap(),
+                    false,
+                ),
+                BinderInfo::Default,
+            ),
+        };
+        let context = || {
+            let mut context = Context::new(&env, Budget::DEFAULT);
+            context
+                .source_recursors
+                .push(Name::from_components(["T", "rec"]));
+            context.txn.lctx.add_param(
+                FVarId(Name::from_components(["existing"])),
+                name.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            );
+            context
+        };
+        let mut complete = context();
+        let saved = complete.txn.lctx.clone();
+        complete.check_compiled_recursors(&term).unwrap();
+        assert_eq!(complete.txn.lctx, saved);
+        let steps = complete.txn.budget.heartbeats_consumed;
+        assert!(steps > 1, "the check must actually visit binders");
+        for allowed in 1..steps {
+            let mut limited = context();
+            limited.txn.budget.max_heartbeats = allowed;
+            assert!(
+                limited.check_compiled_recursors(&term).is_err(),
+                "bound {allowed}"
+            );
+            assert_eq!(limited.txn.lctx, saved, "locals escaped at bound {allowed}");
+            assert_eq!(limited.txn.env, env);
+        }
     }
 
     #[test]
