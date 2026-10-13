@@ -6,6 +6,7 @@
 //! elaborator. Every original row has an elaboration witness: a redundant row
 //! cannot hide an ill-typed body when a generated fallback is unnecessary.
 use super::*;
+mod coverage;
 mod literals;
 use fln_env::constants::ConstantInfo;
 use fln_syntax::source::{ByteSpan, SourceInfo};
@@ -1032,8 +1033,10 @@ impl Context {
                         canonical.insert(c.head.clone(), head);
                     }
                     let mut heads = Vec::new();
+                    let mut has_fallback = false;
                     for row in &matrix.rows {
                         self.tick()?;
+                        has_fallback |= matches!(&arena[row.patterns[0]], Pattern::Bind(_));
                         if let Pattern::Constructor(constructor) = &arena[row.patterns[0]]
                             && !heads.iter().any(|h: &usize| matches!(&arena[*h], Pattern::Constructor(c) if canonical[&c.head] == canonical[&constructor.head]))
                         { heads.push(row.patterns[0]); }
@@ -1052,6 +1055,8 @@ impl Context {
                         pending.push(Task::Build(matrix));
                         continue;
                     }
+                    let needs_fallback = has_fallback
+                        && !self.matrix_constructors_exhaustive(&heads, &arena, &canonical)?;
                     let mut branches = Vec::new();
                     let mut alternatives = Vec::new();
                     for pattern in heads {
@@ -1123,15 +1128,26 @@ impl Context {
                             recursive_root: false,
                         });
                     }
+                    // Catchall rows already participate, in source order, in
+                    // every explicit constructor branch. When those branches
+                    // cover the family there is no additional input on which
+                    // to run the catchall-only submatrix. Compiling it anyway
+                    // can invent a coverage failure in a later literal column
+                    // (notably when structural recursion reorders columns).
+                    // Keep every row's required elaboration witness: dropping
+                    // an unreachable fallback must not hide an invalid body.
                     let mut fallback = Vec::new();
-                    for row in matrix.rows {
-                        if let Pattern::Bind(name) = &arena[row.patterns[0]] {
-                            let mut copy = row.clone();
-                            copy.patterns.remove(0);
-                            if let Some(name) = name {
-                                copy.bindings.push((name.clone(), subject.clone()));
+                    if needs_fallback {
+                        for row in matrix.rows {
+                            self.tick()?;
+                            if let Pattern::Bind(name) = &arena[row.patterns[0]] {
+                                let mut copy = row.clone();
+                                copy.patterns.remove(0);
+                                if let Some(name) = name {
+                                    copy.bindings.push((name.clone(), subject.clone()));
+                                }
+                                fallback.push(copy);
                             }
-                            fallback.push(copy);
                         }
                     }
                     if !fallback.is_empty() {
