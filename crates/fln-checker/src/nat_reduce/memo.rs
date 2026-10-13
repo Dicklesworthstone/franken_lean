@@ -5,7 +5,9 @@
 //! term under the same context and reduction policy. Only a completed natural
 //! result is stored; booleans, refusals, resource stops and partial frames are
 //! not reusable natural operands. Context validation still precedes any hit.
-use super::{Control, Cursor, Halt, NatValue};
+mod names;
+
+use super::{Control, Cursor, Halt, NatValue, WireName};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -16,9 +18,45 @@ const MAX_RETAINED_LIMBS: usize = 65_536;
 pub(super) struct NaturalMemo {
     entries: HashMap<Cursor, Arc<NatValue>>,
     limbs: usize,
+    names: names::Names,
 }
 
 impl NaturalMemo {
+    pub(super) fn recall_operand(
+        &self,
+        cursor: Cursor,
+        name: Option<&WireName>,
+        control: &mut Control<'_>,
+    ) -> Result<Option<Arc<NatValue>>, Halt> {
+        if let Some(value) = self.recall(cursor, control)? {
+            return Ok(Some(value));
+        }
+        if let Some(name) = name
+            && let Some(original) = self.names.recall(name, cursor, control)?
+        {
+            return self.recall(original, control);
+        }
+        Ok(None)
+    }
+
+    pub(super) fn remember_operand(
+        &mut self,
+        cursor: Cursor,
+        name: Option<&WireName>,
+        value: &Arc<NatValue>,
+        control: &mut Control<'_>,
+    ) -> Result<(), Halt> {
+        self.remember(cursor, value, control)?;
+        // Aliases index retained values only. Saturation of the existing memo
+        // cannot produce a dangling alias or circumvent its value/limb caps.
+        if let Some(name) = name
+            && self.entries.contains_key(&cursor)
+        {
+            self.names.remember(name, cursor, control)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn recall(
         &self,
         cursor: Cursor,

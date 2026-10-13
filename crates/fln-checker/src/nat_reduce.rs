@@ -11,6 +11,8 @@
 //! typing, declaration admission, and consensus remain outside this module.
 
 mod memo;
+#[cfg(test)]
+mod shared_tests;
 
 use std::sync::Arc;
 
@@ -1458,6 +1460,21 @@ fn operand_identity(index: u8) -> NatReductionOperand {
     }
 }
 
+/// A bare monomorphic constant has the same meaning in every arena of this
+/// query. Applied functions and universe arguments require their full cursor;
+/// a name-only key would discard those semantic inputs.
+fn operand_name<'a>(
+    cursor: Cursor,
+    candidate: &'a WireExpr,
+    generated: &'a [WireExpr],
+) -> Result<Option<&'a WireName>, Halt> {
+    let term = source_term(cursor.source, candidate, generated)?;
+    Ok(match term.node(cursor.root) {
+        Some(ExprNode::Constant { name, levels }) if levels.is_empty() => Some(name),
+        _ => None,
+    })
+}
+
 fn reduce_inner(
     query: NatReductionQuery<'_>,
     budget: NatReductionBudget,
@@ -1554,7 +1571,13 @@ fn reduce_inner(
                 cursor,
                 core_normalized,
             } => {
-                if context_validated && let Some(value) = memo.recall(cursor, &mut control)? {
+                if context_validated
+                    && let Some(value) = memo.recall_operand(
+                        cursor,
+                        operand_name(cursor, candidate, &generated)?,
+                        &mut control,
+                    )?
+                {
                     EvalState::Natural(value)
                 } else if context_validated
                     && let Some(value) =
@@ -1632,7 +1655,13 @@ fn reduce_inner(
                 // root. Beta/zeta/delta and metadata normalization may move that
                 // root into a different arena, while repeated operands still
                 // refer to their original immutable source cursor.
-                memo.remember(current_operand(frame)?, &value, &mut control)?;
+                let operand = current_operand(frame)?;
+                memo.remember_operand(
+                    operand,
+                    operand_name(operand, candidate, &generated)?,
+                    &value,
+                    &mut control,
+                )?;
                 frame.values[usize::from(frame.next_operand)] = Some(value);
                 if frame.next_operand + 1 < frame.operation.arity() {
                     frame.next_operand += 1;
