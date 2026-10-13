@@ -7829,6 +7829,7 @@ impl Engine {
                     .is_some();
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
+                || fln_elab::source::partial::is_partial(parsed.syntax())
                 || is_instance
                 || has_inline_simp
                 || has_inline_default

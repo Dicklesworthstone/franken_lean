@@ -738,6 +738,23 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        if fln_elab::source::partial::is_partial(parsed.syntax()) {
+            let declarations = match elaboration_outcome(fln_elab::source::partial::elaborate(
+                parsed.syntax(),
+                self.environment(),
+                limits.kernel,
+                scope,
+            ))? {
+                Outcome::Complete(declarations) => declarations,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            // One ordinary council batch: a failed companion never publishes
+            // the logical default as a successful executable definition.
+            return self
+                .admit_declarations(&declarations, options, limits)
+                .map_err(EngineExecutionError::from);
+        }
         let deriving =
             match elaboration_outcome(fln_elab::source::deriving::prepare(parsed.syntax()))? {
                 Outcome::Complete(request) => request,

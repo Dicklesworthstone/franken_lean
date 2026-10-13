@@ -41,6 +41,7 @@ mod numeric;
 mod operators;
 mod optional;
 mod overload;
+pub mod partial;
 mod pattern_typing;
 mod patterns;
 mod record;
@@ -556,6 +557,9 @@ struct Context {
     // Set only after a top-level well-founded lowering succeeds. The source
     // declaration result carries this status to post-admission metadata.
     well_founded_definition: bool,
+    // Enabled only by the batch-only partial-definition entry point. A recursive
+    // body needs its opaque logical interface AND its executable companion.
+    partial: Option<partial::State>,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -636,6 +640,7 @@ impl Context {
             recursion: None,
             well_founded: None,
             well_founded_definition: false,
+            partial: None,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_coercions: Vec::new(),
@@ -956,6 +961,14 @@ impl Context {
                 });
             }
             let name = &resolved;
+            if let Some(reference) = self
+                .partial
+                .as_ref()
+                .and_then(|state| state.reference.as_ref())
+                && &reference.name == name
+            {
+                return Ok(reference.term.clone());
+            }
             if let Some(recursion) = &self.recursion
                 && &recursion.name == name
             {
@@ -4757,6 +4770,7 @@ fn definition_in_context_named(
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
             // Validated, with the declaration kind, by `noncomputable_registration` below.
             NONCOMPUTABLE_SLOT => is_noncomputable = noncomputable_slot(modifier)?,
+            6 if context.partial.is_some() => partial::validate_modifier(modifier)?,
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
     }
@@ -5063,6 +5077,16 @@ fn definition_in_context_named(
         termination,
         !is_theorem && !is_instance && !is_abbrev && !is_opaque,
     )?;
+    if context.partial.is_some()
+        && !matches!(
+            termination,
+            None | Some(recursion::TerminationHint::Automatic)
+        )
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "no termination_by or decreasing_by on partial def",
+        });
+    }
     // `where` declarations scope over the body as `let rec` declarations, the pin's
     // `expandWhereDecls`; each is its own group here, so a later one may call an
     // earlier one.
@@ -5116,6 +5140,7 @@ fn definition_in_context_named(
         roots.extend([term.type_.clone(), term.value.clone()]);
         context.section_parameters(&roots, false)?
     };
+    let partial_captures = section_parameters.clone();
     let instance_type = context
         .public_instance_signature
         .clone()
@@ -5129,6 +5154,7 @@ fn definition_in_context_named(
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
     context.generalize_declaration_universes(&universe_roots)?;
     let mut term = context.finish(term)?;
+    context.close_partial_reference(&mut term, &parameters, &partial_captures)?;
     // Preserve the source's actual lambda stages. Eta-expanding a computed
     // function moves its strict initializer under a new binder and delays it
     // until an argument arrives. Native runtime preparation owns function
@@ -5200,6 +5226,19 @@ fn definition_in_context_named(
             is_unsafe: false,
             all: vec![name.clone()],
         }))
+    } else if context
+        .partial
+        .as_ref()
+        .is_some_and(|state| state.reference.is_some())
+    {
+        base.name = Name::str(name.clone(), "_unsafe_rec");
+        Ok(Declaration::Mutual(vec![DefinitionVal {
+            all: vec![base.name.clone()],
+            base,
+            value: term.value,
+            hints: ReducibilityHints::Opaque,
+            safety: DefinitionSafety::Partial,
+        }]))
     } else {
         Ok(Declaration::Defn(DefinitionVal {
             base,

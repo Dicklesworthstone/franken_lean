@@ -607,6 +607,15 @@ impl Context {
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
         self.txn.budget.heartbeats_consumed = spent;
+        if self.partial.is_some() {
+            let result = self.partial_definition_body(name, parameters, syntax, expected);
+            if result.is_err() {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = snapshot;
+                self.txn.budget.heartbeats_consumed = spent;
+            }
+            return result;
+        }
         let mut parameters = parameters.to_vec();
         let result = (|| {
             let (body, expected, lambdas) =
