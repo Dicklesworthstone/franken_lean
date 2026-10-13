@@ -1,4 +1,4 @@
-//! Constructor inventories for eliminating unreachable matrix fallbacks.
+//! Constructor inventories and deferred missing cases in matrix fallbacks.
 use super::*;
 
 impl Context {
@@ -71,5 +71,53 @@ impl Context {
             }
         }
         Ok(missing.is_empty())
+    }
+}
+
+/// An empty generated match is deliberately a refusal, not an inhabitant or
+/// a `nomatch` proof. `match_parts` rejects it with MissingConstructor whenever
+/// the term driver reaches it. Retaining this obligation in the decision tree
+/// lets the typed outer match discard only a genuinely unreachable constructor
+/// fallback; untyped relative heads alone cannot decide that. Every original
+/// source row still needs its ordinary matrixScope elaboration witness.
+pub(super) fn missing_case(subject: Name) -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "matchMatrix"]),
+        vec![
+            atom("match"),
+            null(vec![]),
+            null(vec![]),
+            null(vec![Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), identifier(subject)],
+            )]),
+            atom("with"),
+            Syntax::node(parser_kind(&["Term", "matchAlts"]), vec![null(vec![])]),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_case_is_an_unconditional_typed_refusal_not_a_term_hole() {
+        let mut context = Context::new(
+            &Environment::new(),
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+        );
+        // Refuse before trying to give even the discriminant a type. This is
+        // not a nomatch proof of emptiness and cannot inhabit an expected type.
+        let missing = missing_case(Name::from_components(["not_in_scope"]));
+        for expected in [None, Some(Expr::sort(Level::zero()))] {
+            assert!(matches!(
+                context.term(&missing, expected),
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::Match(matching::MatchError::MissingConstructor)
+                ))
+            ));
+            assert!(context.matrix_rows.is_empty());
+        }
     }
 }

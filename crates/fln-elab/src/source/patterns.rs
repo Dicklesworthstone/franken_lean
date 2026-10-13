@@ -893,7 +893,9 @@ impl Context {
                 }
                 Task::Build(mut matrix) => {
                     if matrix.rows.is_empty() {
-                        return Err(invalid());
+                        let subject = matrix.subjects.first().ok_or_else(invalid)?;
+                        built.push(coverage::missing_case(subject.clone()));
+                        continue;
                     }
                     if matrix.subjects.is_empty() {
                         let row = matrix.rows.remove(0);

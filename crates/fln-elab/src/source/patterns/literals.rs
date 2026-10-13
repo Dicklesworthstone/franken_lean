@@ -234,12 +234,11 @@ impl Context {
                 Pattern::Constructor(_) => return Err(invalid()),
             }
         }
-        // Nat and String are infinite domains. Char is finite, but this bounded
-        // splitter does not certify exhaustive enumeration of it. Retain the
-        // catchall obligation even when the discriminant is a closed value.
-        if miss.is_empty() {
-            return Err(invalid());
-        }
+        // Nat and String are infinite domains. Keep an empty miss matrix as
+        // an explicit missing-case obligation, not a chosen result. Only the
+        // typed outer constructor match can establish that its entire fallback
+        // is unreachable (relative constructor names have no family here).
+        // A reachable miss still refuses even for a closed discriminant.
         let application = |function, arguments| {
             Syntax::node(
                 parser_kind(&["Term", "app"]),
