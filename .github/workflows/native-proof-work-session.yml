@@ -32,8 +32,8 @@ jobs:
           stored = subprocess.check_output(['git','show','539b6ce58a3d1acbbda882664ec1ecea3b2b8847:.github/workflows/native-proof-work-session.yml'], text=True)
           encoded = re.search(r"encoded = '''([A-Za-z0-9+/=]+)'''", stored).group(1)
           (root/'transmitted.txt').write_text(encoded)
-          assert encoded.count('gndZ97g78q78fD0') == 1
-          encoded = encoded.replace('gndZ97g78q78fD0', 'gndZ97g78qfD0')
+          assert encoded.count('GndZ97g78q78fD0') == 1
+          encoded = encoded.replace('GndZ97g78q78fD0', 'GndZ97g78qfD0')
           (root/'recovered.txt').write_text(encoded)
           patch = gzip.decompress(base64.b64decode(encoded, validate=True))
           assert hashlib.sha256(patch).hexdigest() == '54df26766936c221a0181a5a2c0a9e489990eb0204ac695be3bc856fc7f8e6c9'
