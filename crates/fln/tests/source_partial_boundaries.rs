@@ -251,3 +251,90 @@ fn cancelled_module_replay_publishes_neither_partial_half() {
         .into_complete()
         .unwrap();
 }
+
+#[test]
+fn named_function_witnesses_reimport_without_replacing_executable_callbacks() {
+    let base = Engine::builder().build_empty();
+    let library = format!(
+        r#"{LIB}
+def Callback (A : Type) : Type := Flag -> A
+partial def shift {{A : Type}} (f : Callback A) (flag : Flag) : Callback A :=
+  match flag with
+  | Flag.stop => fun _ => f Flag.again
+  | Flag.again => shift f Flag.stop
+"#
+    );
+    let main_source = b"prelude\nimport CallbackLib\ndef result : Flag := shift (fun x => x) Flag.again Flag.stop";
+    let library_name = n("CallbackLib");
+    let main_name = n("CallbackMain");
+    let build = base
+        .compile_source_modules(
+            &[
+                SourceModuleInput {
+                    name: &main_name,
+                    source: main_source,
+                },
+                SourceModuleInput {
+                    name: &library_name,
+                    source: library.as_bytes(),
+                },
+            ],
+            &main_name,
+            &KVMap::new(),
+            limits(),
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(build.artifacts.len(), 2);
+    let inputs: Vec<_> = build
+        .artifacts
+        .iter()
+        .map(|artifact| OleanModuleInput {
+            name: &artifact.name,
+            artifact: &artifact.bytes,
+            server_artifact: None,
+            private_artifact: None,
+        })
+        .collect();
+    let imported = base
+        .import_olean_modules_for_source(
+            &inputs,
+            &[main_name],
+            &KVMap::new(),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(4 * 1024 * 1024, budget())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    for name in [n("shift"), n("shift._unsafe_rec")] {
+        assert_eq!(
+            imported.environment().find(&name),
+            build.checked.checked.engine.environment().find(&name),
+        );
+    }
+    let execution = imported
+        .execute_source_definitions(
+            &[b"#eval result"],
+            &KVMap::new(),
+            EngineExecutionLimits::new(budget()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let [value] = execution.executions.as_slice() else {
+        panic!("one evaluation")
+    };
+    let fln::VmExit::Returned(returned) = &value.exit else {
+        panic!("{value:?}")
+    };
+    // The checked whole-function inhabitant is f (the identity), which would
+    // return stop here. The recursive implementation returns f again instead.
+    assert_eq!(
+        fln::vm_value_kind(&returned.value),
+        fln_vm::interpreter::ValueKind::Ctor(1)
+    );
+    assert!(base.environment().is_empty());
+}
