@@ -1542,31 +1542,64 @@ mod tests {
     }
 
     fn publish_test_axiom(environment: &Environment, name: &str, type_: Expr) -> Environment {
-        let declaration = Declaration::Axiom(AxiomVal {
-            base: ConstantVal {
-                name: Name::from_components(name.split('.')),
-                level_params: Vec::new(),
-                type_,
-            },
-            is_unsafe: false,
-        });
+        publish_test_declaration(
+            environment,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components(name.split('.')),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            }),
+        )
+    }
+
+    fn publish_test_value(
+        environment: &Environment,
+        name: &str,
+        type_: Expr,
+        value: Expr,
+    ) -> Environment {
+        let name = Name::from_components(name.split('.'));
+        publish_test_declaration(
+            environment,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                value,
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![name],
+            }),
+        )
+    }
+
+    fn publish_test_declaration(
+        environment: &Environment,
+        declaration: Declaration,
+    ) -> Environment {
         let Outcome::Complete(admitted) = admit(environment, declaration, Budget::DEFAULT) else {
-            panic!("the bounded test axiom must reach a kernel verdict");
+            panic!("the bounded test declaration must reach a kernel verdict");
         };
         let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
         else {
-            panic!("the kernel-accepted test axiom must pass the empty council");
+            panic!("the kernel-accepted test declaration must pass the empty council");
         };
-        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
-            checked.publish(
-                DeclarationBudget::default(),
-                CollisionBudget::default(),
-                None,
-            )
-        else {
-            panic!("the checked test axiom must publish exactly once");
-        };
-        publication.environment
+        match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) => publication.environment,
+            Outcome::Complete(Published::BlockCommitted(publication)) => publication.environment,
+            other => panic!("the checked test declaration must publish exactly once: {other:?}"),
+        }
     }
 
     fn binary_intrinsic(expression: &Expr) -> (&Name, &Expr, &Expr) {
@@ -2270,9 +2303,7 @@ mod tests {
     #[test]
     fn scalar_bool_literals_resolve_to_exact_constructor_names() {
         let bool_ty = Expr::const_(Name::from_components(["Bool"]), Vec::new());
-        let env = publish_test_axiom(&nat_environment(), "Bool", Expr::sort(Level::one()));
-        let env = publish_test_axiom(&env, "Bool.false", bool_ty.clone());
-        let env = publish_test_axiom(&env, "Bool.true", bool_ty.clone());
+        let env = publish_test_declaration(&nat_environment(), seed::bool_seed_declaration());
 
         for (spelling, expected) in [
             ("true", "Bool.true"),
@@ -2322,7 +2353,12 @@ mod tests {
         assert!(matches!(body.node(), ExprNode::BVar { idx } if *idx == 0));
 
         let nat_ty = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-        let env = publish_test_axiom(&nat_environment(), "true", nat_ty.clone());
+        let env = publish_test_value(
+            &nat_environment(),
+            "true",
+            nat_ty.clone(),
+            Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+        );
         let parsed = parse_definition(b"def answer := true")
             .expect("an exact checked global named true remains source-spellable");
         let Declaration::Defn(global) = elaborate_definition_in(parsed.syntax(), &env)
@@ -2362,8 +2398,23 @@ mod tests {
             BinderInfo::Default,
         );
         let env = publish_test_axiom(&nat_environment(), "String", Expr::sort(Level::one()));
-        let env = publish_test_axiom(&env, "greet", string_ty.clone());
-        let env = publish_test_axiom(&env, "copy", copy_ty.clone());
+        let env = publish_test_value(
+            &env,
+            "greet",
+            string_ty.clone(),
+            Expr::lit(Literal::Str("hello".into())),
+        );
+        let env = publish_test_value(
+            &env,
+            "copy",
+            copy_ty.clone(),
+            Expr::lam(
+                Name::from_components(["value"]),
+                string_ty.clone(),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+        );
 
         let parsed = parse_definition(b"def message := greet")
             .expect("an un-ascribed constant reference is in the scalar grammar");
@@ -2426,18 +2477,12 @@ mod tests {
     #[test]
     fn evaluation_command_elaborates_its_expression_without_a_fake_definition() {
         let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-        let nat_add = Expr::forall_e(
-            Name::from_components(["left"]),
-            nat.clone(),
-            Expr::forall_e(
-                Name::from_components(["right"]),
-                nat.clone(),
-                nat.clone(),
-                BinderInfo::Default,
-            ),
-            BinderInfo::Default,
-        );
-        let environment = publish_test_axiom(&nat_environment(), "Nat.add", nat_add);
+        // A compiler check needs actual executable fixtures, not an axiom
+        // named Nat.add. Admit the same checked seed as the source front door.
+        let environment = seed::source_seed_declarations_iter()
+            .fold(Environment::new(), |environment, declaration| {
+                publish_test_declaration(&environment, declaration)
+            });
         let parsed = fln_parse::parse_source_command(b"#eval let x : Nat := 40; Nat.add x 2")
             .expect("the bounded evaluation command parses directly");
         let generated = Name::num(Name::anonymous(), 7);

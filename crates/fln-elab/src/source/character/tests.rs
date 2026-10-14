@@ -64,6 +64,7 @@ fn signature(environment: &Environment, name: Name, type_: Expr) -> Environment 
 fn fixture(with_function: bool) -> Environment {
     // These signatures isolate frontend typing and name resolution. They are
     // not runtime Char models or a claim of imported Prelude admission.
+    // Their logical consumers explicitly opt out of code generation.
     let environment = crate::seed::bootstrap_nat_environment(budget()).unwrap();
     let environment = signature(&environment, n("Char"), Expr::sort(Level::one()));
     if with_function {
@@ -147,8 +148,8 @@ fn character_source_builds_a_checked_global_application_to_a_raw_natural() {
         ("'\\uDFFF'", '\0'),
     ] {
         for source in [
-            format!("def value := {spelling}"),
-            format!("def value : Char := ((({spelling})))"),
+            format!("noncomputable def value := {spelling}"),
+            format!("noncomputable def value : Char := ((({spelling})))"),
         ] {
             let checked = crate::check_definition_source(source.as_bytes(), &environment, budget())
                 .unwrap_or_else(|error| panic!("{source}: {error:?}"));
@@ -235,8 +236,10 @@ fn character_hygiene_and_raw_payload_survive_shadowing_and_changed_of_nat() {
     assert_eq!(character.value, expected('a'));
     assert_eq!(character.type_, c("Char"));
 
-    let parsed =
-        crate::parse_definition("def value (Char : Type) : _root_.Char := 'λ'".as_bytes()).unwrap();
+    let parsed = crate::parse_definition(
+        "noncomputable def value (Char : Type) : _root_.Char := 'λ'".as_bytes(),
+    )
+    .unwrap();
     let scope = SourceScope {
         namespace: n("Shadow"),
         ..SourceScope::default()

@@ -8,6 +8,7 @@ use crate::implemented_by::{ImplementedByReadError, ImplementedByTable};
 
 #[derive(Default)]
 pub(super) struct Dependencies {
+    environment: fln_env::environment::Environment,
     names: BTreeSet<Name>,
     implemented_by: ImplementedByTable,
     externs: ExternTable,
@@ -18,18 +19,17 @@ impl Dependencies {
         // Hold the same immutable snapshot across all three reads. Charge row
         // visits and payload bytes before the decoder can allocate their names.
         let env = context.txn.env.clone();
-        let Some(extension) = env.extension(&crate::noncomputable::journal_name()) else {
-            return Ok(Self::default());
-        };
         let mut charge = |amount| {
             for _ in 0..amount {
                 context.tick()?;
             }
             Ok(())
         };
-        charge(extension.len())?;
-        for entry in extension.entries() {
-            charge(entry.payload.len())?;
+        if let Some(extension) = env.extension(&crate::noncomputable::journal_name()) {
+            charge(extension.len())?;
+            for entry in extension.entries() {
+                charge(entry.payload.len())?;
+            }
         }
         let names = crate::noncomputable::read(&env).map_err(|error| match error {
             crate::noncomputable::NoncomputableError::Limit => {
@@ -37,9 +37,9 @@ impl Dependencies {
             }
             other => failure(SourceInferenceError::NoncomputableJournal(other)),
         })?;
-        if names.is_empty() {
-            return Ok(Self::default());
-        }
+        // An empty tag journal does not make an axiom executable. Read the
+        // implementation intentions as well, including their failure/budget
+        // checks, even when no definition has failed compilation yet.
         let implemented_by =
             ImplementedByTable::read_metered(&env, &mut charge).map_err(|error| match error {
                 ImplementedByReadError::Budget(error) => error,
@@ -61,14 +61,11 @@ impl Dependencies {
                 }
             })?;
         Ok(Self {
+            environment: env,
             names,
             implemented_by,
             externs,
         })
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.names.is_empty()
     }
 
     pub(super) fn check(&self, declaration: &Name) -> Result<(), NatDefinitionElabError> {
@@ -81,9 +78,32 @@ impl Dependencies {
         // the logical declaration. This is an exact Name child, never a display
         // string suffix (mkUnsafeRecName in the pinned Compiler/Old.lean).
         let implementation = Name::str(selected.clone(), "_unsafe_rec");
-        if (self.names.contains(selected) || self.names.contains(&implementation))
-            && self.externs.get(selected).is_none()
-        {
+        if self.externs.get(selected).is_some() {
+            return Ok(());
+        }
+        if self.names.contains(selected) || self.names.contains(&implementation) {
+            return Err(failure(SourceInferenceError::NoncomputableDependency(
+                selected.clone(),
+            )));
+        }
+        let unavailable = match self.environment.find(selected) {
+            Some(ConstantInfo::Axiom(actual)) => {
+                // The bounded source seed represents some native intrinsics
+                // as axioms. Reuse its exact candidate, not a name or a type
+                // shape allowlist. Native ABI authorization still belongs to
+                // the existing runtime bridge, not this compiler check.
+                let candidate = crate::seed::source_intrinsic_seed_declaration(selected)
+                    .or_else(|| crate::seed::float_intrinsic_seed_declaration(selected));
+                !matches!(candidate, Some(Declaration::Axiom(expected)) if actual == &expected)
+            }
+            Some(ConstantInfo::Quot(value)) => !matches!(
+                value.kind,
+                fln_env::constants::QuotKind::Ctor | fln_env::constants::QuotKind::Lift
+            ),
+            Some(ConstantInfo::Induct(_) | ConstantInfo::Thm(_)) => true,
+            _ => false,
+        };
+        if unavailable {
             return Err(failure(SourceInferenceError::NoncomputableDependency(
                 selected.clone(),
             )));
@@ -125,6 +145,157 @@ mod tests {
         Typed {
             type_: Expr::const_(n("Nat"), vec![]),
             value: Expr::const_(n(name), vec![]),
+        }
+    }
+
+    fn axiom_environment() -> fln_env::environment::Environment {
+        let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        env.add_decl(ConstantInfo::Axiom(fln_env::constants::AxiomVal {
+            base: ConstantVal {
+                name: n("bodyless"),
+                level_params: vec![],
+                type_: Expr::const_(n("Nat"), vec![]),
+            },
+            is_unsafe: false,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bodyless_axioms_require_code_even_without_a_tag_journal() {
+        let env = axiom_environment();
+        assert!(
+            env.extension(&crate::noncomputable::journal_name())
+                .is_none()
+        );
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        assert!(
+            matches!(context.check_definition_codegen(&term("bodyless")),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::NoncomputableDependency(name)))
+            if name == n("bodyless"))
+        );
+        context.source_scope.noncomputable_section = true;
+        assert_eq!(
+            context.check_definition_codegen(&term("bodyless")),
+            Ok(true)
+        );
+        assert_eq!(context.txn.env, env);
+    }
+
+    #[test]
+    fn untagged_axiom_implementations_and_externs_are_validated_before_exemption() {
+        let base = axiom_environment();
+        let extern_ = crate::externs::register(
+            &base,
+            &n("bodyless"),
+            vec![crate::externs::ExternEntry::Opaque],
+        )
+        .unwrap();
+        assert_eq!(
+            Context::new(&extern_, Budget::DEFAULT).check_definition_codegen(&term("bodyless")),
+            Ok(false)
+        );
+        let actual = base
+            .add_decl(ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: n("actual"),
+                    level_params: vec![],
+                    type_: Expr::const_(n("Nat"), vec![]),
+                },
+                value: Expr::lit(fln_core::expr::Literal::Nat(
+                    fln_core::expr::NatLit::from_u64(7),
+                )),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![n("actual")],
+            }))
+            .unwrap();
+        let replaced =
+            crate::implemented_by::register(&actual, &n("bodyless"), &n("actual")).unwrap();
+        assert_eq!(
+            Context::new(&replaced, Budget::DEFAULT).check_definition_codegen(&term("bodyless")),
+            Ok(false)
+        );
+        for (env, journal) in [
+            (extern_, crate::externs::journal_name()),
+            (replaced, crate::implemented_by::journal_name()),
+        ] {
+            assert!(
+                env.extension(&crate::noncomputable::journal_name())
+                    .is_none()
+            );
+            let damaged = env.push_extension_entry(&journal, b"bad".to_vec()).unwrap();
+            let mut context = Context::new(&damaged, Budget::DEFAULT);
+            context.source_scope.noncomputable_section = true;
+            assert!(matches!(
+                context.check_definition_codegen(&term("bodyless")),
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ExternJournal(_)
+                        | SourceInferenceError::ImplementedByJournal(_)
+                ))
+            ));
+            assert_eq!(context.txn.env, damaged);
+        }
+    }
+
+    #[test]
+    fn native_seed_exceptions_require_exact_declarations_and_do_not_override_tags() {
+        for name in [n("Nat.beq"), n("String.length"), n("Float.sqrt")] {
+            let Some(Declaration::Axiom(candidate)) =
+                crate::seed::source_intrinsic_seed_declaration(&name)
+                    .or_else(|| crate::seed::float_intrinsic_seed_declaration(&name))
+            else {
+                panic!("seed axiom")
+            };
+            let original = ConstantInfo::Axiom(candidate.clone());
+            let env = fln_env::environment::Environment::new()
+                .add_decl(original)
+                .unwrap();
+            let table = Dependencies::read(&mut Context::new(&env, Budget::DEFAULT)).unwrap();
+            table.check(&name).unwrap();
+            // Full equality includes safety and the complete telescope. A
+            // same-name declaration with another type is no native primitive.
+            let mut altered = candidate;
+            altered.base.type_ = Expr::sort(Level::one());
+            let changed = fln_env::environment::Environment::new()
+                .add_decl(ConstantInfo::Axiom(altered))
+                .unwrap();
+            assert!(
+                Dependencies::read(&mut Context::new(&changed, Budget::DEFAULT))
+                    .unwrap()
+                    .check(&name)
+                    .is_err()
+            );
+            table.check(&name).unwrap(); // Another snapshot cannot change this view.
+            let tagged = crate::noncomputable::register(&env, &name).unwrap();
+            assert!(
+                Dependencies::read(&mut Context::new(&tagged, Budget::DEFAULT))
+                    .unwrap()
+                    .check(&name)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn bodyless_analysis_restores_context_at_every_budget_boundary() {
+        let env = axiom_environment();
+        let mut full = Context::new(&env, Budget::DEFAULT);
+        full.source_scope.noncomputable_section = true;
+        assert_eq!(full.check_definition_codegen(&term("bodyless")), Ok(true));
+        for allowance in 1..full.txn.budget.heartbeats_consumed {
+            let mut context = Context::new(&env, Budget::DEFAULT);
+            context.source_scope.noncomputable_section = true;
+            context.txn.budget.max_heartbeats = allowance;
+            let locals = context.txn.lctx.clone();
+            assert!(matches!(
+                context.check_definition_codegen(&term("bodyless")),
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ResourceLimit
+                ))
+            ));
+            assert_eq!(context.txn.env, env);
+            assert_eq!(context.txn.lctx, locals);
         }
     }
 
