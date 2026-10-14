@@ -310,6 +310,17 @@ impl Prefix {
                 assertion.pattern =
                     crate::matching::parse_named_binding(leaves, view, tokens, range.clone())?;
                 *cursor = range.end;
+            } else if form == Form::Let
+                && matches!(tokens.get(*cursor).map(|token| &token.kind),
+                    Some(TokenKind::Symbol(symbol)) if symbol == "(" || symbol == "⟨")
+            {
+                // The declaration-leading parser already accepts these pattern
+                // binders. Nested terms use the same checked constructor syntax,
+                // not an ordinary expression or a recursive parse of the body.
+                let end = argument_atom_end(tokens, *cursor, end)
+                    .ok_or_else(|| refuse(view, tokens, *cursor))?;
+                assertion.pattern = Some(collections::pattern(leaves, view, tokens, *cursor..end)?);
+                *cursor = end;
             }
             // `letId := binderIdent`: a name or the hole `_`.
             if assertion.pattern.is_none()
