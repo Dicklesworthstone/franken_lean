@@ -770,6 +770,40 @@ fn list_pattern(tokens: &[LexedToken], range: Range<usize>) -> bool {
     false
 }
 
+/// Binding headers otherwise use the ordinary term reader, where `x@p` is
+/// parsed as applying x to an explicit term. Only a touching named-pattern
+/// prefix selects the same bounded pattern reader as match alternatives.
+/// Never reinterpret a named equality assumption as a type annotation.
+pub(super) fn named_binding_pattern(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    original: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut found = false;
+    for at in range.clone() {
+        if at + 2 < range.end
+            && matches!(tokens[at].kind, TokenKind::Ident(_))
+            && is_symbol(tokens, at + 1, "@")
+            && tokens[at].extent.end() == tokens[at + 1].extent.start()
+        {
+            found = true;
+            if at + 3 == range.end
+                && matches!(tokens[at + 2].kind, TokenKind::Ident(_))
+                && is_symbol(tokens, range.end, ":")
+            {
+                return Err(refuse(view, tokens, at + 2));
+            }
+        }
+    }
+    if found {
+        pattern(leaves, view, tokens, range)
+    } else {
+        Ok(original)
+    }
+}
+
 fn pattern(
     leaves: &Leaves,
     view: &SourceView,
@@ -784,27 +818,6 @@ fn pattern(
             return Err(refuse(view, tokens, next));
         }
         return Ok(quotation);
-    }
-    // `x@p` around a list pattern (`l@(x :: _)`): the name, then the pattern it names.
-    if range.len() >= 3
-        && matches!(tokens[range.start].kind, TokenKind::Ident(_))
-        && is_symbol(tokens, range.start + 1, "@")
-        && tokens[range.start].extent.end() == tokens[range.start + 1].extent.start()
-        && tokens[range.start + 1].extent.end() == tokens[range.start + 2].extent.start()
-        && range
-            .clone()
-            .any(|at| is_symbol(tokens, at, "[") || is_symbol(tokens, at, "::"))
-    {
-        let named = collections::pattern(leaves, view, tokens, range.start + 2..range.end)?;
-        return Ok(Syntax::node(
-            parser_kind(&["Term", "namedPattern"]),
-            vec![
-                leaves.leaf(range.start)?,
-                leaves.leaf(range.start + 1)?,
-                null_node(Vec::new()),
-                named,
-            ],
-        ));
     }
     if list_pattern(tokens, range.clone()) {
         return collections::pattern(leaves, view, tokens, range);
@@ -965,8 +978,8 @@ fn pattern(
                     values.push(collections::pattern(leaves, view, tokens, range)?);
                     continue;
                 }
-                // `namedPattern := ident noWs "@" noWs (ident ":")? term:max`: the name touches
-                // the `@`, which touches one atomic pattern ending the range (`l@(x :: _)`).
+                // The name touches `@`; the pin permits trivia AFTER it.
+                // The payload is one maximal-precedence pattern ending this range.
                 let touching = |left: usize, right: usize| {
                     tokens[left].extent.end() == tokens[right].extent.start()
                 };
@@ -974,7 +987,6 @@ fn pattern(
                     && matches!(tokens[range.start].kind, TokenKind::Ident(_))
                     && is_symbol(tokens, range.start + 1, "@")
                     && touching(range.start, range.start + 1)
-                    && touching(range.start + 1, range.start + 2)
                     && (range.len() == 3
                         || pairs.get(&(range.start + 2)) == Some(&(range.end - 1))
                         || (range.len() == 4
@@ -1131,8 +1143,8 @@ fn pattern(
                         ellipsis = Some(cursor);
                         break;
                     }
-                    // `x@p` as an argument (`.inner _ l@(.inner ..)`): the name, a touching `@` and
-                    // the atomic pattern touching it are one argument.
+                    // `x@p` as an argument: the name touches `@`, followed by
+                    // one atomic pattern (possibly separated by trivia).
                     let touches = |left: usize, right: usize| {
                         right < range.end
                             && tokens[left].extent.end() == tokens[right].extent.start()
@@ -1140,7 +1152,6 @@ fn pattern(
                     if matches!(tokens[cursor].kind, TokenKind::Ident(_))
                         && is_symbol(tokens, cursor + 1, "@")
                         && touches(cursor, cursor + 1)
-                        && touches(cursor + 1, cursor + 2)
                     {
                         cursor += 2;
                     }

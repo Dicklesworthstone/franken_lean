@@ -910,8 +910,30 @@ impl Model<'_> {
         if depth > DEPTH {
             return Ok(Err(Stop::Unknown));
         }
-        if let Some(inner) = parenthesized_inner(syntax)? {
-            return self.pattern(inner, expected, ensure, variables, depth + 1);
+        // Parentheses and aliases are transparent syntax, not recursive type
+        // structure. Spending the model's depth on them would let a long alias
+        // chain hide an otherwise decidable dependent-pattern mismatch behind
+        // Unknown. Peel them iteratively, still charging every wrapper.
+        let mut syntax = syntax;
+        loop {
+            self.cx.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                syntax = inner;
+                continue;
+            }
+            if let Some((name, inner)) = patterns::named::parts(syntax)? {
+                // The real matrix binds the alias to its checked receiver. It
+                // is not a fresh unification variable or a wildcard payload.
+                if variables.contains_key(&name) {
+                    return Ok(Err(Stop::Unknown));
+                }
+                let id = self.fresh_id("v");
+                self.names.insert(id.clone(), name.clone());
+                variables.insert(name, Expr::fvar(id));
+                syntax = inner;
+                continue;
+            }
+            break;
         }
         let hole = parser_kind(&["Term", "hole"]);
         let synthetic = parser_kind(&["Term", "syntheticHole"]);

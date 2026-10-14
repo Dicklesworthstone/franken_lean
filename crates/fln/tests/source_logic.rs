@@ -472,29 +472,28 @@ fn deriving_commands_are_refused_not_ignored() {
     );
 }
 
-/// `l@p` parses as the pin's `Term.namedPattern`, also as a constructor argument
-/// (`.inner l@(.inner ..) r@.leaf`); the pattern compiler does not bind the name, so the checker
-/// refuses the file, which the pin accepts.
+/// Value aliases are supported; an ellipsis inside an aliased field is still
+/// outside the matrix compiler's supported constructor fragment.
 #[test]
-fn named_patterns_are_refused_not_dropped() {
+fn named_values_are_bound_but_constructor_field_ellipsis_stays_unsupported() {
+    check(
+        "def np : List Nat → Nat\n  | l@(x :: _) => x\n  | [] => 0\n\
+        theorem head : np [7, 8] = 7 := by rfl",
+    );
     let (engine, limits) = engine();
-    for source in [
-        "def np : List Nat → Nat\n  | l@(x :: _) => x\n  | [] => 0\n",
-        "inductive T where\n  | leaf\n  | inner (l : T) (r : T)\n\
-         def np : T → T\n  | .inner l@(.inner ..) r@.leaf => .inner r l\n  | t => t\n",
-    ] {
-        assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
+    let source = "inductive T where\n  | leaf\n  | inner (l : T) (r : T)\n\
+         def np : T → T\n  | .inner l@(.inner ..) r@.leaf => .inner r l\n  | t => t\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
             ),
-            "{source}"
-        );
-    }
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
 }
 
 /// `f <*> x` parses as the pin's `«term_<*>_»` (`Seq.seq f fun _ => x`); the checker does not

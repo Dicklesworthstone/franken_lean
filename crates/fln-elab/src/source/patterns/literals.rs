@@ -149,6 +149,7 @@ impl Context {
                 }
                 Pattern::Constructor(_) => constructors = true,
                 Pattern::Bind(_) => {}
+                Pattern::Named { .. } => return Err(invalid()),
             }
         }
         let Some(selected) = selected else {
@@ -231,7 +232,7 @@ impl Context {
                     hit.push(accepted);
                     miss.push(row.clone());
                 }
-                Pattern::Constructor(_) => return Err(invalid()),
+                Pattern::Constructor(_) | Pattern::Named { .. } => return Err(invalid()),
             }
         }
         // Nat and String are infinite domains. Keep an empty miss matrix as

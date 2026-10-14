@@ -1111,7 +1111,13 @@ impl Prefix {
                     DefinitionGrammar::Scalar,
                 )?);
             }
-            self.pattern = Some(expression);
+            self.pattern = Some(crate::matching::named_binding_pattern(
+                leaves,
+                view,
+                tokens,
+                *name..at,
+                expression,
+            )?);
             if word(tokens, at, ":") {
                 *colon = Some(at);
                 self.phase = Phase::Annotation;

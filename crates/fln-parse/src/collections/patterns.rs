@@ -74,6 +74,7 @@ pub(crate) fn pattern(
     enum Task {
         Parse(Range<usize>),
         Group(usize, usize),
+        Named(usize, usize),
         /// `(p, q, …)` (`Term.tuple`) and `⟨p, …⟩` (`Term.anonymousCtor`): the brackets, the
         /// commas, and the number of elements.
         Tuple(usize, usize, Vec<usize>, usize),
@@ -136,6 +137,18 @@ pub(crate) fn pattern(
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
+            Task::Named(name, at) => {
+                let pattern = values.pop().expect("planned named collection pattern");
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "namedPattern"]),
+                    vec![
+                        leaves.leaf(name)?,
+                        leaves.leaf(at)?,
+                        null_node(Vec::new()),
+                        pattern,
+                    ],
+                ));
+            }
             Task::Tuple(open, close, commas, count) => {
                 let elements = values.split_off(values.len() - count);
                 values.push(tuple(leaves, open, close, &commas, elements)?);
@@ -194,6 +207,26 @@ pub(crate) fn pattern(
             Task::Parse(range) => {
                 if range.is_empty() {
                     return Err(refusal(view, tokens, range.start));
+                }
+                // `x@p` binds one maximal-precedence pattern. In particular,
+                // `x@p :: ps` names p, not the whole cons; grouping names the
+                // whole list. Every alias and group stays on this heap planner.
+                let touches = |left: usize, right: usize| {
+                    right < range.end && tokens[left].extent.end() == tokens[right].extent.start()
+                };
+                if range.len() >= 3
+                    && matches!(tokens[range.start].kind, TokenKind::Ident(_))
+                    && symbol(tokens, range.start + 1, "@")
+                    && touches(range.start, range.start + 1)
+                    && (range.len() == 3
+                        || pairs.get(&(range.start + 2)) == Some(&(range.end - 1))
+                        || (range.len() == 4
+                            && symbol(tokens, range.start + 2, ".")
+                            && touches(range.start + 2, range.start + 3)))
+                {
+                    tasks.push(Task::Named(range.start, range.start + 1));
+                    tasks.push(Task::Parse(range.start + 2..range.end));
+                    continue;
                 }
                 // An entire delimited atom is handled before the infix scan,
                 // so nested singleton lists/groups do not rescan their interiors.
@@ -307,6 +340,13 @@ pub(crate) fn pattern(
                 let mut arguments = Vec::new();
                 while cursor < range.end {
                     let begin = cursor;
+                    if cursor + 2 < range.end
+                        && matches!(tokens[cursor].kind, TokenKind::Ident(_))
+                        && symbol(tokens, cursor + 1, "@")
+                        && tokens[cursor].extent.end() == tokens[cursor + 1].extent.start()
+                    {
+                        cursor += 2;
+                    }
                     if let Some(&close) = pairs.get(&cursor) {
                         cursor = close + 1;
                     } else if symbol(tokens, cursor, ".") {

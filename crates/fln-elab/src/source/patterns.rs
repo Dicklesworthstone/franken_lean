@@ -9,6 +9,7 @@ use super::*;
 mod coverage;
 mod functions;
 mod literals;
+pub(super) mod named;
 use fln_env::constants::ConstantInfo;
 use fln_syntax::source::{ByteSpan, SourceInfo};
 use std::borrow::Cow;
@@ -26,6 +27,7 @@ struct Constructor<'a> {
 }
 enum Pattern<'a> {
     Bind(Option<Name>),
+    Named { name: Name, pattern: usize },
     Constructor(Constructor<'a>),
     Literal(literals::LiteralPattern<'a>),
 }
@@ -556,12 +558,18 @@ impl Context {
         enum Task<'a> {
             Visit(&'a Syntax),
             Constructor(Head, Cow<'a, Syntax>, usize),
+            Named(Name),
         }
         let mut pending = vec![Task::Visit(syntax)];
         let mut values = Vec::new();
         while let Some(task) = pending.pop() {
             self.tick()?;
             match task {
+                Task::Named(name) => {
+                    let pattern = values.pop().ok_or_else(invalid)?;
+                    values.push(arena.len());
+                    arena.push(Pattern::Named { name, pattern });
+                }
                 Task::Constructor(head, syntax, start) => {
                     let fields = values.split_off(start);
                     values.push(arena.len());
@@ -574,6 +582,11 @@ impl Context {
                 Task::Visit(syntax) => {
                     if let Some(inner) = parenthesized_inner(syntax)? {
                         pending.push(Task::Visit(inner));
+                        continue;
+                    }
+                    if let Some((name, pattern)) = named::parts(syntax)? {
+                        pending.push(Task::Named(name));
+                        pending.push(Task::Visit(pattern));
                         continue;
                     }
                     // `⟨p, …⟩`: a constructor pattern whose head is the column type's only
@@ -711,7 +724,11 @@ impl Context {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut bound = HashSet::new();
             for pattern in &arena[start..] {
-                if let Pattern::Bind(Some(name)) = pattern
+                let name = match pattern {
+                    Pattern::Bind(Some(name)) | Pattern::Named { name, .. } => Some(name),
+                    _ => None,
+                };
+                if let Some(name) = name
                     && !bound.insert(name.clone())
                 {
                     return Err(failure(SourceInferenceError::Match(
@@ -917,6 +934,7 @@ impl Context {
                         continue;
                     }
                     let subject = matrix.subjects.remove(0);
+                    self.bind_named_matrix_column(&mut matrix, &subject, &arena)?;
                     if let Some((test, hit, miss)) =
                         self.literal_matrix_split(&mut matrix, &subject, &mut arena)?
                     {
@@ -1015,7 +1033,9 @@ impl Context {
                                     copy.patterns.splice(..0, other.fields.iter().copied());
                                 }
                                 Pattern::Constructor(_) => continue,
-                                Pattern::Literal(_) => return Err(invalid()),
+                                Pattern::Literal(_) | Pattern::Named { .. } => {
+                                    return Err(invalid());
+                                }
                                 Pattern::Bind(name) => {
                                     if let Some(name) = name {
                                         copy.bindings.push((name.clone(), subject.clone()));
