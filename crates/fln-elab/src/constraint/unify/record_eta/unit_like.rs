@@ -15,15 +15,6 @@ impl Engine<'_> {
         locals: &LocalContext,
         pending: &mut VecDeque<Equation>,
     ) -> Result<bool, UnificationError> {
-        // Erasing a stuck function's arguments must not erase unresolved
-        // obligations. The ordinary assignment/synthesis rungs retain them.
-        if left.has_expr_mvar()
-            || right.has_expr_mvar()
-            || left.has_level_mvar()
-            || right.has_level_mvar()
-        {
-            return Ok(false);
-        }
         let Some(left_type) = self.eta_neutral_type(left, locals)? else {
             return Ok(false);
         };
@@ -60,6 +51,32 @@ impl Engine<'_> {
         let Some(right_type) = self.eta_neutral_type(right, locals)? else {
             return Ok(false);
         };
+        let same_type = same_terms(&left_type, &right_type, &mut self.meter)?;
+        if !same_type
+            && (left_type.has_expr_mvar()
+                || left_type.has_level_mvar()
+                || right_type.has_expr_mvar()
+                || right_type.has_level_mvar())
+        {
+            // Type hints produce an ordinary equation, never an equality
+            // verdict. Keep the original pair on the outer worklist, so it
+            // returns through the K1 guard after assignments make progress.
+            // An unchanged generation reaches the normal deferred fixed point.
+            pending.push_front((left_type, right_type, locals.clone()));
+            return Err(UnificationError::Deferred(
+                UnificationDeferred::UnsupportedEquation,
+            ));
+        }
+        // Even after useful type inference, erasing the original arguments
+        // must not erase an unresolved term, instance, or universe obligation.
+        // The whole transaction rolls back if those cannot be resolved.
+        if left.has_expr_mvar()
+            || right.has_expr_mvar()
+            || left.has_level_mvar()
+            || right.has_level_mvar()
+        {
+            return Ok(false);
+        }
         if [&left_type, &right_type, &sort]
             .iter()
             .any(|term| term.has_expr_mvar() || term.has_level_mvar() || term.has_loose_bvars())
@@ -75,7 +92,7 @@ impl Engine<'_> {
         )? {
             return Ok(false);
         }
-        if !same_terms(&left_type, &right_type, &mut self.meter)? {
+        if !same_type {
             // K1 validates typing, but its delta is broader than the caller's.
             // Parameter and universe conversion still use the original policy.
             pending.push_front((left_type, right_type, locals.clone()));

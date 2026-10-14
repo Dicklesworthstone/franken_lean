@@ -363,3 +363,6 @@ fn final_barrier_cancellation_and_work_limits_preserve_all_state() {
         unchanged(&tx, &before);
     }
 }
+
+#[path = "native_unit_like/inference.rs"]
+mod inference;
