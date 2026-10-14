@@ -39,6 +39,7 @@ use fln_env::constants::ConstantInfo;
 use std::collections::{BTreeSet, HashSet};
 
 mod dependencies;
+mod types;
 
 const CSIMP_TABLE: &str = include_str!("../seed/csimp_recursors.tsv");
 const CSIMP_SCHEMA: &str = "schema fln-seed-csimp-recursors/1";
@@ -214,13 +215,12 @@ impl Context {
             .cloned()
             .collect();
         let dependencies = dependencies::Dependencies::read(self)?;
-        if named.is_empty() && dependencies.is_empty() {
-            return Ok(());
-        }
+        // Untagged axioms can still lack executable code. An empty registry
+        // must not bypass the typed walk of a computational declaration.
         // Proof declarations and type formers have no runtime body. This is
         // also necessary for brecOn.go: its PProd result is data even with a
         // Prop-valued motive, but a projection used solely as a proof erases.
-        if type_former_motive(&term.type_) {
+        if self.codegen_type_former(&term.type_)? {
             return Ok(());
         }
         if let Some(sort) = self.known_type(&term.type_)? {
@@ -244,7 +244,7 @@ impl Context {
         let Some(type_) = self.known_type(value)? else {
             return Ok(false);
         };
-        if type_former_motive(&type_) {
+        if self.codegen_type_former(&type_)? {
             return Ok(true);
         }
         let Some(sort) = self.known_type(&type_)? else {
