@@ -251,3 +251,185 @@ partial def shadow (default : Bool) (n : Nat) : Nat := if n == 0 then 8 else sha
         ["23", "8"]
     );
 }
+
+
+#[test]
+fn an_inferred_header_preserves_ordered_tactics_and_lexical_shadowing() {
+    let base = check(
+        &engine(),
+        r#"
+partial def chosen (n : Nat) := by first
+  | exact (if n == 0 then 7 else chosen (n - 1) + 1)
+  | exact true
+partial def shadow (shadow : Nat -> Nat) (n : Nat) := shadow n
+partial def nestedShadow (n : Nat) := (fun nestedShadow => nestedShadow + 1) n
+"#,
+    );
+    assert_eq!(
+        values(
+            &base,
+            "#eval chosen 4\n#eval shadow (fun n => n + 2) 40\n#eval nestedShadow 6\n",
+        ),
+        ["11", "42", "7"]
+    );
+    for name in ["shadow", "nestedShadow"] {
+        assert!(matches!(
+            base.environment().find(&Name::from_components([name])),
+            Some(ConstantInfo::Defn(value)) if value.safety == DefinitionSafety::Safe
+        ));
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components([name, "_unsafe_rec"]))
+        );
+    }
+}
+
+#[test]
+fn inferred_lambdas_close_dependent_parameters_and_section_captures() {
+    assert_eq!(
+        values(
+            &engine(),
+            r#"
+universe u
+partial def pick := fun {A : Type u} (x : A) => fun (n : Nat) =>
+  if n == 0 then x else pick x (n - 1)
+section
+variable (unused : String) (step : Nat)
+partial def captured := fun (n : Nat) =>
+  if n == 0 then step else captured (n - 1) + step
+end
+#eval pick 13 3
+#eval captured 2 4
+"#,
+        ),
+        ["13", "10"]
+    );
+}
+
+#[test]
+fn inferred_partial_results_still_require_a_real_logical_inhabitant() {
+    let base = engine();
+    for source in [
+        "partial def bad (n : Nat) := if n == 0 then true else bad (n - 1) + 1",
+        "partial def bad (n : Nat) := by first | exact (bad n) | exact 0",
+        "partial def bad := fun (n : Nat) => bad n",
+        "partial def bad (n : Nat) : False := bad (n + 1)",
+    ] {
+        refuses(&base, source, "bad");
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["bad", "_unsafe_rec"]))
+        );
+    }
+    assert_eq!(
+        values(&base, "partial def recovered := 42\n#eval recovered"),
+        ["42"]
+    );
+}
+
+#[test]
+fn inferred_partial_companions_keep_noncomputable_section_effects() {
+    let base = engine();
+    let source = r#"
+noncomputable def hidden (n : Nat) : Nat := n + 19
+partial def wrapped (n : Nat) := if n == 0 then hidden n else wrapped (n - 1)
+"#;
+    refuses(&base, source, "wrapped");
+    let admitted = check(&base, &format!("noncomputable section\n{source}\nend\n"));
+    assert!(
+        admitted
+            .execute_source_definitions(
+                &[b"#eval wrapped 2"],
+                &KVMap::new(),
+                EngineExecutionLimits::new(limits().kernel),
+            )
+            .is_err()
+    );
+    refuses(&admitted, "theorem bad : wrapped 0 = 19 := by rfl", "bad");
+}
+
+#[test]
+fn inferred_signatures_and_companions_survive_checked_module_roundtrip() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::source_check::modules::imported::SourceOleanImportLimits;
+    use fln::{OleanCheckLimits, OleanModuleInput, OleanWriteBudget, SourceModuleInput};
+
+    let base = Engine::builder().build_empty();
+    let name = Name::from_components(["Inferred"]);
+    let source = br#"prelude
+universe u
+class Inhabited (A : Sort u) where
+  default : A
+def default {A : Sort u} [inst : Inhabited A] : A := Inhabited.default
+inductive Flag where
+  | stop
+  | again
+partial def rotate (flag : Flag) := match flag with
+  | Flag.stop => Flag.again
+  | Flag.again => rotate Flag.stop
+partial def keep := fun {A : Type} (x : A) (flag : Flag) => match flag with
+  | Flag.stop => x
+  | Flag.again => keep x Flag.stop
+def after : Flag := keep (rotate Flag.stop) Flag.again
+"#;
+    let build = base
+        .compile_source_modules(
+            &[SourceModuleInput {
+                name: &name,
+                source,
+            }],
+            &name,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let [artifact] = build.artifacts.as_slice() else {
+        panic!("one module artifact");
+    };
+    let imported = base
+        .import_olean_modules_for_source(
+            &[OleanModuleInput {
+                name: &name,
+                artifact: &artifact.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }],
+            std::slice::from_ref(&name),
+            &KVMap::new(),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(4 * 1024 * 1024, limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    for (name, declaration) in build.checked.checked.engine.environment().constants() {
+        assert_eq!(imported.environment().find(name), Some(declaration));
+    }
+    let execution = imported
+        .execute_source_definitions(
+            &[b"#eval after"],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(value) = &execution.executions[0].exit else {
+        panic!("expected computed constructor");
+    };
+    assert_eq!(
+        fln::vm_value_kind(&value.value),
+        fln_vm::interpreter::ValueKind::Ctor(1)
+    );
+    refuses(
+        &imported,
+        "def leak : Flag := rotate._unsafe_rec Flag.stop",
+        "leak",
+    );
+    assert!(base.environment().is_empty());
+}
