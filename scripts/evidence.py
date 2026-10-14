@@ -32749,11 +32749,24 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     interpreter_shadow = interpreter_root / "shadow"
     interpreter_shadow.mkdir()
     shadow_marker = interpreter_root / "shadow-imported"
+    (interpreter_shadow / "sitecustomize.py").write_text(
+        "import sys\n"
+        "def _reimport_excepthook(exc_type, exc, tb):\n"
+        "    try:\n"
+        "        import platform\n"
+        "    except BaseException:\n"
+        "        pass\n"
+        "    sys.__excepthook__(exc_type, exc, tb)\n"
+        "sys.excepthook = _reimport_excepthook\n"
+    )
     (interpreter_shadow / "platform.py").write_text(
-        "with open("
+        "import sys\n"
+        "if not getattr(sys, '_fln_shadow_recorded', False):\n"
+        "    sys._fln_shadow_recorded = True\n"
+        "    with open("
         + repr(str(shadow_marker))
         + ", 'ab') as marker:\n"
-        "    marker.write(b'shadow-imported\\n')\n"
+        "        marker.write(b'shadow-imported\\n')\n"
         "raise RuntimeError('planted PYTHONPATH shadow executed')\n"
     )
     interpreter_base_env = {
