@@ -55,6 +55,7 @@ fn range_argument(mut head: Vec<(Syntax, usize)>, body: Syntax) -> (Syntax, usiz
 pub(super) struct Assertion {
     keyword: usize,
     name: Option<usize>,
+    pattern: Option<Syntax>,
     colon: Option<usize>,
     annotation: Option<Syntax>,
     assignment: Option<usize>,
@@ -258,6 +259,7 @@ impl Prefix {
     }
 
     pub(super) fn assertion(
+        leaves: &Leaves,
         view: &SourceView,
         tokens: &[LexedToken],
         keyword: usize,
@@ -280,6 +282,7 @@ impl Prefix {
         let mut assertion = Assertion {
             keyword,
             name: None,
+            pattern: None,
             colon: None,
             annotation: None,
             assignment: None,
@@ -301,8 +304,16 @@ impl Prefix {
                 *cursor += 2;
             }
         } else if form.declares() {
+            if form == Form::Let
+                && let Some(range) = crate::matching::named_let_range(tokens, *cursor, end)
+            {
+                assertion.pattern =
+                    crate::matching::parse_named_binding(leaves, view, tokens, range.clone())?;
+                *cursor = range.end;
+            }
             // `letId := binderIdent`: a name or the hole `_`.
-            if *cursor < end
+            if assertion.pattern.is_none()
+                && *cursor < end
                 && (matches!(&tokens[*cursor].kind, TokenKind::Ident(_))
                     || word(tokens, *cursor, "_"))
             {
@@ -569,10 +580,17 @@ impl Prefix {
                 (None, None) => null_node(vec![]),
                 _ => unreachable!("assertion annotation phases"),
             };
-            let declaration = Syntax::node(
-                parser_kind(&["Term", "letIdDecl"]),
-                vec![
+            let (kind, lhs) = match p.pattern {
+                Some(pattern) => ("letPatDecl", pattern),
+                None => (
+                    "letIdDecl",
                     Syntax::node(parser_kind(&["Term", "letId"]), vec![name]),
+                ),
+            };
+            let declaration = Syntax::node(
+                parser_kind(&["Term", kind]),
+                vec![
+                    lhs,
                     null_node(vec![]),
                     annotation,
                     leaves.leaf(p.assignment.expect("have assignment"))?,

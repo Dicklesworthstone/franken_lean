@@ -1461,8 +1461,9 @@ fn bounded_let_bindings(
         };
         // `let ⟨a, b⟩ := p` / `let (a, b) := p`: a pattern up to its `:=` (or its type's `:`).
         let pattern = (recursive.is_none()
-            && matches!(tokens.get(name).map(|t| &t.kind),
-                Some(TokenKind::Symbol(s)) if s == "⟨" || s == "("))
+            && (matches!(tokens.get(name).map(|t| &t.kind),
+                Some(TokenKind::Symbol(s)) if s == "⟨" || s == "(")
+                || matching::named_prefix(tokens, name, tokens.len())))
         .then(|| {
             let mut depth = 0usize;
             for (at, token) in tokens.iter().enumerate().skip(name) {
@@ -1661,7 +1662,10 @@ fn bounded_value_syntax_to(
             Syntax::node(
                 parser_kind(&["Term", "letPatDecl"]),
                 vec![
-                    bounded_term(leaves, view, tokens, pattern, grammar)?,
+                    match matching::parse_named_binding(leaves, view, tokens, pattern.clone())? {
+                        Some(pattern) => pattern,
+                        None => bounded_term(leaves, view, tokens, pattern, grammar)?,
+                    },
                     null_node(Vec::new()),
                     explicit_type,
                     leaves.leaf(binding.assignment)?,
@@ -3714,8 +3718,14 @@ fn bounded_term_token(
                 || term_locals::word(tokens, index, "show")
                 || term_locals::word(tokens, index, "suffices")) =>
         {
-            let prefix =
-                term_locals::Prefix::assertion(view, tokens, index, &mut cursor, range.end)?;
+            let prefix = term_locals::Prefix::assertion(
+                leaves,
+                view,
+                tokens,
+                index,
+                &mut cursor,
+                range.end,
+            )?;
             frames.push(term_binders::frame(prefix));
         }
         Some(TokenKind::Symbol(symbol))

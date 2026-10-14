@@ -774,13 +774,12 @@ fn list_pattern(tokens: &[LexedToken], range: Range<usize>) -> bool {
 /// parsed as applying x to an explicit term. Only a touching named-pattern
 /// prefix selects the same bounded pattern reader as match alternatives.
 /// Never reinterpret a named equality assumption as a type annotation.
-pub(super) fn named_binding_pattern(
+pub(super) fn parse_named_binding(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
-    original: Syntax,
-) -> Result<Syntax, NatDefinitionParseError> {
+) -> Result<Option<Syntax>, NatDefinitionParseError> {
     let mut found = false;
     for at in range.clone() {
         if at + 2 < range.end
@@ -798,10 +797,56 @@ pub(super) fn named_binding_pattern(
         }
     }
     if found {
-        pattern(leaves, view, tokens, range)
+        pattern(leaves, view, tokens, range).map(Some)
     } else {
-        Ok(original)
+        Ok(None)
     }
+}
+
+pub(super) fn named_binding_pattern(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    original: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    Ok(parse_named_binding(leaves, view, tokens, range)?.unwrap_or(original))
+}
+
+pub(super) fn named_prefix(tokens: &[LexedToken], at: usize, end: usize) -> bool {
+    at + 1 < end
+        && matches!(tokens[at].kind, TokenKind::Ident(_))
+        && is_symbol(tokens, at + 1, "@")
+        && tokens[at].extent.end() == tokens[at + 1].extent.start()
+}
+
+/// Named local declarations inside term frames have the same header boundary
+/// as declaration-leading lets: only an outer colon or assignment ends it.
+/// Delimiters inside the payload remain the pattern parser's responsibility.
+pub(super) fn named_let_range(
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+) -> Option<Range<usize>> {
+    let mut head = start;
+    while head < end && is_symbol(tokens, head, "(") {
+        head += 1;
+    }
+    if !named_prefix(tokens, head, end) {
+        return None;
+    }
+    let mut depth = 0_usize;
+    for (at, token) in tokens.iter().enumerate().take(end).skip(start) {
+        if let TokenKind::Symbol(symbol) = &token.kind {
+            match crate::canonical_bracket(symbol) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.checked_sub(1)?,
+                ":" | ":=" if depth == 0 => return Some(start..at),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn pattern(
@@ -1375,9 +1420,12 @@ fn let_values(
                         Some(pattern) => Syntax::node(
                             parser_kind(&["Term", "letPatDecl"]),
                             vec![
-                                bounded_term_spliced(
-                                    leaves, view, tokens, pattern, grammar, splices, updates,
-                                )?,
+                                match parse_named_binding(leaves, view, tokens, pattern.clone())? {
+                                    Some(pattern) => pattern,
+                                    None => bounded_term_spliced(
+                                        leaves, view, tokens, pattern, grammar, splices, updates,
+                                    )?,
+                                },
                                 null_node(vec![]),
                                 annotation,
                                 leaves.leaf(binding.assignment)?,

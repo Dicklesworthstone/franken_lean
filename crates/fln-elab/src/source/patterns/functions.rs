@@ -15,8 +15,17 @@ pub(super) fn needs_expansion(syntax: &Syntax) -> bool {
 /// An anonymous-constructor (`⟨a, b⟩`) or tuple (`(a, b)`) lambda binder. A binder is lowered as
 /// a term before its lambda is rebuilt, so a tuple arrives here as its macro's
 /// `_root_.Prod.mk a b` (`expandTuple`), itself the pattern the tuple stands for.
-fn pattern_binder(binder: &Syntax) -> bool {
-    binder.kind() == Some(&parser_kind(&["Term", "anonymousCtor"]))
+fn pattern_binder(mut binder: &Syntax) -> bool {
+    // Grouping a named pattern must not turn it into a list of parameter names.
+    // Only peel complete parentheses, leaving annotations to ordinary checking.
+    while let Syntax::Node { kind, args, .. } = binder {
+        if kind != &parser_kind(&["Term", "paren"]) || args.len() != 3 {
+            break;
+        }
+        binder = &args[1];
+    }
+    binder.kind() == Some(&parser_kind(&["Term", "namedPattern"]))
+        || binder.kind() == Some(&parser_kind(&["Term", "anonymousCtor"]))
         || binder.kind() == Some(&parser_kind(&["Term", "tuple"]))
         || matches!(binder, Syntax::Node { kind, args, .. }
             if kind == &parser_kind(&["Term", "app"])

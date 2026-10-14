@@ -2,6 +2,7 @@
 //! binder annotation is another frame phase, not a recursive parser invocation.
 //! Leaves and wrappers follow the pinned Term funBinder/forall grammar.
 use super::*;
+mod named;
 
 pub(super) struct Prefix {
     keyword: usize,
@@ -219,6 +220,13 @@ impl Prefix {
                 self.phase = Phase::Body;
                 *cursor += 1;
                 return Ok(());
+            }
+            if self.lambda
+                && let Some((pattern, next)) = named::binder(leaves, view, tokens, *cursor, end)?
+            {
+                self.binders.push(pattern);
+                *cursor = next;
+                continue;
             }
             if name(tokens, *cursor) {
                 // `explicitBinders` is all-bracketed or all-bare, never mixed.
