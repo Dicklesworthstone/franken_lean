@@ -1,8 +1,7 @@
 name: native source reproduction
 
-# An auxiliary reproduction runner, not an acceptance gate or publisher.
-# Its push trigger is intentionally limited to this workflow; ordinary source
-# commits continue to use the existing quality and product gates.
+# Auxiliary native-source validation, not a product acceptance gate.
+# Exports a tested tree only; it NEVER creates commits or moves a branch.
 on:
   workflow_dispatch:
   push:
@@ -14,10 +13,13 @@ permissions:
 
 jobs:
   reproduce:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
-      - name: checkout the triggering source tree
+      - name: checkout the exact triggering source tree
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
@@ -28,35 +30,76 @@ jobs:
           set -euo pipefail
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt
-          printf 'FLN_REPRO_CHANNEL=%s\n' "$channel" >> "$GITHUB_ENV"
 
-      - name: prepare a credential-free offline reproduction bundle
+      - name: apply the identity-checked selected-lemma feature patch
         shell: bash
         run: |
           set -euo pipefail
-          bundle="$RUNNER_TEMP/native-source-repro"
-          mkdir -p "$bundle"
-          git rev-parse HEAD > "$bundle/source-commit.txt"
-          git archive --format=tar HEAD | gzip -1 > "$bundle/source.tar.gz"
-          compiler="$(rustup which --toolchain "$FLN_REPRO_CHANNEL" rustc)"
-          toolchain="$(dirname "$(dirname "$compiler")")"
-          "$compiler" -Vv > "$bundle/rustc-version.txt"
-          # Only installed public compiler components, never rustup/cargo homes
-          # (which may contain credentials) or the runner's working directory.
-          tar -C "$toolchain" -czf "$bundle/toolchain.tar.gz" bin lib libexec
-          (cd "$bundle" && sha256sum source.tar.gz toolchain.tar.gz > SHA256SUMS)
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess
+          encoded = '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'
+          manifest = {
+              'crates/fln-elab/src/source/tactics.rs': ['5e59e691df9bc51114cbe8fda9d8bc237ac71a07', 'efd723e25cd5186909ed23cde2ed3aa8fed8c668'],
+              'crates/fln-elab/src/source/tactics/search.rs': ['714c1acf365610b5a095155e6b507b00103351af', '51e2d4b0d9ea2da40b9173e2c36a0d5e1f516cfe'],
+              'crates/fln-elab/src/source/tactics/search/selection.rs': ['6fc27becd9b416321167347bc35352ca334242f4', 'ee79f93a45442ef2c256125ec9fbb7bd39cb3dda'],
+              'crates/fln-parse/src/proofs.rs': ['83ed8e544a033c78b0529891654d21e13a3110b4', 'ac6ee338d0c8ccce0fcf9982fcd6283395225b19'],
+              'crates/fln-parse/src/proofs/search.rs': ['7940db022818c1e40863a467ab369ccdf2cd511e', 'e4e5e9d8dcafae9fd774ddcf2fee8c07772a9ee1'],
+              'crates/fln/tests/source_selected_search.rs': [None, 'c115de18253db2138a10b68b1c081735854850f7'],
+          }
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          for path, (before, after) in manifest.items():
+              p = pathlib.Path(path)
+              actual = blob(p.read_bytes()) if p.exists() else None
+              if actual != before:
+                  raise SystemExit('Source identity changed: ' + path)
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          if hashlib.sha256(patch).hexdigest() != '8c6f59df577f4dcda7b95a3d08d42754ad7cb17f3f904cba0a4aa6256f671796':
+              raise SystemExit('Patch digest mismatch')
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          for path, (before, after) in manifest.items():
+              if blob(pathlib.Path(path).read_bytes()) != after:
+                  raise SystemExit('Result identity changed: ' + path)
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'selected-manifest.json').write_text(json.dumps(manifest))
+          PY
 
-      - name: retain the offline reproduction inputs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: native-source-repro-${{ github.sha }}
-          path: ${{ runner.temp }}/native-source-repro/
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: run native proof-search regressions
+      - name: validate native parser elaborator and dual-checker admission
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --offline -p fln-elab --lib source::tactics::search::tests --no-fail-fast
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/search.rs crates/fln-elab/src/source/tactics/search/selection.rs crates/fln-parse/src/proofs.rs crates/fln-parse/src/proofs/search.rs crates/fln/tests/source_selected_search.rs
+          cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
+          cargo test --locked --offline -p fln --test source_selected_search --no-fail-fast
+
+      - name: export tested Git objects without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          if repo != 'Dicklesworthstone/franken_lean':
+              raise SystemExit('Unexpected repository')
+          manifest = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'selected-manifest.json').read_text())
+          def post(endpoint, body):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + '/git/' + endpoint, data=json.dumps(body).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'FrankenLean-native-source-validation'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          entries = []
+          for path, (before, after) in manifest.items():
+              data = pathlib.Path(path).read_bytes()
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if actual != after:
+                  raise SystemExit('Post-test source identity changed: ' + path)
+              uploaded = post('blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+              if uploaded['sha'] != after:
+                  raise SystemExit('Uploaded blob identity mismatch')
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': after})
+          parent = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          tree = post('trees', {'base_tree': base, 'tree': entries})
+          print('TESTED_SOURCE_TREE=' + json.dumps({'parent': parent, 'tree': tree['sha'], 'files': entries}, sort_keys=True))
+          PY
