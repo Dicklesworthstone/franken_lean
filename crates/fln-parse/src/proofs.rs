@@ -15,6 +15,7 @@ pub(super) use elimination::calculation;
 mod guard_hyp;
 mod locations;
 mod rcases;
+mod search;
 
 /// Proof blocks open on one thread at once; the next is refused rather than recursed into on
 /// a small host stack. A count, not a stack measurement, so the refusal is the same on every
@@ -626,8 +627,10 @@ fn local_tactic(
             }
             args.push(config);
         }
+        "solve_by_elim" => {
+            return search::parse(leaves, view, tokens, range, args.remove(0));
+        }
         "assumption"
-        | "solve_by_elim"
         | "rfl"
         | "contradiction"
         | "constructor"
@@ -699,24 +702,6 @@ fn local_tactic(
             args.push(location);
         }
         _ => return Err(refusal(view, tokens, start)),
-    }
-    // `syntax (name := solveByElim) "solve_by_elim" "*"? optConfig (&" only")? args? using_? :
-    // tactic` (`Init/Tactics.lean`), every optional slot empty.
-    if keyword == "solve_by_elim" {
-        return Ok(Syntax::node(
-            parser_kind(&["Tactic", "solveByElim"]),
-            vec![
-                args.remove(0),
-                null_node(Vec::new()),
-                Syntax::node(
-                    parser_kind(&["Tactic", "optConfig"]),
-                    vec![null_node(Vec::new())],
-                ),
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-            ],
-        ));
     }
     // `macro "w" : tactic` and `syntax "w" : tactic` at the root name their kind `tacticW`.
     if matches!(
@@ -2384,6 +2369,12 @@ mod search_tests {
             "theorem t (p : Prop) (h : p) : p := by\r\n  solve_by_elim /- local search -/\r\n",
             "theorem t : P := by first | solve_by_elim | assumption",
             "theorem t : And P Q := by constructor <;> (solve_by_elim)",
+            "theorem t : P := by solve_by_elim only",
+            "theorem t : P := by solve_by_elim only []",
+            "theorem t : P := by solve_by_elim only [h,]",
+            "theorem t : P := by solve_by_elim [f (g x), -(h), h]",
+            "theorem t : P := by solve_by_elim only [*, -h, replacement]",
+            "theorem t : P := by\r\n  solve_by_elim /- pick -/ only [h, f]\r\n",
         ] {
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());
@@ -2398,8 +2389,12 @@ mod search_tests {
     fn solve_by_elim_does_not_silently_ignore_unsupported_options() {
         for tail in [
             "solve_by_elim h",
-            "solve_by_elim [h]",
-            "solve_by_elim only",
+            "solve_by_elim [h,, h]",
+            "solve_by_elim [,h]",
+            "solve_by_elim [-]",
+            "solve_by_elim [* h]",
+            "solve_by_elim [-h x]",
+            "solve_by_elim [h] using localRules",
             "solve_by_elim (config := {})",
             "solve_by_elim at h",
         ] {

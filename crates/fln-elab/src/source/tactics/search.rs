@@ -6,13 +6,17 @@
 //! heap worklists and iterative deepening, not source-controlled Rust recursion.
 use super::*;
 
+mod selection;
+pub(super) use selection::selection;
+use selection::{Candidate, Selection};
+
 const MAX_APPLICATION_DEPTH: usize = 6;
 
-struct Choice {
+struct Choice<'a> {
     context: Box<Context>,
     pending: Vec<(Work<'static>, usize)>,
     goal: ProofGoal,
-    locals: Vec<LocalDecl>,
+    candidates: Vec<Candidate<'a>>,
     next: usize,
     depth: usize,
 }
@@ -28,14 +32,23 @@ impl Context {
     /// evidence, reflexivity/True leaves, and reversed equality facts precede
     /// applications. Shallower proofs precede deeper ones. Defaults construct
     /// ordinary proof terms, never declarations or kernel acceptance.
-    pub(super) fn solve_by_elim_proof_goal(
+    #[cfg(test)]
+    fn solve_by_elim_proof_goal(&mut self, goal: ProofGoal) -> Result<(), NatDefinitionElabError> {
+        self.solve_by_elim_selected_proof_goal(goal, &Selection::default())
+    }
+
+    pub(super) fn solve_by_elim_selected_proof_goal(
         &mut self,
         goal: ProofGoal,
+        selection: &Selection<'_>,
     ) -> Result<(), NatDefinitionElabError> {
         let snapshot = Box::new(self.clone());
+        let validated = self.selected_search_candidates(&goal, selection);
+        restore(self, &snapshot);
+        validated?;
         for limit in 0..=MAX_APPLICATION_DEPTH {
             restore(self, &snapshot);
-            match self.search_local_proof(goal.clone(), limit) {
+            match self.search_selected_proof(goal.clone(), selection, limit) {
                 Ok(()) => return Ok(()),
                 Err(problem) if backtrack::recoverable(&problem) => {}
                 Err(problem) => {
@@ -48,24 +61,26 @@ impl Context {
         Err(error(TacticError::NoMatchingAssumption))
     }
 
-    fn search_local_proof(
+    fn search_selected_proof(
         &mut self,
         goal: ProofGoal,
+        selection: &Selection<'_>,
         limit: usize,
     ) -> Result<(), NatDefinitionElabError> {
         let mut pending = vec![(Work::Goal(goal), 0)];
-        let mut choices: Vec<Choice> = Vec::new();
-        let mut retry: Option<Choice> = None;
+        let mut choices: Vec<Choice<'_>> = Vec::new();
+        let mut retry: Option<Choice<'_>> = None;
+        let defaults = usize::from(selection.defaults);
         loop {
             self.tick()?;
             if let Some(mut choice) = retry.take() {
-                let count = choice.locals.len();
+                let count = choice.candidates.len();
                 // Defaults and both orientations are genuine choice points:
                 // a later dependent premise may require another witness.
                 let attempts = if choice.depth < limit {
-                    count * 4 + 1
+                    count * 4 + defaults
                 } else {
-                    count * 2 + 1
+                    count * 2 + defaults
                 };
                 let mut selected = None;
                 while choice.next < attempts {
@@ -74,12 +89,12 @@ impl Context {
                     let candidate = choice.next;
                     choice.next += 1;
                     let result = if candidate < count {
-                        let local = choice.locals[candidate].clone();
-                        self.search_local_candidate(&choice.goal, local, false)
-                    } else if candidate == count {
+                        let candidate = choice.candidates[candidate].clone();
+                        self.search_candidate(&choice.goal, candidate, false)
+                    } else if defaults != 0 && candidate == count {
                         self.search_default_candidate(&choice.goal)
                     } else {
-                        let offset = candidate - count - 1;
+                        let offset = candidate - count - defaults;
                         let (index, application, reverse) = if offset < count {
                             (offset, false, true)
                         } else if offset < count * 2 {
@@ -87,11 +102,11 @@ impl Context {
                         } else {
                             (offset - count * 2, true, true)
                         };
-                        let local = choice.locals[index].clone();
+                        let candidate = choice.candidates[index].clone();
                         if reverse {
-                            self.search_symmetric_candidate(&choice.goal, local, application)
+                            self.search_symmetric_candidate(&choice.goal, candidate, application)
                         } else {
-                            self.search_local_candidate(&choice.goal, local, application)
+                            self.search_candidate(&choice.goal, candidate, application)
                         }
                     };
                     match result {
@@ -125,20 +140,12 @@ impl Context {
                     }
                     self.txn.lctx = goal.lctx.clone();
                     goal.target = self.instantiate(&goal.target)?;
-                    let mut locals = Vec::new();
-                    for local in goal.lctx.decls().iter().rev() {
-                        self.tick()?;
-                        // Recursive equation hypotheses have their own guarded
-                        // lowering path; search must not expose them as axioms.
-                        if !self.is_matrix_hypothesis(local) {
-                            locals.push(local.clone());
-                        }
-                    }
+                    let candidates = self.selected_search_candidates(&goal, selection)?;
                     retry = Some(Choice {
                         context: Box::new(self.clone()),
                         pending: pending.clone(),
                         goal,
-                        locals,
+                        candidates,
                         next: 0,
                         depth,
                     });
@@ -202,7 +209,7 @@ impl Context {
     fn search_symmetric_candidate(
         &mut self,
         goal: &ProofGoal,
-        local: LocalDecl,
+        candidate: Candidate<'_>,
         application: bool,
     ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
@@ -214,7 +221,7 @@ impl Context {
         let reversed =
             equality::equation(level.clone(), alpha.clone(), right.clone(), left.clone());
         let (witness, subgoal) = self.proof_goal(reversed)?;
-        let candidate = self.search_local_candidate(&subgoal, local, application)?;
+        let candidate = self.search_candidate(&subgoal, candidate, application)?;
         let value = self.symmetric_equality(&level, &alpha, &right, &left, witness)?;
         // The local rule must actually prove the reversed equation before the
         // Eq.rec bridge closes the parent. This is not a recursive "try symm"
@@ -225,19 +232,36 @@ impl Context {
         Ok(work)
     }
 
-    fn search_local_candidate(
+    fn search_candidate(
         &mut self,
         goal: &ProofGoal,
-        local: LocalDecl,
+        candidate: Candidate<'_>,
         application: bool,
     ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
-        let value = Expr::fvar(local.id);
+        // A supplied lemma is elaborated afresh at each choice. In particular,
+        // neither its universe metavariables nor its instance obligations may
+        // be reused by a second application or a different goal context.
+        let instance_start = self.instance_goals.len();
+        let term = match candidate {
+            Candidate::Local(local) => Typed {
+                value: Expr::fvar(local.id),
+                type_: local.type_,
+            },
+            Candidate::Explicit(syntax) => self.term(syntax, None)?,
+        };
         if !application {
-            if !self.proof_types_match(&local.type_, &goal.target)? {
+            if !self.proof_types_match(&term.type_, &goal.target)? {
                 return Err(error(TacticError::NoMatchingAssumption));
             }
-            return Ok(vec![Work::Close(goal.clone(), value)]);
+            self.resolve_instances(false)?;
+            if self.instance_goals[instance_start..]
+                .iter()
+                .any(|id| !self.txn.mvars.is_assigned(id))
+            {
+                return Err(error(TacticError::ApplyMismatch));
+            }
+            return Ok(vec![Work::Close(goal.clone(), term.value)]);
         }
         let mut proof = ProofState {
             extent: None,
@@ -249,16 +273,7 @@ impl Context {
             work: Vec::new(),
             controls: Vec::new(),
         };
-        let instance_start = self.instance_goals.len();
-        self.apply_proof_term(
-            &mut proof,
-            goal.clone(),
-            Typed {
-                value,
-                type_: local.type_,
-            },
-            instance_start,
-        )?;
+        self.apply_proof_term(&mut proof, goal.clone(), term, instance_start)?;
         Ok(proof.work)
     }
 }

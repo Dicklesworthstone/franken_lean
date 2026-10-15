@@ -119,17 +119,17 @@ impl Context {
     ) -> Result<Vec<Candidate<'a>>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         let mut excluded = Vec::new();
-        for syntax in &selection.remove {
-            self.tick()?;
-            let term = self.term(syntax, None)?;
-            excluded.push(self.instantiate(&term.value)?);
-        }
-        // Even unused supplied terms must be well-formed: an available local
-        // cannot hide an unknown name or a resource stop in the argument list.
-        // Discard these probe assignments, then elaborate the chosen term in
-        // the candidate's own snapshot (including its own instance obligations).
+        // Validate every argument even if another candidate would solve the
+        // goal immediately. Both additions and erasures are probes: a removed
+        // term must not leak metavariables, constraints or instance obligations.
         let snapshot = self.clone();
         let validated = (|| {
+            for syntax in &selection.remove {
+                self.tick()?;
+                let term = self.term(syntax, None)?;
+                excluded.push(self.instantiate(&term.value)?);
+                restore(self, &snapshot);
+            }
             for syntax in &selection.add {
                 self.tick()?;
                 self.term(syntax, None)?;

@@ -1,73 +1,62 @@
 name: native source reproduction
 
-# One-shot source transport. No commit creation, branch updates, or gate changes.
-# The exported tree restores the original read-only reproduction workflow.
+# An auxiliary reproduction runner, not an acceptance gate or publisher.
+# Its push trigger is intentionally limited to this workflow; ordinary source
+# commits continue to use the existing quality and product gates.
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: ['.github/workflows/native-source-repro.yml']
+
 permissions:
   contents: read
+
 jobs:
   reproduce:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: checkout the triggering source tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: recover the immutable identity-checked candidate
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 -I - <<'PY'
-          import base64, json, os, pathlib, subprocess, textwrap, urllib.request
-          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/59c68c9b9ff86b06a30c4f9981cc309dc22cbbb0'
-          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'FrankenLean-native-source-validation'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              obj = json.load(response)
-          if obj['sha'] != '59c68c9b9ff86b06a30c4f9981cc309dc22cbbb0':
-              raise SystemExit('Unexpected candidate transport object')
-          source = base64.b64decode(obj['content']).decode()
-          start = source.index('      - name: apply the identity-checked selected-lemma feature patch')
-          end = source.index('\n      - name:', start + 1)
-          block = source[start:end].split('        run: |\n', 1)[1]
-          block = textwrap.dedent(block)
-          # Two transcription defects in the transport encoding, not source edits.
-          # The decoded patch SHA256 and all six before/after Git hashes must match.
-          block = block.replace('CKAffrKB2PuOztxoPt', 'CKAffrKB2KPuOztxoPt')
-          block = block.replace('M1hTOBrN1jfb1bc1k14gP', 'M1hTOBrN1jfb1rck14gP')
-          subprocess.run(['bash', '-euo', 'pipefail', '-c', block], check=True)
-          start = source.index('      - name: export tested Git objects without moving any branch')
-          export = textwrap.dedent(source[start:].split('        run: |\n', 1)[1])
-          export = export.replace("          parent =", "          parent =")
-          marker = "parent = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()"
-          if export.count(marker) != 1:
-              raise SystemExit('Unexpected export program')
-          export = export.replace(marker, "entries.append({'path': '.github/workflows/native-source-repro.yml', 'mode': '100644', 'type': 'blob', 'sha': '64953682521d11816bf5f6e26ef9b4013e505186'})\n" + marker)
-          pathlib.Path(os.environ['RUNNER_TEMP'], 'export-selected-source.sh').write_text(export)
-          PY
-      - name: install the pinned native compiler
+
+      - name: install the repository-pinned native toolchain
         shell: bash
         run: |
           set -euo pipefail
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt
-      - name: run parser elaborator and dual-checker source regressions
+          printf 'FLN_REPRO_CHANNEL=%s\n' "$channel" >> "$GITHUB_ENV"
+
+      - name: prepare a credential-free offline reproduction bundle
         shell: bash
         run: |
           set -euo pipefail
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/search.rs crates/fln-elab/src/source/tactics/search/selection.rs crates/fln-parse/src/proofs.rs crates/fln-parse/src/proofs/search.rs crates/fln/tests/source_selected_search.rs
-          cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
-          cargo test --locked --offline -p fln --test source_selected_search --no-fail-fast
-      - name: export validated objects without moving main
+          bundle="$RUNNER_TEMP/native-source-repro"
+          mkdir -p "$bundle"
+          git rev-parse HEAD > "$bundle/source-commit.txt"
+          git archive --format=tar HEAD | gzip -1 > "$bundle/source.tar.gz"
+          compiler="$(rustup which --toolchain "$FLN_REPRO_CHANNEL" rustc)"
+          toolchain="$(dirname "$(dirname "$compiler")")"
+          "$compiler" -Vv > "$bundle/rustc-version.txt"
+          # Only installed public compiler components, never rustup/cargo homes
+          # (which may contain credentials) or the runner's working directory.
+          tar -C "$toolchain" -czf "$bundle/toolchain.tar.gz" bin lib libexec
+          (cd "$bundle" && sha256sum source.tar.gz toolchain.tar.gz > SHA256SUMS)
+
+      - name: retain the offline reproduction inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-source-repro-${{ github.sha }}
+          path: ${{ runner.temp }}/native-source-repro/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: run native proof-search regressions
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash -euo pipefail "$RUNNER_TEMP/export-selected-source.sh"
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln-elab --lib source::tactics::search::tests --no-fail-fast

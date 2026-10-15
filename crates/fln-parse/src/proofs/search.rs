@@ -28,6 +28,10 @@ pub(super) fn parse(
         null_node(Vec::new())
     };
     let (config, after_config) = config(leaves, view, tokens, at, range.end)?;
+    if after_config != at {
+        // Selected lemmas are supported, configurable search is not yet.
+        return Err(refusal(view, tokens, at));
+    }
     at = after_config;
     let only = if at < range.end
         && matches!(&tokens[at].kind, TokenKind::Ident(name) if *name == Name::from_components(["only"]))

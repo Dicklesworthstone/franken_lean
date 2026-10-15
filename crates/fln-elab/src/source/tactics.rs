@@ -59,6 +59,7 @@ pub enum TacticError {
         count: usize,
     },
     NoMatchingAssumption,
+    InvalidSearchArguments(&'static str),
     SyntheticHoleOutsideRefine,
     IncompatibleSyntheticHole,
     NoConstructor,
@@ -162,6 +163,7 @@ impl std::fmt::Display for TacticError {
                 "left/right require an inductive type with two constructors"
             ),
             Self::NoMatchingAssumption => write!(f, "no local assumption matches the goal"),
+            Self::InvalidSearchArguments(reason) => write!(f, "solve_by_elim: {reason}"),
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
             Self::ChangeMismatch => {
                 write!(f, "change target is not definitionally equal to the goal")
@@ -1206,16 +1208,11 @@ impl Context {
                 expect_default_config(config, "omega configuration")?;
                 self.omega_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
-                let [keyword, star, config, only, arguments, using] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "solve_by_elim", "local proof search tactic")?;
-                expect_empty_null(star, "solve_by_elim star")?;
-                expect_default_config(config, "solve_by_elim configuration")?;
-                expect_empty_null(only, "solve_by_elim only")?;
-                expect_empty_null(arguments, "solve_by_elim arguments")?;
-                expect_empty_null(using, "solve_by_elim using")?;
-                self.solve_by_elim_proof_goal(goal)?;
+                let selection = search::selection(args)?;
+                if selection.all_goals {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                }
+                self.solve_by_elim_selected_proof_goal(goal, &selection)?;
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
