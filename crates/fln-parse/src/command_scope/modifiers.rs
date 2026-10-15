@@ -192,19 +192,34 @@ pub fn prefix(source: &[u8]) -> Result<Option<DeclarationPrefix>, DefinitionPars
 /// binding in the result type does not start the proof. An unfinished header
 /// has no value boundary yet. The returned position is in the original bytes.
 pub fn theorem_body_start(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
-    declaration_body_start(source, false)
+    declaration_body_start(source, BodyKind::Theorem)
 }
 
 /// Locate a named or anonymous instance's value opener without parsing its
 /// unfinished body. This establishes a syntax boundary only: the elaborator
 /// must classify the header before a private proof world may be selected.
 pub fn instance_body_start(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
-    declaration_body_start(source, true)
+    declaration_body_start(source, BodyKind::Instance)
+}
+
+/// Locate a definition, abbreviation or opaque declaration's actual value
+/// opener. Definitions and abbreviations may infer their result type. This
+/// boundary grants no visibility: the elaborator must validate the header and
+/// its declaration-specific exposure policy before selecting a body context.
+pub fn definition_body_start(source: &[u8]) -> Result<Option<usize>, DefinitionParseError> {
+    declaration_body_start(source, BodyKind::Definition)
+}
+
+#[derive(Clone, Copy)]
+enum BodyKind {
+    Theorem,
+    Instance,
+    Definition,
 }
 
 fn declaration_body_start(
     source: &[u8],
-    instance: bool,
+    body_kind: BodyKind,
 ) -> Result<Option<usize>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -212,11 +227,20 @@ fn declaration_body_start(
     let (_, _, declaration_start) =
         crate::declaration_prefix(&view, &tokens, DefinitionGrammar::Scalar)?;
     let declaration_start = instance_keyword(&tokens, declaration_start);
-    if !matches!(tokens.get(declaration_start).map(|token| &token.kind),
-        Some(TokenKind::Symbol(kind)) if kind == if instance { "instance" } else { "theorem" })
-    {
+    let Some(TokenKind::Symbol(kind)) = tokens.get(declaration_start).map(|token| &token.kind)
+    else {
+        return Ok(None);
+    };
+    let matching = match body_kind {
+        BodyKind::Theorem => kind == "theorem",
+        BodyKind::Instance => kind == "instance",
+        BodyKind::Definition => matches!(kind.as_str(), "def" | "abbrev" | "opaque"),
+    };
+    if !matching {
         return Ok(None);
     }
+    let instance = matches!(body_kind, BodyKind::Instance);
+    let inferred_result = matches!(kind.as_str(), "def" | "abbrev");
     let mut cursor = declaration_start + 1;
     if instance
         && matches!(tokens.get(cursor).map(|token| &token.kind),
@@ -251,7 +275,10 @@ fn declaration_body_start(
     if !matches!(tokens.get(cursor).map(|token| &token.kind),
         Some(TokenKind::Symbol(kind)) if kind == ":")
     {
-        return Ok(None);
+        return Ok((inferred_result
+            && matches!(tokens.get(cursor).map(|token| &token.kind),
+                Some(TokenKind::Symbol(kind)) if matches!(kind.as_str(), ":=" | "where" | "|")))
+        .then(|| view.to_original(tokens[cursor].extent.start()).0));
     }
     let start = cursor + 1;
     let mut end =
@@ -435,6 +462,59 @@ mod tests {
         ] {
             assert_eq!(prefix(source.as_bytes()).unwrap(), None, "{source}");
             assert_eq!(instance_body_start(source.as_bytes()).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn definition_completion_boundaries_preserve_inferred_results_and_nested_headers() {
+        for header in [
+            "public def pending",
+            "public def pending (x :",
+            "public def pending.{u",
+            "public def pending (x : Nat := 0) : Nat",
+            "public def pending : let T := Nat; T",
+            "public def pending : (\" := \" = \" := \")",
+            "public def pending : match true with | true => Nat | false => Nat",
+            "public def pending (x : Nat := 0)",
+            "public opaque pending :=",
+            "public theorem pending : True := by",
+            "public instance pending : Pick :=",
+            "public «def» pending :=",
+            "scoped def pending :=",
+        ] {
+            assert_eq!(
+                definition_body_start(header.as_bytes()).unwrap(),
+                None,
+                "{header}"
+            );
+        }
+        for source in [
+            "public def pending :=",
+            "public def pending (x : Nat := 0) :=",
+            "public def pending : let T := Nat; T := hid",
+            "public def pending.{u} {A : Sort u} (x : A) : A := hid",
+            "public abbrev pending := hid",
+            "@[no_expose] public abbrev pending : Nat := hid",
+            "public opaque pending : Nat := hid",
+            "/-- λ declaration -/\r\npublic def pending : Nat /- := -/ := by\r\n  exact hid",
+        ] {
+            assert_eq!(
+                definition_body_start(source.as_bytes()).unwrap(),
+                source.rfind(":="),
+                "{source}"
+            );
+        }
+        for (source, marker) in [
+            ("public def pending (n : Nat) : Nat\n| .zero => hid", "|"),
+            ("public def pending (n : Nat)\n| .zero => hid", "|"),
+            ("public def pending : Pick where", "where"),
+            ("public def pending where", "where"),
+        ] {
+            assert_eq!(
+                definition_body_start(source.as_bytes()).unwrap(),
+                source.find(marker),
+                "{source}"
+            );
         }
     }
 }
