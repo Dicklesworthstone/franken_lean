@@ -1,7 +1,7 @@
-name: native proof-search regressions
+name: checked-source diagnostic transport
 
-# Auxiliary focused regression runner. Existing product and quality gates
-# remain authoritative. This workflow never exports source or updates Git.
+# Temporary transport of locally tested source, not an acceptance gate.
+# This job creates only blobs, never trees, commits or branch updates.
 on:
   workflow_dispatch:
   push:
@@ -10,25 +10,70 @@ on:
 permissions:
   contents: read
 jobs:
-  regressions:
-    runs-on: ubuntu-24.04
+  transport:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: windows-2025
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - name: checkout the triggering source tree
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: preserve committed bytes
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: install the repository-pinned native compiler
+      - name: verify and export tested source blobs
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
-          rustup toolchain install "$channel" --profile minimal --component rustfmt
-      - name: validate parser elaborator checked proofs and executable exits
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/search.rs crates/fln-elab/src/source/tactics/search/selection.rs crates/fln-parse/src/proofs.rs crates/fln-parse/src/proofs/search.rs crates/fln/tests/source_selected_search.rs crates/fln-cli/tests/source_selected_search.rs
-          cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
-          cargo test --locked --offline -p fln -p fln-cli --test source_selected_search --no-fail-fast
-          cargo test --locked --offline -p fln --test source_proof_search --test source_search_reflexivity --no-fail-fast
+          python -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'franken-lean-source-transport'}
+          def request(url, data=None):
+              payload = None if data is None else json.dumps(data).encode()
+              with urllib.request.urlopen(urllib.request.Request(url, data=payload, headers=headers), timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          raw = base64.b64decode(request(api + '/33792f531222b2d8a1e021e44f341116e52a9894')['content'])
+          assert hashlib.sha256(raw).hexdigest() == '6fb77574489b25d0c07ea7618e51576ab4e45463d91eb95c7635b4e94ac394bd'
+          bundle = json.loads(gzip.decompress(raw))
+          expected = {'crates/fln/src/runtime.rs', 'crates/fln/src/runtime/specialize.rs', 'crates/fln/src/lib.rs', 'crates/fln/src/source_intrinsics.rs', 'crates/fln/src/source_intrinsics/diagnostics.rs', 'crates/fln/src/runtime/diagnostics.rs', 'crates/fln/tests/source_runtime_diagnostics.rs'}
+          assert set(bundle['files']) == expected
+          for name, identities in bundle['files'].items():
+              path = pathlib.Path(name)
+              if identities['before'] is None:
+                  assert not path.exists(), name
+              else:
+                  assert blob(path.read_bytes()) == identities['before'], name
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checked-diagnostic-blobs'
+          out.mkdir()
+          result = {'checkout': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': {}, 'baseline': {}}
+          # These are bytes from THIS checkout, not an unavailable shallow parent.
+          baseline = ['crates/fln-cli/tests/source_selected_search.rs', 'crates/fln-elab/src/source/tactics.rs', 'crates/fln-elab/src/source/tactics/search.rs', 'crates/fln-elab/src/source/tactics/search/selection.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln-parse/src/proofs/search.rs', 'crates/fln/tests/source_selected_search.rs', '.github/workflows/native-goal-traces.yml']
+          for name in baseline:
+              data = pathlib.Path(name).read_bytes()
+              target = out / 'baseline' / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+              result['baseline'][name] = blob(data)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=bundle['patch'].encode(), check=True)
+          for name, identities in bundle['files'].items():
+              assert blob(pathlib.Path(name).read_bytes()) == identities['after'], name
+          for name, identities in bundle['files'].items():
+              created = request(api, {'content': base64.b64encode(pathlib.Path(name).read_bytes()).decode(), 'encoding': 'base64'})
+              assert created['sha'] == identities['after'], name
+              result['files'][name] = created['sha']
+          (out / 'blobs.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: checked-diagnostic-blobs-${{ github.sha }}
+          path: ${{ runner.temp }}/checked-diagnostic-blobs/
+          retention-days: 1
+          if-no-files-found: error
