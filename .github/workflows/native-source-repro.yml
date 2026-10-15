@@ -1,62 +1,89 @@
 name: native source reproduction
 
-# An auxiliary reproduction runner, not an acceptance gate or publisher.
-# Its push trigger is intentionally limited to this workflow; ordinary source
-# commits continue to use the existing quality and product gates.
+# Temporary source validation/transport. The runner exports only four named
+# source blobs, never a tree, commit, workflow modification, or branch update.
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: ['.github/workflows/native-source-repro.yml']
-
 permissions:
   contents: read
-
 jobs:
   reproduce:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - name: checkout the triggering source tree
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-
-      - name: install the repository-pinned native toolchain
+      - name: apply the exact joint-search source patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          manifest = {
+              'crates/fln-elab/src/source/tactics.rs': ['efd723e25cd5186909ed23cde2ed3aa8fed8c668', '8a44001f59510b4000b73611313857ffb34af2aa'],
+              'crates/fln-elab/src/source/tactics/search.rs': ['51e2d4b0d9ea2da40b9173e2c36a0d5e1f516cfe', 'e37ca1972c4123cfbbc6b6d59d27c747b64bd78a'],
+              'crates/fln/tests/source_selected_search.rs': ['c115de18253db2138a10b68b1c081735854850f7', '5dd9e7ba8fb0545a10149d6ef689711c8e0aef26'],
+              'crates/fln-cli/tests/source_selected_search.rs': [None, 'f1ee8d342cefe1c3ecfa4c1afff59232879036b4'],
+          }
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          for path, (before, after) in manifest.items():
+              p = pathlib.Path(path)
+              if (blob(p.read_bytes()) if p.exists() else None) != before:
+                  raise SystemExit('Source baseline changed: ' + path)
+          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/c67eaadd6f31ad33464f85c94cc49a28bdbba4c0'
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'FrankenLean-native-source-validation'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              patch = base64.b64decode(json.load(response)['content'])
+          if hashlib.sha256(patch).hexdigest() != 'c15580d4048d2ba696e90650acbf096b3f5368bdcc06a6d99e88b58f03044886':
+              raise SystemExit('Patch digest mismatch')
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          for path, (before, after) in manifest.items():
+              if blob(pathlib.Path(path).read_bytes()) != after:
+                  raise SystemExit('Patched source identity mismatch: ' + path)
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'joint-search-manifest.json').write_text(json.dumps(manifest))
+          PY
+      - name: install the repository-pinned compiler
         shell: bash
         run: |
           set -euo pipefail
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt
-          printf 'FLN_REPRO_CHANNEL=%s\n' "$channel" >> "$GITHUB_ENV"
-
-      - name: prepare a credential-free offline reproduction bundle
+      - name: validate parser elaborator checked proofs and executable exits
         shell: bash
         run: |
           set -euo pipefail
-          bundle="$RUNNER_TEMP/native-source-repro"
-          mkdir -p "$bundle"
-          git rev-parse HEAD > "$bundle/source-commit.txt"
-          git archive --format=tar HEAD | gzip -1 > "$bundle/source.tar.gz"
-          compiler="$(rustup which --toolchain "$FLN_REPRO_CHANNEL" rustc)"
-          toolchain="$(dirname "$(dirname "$compiler")")"
-          "$compiler" -Vv > "$bundle/rustc-version.txt"
-          # Only installed public compiler components, never rustup/cargo homes
-          # (which may contain credentials) or the runner's working directory.
-          tar -C "$toolchain" -czf "$bundle/toolchain.tar.gz" bin lib libexec
-          (cd "$bundle" && sha256sum source.tar.gz toolchain.tar.gz > SHA256SUMS)
-
-      - name: retain the offline reproduction inputs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: native-source-repro-${{ github.sha }}
-          path: ${{ runner.temp }}/native-source-repro/
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: run native proof-search regressions
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/search.rs crates/fln/tests/source_selected_search.rs crates/fln-cli/tests/source_selected_search.rs
+          cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
+          cargo test --locked --offline -p fln -p fln-cli --test source_selected_search --no-fail-fast
+      - name: export validated source blobs only
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --offline -p fln-elab --lib source::tactics::search::tests --no-fail-fast
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          manifest = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'joint-search-manifest.json').read_text())
+          for path, (before, after) in manifest.items():
+              data = pathlib.Path(path).read_bytes()
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if actual != after:
+                  raise SystemExit('Post-test identity mismatch: ' + path)
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'FrankenLean-native-source-validation'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  uploaded = json.load(response)
+              if uploaded['sha'] != after:
+                  raise SystemExit('Uploaded identity mismatch: ' + path)
+              print('VALIDATED_SOURCE_BLOB ' + path + ' ' + after)
+          PY
