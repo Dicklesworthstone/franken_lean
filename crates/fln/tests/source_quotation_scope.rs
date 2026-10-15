@@ -425,3 +425,168 @@ fn field_macros_do_not_hide_invalid_labels_values_or_parameter_escapes() {
         assert!(check(source).is_err(), "must reject {source}");
     }
 }
+
+#[test]
+fn quoted_matches_bind_only_branch_patterns_and_preserve_caller_arguments() {
+    accepted(
+        "macro \"matchAdd \" input:term:max \" plus \" extra:term:max : term => `(match $input:term with | Nat.zero => $extra | Nat.succ n => Nat.add n $extra)\n\
+         theorem zero : (matchAdd (0 : Nat) plus (7 : Nat)) = 7 := rfl\n\
+         theorem successor : (matchAdd (4 : Nat) plus (7 : Nat)) = 10 := rfl\n\
+         theorem hygiene (n : Nat) : (matchAdd (1 : Nat) plus n) = Nat.add 0 n := rfl\n",
+        3,
+    );
+}
+
+#[test]
+fn quoted_match_proofs_are_checked_in_each_refined_branch() {
+    accepted(
+        "macro \"selfProof \" a:term:max : term => `(match $a:term with | Nat.zero => by rfl | Nat.succ n => by rfl)\n\
+         theorem reflexive (n : Nat) : n = n := selfProof n\n",
+        1,
+    );
+    let bad = "macro \"badProof \" a:term:max : term => `(match $a:term with | Nat.zero => by rfl | Nat.succ n => Nat.zero)\ntheorem wrong : (0 : Nat) = 0 := badProof (0 : Nat)\n";
+    assert!(
+        matches!(
+            check(bad),
+            Err(SourceCheckError::Command { command: 1, .. })
+        ),
+        "an unselected branch must still have a proof of the expected type"
+    );
+}
+
+#[test]
+fn quoted_match_notation_prechecks_branches_in_their_own_scope() {
+    accepted(
+        "namespace Library\ndef value : Nat := 11\n\
+         notation:max \"pick \" input:max => match input with | Nat.zero => value | Nat.succ value => value\n\
+         end Library\ndef value : Nat := 99\n\
+         theorem zero : pick (0 : Nat) = 11 := rfl\n\
+         theorem successor : pick (8 : Nat) = 7 := rfl\n",
+        2,
+    );
+    assert!(
+        check("notation \"bad \" input => match input with | Nat.succ n => n | Nat.zero => n\n")
+            .is_err()
+    );
+}
+
+#[test]
+fn quoted_matches_support_nested_patterns_and_multiple_discriminants() {
+    accepted(
+        "inductive Cell where | empty : Cell | one : Nat → Cell\n\
+         macro \"sumCells \" a:term:max b:term:max : term => `(match $a:term, $b:term with | .one x, .one y => Nat.add x y | _, _ => 0)\n\
+         theorem both : (sumCells (Cell.one 4) (Cell.one 5)) = 9 := rfl\n\
+         theorem absent : (sumCells Cell.empty (Cell.one 5)) = 0 := rfl\n\
+         macro \"nestedCell \" a:term:max : term => `(match $a:term with | .one (Nat.succ n) => n | _ => 0)\n\
+         theorem nested : (nestedCell (Cell.one 8)) = 7 := rfl\n",
+        3,
+    );
+}
+
+#[test]
+fn quoted_matches_cannot_hide_invalid_or_nonexhaustive_branches() {
+    for source in [
+        "macro \"badMatch \" a:term:max : term => `(match ($a) with | Nat.zero => 0 | Nat.succ n => missing)\ndef bad : Nat := badMatch (0 : Nat)\n",
+        "macro \"badMatch \" a:term:max : term => `(match ($a) with | Nat.zero => 0)\ndef bad : Nat := badMatch (0 : Nat)\n",
+        "macro \"badMatch \" a:term:max : term => `(match ($a) with | Nat.zero => 0 | Nat.succ n => \"wrong\")\ndef bad : Nat := badMatch (0 : Nat)\n",
+        "macro \"badMatch \" a:term:max : term => `(match ($a) with | Nat.zero => n | Nat.succ n => n)\ndef bad : Nat := badMatch (1 : Nat)\n",
+    ] {
+        let (declaration, _) = source.split_once('\n').unwrap();
+        assert_eq!(check(declaration).unwrap(), 0, "unused macro: {source}");
+        let error = check(source).expect_err("invalid quoted match must be refused at use");
+        assert!(
+            matches!(error, SourceCheckError::Command { command: 1, .. }),
+            "{source}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn quoted_matches_restore_outer_and_sibling_scopes() {
+    accepted(
+        "def n : Nat := 41\n\
+         macro \"branchValue \" a:term:max : term => `(match $a:term with | Nat.succ n => n | Nat.zero => n)\n\
+         theorem local_branch : (branchValue (8 : Nat)) = 7 := rfl\n\
+         theorem global_branch : (branchValue (0 : Nat)) = 41 := rfl\n\
+         macro \"nestedBind \" a:term:max : term => `(match $a:term with | Nat.zero => n | Nat.succ n => Nat.add (match n with | Nat.zero => 1 | Nat.succ n => n) n)\n\
+         theorem nested : (nestedBind (8 : Nat)) = 13 := rfl\n\
+         theorem outer (n : Nat) : (branchValue (0 : Nat)) = 41 := rfl\n",
+        4,
+    );
+    assert!(check("notation:max \"escape \" a:max => (match a with | Nat.zero => 0 | Nat.succ fresh => fresh, fresh)\n").is_err());
+}
+
+#[test]
+fn quoted_grouped_and_anonymous_constructor_patterns_bind_consistently() {
+    accepted(
+        "inductive Choice where | left : Nat → Choice | right : Nat → Choice\n\
+         macro \"payload \" a:term:max : term => `(match $a:term with | .left n | .right n => n)\n\
+         theorem left : (payload (Choice.left 4)) = 4 := rfl\n\
+         theorem right : (payload (Choice.right 7)) = 7 := rfl\n\
+         structure Pair where\n  first : Nat\n  second : Nat\n\
+         macro \"sumPair \" a:term:max : term => `(match $a:term with | ⟨n, m⟩ => Nat.add n m)\n\
+         theorem pair : (sumPair (Pair.mk 4 5)) = 9 := rfl\n",
+        3,
+    );
+    for source in [
+        "macro \"bad \" a:term:max : term => `(match $a:term with | .left n | .right m => n)",
+        "macro \"bad \" a:term:max : term => `(match $a:term with | ⟨n, n⟩ => n)",
+        "macro \"bad \" a:term:max : term => `(match $a:term with | Nat.succ invalid.name => 0)",
+        "macro \"bad \" a:term:max p:term:max : term => `(match $a:term with | $p => 0)",
+    ] {
+        assert!(
+            check(source).is_err(),
+            "unsupported or inconsistent binding: {source}"
+        );
+    }
+}
+
+#[test]
+fn imported_match_macros_compile_and_execute_with_their_definition_site_world() {
+    let base = engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let library_name = Name::from_components(["Library"]);
+    let main_name = Name::from_components(["Main"]);
+    let library = "namespace A\ndef fallback : Nat := 41\nmacro \"valueOf \" input:term:max : term => `(match $input:term with | Nat.zero => fallback | Nat.succ n => Nat.add n 1)\nend A\n";
+    let main = "import Library\ndef fallback : Nat := 99\ndef choose (n : Nat) : Nat := valueOf n\ndef answer : Nat := Nat.add (choose 0) (choose 1)\n";
+    let checked = base
+        .check_source_modules(
+            &[
+                SourceModuleInput {
+                    name: &main_name,
+                    source: main.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &library_name,
+                    source: library.as_bytes(),
+                },
+            ],
+            &main_name,
+            &options,
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.module_order, [library_name, main_name]);
+    let execution = checked
+        .checked
+        .engine
+        .execute_source_definitions(
+            &[b"def run : Nat := answer"],
+            &options,
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(returned) = &execution.executions[0].exit else {
+        panic!("native return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(base.logical_root(&options), before);
+}

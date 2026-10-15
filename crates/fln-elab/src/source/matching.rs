@@ -142,7 +142,11 @@ pub(super) enum MatchStep<'a> {
 
 pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
     if let Syntax::Ident { val, .. } = syntax {
-        if val.is_anonymous() || !val.parent().is_anonymous() {
+        // Quotation-generated pattern binders are atomic before macro scopes
+        // are attached. Retain the scoped identity for local lookup; erasing
+        // it here would capture caller variables in the branch body.
+        let unscoped = val.erase_macro_scopes();
+        if unscoped.is_anonymous() || !unscoped.parent().is_anonymous() {
             return Err(error(MatchError::InvalidPattern));
         }
         return Ok(Some(val.clone()));

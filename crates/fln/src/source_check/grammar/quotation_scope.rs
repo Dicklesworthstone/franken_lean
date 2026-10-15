@@ -12,6 +12,7 @@ use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::{Preresolved, Syntax};
 
 mod do_notation;
+mod matches;
 
 enum Task<'a> {
     Visit(&'a Syntax),
@@ -626,6 +627,10 @@ pub(super) fn preresolve(
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(node @ Syntax::Node { kind, args, .. }) => {
+                if term_kind(kind, "match") {
+                    matches::schedule(node, rule, resolve, &mut tasks, &locals)?;
+                    continue;
+                }
                 if do_notation::visit(node, rule, &mut tasks, locals.len())? {
                     continue;
                 }
@@ -676,15 +681,17 @@ pub(super) fn preresolve(
                     continue;
                 }
                 match resolve(val) {
-                    Resolution::Global(global) => built.push(Syntax::Ident {
-                        info: *info,
-                        raw_val: *raw_val,
-                        val: Name::from_components(["_root_"]).append_core(&global),
-                        preresolved: vec![Preresolved::Decl {
-                            name: global,
-                            fields: Vec::new(),
-                        }],
-                    }),
+                    Resolution::Global(global) | Resolution::Constructor(global) => {
+                        built.push(Syntax::Ident {
+                            info: *info,
+                            raw_val: *raw_val,
+                            val: Name::from_components(["_root_"]).append_core(&global),
+                            preresolved: vec![Preresolved::Decl {
+                                name: global,
+                                fields: Vec::new(),
+                            }],
+                        })
+                    }
                     Resolution::Unchecked => built.push(ident.clone()),
                     Resolution::Nothing if !rule.prechecked => built.push(ident.clone()),
                     Resolution::Nothing => {
@@ -1198,6 +1205,69 @@ mod tests {
         ] {
             let mut rule = rule(source);
             rule.prechecked = false;
+            assert!(matches!(
+                preresolve(&rule, &global),
+                Err(EngineExecutionError::NotImplemented { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn match_constructor_heads_are_globals_while_fields_are_local() {
+        let rule =
+            rule("notation \"m\" => match subject with | zero => fallback | succ value => value");
+        let resolved = preresolve(&rule, &|name| {
+            let global_name = Name::from_components(["Declared"]).append_core(name);
+            if ["zero", "succ"]
+                .iter()
+                .any(|text| *name == Name::from_components([*text]))
+            {
+                Resolution::Constructor(global_name)
+            } else {
+                Resolution::Global(global_name)
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            names(&resolved),
+            [
+                "_root_.Declared.subject",
+                "_root_.Declared.zero",
+                "_root_.Declared.fallback",
+                "_root_.Declared.succ",
+                "value",
+                "value"
+            ]
+        );
+    }
+
+    #[test]
+    fn match_pattern_locals_never_leak_into_the_subject_or_another_branch() {
+        let branch = rule(
+            "notation \"m\" subject => match subject with | .some value => value | .none => value",
+        );
+        unknown(
+            preresolve(&branch, &|_| Resolution::Nothing).unwrap_err(),
+            "value",
+        );
+        let subject =
+            rule("notation \"m\" => match value with | .some value => value | .none => 0");
+        unknown(
+            preresolve(&subject, &|_| Resolution::Nothing).unwrap_err(),
+            "value",
+        );
+    }
+
+    #[test]
+    fn malformed_match_nodes_are_typed_refusals() {
+        let mut rule = rule(
+            "notation \"m\" subject => match subject with | .some value => value | .none => 0",
+        );
+        for args in [Vec::new(), vec![Syntax::Missing; 6]] {
+            rule.rhs = Syntax::node(
+                Name::from_components(["Lean", "Parser", "Term", "match"]),
+                args,
+            );
             assert!(matches!(
                 preresolve(&rule, &global),
                 Err(EngineExecutionError::NotImplemented { .. })
