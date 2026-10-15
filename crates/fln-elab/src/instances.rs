@@ -69,7 +69,11 @@ impl std::fmt::Display for InstanceRegistryError {
                 write!(f, "{} is not registered as a class", n.to_display_string())
             }
             Self::InvalidInstance(n) => {
-                write!(f, "{} is not a safe class instance", n.to_display_string())
+                write!(
+                    f,
+                    "{} is not a supported class instance",
+                    n.to_display_string()
+                )
             }
             Self::NotAnInstance(n) => write!(
                 f,
@@ -435,8 +439,28 @@ fn validate_instance(env: &Environment, name: &Name) -> Result<Name, InstanceReg
     let info = env
         .find(name)
         .ok_or_else(|| InstanceRegistryError::UnknownDeclaration(name.clone()))?;
-    let safe = match info {
-        ConstantInfo::Defn(value) => value.safety == DefinitionSafety::Safe,
+    if !instance_declaration_is_supported(info) {
+        return Err(InstanceRegistryError::InvalidInstance(name.clone()));
+    }
+    instance_telescope(env, &info.constant_val().type_)
+        .map(|(_, class)| class)
+        .ok_or_else(|| InstanceRegistryError::InvalidInstance(name.clone()))
+}
+
+/// Shared by registration, journal replay and native/export index derivation.
+fn instance_declaration_is_supported(info: &ConstantInfo) -> bool {
+    // The pin's Meta.addInstance registers an admitted declaration by its
+    // class-valued type, not by whether callers may use it in safe code.
+    // Keep unsafe definitions as real candidates: silently skipping one could
+    // change priority selection. Ordinary declaration admission still rejects
+    // every safe consumer containing the selected unsafe dictionary. Partial
+    // implementation companions and unsafe axioms/constructors remain outside
+    // this registration door; no declaration is admitted or reclassified here.
+    match info {
+        ConstantInfo::Defn(value) => matches!(
+            value.safety,
+            DefinitionSafety::Safe | DefinitionSafety::Unsafe
+        ),
         ConstantInfo::Thm(_) => true,
         ConstantInfo::Opaque(value) => !value.is_unsafe,
         ConstantInfo::Axiom(value) => !value.is_unsafe,
@@ -444,13 +468,7 @@ fn validate_instance(env: &Environment, name: &Name) -> Result<Name, InstanceReg
         // the pin, `Std.Internal.Do.Assertion.mk` is one, so `import Std` carries it.
         ConstantInfo::Ctor(value) => !value.is_unsafe,
         _ => false,
-    };
-    if !safe {
-        return Err(InstanceRegistryError::InvalidInstance(name.clone()));
     }
-    instance_telescope(env, &info.constant_val().type_)
-        .map(|(_, class)| class)
-        .ok_or_else(|| InstanceRegistryError::InvalidInstance(name.clone()))
 }
 
 fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, InstanceRegistryError> {
@@ -591,7 +609,7 @@ fn instance_payload(
     Ok(payload)
 }
 
-/// Register an already admitted safe declaration; never admit or execute it.
+/// Register an already admitted declaration; never admit or execute it.
 pub fn register_instance(
     env: &Environment,
     declaration: &Name,
@@ -618,7 +636,7 @@ pub fn register_instance(
     )
 }
 
-/// Add or reprioritize an already admitted safe declaration for a global
+/// Add or reprioritize an already admitted declaration for a global
 /// `attribute [instance]` command. Unlike [`register_instance`], this operation
 /// deliberately permits an existing registration. Its original equal-priority
 /// tie-break position is preserved; no stale higher-priority copy survives.
