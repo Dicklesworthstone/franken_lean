@@ -139,6 +139,9 @@ pub(super) fn module(
                 scope.exports_declaration() && fln_elab::source::is_theorem(parsed.syntax());
             let public_instance =
                 scope.exports_declaration() && fln_elab::source::is_instance(parsed.syntax());
+            let hidden_definition = scope.exports_declaration()
+                && !scope.expose_definitions
+                && fln_elab::source::is_definition_body(parsed.syntax());
             let private_scope = scope.clone();
             let environment = if scope.exports_declaration() {
                 scope.instance_scopes = prefix
@@ -161,7 +164,7 @@ pub(super) fn module(
                 .source_view()
                 .from_original(fln_parse::BytePos(offset - prefix_end))
             {
-                let mut private_instance_body = false;
+                let mut private_body = false;
                 let observed = if public_instance {
                     fln_elab::source::inspect::public_instance(
                         parsed.syntax(),
@@ -176,7 +179,24 @@ pub(super) fn module(
                         kind,
                     )
                     .map(|inspected| {
-                        private_instance_body = inspected.private_body;
+                        private_body = inspected.private_body;
+                        inspected.observation
+                    })
+                } else if hidden_definition {
+                    fln_elab::source::inspect::public_definition(
+                        parsed.syntax(),
+                        &fln_elab::source::TheoremWorlds {
+                            public: environment,
+                            private: prefix.checked.checked.engine.environment(),
+                            public_scope: &scope,
+                            private_scope: &private_scope,
+                        },
+                        limits.source.admission.kernel,
+                        position.0,
+                        kind,
+                    )
+                    .map(|inspected| {
+                        private_body = inspected.private_body;
                         inspected.observation
                     })
                 } else if public_theorem {
@@ -234,7 +254,7 @@ pub(super) fn module(
                                 .to_original(fln_parse::BytePos(range.end))
                                 .0;
                 }
-                if private_instance_body
+                if private_body
                     || (public_theorem
                         && fln_parse::command_scope::modifiers::theorem_body_start(command)
                             .map_err(|error| scope_error(&error.to_string()))?

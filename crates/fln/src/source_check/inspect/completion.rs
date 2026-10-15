@@ -230,18 +230,25 @@ impl SourceModuleSession {
         let scope = enclosing
             .for_command_prefix(command_prefix)
             .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?;
-        // Public proof headers see only exported names. The theorem boundary
-        // is syntactic; an instance additionally needs its actual result sort
-        // and exposure attributes, never a guess from its source spelling.
+        // Public headers see only exported names. Definitions and instances
+        // resolve the complete header and declaration-specific exposure policy
+        // before an unfinished body may see private helpers. The placeholder
+        // used for this bounded query is never elaborated or admitted.
         let mut private_body = false;
         if scope.exports_declaration() {
             private_body = fln_parse::command_scope::modifiers::theorem_body_start(command_prefix)
                 .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
                 .is_some();
-            if let Some(body) =
-                fln_parse::command_scope::modifiers::instance_body_start(command_prefix)
+            let body = fln_parse::command_scope::modifiers::instance_body_start(command_prefix)
+                .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
+                .map(|body| (body, true));
+            let body = match body {
+                Some(body) => Some(body),
+                None => fln_parse::command_scope::modifiers::definition_body_start(command_prefix)
                     .map_err(|error| invalid(entry, prefix_end, &error.to_string()))?
-            {
+                    .map(|body| (body, false)),
+            };
+            if let Some((body, instance)) = body {
                 let size = body
                     .checked_add(5)
                     .filter(|size| *size <= limits.max_source_bytes)
@@ -281,14 +288,17 @@ impl SourceModuleSession {
                         .instance_scopes
                         .clone()
                 };
-                let classified = source_records::elaboration_outcome(
-                    fln_elab::source::public_instance_header_is_hidden(
-                        parsed.syntax(),
-                        public,
-                        self.inspection_kernel_budget(),
-                        &public_scope,
-                    ),
-                )
+                let classify = if instance {
+                    fln_elab::source::public_instance_header_is_hidden
+                } else {
+                    fln_elab::source::public_definition_header_is_hidden
+                };
+                let classified = source_records::elaboration_outcome(classify(
+                    parsed.syntax(),
+                    public,
+                    self.inspection_kernel_budget(),
+                    &public_scope,
+                ))
                 .map_err(|error| SourceModuleCheckError::Source {
                     module: entry.clone(),
                     error: SourceCheckError::Command {
