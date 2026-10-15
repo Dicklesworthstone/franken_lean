@@ -301,6 +301,17 @@ fn plan(
         let TokenKind::Symbol(symbol) = &tokens[at].kind else {
             continue;
         };
+        // A quoted capture is one term fragment. In particular the colon in
+        // `$input:term` is part of the capture, not a type ascription that
+        // closes the surrounding match/conditional. The term parser below
+        // still validates the capture's kind, spelling and adjacency.
+        if symbol == "$"
+            && crate::quotations::inside()
+            && let Some(next) = crate::argument_end(tokens, at, range.end)
+        {
+            proof_end = next;
+            continue;
+        }
         // A quotation is read whole, as a `by` block is: a tactic quotation's `first` pipes
         // (`(tactic|⏎  first⏎  | exact …)`) are not this plan's, and a term quotation's `match`
         // or `if` (`(if $c then …)`) is planned by the quotation's own term.

@@ -1,7 +1,8 @@
 //! A file's own notation, end to end: declared, parsed in the commands after it, expanded with
 //! the pin's hygiene, elaborated and kernel-checked (bead `franken_lean-z8j.1.10`, stage 4).
 //!
-//! Every program's verdict was taken from the pinned `lean` (v4.32.0) on 2026-10-09 first.
+//! The original programs' verdicts were taken from the pinned `lean` (v4.32.0) on
+//! 2026-10-09 first. Later native regression cells identify their scope below.
 #![forbid(unsafe_code)]
 use fln::{
     Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckError,
@@ -36,6 +37,37 @@ fn refused(source: &str) -> SourceCheckError {
 }
 
 const ADD: &str = "def myAdd (a b : Nat) : Nat := Nat.add a b\n";
+
+/// Native regression: a whole syntax sequence may end in a bounded term,
+/// not only a single-symbol/single-argument prefix. No fresh oracle run claimed.
+#[test]
+fn multi_argument_macro_sequences_reach_checked_elaboration() {
+    for declaration in [
+        "macro \"combine \" x:term:max y:term:max : term => `(Nat.add $x $y)",
+        "macro \"combine \" x:term:max \" and \" y:term:max : term => `(Nat.add $x $y)",
+    ] {
+        let call = if declaration.contains(" and ") {
+            "combine (4 : Nat) and (5 : Nat)"
+        } else {
+            "combine (4 : Nat) (5 : Nat)"
+        };
+        accepted(&format!(
+            "{declaration}\ntheorem result : ({call}) + 6 = 15 := rfl\n"
+        ));
+        assert!(
+            check(&format!(
+                "{declaration}\ntheorem wrong : ({call}) = 8 := rfl\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            check(&format!(
+                "{declaration}\ndef missing : Nat := combine (4 : Nat)\n"
+            ))
+            .is_err()
+        );
+    }
+}
 
 /// `infixl`, `prefix` and a bracketed `notation`: accepted at the pin (exit 0).
 #[test]

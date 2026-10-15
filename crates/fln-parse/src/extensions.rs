@@ -1040,8 +1040,9 @@ fn symbol_then_argument(body: &Descr) -> bool {
                 if simple(category).as_deref() == Some("term") && *prec >= 1023))
 }
 
-/// Whether every input `descr` reads ends with an atom, so the parser it compiles to ends where
-/// that atom does rather than where a trailing term would.
+/// Whether every input `descr` reads has an atom-bounded endpoint. An argument-
+/// precedence term has the same boundary: `Run::term_end` reads one complete
+/// atom or bracketed term, not the remaining enclosing expression.
 fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
     if depth > MAX_DESCR_DEPTH {
         return false;
@@ -1055,6 +1056,10 @@ fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
             simple(name).as_deref(),
             Some("ident" | "num" | "str" | "char" | "scientific" | "name")
         ),
+        // This applies to the final argument of a whole sequence, not just
+        // `symbol_then_argument`'s one-argument spelling. Without it a valid
+        // two-argument macro is registered but never offered to the parser.
+        Descr::Cat(category, prec) => simple(category).as_deref() == Some("term") && *prec >= 1023,
         Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
             ends_with_atom(body, depth + 1)
         }

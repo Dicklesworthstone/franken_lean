@@ -405,3 +405,23 @@ fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
     }
 }
+
+#[test]
+fn typed_captures_do_not_end_their_enclosing_match_or_conditional() {
+    let mut grammar = FileGrammar::new(false, &[], None).expect("Init");
+    for source in [
+        "macro \"m \" input:term:max : term => `(match $input:term with | Nat.zero => 0 | Nat.succ n => n)",
+        "macro \"m2 \" a:term:max b:term:max : term => `(match $a:term, $b:term with | _, _ => 0)",
+        "macro \"m3 \" c:term:max a:term:max b:term:max : term => `(if $c:term then $a:term else $b:term)",
+    ] {
+        parse(&mut grammar, source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+    for source in [
+        "macro \"bad \" a:term:max : term => `(match $a:unknown with | _ => 0)",
+        "macro \"bad \" a:term:max : term => `(match $a: with | _ => 0)",
+        "macro \"bad \" a:term:max : term => `(match $a with | _ => 0)",
+        "def bad : Nat := match $a:term with | _ => 0",
+    ] {
+        assert!(parse(&mut grammar, source).is_err(), "{source}");
+    }
+}
