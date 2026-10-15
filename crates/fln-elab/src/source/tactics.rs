@@ -8,6 +8,7 @@
 use super::*;
 pub(in crate::source) mod backtrack;
 mod change;
+mod congruence;
 mod construct;
 mod constructor_transport;
 mod constructors;
@@ -1152,13 +1153,8 @@ impl Context {
                     return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
                 }
                 return Ok(ProofAction::Change { goal, target });
-            } else if kind == &parser_kind(&["Tactic", "symm"]) {
-                let [keyword, location] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "symm", "symmetry tactic")?;
-                expect_empty_null(location, "goal-only symmetry location")?;
-                self.symmetrize_proof_goal(proof, goal)?;
+            } else if let Some(tactic) = relations::classify(kind) {
+                self.relation_proof_goal(proof, goal, tactic, args)?;
             } else if kind == &parser_kind(&["Tactic", "tacticSorry"])
                 || kind == &parser_kind(&["Tactic", "tacticAdmit"])
             {

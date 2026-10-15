@@ -48,12 +48,19 @@ fn arrow(domain: Expr, range: Expr) -> Expr {
 #[test]
 fn every_congruence_budget_stop_restores_the_transaction_and_sibling_work() {
     let seed = seeded_context();
-    for dependent in [false, true] {
+    for shape in ["ordinary", "dependent", "implication"] {
         let mut original = seed.clone();
         let a = local(&mut original, "A", Expr::sort(Level::one()));
         let x = local(&mut original, "x", a.clone());
         let y = local(&mut original, "y", a.clone());
-        let (left, right) = if dependent {
+        let (domain, left, right) = if shape == "implication" {
+            let b = local(&mut original, "B", Expr::sort(Level::one()));
+            (
+                Expr::sort(Level::one()),
+                arrow(a.clone(), a.clone()),
+                arrow(b.clone(), b),
+            )
+        } else if shape == "dependent" {
             let family = local(
                 &mut original,
                 "F",
@@ -69,14 +76,16 @@ fn every_congruence_budget_stop_restores_the_transaction_and_sibling_work() {
             let vx = local(&mut original, "vx", Expr::app(family.clone(), x.clone()));
             let vy = local(&mut original, "vy", Expr::app(family, y.clone()));
             (
+                a.clone(),
                 Expr::app(Expr::app(f.clone(), x), vx),
                 Expr::app(Expr::app(f, y), vy),
             )
         } else {
             let f = local(&mut original, "f", arrow(a.clone(), a.clone()));
-            (Expr::app(f.clone(), x), Expr::app(f, y))
+            (a, Expr::app(f.clone(), x), Expr::app(f, y))
         };
-        let target = equality::equation(Level::one(), a, left, right);
+        let level = original.congruence_sort(&domain).unwrap();
+        let target = equality::equation(level, domain, left, right);
         let (root, goal) = original.proof_goal(target.clone()).unwrap();
         let (_, sibling) = original.proof_goal(target.clone()).unwrap();
         original
@@ -119,7 +128,7 @@ fn every_congruence_budget_stop_restores_the_transaction_and_sibling_work() {
                 .expect_err("a smaller budget must not complete congruence");
             assert!(
                 !backtrack::recoverable(&problem),
-                "dependent={dependent}, allowance={allowance}: {problem:?}"
+                "shape={shape}, allowance={allowance}: {problem:?}"
             );
             let spent = limited.txn.budget.heartbeats_consumed;
             assert!(spent >= start + allowance);
@@ -127,7 +136,7 @@ fn every_congruence_budget_stop_restores_the_transaction_and_sibling_work() {
             expected.budget.heartbeats_consumed = spent;
             assert_eq!(
                 limited.txn, expected,
-                "dependent={dependent}, allowance={allowance}"
+                "shape={shape}, allowance={allowance}"
             );
             assert_eq!(limited.next, before.next);
             assert_eq!(limited.instance_goals, before.instance_goals);

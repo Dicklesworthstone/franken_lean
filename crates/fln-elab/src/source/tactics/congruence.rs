@@ -6,6 +6,7 @@
 //! lane changes the kernel's conversion rules or admits unchecked evidence.
 use super::*;
 mod dependent;
+mod implies;
 #[cfg(test)]
 mod tests;
 
@@ -285,7 +286,17 @@ impl Context {
                 let Some((value, children)) =
                     self.congruence_dependent_application(&left, &right)?
                 else {
-                    return Ok(None);
+                    restore(self, &before);
+                    return if heterogeneous {
+                        Ok(None)
+                    } else {
+                        self.congruence_implication(&Equation {
+                            level: u,
+                            domain: alpha,
+                            left,
+                            right,
+                        })
+                    };
                 };
                 let value = if heterogeneous {
                     value
