@@ -679,6 +679,15 @@ pub fn elaborate_example(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    let mut context = Context::scoped(env, kernel, scope);
+    example_in_context(syntax, name, &mut context)
+}
+
+pub(super) fn example_in_context(
+    syntax: &Syntax,
+    name: Name,
+    context: &mut Context,
+) -> Result<Declaration, NatDefinitionElabError> {
     use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
 
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
@@ -744,8 +753,7 @@ pub fn elaborate_example(
         parser_kind(&["Command", "declaration"]),
         vec![declaration[0].clone(), definition],
     );
-    let mut context = Context::scoped(env, kernel, scope);
-    super::definition_in_context_named(&candidate, &mut context, Some(name))
+    super::definition_in_context_named(&candidate, context, Some(name))
 }
 
 /// Recognize the canonical command shape; elaboration still validates its body.

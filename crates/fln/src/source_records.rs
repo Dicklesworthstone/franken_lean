@@ -5,6 +5,7 @@ use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
 mod elaboration;
+pub(crate) mod traces;
 
 pub(crate) use elaboration::{
     apply_admission_effects, apply_batch_effects, apply_execution_effects,

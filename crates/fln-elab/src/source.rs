@@ -49,6 +49,7 @@ mod record_terms;
 mod recursion;
 mod reduce;
 mod tactics;
+pub mod trace;
 
 use super::*;
 use crate::constraint::unify::{
@@ -495,6 +496,9 @@ impl SourceEquation {
 #[derive(Clone)]
 struct Context {
     inspection: Option<inspect::Probe>,
+    traces: trace::TraceLog,
+    goal_tags: std::collections::HashMap<MVarId, Name>,
+    trace_local_names: std::collections::HashMap<FVarId, Name>,
     // Public proof declarations fix their signatures in the exported world
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
@@ -622,6 +626,9 @@ impl Context {
         txn.budget.max_heartbeats = 1_000_000;
         Self {
             inspection: None,
+            traces: trace::TraceLog::default(),
+            goal_tags: std::collections::HashMap::new(),
+            trace_local_names: std::collections::HashMap::new(),
             private_proof_body: None,
             public_theorem_signature: None,
             public_instance_signature: None,

@@ -26,6 +26,7 @@ mod refine;
 mod relations;
 mod rewrite;
 mod search;
+mod trace;
 pub(in crate::source) use refine::RefinementFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +644,11 @@ impl Context {
             ) {
                 self.skip_empty_goal_controls(proof)?;
                 if let Some(&instruction) = proof.instructions.get(proof.cursor) {
+                    if instruction.kind() == Some(&parser_kind(&["Tactic", "traceState"])) {
+                        self.trace_proof_state(proof, instruction)?;
+                        proof.cursor += 1;
+                        continue;
+                    }
                     if let Some(spec) = self.backtrack_instruction(instruction)? {
                         proof.cursor += 1;
                         return Ok(ProofAction::Attempt(spec));
@@ -794,6 +800,9 @@ impl Context {
                 return Ok(ProofAction::Attempt(spec));
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
                 proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "traceState"]) {
+                proof.work.push(Work::Goal(goal));
+                self.trace_proof_state(proof, instruction)?;
             } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {
                 let [keyword, relation, expected] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -1303,6 +1312,7 @@ impl Context {
         instance_start: usize,
     ) -> Result<(), NatDefinitionElabError> {
         let mut arguments = Vec::new();
+        let mut new_arguments = 0usize;
         loop {
             self.tick()?;
             let mut budget = UnificationBudget::new(self.kernel);
@@ -1321,6 +1331,7 @@ impl Context {
             }
             term.type_ = self.whnf(&term.type_)?;
             let ExprNode::ForallE {
+                binder_name,
                 binder_type,
                 body,
                 binder_info,
@@ -1331,10 +1342,15 @@ impl Context {
             };
             let domain = binder_type.clone();
             let body = body.clone();
+            let tag = binder_name.clone();
+            new_arguments += 1;
             let argument = if *binder_info == BinderInfo::InstImplicit {
                 self.instance_hole(domain)?
             } else {
                 let (argument, subgoal) = self.proof_goal(domain)?;
+                if self.traces.enabled() {
+                    self.goal_tags.insert(subgoal.id.clone(), tag);
+                }
                 arguments.push(subgoal);
                 argument
             };
@@ -1351,6 +1367,28 @@ impl Context {
             .any(|id| !self.txn.mvars.is_assigned(id))
         {
             return Err(error(TacticError::ApplyMismatch));
+        }
+        if self.traces.enabled() {
+            let parent = self
+                .goal_tags
+                .get(&goal.id)
+                .cloned()
+                .unwrap_or_else(Name::anonymous);
+            for subgoal in &arguments {
+                let child = self
+                    .goal_tags
+                    .get(&subgoal.id)
+                    .cloned()
+                    .unwrap_or_else(Name::anonymous);
+                self.goal_tags.insert(
+                    subgoal.id.clone(),
+                    if new_arguments == 1 {
+                        parent.clone()
+                    } else {
+                        super::trace::append_tag(&parent, &child)
+                    },
+                );
+            }
         }
         proof.work.push(Work::Close(goal, term.value));
         // The pin's apply returns its new goals non-dependent-first

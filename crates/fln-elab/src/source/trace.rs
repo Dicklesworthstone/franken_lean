@@ -25,6 +25,49 @@ pub struct SourceTrace {
     pub scope: SourceScope,
 }
 
+/// Observations accompany an untrusted candidate, never replace its checks.
+pub struct ObservedDeclaration {
+    pub candidate: ElaboratedDeclaration,
+    pub traces: Vec<SourceTrace>,
+}
+
+/// The ordinary scoped definition elaborator with an explicit diagnostic owner.
+/// Entry points returning only a declaration retain their refusal when a raw
+/// trace is actually executed, rather than silently dropping its output.
+pub fn elaborate_definition(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<ObservedDeclaration, NatDefinitionElabError> {
+    let scope = scope.for_declaration(syntax)?;
+    let mut context = Context::scoped(environment, kernel, &scope);
+    context.traces.enable();
+    let declaration = definition_in_context(syntax, &mut context)?;
+    Ok(ObservedDeclaration {
+        candidate: ElaboratedDeclaration {
+            declaration,
+            irreducible: context.well_founded_definition,
+            noncomputable: context.noncomputable_definition,
+        },
+        traces: context.traces.collect()?,
+    })
+}
+
+/// Examples share definition elaboration but their successor remains scratch-only.
+pub fn elaborate_example(
+    syntax: &Syntax,
+    name: Name,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<(Declaration, Vec<SourceTrace>), NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope);
+    context.traces.enable();
+    let declaration = scope::example_in_context(syntax, name, &mut context)?;
+    Ok((declaration, context.traces.collect()?))
+}
+
 #[derive(Clone, Default)]
 pub(super) struct TraceLog(Option<Arc<Mutex<RetainedTraces>>>);
 
@@ -35,6 +78,9 @@ struct RetainedTraces {
 }
 
 impl TraceLog {
+    pub fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
     pub fn enable(&mut self) {
         self.0 = Some(Arc::new(Mutex::new(RetainedTraces::default())));
     }
@@ -89,6 +135,28 @@ pub(super) fn append_tag(parent: &Name, child: &Name) -> Name {
 }
 
 impl Context {
+    /// Remember the source stem for an inaccessible introduction. These names
+    /// are display-only: tactic name resolution still uses the original local.
+    pub(super) fn trace_introduced_name(&mut self, id: &FVarId, name: &Name, binder: &Name) {
+        if self.traces.enabled() && name.parent() == Name::from_components(["_fln_source"]) {
+            let stem = if binder.is_anonymous() {
+                Name::from_components(["a"])
+            } else {
+                binder.clone()
+            };
+            // The existing printer uses the normal Name hygiene grammar, with
+            // the exact generated identity as the scope (not a shared counter).
+            let display = Name::num(
+                Name::str(Name::str(stem, "_@"), "_hyg"),
+                match id.0.leaf_view() {
+                    LeafView::Num(n) => n,
+                    _ => 0,
+                },
+            );
+            self.trace_local_names.insert(id.clone(), display);
+        }
+    }
+
     pub(super) fn record_goal_trace(
         &mut self,
         instruction: &Syntax,

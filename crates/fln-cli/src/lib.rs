@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod goal_traces;
 #[cfg(test)]
 mod guard_filter_tests;
 mod guard_messages;
@@ -12106,17 +12107,21 @@ fn render_lean_source_commands(
             guard_messages::Buffer::new(&guard.spec),
         );
     }
-    // Warnings interleave with the outputs in command order, as the pin logs them.
-    let mut warnings = completed.warnings.iter().peekable();
+    let messages = match goal_traces::ordered(completed) {
+        Ok(messages) => messages,
+        Err(failure) => return failure,
+    };
+    let mut messages = messages.iter().peekable();
     for output in &completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
             | fln::SourceCommandOutput::Check { command_index, .. }
             | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
-        while let Some(warning) = warnings.next_if(|warning| warning.command_index <= command_index)
-        {
-            if let Err(failure) = emit_lean_warning(warning, sink, &mut guarded, &mut stdout) {
+        while let Some(message) = messages.next_if(|message| message.command() <= command_index) {
+            if let Err(failure) =
+                message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output)
+            {
                 return failure;
             }
         }
@@ -12287,8 +12292,8 @@ fn render_lean_source_commands(
             }
         }
     }
-    for warning in warnings {
-        if let Err(failure) = emit_lean_warning(warning, sink, &mut guarded, &mut stdout) {
+    for message in messages {
+        if let Err(failure) = message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output) {
             return failure;
         }
     }
@@ -12314,8 +12319,8 @@ fn render_lean_source_commands(
                 return source_failure(
                     "capability",
                     &format!(
-                        "command {}: `#guard_msgs` over `#check` produced a message that differs \
-                         from the docstring, and this door's `#check` rendering is not proven to be \
+                        "command {}: `#guard_msgs` over `#check` or a raw goal trace produced a message that differs \
+                         from the docstring, and this door's goal/`#check` rendering is not proven to be \
                          the pin's:\n\n{produced}",
                         guard.command_index
                     ),

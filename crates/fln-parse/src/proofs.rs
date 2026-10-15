@@ -326,6 +326,7 @@ pub(crate) fn tactic(
             "by_cases",
             "decide",
             "skip",
+            "trace_state",
             "fail",
             "omega",
             "unfold",
@@ -637,6 +638,7 @@ fn local_tactic(
         | "left"
         | "right"
         | "skip"
+        | "trace_state"
         | "trivial"
         | "ac_rfl"
         | "infer_instance"
@@ -725,6 +727,7 @@ fn local_tactic(
         // `macro "trivial" : tactic` (`Init/Tactics.lean`).
         "trivial" => "tacticTrivial",
         "rename_i" => "renameI",
+        "trace_state" => "traceState",
         // `syntax (name := acRfl) "ac_rfl" : tactic` (`Init/Tactics.lean`).
         "ac_rfl" => "acRfl",
         // `macro "infer_instance" : tactic`, `macro "exfalso" : tactic` and `norm_cast`'s

@@ -20,6 +20,7 @@ use fln_core::expr::NatLit;
 use fln_core::level::LevelView;
 
 pub mod format;
+pub mod goals;
 mod print;
 use format::Format;
 

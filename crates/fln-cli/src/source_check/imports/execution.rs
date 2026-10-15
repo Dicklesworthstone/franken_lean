@@ -888,6 +888,33 @@ fn render(
         }
         render_commands(commands, &name, json, &mut output)?;
         if json {
+            append(&mut output, "],\"traces\":[")?;
+        }
+        for (index, trace) in commands.traces.iter().enumerate() {
+            if json {
+                if index != 0 {
+                    append(&mut output, ",")?;
+                }
+                append(
+                    &mut output,
+                    &format!(
+                        "{{\"command\":{},\"byteOffset\":{},\"message\":{}}}",
+                        trace.command_index,
+                        trace.at.0,
+                        json_string(&trace.message),
+                    ),
+                )?;
+            } else {
+                append(
+                    &mut output,
+                    &format!(
+                        "Trace {name}, command {}, byte {}:\n{}\n",
+                        trace.command_index, trace.at.0, trace.message
+                    ),
+                )?;
+            }
+        }
+        if json {
             append(&mut output, "]}")?;
         }
     }
