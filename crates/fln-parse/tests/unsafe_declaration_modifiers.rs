@@ -69,3 +69,43 @@ fn conflicting_modifiers_are_retained_for_elaborator_refusal() {
     assert_eq!(args(&modifiers[5]).len(), 1);
     assert_eq!(args(&modifiers[6]).len(), 1);
 }
+
+#[test]
+fn mutual_unsafe_members_keep_their_modifiers_and_original_error_positions() {
+    use fln_parse::command_scope::{mutual, partition};
+    let body = "\r\n  /-- 🦀 end mutual -/\r\n  private unsafe def first (n : Nat) : Nat := second n\r\n  unsafe def second (n : Nat) : Nat := first n\r\n";
+    let members = mutual::parse(format!("mutual{body}end").as_bytes())
+        .unwrap()
+        .unwrap();
+    let commands = partition(body.as_bytes()).unwrap();
+    assert_eq!(members.len(), 2);
+    for (member, (_, bytes)) in members.iter().zip(&commands) {
+        assert_eq!(member, parse_definition(bytes).unwrap().syntax());
+        assert_eq!(args(&args(&args(member)[0])[5]).len(), 1);
+    }
+    for source in [
+        "mutual\nunsafe def a : Nat := 1\ndef b : Nat := 2\nend",
+        "mutual\nunsafe def a : Nat := 1\npartial def b : Nat := 2\nend",
+        "mutual\nunsafe def a : Nat := 1\naxiom b : Nat\nend",
+        "mutual\nunsafe def a : Nat := 1\nend\nunsafe def b : Nat := 2",
+    ] {
+        assert!(mutual::parse(source.as_bytes()).is_err(), "{source}");
+    }
+    let oversized = format!(
+        "mutual\n{}end",
+        (0..9)
+            .map(|i| format!("unsafe def d{i} : Nat := {i}\n"))
+            .collect::<String>()
+    );
+    assert!(mutual::parse(oversized.as_bytes()).is_err());
+    let source =
+        "-- 🦀\r\nmutual\r\nunsafe def a : Nat := 1\r\nunsafe def b : Nat := if true then )\r\nend";
+    assert_eq!(
+        mutual::parse(source.as_bytes())
+            .unwrap_err()
+            .primary_offset()
+            .unwrap()
+            .0,
+        source.rfind(')').unwrap()
+    );
+}
