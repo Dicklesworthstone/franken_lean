@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 4e0b027ef535cfd89cd533f527948eae5c9eee1f
+          ref: 3b3ab3d01438373fe23d2295408cb9e3d08fee20
           persist-credentials: false
       - name: Transfer exact tested files without changing any branch
         env:
@@ -37,20 +37,27 @@ jobs:
                   return json.load(response)
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '51fb17b4132af4c7fa628098a25ec54114f8e2aa'
-          source = '94916512a91ede6ef0d461da9ba4372c78f7ef4a'
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == 'e64e3ea63d3d7f651870fddc99504c808c74ab9f'
+          source = 'd4165b73c9d054abfcdf95a9431105ae9dda741c'
           obj = request('/git/blobs/' + source)
           assert obj['encoding'] == 'base64'
           encoded = base64.b64decode(obj['content'])
           assert blob(encoded) == source
+          # Repair two transport transcription bytes, never source text.
+          # The intended encoded identity, complete patch and every output file
+          # are independently bound below to the locally tested originals.
+          assert encoded.count(b'CSSiz2Wde') == 1
+          assert encoded.count(b'AV+SfjVnh') == 1
+          encoded = encoded.replace(b'CSSiz2Wde', b'CSSiz2de').replace(b'AV+SfjVnh', b'AV+RfjVnh')
+          assert blob(encoded) == '9e9adf246ffb798ce0e4f16ede839b148b54fddb'
           patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == 'e1f1437f48c622b2a9f208f8ed508e2b893e37d2eddee7df66f546b4ebe5d20a'
+          assert hashlib.sha256(patch).hexdigest() == '19b61d8589e3dd0141b52889909366c0da4151828b8a86ed933d23637c9d8fd3'
           manifest = {
-              'crates/fln-parse/src/extensions.rs': ['af1bce42aabfbf9a24f5faee9d4c34efcb4abb57', '172302efcf25c2c627ac636d4882590fb08caf42'],
-              'crates/fln-parse/src/matching.rs': ['bcf30e07d5afc0cf1e8dd1741d1bfbd407fdfad1', 'd74c1bd1135eb63c8895743c0c5c8773e9f77e38'],
-              'crates/fln-parse/tests/quotation_trees.rs': ['9fdbb07dd49da2b0c2e8f6aa2bd355a5255d7f20', '9d47ce8fd28706c71bf0b9729f4ae3d2aaaa70ab'],
-              'crates/fln-parse/tests/syntax_extensions.rs': ['febf8be24aa7a6e0ccddd89bdca7a7d5c94a1adc', '3ad7f002cfff26ebf87bfff659201ca7e8a58aa1'],
-              'crates/fln/tests/source_notation.rs': ['0a34abfe320a9f74d5150b54726bf3c306845daa', '217c0473555db860add2fa49cd2902306bb0c62d'],
+              'crates/fln-elab/src/source/matching.rs': ['7bd2aaf959e2160420878c028dbc08def5c3aaf3', 'dc7c1c1f674ffe5bb63256be3a4a95acfdf7290b'],
+              'crates/fln/src/source_check/grammar.rs': ['6bedc1d1523b6c214766c11f3417ded82c844bd0', 'bbec21fb6618bea9c0aa1aa845c03cab9900a51e'],
+              'crates/fln/src/source_check/grammar/quotation_scope.rs': ['2e383e045cb1900eece94227791dc1cc6176fb5f', '895a38b7f5f02f54bdce7838a7c92df42f840a96'],
+              'crates/fln/src/source_check/grammar/quotation_scope/matches.rs': [None, '6e28f6652e000ea90d7b6753b08b3d74e6a5c5a8'],
+              'crates/fln/tests/source_quotation_scope.rs': ['bffc47bcc75f4c082c82b4ea51c18f96ae118cf7', '48c2cf7434b6ae7b2f24ff7dc65afd809f494e8f'],
           }
           paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
           assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
