@@ -1,5 +1,5 @@
-//! `solve_by_elim`'s selected-lemma grammar from the pinned Init/Tactics.lean.
-//! Keep the six optional slots and each argument's category node; terms use
+//! Selected-lemma grammars from the pinned Init/Tactics.lean.
+//! Preserve each tactic's exact slots and every argument category; terms use
 //! the ordinary bounded parser, never token-spelling lookup in the elaborator.
 use super::*;
 
@@ -19,8 +19,15 @@ pub(super) fn parse(
     range: Range<usize>,
     keyword: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let name = match &keyword {
+        Syntax::Atom { val, .. } if val == "solve_by_elim" => "solveByElim",
+        Syntax::Atom { val, .. } if val == "apply_assumption" => "applyAssumption",
+        Syntax::Atom { val, .. } if val == "apply_rules" => "applyRules",
+        _ => return Err(refusal(view, tokens, range.start)),
+    };
+    let solve = name == "solveByElim";
     let mut at = range.start + 1;
-    let all_goals = if at < range.end && symbol(tokens, at, "*") {
+    let all_goals = if solve && at < range.end && symbol(tokens, at, "*") {
         let slot = null_node(vec![leaves.leaf(at)?]);
         at += 1;
         slot
@@ -28,7 +35,7 @@ pub(super) fn parse(
         null_node(Vec::new())
     };
     let (config, after_config) = config(leaves, view, tokens, at, range.end)?;
-    if after_config != at {
+    if solve && after_config != at {
         // Selected lemmas are supported, configurable search is not yet.
         return Err(refusal(view, tokens, at));
     }
@@ -81,17 +88,12 @@ pub(super) fn parse(
     if at != range.end {
         return Err(refusal(view, tokens, at));
     }
-    Ok(Syntax::node(
-        parser_kind(&["Tactic", "solveByElim"]),
-        vec![
-            keyword,
-            all_goals,
-            config,
-            only,
-            arguments,
-            null_node(Vec::new()),
-        ],
-    ))
+    let mut slots = vec![keyword];
+    if solve {
+        slots.push(all_goals);
+    }
+    slots.extend([config, only, arguments, null_node(Vec::new())]);
+    Ok(Syntax::node(parser_kind(&["Tactic", name]), slots))
 }
 
 fn argument(
@@ -138,4 +140,92 @@ fn argument(
     } else {
         term
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(source: &str) -> Result<Syntax, NatDefinitionParseError> {
+        let original = SourceText::from_utf8(source.as_bytes()).unwrap();
+        let view = SourceView::of(&original);
+        let tokens = command_scope::tokens(&view).unwrap();
+        let leaves = Leaves::build(view.normalized(), &tokens).unwrap();
+        let word = match &tokens[0].kind {
+            TokenKind::Ident(word) => word.to_display_string(),
+            TokenKind::Symbol(word) => word.clone(),
+            _ => panic!("tactic keyword"),
+        };
+        let keyword = Syntax::atom(leaves.leaf(0).unwrap().info(), word);
+        let syntax = parse(&leaves, &view, &tokens, 0..tokens.len(), keyword)?;
+        assert_eq!(
+            syntax
+                .reconstruct(view.normalized(), leaves.attachment().epilogue())
+                .unwrap(),
+            source.replace("\r\n", "\n").as_bytes(),
+        );
+        Ok(syntax)
+    }
+
+    #[test]
+    fn greedy_rule_categories_keep_five_slots_and_every_config_or_argument_leaf() {
+        for (word, name) in [
+            ("apply_rules", "applyRules"),
+            ("apply_assumption", "applyAssumption"),
+        ] {
+            for suffix in [
+                "",
+                " only []",
+                " only [*]",
+                " [-h, h]",
+                " (maxDepth := (0x10)) -symm +exfalso only [*, -h, (f h),]",
+                " (symm := false) (exfalso := Bool.true) [f h]",
+                " /- λ 🦀 -/\r\n only [«x.y», h₂,]",
+            ] {
+                let syntax = read(&format!("{word}{suffix}")).unwrap();
+                let Syntax::Node { kind, args, .. } = &syntax else {
+                    panic!("node")
+                };
+                assert_eq!(kind, &parser_kind(&["Tactic", name]));
+                assert_eq!(args.len(), 5);
+                assert_eq!(args[1].kind(), Some(&parser_kind(&["Tactic", "optConfig"])));
+                assert!(matches!(&args[4], Syntax::Node {args, ..} if args.is_empty()));
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_rules_refuse_stars_missing_arguments_and_unimplemented_label_sets() {
+        for word in ["apply_rules", "apply_assumption"] {
+            for suffix in [
+                "*",
+                " [",
+                " [h,,h]",
+                " [,h]",
+                " [-]",
+                " [* h]",
+                " [-f h]",
+                " using other",
+                " [h] trailing",
+                " (maxDepth :=)",
+                "+",
+                " (symm := true",
+            ] {
+                let source = format!("{word}{suffix}");
+                assert!(read(&source).is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn solve_search_keeps_its_separate_star_slot_and_configuration_refusal() {
+        for source in [
+            "solve_by_elim",
+            "solve_by_elim* only [*]",
+            "solve_by_elim [-h, h]",
+        ] {
+            assert!(matches!(&read(source).unwrap(), Syntax::Node {args, ..} if args.len() == 6));
+        }
+        assert!(read("solve_by_elim (maxDepth := 12)").is_err());
+    }
 }
