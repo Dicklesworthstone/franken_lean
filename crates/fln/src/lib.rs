@@ -40,6 +40,7 @@ pub mod source_main;
 #[cfg(test)]
 mod source_nat_add_binding_tests;
 mod source_records;
+pub use source_records::SourceDeclarationAdmission;
 #[cfg(test)]
 mod source_seed_names;
 pub use fln_rt::obj::{CapturedStdout, StdoutCapture, StdoutCaptureError, flush_native_stdout};
@@ -6793,7 +6794,7 @@ impl Engine {
         source: &[u8],
         options: &KVMap,
         limits: EngineAdmissionLimits,
-    ) -> Result<Outcome<DeclarationAdmission>, EngineExecutionError> {
+    ) -> Result<Outcome<SourceDeclarationAdmission>, EngineExecutionError> {
         // Under an entered grammar (`source_check::grammar`) the file's notations expand first,
         // as `source_records::parse_scoped_command` expands them.
         let parsed = fln_parse::parse_definition(source)
@@ -6959,7 +6960,12 @@ impl Engine {
                         source_records::tag_protected(&admitted.engine, &name)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                Outcome::Complete(admitted)
+                return self.finish_local_function_admission(
+                    admitted,
+                    &elaborated.local_functions,
+                    options,
+                    limits,
+                );
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7972,6 +7978,7 @@ impl Engine {
                         (
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
+                                local_functions: Vec::new(),
                                 irreducible: false,
                                 noncomputable: false,
                             },
@@ -8040,6 +8047,7 @@ impl Engine {
             )?;
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
+                local_functions,
                 irreducible,
                 noncomputable,
             } = elaborated;
@@ -8173,6 +8181,16 @@ impl Engine {
                         )?;
                     admission.result_logical_root = admission.engine.logical_root(options);
                 }
+                let admission = match engine.finish_local_function_batch(
+                    admission,
+                    &local_functions,
+                    options,
+                    limits.admission(),
+                )? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
                     .map_err(|error| {
@@ -8199,8 +8217,9 @@ impl Engine {
                 }
                 merged
             });
-            let mut execution = match engine.execute_definition_entry(
+            let mut execution = match engine.execute_definition_entry_with_helpers(
                 declaration,
+                &local_functions,
                 scoped_options.as_ref().unwrap_or(options),
                 limits,
                 entry,
@@ -8245,6 +8264,11 @@ impl Engine {
                 scopes.admitted(&execution.declaration);
             }
             execution.evaluation_presentation = evaluation_presentation;
+            if !is_evaluation {
+                for helper in &execution.local_functions {
+                    scopes.admitted(&helper.declaration);
+                }
+            }
             let execution_index = executions.len();
             // Printer candidates retain their checked successor in the
             // execution evidence, but never become source declarations.
@@ -8800,7 +8824,13 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         Ok(
-            match self.execute_definition(elaborated.declaration, options, limits)? {
+            match self.execute_definition_entry_with_helpers(
+                elaborated.declaration,
+                &elaborated.local_functions,
+                options,
+                limits,
+                source_evaluation::Entry::Value,
+            )? {
                 Outcome::Complete(mut execution) => {
                     source_records::apply_execution_effects(
                         &mut execution,
@@ -9444,6 +9474,17 @@ impl Engine {
         limits: EngineExecutionLimits,
         entry: source_evaluation::Entry,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        self.execute_definition_entry_with_helpers(declaration, &[], options, limits, entry)
+    }
+
+    fn execute_definition_entry_with_helpers(
+        &self,
+        declaration: Declaration,
+        helpers: &[Declaration],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        entry: source_evaluation::Entry,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
         let (expression, declared_type) = match &declaration {
             Declaration::Defn(definition) => {
                 (definition.value.clone(), definition.base.type_.clone())
@@ -9482,6 +9523,18 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
+        // Check every generated helper BEFORE running any body. A bad helper
+        // cannot turn a rejected source command into observable IO effects.
+        let admission = match self.finish_local_function_admission(
+            admission,
+            helpers,
+            options,
+            limits.admission(),
+        )? {
+            Outcome::Complete(admission) => admission,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         // An unsafe recursive definition is its own executable body. Its
         // recursive constant exists only in the checked successor, unlike a
         // safe source definition's already-admitted executable companion.
@@ -9576,6 +9629,7 @@ impl Engine {
             flbc_artifact,
             exit,
             checker: admission.checker,
+            local_functions: admission.admissions.into_iter().skip(1).collect(),
         }))
     }
 }
@@ -11800,6 +11854,10 @@ pub struct DefinitionExecution {
     pub exit: VmExit,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+    /// Separate checked helper transitions, after the primary declaration.
+    /// Empty for raw declaration execution; source APIs retain these receipts
+    /// and the final engine only when the entire helper batch succeeds.
+    pub local_functions: Vec<DeclarationAdmission>,
 }
 
 /// One bounded `#check` query or anonymous example validated by both checker seats.

@@ -51,9 +51,11 @@ pub fn elaborate_definition(
     let mut context = Context::scoped(environment, kernel, &scope);
     context.traces.enable();
     let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ObservedDeclaration {
         candidate: ElaboratedDeclaration {
             declaration,
+            local_functions,
             irreducible: context.well_founded_definition,
             noncomputable: context.noncomputable_definition,
         },

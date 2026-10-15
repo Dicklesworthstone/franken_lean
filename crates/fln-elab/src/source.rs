@@ -523,6 +523,7 @@ struct Context {
     // opaque after leaving their lexical scope, until their enclosing
     // declaration has completed all source constraints.
     deferred_local_functions: Vec<local_functions::Deferred>,
+    local_function_lifting: local_functions::lifting::Lifting,
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
@@ -638,6 +639,7 @@ impl Context {
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
             deferred_local_functions: Vec::new(),
+            local_function_lifting: local_functions::lifting::Lifting::default(),
             txn,
             kernel,
             next: 0,
@@ -3608,7 +3610,7 @@ impl Context {
                                 }
                             }
                             let value = if build.binding.recursive {
-                                self.defer_local_function(value)?
+                                self.defer_local_function(value, build.lift_name)?
                             } else {
                                 value
                             };
@@ -4628,6 +4630,9 @@ pub(super) fn definition(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElaboratedDeclaration {
     pub declaration: Declaration,
+    /// Closed local recursive helpers. They grant no authority: callers must
+    /// admit every helper and the owner atomically through both checkers.
+    pub local_functions: Vec<Declaration>,
     /// The definition actually used well-founded lowering. A source spelling or
     /// a body mentioning `WellFounded.Nat.fix` does not set this effect.
     pub irreducible: bool,
@@ -4655,8 +4660,10 @@ fn definition_scoped_with_effects(
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope);
     let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
+        local_functions,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,
     })
@@ -4979,6 +4986,8 @@ fn definition_in_context_named(
             owned
         }
     };
+    context.local_function_lifting.parent =
+        (!owned_name.is_anonymous()).then(|| owned_name.clone());
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
@@ -5072,6 +5081,7 @@ fn definition_in_context_named(
             .as_ref()
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         owned_name = context.generated_instance_name(&parameters, expected)?;
+        context.local_function_lifting.parent = Some(owned_name.clone());
     }
     if is_instance && !hidden_instance {
         // Naming may consult the private predecessor only for collisions. Once
@@ -5248,6 +5258,7 @@ fn definition_in_context_named(
         .map(|parameter| parameter.type_.clone())
         .collect();
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
+    universe_roots.extend(context.local_function_lifting.roots());
     context.generalize_declaration_universes(&universe_roots)?;
     let mut term = context.finish(term)?;
     context.close_partial_reference(&mut term, &parameters, &partial_captures)?;

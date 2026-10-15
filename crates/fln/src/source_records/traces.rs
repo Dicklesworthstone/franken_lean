@@ -115,6 +115,7 @@ impl Engine {
                 elaborated.declaration,
                 elaborated.irreducible,
                 elaborated.noncomputable,
+                elaborated.local_functions,
                 options,
                 limits,
                 scope,

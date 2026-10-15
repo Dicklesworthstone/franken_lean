@@ -5,7 +5,9 @@ use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
 mod elaboration;
+mod local_functions;
 pub(crate) mod traces;
+pub use local_functions::SourceDeclarationAdmission;
 
 pub(crate) use elaboration::{
     apply_admission_effects, apply_batch_effects, apply_execution_effects,
@@ -349,6 +351,7 @@ impl Engine {
                     candidate,
                     false,
                     inferred_noncomputable,
+                    Vec::new(),
                     options,
                     limits,
                     public_scope,
@@ -420,6 +423,7 @@ impl Engine {
                 interface,
                 false,
                 false,
+                Vec::new(),
                 options,
                 limits,
                 public_scope,
@@ -479,6 +483,7 @@ impl Engine {
         declaration: Declaration,
         irreducible: bool,
         inferred_noncomputable: bool,
+        local_functions: Vec<Declaration>,
         options: &KVMap,
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
@@ -633,7 +638,7 @@ impl Engine {
                     batch.engine.environment = tag_protected(&batch.engine, &name)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                Outcome::Complete(batch)
+                return self.finish_local_function_batch(batch, &local_functions, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -854,6 +859,7 @@ impl Engine {
                     elaborated.declaration,
                     elaborated.irreducible,
                     elaborated.noncomputable,
+                    elaborated.local_functions,
                     options,
                     limits,
                     scope,
@@ -861,13 +867,7 @@ impl Engine {
             }
             return Ok(
                 match self.admit_source_declaration(source, options, limits)? {
-                    Outcome::Complete(admitted) => Outcome::Complete(DeclarationBatchAdmission {
-                        engine: admitted.engine.clone(),
-                        base_logical_root: admitted.base_logical_root,
-                        result_logical_root: admitted.result_logical_root,
-                        admissions: vec![admitted],
-                        local_instance: None,
-                    }),
+                    Outcome::Complete(admitted) => Outcome::Complete(admitted.into_batch()),
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 },
