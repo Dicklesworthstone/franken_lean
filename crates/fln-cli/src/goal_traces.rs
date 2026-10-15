@@ -28,10 +28,11 @@ impl Message<'_> {
                 let target = guards.get_mut(&trace.command_index).and_then(|guard| {
                     // As with #check, a mismatch may be our partial printer,
                     // never evidence that the reference rejects the source.
-                    guard.from_check |= guard
-                        .spec
-                        .action(fln_parse::command_scope::guard_spec::Severity::Info)
-                        == fln_parse::command_scope::guard_spec::Action::Check;
+                    guard.from_check |= trace.is_goal_state
+                        && guard
+                            .spec
+                            .action(fln_parse::command_scope::guard_spec::Severity::Info)
+                            == fln_parse::command_scope::guard_spec::Action::Check;
                     guard.evaluation_target(&mut discarded)
                 });
                 budget

@@ -327,6 +327,7 @@ pub(crate) fn tactic(
             "decide",
             "skip",
             "trace_state",
+            "trace",
             "fail",
             "omega",
             "unfold",
@@ -619,6 +620,19 @@ fn local_tactic(
                 Vec::new()
             }));
         }
+        // The pin's `trace` accepts exactly a string literal, not a term.
+        "trace"
+            if range.end == start + 2
+                && matches!(
+                    &tokens[start + 1].kind,
+                    TokenKind::Literal(LiteralKind::Str)
+                ) =>
+        {
+            args.push(Syntax::node(
+                Name::from_components(["str"]),
+                vec![leaves.leaf(start + 1)?],
+            ));
+        }
         // `decide` and `omega` are `"…" optConfig` (`Init/Tactics.lean`); the empty
         // configuration is a node of its own in the pin's tree.
         "decide" | "omega" => {
@@ -728,6 +742,7 @@ fn local_tactic(
         "trivial" => "tacticTrivial",
         "rename_i" => "renameI",
         "trace_state" => "traceState",
+        "trace" => "traceMessage",
         // `syntax (name := acRfl) "ac_rfl" : tactic` (`Init/Tactics.lean`).
         "ac_rfl" => "acRfl",
         // `macro "infer_instance" : tactic`, `macro "exfalso" : tactic` and `norm_cast`'s
@@ -2452,6 +2467,41 @@ mod simp_all_tests {
             "simp_all [h,,k]",
         ] {
             let source = format!("theorem t : True := by {tactic}");
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    #[test]
+    fn trace_messages_and_goal_snapshots_preserve_every_source_leaf() {
+        for source in [
+            "def trace (n : Nat) : Nat := n",
+            "theorem t : True := by\r\n  trace /- λ -/ \"line\\nnext\"\r\n  trace_state\r\n  constructor",
+            "theorem t : True := by first | (trace \"first\"; fail) | constructor",
+            "theorem t : True := by constructor; trace \"\"",
+        ] {
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn trace_requires_its_complete_literal_shape() {
+        for tail in [
+            "trace",
+            "trace 1",
+            "trace True",
+            "trace \"a\" \"b\"",
+            "trace (\"a\")",
+            "trace_state \"a\"",
+        ] {
+            let source = format!("theorem t : True := by {tail}");
             assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
         }
     }

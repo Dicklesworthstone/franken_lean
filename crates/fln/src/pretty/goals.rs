@@ -1,6 +1,9 @@
 //! Goal display shares the normal bounded term printer and its name resolution.
 use super::*;
-use fln_elab::{lctx::LocalDecl, source::trace::SourceTrace};
+use fln_elab::{
+    lctx::LocalDecl,
+    source::trace::{SourceTrace, TraceContent},
+};
 
 fn close(expr: &Expr, locals: &[LocalDecl]) -> Result<Expr, Unsupported> {
     let mut closed = expr.clone();
@@ -21,9 +24,13 @@ fn close(expr: &Expr, locals: &[LocalDecl]) -> Result<Expr, Unsupported> {
 /// Render a raw trace without changing goals, definitions or metavariables.
 /// An unrenderable expression remains a refusal, even when a guard drops traces.
 pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsupported> {
+    let goals = match &event.content {
+        TraceContent::Goals(goals) => goals,
+        TraceContent::Message(message) => return Ok(message.clone()),
+    };
     let mut displayed = Vec::new();
     let mut total = 0usize;
-    for goal in &event.goals {
+    for goal in goals {
         let locals = goal.locals.decls();
         let mut printer = Printer::in_scope(env, &event.scope);
         let mut names = Vec::new();

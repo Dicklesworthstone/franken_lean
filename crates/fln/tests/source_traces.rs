@@ -158,3 +158,84 @@ fn entry_points_without_a_trace_output_channel_refuse_instead_of_dropping_it() {
         .is_err()
     );
 }
+
+#[test]
+fn literal_messages_share_order_and_backtracking_without_goal_inspection() {
+    let base = engine();
+    let source = "example (P : Prop) (h : P) : P := by\n  first | (trace \"first branch\"; fail) | exact h\n  trace \"after proof\"\n  trace_state\n";
+    let result = run(&base, source);
+    assert_eq!(texts(&result), ["first branch", "after proof", ""]);
+    assert_eq!(
+        result
+            .traces
+            .iter()
+            .map(|t| t.is_goal_state)
+            .collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    assert_eq!(result.traces[0].at.0, source.find("trace \"").unwrap());
+    assert_eq!(
+        result.batch.engine.logical_root(&KVMap::new()),
+        base.logical_root(&KVMap::new())
+    );
+}
+
+#[test]
+fn trace_message_decoding_preserves_unicode_escapes_and_empty_messages() {
+    let result = run(
+        &engine(),
+        r#"example : True := by
+  trace "first\nsecond\t\"λ\"\\"
+  trace ""
+  constructor
+"#,
+    );
+    assert_eq!(texts(&result), ["first\nsecond\t\"λ\"\\", ""]);
+}
+
+#[test]
+fn literal_trace_refuses_terms_extra_tokens_and_missing_diagnostic_owners() {
+    let base = engine();
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    assert!(
+        base.admit_source_declaration(
+            b"theorem bad : True := by trace \"visible\"; constructor",
+            &KVMap::new(),
+            limits,
+        )
+        .is_err()
+    );
+    for source in [
+        "example : True := by trace; constructor",
+        "example : True := by trace True; constructor",
+        "example : True := by trace \"one\" \"two\"; constructor",
+        "example : True := by trace (\"one\"); constructor",
+    ] {
+        assert!(
+            base.execute_source_commands_with_checks(
+                source.as_bytes(),
+                &KVMap::new(),
+                EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
+            )
+            .is_err(),
+            "{source}"
+        );
+    }
+    let fresh = run(&base, "example : True := by trace \"fresh\"; constructor");
+    assert_eq!(texts(&fresh), ["fresh"]);
+}
+
+#[test]
+fn pinned_trace_state_backtracking_fixture_matches_its_unchanged_expected_output() {
+    // Unmodified tests/elab input and expected output from the Reference pin
+    // in SUITE.lock. Neither is regenerated from the native implementation.
+    let source = include_str!("fixtures/traceStateBacktracking.lean");
+    let expected = include_str!("fixtures/traceStateBacktracking.lean.out.expected");
+    let result = run(&engine(), source);
+    let actual = result
+        .traces
+        .iter()
+        .map(|row| format!("{}\n", row.message))
+        .collect::<String>();
+    assert_eq!(actual, expected);
+}

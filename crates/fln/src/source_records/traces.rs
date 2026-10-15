@@ -12,6 +12,8 @@ pub struct SourceTraceMessage {
     pub command_index: usize,
     pub at: fln_parse::BytePos,
     pub message: String,
+    /// Goal displays use the bounded partial pretty-printer; literal messages do not.
+    pub is_goal_state: bool,
 }
 
 /// Freeze display in the command's environment and scope, not the final file's.
@@ -58,6 +60,10 @@ pub(crate) fn append(
             command_index,
             at: fln_parse::BytePos(at),
             message,
+            is_goal_state: matches!(
+                trace.content,
+                fln_elab::source::trace::TraceContent::Goals(_)
+            ),
         });
     }
     Ok(())

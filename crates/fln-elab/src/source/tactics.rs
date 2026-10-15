@@ -644,7 +644,9 @@ impl Context {
             ) {
                 self.skip_empty_goal_controls(proof)?;
                 if let Some(&instruction) = proof.instructions.get(proof.cursor) {
-                    if instruction.kind() == Some(&parser_kind(&["Tactic", "traceState"])) {
+                    if instruction.kind() == Some(&parser_kind(&["Tactic", "traceState"]))
+                        || instruction.kind() == Some(&parser_kind(&["Tactic", "traceMessage"]))
+                    {
                         self.trace_proof_state(proof, instruction)?;
                         proof.cursor += 1;
                         continue;
@@ -800,7 +802,9 @@ impl Context {
                 return Ok(ProofAction::Attempt(spec));
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
                 proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "traceState"]) {
+            } else if kind == &parser_kind(&["Tactic", "traceState"])
+                || kind == &parser_kind(&["Tactic", "traceMessage"])
+            {
                 proof.work.push(Work::Goal(goal));
                 self.trace_proof_state(proof, instruction)?;
             } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {

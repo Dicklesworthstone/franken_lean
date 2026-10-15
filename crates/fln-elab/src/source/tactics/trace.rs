@@ -7,6 +7,9 @@ impl Context {
         proof: &ProofState<'_>,
         instruction: &Syntax,
     ) -> Result<(), NatDefinitionElabError> {
+        if instruction.kind() == Some(&parser_kind(&["Tactic", "traceMessage"])) {
+            return self.record_message_trace(instruction);
+        }
         let mut goals = Vec::new();
         for work in proof.work.iter().rev() {
             self.tick()?;

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 const MAX_EVENTS: usize = 4096;
 const MAX_GOALS: usize = 256;
 const MAX_LOCALS: usize = 4096;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceGoal {
@@ -17,11 +18,17 @@ pub struct TraceGoal {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TraceContent {
+    Goals(Vec<TraceGoal>),
+    Message(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceTrace {
     /// Syntax byte offset relative to its command. Elaboration returns a
     /// normalized offset; the source engine maps it to the original buffer.
     pub at: usize,
-    pub goals: Vec<TraceGoal>,
+    pub content: TraceContent,
     pub scope: SourceScope,
 }
 
@@ -75,6 +82,7 @@ pub(super) struct TraceLog(Option<Arc<Mutex<RetainedTraces>>>);
 struct RetainedTraces {
     events: Vec<SourceTrace>,
     units: usize,
+    message_bytes: usize,
 }
 
 impl TraceLog {
@@ -103,15 +111,20 @@ impl TraceLog {
         let mut log = log
             .lock()
             .map_err(|_| failure(SourceInferenceError::Scope))?;
-        let incoming = event
-            .goals
-            .iter()
-            .map(|g| g.locals.len() + 1)
-            .sum::<usize>();
-        if log.events.len() >= MAX_EVENTS || incoming.saturating_add(log.units) > 65_536 {
+        let (incoming, bytes) = match &event.content {
+            TraceContent::Goals(goals) => {
+                (goals.iter().map(|g| g.locals.len() + 1).sum::<usize>(), 0)
+            }
+            TraceContent::Message(message) => (0, message.len()),
+        };
+        if log.events.len() >= MAX_EVENTS
+            || incoming.saturating_add(log.units) > 65_536
+            || bytes.saturating_add(log.message_bytes) > MAX_MESSAGE_BYTES
+        {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
         log.units += incoming;
+        log.message_bytes += bytes;
         log.events.push(event);
         Ok(())
     }
@@ -155,6 +168,44 @@ impl Context {
             );
             self.trace_local_names.insert(id.clone(), display);
         }
+    }
+
+    /// Literal trace messages do not inspect or elaborate a goal. In particular
+    /// they also run with no remaining goals and inside failed alternatives.
+    pub(super) fn record_message_trace(
+        &mut self,
+        instruction: &Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceMessage"])?;
+        let args = expect_node(
+            instruction,
+            &parser_kind(&["Tactic", "traceMessage"]),
+            2,
+            "trace message",
+        )?;
+        expect_atom(&args[0], "trace", "trace message keyword")?;
+        let literal = expect_node(&args[1], &Name::from_components(["str"]), 1, "trace string")?;
+        let Syntax::Atom { val: spelling, .. } = &literal[0] else {
+            return Err(failure(SourceInferenceError::Tactic(
+                tactics::TacticError::MalformedScript,
+            )));
+        };
+        if spelling.len() > MAX_MESSAGE_BYTES {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        for _ in spelling.as_bytes().chunks(1024) {
+            self.tick()?;
+        }
+        let Literal::Str(message) = decode_string(spelling)? else {
+            return Err(failure(SourceInferenceError::Tactic(
+                tactics::TacticError::MalformedScript,
+            )));
+        };
+        self.traces.append(SourceTrace {
+            at: args[0].info().pos(true).map_or(0, |p| p.0),
+            content: TraceContent::Message(message),
+            scope: self.source_scope.clone(),
+        })
     }
 
     pub(super) fn record_goal_trace(
@@ -210,7 +261,7 @@ impl Context {
         }
         self.traces.append(SourceTrace {
             at: args[0].info().pos(true).map_or(0, |p| p.0),
-            goals: observed,
+            content: TraceContent::Goals(observed),
             scope: self.source_scope.clone(),
         })
     }
@@ -221,7 +272,9 @@ pub fn contains_trace(syntax: &Syntax) -> bool {
     let mut pending = vec![syntax];
     while let Some(syntax) = pending.pop() {
         if let Syntax::Node { kind, args, .. } = syntax {
-            if kind == &parser_kind(&["Tactic", "traceState"]) {
+            if kind == &parser_kind(&["Tactic", "traceState"])
+                || kind == &parser_kind(&["Tactic", "traceMessage"])
+            {
                 return true;
             }
             pending.extend(args);
@@ -236,7 +289,7 @@ mod tests {
     fn event() -> SourceTrace {
         SourceTrace {
             at: 0,
-            goals: Vec::new(),
+            content: TraceContent::Goals(Vec::new()),
             scope: SourceScope::default(),
         }
     }
@@ -269,5 +322,29 @@ mod tests {
                 SourceInferenceError::Tactic(tactics::TacticError::UnsupportedTactic(_))
             ))
         ));
+    }
+    #[test]
+    fn literal_trace_capacity_is_shared_and_failure_atomic() {
+        let mut log = TraceLog::default();
+        log.enable();
+        let snapshot = log.clone();
+        for _ in 0..4 {
+            let mut message = event();
+            message.content = TraceContent::Message("x".repeat(MAX_MESSAGE_BYTES / 4));
+            log.append(message).unwrap();
+        }
+        let mut extra = event();
+        extra.content = TraceContent::Message("x".into());
+        assert!(matches!(
+            snapshot.append(extra),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(snapshot.collect().unwrap().len(), 4);
+        let mut independent = TraceLog::default();
+        independent.enable();
+        independent.append(event()).unwrap();
+        assert_eq!(independent.collect().unwrap().len(), 1);
     }
 }

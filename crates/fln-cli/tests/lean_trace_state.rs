@@ -63,3 +63,24 @@ fn later_bad_proof_never_publishes_earlier_buffered_traces() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn literal_trace_reaches_the_installed_binary_before_and_after_proof_closure() {
+    success(
+        "example : Fact := by\n  first | (trace \"first branch\"; fail) | constructor\n  trace \"after proof\"\n  trace_state",
+        "first branch\nafter proof\n\n",
+    );
+}
+
+#[test]
+fn literal_message_guards_check_exact_text_and_preserve_failed_choice_order() {
+    success(
+        "/-- info: first branch\n---\ninfo: after proof -/\n#guard_msgs in\nexample : Fact := by\n  first | (trace \"first branch\"; fail) | constructor\n  trace \"after proof\"",
+        "",
+    );
+    let mismatch = lean(
+        "/-- info: wrong -/\n#guard_msgs in\nexample : Fact := by trace \"right\"; constructor",
+    );
+    assert_eq!(mismatch.status.code(), Some(1), "{mismatch:?}");
+    assert!(mismatch.stdout.is_empty());
+}
