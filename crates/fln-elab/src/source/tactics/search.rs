@@ -6,6 +6,7 @@
 //! heap worklists and iterative deepening, not source-controlled Rust recursion.
 use super::*;
 
+mod construction;
 mod rules;
 mod rules_config;
 mod selection;
@@ -107,6 +108,31 @@ impl Context {
                 validated?;
             }
         }
+        let first = self.search_frontier_limits(frontier, selection);
+        if first.is_ok() {
+            return first;
+        }
+        restore(self, &snapshot);
+        let problem = first.expect_err("unsuccessful search");
+        if !backtrack::recoverable(&problem) {
+            return Err(problem);
+        }
+        // The pin retries exfalso only after the complete initial search fails,
+        // and only for one visible goal. Never prove an early sibling and then
+        // silently change just the later sibling into False.
+        let retry = self.search_exfalso_frontier(frontier, selection);
+        if retry.is_err() {
+            restore(self, &snapshot);
+        }
+        retry
+    }
+
+    fn search_frontier_limits(
+        &mut self,
+        frontier: &[Work<'static>],
+        selection: &Selection<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let snapshot = Box::new(self.clone());
         for limit in 0..=MAX_APPLICATION_DEPTH {
             restore(self, &snapshot);
             match self.search_selected_proof(frontier, selection, limit) {
@@ -138,18 +164,24 @@ impl Context {
                 let count = choice.candidates.len();
                 // Defaults and both orientations are genuine choice points:
                 // a later dependent premise may require another witness.
-                let attempts = if choice.depth < limit {
+                let applications = choice.depth < limit;
+                let regular_attempts = if applications {
                     count * 4 + defaults
                 } else {
                     count * 2 + defaults
                 };
+                // The constructor/intro discharger is one final choice, not a
+                // new unbounded recursive search or a second constructor loop.
+                let attempts = regular_attempts + usize::from(applications);
                 let mut selected = None;
                 while choice.next < attempts {
                     restore(self, &choice.context);
                     self.tick()?;
                     let candidate = choice.next;
                     choice.next += 1;
-                    let result = if candidate < count {
+                    let result = if candidate == regular_attempts {
+                        self.search_construction_candidate(&choice.goal)
+                    } else if candidate < count {
                         let candidate = choice.candidates[candidate].clone();
                         self.search_candidate(&choice.goal, candidate, false)
                     } else if defaults != 0 && candidate == count {
@@ -531,6 +563,77 @@ mod tests {
             assert_eq!(limited.instance_goals, original.instance_goals);
             assert!(limited.txn.budget.heartbeats_consumed >= before + allowance);
             assert!(matches!(pending.work.as_slice(), [Work::Goal(goal)] if goal.id == second.id));
+        }
+    }
+
+    #[test]
+    fn every_structural_search_budget_stop_restores_binders_and_deferred_evidence() {
+        let mut initial = seeded_context();
+        let p = proposition(&mut initial, "P");
+        let t = Expr::const_(Name::from_components(["True"]), Vec::new());
+        let both = Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["And"]), Vec::new()),
+                p.clone(),
+            ),
+            t,
+        );
+        let q = proposition(&mut initial, "Q");
+        let mut negative = initial.clone();
+        local(&mut negative, "hp", p.clone());
+        local(
+            &mut negative,
+            "no",
+            arrow(
+                p.clone(),
+                Expr::const_(Name::from_components(["False"]), Vec::new()),
+            ),
+        );
+        for (mut original, target) in [(initial, arrow(p, both)), (negative, q)] {
+            let (root, goal) = original.proof_goal(target).unwrap();
+            let selection = Selection {
+                defaults: false,
+                ..Selection::default()
+            };
+            let before = original.txn.budget.heartbeats_consumed;
+            let mut complete = original.clone();
+            complete
+                .solve_by_elim_selected_proof_goal(goal.clone(), &selection)
+                .unwrap();
+            let work = complete.txn.budget.heartbeats_consumed - before;
+            let proof = complete.instantiate(&root).unwrap();
+            assert!(!proof.has_expr_mvar());
+            assert!(!proof.has_level_mvar());
+            assert!(!proof.has_loose_bvars());
+            for allowance in 0..work {
+                let mut limited = original.clone();
+                limited.txn.budget.max_heartbeats = before + allowance;
+                let problem = limited
+                    .solve_by_elim_selected_proof_goal(goal.clone(), &selection)
+                    .expect_err("a partial search is not closed evidence");
+                assert!(
+                    !backtrack::recoverable(&problem),
+                    "{allowance}: {problem:?}"
+                );
+                assert!(limited.txn.budget.heartbeats_consumed >= before + allowance);
+                // Normalize only the caller-supplied cap and consumed work.
+                // Every semantic component, including universes, queued
+                // constraints, context and assignments, must be unchanged.
+                limited.txn.budget = original.txn.budget.clone();
+                assert_eq!(limited.txn, original.txn, "{allowance}");
+                assert_eq!(limited.next, original.next);
+                assert_eq!(limited.equations.len(), original.equations.len());
+                assert!(
+                    limited
+                        .equations
+                        .iter()
+                        .zip(&original.equations)
+                        .all(|(a, b)| a.sides == b.sides && a.policy == b.policy)
+                );
+                assert_eq!(limited.instance_goals, original.instance_goals);
+                assert_eq!(limited.goal_tags, original.goal_tags);
+                assert_eq!(limited.trace_local_names, original.trace_local_names);
+            }
         }
     }
 

@@ -244,6 +244,15 @@ fn error(reason: TacticError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Tactic(reason))
 }
 
+/// Application callers select the order of their *real* pending obligations.
+/// Manual tactics prefer nondependent goals; search's constructor discharger
+/// follows the original telescope, so a witness choice can be backtracked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApplyGoalOrder {
+    NonDependentFirst,
+    Telescope,
+}
+
 #[derive(Clone)]
 pub(super) struct ProofGoal {
     pub(in crate::source) id: MVarId,
@@ -1321,8 +1330,25 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'_>,
         goal: ProofGoal,
+        term: Typed,
+        instance_start: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.apply_proof_term_ordered(
+            proof,
+            goal,
+            term,
+            instance_start,
+            ApplyGoalOrder::NonDependentFirst,
+        )
+    }
+
+    pub(super) fn apply_proof_term_ordered(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
         mut term: Typed,
         instance_start: usize,
+        order: ApplyGoalOrder,
     ) -> Result<(), NatDefinitionElabError> {
         let mut arguments = Vec::new();
         let mut new_arguments = 0usize;
@@ -1404,6 +1430,14 @@ impl Context {
             }
         }
         proof.work.push(Work::Close(goal, term.value));
+        if order == ApplyGoalOrder::Telescope {
+            // SolveByElim.constructorAfter explicitly uses newGoals := .all.
+            // Keep even assigned holes in order; the worklist skips them.
+            proof
+                .work
+                .extend(arguments.into_iter().rev().map(Work::Goal));
+            return Ok(());
+        }
         // The pin's apply returns its new goals non-dependent-first
         // (`ApplyConfig.newGoals := ApplyNewGoals.nonDependentFirst`,
         // Init/Meta/Defs.lean:1706): a goal is dependent exactly when another

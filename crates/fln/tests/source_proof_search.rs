@@ -100,7 +100,9 @@ fn false_and_cyclic_goals_refuse_atomically_and_leave_the_engine_usable() {
         "theorem bad (p : Prop) (loop : p -> p) : p := by solve_by_elim",
         "theorem bad (p q : Prop) (f : p -> q) (g : q -> p) : q := by solve_by_elim",
         "theorem bad (p : Prop) (hp : p) : False := by solve_by_elim",
-        "def bad (f : Nat -> Nat) : Nat := by solve_by_elim",
+        // Nat has a real zero constructor; constructor fallback can now
+        // inhabit it. An arbitrary carrier must still not be fabricated.
+        "def bad (A : Type) (f : A -> A) : A := by solve_by_elim",
         "theorem bad (p : Prop) (hp : p) : p := by solve_by_elim; assumption",
     ] {
         let source = format!("def earlier : Nat := 7\n{bad}\n");
