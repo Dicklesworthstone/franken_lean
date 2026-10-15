@@ -41,3 +41,16 @@ fn malformed_depth_arguments_are_not_ignored() {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
 }
+
+#[test]
+fn nested_congruence_controls_do_not_capture_ordinary_term_names() {
+    for source in [
+        "def congr : Nat := 7",
+        "theorem t (P : Prop) (congr : P) : P := by exact congr",
+        "/-- λ -/\r\ntheorem t (a : Nat) : a = a := by\r\n  first | (congr 0; fail) | congr 1\r\n",
+        "theorem t (a : Nat) : (a = a) ∧ (a = a) := by constructor <;> congr 1",
+    ] {
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    }
+}
