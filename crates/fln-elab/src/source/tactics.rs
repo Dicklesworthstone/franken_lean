@@ -1223,6 +1223,15 @@ impl Context {
             } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
                 let selection = search::selection(args)?;
                 self.solve_by_elim_selected_proof_state(proof, goal, &selection)?;
+            } else if kind == &parser_kind(&["Tactic", "applyRules"])
+                || kind == &parser_kind(&["Tactic", "applyAssumption"])
+            {
+                self.apply_rule_proof_goal(
+                    proof,
+                    goal,
+                    args,
+                    kind == &parser_kind(&["Tactic", "applyAssumption"]),
+                )?;
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

@@ -42,6 +42,15 @@ pub(in crate::source::tactics) fn selection(
         _ => return Err(error(TacticError::MalformedScript)),
     };
     expect_default_config(config, "solve_by_elim configuration")?;
+    selected_arguments(all_goals, only, arguments, using)
+}
+
+pub(super) fn selected_arguments<'a>(
+    all_goals: bool,
+    only: &'a Syntax,
+    arguments: &'a Syntax,
+    using: &'a Syntax,
+) -> Result<Selection<'a>, NatDefinitionElabError> {
     expect_empty_null(using, "solve_by_elim label attributes")?;
     let only = match expect_null_args(only, "solve_by_elim only")? {
         [] => false,

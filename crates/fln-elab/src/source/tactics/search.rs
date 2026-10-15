@@ -6,6 +6,8 @@
 //! heap worklists and iterative deepening, not source-controlled Rust recursion.
 use super::*;
 
+mod rules;
+mod rules_config;
 mod selection;
 pub(super) use selection::selection;
 use selection::{Candidate, Selection};

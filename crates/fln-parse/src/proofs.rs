@@ -301,6 +301,8 @@ pub(crate) fn tactic(
             "exact",
             "assumption",
             "solve_by_elim",
+            "apply_assumption",
+            "apply_rules",
             "apply",
             "refine",
             "constructor",
@@ -642,7 +644,7 @@ fn local_tactic(
             }
             args.push(config);
         }
-        "solve_by_elim" => {
+        "solve_by_elim" | "apply_assumption" | "apply_rules" => {
             return search::parse(leaves, view, tokens, range, args.remove(0));
         }
         "assumption"
