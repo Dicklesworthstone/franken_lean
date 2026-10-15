@@ -4822,7 +4822,13 @@ fn definition_in_context_named(
                 }
                 _ => return Err(failure(SourceInferenceError::Scope)),
             },
-            6 if context.partial.is_some() => partial::validate_modifier(modifier)?,
+            6 if context
+                .partial
+                .as_ref()
+                .is_some_and(|state| state.kind == partial::Kind::Partial) =>
+            {
+                partial::validate_modifier(modifier)?
+            }
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
     }
@@ -4845,12 +4851,19 @@ fn definition_in_context_named(
         // MutualDef.check at the pin forbids unsafe theorems and unsafe
         // partial declarations. Opaque/axiom forms need a separate source
         // door; do not accidentally give them recursive-definition machinery.
-        if is_theorem || is_opaque || is_axiom || context.partial.is_some() {
+        if is_theorem
+            || is_opaque
+            || is_axiom
+            || context
+                .partial
+                .as_ref()
+                .is_some_and(|state| state.kind != partial::Kind::Unsafe)
+        {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "unsafe def, abbrev, or data instance without partial",
             });
         }
-        context.partial = Some(partial::State {
+        context.partial.get_or_insert(partial::State {
             kind: partial::Kind::Unsafe,
             ..partial::State::default()
         });
@@ -5321,7 +5334,7 @@ fn definition_in_context_named(
             .partial
             .as_ref()
             .is_some_and(|state| state.reference.is_some());
-        Ok(Declaration::Defn(DefinitionVal {
+        let definition = DefinitionVal {
             base,
             value: term.value,
             hints: if recursive {
@@ -5333,7 +5346,16 @@ fn definition_in_context_named(
             },
             safety: DefinitionSafety::Unsafe,
             all: vec![name.clone()],
-        }))
+        };
+        if context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.group.is_some())
+        {
+            Ok(Declaration::Mutual(vec![definition]))
+        } else {
+            Ok(Declaration::Defn(definition))
+        }
     } else if context
         .partial
         .as_ref()

@@ -140,6 +140,37 @@ pub fn is_partial(syntax: &Syntax) -> bool {
         .is_some_and(|slot| validate_modifier(slot).is_ok())
 }
 
+/// Classify an unsafe `def` for mutual admission without dropping its syntax.
+/// This is not validation: the complete modifier/header/body checks still run.
+pub fn is_unsafe_definition(syntax: &Syntax) -> bool {
+    let Some(args) = syntax_args(syntax, &parser_kind(&["Command", "declaration"])) else {
+        return false;
+    };
+    if args.get(1).and_then(Syntax::kind) != Some(&parser_kind(&["Command", "definition"])) {
+        return false;
+    }
+    args.first()
+        .and_then(|node| syntax_args(node, &parser_kind(&["Command", "declModifiers"])))
+        .and_then(|modifiers| modifiers.get(5))
+        .is_some_and(|slot| validate_unsafe_modifier(slot).is_ok())
+}
+
+pub(super) fn validate_unsafe_modifier(slot: &Syntax) -> Result<(), NatDefinitionElabError> {
+    let [modifier] = expect_null_args(slot, "unsafe modifier")? else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    let [keyword] = expect_node(
+        modifier,
+        &parser_kind(&["Command", "unsafe"]),
+        1,
+        "unsafe modifier",
+    )?
+    else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    expect_atom(keyword, "unsafe", "unsafe modifier").map(|_| ())
+}
+
 fn syntax_args<'a>(syntax: &'a Syntax, expected: &Name) -> Option<&'a [Syntax]> {
     match syntax {
         Syntax::Node { kind, args, .. } if kind == expected => Some(args),

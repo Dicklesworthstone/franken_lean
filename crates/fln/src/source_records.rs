@@ -217,7 +217,10 @@ impl Engine {
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
             ScopedCommandSyntax::Mutual(members) => {
-                if members.iter().any(fln_elab::source::partial::is_partial) {
+                if members.iter().any(|member| {
+                    fln_elab::source::partial::is_partial(member)
+                        || fln_elab::source::partial::is_unsafe_definition(member)
+                }) {
                     let declarations = match elaboration_outcome(
                         fln_elab::source::partial::elaborate_group(
                             &members,

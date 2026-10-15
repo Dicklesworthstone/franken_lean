@@ -79,3 +79,52 @@ fn installed_unsafe_recursion_executes_replays_and_cannot_publish_a_safe_proof()
     assert!(recovered.contains("\"finalValue\":6"), "{recovered}");
     assert_eq!(std::fs::read(&source).unwrap(), good.as_bytes());
 }
+
+#[test]
+fn installed_mutual_unsafe_group_replays_its_real_bodies() {
+    let root = std::env::temp_dir().join(format!("fln-mutual-unsafe-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("Mutual.lean");
+    let artifact = root.join("Mutual.flbc");
+    let group = "mutual\nunsafe def ping (n : Nat) : Nat := if n == 0 then 7 else pong (n - 1)\nunsafe def pong (n : Nat) : Nat := if n == 0 then 13 else ping (n - 1)\nend\n";
+    let good = format!("{group}#eval ping 5\n");
+    std::fs::write(&source, &good).unwrap();
+    let output = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["run", "--json", "--emit-flbc"])
+            .arg(&artifact)
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(output.contains("\"finalValue\":13"), "{output}");
+    let replay = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["flbc", "run", "--json"])
+            .arg(&artifact)
+            .output()
+            .unwrap(),
+    );
+    assert!(replay.contains("\"returnValue\":13"), "{replay}");
+    std::fs::write(
+        &source,
+        format!("{good}theorem leak : ping 0 = ping 0 := by rfl\n"),
+    )
+    .unwrap();
+    let refusal = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(refusal.stdout.is_empty());
+    std::fs::write(&source, &good).unwrap();
+    let recovered = successful(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["run", "--json"])
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(recovered.contains("\"finalValue\":13"), "{recovered}");
+}

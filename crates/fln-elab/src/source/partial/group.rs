@@ -1,4 +1,4 @@
-//! Mutual partial predefinitions. Headers are candidates, never installed as
+//! Mutual partial and unsafe predefinitions. Headers are candidates, never installed as
 //! axioms; every recursive occurrence is a typed private local until closure.
 //! The pin partitions dependencies into SCCs before choosing partial/nonrec.
 use super::*;
@@ -19,6 +19,37 @@ fn refusal(expected: &'static str) -> NatDefinitionElabError {
     NatDefinitionElabError::UnexpectedSyntax { expected }
 }
 
+fn validate_group_member(syntax: &Syntax, kind: Kind) -> Result<(), NatDefinitionElabError> {
+    if kind == Kind::Partial {
+        return validate(syntax);
+    }
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "mutual unsafe declaration",
+    )?;
+    expect_node(
+        &declaration[1],
+        &parser_kind(&["Command", "definition"]),
+        5,
+        "mutual unsafe def",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    validate_unsafe_modifier(&modifiers[5])?;
+    // The whole group must have the same safety. Unsupported attributes and
+    // compute modifiers cannot be dropped by taking the group admission door.
+    for index in [1, PROTECTED_SLOT, NONCOMPUTABLE_SLOT, 6] {
+        expect_empty_null(&modifiers[index], "unattributed unsafe def without partial")?;
+    }
+    Ok(())
+}
+
 /// Return a complete, untrusted group in dependency/admission order. No prefix
 /// is observable unless the caller's ordinary two-checker batch succeeds.
 pub fn elaborate_group(
@@ -28,8 +59,13 @@ pub fn elaborate_group(
     scope: &SourceScope,
 ) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     if members.is_empty() || members.len() > 8 {
-        return Err(refusal("one to eight mutual partial definitions"));
+        return Err(refusal("one to eight mutual partial or unsafe definitions"));
     }
+    let kind = if is_unsafe_definition(&members[0]) {
+        Kind::Unsafe
+    } else {
+        Kind::Partial
+    };
     let mut meter = Context::scoped(environment, kernel, scope);
     // Section locals have one meaning throughout the group. Their universes
     // cannot be independently instantiated at a peer occurrence. Declaration-
@@ -50,7 +86,7 @@ pub fn elaborate_group(
     let mut reserved = HashSet::new();
     for member in members {
         meter.tick()?;
-        validate(member)?;
+        validate_group_member(member, kind)?;
         let effective = scope.for_declaration(member)?;
         let declaration = expect_node(
             member,
@@ -76,7 +112,11 @@ pub fn elaborate_group(
         let name = effective
             .declaration_name(val)
             .map_err(|_| failure(SourceInferenceError::Scope))?;
-        for reserved_name in [name.clone(), Name::str(name.clone(), "_unsafe_rec")] {
+        let mut candidates = vec![name.clone()];
+        if kind == Kind::Partial {
+            candidates.push(Name::str(name.clone(), "_unsafe_rec"));
+        }
+        for reserved_name in candidates {
             if environment.contains(&reserved_name) || !reserved.insert(reserved_name) {
                 return Err(refusal("fresh distinct mutual names and companions"));
             }
@@ -94,6 +134,7 @@ pub fn elaborate_group(
         let mut context = Context::scoped(environment, kernel, scope);
         context.txn.budget = meter.txn.budget.clone();
         context.partial = Some(State {
+            kind,
             group: Some(prototype.clone()),
             ..State::default()
         });
@@ -123,6 +164,7 @@ pub fn elaborate_group(
         let mut context = Context::scoped(environment, kernel, scope);
         context.txn.budget = meter.txn.budget.clone();
         context.partial = Some(State {
+            kind,
             group: Some(group.clone()),
             ..State::default()
         });
@@ -146,7 +188,13 @@ pub fn elaborate_group(
 
     let executable: Vec<_> = names
         .iter()
-        .map(|name| Name::str(name.clone(), "_unsafe_rec"))
+        .map(|name| {
+            if kind == Kind::Unsafe {
+                name.clone()
+            } else {
+                Name::str(name.clone(), "_unsafe_rec")
+            }
+        })
         .collect();
     let mut edges = vec![vec![false; names.len()]; names.len()];
     for (index, body) in bodies.iter().enumerate() {
@@ -219,7 +267,17 @@ pub fn elaborate_group(
                 Ok((!recursive || !component.contains(&target))
                     .then(|| Expr::const_(names[target].clone(), levels.clone())))
             })?;
-            if recursive {
+            if recursive && kind == Kind::Unsafe {
+                // Unsafe SCCs keep their real names and checked executable
+                // bodies. There is no safe logical witness to manufacture.
+                definition.safety = DefinitionSafety::Unsafe;
+                definition.hints = ReducibilityHints::Opaque;
+                definition.all = implementation_group.clone();
+                if failed_codegen[index] {
+                    noncomputable.insert(definition.base.name.clone());
+                }
+                implementations.push(definition);
+            } else if recursive {
                 if !matches!(
                     meter.whnf(&definition.base.type_)?.node(),
                     ExprNode::ForallE { .. }
@@ -248,7 +306,11 @@ pub fn elaborate_group(
             } else {
                 definition.base.name = names[index].clone();
                 definition.all = logical_group.clone();
-                definition.safety = DefinitionSafety::Safe;
+                definition.safety = if kind == Kind::Unsafe {
+                    DefinitionSafety::Unsafe
+                } else {
+                    DefinitionSafety::Safe
+                };
                 definition.hints = ReducibilityHints::Regular(1);
                 if failed_codegen[index] {
                     noncomputable.insert(definition.base.name.clone());
@@ -296,15 +358,21 @@ impl Context {
             type_.clone(),
             BinderInfo::Default,
         );
+        let executable = if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.kind == Kind::Unsafe)
+        {
+            name.clone()
+        } else {
+            Name::str(name.clone(), "_unsafe_rec")
+        };
         self.partial
             .as_mut()
             .and_then(|state| state.group.as_mut())
             .expect("group exists")
             .calls
-            .push((
-                marker.clone(),
-                Expr::const_(Name::str(name.clone(), "_unsafe_rec"), levels),
-            ));
+            .push((marker.clone(), Expr::const_(executable, levels)));
         Ok(Some(Typed {
             value: Expr::fvar(marker),
             type_,
