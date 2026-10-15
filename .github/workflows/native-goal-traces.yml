@@ -1,0 +1,120 @@
+name: native goal trace validation
+
+# Temporary candidate verification. Source publication remains an explicit
+# GitHub operation; the runner exports verified blobs, never branch updates.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-goal-traces.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: apply the exact native trace candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request, zlib
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/'
+          parts = ['2e362ecd797e02ff3e0fa7deaeed11eea6aac67c', 'eb7753227376d4b844909289974713d2db7bcb96', 'dfe0c88139ed6fa61f2583cf7bdb08c746969808', '27aef532e23974a4df6953c2f7d5ed3570d90ed3', 'd8f1f01ac0948a29798890626e9b1a199dfce36b', 'ce70c61be5271bbcf26fd85cf70fde838df18a28', '265b9f9d5b20ac0c8d1b4a8c2957e55bca1d3df5', '3c61e21138260316ddbbac51ad8db215b8dc911f']
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          chunks = []
+          for identity in parts:
+              request = urllib.request.Request(api + identity, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'FrankenLean-goal-trace-validation'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  raw = base64.b64decode(json.load(response)['content'])
+              assert blob(raw) == identity, identity
+              chunks.append(raw)
+          data = zlib.decompress(base64.b64decode(b''.join(chunks), validate=True))
+          assert hashlib.sha256(data).hexdigest() == '1517d4c9ba68185a68d65ee5f8c05c7cf13a313b3bda95dab9cf2b70740073eb'
+          bundle = json.loads(data)
+          assert len(bundle['files']) == 15
+          paths = set()
+          root = pathlib.Path.cwd().resolve()
+          for row in bundle['files']:
+              path = pathlib.Path(row['path'])
+              assert row['path'].startswith('crates/') and path.suffix == '.rs'
+              assert path.resolve().is_relative_to(root) and not path.is_symlink()
+              assert row['path'] not in paths
+              paths.add(row['path'])
+              if row['before'] is None:
+                  assert not path.exists(), row['path']
+              else:
+                  assert blob(path.read_bytes()) == row['before'], row['path']
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=bundle['patch'].encode(), check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=bundle['patch'].encode(), check=True)
+          for row in bundle['files']:
+              assert blob(pathlib.Path(row['path']).read_bytes()) == row['after'], row['path']
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'goal-trace-validation'
+          out.mkdir()
+          (out / 'candidate.json').write_bytes(data)
+          PY
+      - name: install the repository-pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: verify checked source and installed CLI behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, os, pathlib, subprocess
+          bundle = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'goal-trace-validation/candidate.json').read_bytes())
+          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *[row['path'] for row in bundle['files']]], check=True)
+          PY
+          {
+            cargo check --locked --offline -p fln-cli
+            cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
+            cargo test --locked --offline -p fln --test source_traces --test source_selected_search --no-fail-fast
+            cargo test --locked --offline -p fln-cli --test lean_trace_state --no-fail-fast
+            cargo test --locked --offline -p fln-cli --lib goal_traces::tests --no-fail-fast
+          } 2>&1 | tee "$RUNNER_TEMP/goal-trace-validation/tests.log"
+      - name: export validated source blobs without publishing a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'goal-trace-validation'
+          bundle = json.loads((out / 'candidate.json').read_bytes())
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'FrankenLean-goal-trace-validation'}
+          result = {'checkout': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': {}}
+          for row in bundle['files']:
+              data = pathlib.Path(row['path']).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == row['after']
+              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
+              with urllib.request.urlopen(urllib.request.Request(api, data=payload, headers=headers), timeout=60) as response:
+                  created = json.load(response)
+              assert created['sha'] == row['after'], row['path']
+              result['files'][row['path']] = created['sha']
+          (out / 'blobs.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: goal-trace-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/goal-trace-validation/
+          retention-days: 2
+          if-no-files-found: warn
