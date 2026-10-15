@@ -4216,7 +4216,7 @@ pub(crate) extern "C" fn export_lean_mk_io_user_error(msg: *mut LeanObject) -> *
 /// the process stderr remains only for a malformed non-closure field. The
 /// pin asserts the result ok and drops it;
 /// both arms here settle everything they build.
-fn dbg_eprintln(msg: &[u8]) {
+pub(crate) fn dbg_eprintln(msg: &[u8]) {
     if !crate::stdio::panic_message_via_stream(msg) {
         use std::io::Write;
         let mut err = std::io::stderr().lock();

@@ -1,7 +1,7 @@
-name: native runtime diagnostic source transport
+name: native proof-search regressions
 
-# Temporary identity-checked transport of locally tested source. This job
-# creates only Git blobs; source commits and main updates remain explicit.
+# Auxiliary focused regression runner. Existing product and quality gates
+# remain authoritative. This workflow never exports source or updates Git.
 on:
   workflow_dispatch:
   push:
@@ -10,70 +10,25 @@ on:
 permissions:
   contents: read
 jobs:
-  transport:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
-    runs-on: windows-2025
+  regressions:
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    permissions:
-      contents: write
     steps:
-      - name: preserve committed source bytes
-        shell: bash
-        run: git config --global core.autocrlf false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: checkout the triggering source tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: apply and export only the verified source blobs
+      - name: install the repository-pinned native compiler
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python -I - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          repo = 'Dicklesworthstone/franken_lean'
-          api = 'https://api.github.com/repos/' + repo + '/git/blobs'
-          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'franken-lean-source-transport'}
-          def request(url, data=None):
-              payload = None if data is None else json.dumps(data).encode()
-              with urllib.request.urlopen(urllib.request.Request(url, data=payload, headers=headers), timeout=60) as response:
-                  return json.load(response)
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          raw = base64.b64decode(request(api + '/e640ae238108b4bab19325bb6eb7bd0c9b310815')['content'])
-          assert hashlib.sha256(raw).hexdigest() == '50da216178c968d4e2dc9cb8c02523b9dff0ebc5678073803acbe5bae4356606'
-          bundle = json.loads(gzip.decompress(raw))
-          expected = {'ci/BOUNDARY_API.txt', 'crates/fln-rt/src/lib.rs', 'crates/fln-unsafe-abi/src/export.rs', 'crates/fln-unsafe-abi/src/lib.rs', 'crates/fln-vm/src/interpreter.rs', 'crates/fln-vm/src/interpreter/diagnostics.rs', 'crates/fln-vm/tests/runtime_diagnostics.rs'}
-          assert set(bundle['files']) == expected
-          for name, identities in bundle['files'].items():
-              path = pathlib.Path(name)
-              if identities['before'] is None:
-                  assert not path.exists(), name
-              else:
-                  assert blob(path.read_bytes()) == identities['before'], name
-          subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=bundle['patch'].encode(), check=True)
-          for name, identities in bundle['files'].items():
-              assert blob(pathlib.Path(name).read_bytes()) == identities['after'], name
-          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'diagnostic-source-blobs'
-          out.mkdir()
-          result = {'checkout': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': {}}
-          for name, identities in bundle['files'].items():
-              created = request(api, {'content': base64.b64encode(pathlib.Path(name).read_bytes()).decode(), 'encoding': 'base64'})
-              assert created['sha'] == identities['after'], name
-              result['files'][name] = created['sha']
-          (out / 'blobs.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
-          baseline = '408050eaab36bb33e7b15e7336946b7a670b9fc3'
-          paths = ['.github/workflows/native-source-repro.yml', 'crates/fln-cli/tests/source_selected_search.rs', 'crates/fln-elab/src/source/tactics.rs', 'crates/fln-elab/src/source/tactics/search.rs', 'crates/fln-elab/src/source/tactics/search/selection.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln-parse/src/proofs/search.rs', 'crates/fln/tests/source_selected_search.rs']
-          for name in paths:
-              target = out / 'baseline' / name
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_bytes(subprocess.check_output(['git', 'show', baseline + ':' + name]))
-          (out / 'baseline-commit.txt').write_text(baseline + '\n', encoding='utf-8')
-          print(json.dumps(result, indent=2))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: diagnostic-source-blobs-${{ github.sha }}
-          path: ${{ runner.temp }}/diagnostic-source-blobs/
-          retention-days: 1
-          if-no-files-found: error
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt
+      - name: validate parser elaborator checked proofs and executable exits
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/search.rs crates/fln-elab/src/source/tactics/search/selection.rs crates/fln-parse/src/proofs.rs crates/fln-parse/src/proofs/search.rs crates/fln/tests/source_selected_search.rs crates/fln-cli/tests/source_selected_search.rs
+          cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
+          cargo test --locked --offline -p fln -p fln-cli --test source_selected_search --no-fail-fast
+          cargo test --locked --offline -p fln --test source_proof_search --test source_search_reflexivity --no-fail-fast

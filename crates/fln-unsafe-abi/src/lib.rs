@@ -98,5 +98,18 @@ pub fn set_allocation_heartbeats(count: u64) {
     membrane::set_heartbeats(count);
 }
 
+/// Report a nonfatal language panic using the same stderr stream, backtrace,
+/// and process policy as the exported runtime. Fatal runtime policies may exit
+/// or abort; this function never manufactures a language value or proof.
+pub fn report_panic(message: &[u8]) {
+    export::panic_impl(message, false);
+}
+
+/// Write one debugging line to the thread-current Lean stderr stream.
+/// Continuation execution belongs to the caller's execution engine.
+pub fn trace_message(message: &[u8]) {
+    export::dbg_eprintln(message);
+}
+
 #[cfg(test)]
 mod tests;
