@@ -2406,6 +2406,7 @@ impl Expander {
         // Rebuild the template bottom-up with the substitutions applied.
         enum Step<'a> {
             Visit(&'a Syntax),
+            Raw(&'a Syntax),
             Build(fln_syntax::source::SourceInfo, &'a Name, usize),
         }
         let mut steps = vec![Step::Visit(&rule.rhs)];
@@ -2413,8 +2414,21 @@ impl Expander {
             match step {
                 Step::Visit(Syntax::Node { info, kind, args }) => {
                     steps.push(Step::Build(*info, kind, args.len()));
-                    steps.extend(args.iter().rev().map(Step::Visit));
+                    steps.extend(args.iter().enumerate().rev().map(|(index, child)| {
+                        if raw_identifier_slot(kind, index) {
+                            Step::Raw(child)
+                        } else {
+                            Step::Visit(child)
+                        }
+                    }));
                 }
+                // Labels are not hygienic term identifiers (the pin uses
+                // rawIdent or erases macro scopes when interpreting them).
+                // Antiquoted labels still substitute their syntax.
+                Step::Raw(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
+                    leaves.push(bound[val].clone());
+                }
+                Step::Raw(leaf) => leaves.push(leaf.clone()),
                 Step::Visit(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
                     leaves.push(bound[val].clone());
                 }
@@ -2447,6 +2461,23 @@ impl Expander {
         }
         leaves.pop().ok_or("an empty template")
     }
+}
+
+/// Literal identifier positions with the pin's raw-label semantics.
+/// Quotation name resolution and instantiation share this distinction: a label
+/// is neither a global reference nor a local binder. Its value expression is.
+pub fn raw_identifier_slot(kind: &Name, index: usize) -> bool {
+    [
+        ("namedArgument", 1),
+        ("structInstLVal", 0),
+        ("proj", 2),
+        ("dotIdent", 1),
+        ("pipeProj", 2),
+    ]
+    .iter()
+    .any(|(leaf, slot)| {
+        index == *slot && *kind == Name::from_components(["Lean", "Parser", "Term", leaf])
+    })
 }
 
 /// What a node of a notation the file declared expands to: `elabNotation`'s `macro_rules` (the

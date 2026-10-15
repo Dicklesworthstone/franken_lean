@@ -306,3 +306,122 @@ fn unused_macros_defer_unknown_names_but_checked_notations_still_refuse_lets() {
         Err(SourceCheckError::Command { command: 0, .. })
     ));
 }
+
+#[test]
+fn macro_field_labels_and_named_arguments_are_not_global_references() {
+    accepted(
+        "structure Cell where\n  value : Nat\n\
+         def choose (left right : Nat) : Nat := left\n\
+         namespace A\ndef value : Nat := 99\ndef left : Nat := 88\n\
+         macro \"cellOf \" x:term:max : term => `({ value := $x : Cell })\n\
+         macro \"readCell \" x:term:max : term => `(($x).value)\n\
+         macro \"chooseLeft \" x:term:max : term => `(choose (right := 0) (left := $x))\n\
+         end A\n\
+         theorem field : readCell (cellOf (42 : Nat)) = 42 := rfl\n\
+         theorem named : chooseLeft (37 : Nat) = 37 := rfl\n",
+        2,
+    );
+}
+
+#[test]
+fn macro_record_method_parameters_are_local_to_their_field() {
+    accepted(
+        "structure Operations where\n  run : Nat → Nat\n  other : Nat\n\
+         namespace A\ndef n : Nat := 7\n\
+         macro \"operations \" x:term:max : term => `({ run (n : Nat) := Nat.add n $x, other := n : Operations })\n\
+         end A\ndef n : Nat := 99\n\
+         theorem runMethod (n : Nat) : (operations n).run 2 = Nat.add 2 n := rfl\n\
+         theorem otherField : (operations (1 : Nat)).other = 7 := rfl\n",
+        2,
+    );
+}
+
+#[test]
+fn macro_record_update_and_abbreviation_keep_definition_site_values() {
+    accepted(
+        "structure Cell where\n  value : Nat\n\
+         namespace A\ndef value : Nat := 7\n\
+         macro \"defaultCell\" : term => `({ value : Cell })\n\
+         macro \"updateCell \" x:term:max : term => `({ $x with value := value })\n\
+         end A\ndef value : Nat := 99\n\
+         theorem abbreviation : (defaultCell).value = 7 := rfl\n\
+         theorem update : (updateCell ({ value := 42 : Cell })).value = 7 := rfl\n",
+        2,
+    );
+}
+
+#[test]
+fn checked_notations_support_named_arguments_but_do_not_admit_unknown_values() {
+    accepted(
+        "def choose (left right : Nat) : Nat := left\n\
+         notation \"seven\" => choose (right := 0) (left := 7)\n\
+         theorem result : seven = 7 := rfl\n",
+        1,
+    );
+    assert!(check("def choose (left right : Nat) : Nat := left\nnotation \"bad\" => choose (left := missing) (right := 0)\n").is_err());
+    assert!(check("structure Cell where\n  value : Nat\nnotation \"notPrechecked\" => { value := 1 : Cell }\n").is_err());
+}
+
+#[test]
+fn field_macros_execute_after_native_module_journal_replay() {
+    let base = engine();
+    let library = Name::from_components(["Fields"]);
+    let main = Name::from_components(["Main"]);
+    let source = "structure Cell where\n  value : Nat\n\
+        macro \"cellOf \" x:term:max : term => `({ value := $x : Cell })\n\
+        macro \"readCell \" x:term:max : term => `(($x).value)\n";
+    let consumer = "import Fields\ndef answer : Nat := readCell (cellOf (42 : Nat))\n";
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let result = base
+        .check_source_modules(
+            &[
+                SourceModuleInput {
+                    name: &library,
+                    source: source.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &main,
+                    source: consumer.as_bytes(),
+                },
+            ],
+            &main,
+            &options,
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let execution = result
+        .checked
+        .engine
+        .execute_source_definitions(
+            &[b"def run : Nat := answer"],
+            &options,
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(returned) = &execution.executions[0].exit else {
+        panic!("native return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(base.logical_root(&options), before);
+}
+
+#[test]
+fn field_macros_do_not_hide_invalid_labels_values_or_parameter_escapes() {
+    for source in [
+        "structure Cell where\n  value : Nat\nmacro \"bad\" : term => `({ missing := 1 : Cell })\ndef x : Cell := bad\n",
+        "structure Cell where\n  value : Nat\nmacro \"bad\" : term => `({ value := True.intro : Cell })\ndef x : Cell := bad\n",
+        "structure Cell where\n  value : Nat\nmacro \"bad\" : term => `({ value := 1, value := 2 : Cell })\ndef x : Cell := bad\n",
+        "structure Ops where\n  run : Nat → Nat\n  other : Nat\nmacro \"bad\" : term => `({ run (n : Nat) := n, other := n : Ops })\ndef x : Ops := bad\n",
+        "def choose (left right : Nat) : Nat := left\nmacro \"bad\" : term => `(choose (missing := 7) (right := 0))\ndef x : Nat := bad\n",
+    ] {
+        assert!(check(source).is_err(), "must reject {source}");
+    }
+}

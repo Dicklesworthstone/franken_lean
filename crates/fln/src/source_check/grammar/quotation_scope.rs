@@ -493,6 +493,126 @@ fn shared_binder<'a>(
     Ok(())
 }
 
+/// Fields and argument labels are raw identifiers at the pin. Only their
+/// values are terms. Method binders scope over that field's annotation and
+/// initializer, never over a sibling field or an update source.
+fn field_syntax<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    tasks: &mut Vec<Task<'a>>,
+    scope_depth: usize,
+) -> Result<bool, EngineExecutionError> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Ok(false);
+    };
+    let named = term_kind(kind, "namedArgument");
+    let field = term_kind(kind, "structInstField");
+    if !named
+        && !field
+        && !["proj", "pipeProj", "dotIdent", "structInst"]
+            .iter()
+            .any(|leaf| term_kind(kind, leaf))
+    {
+        return Ok(false);
+    }
+    // Only application named arguments have a quotation-precheck hook.
+    // Supporting unchecked user macros must not widen checked notations.
+    if rule.prechecked && !named {
+        return Err(unsupported_binder());
+    }
+    let raw = |syntax: &Syntax| match syntax {
+        Syntax::Ident { val, .. }
+            if !val.is_anonymous()
+                && !rule.variables.iter().any(|(_, variable)| variable == val) =>
+        {
+            Ok(())
+        }
+        Syntax::Node { kind, args, .. }
+            if *kind == Name::from_components(["fieldIdx"])
+                && matches!(args.as_slice(), [Syntax::Atom { .. }]) =>
+        {
+            Ok(())
+        }
+        _ => Err(unsupported_binder()),
+    };
+    if field {
+        let [label, payload] = args.as_slice() else {
+            return Err(unsupported_binder());
+        };
+        let [name, path] = term_args(label, "structInstLVal")? else {
+            return Err(unsupported_binder());
+        };
+        raw(name)?;
+        if !null_args(path)?.is_empty() {
+            return Err(unsupported_binder());
+        }
+        let entries = null_args(payload)?;
+        tasks.push(Task::Restore(scope_depth));
+        tasks.push(build(syntax)?);
+        if entries.is_empty() {
+            // `{ field }` reads a value as well as naming a field. Give that
+            // value its own identifier so global pre-resolution never changes
+            // the field label, and ordinary expansion retains its hygiene.
+            let null = || Name::from_components(["null"]);
+            tasks.push(Task::BuildNew(null(), 3));
+            tasks.push(Task::BuildNew(
+                Name::from_components(["Lean", "Parser", "Term", "structInstFieldDef"]),
+                3,
+            ));
+            tasks.push(Task::Visit(name));
+            tasks.push(Task::Emit(Syntax::node(null(), vec![])));
+            tasks.push(Task::Emit(Syntax::atom(SourceInfo::None, ":=")));
+            tasks.push(Task::Emit(Syntax::node(null(), vec![])));
+            tasks.push(Task::Emit(Syntax::node(null(), vec![])));
+        } else {
+            let [binders, annotation, definition] = entries else {
+                return Err(unsupported_binder());
+            };
+            null_args(binders)?;
+            shared_type(annotation)?;
+            let [assignment, private, value] = term_args(definition, "structInstFieldDef")? else {
+                return Err(unsupported_binder());
+            };
+            if !atom(assignment, &[":="]) || !null_args(private)?.is_empty() {
+                return Err(unsupported_binder());
+            }
+            tasks.push(build(payload)?);
+            tasks.push(build(definition)?);
+            tasks.push(Task::Visit(value));
+            tasks.push(Task::Copy(private));
+            tasks.push(Task::Copy(assignment));
+            tasks.push(Task::Visit(annotation));
+            tasks.push(Task::Binders(binders));
+        }
+        tasks.push(Task::Copy(label));
+        return Ok(true);
+    }
+    let expected = if named {
+        5
+    } else if term_kind(kind, "proj") {
+        3
+    } else if term_kind(kind, "pipeProj") {
+        5
+    } else if term_kind(kind, "dotIdent") {
+        2
+    } else {
+        6
+    };
+    if args.len() != expected {
+        return Err(unsupported_binder());
+    }
+    tasks.push(build(syntax)?);
+    for (index, child) in args.iter().enumerate().rev() {
+        if fln_parse::extensions::raw_identifier_slot(kind, index) {
+            raw(child)?;
+            tasks.push(Task::Copy(child));
+        } else {
+            tasks.push(Task::Visit(child));
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn preresolve(
     rule: &NotationRule,
     resolve: &impl Fn(&Name) -> Resolution,
@@ -503,6 +623,9 @@ pub(super) fn preresolve(
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(node @ Syntax::Node { kind, args, .. }) => {
+                if field_syntax(node, rule, &mut tasks, locals.len())? {
+                    continue;
+                }
                 if term_kind(kind, "fun") {
                     lambda(node, &mut tasks, locals.len())?;
                     continue;
