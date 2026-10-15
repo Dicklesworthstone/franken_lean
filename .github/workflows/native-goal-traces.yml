@@ -1,8 +1,7 @@
-name: native goal trace source transport
+name: native trace source transport
 
-# Temporary transport of locally compiled and tested source, not a test verdict.
-# The separate Linux validation run remains independent. Only blobs are exported;
-# committing source and updating main are explicit GitHub operations.
+# Temporary byte transport, not an acceptance verdict. The two feature patches
+# have been exercised locally; explicit GitHub calls publish their commits.
 on:
   workflow_dispatch:
   push:
@@ -24,33 +23,77 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: export the exact locally tested trace source
+      - name: export both exact locally tested source increments
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python -I - <<'PY'
-          import base64, hashlib, json, os, subprocess, textwrap, urllib.request
-          identity = 'dec4921d32f97bc25f10cd97ef91b3cfb3a0968e'
-          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + identity
-          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'FrankenLean-goal-trace-transport'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              source = base64.b64decode(json.load(response)['content'])
-          assert hashlib.sha1(b'blob ' + str(len(source)).encode() + b'\0' + source).hexdigest() == identity
-          source = source.decode()
-          for name in ['apply the exact native trace candidate', 'export validated source blobs without publishing a branch']:
-              start = source.index('      - name: ' + name + '\n')
-              end = source.find('\n      - ', start + 1)
-              block = source[start:] if end == -1 else source[start:end]
-              block = textwrap.dedent(block.split('        run: |\n', 1)[1])
-              block = block.replace('python3 -I -', 'python -I -')
-              subprocess.run(['bash', '-euo', 'pipefail', '-c', block], check=True)
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request, zlib
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'FrankenLean-native-trace-transport'}
+          def request(url, value=None):
+              payload = None if value is None else json.dumps(value).encode()
+              with urllib.request.urlopen(urllib.request.Request(url, data=payload, headers=headers), timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          stages = [
+              ('goals', '1517d4c9ba68185a68d65ee5f8c05c7cf13a313b3bda95dab9cf2b70740073eb', 15, ['2e362ecd797e02ff3e0fa7deaeed11eea6aac67c', 'eb7753227376d4b844909289974713d2db7bcb96', 'dfe0c88139ed6fa61f2583cf7bdb08c746969808', '27aef532e23974a4df6953c2f7d5ed3570d90ed3', 'd8f1f01ac0948a29798890626e9b1a199dfce36b', 'ce70c61be5271bbcf26fd85cf70fde838df18a28', '265b9f9d5b20ac0c8d1b4a8c2957e55bca1d3df5', '3c61e21138260316ddbbac51ad8db215b8dc911f']),
+              ('messages', '63a7cd4710f4023b5a0f5a95e605bc6c5a19d2ee58ca215075928cd12cc9bf5d', 11, ['47ab5c5e6fec93d690de23e63b383062f1efd84b', 'cb283fbaf7e9bcb562550131bd16466b5d16fe9e', '9b3bfd67469b0a064ff29b9ac0d97b3fff1537aa', '5d4d92f5d5f0a5f2a19873055310fd42ebb59c51']),
+          ]
+          fixtures = {'crates/fln/tests/fixtures/traceStateBacktracking.lean', 'crates/fln/tests/fixtures/traceStateBacktracking.lean.out.expected'}
+          root = pathlib.Path.cwd().resolve()
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-trace-source'
+          out.mkdir()
+          checkout = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          for stage, digest, count, parts in stages:
+              chunks = []
+              for identity in parts:
+                  raw = base64.b64decode(request(api + '/' + identity)['content'])
+                  assert blob(raw) == identity, identity
+                  if identity == '47ab5c5e6fec93d690de23e63b383062f1efd84b':
+                      # Repair a transport transcription; the decoded patch and
+                      # every source file must still have their original hash.
+                      old = b'YZdkoQi8BdXCdwr'
+                      new = b'YZdkoQi8hSWEvZg5S4/P5pbtuLPQc20BuMVWsFjO45kz1/CK5tEyXi4iEQBdXCdwr'
+                      assert raw.count(old) == 1
+                      raw = raw.replace(old, new)
+                      assert blob(raw) == '3011c8c393a965327321049a4639fc77fb031597'
+                  chunks.append(raw)
+              data = zlib.decompress(base64.b64decode(b''.join(chunks), validate=True))
+              assert hashlib.sha256(data).hexdigest() == digest, stage
+              bundle = json.loads(data)
+              assert len(bundle['files']) == count
+              paths = set()
+              for row in bundle['files']:
+                  path = pathlib.Path(row['path'])
+                  assert row['path'].startswith('crates/') and (path.suffix == '.rs' or row['path'] in fixtures)
+                  assert path.resolve().is_relative_to(root) and not path.is_symlink()
+                  assert row['path'] not in paths
+                  paths.add(row['path'])
+                  if row['before'] is None:
+                      assert not path.exists(), row['path']
+                  else:
+                      assert blob(path.read_bytes()) == row['before'], row['path']
+              subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=bundle['patch'].encode(), check=True)
+              subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=bundle['patch'].encode(), check=True)
+              result = {'checkout': checkout, 'patch_sha256': digest, 'files': {}}
+              for row in bundle['files']:
+                  content = pathlib.Path(row['path']).read_bytes()
+                  assert blob(content) == row['after'], row['path']
+                  created = request(api, {'content': base64.b64encode(content).decode(), 'encoding': 'base64'})
+                  assert created['sha'] == row['after'], row['path']
+                  result['files'][row['path']] = created['sha']
+              (out / (stage + '-blobs.json')).write_text(json.dumps(result, indent=2), encoding='utf-8')
+              (out / (stage + '-candidate.json')).write_bytes(data)
+              print(json.dumps(result, indent=2))
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: goal-trace-source-blobs-${{ github.sha }}
-          path: ${{ runner.temp }}/goal-trace-validation/
+          name: native-trace-source-${{ github.sha }}
+          path: ${{ runner.temp }}/native-trace-source/
           retention-days: 2
           if-no-files-found: warn
