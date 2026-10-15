@@ -1,0 +1,62 @@
+name: native source reproduction
+
+# An auxiliary reproduction runner, not an acceptance gate or publisher.
+# Its push trigger is intentionally limited to this workflow; ordinary source
+# commits continue to use the existing quality and product gates.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-source-repro.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: checkout the triggering source tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: install the repository-pinned native toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt
+          printf 'FLN_REPRO_CHANNEL=%s\n' "$channel" >> "$GITHUB_ENV"
+
+      - name: prepare a credential-free offline reproduction bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/native-source-repro"
+          mkdir -p "$bundle"
+          git rev-parse HEAD > "$bundle/source-commit.txt"
+          git archive --format=tar HEAD | gzip -1 > "$bundle/source.tar.gz"
+          compiler="$(rustup which --toolchain "$FLN_REPRO_CHANNEL" rustc)"
+          toolchain="$(dirname "$(dirname "$compiler")")"
+          "$compiler" -Vv > "$bundle/rustc-version.txt"
+          # Only installed public compiler components, never rustup/cargo homes
+          # (which may contain credentials) or the runner's working directory.
+          tar -C "$toolchain" -czf "$bundle/toolchain.tar.gz" bin lib libexec
+          (cd "$bundle" && sha256sum source.tar.gz toolchain.tar.gz > SHA256SUMS)
+
+      - name: retain the offline reproduction inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-source-repro-${{ github.sha }}
+          path: ${{ runner.temp }}/native-source-repro/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: run native proof-search regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln-elab --lib source::tactics::search::tests --no-fail-fast
