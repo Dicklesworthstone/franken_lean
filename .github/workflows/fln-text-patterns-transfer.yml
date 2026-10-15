@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 3b3ab3d01438373fe23d2295408cb9e3d08fee20
+          ref: a751969ca531afbb820d000083a46f9834a7c9da
           persist-credentials: false
       - name: Transfer exact tested files without changing any branch
         env:
@@ -37,49 +37,57 @@ jobs:
                   return json.load(response)
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == 'e64e3ea63d3d7f651870fddc99504c808c74ab9f'
-          source = 'd4165b73c9d054abfcdf95a9431105ae9dda741c'
-          obj = request('/git/blobs/' + source)
-          assert obj['encoding'] == 'base64'
-          encoded = base64.b64decode(obj['content'])
-          assert blob(encoded) == source
-          # Repair two transport transcription bytes, never source text.
-          # The intended encoded identity, complete patch and every output file
-          # are independently bound below to the locally tested originals.
-          assert encoded.count(b'CSSiz2Wde') == 1
-          assert encoded.count(b'AV+SfjVnh') == 1
-          encoded = encoded.replace(b'CSSiz2Wde', b'CSSiz2de').replace(b'AV+SfjVnh', b'AV+RfjVnh')
-          assert blob(encoded) == '9e9adf246ffb798ce0e4f16ede839b148b54fddb'
-          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '19b61d8589e3dd0141b52889909366c0da4151828b8a86ed933d23637c9d8fd3'
-          manifest = {
-              'crates/fln-elab/src/source/matching.rs': ['7bd2aaf959e2160420878c028dbc08def5c3aaf3', 'dc7c1c1f674ffe5bb63256be3a4a95acfdf7290b'],
-              'crates/fln/src/source_check/grammar.rs': ['6bedc1d1523b6c214766c11f3417ded82c844bd0', 'bbec21fb6618bea9c0aa1aa845c03cab9900a51e'],
-              'crates/fln/src/source_check/grammar/quotation_scope.rs': ['2e383e045cb1900eece94227791dc1cc6176fb5f', '895a38b7f5f02f54bdce7838a7c92df42f840a96'],
-              'crates/fln/src/source_check/grammar/quotation_scope/matches.rs': [None, '6e28f6652e000ea90d7b6753b08b3d74e6a5c5a8'],
-              'crates/fln/tests/source_quotation_scope.rs': ['bffc47bcc75f4c082c82b4ea51c18f96ae118cf7', '48c2cf7434b6ae7b2f24ff7dc65afd809f494e8f'],
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '1f04b8dcc113541f604f5af0f4de4c435295bf16'
+          parts = [
+              'c381183495afeb155f5b3687bb41b620a234e7c7',
+              'ff0ed09408753f6efc73110347753ff0b1f909d4',
+              'ad45e5146387bd6f90e4013f0d54d8f7f467a45f',
+              'fee63d3b481fc1af3e286d6d1205973b9287a98f',
+              'daffca5d366ccb4d36855f6a396863d7625af3b6',
+              '09c32974c19687b8adb8ece8dc910894e749317a',
+          ]
+          chunks = []
+          for source in parts:
+              obj = request('/git/blobs/' + source)
+              assert obj['encoding'] == 'base64' and obj['size'] <= 1200
+              chunk = base64.b64decode(obj['content'])
+              assert blob(chunk) == source
+              chunks.append(chunk)
+          compressed = b''.join(chunks)
+          assert blob(compressed) == 'a916646ca38406eba9eebbc0581438770bb720cd'
+          assert hashlib.sha256(compressed).hexdigest() == '81b5c2b511c75109af237e856a01c22d9079fd25ed40e2f64075ddf3a631f7c1'
+          manifest = json.loads(gzip.decompress(compressed))
+          expected = {
+              'crates/fln/src/source_check/grammar/quotation_scope.rs': {'before': '895a38b7f5f02f54bdce7838a7c92df42f840a96', 'after': '3db0619e0f4b6eb5d2a312a637751714c60a21c9'},
+              'crates/fln/src/source_check/grammar/quotation_scope/do_notation.rs': {'before': 'cf813f3f22176a6309c155e2e4b821b3de7e50d3', 'after': '8d74d674b343a993fa842efd5933d5179bf34eca'},
+              'crates/fln/src/source_check/grammar/quotation_scope/matches.rs': {'before': '6e28f6652e000ea90d7b6753b08b3d74e6a5c5a8', 'after': 'bce25154ef82da36bbbaa4892a1cf4785cc8e836'},
+              'crates/fln/tests/source_quotation_do.rs': {'before': '0daa4d979aa4cc50c389afc80eb53464604791b4', 'after': '414b7cfe50f375c5808e077298d2c5b774394519'},
           }
+          assert manifest['files'] == expected
+          patch = manifest['patch'].encode()
           paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
-          assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
+          assert sorted(paths) == sorted(expected) and len(paths) == len(set(paths))
           assert '\ndeleted file mode ' not in patch.decode()
-          for path, (before, after) in manifest.items():
+          for path, identities in expected.items():
               file = pathlib.Path(path)
-              assert not file.is_symlink()
-              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
+              assert not file.is_symlink() and not any(parent.is_symlink() for parent in file.parents)
+              assert blob(file.read_bytes()) == identities['before'], path
           patch_file = root / 'source.patch'
           patch_file.write_bytes(patch)
           subprocess.run(['git', 'apply', '--check', str(patch_file)], check=True)
           subprocess.run(['git', 'apply', str(patch_file)], check=True)
           subprocess.run(['git', 'diff', '--check'], check=True)
-          for path, (before, after) in manifest.items():
-              assert blob(pathlib.Path(path).read_bytes()) == after, path
-          for path, (before, after) in manifest.items():
-              result = request('/git/blobs', {'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode(), 'encoding': 'base64'})
-              assert result['sha'] == after, path
-              print(after, path)
-          # The connected GitHub client performs the guarded publication after
-          # comparing current main. This job never creates a commit or ref.
-          (root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+          for path, identities in expected.items():
+              assert blob(pathlib.Path(path).read_bytes()) == identities['after'], path
+          for path, identities in expected.items():
+              data = pathlib.Path(path).read_bytes()
+              data.decode('utf-8')
+              result = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert result['sha'] == identities['after'], path
+              print(result['sha'], path)
+          # No commit or ref operation occurs here. The connected GitHub
+          # client compares current main before its guarded publication.
+          (root / 'manifest.json').write_text(json.dumps(expected, indent=2))
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
