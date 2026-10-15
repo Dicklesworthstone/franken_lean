@@ -22,6 +22,7 @@ mod nested;
 pub(super) use nested::bind_join_domain;
 mod pattern_binding;
 mod returns;
+mod sequences;
 pub(super) use returns::join_parts;
 mod unless;
 
@@ -403,6 +404,7 @@ impl Context {
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        let syntax = sequences::flatten_bare_nested(self, syntax)?;
         if let Some(expanded) = self.expand_term_do_form(&syntax, pattern)? {
             return Ok(expanded);
         }

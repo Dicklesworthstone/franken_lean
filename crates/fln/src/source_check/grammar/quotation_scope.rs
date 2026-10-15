@@ -11,8 +11,11 @@ use fln_parse::extensions::NotationRule;
 use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::{Preresolved, Syntax};
 
+mod do_notation;
+
 enum Task<'a> {
     Visit(&'a Syntax),
+    DoSequence(&'a Syntax, bool),
     Copy(&'a Syntax),
     Emit(Syntax),
     Build(SourceInfo, &'a Name, usize),
@@ -623,6 +626,9 @@ pub(super) fn preresolve(
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(node @ Syntax::Node { kind, args, .. }) => {
+                if do_notation::visit(node, rule, &mut tasks, locals.len())? {
+                    continue;
+                }
                 if field_syntax(node, rule, &mut tasks, locals.len())? {
                     continue;
                 }
@@ -692,6 +698,9 @@ pub(super) fn preresolve(
                         });
                     }
                 }
+            }
+            Task::DoSequence(sequence, scoped) => {
+                do_notation::sequence(sequence, &mut tasks, scoped.then_some(locals.len()))?;
             }
             Task::Visit(leaf) | Task::Copy(leaf) => built.push(leaf.clone()),
             Task::Emit(syntax) => built.push(syntax),
@@ -1128,5 +1137,71 @@ mod tests {
             preresolve(&rule, &global),
             Err(EngineExecutionError::NotImplemented { .. })
         ));
+    }
+    #[test]
+    fn do_quotation_names_bind_only_after_the_initializer() {
+        let mut rule = rule("notation \"seq\" => do { let x : Nat := x; let y ← x; return y }");
+        rule.prechecked = false;
+        assert_eq!(
+            names(&preresolve(&rule, &global).unwrap()),
+            [
+                "x",
+                "_root_.Declared.Nat",
+                "_root_.Declared.x",
+                "y",
+                "x",
+                "y"
+            ]
+        );
+    }
+
+    #[test]
+    fn do_function_domains_and_continuations_have_distinct_scopes() {
+        let mut rule = rule("notation \"seq\" => do { let f (x : Nat) : Nat := x; return x }");
+        rule.prechecked = false;
+        assert_eq!(
+            names(&preresolve(&rule, &global).unwrap()),
+            [
+                "f",
+                "x",
+                "_root_.Declared.Nat",
+                "_root_.Declared.Nat",
+                "x",
+                "_root_.Declared.x"
+            ]
+        );
+    }
+
+    #[test]
+    fn do_scopes_restore_at_term_boundaries_and_flatten_bare_nested_blocks() {
+        for (source, expected) in [
+            (
+                "notation \"seq\" => (do { let x := x; return x }) x",
+                vec!["x", "_root_.Declared.x", "x", "_root_.Declared.x"],
+            ),
+            (
+                "notation \"seq\" => do { do { let x := x; return x }; return x }",
+                vec!["x", "_root_.Declared.x", "x", "x"],
+            ),
+        ] {
+            let mut rule = rule(source);
+            rule.prechecked = false;
+            assert_eq!(names(&preresolve(&rule, &global).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn do_quotation_unsupported_patterns_are_not_walked_as_global_names() {
+        for source in [
+            "notation \"seq\" => do { let (x, y) := pair; return x }",
+            "notation \"seq\" => do { let rec f (n : Nat) := f n; return f }",
+        ] {
+            let mut rule = rule(source);
+            rule.prechecked = false;
+            assert!(matches!(
+                preresolve(&rule, &global),
+                Err(EngineExecutionError::NotImplemented { .. })
+            ));
+        }
     }
 }
