@@ -4794,6 +4794,7 @@ fn definition_in_context_named(
     scope::simp::registration(syntax)?;
     let mut is_protected = false;
     let mut is_noncomputable = false;
+    let mut is_unsafe = false;
     for (index, modifier) in modifiers.iter().enumerate() {
         match index {
             0 => doc_comment_slot(modifier)?,
@@ -4804,6 +4805,23 @@ fn definition_in_context_named(
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
             // Validated, with the declaration kind, by `noncomputable_registration` below.
             NONCOMPUTABLE_SLOT => is_noncomputable = noncomputable_slot(modifier)?,
+            5 => match expect_null_args(modifier, "unsafe modifier")? {
+                [] => {}
+                [modifier] => {
+                    let [keyword] = expect_node(
+                        modifier,
+                        &parser_kind(&["Command", "unsafe"]),
+                        1,
+                        "unsafe modifier",
+                    )?
+                    else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    expect_atom(keyword, "unsafe", "unsafe modifier")?;
+                    is_unsafe = true;
+                }
+                _ => return Err(failure(SourceInferenceError::Scope)),
+            },
             6 if context.partial.is_some() => partial::validate_modifier(modifier)?,
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
@@ -4823,6 +4841,20 @@ fn definition_in_context_named(
     // `axiom` is `"axiom " declId declSig` (vendored `Lean/Elab/Declaration.lean`,
     // `elabAxiom`): a theorem's header and no value.
     let is_axiom = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","axiom"]));
+    if is_unsafe {
+        // MutualDef.check at the pin forbids unsafe theorems and unsafe
+        // partial declarations. Opaque/axiom forms need a separate source
+        // door; do not accidentally give them recursive-definition machinery.
+        if is_theorem || is_opaque || is_axiom || context.partial.is_some() {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "unsafe def, abbrev, or data instance without partial",
+            });
+        }
+        context.partial = Some(partial::State {
+            kind: partial::Kind::Unsafe,
+            ..partial::State::default()
+        });
+    }
     if is_opaque {
         let parts = expect_node(
             &declaration[1],
@@ -5280,6 +5312,31 @@ fn definition_in_context_named(
     } else if context
         .partial
         .as_ref()
+        .is_some_and(|state| state.kind == partial::Kind::Unsafe)
+    {
+        // Basic.addAndCompileUnsafe retains direct recursive references and
+        // opaque hints. Even a nonrecursive unsafe definition stays Unsafe;
+        // it never acquires a safe logical inhabitant or companion.
+        let recursive = context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.reference.is_some());
+        Ok(Declaration::Defn(DefinitionVal {
+            base,
+            value: term.value,
+            hints: if recursive {
+                ReducibilityHints::Opaque
+            } else if is_abbrev {
+                ReducibilityHints::Abbrev
+            } else {
+                ReducibilityHints::Regular(1)
+            },
+            safety: DefinitionSafety::Unsafe,
+            all: vec![name.clone()],
+        }))
+    } else if context
+        .partial
+        .as_ref()
         .is_some_and(|state| state.reference.is_some() || state.group.is_some())
     {
         base.name = Name::str(name.clone(), "_unsafe_rec");
@@ -5442,7 +5499,16 @@ fn query_in(
     evaluate: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
     let (term, level_params) = query_term(syntax, &name, &mut context, evaluate)?;
-    Ok(query_declaration(name, term, level_params))
+    Ok(query_declaration(
+        name,
+        term,
+        level_params,
+        if evaluate {
+            DefinitionSafety::Unsafe
+        } else {
+            DefinitionSafety::Safe
+        },
+    ))
 }
 
 fn query_term(
@@ -5552,7 +5618,12 @@ fn query_term(
     Ok((term, level_params))
 }
 
-fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declaration {
+fn query_declaration(
+    name: Name,
+    term: Typed,
+    level_params: Vec<Name>,
+    safety: DefinitionSafety,
+) -> Declaration {
     Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),
@@ -5561,7 +5632,7 @@ fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declar
         },
         value: term.value,
         hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
+        safety,
         all: vec![name],
     })
 }

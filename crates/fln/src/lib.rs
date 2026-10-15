@@ -9482,7 +9482,18 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress)
+        // An unsafe recursive definition is its own executable body. Its
+        // recursive constant exists only in the checked successor, unlike a
+        // safe source definition's already-admitted executable companion.
+        // Never use an unchecked header to make the compiler accept the call.
+        let executable_environment = if matches!(&admission.declaration,
+            Declaration::Defn(definition) if definition.safety == DefinitionSafety::Unsafe)
+        {
+            admission.engine.environment()
+        } else {
+            self.environment()
+        };
+        let mut preparation = runtime::Preparation::new(executable_environment, limits.ingress)
             .with_executable_opaques(&self.executable_opaques)
             .with_runtime_initializers(&self.runtime_initializers);
         let evaluated = match entry {
@@ -9503,7 +9514,7 @@ impl Engine {
             .expression_at_type(&expression, Some(declared_type.clone()))
             .map_err(EngineExecutionError::Ingress)?;
         let mut catalog = executable_dependencies(
-            &self.environment,
+            executable_environment,
             &expression,
             limits.ingress,
             &mut preparation,

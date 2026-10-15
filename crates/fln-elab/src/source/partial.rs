@@ -103,8 +103,18 @@ impl ElaboratedPartial {
 
 #[derive(Clone, Default)]
 pub(super) struct State {
+    /// Both forms elaborate recursion against private typed locals. Only
+    /// `partial` subsequently needs a safe inhabited logical interface.
+    pub kind: Kind,
     pub reference: Option<Reference>,
     pub group: Option<group::Group>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Kind {
+    #[default]
+    Partial,
+    Unsafe,
 }
 
 #[derive(Clone)]
@@ -328,7 +338,12 @@ impl Context {
         }
         // The pin permits nonrecursive partial constants. Only a surviving
         // recursive edge imposes this restriction on the function signature.
-        if !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. }) {
+        if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.kind == Kind::Partial)
+            && !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. })
+        {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "a function type for recursive partial def",
             });
@@ -362,8 +377,17 @@ impl Context {
             roots.push(self.instantiate(&parameter.type_)?);
         }
         let levels = self.declaration_levels(&roots)?;
+        let executable_name = if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.kind == Kind::Unsafe)
+        {
+            reference.name
+        } else {
+            Name::str(reference.name, "_unsafe_rec")
+        };
         let mut executable = Expr::const_(
-            Name::str(reference.name, "_unsafe_rec"),
+            executable_name,
             levels.into_iter().map(Level::param).collect(),
         );
         for capture in captures {
