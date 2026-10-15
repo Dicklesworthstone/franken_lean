@@ -1209,10 +1209,7 @@ impl Context {
                 self.omega_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
                 let selection = search::selection(args)?;
-                if selection.all_goals {
-                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
-                }
-                self.solve_by_elim_selected_proof_goal(goal, &selection)?;
+                self.solve_by_elim_selected_proof_state(proof, goal, &selection)?;
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

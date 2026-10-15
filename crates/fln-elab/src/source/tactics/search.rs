@@ -37,18 +37,77 @@ impl Context {
         self.solve_by_elim_selected_proof_goal(goal, &Selection::default())
     }
 
-    pub(super) fn solve_by_elim_selected_proof_goal(
+    /// Share choices across the visible frontier, including deferred close
+    /// actions. A later sibling may constrain a witness chosen for an earlier
+    /// sibling, so mapping independent searches over the goals is insufficient.
+    pub(super) fn solve_by_elim_selected_proof_state(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        selection: &Selection<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if !selection.all_goals {
+            return self.solve_by_elim_selected_proof_goal(goal, selection);
+        }
+        let mut boundary = proof.work.len();
+        let mut frontier = Vec::new();
+        for work in proof.work.iter().rev() {
+            self.tick()?;
+            match work {
+                Work::Goal(goal) => frontier.push(Work::Goal(goal.clone())),
+                Work::Close(goal, value) => {
+                    frontier.push(Work::Close(goal.clone(), value.clone()));
+                }
+                // Never steal another branch's script, term, rewrite, or the
+                // goals suspended outside a focus/attempt/option scope.
+                _ => break,
+            }
+            boundary -= 1;
+        }
+        frontier.reverse();
+        frontier.push(Work::Goal(goal));
+        let goals = frontier
+            .iter()
+            .filter(
+                |work| matches!(work, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id)),
+            )
+            .count();
+        if goals > 1 && !selection.remove.is_empty() {
+            return Err(error(TacticError::InvalidSearchArguments(
+                "removing local hypotheses is not supported across multiple goals",
+            )));
+        }
+        // Both context and worklist commit only after every goal and close
+        // continuation has succeeded. Failure leaves sibling work untouched.
+        self.solve_selected_frontier(&frontier, selection)?;
+        proof.work.truncate(boundary);
+        Ok(())
+    }
+
+    fn solve_by_elim_selected_proof_goal(
         &mut self,
         goal: ProofGoal,
         selection: &Selection<'_>,
     ) -> Result<(), NatDefinitionElabError> {
+        self.solve_selected_frontier(&[Work::Goal(goal)], selection)
+    }
+
+    fn solve_selected_frontier(
+        &mut self,
+        frontier: &[Work<'static>],
+        selection: &Selection<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
         let snapshot = Box::new(self.clone());
-        let validated = self.selected_search_candidates(&goal, selection);
-        restore(self, &snapshot);
-        validated?;
+        for work in frontier.iter().rev() {
+            if let Work::Goal(goal) = work {
+                let validated = self.selected_search_candidates(goal, selection);
+                restore(self, &snapshot);
+                validated?;
+            }
+        }
         for limit in 0..=MAX_APPLICATION_DEPTH {
             restore(self, &snapshot);
-            match self.search_selected_proof(goal.clone(), selection, limit) {
+            match self.search_selected_proof(frontier, selection, limit) {
                 Ok(()) => return Ok(()),
                 Err(problem) if backtrack::recoverable(&problem) => {}
                 Err(problem) => {
@@ -63,11 +122,11 @@ impl Context {
 
     fn search_selected_proof(
         &mut self,
-        goal: ProofGoal,
+        frontier: &[Work<'static>],
         selection: &Selection<'_>,
         limit: usize,
     ) -> Result<(), NatDefinitionElabError> {
-        let mut pending = vec![(Work::Goal(goal), 0)];
+        let mut pending: Vec<_> = frontier.iter().cloned().map(|work| (work, 0)).collect();
         let mut choices: Vec<Choice<'_>> = Vec::new();
         let mut retry: Option<Choice<'_>> = None;
         let defaults = usize::from(selection.defaults);
@@ -409,6 +468,68 @@ mod tests {
             ))
         ));
         assert!(!context.txn.mvars.is_assigned(&id));
+    }
+
+    #[test]
+    fn every_joint_search_budget_stop_restores_all_assignments_and_pending_work() {
+        let mut original = context();
+        let p = proposition(&mut original, "p");
+        let q = proposition(&mut original, "q");
+        local(&mut original, "hp", p.clone());
+        local(&mut original, "hq", q.clone());
+        let (root, first) = original.proof_goal(p.clone()).unwrap();
+        let (_, second) = original.proof_goal(q).unwrap();
+        let proof = ProofState {
+            extent: None,
+            saved: original.txn.lctx.clone(),
+            target: p,
+            root,
+            instructions: Vec::new(),
+            cursor: 0,
+            work: vec![Work::Goal(second.clone())],
+            controls: Vec::new(),
+        };
+        let selection = Selection {
+            all_goals: true,
+            ..Selection::default()
+        };
+        let before = original.txn.budget.heartbeats_consumed;
+        let mut completed = original.clone();
+        let mut completed_proof = proof.clone();
+        completed
+            .solve_by_elim_selected_proof_state(&mut completed_proof, first.clone(), &selection)
+            .unwrap();
+        assert!(completed.txn.mvars.is_assigned(&first.id));
+        assert!(completed.txn.mvars.is_assigned(&second.id));
+        assert!(completed_proof.work.is_empty());
+        let work = completed.txn.budget.heartbeats_consumed - before;
+        for allowance in 0..work {
+            let mut limited = original.clone();
+            limited.txn.budget.max_heartbeats = before + allowance;
+            let mut pending = proof.clone();
+            let outcome =
+                limited.solve_by_elim_selected_proof_state(&mut pending, first.clone(), &selection);
+            let problem = outcome.expect_err("a smaller budget must not complete joint search");
+            assert!(
+                matches!(
+                    &problem,
+                    NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+                ) || matches!(&problem, NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason)) if matches!(reason.as_ref(), UnificationError::HeartbeatLimit)),
+                "allowance {allowance}: {problem:?}"
+            );
+            assert!(!backtrack::recoverable(&problem), "allowance {allowance}");
+            assert!(!limited.txn.mvars.is_assigned(&first.id));
+            assert!(!limited.txn.mvars.is_assigned(&second.id));
+            assert_eq!(limited.txn.mvars.len(), original.txn.mvars.len());
+            assert_eq!(
+                limited.txn.mvars.assignments(),
+                original.txn.mvars.assignments()
+            );
+            assert_eq!(limited.txn.lctx.decls(), original.txn.lctx.decls());
+            assert_eq!(limited.instance_goals, original.instance_goals);
+            assert!(limited.txn.budget.heartbeats_consumed >= before + allowance);
+            assert!(matches!(pending.work.as_slice(), [Work::Goal(goal)] if goal.id == second.id));
+        }
     }
 
     #[test]

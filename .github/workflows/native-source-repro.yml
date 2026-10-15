@@ -1,8 +1,7 @@
-name: native source reproduction
+name: native proof-search regressions
 
-# Temporary identity-checked source transport, NOT a validation or acceptance
-# gate. Local native tests have already run; normal CI is unchanged. This job
-# exports four exact source blobs and never creates commits or moves refs.
+# Auxiliary focused regression runner. Existing product and quality gates
+# remain authoritative. This workflow never exports source or updates Git.
 on:
   workflow_dispatch:
   push:
@@ -11,40 +10,25 @@ on:
 permissions:
   contents: read
 jobs:
-  transport:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
-    runs-on: windows-2025
-    timeout-minutes: 10
-    permissions:
-      contents: write
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: preserve committed source bytes
-        shell: bash
-        run: git config --global core.autocrlf false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: checkout the triggering source tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: export the immutable locally tested source identities
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: install the repository-pinned native compiler
         shell: bash
         run: |
           set -euo pipefail
-          python -I - <<'PY'
-          import base64, hashlib, json, os, subprocess, textwrap, urllib.request
-          identity = 'b59de291018c9c868bdd8bc6192c6fc9094a6133'
-          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + identity
-          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'FrankenLean-source-transport'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              source = base64.b64decode(json.load(response)['content'])
-          if hashlib.sha1(b'blob ' + str(len(source)).encode() + b'\0' + source).hexdigest() != identity:
-              raise SystemExit('Immutable transport program identity mismatch')
-          source = source.decode()
-          for name in ['apply the exact joint-search source patch', 'export validated source blobs only']:
-              start = source.index('      - name: ' + name + '\n')
-              end = source.find('\n      - name:', start + 1)
-              block = source[start:] if end == -1 else source[start:end]
-              block = textwrap.dedent(block.split('        run: |\n', 1)[1])
-              block = block.replace('python3 -I -', 'python -I -')
-              subprocess.run(['bash', '-euo', 'pipefail', '-c', block], check=True)
-          PY
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt
+      - name: validate parser elaborator checked proofs and executable exits
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/search.rs crates/fln-elab/src/source/tactics/search/selection.rs crates/fln-parse/src/proofs.rs crates/fln-parse/src/proofs/search.rs crates/fln/tests/source_selected_search.rs crates/fln-cli/tests/source_selected_search.rs
+          cargo test --locked --offline -p fln-parse -p fln-elab --lib --no-fail-fast
+          cargo test --locked --offline -p fln -p fln-cli --test source_selected_search --no-fail-fast
+          cargo test --locked --offline -p fln --test source_proof_search --test source_search_reflexivity --no-fail-fast

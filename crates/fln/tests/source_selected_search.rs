@@ -166,3 +166,85 @@ fn selected_search_never_turns_a_cycle_or_false_equality_into_evidence() {
         rejected(&base, source);
     }
 }
+
+#[test]
+fn joint_search_solves_every_visible_goal_with_fresh_local_contexts() {
+    let base = engine();
+    for source in [
+        "theorem selected (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor\n  solve_by_elim*",
+        "theorem selected : (0 = 0) ∧ (true = true) := by\n  constructor\n  solve_by_elim* only [Eq.refl]",
+        "theorem selected (P : Prop) : (P -> P) ∧ (P -> P) := by\n  constructor\n  all_goals intro h\n  solve_by_elim* only [h]",
+    ] {
+        admit(&base, source);
+    }
+}
+
+#[test]
+fn joint_search_backtracks_across_dependent_sibling_goals() {
+    let base = engine();
+    // The first matching P witness is 0, but only 1 has a Q witness. Search
+    // must revisit its earlier P choice when the later Q obligation fails.
+    let source = "theorem selected (P Q : Nat -> Prop) (p1 : P 1) (q1 : Q 1) (p0 : P 0) (finish : (n : Nat) -> P n -> Q n -> True) : True := by\n  apply finish\n  solve_by_elim* only [p0, p1, q1]";
+    admit(&base, source);
+    rejected(
+        &base,
+        &source
+            .replace("theorem selected", "theorem bad")
+            .replace("solve_by_elim*", "all_goals solve_by_elim"),
+    );
+}
+
+#[test]
+fn failed_joint_search_restores_all_goals_before_an_alternative() {
+    let base = engine();
+    admit(
+        &base,
+        "theorem selected (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor\n  first | solve_by_elim* only [hp] | solve_by_elim* only [hp, hq]",
+    );
+    rejected(
+        &base,
+        "theorem bad (P Q : Prop) (hp : P) : P ∧ Q := by\n  constructor\n  solve_by_elim* only [hp]",
+    );
+}
+
+#[test]
+fn joint_search_respects_focus_and_option_boundaries() {
+    let base = engine();
+    for source in [
+        "theorem selected (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor\n  · solve_by_elim*\n  · exact hq",
+        "theorem selected (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor\n  focus solve_by_elim*\n  exact hq",
+        "theorem selected (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor\n  set_option maxHeartbeats 200000 in solve_by_elim*",
+        "theorem selected (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor <;> solve_by_elim*",
+    ] {
+        admit(&base, source);
+    }
+}
+
+#[test]
+fn joint_search_rejects_cross_goal_erasure_and_does_not_drop_siblings() {
+    let base = engine();
+    for source in [
+        "theorem bad (P Q : Prop) (hp : P) (hq : Q) : P ∧ Q := by\n  constructor\n  solve_by_elim* [-hp]",
+        "theorem bad (P Q : Prop) (hp : P) : P ∧ Q := by\n  constructor\n  focus solve_by_elim*",
+        "theorem bad (P Q : Prop) (hp : P) : P ∧ Q := by\n  constructor\n  solve_by_elim* only [hp]",
+    ] {
+        rejected(&base, source);
+    }
+    admit(
+        &base,
+        "theorem selected (P : Prop) (hp : P) : P := by solve_by_elim* [-hp, hp]",
+    );
+}
+
+#[test]
+fn joint_lemma_names_are_validated_in_each_goals_own_context() {
+    let base = engine();
+    rejected(
+        &base,
+        "theorem bad (P Q : Prop) (hq : Q) : (P -> P) ∧ Q := by\n  constructor\n  focus intro h\n  solve_by_elim* only [h, hq]",
+    );
+    admit(
+        &base,
+        "theorem selected (P Q : Prop) (hq : Q) : (P -> P) ∧ Q := by\n  constructor\n  focus intro h\n  solve_by_elim*",
+    );
+}
