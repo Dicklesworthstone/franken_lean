@@ -6,6 +6,7 @@
 //! heap worklists and iterative deepening, not source-controlled Rust recursion.
 use super::*;
 
+mod congruence;
 mod construction;
 mod rules;
 mod rules_config;
@@ -13,7 +14,8 @@ mod selection;
 pub(super) use selection::selection;
 use selection::{Candidate, Selection};
 
-const MAX_APPLICATION_DEPTH: usize = 6;
+// Reflexivity/True, congrFun, congrArg are distinct backtracking choices.
+const DEFAULT_CANDIDATES: usize = 3;
 
 struct Choice<'a> {
     context: Box<Context>,
@@ -21,7 +23,8 @@ struct Choice<'a> {
     goal: ProofGoal,
     candidates: Vec<Candidate<'a>>,
     next: usize,
-    depth: usize,
+    budget: usize,
+    spent: Vec<usize>,
 }
 
 fn restore(context: &mut Context, snapshot: &Context) {
@@ -114,7 +117,7 @@ impl Context {
         }
         restore(self, &snapshot);
         let problem = first.expect_err("unsuccessful search");
-        if !backtrack::recoverable(&problem) {
+        if !selection.config.exfalso || !backtrack::recoverable(&problem) {
             return Err(problem);
         }
         // The pin retries exfalso only after the complete initial search fails,
@@ -133,7 +136,7 @@ impl Context {
         selection: &Selection<'_>,
     ) -> Result<(), NatDefinitionElabError> {
         let snapshot = Box::new(self.clone());
-        for limit in 0..=MAX_APPLICATION_DEPTH {
+        for limit in 1..=selection.config.max_steps {
             restore(self, &snapshot);
             match self.search_selected_proof(frontier, selection, limit) {
                 Ok(()) => return Ok(()),
@@ -154,25 +157,45 @@ impl Context {
         selection: &Selection<'_>,
         limit: usize,
     ) -> Result<(), NatDefinitionElabError> {
-        let mut pending: Vec<_> = frontier.iter().cloned().map(|work| (work, 0)).collect();
+        // Completely closed frontiers are independent: no shared assignment
+        // can affect a sibling's type or local context. Open frontiers retain
+        // one coupled budget and all their original choice points.
+        let independent = self.closed_search_frontier(frontier)?;
+        let mut pending: Vec<_> = frontier
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, work)| (work, if independent { index } else { 0 }))
+            .collect();
+        let mut spent = vec![0; frontier.len().max(1)];
         let mut choices: Vec<Choice<'_>> = Vec::new();
         let mut retry: Option<Choice<'_>> = None;
-        let defaults = usize::from(selection.defaults);
+        let defaults = if selection.defaults {
+            DEFAULT_CANDIDATES
+        } else {
+            0
+        };
         loop {
             self.tick()?;
             if let Some(mut choice) = retry.take() {
                 let count = choice.candidates.len();
                 // Defaults and both orientations are genuine choice points:
                 // a later dependent premise may require another witness.
-                let applications = choice.depth < limit;
-                let regular_attempts = if applications {
-                    count * 4 + defaults
-                } else {
-                    count * 2 + defaults
-                };
+                // Backtrack.run spends one recursion step per selected rule,
+                // and also needs a positive remainder for its terminal call.
+                // Exact evidence is an application too; maxDepth 0 or 1 must
+                // not silently acquire an unmetered assumption/rfl shortcut.
+                let available = choice.spent[choice.budget] < limit.saturating_sub(1);
+                let symmetric = usize::from(selection.config.symm);
+                let regular_attempts = count * (2 + 2 * symmetric) + defaults;
                 // The constructor/intro discharger is one final choice, not a
                 // new unbounded recursive search or a second constructor loop.
-                let attempts = regular_attempts + usize::from(applications);
+                let construction = selection.config.constructor || selection.config.intro;
+                let attempts = if available {
+                    regular_attempts + usize::from(construction)
+                } else {
+                    0
+                };
                 let mut selected = None;
                 while choice.next < attempts {
                     restore(self, &choice.context);
@@ -180,20 +203,20 @@ impl Context {
                     let candidate = choice.next;
                     choice.next += 1;
                     let result = if candidate == regular_attempts {
-                        self.search_construction_candidate(&choice.goal)
+                        self.search_construction_candidate(&choice.goal, selection.config)
                     } else if candidate < count {
                         let candidate = choice.candidates[candidate].clone();
                         self.search_candidate(&choice.goal, candidate, false)
-                    } else if defaults != 0 && candidate == count {
-                        self.search_default_candidate(&choice.goal)
+                    } else if candidate < count + defaults {
+                        self.search_default_choice(&choice.goal, candidate - count)
                     } else {
                         let offset = candidate - count - defaults;
-                        let (index, application, reverse) = if offset < count {
+                        let (index, application, reverse) = if offset < count * symmetric {
                             (offset, false, true)
-                        } else if offset < count * 2 {
-                            (offset - count, true, false)
+                        } else if offset < count * (1 + symmetric) {
+                            (offset - count * symmetric, true, false)
                         } else {
-                            (offset - count * 2, true, true)
+                            (offset - count * (1 + symmetric), true, true)
                         };
                         let candidate = choice.candidates[index].clone();
                         if reverse {
@@ -213,7 +236,9 @@ impl Context {
                 }
                 if let Some(work) = selected {
                     pending = choice.pending.clone();
-                    pending.extend(work.into_iter().map(|work| (work, choice.depth + 1)));
+                    spent = choice.spent.clone();
+                    spent[choice.budget] += 1;
+                    pending.extend(work.into_iter().map(|work| (work, choice.budget)));
                     choices.push(choice);
                     continue;
                 }
@@ -223,7 +248,7 @@ impl Context {
                 }
                 continue;
             }
-            let Some((work, depth)) = pending.pop() else {
+            let Some((work, budget)) = pending.pop() else {
                 return Ok(());
             };
             match work {
@@ -240,7 +265,8 @@ impl Context {
                         goal,
                         candidates,
                         next: 0,
-                        depth,
+                        budget,
+                        spent: spent.clone(),
                     });
                 }
                 Work::Close(goal, value) => match self.close_proof_goal(goal, value) {
@@ -257,6 +283,43 @@ impl Context {
                 // stack, never source scripts or control frames.
                 _ => return Err(error(TacticError::MalformedScript)),
             }
+        }
+    }
+
+    fn closed_search_frontier(
+        &mut self,
+        frontier: &[Work<'static>],
+    ) -> Result<bool, NatDefinitionElabError> {
+        for work in frontier {
+            self.tick()?;
+            let Work::Goal(goal) = work else { continue };
+            let target = self.instantiate(&goal.target)?;
+            if target.has_expr_mvar() || target.has_level_mvar() {
+                return Ok(false);
+            }
+            for local in goal.lctx.decls() {
+                self.tick()?;
+                for expr in std::iter::once(&local.type_).chain(local.value.iter()) {
+                    let expr = self.instantiate(expr)?;
+                    if expr.has_expr_mvar() || expr.has_level_mvar() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn search_default_choice(
+        &mut self,
+        goal: &ProofGoal,
+        index: usize,
+    ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
+        match index {
+            0 => self.search_default_candidate(goal),
+            1 => self.search_congruence_candidate(goal, true),
+            2 => self.search_congruence_candidate(goal, false),
+            _ => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -633,6 +696,141 @@ mod tests {
                 assert_eq!(limited.instance_goals, original.instance_goals);
                 assert_eq!(limited.goal_tags, original.goal_tags);
                 assert_eq!(limited.trace_local_names, original.trace_local_names);
+            }
+        }
+    }
+
+    #[test]
+    fn configured_search_budget_stops_preserve_the_entire_transaction() {
+        let mut original = context();
+        let p = proposition(&mut original, "P");
+        let q = proposition(&mut original, "Q");
+        local(&mut original, "h", p.clone());
+        local(&mut original, "f", arrow(p, q.clone()));
+        let (_, goal) = original.proof_goal(q).unwrap();
+        let selection = Selection {
+            config: rules_config::Config {
+                max_steps: 10,
+                symm: false,
+                exfalso: false,
+                intro: false,
+                constructor: false,
+            },
+            defaults: false,
+            ..Selection::default()
+        };
+        let mut complete = original.clone();
+        complete
+            .solve_by_elim_selected_proof_goal(goal.clone(), &selection)
+            .unwrap();
+        let before = original.txn.budget.heartbeats_consumed;
+        let cost = complete.txn.budget.heartbeats_consumed - before;
+        for allowance in 0..cost {
+            let mut limited = original.clone();
+            limited.txn.budget.max_heartbeats = before + allowance;
+            let error = limited
+                .solve_by_elim_selected_proof_goal(goal.clone(), &selection)
+                .expect_err("a resource stop cannot publish a partial configured proof");
+            assert!(!backtrack::recoverable(&error), "{allowance}: {error:?}");
+            assert!(limited.txn.budget.heartbeats_consumed >= before + allowance);
+            limited.txn.budget = original.txn.budget.clone();
+            assert_eq!(limited.txn, original.txn, "{allowance}");
+            assert_eq!(limited.next, original.next);
+            assert_eq!(limited.instance_goals, original.instance_goals);
+            assert_eq!(limited.goal_tags, original.goal_tags);
+            assert_eq!(limited.trace_local_names, original.trace_local_names);
+            assert_eq!(limited.equations.len(), original.equations.len());
+            assert!(
+                limited
+                    .equations
+                    .iter()
+                    .zip(&original.equations)
+                    .all(|(a, b)| a.sides == b.sides && a.policy == b.policy)
+            );
+        }
+    }
+
+    #[test]
+    fn every_congruence_budget_stop_restores_evidence_and_private_binders() {
+        let mut initial = seeded_context();
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let f = local(&mut initial, "f", arrow(nat.clone(), nat.clone()));
+        let g = local(&mut initial, "g", arrow(nat.clone(), nat.clone()));
+        let x = local(&mut initial, "x", nat.clone());
+        let y = local(&mut initial, "y", nat.clone());
+        let one = Level::succ(Level::zero()).unwrap();
+        for function in [false, true] {
+            let mut original = initial.clone();
+            let (domain, lhs, rhs, left, right) = if function {
+                (
+                    arrow(nat.clone(), nat.clone()),
+                    f.clone(),
+                    g.clone(),
+                    Expr::app(f.clone(), x.clone()),
+                    Expr::app(g.clone(), x.clone()),
+                )
+            } else {
+                (
+                    nat.clone(),
+                    x.clone(),
+                    y.clone(),
+                    Expr::app(f.clone(), x.clone()),
+                    Expr::app(f.clone(), y.clone()),
+                )
+            };
+            local(
+                &mut original,
+                "h",
+                equality::equation(one.clone(), domain, lhs, rhs),
+            );
+            let (_, goal) = original
+                .proof_goal(equality::equation(one.clone(), nat.clone(), left, right))
+                .unwrap();
+            let selection = Selection {
+                config: rules_config::Config {
+                    max_steps: 3,
+                    symm: false,
+                    exfalso: false,
+                    intro: false,
+                    constructor: false,
+                },
+                ..Selection::default()
+            };
+            let before = original.txn.budget.heartbeats_consumed;
+            let mut complete = original.clone();
+            complete
+                .solve_by_elim_selected_proof_goal(goal.clone(), &selection)
+                .unwrap();
+            let work = complete.txn.budget.heartbeats_consumed - before;
+            for allowance in 0..work {
+                let mut limited = original.clone();
+                limited.txn.budget.max_heartbeats = before + allowance;
+                let problem = limited
+                    .solve_by_elim_selected_proof_goal(goal.clone(), &selection)
+                    .expect_err("partial congruence is not equality evidence");
+                assert!(
+                    !backtrack::recoverable(&problem),
+                    "{function}/{allowance}: {problem:?}"
+                );
+                assert!(
+                    limited.txn.budget.heartbeats_consumed >= before + allowance,
+                    "{function}/{allowance}: consumed {} (before {before}), {problem:?}",
+                    limited.txn.budget.heartbeats_consumed
+                );
+                limited.txn.budget = original.txn.budget.clone();
+                assert_eq!(limited.txn, original.txn, "{function}/{allowance}");
+                assert_eq!(limited.next, original.next);
+                assert_eq!(limited.instance_goals, original.instance_goals);
+                assert_eq!(limited.goal_tags, original.goal_tags);
+                assert_eq!(limited.trace_local_names, original.trace_local_names);
+                assert_eq!(limited.equations.len(), original.equations.len());
+                assert!(
+                    limited
+                        .equations
+                        .iter()
+                        .zip(&original.equations)
+                        .all(|(a, b)| a.sides == b.sides && a.policy == b.policy)
+                );
             }
         }
     }

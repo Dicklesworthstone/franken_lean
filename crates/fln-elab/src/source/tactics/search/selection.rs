@@ -3,6 +3,7 @@
 use super::*;
 
 pub(in crate::source::tactics) struct Selection<'a> {
+    pub(super) config: rules_config::Config,
     pub all_goals: bool,
     pub defaults: bool,
     pub locals: bool,
@@ -13,6 +14,7 @@ pub(in crate::source::tactics) struct Selection<'a> {
 impl Default for Selection<'_> {
     fn default() -> Self {
         Self {
+            config: rules_config::Config::search_default(),
             all_goals: false,
             defaults: true,
             locals: true,
@@ -26,9 +28,10 @@ fn kind(name: &str) -> Name {
     parser_kind(&["Tactic", "SolveByElim", name])
 }
 
-pub(in crate::source::tactics) fn selection(
-    args: &[Syntax],
-) -> Result<Selection<'_>, NatDefinitionElabError> {
+pub(in crate::source::tactics) fn selection<'a>(
+    context: &mut Context,
+    args: &'a [Syntax],
+) -> Result<Selection<'a>, NatDefinitionElabError> {
     let [keyword, all_goals, config, only, arguments, using] = args else {
         return Err(error(TacticError::MalformedScript));
     };
@@ -41,8 +44,10 @@ pub(in crate::source::tactics) fn selection(
         }
         _ => return Err(error(TacticError::MalformedScript)),
     };
-    expect_default_config(config, "solve_by_elim configuration")?;
-    selected_arguments(all_goals, only, arguments, using)
+    let config = rules_config::Config::read_search(context, config)?;
+    let mut selection = selected_arguments(all_goals, only, arguments, using)?;
+    selection.config = config;
+    Ok(selection)
 }
 
 pub(super) fn selected_arguments<'a>(

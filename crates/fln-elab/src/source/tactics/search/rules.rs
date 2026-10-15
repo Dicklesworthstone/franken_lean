@@ -155,7 +155,7 @@ impl Context {
             .iter()
             .cloned()
             .map(|c| (c, false))
-            .chain(locals.iter().cloned().filter(|_| symm).map(|c| (c, true)))
+            .chain(locals.iter().filter(|_| symm).cloned().map(|c| (c, true)))
             .chain(explicit.into_iter().map(|c| (c, false)));
         let snapshot = self.clone();
         for (candidate, reverse) in attempts {
@@ -178,16 +178,19 @@ impl Context {
         restore(self, &snapshot);
         if selection.defaults {
             // Defaults are last, after the selected context and explicit rules.
-            // This helper builds ordinary Eq/HEq/True evidence, never a verdict.
-            let result = self.search_default_candidate(goal);
-            if result.is_ok() {
-                return result;
-            }
-            restore(self, &snapshot);
-            if let Err(problem) = result
-                && !backtrack::recoverable(&problem)
-            {
-                return Err(problem);
+            // Congruence may leave a real premise. Like selected rules, its
+            // first applicable result is greedy, not speculative success.
+            for index in 0..DEFAULT_CANDIDATES {
+                let result = self.search_default_choice(goal, index);
+                if result.is_ok() {
+                    return result;
+                }
+                restore(self, &snapshot);
+                if let Err(problem) = result
+                    && !backtrack::recoverable(&problem)
+                {
+                    return Err(problem);
+                }
             }
         }
         Err(error(TacticError::NoMatchingAssumption))

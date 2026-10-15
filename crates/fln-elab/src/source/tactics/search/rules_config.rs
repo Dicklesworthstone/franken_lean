@@ -6,21 +6,47 @@ pub(super) struct Config {
     pub max_steps: usize,
     pub symm: bool,
     pub exfalso: bool,
+    pub intro: bool,
+    pub constructor: bool,
 }
 
 fn unsupported() -> NatDefinitionElabError {
     NatDefinitionElabError::UnexpectedSyntax {
-        expected: "native rule configuration: literal maxDepth, symm or exfalso",
+        expected: "supported literal proof-search or rule configuration",
     }
 }
 
 impl Config {
-    pub fn read(context: &mut Context, syntax: &Syntax) -> Result<Self, NatDefinitionElabError> {
-        let mut config = Self {
-            max_steps: 50,
+    pub const fn search_default() -> Self {
+        Self {
+            max_steps: 6,
             symm: true,
             exfalso: true,
-        };
+            intro: true,
+            constructor: true,
+        }
+    }
+
+    pub fn read(context: &mut Context, syntax: &Syntax) -> Result<Self, NatDefinitionElabError> {
+        Self::read_for(context, syntax, false)
+    }
+
+    pub fn read_search(
+        context: &mut Context,
+        syntax: &Syntax,
+    ) -> Result<Self, NatDefinitionElabError> {
+        Self::read_for(context, syntax, true)
+    }
+
+    fn read_for(
+        context: &mut Context,
+        syntax: &Syntax,
+        search: bool,
+    ) -> Result<Self, NatDefinitionElabError> {
+        let mut config = Self::search_default();
+        if !search {
+            config.max_steps = 50;
+        }
         let [rows] = expect_node(
             syntax,
             &parser_kind(&["Tactic", "optConfig"]),
@@ -93,6 +119,9 @@ impl Config {
                 };
             } else if name == &Name::from_components(["symm"])
                 || name == &Name::from_components(["exfalso"])
+                || (search
+                    && (name == &Name::from_components(["intro"])
+                        || name == &Name::from_components(["constructor"])))
             {
                 // The pin's ConfigEval.evalBoolStx recognizes these syntax
                 // literals directly, without looking up a same-named local.
@@ -116,8 +145,12 @@ impl Config {
                 };
                 if name == &Name::from_components(["symm"]) {
                     config.symm = enabled;
-                } else {
+                } else if name == &Name::from_components(["exfalso"]) {
                     config.exfalso = enabled;
+                } else if name == &Name::from_components(["intro"]) {
+                    config.intro = enabled;
+                } else {
+                    config.constructor = enabled;
                 }
             } else {
                 return Err(unsupported());

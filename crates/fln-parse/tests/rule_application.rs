@@ -97,6 +97,57 @@ fn missing_terms_star_modifiers_and_using_suffixes_are_not_discarded() {
 }
 
 #[test]
+fn configured_solve_by_elim_preserves_its_six_slots_and_source_positions() {
+    for star in ["", "*"] {
+        let source = format!(
+            "/-- λ 🦀 -/\r\ntheorem result (P : Prop) (h : P) : P := by\r\n  solve_by_elim{star} (maxDepth := (0x10)) -intro +constructor (symm := Bool.false) -exfalso only [*, h,]\r\n"
+        );
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        let mut pending = vec![parsed.syntax()];
+        let expected = Name::from_components(["Lean", "Parser", "Tactic", "solveByElim"]);
+        let mut found = false;
+        while let Some(syntax) = pending.pop() {
+            if let Syntax::Node { kind, args, .. } = syntax {
+                if kind == &expected {
+                    found = true;
+                    assert_eq!(args.len(), 6);
+                    assert!(
+                        matches!(&args[1], Syntax::Node { args, .. } if args.len() == usize::from(!star.is_empty()))
+                    );
+                    assert_eq!(
+                        args[2].kind(),
+                        Some(&Name::from_components([
+                            "Lean",
+                            "Parser",
+                            "Tactic",
+                            "optConfig"
+                        ]))
+                    );
+                }
+                pending.extend(args);
+            }
+        }
+        assert!(found);
+    }
+}
+
+#[test]
+fn malformed_search_options_cannot_be_discarded_after_a_valid_prefix() {
+    for tail in [
+        "+",
+        "(maxDepth :=)",
+        "(symm := true",
+        "(intro true)",
+        "only [h] -symm",
+        "(maxDepth := 10) trailing",
+    ] {
+        let source = format!("theorem bad (P : Prop) (h : P) : P := by solve_by_elim {tail}");
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+}
+
+#[test]
 fn selected_congruence_lemmas_remain_terms_not_tactic_keywords() {
     for tactic in ["apply_rules", "apply_assumption", "solve_by_elim"] {
         let source = format!(

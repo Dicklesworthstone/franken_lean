@@ -35,10 +35,6 @@ pub(super) fn parse(
         null_node(Vec::new())
     };
     let (config, after_config) = config(leaves, view, tokens, at, range.end)?;
-    if solve && after_config != at {
-        // Selected lemmas are supported, configurable search is not yet.
-        return Err(refusal(view, tokens, at));
-    }
     at = after_config;
     let only = if at < range.end
         && matches!(&tokens[at].kind, TokenKind::Ident(name) if *name == Name::from_components(["only"]))
@@ -218,14 +214,16 @@ mod tests {
     }
 
     #[test]
-    fn solve_search_keeps_its_separate_star_slot_and_configuration_refusal() {
+    fn solve_search_keeps_its_separate_star_slot_and_configuration_tree() {
         for source in [
             "solve_by_elim",
             "solve_by_elim* only [*]",
             "solve_by_elim [-h, h]",
+            "solve_by_elim (maxDepth := 12)",
+            "solve_by_elim* -intro +constructor only [*]",
         ] {
             assert!(matches!(&read(source).unwrap(), Syntax::Node {args, ..} if args.len() == 6));
         }
-        assert!(read("solve_by_elim (maxDepth := 12)").is_err());
+        assert!(read("solve_by_elim (maxDepth :=)").is_err());
     }
 }

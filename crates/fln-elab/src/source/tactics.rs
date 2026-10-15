@@ -1230,7 +1230,7 @@ impl Context {
                 expect_default_config(config, "omega configuration")?;
                 self.omega_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
-                let selection = search::selection(args)?;
+                let selection = search::selection(self, args)?;
                 self.solve_by_elim_selected_proof_state(proof, goal, &selection)?;
             } else if kind == &parser_kind(&["Tactic", "applyRules"])
                 || kind == &parser_kind(&["Tactic", "applyAssumption"])

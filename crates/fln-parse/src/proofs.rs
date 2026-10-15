@@ -2395,6 +2395,9 @@ mod search_tests {
             "theorem t : P := by solve_by_elim [f (g x), -(h), h]",
             "theorem t : P := by solve_by_elim only [*, -h, replacement]",
             "theorem t : P := by\r\n  solve_by_elim /- pick -/ only [h, f]\r\n",
+            // Option names and values are retained syntax. The elaborator
+            // rejects unsupported configuration instead of the parser dropping it.
+            "theorem t : P := by solve_by_elim (config := {})",
         ] {
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());
@@ -2415,7 +2418,6 @@ mod search_tests {
             "solve_by_elim [* h]",
             "solve_by_elim [-h x]",
             "solve_by_elim [h] using localRules",
-            "solve_by_elim (config := {})",
             "solve_by_elim at h",
         ] {
             let source = format!("theorem t : True := by {tail}");

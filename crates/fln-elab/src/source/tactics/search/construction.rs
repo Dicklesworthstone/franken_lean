@@ -7,6 +7,7 @@ impl Context {
     pub(super) fn search_construction_candidate(
         &mut self,
         goal: &ProofGoal,
+        config: rules_config::Config,
     ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         let snapshot = self.clone();
@@ -20,17 +21,22 @@ impl Context {
             work: Vec::new(),
             controls: Vec::new(),
         };
-        match self.construct_proof_goal_ordered(
-            &mut proof,
-            goal.clone(),
-            None,
-            ApplyGoalOrder::Telescope,
-        ) {
-            Ok(()) => return Ok(proof.work),
-            Err(problem) if backtrack::recoverable(&problem) => {}
-            Err(problem) => return Err(problem),
+        if config.constructor {
+            match self.construct_proof_goal_ordered(
+                &mut proof,
+                goal.clone(),
+                None,
+                ApplyGoalOrder::Telescope,
+            ) {
+                Ok(()) => return Ok(proof.work),
+                Err(problem) if backtrack::recoverable(&problem) => {}
+                Err(problem) => return Err(problem),
+            }
         }
         restore(self, &snapshot);
+        if !config.intro {
+            return Err(error(TacticError::NoMatchingAssumption));
+        }
         // Preserve a visible let rather than erasing its value and local
         // scope before introducing. Type aliases may expose a forall by WHNF.
         let mut target = self.instantiate(&goal.target)?;

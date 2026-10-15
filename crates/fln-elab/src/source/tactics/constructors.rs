@@ -543,7 +543,7 @@ impl Context {
     }
 
     /// Congruence under a nondependent function, retaining the supplied evidence.
-    fn selector_congruence(
+    pub(super) fn selector_congruence(
         &mut self,
         equality: &Typed,
         codomain: &Expr,
