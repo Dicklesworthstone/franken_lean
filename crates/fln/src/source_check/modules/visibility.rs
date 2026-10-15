@@ -118,7 +118,7 @@ impl<'a> PublicWorld<'a> {
         }
         // The private successor already contains its checked theorem, including
         // a proof-valued instance. Replay only metadata, never the same-name
-        // public axiom over that theorem. Both worlds retain identical
+        // public axiom over that checked implementation. Both worlds retain identical
         // instance priorities and reducibility without exposing a private body.
         let metadata = replay::Export::capture(
             &self.module,

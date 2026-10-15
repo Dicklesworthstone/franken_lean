@@ -429,7 +429,6 @@ fn hidden_header_dependencies_bad_proofs_and_exposed_private_bodies_are_refused(
         "public instance leak : Law (Hidden Truth) := Law.mk hiddenProof",
         "public instance invalid (P Q : Prop) (h : P) : Law Q := Law.mk h",
         "@[expose] public instance leak : Law Truth := Law.mk hiddenProof",
-        "@[no_expose] public instance data : Pick := Pick.mk Token.left",
         "private instance repeated : Law Truth := Law.mk Truth.make\npublic instance repeated : Law Truth := Law.mk Truth.make",
         "public instance repeated : Law Truth := Law.mk Truth.make\nprivate instance repeated : Law Truth := Law.mk Truth.make",
     ] {

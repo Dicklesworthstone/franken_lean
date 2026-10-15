@@ -70,14 +70,13 @@ fn visibility_overrides_preserve_module_identity_and_do_not_mutate_defaults() {
 }
 
 #[test]
-fn hidden_bodies_and_split_visibility_refuse_while_public_data_groups_select_exports() {
+fn hidden_bodies_select_headers_while_split_data_visibility_still_refuses() {
     let mut public = module();
     public.public_declarations = true;
     public.expose_definitions = true;
     // `@[no_expose] public instance` is read now; the pin accepts it on a class instance
     // (`@[no_expose] public instance dictionary : C := ⟨1⟩` in a `module`, 2026-10-11).
     for source in [
-        "@[no_expose] def hidden (a : Type) (x : a) : a := x",
         "@[expose] public theorem proof (p : Prop) (h : p) : p := h",
         "@[no_expose] public theorem proof (p : Prop) (h : p) : p := h",
         "mutual\n  public inductive A where | mk\n  private inductive B where | mk\nend",
@@ -112,11 +111,21 @@ fn hidden_bodies_and_split_visibility_refuse_while_public_data_groups_select_exp
         selected.declaration_name(&n("A")).unwrap(),
         private(&n("API.A"))
     );
-    assert!(
-        module()
-            .for_command_source(b"public def hidden (a : Type) (x : a) : a := x")
-            .is_err()
-    );
+    for (scope, source) in [
+        (module(), "public def hidden (a : Type) (x : a) : a := x"),
+        (
+            public.clone(),
+            "@[no_expose] def hidden (a : Type) (x : a) : a := x",
+        ),
+    ] {
+        let header = scope.for_command_source(source.as_bytes()).unwrap();
+        assert!(header.exports_declaration());
+        assert!(!header.expose_definitions);
+        assert_eq!(
+            header.declaration_name(&n("hidden")).unwrap(),
+            n("API.hidden")
+        );
+    }
     assert!(
         module()
             .for_command_source(b"mutual inductive A where | mk public inductive B where | mk end")

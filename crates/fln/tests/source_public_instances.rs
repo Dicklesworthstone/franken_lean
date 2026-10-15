@@ -187,11 +187,8 @@ fn public_instance_signatures_and_bodies_cannot_use_private_dependencies() {
 }
 
 #[test]
-fn hidden_instance_bodies_and_visibility_collisions_remain_explicit_refusals() {
+fn public_instance_visibility_collisions_remain_explicit_refusals() {
     for declaration in [
-        "@[no_expose] public instance dictionary : Pick Token := Pick.mk Token.left",
-        "@[expose, no_expose] public instance dictionary : Pick Token := Pick.mk Token.left",
-        "@[expose] public section\n@[no_expose] instance dictionary : Pick Token := Pick.mk Token.left",
         "instance duplicate : Pick Token := Pick.mk Token.left\npublic instance duplicate : Pick Token := Pick.mk Token.right",
         "public instance duplicate : Pick Token := Pick.mk Token.left\nprivate instance duplicate : Pick Token := Pick.mk Token.right",
     ] {
@@ -313,5 +310,34 @@ fn changed_or_failed_public_instances_do_not_publish_stale_cached_dictionaries()
             recovered.checked.checked.result_logical_root,
             cold.checked.checked.result_logical_root
         );
+    }
+}
+
+#[test]
+fn no_expose_overrides_explicit_and_inherited_data_instance_exposure() {
+    for declaration in [
+        "@[no_expose] public instance dictionary : Pick Token := Pick.mk Token.left",
+        "@[expose, no_expose] public instance dictionary : Pick Token := Pick.mk Token.left",
+        "@[expose] public section\n@[no_expose] instance dictionary : Pick Token := Pick.mk Token.left\nend",
+    ] {
+        let api = format!("{HEADER}{declaration}");
+        for result in check_both(&[
+            ("Main", "prelude\nimport Api"),
+            ("Api", &api),
+            ("Base", BASE),
+        ]) {
+            let checked = result.unwrap().into_complete().unwrap();
+            let env = checked.checked.engine.environment();
+            assert!(
+                matches!(env.find(&n("dictionary")), Some(fln_env::constants::ConstantInfo::Axiom(signature)) if !signature.is_unsafe)
+            );
+            assert!(
+                InstanceRegistry::read(env)
+                    .unwrap()
+                    .candidates(&n("Pick"))
+                    .iter()
+                    .any(|row| row.declaration == n("dictionary"))
+            );
+        }
     }
 }

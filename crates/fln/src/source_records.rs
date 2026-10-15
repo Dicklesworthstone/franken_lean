@@ -6,6 +6,7 @@ use fln_kernel::verdict::Verdict;
 mod auxiliaries;
 mod elaboration;
 mod local_functions;
+mod public_body;
 pub(crate) mod traces;
 pub use local_functions::SourceDeclarationAdmission;
 
@@ -282,6 +283,23 @@ impl Engine {
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
         let parsed = match parse_scoped_command(source)? {
             ScopedCommandSyntax::Definition(parsed)
+                if fln_elab::source::is_definition_body(parsed.syntax())
+                    && !public_scope
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                        .expose_definitions =>
+            {
+                return self.admit_hidden_public_definition(
+                    public,
+                    parsed.syntax(),
+                    options,
+                    limits,
+                    public_scope,
+                    private_scope,
+                );
+            }
+            ScopedCommandSyntax::Definition(parsed)
                 if fln_elab::source::is_theorem(parsed.syntax())
                     || fln_elab::source::instance_registration(parsed.syntax())
                         .map_err(DefinitionFrontendError::Elaborate)
@@ -318,7 +336,7 @@ impl Engine {
         let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
         let candidate = if is_theorem {
             fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel)
-                .map(|declaration| (declaration, true, true, false))
+                .map(|declaration| (declaration, true, true, false, Vec::new()))
         } else {
             fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
                 .map(|instance| {
@@ -327,18 +345,33 @@ impl Engine {
                         instance.proof_valued,
                         instance.hidden_body,
                         instance.noncomputable,
+                        instance.local_functions,
                     )
                 })
         };
-        let (candidate, proof_valued, hidden_body, inferred_noncomputable) =
+        let (candidate, proof_valued, hidden_body, inferred_noncomputable, local_functions) =
             match elaboration_outcome(candidate)? {
                 Outcome::Complete(candidate) => candidate,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
         if !proof_valued {
-            if hidden_body
-                || !matches!(&candidate, Declaration::Defn(definition)
+            if hidden_body {
+                return self.admit_hidden_public_candidate(
+                    public,
+                    parsed.syntax(),
+                    fln_elab::source::ElaboratedDeclaration {
+                        declaration: candidate,
+                        local_functions,
+                        irreducible: false,
+                        noncomputable: inferred_noncomputable,
+                    },
+                    options,
+                    limits,
+                    public_scope,
+                );
+            }
+            if !matches!(&candidate, Declaration::Defn(definition)
                     if definition.safety == DefinitionSafety::Safe)
             {
                 return Err(EngineExecutionError::NotImplemented {
@@ -351,7 +384,7 @@ impl Engine {
                     candidate,
                     false,
                     inferred_noncomputable,
-                    Vec::new(),
+                    local_functions,
                     options,
                     limits,
                     public_scope,
@@ -417,6 +450,16 @@ impl Engine {
             base: theorem.base.clone(),
             is_unsafe: false,
         });
+        let private_implementation = match self.finish_local_function_batch(
+            private_implementation,
+            &local_functions,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         Ok(
             match public.admit_scoped_candidate(
                 parsed.syntax(),

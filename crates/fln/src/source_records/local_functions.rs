@@ -29,10 +29,24 @@ impl SourceDeclarationAdmission {
 impl Engine {
     pub(crate) fn finish_local_function_batch(
         &self,
+        batch: DeclarationBatchAdmission,
+        helpers: &[Declaration],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        self.finish_local_function_batch_with_noncomputable(batch, helpers, options, limits, false)
+    }
+
+    /// A hidden public owner receives its metadata in the later atomic public
+    /// replay. Carry only its noncomputable classification to the private helpers
+    /// now, without inserting the owner's journal entry twice.
+    pub(crate) fn finish_local_function_batch_with_noncomputable(
+        &self,
         mut batch: DeclarationBatchAdmission,
         helpers: &[Declaration],
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        owner_noncomputable: bool,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         if helpers.is_empty() {
             return Ok(Outcome::Complete(batch));
@@ -63,7 +77,8 @@ impl Engine {
                     ),
                 ))
             })?
-            .contains(owner_name);
+            .contains(owner_name)
+            || owner_noncomputable;
         for helper in helpers {
             let mut admitted =
                 match batch

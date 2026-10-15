@@ -43,6 +43,10 @@ mod optional;
 mod overload;
 pub mod partial;
 mod pattern_typing;
+mod public_body;
+pub use public_body::{
+    elaborate_public_definition, is_definition_body, public_definition_header_is_hidden,
+};
 mod patterns;
 mod record;
 mod record_terms;
@@ -504,13 +508,15 @@ struct Context {
     // untrusted elaborator inputs; complete bodies require ordinary admission.
     private_proof_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
     public_theorem_signature: Option<ConstantVal>,
+    private_definition_body: bool,
+    public_definition_header: Option<public_body::Header>,
     public_instance_signature: Option<instance_command::PublicHeader>,
     /// A frozen public instance header does not itself imply a private body:
     /// an explicitly exposed proof is checked in the public predecessor.
     private_instance_body: bool,
-    // Completion may observe only a resolved instance header. The value is
+    // Completion may observe only a resolved declaration header. The value is
     // returned at that boundary; no body or declaration is constructed.
-    instance_header_probe: Option<bool>,
+    declaration_header_probe: Option<bool>,
     source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
@@ -632,9 +638,11 @@ impl Context {
             trace_local_names: std::collections::HashMap::new(),
             private_proof_body: None,
             public_theorem_signature: None,
+            private_definition_body: false,
+            public_definition_header: None,
             public_instance_signature: None,
             private_instance_body: false,
-            instance_header_probe: None,
+            declaration_header_probe: None,
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
@@ -4418,8 +4426,8 @@ impl Context {
     }
 }
 
-/// The two checked predecessor views used by a module's public proof declaration. The
-/// signature sees `public`; only its proof sees `private`. Scope histories are
+/// The two checked predecessor views used by a module's public declaration. The
+/// signature sees `public`; a hidden implementation sees `private`. Scope histories are
 /// supplied separately because each anchors a different instance journal.
 #[derive(Clone, Copy)]
 pub struct TheoremWorlds<'a> {
@@ -4451,13 +4459,16 @@ pub fn is_instance(syntax: &Syntax) -> bool {
 #[derive(Debug)]
 pub struct PublicInstance {
     pub declaration: Declaration,
+    /// Independently checked local helpers, kept in the selected body world.
+    pub local_functions: Vec<Declaration>,
     pub proof_valued: bool,
     pub hidden_body: bool,
     pub noncomputable: bool,
 }
 
 /// Elaborate a public instance once, choosing its body world from the resolved
-/// header. Data instances and explicitly exposed proofs stay entirely public.
+/// header. Automatically exposed data and explicitly exposed proofs stay public;
+/// `no_expose` selects the private body world for either kind.
 /// Proof instances become theorems with frozen public types, as in the pin's
 /// `addNonRecAux`; their body exposure does not change their declaration kind.
 pub fn elaborate_public_instance(
@@ -4467,7 +4478,9 @@ pub fn elaborate_public_instance(
 ) -> Result<PublicInstance, NatDefinitionElabError> {
     let mut context = Context::public_instance(syntax, worlds, kernel)?;
     let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
     Ok(PublicInstance {
+        local_functions,
         proof_valued: matches!(&declaration, Declaration::Thm(_)),
         hidden_body: context.private_instance_body,
         noncomputable: context.noncomputable_definition,
@@ -4475,7 +4488,7 @@ pub fn elaborate_public_instance(
     })
 }
 
-/// Observe whether a complete public instance header selects a private proof
+/// Observe whether a complete public instance header selects a private
 /// body. The syntax may contain a placeholder body: it is never elaborated.
 /// This bounded query grants no declaration or export authority.
 pub fn public_instance_header_is_hidden(
@@ -4490,12 +4503,24 @@ pub fn public_instance_header_is_hidden(
             expected: "a public instance header in a module file",
         });
     }
-    let mut context = Context::scoped(environment, kernel, &scope);
-    context.instance_header_probe = Some(false);
+    probe_header_visibility(syntax, environment, kernel, &scope)
+}
+
+fn probe_header_visibility(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<bool, NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope);
+    // There is no final candidate admission after a header-only query. Rigid
+    // typing failures must be observed before revealing a private body context.
+    context.attempt_depth = 1;
+    context.declaration_header_probe = Some(false);
     match definition_in_context(syntax, &mut context) {
         Err(NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)) => {
             context
-                .instance_header_probe
+                .declaration_header_probe
                 .ok_or_else(|| failure(SourceInferenceError::Scope))
         }
         Err(error) => Err(error),
@@ -5088,8 +5113,12 @@ fn definition_in_context_named(
         // the name is chosen, an exposed body retains only its public world.
         context.private_proof_body = None;
     }
-    if let Some(probe) = &mut context.instance_header_probe {
-        *probe = hidden_instance;
+    if let Some(probe) = &mut context.declaration_header_probe {
+        *probe = if is_instance {
+            hidden_instance
+        } else {
+            context.source_scope.exports_declaration() && !context.source_scope.expose_definitions
+        };
         return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
@@ -5125,6 +5154,11 @@ fn definition_in_context_named(
             context.enter_private_proof()?;
             context.private_instance_body = true;
         }
+    } else if hidden_instance && context.source_scope.exports_declaration() {
+        context.enter_public_definition_body(&parameters, expected.as_ref())?;
+        context.private_instance_body = true;
+    } else if context.private_definition_body {
+        context.enter_public_definition_body(&parameters, expected.as_ref())?;
     } else if context.private_proof_body.is_some() {
         context.enter_public_theorem_proof(
             name,
@@ -5246,6 +5280,11 @@ fn definition_in_context_named(
         roots.extend([term.type_.clone(), term.value.clone()]);
         context.section_parameters(&roots, false)?
     };
+    let public_definition_type = context
+        .public_definition_header
+        .clone()
+        .map(|header| header.close(context, &section_parameters, &term.type_))
+        .transpose()?;
     let partial_captures = section_parameters.clone();
     let instance_type = context
         .public_instance_signature
@@ -5300,7 +5339,11 @@ fn definition_in_context_named(
     if !is_theorem && !proof_instance && !is_noncomputable {
         context.noncomputable_definition = context.check_definition_codegen(&term)?;
     }
-    let type_ = instance_type.unwrap_or(term.type_);
+    let type_ = if let Some(header) = public_definition_type {
+        context.instantiate(&header)?
+    } else {
+        instance_type.unwrap_or(term.type_)
+    };
     let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
     let mut base = ConstantVal {
         name: name.clone(),

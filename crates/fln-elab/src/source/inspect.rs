@@ -121,6 +121,24 @@ pub fn public_instance(
     })
 }
 
+/// Observe a hidden definition using exactly the same public-header/private-
+/// implementation transition as admission. The flag is set only when that
+/// transition actually occurred, never by the cursor's spelling or position.
+pub fn public_definition(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<PublicInstanceObservation, NatDefinitionElabError> {
+    let mut context = Context::public_definition(syntax, worlds, kernel)?;
+    let observation = declaration_in_context(syntax, &mut context, offset, kind)?;
+    Ok(PublicInstanceObservation {
+        observation,
+        private_body: context.public_definition_header.is_some(),
+    })
+}
+
 fn declaration_in_context(
     syntax: &Syntax,
     context: &mut Context,
