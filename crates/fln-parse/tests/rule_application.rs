@@ -95,3 +95,34 @@ fn missing_terms_star_modifiers_and_using_suffixes_are_not_discarded() {
         }
     }
 }
+
+#[test]
+fn selected_congruence_lemmas_remain_terms_not_tactic_keywords() {
+    for tactic in ["apply_rules", "apply_assumption", "solve_by_elim"] {
+        let source = format!(
+            "/-- λ -/\r\ntheorem t (f : Nat -> Nat) (a b : Nat) (h : a = b) : f a = f b := by\r\n  {tactic} only [congrArg f, (congrFun h), Eq.refl]\r\n"
+        );
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        let mut work = vec![parsed.syntax()];
+        let mut names = Vec::new();
+        while let Some(node) = work.pop() {
+            match node {
+                Syntax::Ident { val, .. } => names.push(val.clone()),
+                Syntax::Node { args, .. } => work.extend(args),
+                _ => {}
+            }
+        }
+        for expected in ["congrArg", "congrFun"] {
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|n| **n == Name::from_components([expected]))
+                    .count(),
+                1,
+                "a selected congruence lemma is an ordinary term identifier"
+            );
+        }
+        assert!(names.contains(&Name::from_components(["Eq", "refl"])));
+    }
+}
