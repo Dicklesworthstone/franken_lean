@@ -104,3 +104,36 @@ fn inspection_and_inconclusive_failures_are_not_type_mismatches() {
     })));
     assert!(observation_complete(&failure(SourceInferenceError::ObservationComplete)));
 }
+
+#[test]
+fn tactic_attempts_retry_only_after_an_independent_closed_refutation() {
+    let (mut context, equality, proof, expected) = setup(false);
+    context.attempt_depth = 1;
+    let direct = context.clone().term(&syntax(), Some(expected.clone()));
+    assert!(matches!(direct, Err(ref error) if attempt_deferral(error)));
+    let term = context
+        .substitution_operand(&syntax(), &expected, &equality, &proof)
+        .unwrap();
+    assert_eq!(term.type_, expected);
+    let actual = context.known_type(&term.value).unwrap().unwrap();
+    assert!(context.coercion_eq(&actual, &expected).unwrap());
+}
+
+#[test]
+fn tactic_retry_still_refuses_unrelated_types_without_publishing_assignments() {
+    let (mut context, equality, proof, expected) = setup(true);
+    context.attempt_depth = 1;
+    let before = context.clone();
+    let result = context.substitution_operand(&syntax(), &expected, &equality, &proof);
+    assert!(matches!(result, Err(ref error) if attempt_deferral(error)));
+    assert_eq!(context.next, before.next);
+    assert_eq!(context.txn.mvars.assignments(), before.txn.mvars.assignments());
+    assert_eq!(context.equations.len(), before.equations.len());
+    assert!(context.txn.budget.heartbeats_consumed > before.txn.budget.heartbeats_consumed);
+    for reason in [UnificationDeferred::InvalidLocalContext,
+        UnificationDeferred::UnknownMetavariable(fln_core::expr::MVarId(name("unknown")))] {
+        assert!(!attempt_deferral(&failure(SourceInferenceError::Unification(Box::new(
+            UnificationError::Deferred(reason),
+        )))));
+    }
+}

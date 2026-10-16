@@ -28,7 +28,7 @@ impl Context {
                 *self = trial;
                 return Err(error);
             }
-            Err(error) if definite_mismatch(&error) => error,
+            Err(error) if definite_mismatch(&error) || attempt_deferral(&error) => error,
             Err(error) => return Err(error),
         };
         if !self.independently_typed_operand(syntax)? {
@@ -93,6 +93,19 @@ impl Context {
         if !determined(&operand.value) || !determined(&operand.type_) {
             return Ok(None);
         }
+        // Within `first`/`try`, check_attempt_equation uses the speculative
+        // unifier before the normal closed conversion boundary. Its unsupported
+        // equation is not itself a mismatch. Establish that independently on
+        // this fully inferred operand before attempting reverse transport.
+        if !matches!(
+            self.coercion_conversion(&operand.type_, expected)?,
+            coercions::Conversion::Refuted(Verdict::Rejected {
+                class: fln_kernel::verdict::RejectClass::NotDefEq,
+                ..
+            })
+        ) {
+            return Ok(None);
+        }
         let abstracted = self.kabstract(&operand.type_, &equality.rhs)?;
         if !abstracted.has_loose_bvars() {
             return Ok(None);
@@ -123,6 +136,18 @@ fn definite_mismatch(error: &NatDefinitionElabError) -> bool {
                     class: fln_kernel::verdict::RejectClass::NotDefEq, ..
                 })
         )
+}
+
+/// A speculative unifier can stop on a closed equation inside a tactic
+/// attempt. It only permits the isolated probe above, never immediate recovery.
+/// Unknown metavariables, invalid contexts, cancellation and limits do not.
+fn attempt_deferral(error: &NatDefinitionElabError) -> bool {
+    matches!(error,
+        NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason))
+            if matches!(reason.as_ref(), UnificationError::Deferred(
+                UnificationDeferred::UnsupportedEquation
+            ))
+    )
 }
 
 fn observation_complete(error: &NatDefinitionElabError) -> bool {
