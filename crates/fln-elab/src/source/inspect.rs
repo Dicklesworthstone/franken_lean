@@ -26,6 +26,9 @@ pub enum ObservationKind {
 /// through the same metavariable store used by the native tactic driver.
 #[derive(Debug, Clone)]
 pub struct ObservedGoal {
+    /// Existing tactic obligation; inferred term types do not invent a metavariable.
+    pub id: Option<MVarId>,
+    pub user_name: Option<Name>,
     pub target: Expr,
     pub locals: LocalContext,
 }
@@ -352,7 +355,10 @@ impl Context {
             Site::Term(range) => {
                 matches!(syntax, Syntax::Ident { .. })
                     && syntax.info().pos(true).is_some_and(|p| p.0 == range.start)
-                    && syntax.info().end_pos(true).is_some_and(|p| p.0 == range.end)
+                    && syntax
+                        .info()
+                        .end_pos(true)
+                        .is_some_and(|p| p.0 == range.end)
             }
             // The driver schedules the existing post-term observation task.
             // Exact spans are checked there with the charged traversal below;
@@ -387,7 +393,20 @@ impl Context {
             // inference-only term carries its inferred type. Observe before
             // declaration finalization, which would refuse unfinished holes.
             // An invalid selected term still fails rather than inventing info.
-            return self.observe_goals(&[(term.type_, locals)]);
+            self.flush(true)?;
+            let target = self.instantiate(&term.type_)?;
+            let locals = self.observation_locals(&locals)?;
+            let probe = self.inspection.as_mut().expect("selected term-goal probe");
+            probe.result = Some(SourceObservation::Goals {
+                range: probe.site.range().clone(),
+                goals: vec![ObservedGoal {
+                    id: None,
+                    user_name: None,
+                    target,
+                    locals,
+                }],
+            });
+            return Err(failure(SourceInferenceError::ObservationComplete));
         }
         self.flush(true)?;
         let expression = self.instantiate(&term.value)?;
@@ -424,7 +443,7 @@ impl Context {
         });
         if selected {
             // The by-term's expected goal exists before its first tactic runs.
-            return self.observe_goals(&[(goal.target.clone(), goal.lctx.clone())]);
+            return self.observe_goals(std::slice::from_ref(goal));
         }
         Ok(())
     }
@@ -448,7 +467,7 @@ impl Context {
     pub(super) fn observe_proof_end(
         &mut self,
         extent: Option<&Range<usize>>,
-        goals: &[(Expr, LocalContext)],
+        goals: &[tactics::ProofGoal],
     ) -> Result<(), NatDefinitionElabError> {
         if self.observes_goal(None, extent)? {
             self.observe_goals(goals)?;
@@ -457,14 +476,23 @@ impl Context {
     }
     pub(super) fn observe_goals(
         &mut self,
-        goals: &[(Expr, LocalContext)],
+        goals: &[tactics::ProofGoal],
     ) -> Result<(), NatDefinitionElabError> {
         self.flush(true)?;
         let mut observed = Vec::new();
-        for (target, locals) in goals {
-            let target = self.instantiate(target)?;
-            let locals = self.observation_locals(locals)?;
-            observed.push(ObservedGoal { target, locals });
+        for goal in goals {
+            let target = self.instantiate(&goal.target)?;
+            let locals = self.observation_locals(&goal.lctx)?;
+            observed.push(ObservedGoal {
+                id: Some(goal.id.clone()),
+                user_name: self
+                    .goal_tags
+                    .get(&goal.id)
+                    .filter(|name| !name.is_anonymous())
+                    .cloned(),
+                target,
+                locals,
+            });
         }
         let probe = self.inspection.as_mut().expect("selected probe");
         probe.result = Some(SourceObservation::Goals {

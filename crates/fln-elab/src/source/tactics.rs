@@ -781,7 +781,7 @@ impl Context {
             goal.target = self.instantiate(&goal.target)?;
             let instruction = proof.instructions.get(proof.cursor).copied();
             if self.observes_goal(instruction, proof.extent.as_deref())? {
-                let mut visible = vec![(goal.target.clone(), goal.lctx.clone())];
+                let mut visible = vec![goal.clone()];
                 for pending in proof.work.iter().rev() {
                     self.tick()?;
                     match pending {
@@ -790,7 +790,7 @@ impl Context {
                         | Work::EndAttempt(_)
                         | Work::EndOptions(_) => break,
                         Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
-                            visible.push((other.target.clone(), other.lctx.clone()));
+                            visible.push(other.clone());
                         }
                         _ => {}
                     }
