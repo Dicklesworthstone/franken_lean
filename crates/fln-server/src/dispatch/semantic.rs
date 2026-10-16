@@ -5,11 +5,15 @@ use std::ops::Range;
 mod completion;
 pub mod index;
 pub use completion::CompletionItem;
+pub(super) mod interactive;
+pub use interactive::{Goal, Hypothesis, TermGoal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
     Goals,
     TermGoal,
+    InteractiveGoals,
+    InteractiveTermGoal,
     Hover,
     Definition,
     Completion,
@@ -28,7 +32,13 @@ pub struct Query<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     /// Provisional tactic obligations, not evidence of declaration admission.
-    Goals { goals: Vec<String> },
+    Goals {
+        goals: Vec<String>,
+    },
+    InteractiveGoals {
+        goals: Vec<Goal>,
+    },
+    InteractiveTermGoal(TermGoal),
     /// One provisional term goal in the accepted document's coordinate system.
     TermGoal {
         goal: String,
@@ -60,13 +70,13 @@ pub(super) fn initialize_response(id: &RequestId) -> String {
     let response = wire::initialize_response(id);
     response.replacen(
         "\"capabilities\":{",
-        "\"capabilities\":{\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
+        "\"capabilities\":{\"lean\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
         1,
     )
 }
 
 /// Convert a verified UTF-8 byte boundary to an LSP position. CRLF is one newline.
-fn position(text: &str, offset: usize) -> Result<json::Position, &'static str> {
+pub(super) fn position(text: &str, offset: usize) -> Result<json::Position, &'static str> {
     if offset > text.len() || !text.is_char_boundary(offset) {
         return Err("semantic range is outside the accepted source");
     }

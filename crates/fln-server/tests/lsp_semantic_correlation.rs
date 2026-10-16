@@ -75,7 +75,11 @@ fn native_goal_and_hover_results_have_typed_counters() {
 
 #[test]
 fn no_information_and_typed_nonanswers_remain_distinct() {
-    for method in ["$/lean/plainGoal", "$/lean/plainTermGoal", "textDocument/hover"] {
+    for method in [
+        "$/lean/plainGoal",
+        "$/lean/plainTermGoal",
+        "textDocument/hover",
+    ] {
         accepted(
             method,
             r#""result":null"#,
@@ -297,7 +301,10 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
                 source: "def value := 1".to_owned(),
                 range: 4..9,
             },
-            QueryKind::Goals | QueryKind::Hover => return Ok(None),
+            QueryKind::Goals
+            | QueryKind::Hover
+            | QueryKind::InteractiveGoals
+            | QueryKind::InteractiveTermGoal => return Ok(None),
         }))
     }
     fn check(

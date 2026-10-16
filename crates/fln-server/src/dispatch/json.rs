@@ -18,3 +18,5 @@ mod files;
 pub(super) use files::{
     RegistrationReply, registration_reply, supports_file_registration, watched_file_uris,
 };
+
+pub(super) mod rpc;

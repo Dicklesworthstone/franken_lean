@@ -357,8 +357,8 @@ def cleanupFailure : Logged Nat := failureQuoted
     let before = base.logical_root(&KVMap::new());
     for declaration in [
         r#"macro "badCleanup " : term => `(do { try { raise (5 : Nat) } catch fresh => { return fresh } finally { mark fresh } })"#,
-        r#"macro "badCleanup " : term => `(do { try { let secret : Nat := 42; return secret } finally { mark secret } })",,
-        r#"macro "badCleanup " : term => `(do { try { return 42 } finally { return 7 } })",,
+        r#"macro "badCleanup " : term => `(do { try { let secret : Nat := 42; return secret } finally { mark secret } })"#,
+        r#"macro "badCleanup " : term => `(do { try { return 42 } finally { return 7 } })"#,
     ] {
         checked(&base, declaration);
         let source = format!("{declaration}\ndef bad : Logged Nat := badCleanup");

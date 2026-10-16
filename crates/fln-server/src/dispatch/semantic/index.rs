@@ -89,6 +89,8 @@ fn kind(answer: &Answer) -> QueryKind {
     match answer {
         Answer::Goals { .. } => QueryKind::Goals,
         Answer::TermGoal { .. } => QueryKind::TermGoal,
+        Answer::InteractiveGoals { .. } => QueryKind::InteractiveGoals,
+        Answer::InteractiveTermGoal(_) => QueryKind::InteractiveTermGoal,
         Answer::Hover { .. } => QueryKind::Hover,
         Answer::Definition { .. } => QueryKind::Definition,
         Answer::Completion { .. } => QueryKind::Completion,
@@ -106,6 +108,10 @@ fn add(total: &mut usize, amount: usize, limit: usize) -> Result<(), IndexRefusa
 fn payload_bytes(answer: &Answer) -> Result<usize, IndexRefusal> {
     let mut total = 0;
     match answer {
+        Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_) => {
+            return super::interactive::payload_bytes(answer)
+                .map_err(|_| IndexRefusal::InvalidAnnotation);
+        }
         Answer::Goals { goals } => {
             if goals.len() > super::MAX_GOALS {
                 return Err(IndexRefusal::ResourceLimit);
@@ -208,15 +214,33 @@ impl SemanticIndex {
                     }
                     exact_range(query.text, range)?;
                 }
-                Answer::Goals { .. } | Answer::Definition { .. } => {}
+                Answer::InteractiveTermGoal(goal) => {
+                    if goal.range.start > annotation.selection.start
+                        || goal.range.end <= annotation.selection.end
+                    {
+                        return Err(IndexRefusal::InvalidAnnotation);
+                    }
+                    exact_range(query.text, &goal.range)?;
+                }
+                Answer::Goals { .. }
+                | Answer::InteractiveGoals { .. }
+                | Answer::Definition { .. } => {}
             }
             let sample = Query {
                 kind: kind(&annotation.answer),
                 offset: annotation.selection.start,
                 ..query
             };
-            super::result_json(annotation.answer.clone(), sample)
-                .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+            if matches!(
+                annotation.answer,
+                Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_)
+            ) {
+                super::interactive::validate(&annotation.answer, sample)
+                    .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+            } else {
+                super::result_json(annotation.answer.clone(), sample)
+                    .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+            }
             entries.push(Entry { annotation, order });
         }
         entries.sort_by_key(|entry| (entry.annotation.selection.start, entry.order));
@@ -288,7 +312,16 @@ impl SemanticIndex {
             .map_err(|_| IndexRefusal::ContentModified)?;
         let answer = entry.annotation.answer.clone();
         // Validate against the actual cursor, not just the construction sample.
-        super::result_json(answer.clone(), query).map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        if matches!(
+            answer,
+            Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_)
+        ) {
+            super::interactive::validate(&answer, query)
+                .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        } else {
+            super::result_json(answer.clone(), query)
+                .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        }
         Ok(Some(answer))
     }
 }

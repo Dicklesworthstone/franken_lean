@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 mod completion;
 mod dependencies;
+mod interactive;
 mod navigation;
 mod render;
 use fln::source_check::inspect::{ObservationKind, SourceObservation};
@@ -507,8 +508,8 @@ fn inspect_sources(
         .map(|(name, source)| fln::SourceModuleInput { name, source })
         .collect();
     let wanted = match kind {
-        QueryKind::Goals => ObservationKind::Goals,
-        QueryKind::TermGoal => ObservationKind::TermGoal,
+        QueryKind::Goals | QueryKind::InteractiveGoals => ObservationKind::Goals,
+        QueryKind::TermGoal | QueryKind::InteractiveTermGoal => ObservationKind::TermGoal,
         QueryKind::Hover => ObservationKind::Term,
         QueryKind::Definition => {
             return navigation::definition(session, sources, &inputs, offset);
@@ -531,6 +532,14 @@ fn inspect_sources(
     };
     Ok(match inspected.observation {
         None => None,
+        Some(SourceObservation::Goals { range, goals })
+            if matches!(
+                kind,
+                QueryKind::InteractiveGoals | QueryKind::InteractiveTermGoal
+            ) =>
+        {
+            Some(interactive::observe(goals, range, kind)?)
+        }
         Some(SourceObservation::Goals { range, goals }) => {
             if goals.len() > 256 {
                 return Err("too many goals for one editor response".to_owned());

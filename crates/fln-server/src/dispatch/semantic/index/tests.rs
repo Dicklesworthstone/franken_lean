@@ -350,14 +350,28 @@ fn term_goals_are_indexed_separately_with_native_interval_precedence() {
     assert_eq!(
         contents(
             index
-                .query(Query { kind: QueryKind::Hover, ..q }, &revision, &[])
+                .query(
+                    Query {
+                        kind: QueryKind::Hover,
+                        ..q
+                    },
+                    &revision,
+                    &[]
+                )
                 .unwrap()
         ),
         "native hover"
     );
     assert_eq!(
         index
-            .query(Query { kind: QueryKind::Goals, ..q }, &revision, &[])
+            .query(
+                Query {
+                    kind: QueryKind::Goals,
+                    ..q
+                },
+                &revision,
+                &[]
+            )
             .unwrap(),
         None
     );
@@ -384,11 +398,15 @@ fn term_goal_selection_cannot_include_the_exclusive_answer_endpoint() {
     let answer = term_goal(1..1, 1..2, "⊢ A");
     let index = SemanticIndex::new(q, &revision, vec![answer.clone()]).unwrap();
     assert_eq!(
-        index.query(Query { offset: 1, ..q }, &revision, &[]).unwrap(),
+        index
+            .query(Query { offset: 1, ..q }, &revision, &[])
+            .unwrap(),
         Some(answer.answer)
     );
     assert_eq!(
-        index.query(Query { offset: 2, ..q }, &revision, &[]).unwrap(),
+        index
+            .query(Query { offset: 2, ..q }, &revision, &[])
+            .unwrap(),
         None
     );
 }
@@ -402,7 +420,14 @@ fn term_goal_index_revalidates_unicode_ranges_and_editor_revisions() {
     let index = SemanticIndex::new(q, &revision, vec![answer.clone()]).unwrap();
     assert_eq!(index.query(q, &revision, &[]).unwrap(), Some(answer.answer));
     assert_eq!(
-        index.query(Query { text: "😀\r\nx", ..q }, &Revision::new(), &[]),
+        index.query(
+            Query {
+                text: "😀\r\nx",
+                ..q
+            },
+            &Revision::new(),
+            &[]
+        ),
         Err(IndexRefusal::ContentModified)
     );
     for (selection, range) in [(0..0, 0..1), (0..0, 0..5), (5..5, 4..6), (6..6, 6..8)] {
@@ -418,8 +443,14 @@ fn term_goal_payload_and_build_work_are_charged_before_publication() {
     let q = query("_", 0, QueryKind::TermGoal);
     let revision = Revision::new();
     let goal = "x : A\n⊢ A";
-    assert_eq!(payload_bytes(&term_goal(0..0, 0..1, goal).answer), Ok(goal.len()));
-    for goal in [String::new(), "x".repeat(super::super::MAX_RESULT_BYTES / 16 + 1)] {
+    assert_eq!(
+        payload_bytes(&term_goal(0..0, 0..1, goal).answer),
+        Ok(goal.len())
+    );
+    for goal in [
+        String::new(),
+        "x".repeat(super::super::MAX_RESULT_BYTES / 16 + 1),
+    ] {
         assert!(matches!(
             SemanticIndex::new(q, &revision, vec![term_goal(0..0, 0..1, &goal)]),
             Err(IndexRefusal::InvalidAnnotation)
@@ -434,5 +465,100 @@ fn term_goal_payload_and_build_work_are_charged_before_publication() {
     assert!(matches!(
         SemanticIndex::new(q, &revision, vec![term_goal(0..0, 0..1, "⊢ A"); 5]),
         Err(IndexRefusal::ResourceLimit)
+    ));
+}
+
+#[test]
+fn interactive_annotations_remain_revision_bound_and_validate_ranges_without_rpc_allocations() {
+    use super::super::{Goal, Hypothesis, TermGoal};
+    let revision = Revision::new();
+    let q = query("β", 0, QueryKind::InteractiveGoals);
+    let hypotheses = vec![Hypothesis {
+        name: "β".into(),
+        fvar_id: "_uniq.1".into(),
+        type_: "P".into(),
+        value: None,
+    }];
+    let answer = Answer::InteractiveGoals {
+        goals: vec![Goal {
+            mvar_id: "_uniq.2".into(),
+            user_name: None,
+            hypotheses: hypotheses.clone(),
+            target: "P".into(),
+        }],
+    };
+    let term = Answer::InteractiveTermGoal(TermGoal {
+        hypotheses,
+        target: "P".into(),
+        range: 0..2,
+    });
+    let index = SemanticIndex::new(
+        q,
+        &revision,
+        vec![
+            Annotation {
+                selection: 0..0,
+                answer: answer.clone(),
+            },
+            Annotation {
+                selection: 0..0,
+                answer: term.clone(),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(index.query(q, &revision, &[]).unwrap(), Some(answer));
+    assert_eq!(
+        index
+            .query(
+                Query {
+                    kind: QueryKind::InteractiveTermGoal,
+                    ..q
+                },
+                &revision,
+                &[]
+            )
+            .unwrap(),
+        Some(term.clone())
+    );
+    assert_eq!(
+        index.query(q, &Revision::new(), &[]),
+        Err(IndexRefusal::ContentModified)
+    );
+    assert!(matches!(
+        SemanticIndex::new(
+            q,
+            &revision,
+            vec![Annotation {
+                selection: 0..2,
+                answer: term
+            }]
+        ),
+        Err(IndexRefusal::InvalidAnnotation)
+    ));
+}
+
+#[test]
+fn duplicate_native_ids_refuse_the_whole_interactive_index() {
+    use super::super::Goal;
+    let q = query("x", 0, QueryKind::InteractiveGoals);
+    let goal = Goal {
+        mvar_id: "same".into(),
+        user_name: None,
+        hypotheses: vec![],
+        target: "P".into(),
+    };
+    assert!(matches!(
+        SemanticIndex::new(
+            q,
+            &Revision::new(),
+            vec![Annotation {
+                selection: 0..0,
+                answer: Answer::InteractiveGoals {
+                    goals: vec![goal.clone(), goal]
+                }
+            }]
+        ),
+        Err(IndexRefusal::InvalidAnnotation)
     ));
 }
