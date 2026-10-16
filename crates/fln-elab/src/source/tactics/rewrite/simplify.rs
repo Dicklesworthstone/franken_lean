@@ -3,6 +3,7 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod binders;
 mod locations;
 mod simpa;
 mod unfold;
@@ -645,7 +646,12 @@ impl Context {
                     premise_rules,
                 )?
                 else {
-                    return Ok(None);
+                    return match self.simp_binder_rule(&target, rule, premise_rules)? {
+                        Some(evidence) => self
+                            .rewrite_transport(goal, evidence, &target, false)
+                            .map(Some),
+                        None => Ok(None),
+                    };
                 };
                 assert!(premises.is_empty(), "simp discharges its own premises");
                 Ok(Some(self.rewrite_transport(

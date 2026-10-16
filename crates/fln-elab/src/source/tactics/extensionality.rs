@@ -108,7 +108,7 @@ impl Context {
         Ok(work)
     }
 
-    fn funext_step(
+    pub(super) fn funext_step(
         &mut self,
         goal: &ProofGoal,
     ) -> Result<(Expr, ProofGoal), NatDefinitionElabError> {

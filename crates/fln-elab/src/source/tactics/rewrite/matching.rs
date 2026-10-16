@@ -323,119 +323,128 @@ impl Context {
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
-        let mut implicit_holes = Vec::new();
-        // Rule elaboration has already inserted implicit arguments. They are
-        // obligations too, even when equality transport later erases the rule.
-        rule.value = template.instantiate(&rule.value)?;
-        let mut pending = vec![&rule.value];
-        let mut visited = HashSet::new();
-        while let Some(term) = pending.pop() {
-            template.tick()?;
-            if !visited.insert(term.allocation_identity()) {
-                continue;
+        // Preparing a rule is speculative too. Charge its private context on
+        // EVERY exit, including interruption while opening its telescope.
+        let prepared = (|| {
+            let mut implicit_holes = Vec::new();
+            // Rule elaboration has already inserted implicit arguments. They are
+            // obligations too, even when equality transport later erases the rule.
+            rule.value = template.instantiate(&rule.value)?;
+            let mut pending = vec![&rule.value];
+            let mut visited = HashSet::new();
+            while let Some(term) = pending.pop() {
+                template.tick()?;
+                if !visited.insert(term.allocation_identity()) {
+                    continue;
+                }
+                if let ExprNode::MVar { id } = term.node()
+                    && !implicit_holes.contains(id)
+                {
+                    implicit_holes.push(id.clone());
+                }
+                pending.extend(children(term).into_iter().rev().flatten());
             }
-            if let ExprNode::MVar { id } = term.node()
-                && !implicit_holes.contains(id)
-            {
-                implicit_holes.push(id.clone());
+            let mut holes = Vec::new();
+            loop {
+                template.tick()?;
+                // The pin prepares simp theorems at reducible transparency without
+                // unfolding local lets. Preserve the final proposition's head too:
+                // unfolding Nat.lt here would hide it from the occurrence matcher.
+                rule.type_ = if inside_out {
+                    template.whnf_with_transparency(
+                        &rule.type_,
+                        UnificationTransparency::Abbreviations,
+                        false,
+                    )?
+                } else {
+                    template.whnf(&rule.type_)?
+                };
+                // A refutation is a rewrite of its proposition to False, not an
+                // implication whose antecedent simp must first prove. Stop before
+                // consuming that final proof binder; outer parameters still infer
+                // normally from the selected occurrence.
+                if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
+                    break;
+                }
+                let ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } = rule.type_.node()
+                else {
+                    break;
+                };
+                let domain = binder_type.clone();
+                let body = body.clone();
+                let argument = if *binder_info == BinderInfo::InstImplicit {
+                    template.instance_hole(domain)?
+                } else {
+                    template.hole(domain)?
+                };
+                if let ExprNode::MVar { id } = argument.node() {
+                    holes.push(id.clone());
+                }
+                rule.type_ = template.substitute(&body, &argument)?;
+                rule.value = Expr::app(rule.value, argument);
             }
-            pending.extend(children(term).into_iter().rev().flatten());
-        }
-        let mut holes = Vec::new();
-        loop {
-            template.tick()?;
-            // The pin prepares simp theorems at reducible transparency without
-            // unfolding local lets. Preserve the final proposition's head too:
-            // unfolding Nat.lt here would hide it from the occurrence matcher.
-            rule.type_ = if inside_out {
-                template.whnf_with_transparency(
-                    &rule.type_,
-                    UnificationTransparency::Abbreviations,
-                    false,
-                )?
-            } else {
-                template.whnf(&rule.type_)?
+            // Rewrite's newly applied parameters precede the unresolved implicit
+            // arguments inserted while elaborating the selected rule expression.
+            holes.extend(implicit_holes);
+            // A known class input must select its dictionary before matching a
+            // pattern containing that dictionary. Synthetic-opaque instance holes
+            // cannot be assigned by occurrence unification. Inputs learned from
+            // the occurrence still get the second synthesis pass below.
+            let resolution = template.resolve_instances(false);
+            self.charge_rewrite_trial(&template);
+            resolution?;
+            let compiled = (|| {
+                let rule = template.equivalence_rewrite_rule(rule)?;
+                if inside_out {
+                    let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
+                    template.equivalence_rewrite_rule(rule)
+                } else {
+                    Ok(rule)
+                }
+            })();
+            self.charge_rewrite_trial(&template);
+            let rule = compiled?;
+            let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
+                // An explicitly selected proposition proof can discharge another
+                // rule's premise without itself being an equality rewrite.
+                if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
+                    let universe = template.whnf(&universe)?;
+                    if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                        self.charge_rewrite_trial(&template);
+                        return Ok(None);
+                    }
+                }
+                return Err(error(TacticError::ExpectedEquality));
             };
-            // A refutation is a rewrite of its proposition to False, not an
-            // implication whose antecedent simp must first prove. Stop before
-            // consuming that final proof binder; outer parameters still infer
-            // normally from the selected occurrence.
-            if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
-                break;
+            let pattern = if reverse { rhs } else { lhs };
+            self.charge_rewrite_trial(&template);
+            if !inside_out {
+                let pattern = template.instantiate(&pattern)?;
+                self.charge_rewrite_trial(&template);
+                let mut head = &pattern;
+                loop {
+                    template.tick()?;
+                    match head.node() {
+                        ExprNode::App { f, .. } => head = f,
+                        ExprNode::MData { expr, .. } => head = expr,
+                        ExprNode::MVar { .. } => {
+                            return Err(error(TacticError::RewriteMetavariablePattern));
+                        }
+                        _ => break,
+                    }
+                }
             }
-            let ExprNode::ForallE {
-                binder_type,
-                body,
-                binder_info,
-                ..
-            } = rule.type_.node()
-            else {
-                break;
-            };
-            let domain = binder_type.clone();
-            let body = body.clone();
-            let argument = if *binder_info == BinderInfo::InstImplicit {
-                template.instance_hole(domain)?
-            } else {
-                template.hole(domain)?
-            };
-            if let ExprNode::MVar { id } = argument.node() {
-                holes.push(id.clone());
-            }
-            rule.type_ = template.substitute(&body, &argument)?;
-            rule.value = Expr::app(rule.value, argument);
-        }
-        // Rewrite's newly applied parameters precede the unresolved implicit
-        // arguments inserted while elaborating the selected rule expression.
-        holes.extend(implicit_holes);
-        // A known class input must select its dictionary before matching a
-        // pattern containing that dictionary. Synthetic-opaque instance holes
-        // cannot be assigned by occurrence unification. Inputs learned from
-        // the occurrence still get the second synthesis pass below.
-        let resolution = template.resolve_instances(false);
-        self.charge_rewrite_trial(&template);
-        resolution?;
-        let compiled = (|| {
-            let rule = template.equivalence_rewrite_rule(rule)?;
-            if inside_out {
-                let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
-                template.equivalence_rewrite_rule(rule)
-            } else {
-                Ok(rule)
-            }
+            Ok(Some((rule, alpha, pattern, holes)))
         })();
         self.charge_rewrite_trial(&template);
-        let rule = compiled?;
-        let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
-            // An explicitly selected proposition proof can discharge another
-            // rule's premise without itself being an equality rewrite.
-            if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
-                let universe = template.whnf(&universe)?;
-                if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
-                    self.charge_rewrite_trial(&template);
-                    return Ok(None);
-                }
-            }
-            return Err(error(TacticError::ExpectedEquality));
+        let Some((rule, alpha, pattern, holes)) = prepared? else {
+            return Ok(None);
         };
-        let pattern = if reverse { rhs } else { lhs };
-        self.charge_rewrite_trial(&template);
-        if !inside_out {
-            let pattern = template.instantiate(&pattern)?;
-            self.charge_rewrite_trial(&template);
-            let mut head = &pattern;
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::App { f, .. } => head = f,
-                    ExprNode::MData { expr, .. } => head = expr,
-                    ExprNode::MVar { .. } => {
-                        return Err(error(TacticError::RewriteMetavariablePattern));
-                    }
-                    _ => break,
-                }
-            }
-        }
         let mut pending = vec![(target, false)];
         let mut visited = HashSet::new();
         while let Some((term, exit)) = pending.pop() {
