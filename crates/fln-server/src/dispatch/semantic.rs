@@ -9,6 +9,7 @@ pub use completion::CompletionItem;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
     Goals,
+    TermGoal,
     Hover,
     Definition,
     Completion,
@@ -28,6 +29,11 @@ pub struct Query<'a> {
 pub enum Answer {
     /// Provisional tactic obligations, not evidence of declaration admission.
     Goals { goals: Vec<String> },
+    /// One provisional term goal in the accepted document's coordinate system.
+    TermGoal {
+        goal: String,
+        range: Range<usize>,
+    },
     Hover {
         contents: String,
         range: Range<usize>,
@@ -116,6 +122,32 @@ fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str>
                 items
             )
         }
+        (QueryKind::TermGoal, Answer::TermGoal { goal, range }) => {
+            if goal.is_empty()
+                || goal.len() > MAX_RESULT_BYTES / 16
+                || range.start >= range.end
+                || !range.contains(&query.offset)
+            {
+                return Err("semantic term goal response exceeds its bounds");
+            }
+            let start = position(query.text, range.start)?;
+            let end = position(query.text, range.end)?;
+            // A byte inside CRLF has no exact LSP coordinate. Never silently
+            // move the provider's selected span onto a different source site.
+            if json::byte_offset(query.text, start)? != range.start
+                || json::byte_offset(query.text, end)? != range.end
+            {
+                return Err("term goal range has no exact LSP coordinate mapping");
+            }
+            format!(
+                "{{\"goal\":{},\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}}}",
+                crate::json_string(&goal),
+                start.line,
+                start.character,
+                end.line,
+                end.character
+            )
+        }
         (QueryKind::Hover, Answer::Hover { contents, range }) => {
             if contents.len() > MAX_RESULT_BYTES / 8 || range.start > range.end {
                 return Err("semantic hover response exceeds its bounds");
@@ -200,6 +232,7 @@ pub(super) fn handle(
     }
     let kind = match method {
         "$/lean/plainGoal" => QueryKind::Goals,
+        "$/lean/plainTermGoal" => QueryKind::TermGoal,
         "textDocument/hover" => QueryKind::Hover,
         "textDocument/definition" => QueryKind::Definition,
         "textDocument/completion" => QueryKind::Completion,
@@ -345,3 +378,5 @@ mod tests {
 
 #[cfg(test)]
 mod navigation_tests;
+#[cfg(test)]
+mod term_goal_tests;

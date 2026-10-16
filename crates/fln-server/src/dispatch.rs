@@ -1094,6 +1094,7 @@ fn serve_inner(
                 write_warning(output, message)?;
             }
             ("$/lean/plainGoal", Some(request_id), state)
+            | ("$/lean/plainTermGoal", Some(request_id), state)
             | ("textDocument/hover", Some(request_id), state)
             | ("textDocument/definition", Some(request_id), state)
             | ("textDocument/completion", Some(request_id), state) => {
@@ -1106,11 +1107,6 @@ fn serve_inner(
                         &method,
                         envelope.params,
                     )?;
-                }
-            }
-            ("$/lean/plainTermGoal", Some(request_id), state) => {
-                if running_request(output, state, request_id)? {
-                    write_protocol_message(output, null_response(request_id))?;
                 }
             }
             ("$/lean/rpc/connect", Some(request_id), state)
