@@ -55,3 +55,61 @@ jobs:
           cargo clippy --locked -p fln-parse --test false_or_by_contra -- -D warnings
           cargo clippy --locked -p fln --test source_false_or_by_contra --test source_goal_identities -- -D warnings
           cargo clippy --locked -p fln-cli --test source_false_or_by_contra -- -D warnings
+  pinned-import:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: '7c2b9671898271db5e4bc2e4e44af447c48af577'
+          persist-credentials: false
+      - name: Verify candidate and exact Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 7c2b9671898271db5e4bc2e4e44af447c48af577
+          rustup show active-toolchain
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+          rustfmt --edition 2024 --config skip_children=true crates/fln/tests/source_imported_contradiction.rs
+          git diff --check
+      - name: Check the unchanged proof bodies with the exact Reference
+        run: timeout 120 "$FLN_REFERENCE_LIB/../../bin/lean" crates/fln/tests/support/source_imported_contradiction.lean
+      - name: Import actual classical declarations and check positive negative and recovery proofs
+        if: success() || failure()
+        run: cargo test --locked -p fln --test source_imported_contradiction -- --nocapture --test-threads=1
+      - name: Check imported proof target warnings
+        if: success() || failure()
+        run: cargo clippy --locked -p fln --test source_imported_contradiction -- -D warnings
+      - name: Retain exact sources and compiler for offline validation
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/contradiction-kit"
+          git rev-parse HEAD > "$RUNNER_TEMP/contradiction-kit/base.txt"
+          git diff --binary > "$RUNNER_TEMP/contradiction-kit/format.patch"
+          sha256sum crates/fln/tests/source_imported_contradiction.rs crates/fln/tests/support/source_imported_contradiction.lean > "$RUNNER_TEMP/contradiction-kit/sources.sha256"
+          tar -I 'zstd -3 -T2' --exclude=.git --exclude=target -cf "$RUNNER_TEMP/contradiction-kit/source.tar.zst" .
+          tar -I 'zstd -3 -T2' -C "$(rustc --print sysroot)" -cf "$RUNNER_TEMP/contradiction-kit/rust.tar.zst" bin lib
+          tar -I 'zstd -3 -T2' -C "$FLN_REFERENCE_LIB" -cf "$RUNNER_TEMP/contradiction-kit/init.tar.zst" Init
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: contradiction-import-${{ github.sha }}
+          path: ${{ runner.temp }}/contradiction-kit
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
