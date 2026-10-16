@@ -5,6 +5,9 @@ on:
     paths:
       - '.github/workflows/native-editor-proof-integration.yml'
       - 'crates/fln-server/**'
+      - 'crates/fln-elab/src/source/subst*'
+      - 'crates/fln-elab/src/source/subst/**'
+      - 'crates/fln/tests/source_subst*'
       - 'crates/fln-olean/**'
       - 'crates/fln-cli/src/lib.rs'
       - 'crates/fln-cli/src/bin/**'
@@ -57,6 +60,7 @@ jobs:
           rustc -Vv
           cargo test --locked -p fln-olean --lib extension_write::
           cargo test --locked -p fln-olean --lib rebuild::
+          cargo test --locked -p fln --test source_subst --test source_subst_operand --no-fail-fast
           cargo test --locked -p fln-server
           cargo test --locked -p fln-cli --lib source_check::lsp::dependencies
           cargo test --locked -p fln-cli --test lsp_proof_modules --test lsp_stdio_e2e --test source_module_check --no-fail-fast

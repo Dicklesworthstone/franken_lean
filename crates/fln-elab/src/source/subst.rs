@@ -7,11 +7,13 @@
 //! the other side, and the result is `@Eq.rec α a motive e b h`. Without an expected type,
 //! `e`'s own type is abstracted at `a`, or failing that at `b`.
 //!
-//! Not reproduced, and refused instead of approximated: the pin's retry that also rewrites
-//! `e`'s type when it does not check against the motive's instance, and its fallback to
-//! `subst` when the motive is not type correct. Abstraction is structural (after
-//! instantiation), where the pin's `kabstract` also matches up to instances.
+//! A failed operand check retries the pin's reverse transport for a fully inferred local
+//! value or explicitly type-ascribed operand. Expected-type-dependent syntax is
+//! not reinterpreted without its expected type. The bad-motive `subst` fallback
+//! remains unsupported. Abstraction is structural after instantiation.
 use super::*;
+
+mod operand;
 
 /// Why `▸` was refused: the pin's messages' first lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +131,14 @@ impl Context {
                     std::mem::swap(&mut lhs, &mut rhs);
                 }
                 let operand_expected = self.substitute(&abstracted, &lhs)?;
-                let operand = self.term(operand, Some(operand_expected.clone()))?;
-                let operand = self.finish_term(operand, Some(&operand_expected))?;
+                let oriented = Equality {
+                    level: level.clone(),
+                    alpha: alpha.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                };
+                let operand =
+                    self.substitution_operand(operand, &operand_expected, &oriented, &proof)?;
                 (abstracted, operand)
             }
             None => {
@@ -149,8 +157,26 @@ impl Context {
                 (abstracted, operand)
             }
         };
+        self.substitution_transport(
+            &Equality { level, alpha, lhs, rhs },
+            abstracted,
+            operand,
+            proof,
+        )
+    }
+
+    /// Build only an ordinary equality recursor. Final declaration admission
+    /// checks both this motive and the operand, including an inner retry cast.
+    fn substitution_transport(
+        &mut self,
+        equality: &Equality,
+        abstracted: Expr,
+        operand: Typed,
+        proof: Expr,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let Equality { level, alpha, lhs, rhs } = equality;
         // The motive `fun x (h : lhs = x) => abstracted[x]`, and its universe.
-        let result_type = self.substitute(&abstracted, &rhs)?;
+        let result_type = self.substitute(&abstracted, rhs)?;
         let sort = self
             .known_type(&result_type)?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
@@ -167,7 +193,7 @@ impl Context {
             alpha.clone(),
             Expr::lam(
                 Name::from_components(["h"]),
-                eq(&level, &alpha, lhs.clone(), x),
+                eq(level, alpha, lhs.clone(), x),
                 body,
                 BinderInfo::Default,
             ),
@@ -175,9 +201,9 @@ impl Context {
         );
         let rec = Expr::const_(
             Name::from_components(["Eq", "rec"]),
-            vec![motive_level, level],
+            vec![motive_level, level.clone()],
         );
-        let value = [alpha, lhs, motive, operand.value, rhs, proof]
+        let value = [alpha.clone(), lhs.clone(), motive, operand.value, rhs.clone(), proof]
             .into_iter()
             .fold(rec, Expr::app);
         Ok(Typed {
