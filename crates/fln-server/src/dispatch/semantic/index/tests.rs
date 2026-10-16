@@ -310,3 +310,129 @@ fn point_annotations_at_end_of_document_are_supported() {
     .unwrap();
     assert_eq!(index.query(q, &revision, &[]).unwrap(), Some(answer));
 }
+
+fn term_goal(selection: Range<usize>, range: Range<usize>, goal: &str) -> Annotation {
+    Annotation {
+        selection,
+        answer: Answer::TermGoal {
+            goal: goal.to_owned(),
+            range,
+        },
+    }
+}
+
+#[test]
+fn term_goals_are_indexed_separately_with_native_interval_precedence() {
+    let q = query("abcdef", 3, QueryKind::TermGoal);
+    let revision = Revision::new();
+    let later = term_goal(2..3, 2..4, "x : A\n⊢ A");
+    let index = SemanticIndex::new(
+        q,
+        &revision,
+        vec![
+            term_goal(0..5, 0..6, "⊢ Outer"),
+            term_goal(2..3, 2..4, "⊢ Earlier"),
+            later.clone(),
+            hover(3..3, "native hover"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(index.query(q, &revision, &[]).unwrap(), Some(later.answer));
+    assert_eq!(
+        index
+            .query(Query { offset: 5, ..q }, &revision, &[])
+            .unwrap(),
+        Some(Answer::TermGoal {
+            goal: "⊢ Outer".into(),
+            range: 0..6,
+        })
+    );
+    assert_eq!(
+        contents(
+            index
+                .query(Query { kind: QueryKind::Hover, ..q }, &revision, &[])
+                .unwrap()
+        ),
+        "native hover"
+    );
+    assert_eq!(
+        index
+            .query(Query { kind: QueryKind::Goals, ..q }, &revision, &[])
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        index
+            .query(Query { offset: 6, ..q }, &revision, &[])
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn term_goal_selection_cannot_include_the_exclusive_answer_endpoint() {
+    let q = query("abc", 0, QueryKind::TermGoal);
+    let revision = Revision::new();
+    for (selection, range) in [(0..3, 0..3), (3..3, 0..3), (0..1, 1..3), (0..0, 0..0)] {
+        assert!(matches!(
+            SemanticIndex::new(q, &revision, vec![term_goal(selection, range, "⊢ A")]),
+            Err(IndexRefusal::InvalidAnnotation)
+        ));
+    }
+    // An exact cursor at a token's start is valid; a cursor immediately after
+    // the token has no term information, rather than failing wire validation.
+    let answer = term_goal(1..1, 1..2, "⊢ A");
+    let index = SemanticIndex::new(q, &revision, vec![answer.clone()]).unwrap();
+    assert_eq!(
+        index.query(Query { offset: 1, ..q }, &revision, &[]).unwrap(),
+        Some(answer.answer)
+    );
+    assert_eq!(
+        index.query(Query { offset: 2, ..q }, &revision, &[]).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn term_goal_index_revalidates_unicode_ranges_and_editor_revisions() {
+    let text = "😀\r\n_";
+    let q = query(text, 6, QueryKind::TermGoal);
+    let revision = Revision::new();
+    let answer = term_goal(6..6, 6..7, "x : A\n⊢ A");
+    let index = SemanticIndex::new(q, &revision, vec![answer.clone()]).unwrap();
+    assert_eq!(index.query(q, &revision, &[]).unwrap(), Some(answer.answer));
+    assert_eq!(
+        index.query(Query { text: "😀\r\nx", ..q }, &Revision::new(), &[]),
+        Err(IndexRefusal::ContentModified)
+    );
+    for (selection, range) in [(0..0, 0..1), (0..0, 0..5), (5..5, 4..6), (6..6, 6..8)] {
+        assert!(matches!(
+            SemanticIndex::new(q, &revision, vec![term_goal(selection, range, "⊢ A")]),
+            Err(IndexRefusal::InvalidAnnotation)
+        ));
+    }
+}
+
+#[test]
+fn term_goal_payload_and_build_work_are_charged_before_publication() {
+    let q = query("_", 0, QueryKind::TermGoal);
+    let revision = Revision::new();
+    let goal = "x : A\n⊢ A";
+    assert_eq!(payload_bytes(&term_goal(0..0, 0..1, goal).answer), Ok(goal.len()));
+    for goal in [String::new(), "x".repeat(super::super::MAX_RESULT_BYTES / 16 + 1)] {
+        assert!(matches!(
+            SemanticIndex::new(q, &revision, vec![term_goal(0..0, 0..1, &goal)]),
+            Err(IndexRefusal::InvalidAnnotation)
+        ));
+    }
+    assert!(matches!(
+        payload_bytes(&term_goal(0..0, 0..1, &"x".repeat(MAX_PAYLOAD_BYTES + 1)).answer),
+        Err(IndexRefusal::ResourceLimit)
+    ));
+    let text = "x".repeat(1024 * 1024);
+    let q = query(&text, 0, QueryKind::TermGoal);
+    assert!(matches!(
+        SemanticIndex::new(q, &revision, vec![term_goal(0..0, 0..1, "⊢ A"); 5]),
+        Err(IndexRefusal::ResourceLimit)
+    ));
+}

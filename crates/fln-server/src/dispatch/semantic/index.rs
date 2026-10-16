@@ -40,6 +40,8 @@ impl Eq for Revision {}
 /// The source interval in which a native answer applies. Endpoints are included
 /// for editor cursors; an empty interval denotes exactly one position. Narrower
 /// intervals take precedence; equally narrow records use the later input row.
+/// A term-goal selection must lie wholly inside its answer's half-open source
+/// range: even the included selection endpoint must precede the range's end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
     pub selection: Range<usize>,
@@ -86,6 +88,7 @@ pub struct SemanticIndex {
 fn kind(answer: &Answer) -> QueryKind {
     match answer {
         Answer::Goals { .. } => QueryKind::Goals,
+        Answer::TermGoal { .. } => QueryKind::TermGoal,
         Answer::Hover { .. } => QueryKind::Hover,
         Answer::Definition { .. } => QueryKind::Definition,
         Answer::Completion { .. } => QueryKind::Completion,
@@ -113,6 +116,9 @@ fn payload_bytes(answer: &Answer) -> Result<usize, IndexRefusal> {
         }
         Answer::Hover { contents, .. } => {
             add(&mut total, contents.len(), MAX_PAYLOAD_BYTES)?;
+        }
+        Answer::TermGoal { goal, .. } => {
+            add(&mut total, goal.len(), MAX_PAYLOAD_BYTES)?;
         }
         Answer::Definition { uri, source, .. } => {
             add(&mut total, uri.len(), MAX_PAYLOAD_BYTES)?;
@@ -182,6 +188,18 @@ impl SemanticIndex {
             add(&mut work, cost, MAX_BUILD_WORK)?;
             exact_range(query.text, &annotation.selection)?;
             match &annotation.answer {
+                Answer::TermGoal { range, .. } => {
+                    // Selection endpoints are included, but a term-goal answer
+                    // only applies strictly before the end of its source span.
+                    // Validate every possible selected cursor, not just the
+                    // sample at selection.start used for wire validation below.
+                    if range.start > annotation.selection.start
+                        || range.end <= annotation.selection.end
+                    {
+                        return Err(IndexRefusal::InvalidAnnotation);
+                    }
+                    exact_range(query.text, range)?;
+                }
                 Answer::Hover { range, .. } | Answer::Completion { range, .. } => {
                     if range.start > annotation.selection.start
                         || range.end < annotation.selection.end
