@@ -425,3 +425,20 @@ fn typed_captures_do_not_end_their_enclosing_match_or_conditional() {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
     }
 }
+
+#[test]
+fn single_arm_do_matches_remain_syntax_inside_macro_quotations() {
+    let mut grammar = FileGrammar::new(false, &[], None).expect("Init");
+    for source in [
+        r#"macro "onlyZeroTyped " arg:term:max : term => `(do { match $arg:term with | Nat.zero => return 42 })"#,
+        r#"macro "onlySucc " arg:term:max : term => `(do { match $arg:term with | Nat.succ n => return n })"#,
+    ] {
+        parse(&mut grammar, source).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+    }
+    // The pin consumes a bare antiquotation here as an optional match switch,
+    // not as the discriminant. Keep that refusal rather than silently changing
+    // the quotation grammar to make the nonexhaustive test easier to write.
+    assert!(parse(&mut grammar,
+        r#"macro "bareMatch " arg:term:max : term => `(do { match $arg with | Nat.zero => return 42 })"#
+    ).is_err());
+}

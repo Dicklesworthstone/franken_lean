@@ -291,3 +291,195 @@ theorem early_value : early = 42 := rfl
         2,
     );
 }
+
+#[test]
+fn control_match_preserves_branch_scopes_and_spliced_arguments() {
+    checked(
+        r#"
+def value : Nat := 90
+macro "withCase " arg:term:max extra:term:max : term => `(do { match $arg:term with | Nat.zero => return value | Nat.succ value => return Nat.add value $extra })
+def select (value : Nat) : Id Nat := withCase (Nat.succ 1) value
+def zero : Id Nat := withCase (0 : Nat) (3 : Nat)
+theorem selected : select 41 = 42 := rfl
+theorem fallback : zero = 90 := rfl
+"#,
+        2,
+    );
+}
+
+#[test]
+fn control_if_let_binds_success_only_in_pure_and_monadic_conditions() {
+    checked(
+        r#"
+inductive Choice where | no : Choice | yes : Nat -> Choice
+def value : Nat := 7
+macro "withTest " arg:term:max extra:term:max : term => `(do { if let Choice.yes value := $arg then return Nat.add value $extra else return value })
+macro "withAction " arg:term:max extra:term:max : term => `(do { if let Choice.yes value ← ($arg : Id Choice) then return Nat.add value $extra else return value })
+def pureResult (value : Nat) : Id Nat := withTest (Choice.yes 1) value
+def actionResult (value : Nat) : Id Nat := withAction (Choice.yes 1) value
+def pureFallback : Id Nat := withTest Choice.no (0 : Nat)
+def actionFallback : Id Nat := withAction Choice.no (0 : Nat)
+theorem pure_value : pureResult 41 = 42 := rfl
+theorem action_value : actionResult 41 = 42 := rfl
+theorem pure_fallback : pureFallback = 7 := rfl
+theorem action_fallback : actionFallback = 7 := rfl
+"#,
+        4,
+    );
+}
+
+#[test]
+fn control_named_conditions_keep_positive_and_negative_evidence_local() {
+    checked(
+        r#"
+def h : Nat := 99
+macro "withEvidence " arg:term:max : term => `(do { if h : $arg = 0 then have same : $arg = 0 := h; return 1 else have different : Not ($arg = 0) := h; return 2 })
+def zero : Id Nat := withEvidence (0 : Nat)
+def one : Id Nat := withEvidence (1 : Nat)
+theorem zero_value : zero = 1 := rfl
+theorem one_value : one = 2 := rfl
+"#,
+        2,
+    );
+}
+
+#[test]
+fn control_else_if_headers_see_failure_evidence_but_not_failed_patterns() {
+    checked(
+        r#"
+def value : Nat := 7
+macro "chain " arg:term:max : term => `(do { if h : $arg = 0 then return 10 else if let Nat.succ value := $arg then have notZero : Not ($arg = 0) := h; return value else return value })
+macro "fallThrough " arg:term:max : term => `(do { if let Nat.succ value := $arg then return value else if value = 7 then return value else return 99 })
+def a : Id Nat := chain (0 : Nat)
+def b : Id Nat := chain (2 : Nat)
+def c : Id Nat := fallThrough (0 : Nat)
+theorem av : a = 10 := rfl
+theorem bv : b = 1 := rfl
+theorem cv : c = 7 := rfl
+"#,
+        3,
+    );
+}
+
+#[test]
+fn control_nested_branches_restore_outer_bindings_and_continuation_scope() {
+    checked(
+        r#"
+def value : Nat := 7
+def h : Nat := 99
+macro "nestedControl " arg:term:max : term => `(do { let value : Nat := $arg; if let Nat.succ value := value then match value with | Nat.zero => return value | Nat.succ value => return Nat.add value 1 else return value })
+macro "afterBranch " : term => `(do
+  if h : True then
+    (Pure.pure PUnit.unit : Id PUnit)
+  else
+    (Pure.pure PUnit.unit : Id PUnit)
+  return h)
+def a : Id Nat := nestedControl (3 : Nat)
+def b : Id Nat := nestedControl (0 : Nat)
+def c : Id Nat := afterBranch
+theorem av : a = 2 := rfl
+theorem bv : b = 0 := rfl
+theorem cv : c = 99 := rfl
+"#,
+        3,
+    );
+}
+
+#[test]
+fn control_imported_branch_macros_execute_without_capturing_consumer_names() {
+    let base = engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let lib = fln::Name::from_components(["Library"]);
+    let main = fln::Name::from_components(["Main"]);
+    let library = r#"namespace Lib
+ def fallback : Nat := 7
+ macro "branchRun " arg:term:max extra:term:max : term => `(do { if let Nat.succ value := $arg then match value with | Nat.zero => return $extra | Nat.succ value => return Nat.add value $extra else return fallback })
+end Lib
+"#;
+    let consumer = r#"import Library
+ def fallback : Nat := 99
+ def choose (value : Nat) : Id Nat := branchRun (Nat.succ 2) value
+ def result : Id Nat := choose 41
+ theorem result_value : result = 42 := rfl
+"#;
+    let imported = base
+        .check_source_modules(
+            &[
+                fln::SourceModuleInput {
+                    name: &main,
+                    source: consumer.as_bytes(),
+                },
+                fln::SourceModuleInput {
+                    name: &lib,
+                    source: library.as_bytes(),
+                },
+            ],
+            &main,
+            &options,
+            fln::source_check::modules::SourceModuleCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(imported.checked.theorems, 1);
+    let execution = imported
+        .checked
+        .engine
+        .execute_source_commands_with_checks(
+            b"#eval result\n#eval (branchRun (0 : Nat) (1 : Nat) : Id Nat)",
+            &options,
+            fln::EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(execution.batch.executions.len(), 2);
+    for (execution, expected) in execution.batch.executions.iter().zip(["42", "7"]) {
+        let fln::VmExit::Returned(returned) = &execution.exit else {
+            panic!("native return");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
+            Some(expected)
+        );
+    }
+    assert_eq!(base.logical_root(&options), before);
+}
+
+#[test]
+fn control_bad_branch_uses_are_rejected_atomically_and_the_engine_recovers() {
+    let base = engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    for declaration in [
+        r#"macro "bad " arg:term:max : term => `(do { if let Nat.succ fresh := $arg then return fresh else return fresh })"#,
+        r#"macro "bad " arg:term:max : term => `(do { match $arg:term with | Nat.zero => return 42 })"#,
+        r#"macro "bad " arg:term:max : term => `(do { if h : $arg = 0 then have wrong : Not ($arg = 0) := h; return 1 else return 2 })"#,
+        r#"macro "bad " arg:term:max : term => `(do { if $arg = 0 then return 1 else return "wrong" })"#,
+    ] {
+        // Registration is not proof that a macro's uses are valid. Prove the
+        // refusal occurs at a use, including in a statically unselected arm.
+        base.check_source_files(&[declaration.as_bytes()], &options, limits())
+            .unwrap_or_else(|e| panic!("unused macro: {declaration}\n{e:?}"))
+            .into_complete()
+            .unwrap();
+        let source = format!("{declaration}\ndef fail (n : Nat) : Id Nat := bad n");
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&options), before);
+    }
+    let good = b"macro \"good \" arg:term:max : term => `(do { match $arg:term with | Nat.zero => return 0 | Nat.succ n => return Nat.add n 1 })\ndef ok : Id Nat := good (42 : Nat)\ntheorem good_value : ok = 42 := rfl";
+    assert_eq!(
+        base.check_source_files(&[good], &options, limits())
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .theorems,
+        1
+    );
+    assert_eq!(base.logical_root(&options), before);
+}

@@ -218,3 +218,172 @@ pub(super) fn visit<'a>(
     }
     Ok(false)
 }
+
+/// The syntax of a condition and the names available on its two exits.
+/// Evidence binders name a proof on both exits (with different types, checked
+/// by elaboration); a pattern's fields are in scope on the success exit only.
+struct Condition<'a> {
+    tasks: Vec<Task<'a>>,
+    yes: Vec<Name>,
+    no: Vec<Name>,
+    depth: usize,
+}
+
+fn condition<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    resolve: &impl Fn(&Name) -> Resolution,
+    outer: &[Name],
+) -> Result<Condition<'a>, EngineExecutionError> {
+    let mut tasks = vec![build(syntax)?];
+    let mut names = Vec::new();
+    let negative;
+    if let Ok(parts) = term_args(syntax, "doIfProp") {
+        let [binding, predicate] = parts else {
+            return Err(unsupported_binder());
+        };
+        match null_args(binding)? {
+            [] => {}
+            [name, colon] if atom(colon, &[":"]) => {
+                if !atom(name, &["_"]) {
+                    binder_name(name, rule, &mut names)?;
+                    if names
+                        .iter()
+                        .any(|name| !name.erase_macro_scopes().parent().is_anonymous())
+                    {
+                        return Err(unsupported_binder());
+                    }
+                }
+            }
+            _ => return Err(unsupported_binder()),
+        }
+        tasks.push(Task::Visit(predicate));
+        tasks.push(Task::Copy(binding));
+        negative = names.clone();
+    } else {
+        let [keyword, pattern, assignment] = term_args(syntax, "doIfLet")? else {
+            return Err(unsupported_binder());
+        };
+        if !atom(keyword, &["let"]) {
+            return Err(unsupported_binder());
+        }
+        let monadic = term_args(assignment, "doIfLetBind").is_ok();
+        let [operator, value] = term_args(
+            assignment,
+            if monadic {
+                "doIfLetBind"
+            } else {
+                "doIfLetPure"
+            },
+        )?
+        else {
+            return Err(unsupported_binder());
+        };
+        if !(if monadic {
+            atom(operator, &["←", "<-"])
+        } else {
+            atom(operator, &[":="])
+        }) {
+            return Err(unsupported_binder());
+        }
+        let (pattern, bound) = matches::single_pattern(pattern, rule, resolve, outer)?;
+        names = bound;
+        negative = Vec::new();
+        tasks.push(build(assignment)?);
+        tasks.push(Task::Visit(value));
+        tasks.push(Task::Copy(operator));
+        tasks.push(Task::Emit(pattern));
+        tasks.push(Task::Copy(keyword));
+    }
+    Ok(Condition {
+        tasks,
+        yes: names,
+        no: negative,
+        depth: outer.len(),
+    })
+}
+
+/// Keep the original six-slot doIf and its else-if group nodes. Work is queued
+/// in source order: predicate, success-only locals, success sequence, restore,
+/// failure evidence, next predicate. Each sequence restores its own local lets;
+/// the whole conditional restores all evidence before its enclosing suffix.
+/// No branch body is visited with another branch's pattern variables.
+pub(super) fn conditional<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    resolve: &impl Fn(&Name) -> Resolution,
+    tasks: &mut Vec<Task<'a>>,
+    outer: &[Name],
+) -> Result<(), EngineExecutionError> {
+    if rule.prechecked {
+        return Err(unsupported_binder());
+    }
+    let [keyword, predicate, then, yes, clauses, otherwise] = term_args(syntax, "doIf")? else {
+        return Err(unsupported_binder());
+    };
+    if !atom(keyword, &["if"]) || !atom(then, &["then"]) {
+        return Err(unsupported_binder());
+    }
+    let first = condition(predicate, rule, resolve, outer)?;
+    let mut failures = outer.to_vec();
+    failures.extend(first.no.iter().cloned());
+    let mut following = Vec::new();
+    for clause in null_args(clauses)? {
+        let Syntax::Node { kind, args, .. } = clause else {
+            return Err(unsupported_binder());
+        };
+        let [prefix, predicate, then, body] = args.as_slice() else {
+            return Err(unsupported_binder());
+        };
+        let Syntax::Node {
+            kind: prefix_kind,
+            args: words,
+            ..
+        } = prefix
+        else {
+            return Err(unsupported_binder());
+        };
+        if *kind != Name::from_components(["group"])
+            || *prefix_kind != *kind
+            || words.len() != 2
+            || !atom(&words[0], &["else"])
+            || !atom(&words[1], &["if"])
+            || !atom(then, &["then"])
+        {
+            return Err(unsupported_binder());
+        }
+        let header = condition(predicate, rule, resolve, &failures)?;
+        failures.extend(header.no.iter().cloned());
+        following.push((clause, prefix, then, body, header));
+    }
+    let other = null_args(otherwise)?;
+    if !(other.is_empty() || (other.len() == 2 && atom(&other[0], &["else"]))) {
+        return Err(unsupported_binder());
+    }
+    tasks.push(Task::Restore(outer.len()));
+    tasks.push(build(syntax)?);
+    tasks.push(build(otherwise)?);
+    if let [keyword, body] = other {
+        tasks.push(Task::Visit(body));
+        tasks.push(Task::Copy(keyword));
+    }
+    tasks.push(build(clauses)?);
+    for (clause, prefix, then, body, header) in following.into_iter().rev() {
+        tasks.push(Task::Bind(header.no));
+        tasks.push(Task::Restore(header.depth));
+        tasks.push(build(clause)?);
+        tasks.push(Task::Visit(body));
+        tasks.push(Task::Copy(then));
+        tasks.push(Task::Bind(header.yes));
+        tasks.extend(header.tasks);
+        tasks.push(Task::Copy(prefix));
+    }
+    tasks.push(Task::Bind(first.no));
+    tasks.push(Task::Restore(first.depth));
+    tasks.push(Task::Visit(yes));
+    tasks.push(Task::Copy(then));
+    tasks.push(Task::Bind(first.yes));
+    tasks.extend(first.tasks);
+    tasks.push(Task::Copy(keyword));
+    Ok(())
+}

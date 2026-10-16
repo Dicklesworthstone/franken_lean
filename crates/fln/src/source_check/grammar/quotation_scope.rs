@@ -627,8 +627,12 @@ pub(super) fn preresolve(
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(node @ Syntax::Node { kind, args, .. }) => {
-                if term_kind(kind, "match") {
+                if term_kind(kind, "match") || term_kind(kind, "doMatch") {
                     matches::schedule(node, rule, resolve, &mut tasks, &locals)?;
+                    continue;
+                }
+                if term_kind(kind, "doIf") {
+                    do_notation::conditional(node, rule, resolve, &mut tasks, &locals)?;
                     continue;
                 }
                 if do_notation::visit(node, rule, &mut tasks, locals.len())? {

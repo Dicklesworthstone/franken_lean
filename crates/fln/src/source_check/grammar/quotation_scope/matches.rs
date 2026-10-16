@@ -216,17 +216,54 @@ pub(super) fn schedule<'a>(
     tasks: &mut Vec<Task<'a>>,
     outer: &[Name],
 ) -> Result<(), EngineExecutionError> {
-    let [
-        keyword,
-        generalizing,
-        motive,
-        discriminants,
-        with,
-        alternatives,
-    ] = term_args(syntax, "match")?
-    else {
-        return Err(unsupported_binder());
-    };
+    let (keyword, dependent, generalizing, motive, discriminants, with, alternatives) =
+        if let Ok(parts) = term_args(syntax, "doMatch") {
+            let [
+                keyword,
+                dependent,
+                generalizing,
+                motive,
+                discriminants,
+                with,
+                alternatives,
+            ] = parts
+            else {
+                return Err(unsupported_binder());
+            };
+            if rule.prechecked || !null_args(dependent)?.is_empty() {
+                return Err(unsupported_binder());
+            }
+            (
+                keyword,
+                Some(dependent),
+                generalizing,
+                motive,
+                discriminants,
+                with,
+                alternatives,
+            )
+        } else {
+            let [
+                keyword,
+                generalizing,
+                motive,
+                discriminants,
+                with,
+                alternatives,
+            ] = term_args(syntax, "match")?
+            else {
+                return Err(unsupported_binder());
+            };
+            (
+                keyword,
+                None,
+                generalizing,
+                motive,
+                discriminants,
+                with,
+                alternatives,
+            )
+        };
     if !atom(keyword, &["match"])
         || !atom(with, &["with"])
         || !null_args(generalizing)?.is_empty()
@@ -293,6 +330,26 @@ pub(super) fn schedule<'a>(
     tasks.push(Task::Visit(discriminants));
     tasks.push(Task::Copy(motive));
     tasks.push(Task::Copy(generalizing));
+    if let Some(dependent) = dependent {
+        tasks.push(Task::Copy(dependent));
+    }
     tasks.push(Task::Copy(keyword));
     Ok(())
+}
+
+/// A conditional has one pattern rather than a comma-separated matrix row.
+/// Use the same constructor/binder analysis as match alternatives, not a
+/// second recognizer with different hygiene or name-resolution rules.
+pub(super) fn single_pattern(
+    syntax: &Syntax,
+    rule: &NotationRule,
+    resolve: &impl Fn(&Name) -> Resolution,
+    outer: &[Name],
+) -> Result<(Syntax, Vec<Name>), EngineExecutionError> {
+    let row = Syntax::node(Name::from_components(["null"]), vec![syntax.clone()]);
+    let (mut row, names) = patterns(&row, rule, resolve, outer)?;
+    let Syntax::Node { args, .. } = &mut row else {
+        return Err(unsupported_binder());
+    };
+    Ok((args.pop().ok_or_else(unsupported_binder)?, names))
 }

@@ -151,7 +151,10 @@ pub(super) fn split(
             [] => {}
             [binder, colon] => {
                 expect_atom(colon, ":", "condition binder colon")?;
-                if !matches!(binder, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+                // Macro-generated binders are atomic before hygiene scopes
+                // are attached. Validate that shape without erasing the name
+                // which the branch body must use for capture-free lookup.
+                if !matches!(binder, Syntax::Ident { val, .. } if !val.erase_macro_scopes().is_anonymous() && val.erase_macro_scopes().parent().is_anonymous())
                     && !matches!(binder, Syntax::Atom { val, .. } if val == "_")
                 {
                     return Err(invalid());
