@@ -128,7 +128,8 @@ impl Context {
             [] => None,
             [name, colon]
                 if matches!(name, Syntax::Ident { val, .. }
-                    if !val.is_anonymous() && val.parent().is_anonymous()) =>
+                    if { let plain = val.erase_macro_scopes();
+                        !plain.is_anonymous() && plain.parent().is_anonymous() }) =>
             {
                 expect_atom(colon, ":", "membership witness separator")?;
                 Some(name.clone())
@@ -149,7 +150,8 @@ impl Context {
             self.do_control_name()?
         } else {
             if !matches!(&name, Syntax::Ident { val, .. }
-                if !val.is_anonymous() && val.parent().is_anonymous())
+                if { let plain = val.erase_macro_scopes();
+                    !plain.is_anonymous() && plain.parent().is_anonymous() })
             {
                 return Err(invalid());
             }

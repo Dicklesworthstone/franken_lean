@@ -492,3 +492,250 @@ fn control_bad_branch_uses_are_rejected_atomically_and_the_engine_recovers() {
     );
     assert_eq!(base.logical_root(&options), before);
 }
+
+// An ordinary checked source library, not a trusted iteration or evidence stub.
+fn loop_engine() -> Engine {
+    engine()
+        .check_source_files(
+            &[br#"
+inductive ForInStep (A : Type) where
+  | done (value : A)
+  | yield (value : A)
+class ForIn (m : Type -> Type) (R : Type) (A : outParam Type) where
+  forIn : {B : Type} -> R -> B -> (A -> B -> m (ForInStep B)) -> m B
+def stepValue {A : Type} (step : ForInStep A) : A :=
+  match step with
+  | ForInStep.done value => value
+  | ForInStep.yield value => value
+def boolFor {B : Type} (xs : Bool) (b : B) (f : Nat -> B -> Id (ForInStep B)) : Id B :=
+  if xs then stepValue (f 42 b) else b
+instance idBoolFor : ForIn Id Bool Nat := { forIn := fun xs b f => boolFor xs b f }
+class Membership (A R : Type) where
+  mem : R -> A -> Prop
+class ForIn' (m : Type -> Type) (R : Type) (A : outParam Type) (d : outParam (Membership A R)) where
+  forIn' : {B : Type} -> (xs : R) -> B -> ((a : A) -> @Membership.mem A R d xs a -> B -> m (ForInStep B)) -> m B
+instance memberNat : Membership Nat Nat := { mem := fun xs a => a = xs }
+def natFor {B : Type} (xs : Nat) (b : B) (f : (a : Nat) -> a = xs -> B -> Id (ForInStep B)) : Id B :=
+  stepValue (f xs (by rfl) b)
+instance natIteration : ForIn' Id Nat Nat memberNat := { forIn' := fun xs b f => natFor xs b f }
+"#],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine
+}
+
+fn loop_values(base: &Engine, source: &str, expected: &[&str]) {
+    let result = base
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
+        .into_complete()
+        .unwrap();
+    let evaluations: Vec<_> = result
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            fln::SourceCommandOutput::Evaluation {
+                execution_index, ..
+            } => Some(&result.batch.executions[*execution_index]),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(evaluations.len(), expected.len());
+    for (execution, expected) in evaluations.iter().zip(expected) {
+        let fln::VmExit::Returned(returned) = &execution.exit else {
+            panic!("native loop must return: {:?}", execution.exit);
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
+            Some(*expected)
+        );
+    }
+}
+
+#[test]
+fn loop_control_ordinary_iteration_and_real_membership_proofs_execute() {
+    loop_values(
+        &loop_engine(),
+        r#"
+def ordinary : Id Nat := do { for x in true do { return x }; return 0 }
+def witnessed (n : Nat) : Id Nat := do { for h : x in n do { have eq : x = n := h; return x }; return n }
+theorem ordinary_value : ordinary = 42 := rfl
+#eval ordinary
+#eval witnessed 17
+"#,
+        &["42", "17"],
+    );
+}
+
+#[test]
+fn loop_quotations_resolve_headers_before_binders_and_preserve_caller_values() {
+    loop_values(
+        &loop_engine(),
+        r#"
+namespace Library
+def values : Bool := true
+def element : Type := Nat
+macro "loopFirst " input:term:max : term => `(do { for (element : element) in values do { return Nat.add element $input }; return $input })
+macro "loopSelf " : term => `(do { for values in values do { return values }; return 7 })
+end Library
+namespace Caller
+def values : Bool := false
+def element : Type := Bool
+def result (element : Nat) : Id Nat := loopFirst element
+def sameName : Id Nat := loopSelf
+theorem result_value : result 41 = 83 := rfl
+theorem same_value : sameName = 42 := rfl
+#eval result 41
+#eval sameName
+end Caller
+"#,
+        &["83", "42"],
+    );
+}
+
+#[test]
+fn loop_quotations_restore_nested_scopes_and_ignore_wildcards() {
+    loop_values(
+        &loop_engine(),
+        r#"
+def value : Nat := 7
+macro "nestedLoop " input:term:max : term => `(do { let value : Nat := $input; for value in true do { for value in false do { return 100 }; return value }; return value })
+macro "afterLoop " : term => `(do { for value in true do { let value : Nat := 99; (Pure.pure PUnit.unit : Id PUnit) }; return value })
+macro "emptyLoop " input:term:max : term => `(do { for _ in false do { return 99 }; return $input })
+macro "loopTerm " : term => `(for value in true do { (Pure.pure PUnit.unit : Id PUnit) })
+def a : Id Nat := nestedLoop (9 : Nat)
+def b : Id Nat := afterLoop
+def c : Id Nat := emptyLoop (17 : Nat)
+def d : Id PUnit := loopTerm
+theorem av : a = 42 := rfl
+theorem bv : b = 7 := rfl
+theorem cv : c = 17 := rfl
+theorem dv : d = PUnit.unit := rfl
+#eval a
+#eval b
+#eval c
+"#,
+        &["42", "7", "17"],
+    );
+}
+
+#[test]
+fn loop_quotations_bind_only_real_membership_evidence_without_capture() {
+    loop_values(
+        &loop_engine(),
+        r#"
+def evidence : Nat := 9
+macro "witnessLoop " input:term:max extra:term:max : term => `(do { for evidence : value in $input do { have same : value = $input := evidence; return Nat.add value $extra }; return $extra })
+macro "witnessAfter " input:term:max : term => `(do { for evidence : value in $input do { have same : value = $input := evidence; (Pure.pure PUnit.unit : Id PUnit) }; return evidence })
+def found (evidence : Nat) : Id Nat := witnessLoop (1 : Nat) evidence
+def outer : Id Nat := witnessAfter (3 : Nat)
+theorem found_value : found 41 = 42 := rfl
+theorem outer_value : outer = 9 := rfl
+#eval found 41
+#eval outer
+"#,
+        &["42", "9"],
+    );
+}
+
+#[test]
+fn loop_quotations_reject_bad_uses_atomically_and_recover() {
+    let base = loop_engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    for declaration in [
+        r#"macro "badLoop " : term => `(do { for fresh in true do { (Pure.pure PUnit.unit : Id PUnit) }; return fresh })"#,
+        r#"macro "badLoop " : term => `(do { for (x : Bool) in true do { return 1 }; return 2 })"#,
+        r#"macro "badLoop " : term => `(do { for h : x in (1 : Nat) do { have wrong : x = 0 := h; return 1 }; return 2 })"#,
+        r#"macro "badLoop " : term => `(do { for x in false do { return "wrong" }; return 2 })"#,
+        r#"macro "badLoop " : term => `(do { for h : x in true do { return x }; return 2 })"#,
+    ] {
+        base.check_source_files(&[declaration.as_bytes()], &options, limits())
+            .unwrap_or_else(|e| panic!("unused macro: {declaration}\n{e:?}"))
+            .into_complete()
+            .unwrap();
+        let source = format!("{declaration}\ndef rejected : Id Nat := badLoop");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .unwrap_err();
+        let fln::SourceCheckError::Command { command, error, .. } = error else {
+            panic!("command refusal: {source}\n{error:?}");
+        };
+        assert_eq!(command, 1, "the use must fail: {source}");
+        assert!(
+            matches!(
+                error.as_ref(),
+                fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(_))
+            ),
+            "elaboration refusal: {source}\n{error:?}"
+        );
+        assert_eq!(base.logical_root(&options), before);
+    }
+    loop_values(
+        &base,
+        "macro \"goodLoop \" : term => `(do { for x in true do { return x }; return 0 })\n#eval (goodLoop : Id Nat)",
+        &["42"],
+    );
+    assert_eq!(base.logical_root(&options), before);
+}
+
+#[test]
+fn loop_quotations_import_and_execute_in_the_admitted_successor() {
+    let base = loop_engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let library = fln::Name::from_components(["LoopLibrary"]);
+    let consumer = fln::Name::from_components(["LoopConsumer"]);
+    let lib = r#"
+namespace Nat
+macro "constructorNamedLoop " : term => `(do { for zero in true do { return zero }; return 0 })
+end Nat
+namespace Lib
+def enabled : Bool := true
+def fallback : Nat := 7
+macro "importLoop " extra:term:max : term => `(do { for value in enabled do { return Nat.add value $extra }; return fallback })
+end Lib
+"#;
+    let source = r#"
+import LoopLibrary
+def enabled : Bool := false
+def fallback : Nat := 99
+def fromImport (value : Nat) : Id Nat := importLoop value
+def result : Id Nat := fromImport 1
+theorem imported_value : result = 43 := rfl
+"#;
+    let imported = base
+        .check_source_modules(
+            &[
+                fln::SourceModuleInput {
+                    name: &consumer,
+                    source: source.as_bytes(),
+                },
+                fln::SourceModuleInput {
+                    name: &library,
+                    source: lib.as_bytes(),
+                },
+            ],
+            &consumer,
+            &options,
+            fln::source_check::modules::SourceModuleCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(imported.checked.theorems, 1);
+    loop_values(
+        &imported.checked.engine,
+        "#eval result\n#eval (constructorNamedLoop : Id Nat)",
+        &["43", "42"],
+    );
+    assert_eq!(base.logical_root(&options), before);
+}

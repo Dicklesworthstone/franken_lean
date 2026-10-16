@@ -145,6 +145,78 @@ fn binding<'a>(
     Ok(())
 }
 
+/// An iterator's annotation and collection belong to the enclosing context.
+/// Only the body sees the element and optional membership proof. A bare name
+/// here is a binder even when it also names a constructor at the declaration
+/// site (the pin's `expandDoFor` tests `isIdent` before expanding patterns).
+fn for_loop<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    tasks: &mut Vec<Task<'a>>,
+    scope_depth: usize,
+) -> Result<(), EngineExecutionError> {
+    let Syntax::Node { args, .. } = syntax else {
+        return Err(unsupported_binder());
+    };
+    let [keyword, declarations, do_, body] = args.as_slice() else {
+        return Err(unsupported_binder());
+    };
+    let [declaration] = null_args(declarations)? else {
+        // Multiple collections use streams, not independent nested loops.
+        return Err(unsupported_binder());
+    };
+    let [witness, iterator, in_, collection] = term_args(declaration, "doForDecl")? else {
+        return Err(unsupported_binder());
+    };
+    if !atom(keyword, &["for"]) || !atom(do_, &["do"]) || !atom(in_, &["in"]) {
+        return Err(unsupported_binder());
+    }
+    let name = if bare_binder(iterator) {
+        iterator
+    } else {
+        let [_open, name @ Syntax::Ident { .. }, colon, annotation, close] =
+            term_args(iterator, "typeAscription")?
+        else {
+            return Err(unsupported_binder());
+        };
+        if !atom(colon, &[":"]) || !atom(close, &[")"]) || null_args(annotation)?.len() != 1 {
+            return Err(unsupported_binder());
+        }
+        name
+    };
+    let mut names = Vec::new();
+    binder_name(name, rule, &mut names)?;
+    match null_args(witness)? {
+        [] => {}
+        [name @ Syntax::Ident { .. }, colon] if atom(colon, &[":"]) => {
+            binder_name(name, rule, &mut names)?;
+        }
+        _ => return Err(unsupported_binder()),
+    }
+    if names.iter().any(|name| {
+        let plain = name.erase_macro_scopes();
+        plain.is_anonymous() || !plain.parent().is_anonymous()
+    }) {
+        return Err(unsupported_binder());
+    }
+    tasks.push(Task::Restore(scope_depth));
+    tasks.push(build(syntax)?);
+    tasks.push(Task::DoSequence(body, true));
+    tasks.push(Task::Copy(do_));
+    tasks.push(Task::Bind(names));
+    tasks.push(build(declarations)?);
+    tasks.push(build(declaration)?);
+    tasks.push(Task::Visit(collection));
+    tasks.push(Task::Copy(in_));
+    // Binder resolves the annotation first. Discard its temporary binding
+    // before visiting the collection, then introduce all names for the body.
+    tasks.push(Task::Restore(scope_depth));
+    tasks.push(Task::Binder(iterator, None));
+    tasks.push(Task::Copy(witness));
+    tasks.push(Task::Copy(keyword));
+    Ok(())
+}
+
 pub(super) fn visit<'a>(
     syntax: &'a Syntax,
     rule: &NotationRule,
@@ -191,12 +263,17 @@ pub(super) fn visit<'a>(
         binding(syntax, rule, tasks, scope_depth)?;
         return Ok(true);
     }
+    if term_kind(kind, "doFor") || term_kind(kind, "termFor") {
+        if rule.prechecked {
+            return Err(unsupported_binder());
+        }
+        for_loop(syntax, rule, tasks, scope_depth)?;
+        return Ok(true);
+    }
     // These shapes also bind identifiers. Until their scope is analysed, do
     // not send them through the generic walk and pre-resolve binders as globals.
     if [
         "doLetRec",
-        "doFor",
-        "termFor",
         "doMatch",
         "doIfLet",
         "doReassign",
