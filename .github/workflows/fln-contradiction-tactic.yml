@@ -23,7 +23,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Apply the reviewed candidate against exact source preimages
+      - name: Apply reviewed candidate without overwriting concurrent goal-identity changes
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
@@ -32,7 +32,7 @@ jobs:
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           manifest = {
-              'crates/fln-elab/src/source/tactics.rs': '1bc883776cfa7511f6a8dcb9f9039b142d7a3e35',
+              'crates/fln-elab/src/source/tactics.rs': '59434310c7eafe07657ab4b6a65e9daeb4d86c0b',
               'crates/fln-parse/src/proofs.rs': '514f3835788ed221f9c1f7d884fa78c3f4781ae5',
               'crates/fln-elab/src/source/tactics/false_or_by_contra.rs': None,
               'crates/fln-parse/tests/false_or_by_contra.rs': None,
@@ -61,7 +61,7 @@ jobs:
           (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
           subprocess.run(['git', 'apply', '--check', str(root / 'candidate.patch')], check=True)
           subprocess.run(['git', 'apply', str(root / 'candidate.patch')], check=True)
-      - name: Format only the changed implementation and tests
+      - name: Format changed implementation and tests
         shell: bash
         run: |
           set -euo pipefail
@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p fln-parse --test false_or_by_contra -- --nocapture
-          cargo test --locked -p fln --test source_false_or_by_contra -- --nocapture --test-threads=1
+          cargo test --locked -p fln --test source_false_or_by_contra --test source_goal_identities -- --nocapture --test-threads=1
       - name: Test installed CLI and retained classical and closing tactics
         run: |
           set -euo pipefail
@@ -90,7 +90,7 @@ jobs:
           set -euo pipefail
           cargo clippy --locked -p fln-elab --lib -- -D warnings
           cargo clippy --locked -p fln-parse --test false_or_by_contra -- -D warnings
-          cargo clippy --locked -p fln --test source_false_or_by_contra -- -D warnings
+          cargo clippy --locked -p fln --test source_false_or_by_contra --test source_goal_identities -- -D warnings
           cargo clippy --locked -p fln-cli --test source_false_or_by_contra -- -D warnings
       - name: Retain immutable tested source blobs for direct main publication
         env:
@@ -115,6 +115,16 @@ jobs:
           receipt = {'base': (root / 'base.txt').read_text().strip(), 'blobs': blobs, 'published_branch': False}
           (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
           print('FLN_CONTRADICTION_TESTED_BLOBS ' + json.dumps(receipt), flush=True)
+      - name: Retain relevant open functional work for follow-on implementation
+        shell: python
+        run: |
+          import json, os, pathlib
+          rows = [json.loads(line) for line in pathlib.Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          matches = [row for row in rows if row.get('status') in ('open', 'in_progress') and row.get('priority', 4) <= 1 and any(word in (row.get('title', '') + ' ' + row.get('description', '')).lower() for word in ('tactic', 'source', 'elaborat'))]
+          result = [{'id': row.get('id'), 'title': row.get('title'), 'status': row.get('status'), 'priority': row.get('priority'), 'description': row.get('description', '')[:1500]} for row in matches]
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'contradiction-evidence'
+          (root / 'open-functional-beads.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result[:20], indent=2))
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
