@@ -464,11 +464,20 @@ fn control_bad_branch_uses_are_rejected_atomically_and_the_engine_recovers() {
             .unwrap_or_else(|e| panic!("unused macro: {declaration}\n{e:?}"))
             .into_complete()
             .unwrap();
-        let source = format!("{declaration}\ndef fail (n : Nat) : Id Nat := bad n");
+        let source = format!("{declaration}\ndef rejectedValue (n : Nat) : Id Nat := bad n");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .unwrap_err();
+        let fln::SourceCheckError::Command { command, error, .. } = error else {
+            panic!("expected a command elaboration refusal: {source}\n{error:?}");
+        };
+        assert_eq!(command, 1, "the use, not registration, must fail: {source}");
         assert!(
-            base.check_source_files(&[source.as_bytes()], &options, limits())
-                .is_err(),
-            "{source}"
+            matches!(
+                error.as_ref(),
+                fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(_))
+            ),
+            "expected elaboration, not a parser refusal: {source}\n{error:?}"
         );
         assert_eq!(base.logical_root(&options), before);
     }

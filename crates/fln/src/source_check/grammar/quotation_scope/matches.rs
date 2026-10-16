@@ -353,3 +353,101 @@ pub(super) fn single_pattern(
     };
     Ok((args.pop().ok_or_else(unsupported_binder)?, names))
 }
+
+/// Term conditionals share the same pattern analysis as matches and do-if-let.
+/// Their predicates/initializers precede all bindings. A proof name is local
+/// in both branches; a destructuring pattern is local only in the first one.
+/// Keep the actual syntax nodes so no quotation is reparsed or re-positioned.
+pub(super) fn conditional<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    resolve: &impl Fn(&Name) -> Resolution,
+    tasks: &mut Vec<Task<'a>>,
+    outer: &[Name],
+) -> Result<bool, EngineExecutionError> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Ok(false);
+    };
+    let (keyword, prefix, condition, then, yes, otherwise, no, names, negative) = if *kind
+        == Name::from_components(["termIfLet"])
+    {
+        let [
+            keyword,
+            let_,
+            pattern,
+            assignment,
+            value,
+            then,
+            yes,
+            otherwise,
+            no,
+        ] = args.as_slice()
+        else {
+            return Err(unsupported_binder());
+        };
+        if !atom(let_, &["let"]) || !atom(assignment, &[":="]) {
+            return Err(unsupported_binder());
+        }
+        let (pattern, names) = single_pattern(pattern, rule, resolve, outer)?;
+        let prefix = vec![
+            Task::Copy(assignment),
+            Task::Emit(pattern),
+            Task::Copy(let_),
+        ];
+        (
+            keyword,
+            prefix,
+            value,
+            then,
+            yes,
+            otherwise,
+            no,
+            names,
+            Vec::new(),
+        )
+    } else if *kind == Name::from_components(["termDepIfThenElse"]) {
+        let [keyword, binder, colon, condition, then, yes, otherwise, no] = args.as_slice() else {
+            return Err(unsupported_binder());
+        };
+        let Syntax::Node { kind, args, .. } = binder else {
+            return Err(unsupported_binder());
+        };
+        let [name] = args.as_slice() else {
+            return Err(unsupported_binder());
+        };
+        if *kind != Name::from_components(["Lean", "binderIdent"]) || !atom(colon, &[":"]) {
+            return Err(unsupported_binder());
+        }
+        let mut names = Vec::new();
+        binder_name(name, rule, &mut names)?;
+        if names
+            .iter()
+            .any(|name| !name.erase_macro_scopes().parent().is_anonymous())
+        {
+            return Err(unsupported_binder());
+        }
+        let negative = names.clone();
+        let prefix = vec![Task::Copy(colon), Task::Copy(binder)];
+        (
+            keyword, prefix, condition, then, yes, otherwise, no, names, negative,
+        )
+    } else {
+        return Ok(false);
+    };
+    if !atom(keyword, &["if"]) || !atom(then, &["then"]) || !atom(otherwise, &["else"]) {
+        return Err(unsupported_binder());
+    }
+    tasks.push(Task::Restore(outer.len()));
+    tasks.push(build(syntax)?);
+    tasks.push(Task::Visit(no));
+    tasks.push(Task::Copy(otherwise));
+    tasks.push(Task::Bind(negative));
+    tasks.push(Task::Restore(outer.len()));
+    tasks.push(Task::Visit(yes));
+    tasks.push(Task::Bind(names));
+    tasks.push(Task::Copy(then));
+    tasks.push(Task::Visit(condition));
+    tasks.extend(prefix);
+    tasks.push(Task::Copy(keyword));
+    Ok(true)
+}

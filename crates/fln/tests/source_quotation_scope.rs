@@ -590,3 +590,120 @@ fn imported_match_macros_compile_and_execute_with_their_definition_site_world() 
     );
     assert_eq!(base.logical_root(&options), before);
 }
+
+#[test]
+fn conditional_templates_keep_pattern_fields_local_to_the_success_term() {
+    accepted(
+        r#"
+def value : Nat := 7
+macro "patternValue " arg:term:max extra:term:max : term => `(if let Nat.succ value := $arg then Nat.add value $extra else value)
+def answer (value : Nat) : Nat := patternValue (Nat.succ 1) value
+notation "headOrGlobal " arg:max => if let Nat.succ value := arg then value else value
+theorem answer_value : answer 41 = 42 := rfl
+theorem yes_value : (headOrGlobal (3 : Nat)) = 2 := rfl
+theorem no_value : (headOrGlobal (0 : Nat)) = 7 := rfl
+"#,
+        3,
+    );
+}
+
+#[test]
+fn conditional_templates_keep_evidence_out_of_the_predicate_and_siblings() {
+    accepted(
+        r#"
+def h : Nat := 7
+macro "proofValue " arg:term:max : term => `(if h : $arg = 0 then (fun (p : $arg = 0) => 1) h else (fun (p : Not ($arg = 0)) => 2) h)
+def zero : Nat := proofValue (0 : Nat)
+def one : Nat := proofValue (1 : Nat)
+notation "scopeValue" => (if h : h = 7 then 1 else 2)
+theorem zero_value : zero = 1 := rfl
+theorem one_value : one = 2 := rfl
+theorem scope_value : scopeValue = 1 := rfl
+"#,
+        3,
+    );
+}
+
+#[test]
+fn conditional_templates_precheck_free_names_without_leaking_pattern_binders() {
+    for source in [
+        "notation \"leaky \" arg:max => if let Nat.succ fresh := arg then fresh else fresh",
+        "notation \"badInitializer\" => if let Nat.succ fresh := fresh then fresh else 0",
+        "notation \"badPredicate\" => if h : h = 0 then 1 else 2",
+        "notation \"leakySibling\" => (if let Nat.succ fresh := 1 then fresh else 0, fresh)",
+    ] {
+        assert!(
+            matches!(
+                check(source),
+                Err(SourceCheckError::Command { command: 0, .. })
+            ),
+            "{source}"
+        );
+    }
+    accepted(
+        r#"
+macro "evidenceCapture " arg:term:max extra:term:max : term => `(if h : $arg = 0 then $extra else 2)
+def keep (h : Nat) : Nat := evidenceCapture (0 : Nat) h
+theorem kept : keep 42 = 42 := rfl
+"#,
+        1,
+    );
+}
+
+#[test]
+fn conditional_templates_execute_both_paths_and_cannot_make_false_proofs() {
+    let source = r#"
+def value : Nat := 7
+macro "chooseValue " arg:term:max : term => `(if let Nat.succ value := $arg then value else value)
+macro "chooseProof " arg:term:max : term => `(if h : $arg = 0 then (fun (proof : $arg = 0) => 42) h else 7)
+#eval chooseValue (43 : Nat)
+#eval chooseValue (0 : Nat)
+#eval chooseProof (0 : Nat)
+#eval chooseProof (1 : Nat)
+"#;
+    let result = engine()
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    // The command stream executes `def value` as well as the four queries.
+    assert_eq!(result.batch.executions.len(), 5);
+    for (execution, expected) in result
+        .batch
+        .executions
+        .iter()
+        .zip(["7", "42", "7", "42", "7"])
+    {
+        let VmExit::Returned(returned) = &execution.exit else {
+            panic!("native return");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&returned.value).as_deref(),
+            Some(expected)
+        );
+    }
+    let bad = r#"macro "falseBranch " arg:term:max : term => `(if h : $arg = 0 then (h : False) else True.intro)"#;
+    accepted(bad, 0);
+    for declaration in [
+        "theorem bad : True := falseBranch (1 : Nat)",
+        "theorem bad : False := falseBranch (0 : Nat)",
+    ] {
+        let source = format!("{bad}\n{declaration}");
+        let error = check(&source).unwrap_err();
+        let SourceCheckError::Command { command, error, .. } = error else {
+            panic!("expected a command elaboration refusal: {source}\n{error:?}");
+        };
+        assert_eq!(command, 1, "the use, not registration, must fail: {source}");
+        assert!(
+            matches!(
+                error.as_ref(),
+                fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(_))
+            ),
+            "expected elaboration, not a parser refusal: {source}\n{error:?}"
+        );
+    }
+}
