@@ -18,6 +18,7 @@ mod decision;
 pub(in crate::source) mod eliminate;
 mod empty;
 mod equality;
+mod extensionality;
 mod guard;
 mod guard_hyp;
 mod index_equations;
@@ -658,6 +659,11 @@ impl Context {
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "traceMessage"]))
                     {
                         self.trace_proof_state(proof, instruction)?;
+                        proof.cursor += 1;
+                        continue;
+                    }
+                    if extensionality::is_empty(instruction) {
+                        self.require_declared_tactic(&["tacticFunext___"])?;
                         proof.cursor += 1;
                         continue;
                     }

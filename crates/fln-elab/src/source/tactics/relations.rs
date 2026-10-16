@@ -7,6 +7,7 @@ use super::*;
 pub(super) enum RelationTactic {
     Symmetry,
     Congruence,
+    FunctionExtensionality,
 }
 
 pub(super) fn classify(kind: &Name) -> Option<RelationTactic> {
@@ -14,6 +15,8 @@ pub(super) fn classify(kind: &Name) -> Option<RelationTactic> {
         Some(RelationTactic::Symmetry)
     } else if kind == &parser_kind(&["Tactic", "congr"]) {
         Some(RelationTactic::Congruence)
+    } else if kind == &Name::from_components(["tacticFunext___"]) {
+        Some(RelationTactic::FunctionExtensionality)
     } else {
         None
     }
@@ -28,6 +31,7 @@ impl Context {
         args: &[Syntax],
     ) -> Result<(), NatDefinitionElabError> {
         match tactic {
+            RelationTactic::FunctionExtensionality => self.funext_proof_goal(proof, goal, args),
             RelationTactic::Congruence => self.congruence_proof_goal(proof, goal, args),
             RelationTactic::Symmetry => {
                 let [keyword, location] = args else {
