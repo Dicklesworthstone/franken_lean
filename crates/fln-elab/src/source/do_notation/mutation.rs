@@ -480,11 +480,13 @@ pub(super) fn state_tuple(state: &[Syntax]) -> Syntax {
     tuple
 }
 
-/// Whether `syntax` is a `state_tuple` of plain names.
+/// Whether `syntax` is a `state_tuple` of plain names. Macro scopes do not
+/// turn a local into a qualified field path. Erase scopes only for this shape
+/// test; tuple components retain their complete identities for state lookup.
 pub(super) fn is_state_tuple(syntax: &Syntax) -> bool {
     let mut syntax = syntax;
     loop {
-        if matches!(syntax, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+        if matches!(syntax, Syntax::Ident { val, .. } if !val.is_anonymous() && val.erase_macro_scopes().parent().is_anonymous())
         {
             return true;
         }
@@ -503,7 +505,7 @@ pub(super) fn is_state_tuple(syntax: &Syntax) -> bool {
         let [first, rest] = &pair[..] else {
             return false;
         };
-        if !matches!(first, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+        if !matches!(first, Syntax::Ident { val, .. } if !val.is_anonymous() && val.erase_macro_scopes().parent().is_anonymous())
         {
             return false;
         }

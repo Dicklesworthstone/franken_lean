@@ -81,7 +81,13 @@ fn binding<'a>(
         _ => return Err(unsupported_binder()),
     };
     if !atom(keyword, &[if have { "have" } else { "let" }])
-        || mutable.is_some_and(|m| !null_args(m).is_ok_and(<[Syntax]>::is_empty))
+        || mutable.is_some_and(|m| {
+            !null_args(m).is_ok_and(|parts| match parts {
+                [] => true,
+                [keyword] => atom(keyword, &["mut"]),
+                _ => false,
+            })
+        })
     {
         return Err(unsupported_binder());
     }
@@ -142,6 +148,67 @@ fn binding<'a>(
         tasks.push(Task::Copy(mutable));
     }
     tasks.push(Task::Copy(keyword));
+    Ok(())
+}
+
+/// Reassignment refers to an existing local; it does not introduce a new
+/// quotation scope. Keep its target literal, like a declaration name, and
+/// resolve only its annotation and value. The do elaborator decides whether
+/// that exact hygienic identity is mutable in the current block.
+fn reassignment<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    tasks: &mut Vec<Task<'a>>,
+) -> Result<(), EngineExecutionError> {
+    let arrow = term_args(syntax, "doReassignArrow").is_ok();
+    let [declaration] = term_args(
+        syntax,
+        if arrow { "doReassignArrow" } else { "doReassign" },
+    )? else {
+        return Err(unsupported_binder());
+    };
+    let (id, parameters, annotation, operator, value) = if arrow {
+        let [name, annotation, operator, value] = term_args(declaration, "doIdDecl")? else {
+            return Err(unsupported_binder());
+        };
+        (name, None, annotation, operator, value)
+    } else {
+        let [id, parameters, annotation, operator, value] =
+            term_args(declaration, "letIdDeclNoBinders")?
+        else {
+            return Err(unsupported_binder());
+        };
+        if !null_args(parameters)?.is_empty() {
+            return Err(unsupported_binder());
+        }
+        (id, Some(parameters), annotation, operator, value)
+    };
+    let name = if arrow {
+        id
+    } else {
+        let [name] = term_args(id, "letId")? else {
+            return Err(unsupported_binder());
+        };
+        name
+    };
+    let mut names = Vec::new();
+    binder_name(name, rule, &mut names)?;
+    if names.len() != 1 || !names[0].erase_macro_scopes().parent().is_anonymous() {
+        return Err(unsupported_binder());
+    }
+    shared_type(annotation)?;
+    if !atom(operator, if arrow { &["←", "<-"] } else { &[":="] }) {
+        return Err(unsupported_binder());
+    }
+    tasks.push(build(syntax)?);
+    tasks.push(build(declaration)?);
+    tasks.push(Task::Visit(value));
+    tasks.push(Task::Copy(operator));
+    tasks.push(Task::Visit(annotation));
+    if let Some(parameters) = parameters {
+        tasks.push(Task::Copy(parameters));
+    }
+    tasks.push(Task::Copy(id));
     Ok(())
 }
 
@@ -270,14 +337,22 @@ pub(super) fn visit<'a>(
         for_loop(syntax, rule, tasks, scope_depth)?;
         return Ok(true);
     }
+    if ["doReassign", "doReassignArrow"]
+        .iter()
+        .any(|k| term_kind(kind, k))
+    {
+        if rule.prechecked {
+            return Err(unsupported_binder());
+        }
+        reassignment(syntax, rule, tasks)?;
+        return Ok(true);
+    }
     // These shapes also bind identifiers. Until their scope is analysed, do
     // not send them through the generic walk and pre-resolve binders as globals.
     if [
         "doLetRec",
         "doMatch",
         "doIfLet",
-        "doReassign",
-        "doReassignArrow",
         "doTry",
     ]
     .iter()

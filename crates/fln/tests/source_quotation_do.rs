@@ -739,3 +739,54 @@ theorem imported_value : result = 43 := rfl
     );
     assert_eq!(base.logical_root(&options), before);
 }
+
+
+#[test]
+fn quoted_loop_mutable_and_monadic_reassignment_preserve_hygienic_state() {
+    let base = loop_engine();
+    let before = base.logical_root(&KVMap::new());
+    loop_values(
+        &base,
+        r#"
+def total : Nat := 900
+macro "mutableQuoted " input:term:max : term => `(do {
+  let mut total : Nat := $input
+  for x in true do { total ← (Nat.add total x : Id Nat) }
+  return total })
+def answer (total : Nat) : Id Nat := mutableQuoted total
+theorem answer_value : answer 0 = 42 := rfl
+#eval answer 0
+"#,
+        &["42"],
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn quoted_reassignment_cannot_capture_a_callers_mutable_local() {
+    let base = loop_engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let source = br#"
+macro "stealMutable " : term => `(do { total := 99; return total })
+def rejectedValue : Id Nat := do
+  let mut total : Nat := 42
+  let n <- stealMutable
+  return n
+"#;
+    assert!(base.check_source_files(&[source], &options, limits()).is_err());
+    assert_eq!(base.logical_root(&options), before);
+    loop_values(
+        &base,
+        r#"
+macro "retryMutable " : term => `(do {
+  let mut total : Nat := 0
+  for x in true do { total := total + x }
+  return total })
+def recovered : Id Nat := retryMutable
+theorem recovery_value : recovered = 42 := rfl
+#eval recovered
+"#,
+        &["42"],
+    );
+}
