@@ -37,3 +37,32 @@ fn malformed_funext_arguments_do_not_disappear() {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
 }
+
+#[test]
+fn typed_and_tuple_funext_introductions_preserve_exact_original_bytes() {
+    for tactic in ["intro", "funext"] {
+        for patterns in [
+            "(x : Nat)",
+            "(x :)",
+            "(_ : Nat) y",
+            "(a, b) (c, d)",
+            "⟨a, ⟨b, c⟩⟩",
+            "(a, (b, c))",
+        ] {
+            let source = format!(
+                "-- 🦀\r\ntheorem t : True := by\r\n  {tactic} {patterns}\r\n  constructor\r\n"
+            );
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+    }
+    for source in [
+        "theorem t : True := by funext (x : := Nat)",
+        "theorem t : True := by funext (a,, b)",
+        "theorem t : True := by funext (a, b",
+        "theorem t : True := by intros (a, b)",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+}

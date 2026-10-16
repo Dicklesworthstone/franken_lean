@@ -44,22 +44,8 @@ impl Context {
         };
         expect_atom(keyword, "funext", "function extensionality")?;
         let names = expect_null_args(names, "function extensionality introductions")?;
-        let mut introductions = Vec::new();
-        for name in names {
-            self.tick()?;
-            introductions.push(match name {
-                Syntax::Ident { val, .. } => Some(val.clone()),
-                Syntax::Node { kind, args, .. }
-                    if kind == &parser_kind(&["Term", "hole"])
-                        && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
-                {
-                    None
-                }
-                _ => return Err(error(TacticError::MalformedScript)),
-            });
-        }
         let before = Box::new(self.clone());
-        match self.funext_frontier(goal, &introductions) {
+        match self.funext_frontier(goal, names) {
             Ok(work) => {
                 proof.work.extend(work);
                 Ok(())
@@ -74,25 +60,43 @@ impl Context {
     fn funext_frontier(
         &mut self,
         mut goal: ProofGoal,
-        names: &[Option<Name>],
+        names: &[Syntax],
     ) -> Result<Vec<Work<'static>>, NatDefinitionElabError> {
+        if !names.is_empty() {
+            let mut pending = vec![(Work::Goal(goal), 0)];
+            let mut output = Vec::new();
+            while let Some((work, index)) = pending.pop() {
+                self.tick()?;
+                match work {
+                    Work::Goal(parent) if index < names.len() => {
+                        let (value, child) = self.funext_step(&parent)?;
+                        pending.push((Work::Close(parent, value), index + 1));
+                        for work in self.introduce_proof_pattern(child, Some(&names[index]))? {
+                            pending.push((work, index + 1));
+                        }
+                    }
+                    work @ (Work::Goal(_) | Work::Close(..)) => output.push(work),
+                    _ => return Err(error(TacticError::MalformedScript)),
+                }
+            }
+            output.reverse();
+            return Ok(output);
+        }
         let mut work = Vec::new();
-        let mut index = 0;
         loop {
             self.tick()?;
-            if !names.is_empty() && index == names.len() {
-                break;
-            }
             // Bare funext is repeat (apply funext; intro): only the failed
-            // iteration rolls back. A resource stop is never normal failure.
+            // iteration rolls back. Resource stops are never normal failure.
             let before = Box::new(self.clone());
-            match self.funext_step(&goal, names.get(index).cloned().flatten()) {
-                Ok((value, child)) => {
+            match self.funext_step(&goal) {
+                Ok((value, mut child)) => {
+                    let name = self.fresh_name()?;
+                    self.introduce_proof_binder(&mut child, name)?;
+                    child.lctx = self.txn.lctx.clone();
                     work.push(Work::Close(goal, value));
                     goal = child;
-                    index += 1;
                 }
-                Err(problem) if names.is_empty() && backtrack::recoverable(&problem) => {
+                Err(problem) if backtrack::recoverable(&problem) => {
                     restore(self, &before);
                     break;
                 }
@@ -107,7 +111,6 @@ impl Context {
     fn funext_step(
         &mut self,
         goal: &ProofGoal,
-        name: Option<Name>,
     ) -> Result<(Expr, ProofGoal), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.flush(false)?;
@@ -146,7 +149,7 @@ impl Context {
             Expr::app(right.clone(), x),
         );
         let pointwise = self.close_equality_binder(&argument, pointwise, false)?;
-        let (witness, mut child) = self.proof_goal(pointwise)?;
+        let (witness, child) = self.proof_goal(pointwise)?;
         let equation = FunctionEquation {
             function_type,
             universe,
@@ -155,12 +158,6 @@ impl Context {
         };
         let value =
             self.quotient_funext(&equation, &argument, &codomain, &result_level, witness)?;
-        let name = match name {
-            Some(name) => name,
-            None => self.fresh_name()?,
-        };
-        self.introduce_proof_binder(&mut child, name)?;
-        child.lctx = self.txn.lctx.clone();
         Ok((value, child))
     }
 

@@ -466,25 +466,6 @@ fn local_tactic(
             };
             args.push(null_node(depth));
         }
-        // `syntax "funext" (ppSpace colGt term:max)* : tactic` (`Init/Tactics.lean`), a root
-        // kind; only names and holes are read.
-        "funext" => {
-            let mut names = Vec::new();
-            for index in start + 1..range.end {
-                names.push(match &tokens[index].kind {
-                    TokenKind::Ident(_) => leaves.leaf(index)?,
-                    TokenKind::Symbol(symbol) if symbol == "_" => {
-                        Syntax::node(parser_kind(&["Term", "hole"]), vec![leaves.leaf(index)?])
-                    }
-                    _ => return Err(refusal(view, tokens, index)),
-                });
-            }
-            args.push(null_node(names));
-            return Ok(Syntax::node(
-                Name::from_components(["tacticFunext___"]),
-                args,
-            ));
-        }
         // `syntax (name := renameI) "rename_i" (ppSpace colGt binderIdent)+ : tactic`
         // (`Init/Tactics.lean`).
         "rename_i" if range.end > start + 1 => {
@@ -506,11 +487,11 @@ fn local_tactic(
         }
         // `intros` is `"intros" (ppSpace colGt (ident <|> hole))*`; `intro`'s arguments are
         // `term:max`, a bracketed pattern too (`intro ⟨a, b⟩ (k : T)`) (`Init/Tactics.lean`).
-        "intro" | "intros" => {
+        "intro" | "intros" | "funext" => {
             let mut names = Vec::new();
             let mut index = start + 1;
             while index < range.end {
-                let bracket = keyword == "intro"
+                let bracket = keyword != "intros"
                     && matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == "⟨" || symbol == "(");
                 if matches!(&tokens[index].kind, TokenKind::Ident(_)) {
                     names.push(leaves.leaf(index)?);
@@ -538,6 +519,12 @@ fn local_tactic(
                 index += 1;
             }
             args.push(null_node(names));
+            if keyword == "funext" {
+                return Ok(Syntax::node(
+                    Name::from_components(["tacticFunext___"]),
+                    args,
+                ));
+            }
         }
         "injection"
             if range.end >= start + 2 && matches!(&tokens[start + 1].kind, TokenKind::Ident(_)) =>

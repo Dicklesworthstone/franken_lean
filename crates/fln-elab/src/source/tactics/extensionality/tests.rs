@@ -123,3 +123,95 @@ fn every_funext_budget_stop_restores_binders_metavariables_and_siblings() {
         }
     }
 }
+
+fn introduction_args(script: &str, funext: bool) -> Vec<Syntax> {
+    let source = format!("theorem t : True := by {script}");
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    let wanted = if funext {
+        Name::from_components(["tacticFunext___"])
+    } else {
+        parser_kind(&["Tactic", "intro"])
+    };
+    let mut pending = vec![parsed.syntax()];
+    while let Some(syntax) = pending.pop() {
+        if let Syntax::Node { kind, args, .. } = syntax {
+            if kind == &wanted {
+                return args.clone();
+            }
+            pending.extend(args);
+        }
+    }
+    panic!("no introduction in {source}");
+}
+
+#[test]
+fn typed_and_pattern_introduction_cutoffs_restore_refinement_frames_and_pending_goals() {
+    let seed = seeded_context();
+    for (script, extensionality) in [
+        ("intro (x : Nat)", false),
+        ("intro ⟨p, q⟩", false),
+        ("funext (x : Nat)", true),
+    ] {
+        let mut original = seed.clone();
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let truth = Expr::const_(Name::from_components(["True"]), Vec::new());
+        let target = if extensionality {
+            let ftype = arrow(nat.clone(), nat.clone());
+            let f = local(&mut original, "f", ftype.clone());
+            let g = local(&mut original, "g", ftype.clone());
+            equality::equation(Level::one(), ftype, f, g)
+        } else if script.contains('⟨') {
+            let both = Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["And"]), Vec::new()),
+                    truth.clone(),
+                ),
+                truth.clone(),
+            );
+            arrow(both, truth.clone())
+        } else {
+            arrow(nat, truth.clone())
+        };
+        let (_, goal) = original.proof_goal(target).unwrap();
+        let (_, sibling) = original.proof_goal(truth).unwrap();
+        let mut proof = introductions::frame(&goal);
+        proof.work.push(Work::Goal(sibling.clone()));
+        let args = introduction_args(script, extensionality);
+        let call = |context: &mut Context, proof: &mut ProofState<'_>| {
+            if extensionality {
+                context.funext_proof_goal(proof, goal.clone(), &args)
+            } else {
+                context.intro_proof_patterns(
+                    proof,
+                    goal.clone(),
+                    expect_null_args(&args[1], "patterns").unwrap(),
+                )
+            }
+        };
+        let mut completed = original.clone();
+        call(&mut completed, &mut proof.clone()).unwrap();
+        let before = original.txn.budget.heartbeats_consumed;
+        let used = completed.txn.budget.heartbeats_consumed - before;
+        for allowance in 0..used {
+            let mut limited = original.clone();
+            limited.txn.budget.max_heartbeats = before + allowance;
+            let mut pending = proof.clone();
+            let problem = call(&mut limited, &mut pending)
+                .expect_err("no partially introduced pattern may commit");
+            assert!(
+                !backtrack::recoverable(&problem),
+                "{script}/{allowance}: {problem:?}"
+            );
+            assert!(limited.txn.budget.heartbeats_consumed >= before + allowance);
+            limited.txn.budget = original.txn.budget.clone();
+            assert_eq!(limited.txn, original.txn, "{script}/{allowance}");
+            assert_eq!(limited.next, original.next);
+            assert_eq!(limited.instance_goals, original.instance_goals);
+            assert_eq!(limited.goal_tags, original.goal_tags);
+            assert_eq!(limited.trace_local_names, original.trace_local_names);
+            assert!(limited.refinements.is_empty());
+            assert!(limited.equations.is_empty());
+            assert!(matches!(pending.work.as_slice(), [Work::Goal(g)] if g.id == sibling.id));
+        }
+    }
+}

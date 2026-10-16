@@ -22,6 +22,7 @@ mod extensionality;
 mod guard;
 mod guard_hyp;
 mod index_equations;
+mod introductions;
 mod omega;
 mod rcases;
 mod refine;
@@ -1080,23 +1081,7 @@ impl Context {
                 };
                 expect_atom(keyword, "intro", "intro keyword")?;
                 let names = expect_null_args(names, "intro names")?;
-                for index in 0..names.len().max(1) {
-                    self.tick()?;
-                    let name = match names.get(index) {
-                        Some(Syntax::Ident { val, .. }) => val.clone(),
-                        Some(Syntax::Node { kind, args, .. })
-                            if kind == &parser_kind(&["Term", "hole"])
-                                && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
-                        {
-                            self.fresh_name()?
-                        }
-                        None => self.fresh_name()?,
-                        _ => return Err(error(TacticError::MalformedScript)),
-                    };
-                    self.introduce_proof_binder(&mut goal, name)?;
-                }
-                goal.lctx = self.txn.lctx.clone();
-                proof.work.push(Work::Goal(goal));
+                self.intro_proof_patterns(proof, goal, names)?;
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "generalize"]) {
