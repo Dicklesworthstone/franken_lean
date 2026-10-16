@@ -1,4 +1,4 @@
-name: Source frontier reproduction snapshot
+name: Source frontier reproduction snapshot - quoted branch recovery
 on:
   push:
     branches: [main]
