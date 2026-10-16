@@ -280,14 +280,44 @@ pub(super) fn schedule<'a>(
             return Err(unsupported_binder());
         }
     }
+    tasks.push(build(syntax)?);
+    schedule_alternatives(
+        alternatives,
+        rule,
+        resolve,
+        tasks,
+        outer,
+        discrs.len().div_ceil(2),
+    )?;
+    tasks.push(Task::Copy(with));
+    tasks.push(Task::Visit(discriminants));
+    tasks.push(Task::Copy(motive));
+    tasks.push(Task::Copy(generalizing));
+    if let Some(dependent) = dependent {
+        tasks.push(Task::Copy(dependent));
+    }
+    tasks.push(Task::Copy(keyword));
+    Ok(())
+}
+
+/// Match expressions, do matches and pattern catch handlers share one
+/// alternative scope law. Each row's constructors resolve at declaration,
+/// while its variables enter only that alternative's body.
+pub(super) fn schedule_alternatives<'a>(
+    alternatives: &'a Syntax,
+    rule: &NotationRule,
+    resolve: &impl Fn(&Name) -> Resolution,
+    tasks: &mut Vec<Task<'a>>,
+    outer: &[Name],
+    columns: usize,
+) -> Result<(), EngineExecutionError> {
     let [alt_list] = term_args(alternatives, "matchAlts")? else {
         return Err(unsupported_binder());
     };
     let alts = null_args(alt_list)?;
-    if alts.is_empty() {
+    if alts.is_empty() || columns == 0 {
         return Err(unsupported_binder());
     }
-    tasks.push(build(syntax)?);
     tasks.push(build(alternatives)?);
     tasks.push(build(alt_list)?);
     for alternative in alts.iter().rev() {
@@ -305,7 +335,7 @@ pub(super) fn schedule<'a>(
                 transformed.push(row.clone());
                 continue;
             }
-            if separated(row, ",")?.len() != discrs.len() {
+            if separated(row, ",")?.len().div_ceil(2) != columns {
                 return Err(unsupported_binder());
             }
             let (pattern, mut names) = patterns(row, rule, resolve, outer)?;
@@ -326,14 +356,6 @@ pub(super) fn schedule<'a>(
         tasks.push(Task::Emit(rebuild(rows, transformed)?));
         tasks.push(Task::Copy(pipe));
     }
-    tasks.push(Task::Copy(with));
-    tasks.push(Task::Visit(discriminants));
-    tasks.push(Task::Copy(motive));
-    tasks.push(Task::Copy(generalizing));
-    if let Some(dependent) = dependent {
-        tasks.push(Task::Copy(dependent));
-    }
-    tasks.push(Task::Copy(keyword));
     Ok(())
 }
 

@@ -638,6 +638,10 @@ pub(super) fn preresolve(
                     do_notation::conditional(node, rule, resolve, &mut tasks, &locals)?;
                     continue;
                 }
+                if term_kind(kind, "doTry") {
+                    do_notation::exception_region(node, rule, resolve, &mut tasks, &locals)?;
+                    continue;
+                }
                 if do_notation::visit(node, rule, &mut tasks, locals.len())? {
                     continue;
                 }

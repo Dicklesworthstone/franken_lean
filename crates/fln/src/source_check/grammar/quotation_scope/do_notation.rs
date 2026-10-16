@@ -464,3 +464,85 @@ pub(super) fn conditional<'a>(
     tasks.push(Task::Copy(keyword));
     Ok(())
 }
+
+
+/// A protected sequence, each catch handler, and the finalizer have separate
+/// lexical scopes. The ordinary exception elaborator owns their dynamic
+/// extent and control effects; this walk only resolves template identifiers.
+pub(super) fn exception_region<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    resolve: &impl Fn(&Name) -> Resolution,
+    tasks: &mut Vec<Task<'a>>,
+    outer: &[Name],
+) -> Result<(), EngineExecutionError> {
+    if rule.prechecked {
+        return Err(unsupported_binder());
+    }
+    let [keyword, body, catches, finally] = term_args(syntax, "doTry")? else {
+        return Err(unsupported_binder());
+    };
+    let handlers = null_args(catches)?;
+    let finalizers = null_args(finally)?;
+    if !atom(keyword, &["try"])
+        || finalizers.len() > 1
+        || handlers.is_empty() && finalizers.is_empty()
+    {
+        return Err(unsupported_binder());
+    }
+    tasks.push(Task::Restore(outer.len()));
+    tasks.push(build(syntax)?);
+    tasks.push(build(finally)?);
+    if let [finalizer] = finalizers {
+        let [keyword, body] = term_args(finalizer, "doFinally")? else {
+            return Err(unsupported_binder());
+        };
+        if !atom(keyword, &["finally"]) {
+            return Err(unsupported_binder());
+        }
+        tasks.push(build(finalizer)?);
+        tasks.push(Task::Visit(body));
+        tasks.push(Task::Copy(keyword));
+    }
+    tasks.push(build(catches)?);
+    for handler in handlers.iter().rev() {
+        if let Ok(parts) = term_args(handler, "doCatchMatch") {
+            let [keyword, alternatives] = parts else {
+                return Err(unsupported_binder());
+            };
+            if !atom(keyword, &["catch"]) {
+                return Err(unsupported_binder());
+            }
+            tasks.push(build(handler)?);
+            matches::schedule_alternatives(alternatives, rule, resolve, tasks, outer, 1)?;
+            tasks.push(Task::Copy(keyword));
+            continue;
+        }
+        let [keyword, name, annotation, arrow, body] = term_args(handler, "doCatch")? else {
+            return Err(unsupported_binder());
+        };
+        if !atom(keyword, &["catch"]) || !atom(arrow, &["=>", "↦"]) {
+            return Err(unsupported_binder());
+        }
+        optional_type(annotation)?;
+        let mut names = Vec::new();
+        binder_name(name, rule, &mut names)?;
+        if names
+            .iter()
+            .any(|name| !name.erase_macro_scopes().parent().is_anonymous())
+        {
+            return Err(unsupported_binder());
+        }
+        tasks.push(Task::Restore(outer.len()));
+        tasks.push(build(handler)?);
+        tasks.push(Task::Visit(body));
+        tasks.push(Task::Copy(arrow));
+        tasks.push(Task::Bind(names));
+        tasks.push(Task::Visit(annotation));
+        tasks.push(Task::Copy(name));
+        tasks.push(Task::Copy(keyword));
+    }
+    tasks.push(Task::Visit(body));
+    tasks.push(Task::Copy(keyword));
+    Ok(())
+}
