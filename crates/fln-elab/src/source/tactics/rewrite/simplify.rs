@@ -628,38 +628,13 @@ impl Context {
                 Ok(Some((next_goal, child)))
             }
             UnfoldResult::NotDefinition => {
-                // Re-elaboration gives each polymorphic use fresh universes.
-                let mut term = self.selected_simp_term(rule)?;
-                // Selected definitions normalize the lemma's type as well as
-                // the goal. Keep its actual proof term: conversion is checked
-                // by the final kernel, never replaced by an equality axiom.
-                term.type_ = self.simp_premise_target(&term.type_, premise_rules)?;
-                let Some(RewriteMatch {
-                    rule: term,
-                    occurrence,
-                    premises,
-                }) = self.instantiate_rewrite_rule(
-                    term,
-                    &target,
-                    rule.reverse(),
-                    true,
-                    premise_rules,
-                )?
+                let Some((term, occurrence, reverse)) =
+                    self.simp_rule_evidence(&target, rule, premise_rules)?
                 else {
-                    return match self.simp_binder_rule(&target, rule, premise_rules)? {
-                        Some(evidence) => self
-                            .rewrite_transport(goal, evidence, &target, false)
-                            .map(Some),
-                        None => Ok(None),
-                    };
+                    return Ok(None);
                 };
-                assert!(premises.is_empty(), "simp discharges its own premises");
-                Ok(Some(self.rewrite_transport(
-                    goal,
-                    term,
-                    &occurrence,
-                    rule.reverse(),
-                )?))
+                self.rewrite_transport(goal, term, &occurrence, reverse)
+                    .map(Some)
             }
         }
     }
@@ -683,6 +658,8 @@ impl Context {
                 self.constant(&Name::from_components(["True", "intro"]))?
                     .value,
             )
+        } else if matches!(target.node(), ExprNode::ForallE { .. }) {
+            self.simp_quantified_reflexivity(goal, target)?
         } else {
             self.automatic_reflexivity_candidate(goal, false)?
         };

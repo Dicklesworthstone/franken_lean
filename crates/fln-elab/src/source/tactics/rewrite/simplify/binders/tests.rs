@@ -96,3 +96,86 @@ fn every_lambda_rewrite_cutoff_restores_the_entire_transaction() {
         assert!(limited.equations.is_empty());
     }
 }
+
+#[test]
+fn quantified_rewrites_and_leaf_closure_restore_every_interrupted_context() {
+    let mut initial = context();
+    let a = local(&mut initial, "A", Expr::sort(Level::one()));
+    let f = local(&mut initial, "f", arrow(a.clone(), a.clone()));
+    let g = local(&mut initial, "g", arrow(a.clone(), a.clone()));
+    let p = local(
+        &mut initial,
+        "P",
+        arrow(a.clone(), Expr::sort(Level::zero())),
+    );
+    let x = Expr::bvar(0).unwrap();
+    let left = Expr::app(f, x.clone());
+    local(
+        &mut initial,
+        "h",
+        arrow(
+            a.clone(),
+            equality::equation(
+                Level::one(),
+                a.clone(),
+                left.clone(),
+                Expr::app(g, x.clone()),
+            ),
+        ),
+    );
+    let rewrite_target = arrow(a.clone(), Expr::app(p, left));
+    let reflexive_target = arrow(
+        a.clone(),
+        equality::equation(Level::one(), a.clone(), x.clone(), x),
+    );
+    let true_target = arrow(
+        a.clone(),
+        Expr::const_(Name::from_components(["True"]), vec![]),
+    );
+    initial.hole(a).unwrap();
+    for (target, rewriting) in [
+        (rewrite_target, true),
+        (reflexive_target, false),
+        (true_target, false),
+    ] {
+        let mut original = initial.clone();
+        let (_, goal) = original.proof_goal(target.clone()).unwrap();
+        let run = |ctx: &mut Context| {
+            if rewriting {
+                ctx.simp_binder_rule(
+                    &target,
+                    &SimpRule::Local(FVarId(Name::from_components(["h"]))),
+                    &[],
+                )
+                .map(|result| result.map(|term| term.value))
+            } else {
+                ctx.simp_quantified_reflexivity(&goal, target.clone())
+            }
+        };
+        let start = original.txn.budget.heartbeats_consumed;
+        let mut complete = original.clone();
+        let proof = run(&mut complete).unwrap().unwrap();
+        assert!(!proof.has_expr_mvar());
+        assert!(!proof.has_level_mvar());
+        assert!(!proof.has_loose_bvars());
+        assert_eq!(complete.txn.lctx, original.txn.lctx);
+        let used = complete.txn.budget.heartbeats_consumed - start;
+        for allowance in 0..used {
+            let mut limited = original.clone();
+            limited.txn.budget.max_heartbeats = start + allowance;
+            let problem = run(&mut limited).err().expect("not completed evidence");
+            assert!(
+                !backtrack::recoverable(&problem),
+                "{allowance}: {problem:?}"
+            );
+            assert!(limited.txn.budget.heartbeats_consumed >= start + allowance);
+            limited.txn.budget = original.txn.budget.clone();
+            assert_eq!(limited.txn, original.txn, "{allowance}");
+            assert_eq!(limited.next, original.next);
+            assert_eq!(limited.instance_goals, original.instance_goals);
+            assert_eq!(limited.goal_tags, original.goal_tags);
+            assert_eq!(limited.trace_local_names, original.trace_local_names);
+            assert!(limited.equations.is_empty());
+        }
+    }
+}

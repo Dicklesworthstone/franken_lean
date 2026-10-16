@@ -2,6 +2,7 @@
 //! The traversal and its closing continuations live on the heap. No raw bound
 //! variable is ever assigned to a rewrite metavariable from an outer context.
 use super::*;
+mod quantifiers;
 #[cfg(test)]
 mod tests;
 
@@ -21,6 +22,31 @@ struct Scan {
 }
 
 impl Context {
+    /// Goal, hypothesis and `simpa using` simplification select identical
+    /// evidence. A scoped rewrite lifts to an equality of the whole target;
+    /// ordinary closed occurrences keep their existing transport direction.
+    pub(super) fn simp_rule_evidence(
+        &mut self,
+        target: &Expr,
+        rule: &SimpRule<'_>,
+        premises: &[SimpRule<'_>],
+    ) -> Result<Option<(Typed, Expr, bool)>, NatDefinitionElabError> {
+        let mut term = self.selected_simp_term(rule)?;
+        term.type_ = self.simp_premise_target(&term.type_, premises)?;
+        if let Some(found) =
+            self.instantiate_rewrite_rule(term, target, rule.reverse(), true, premises)?
+        {
+            assert!(
+                found.premises.is_empty(),
+                "simp discharges its own premises"
+            );
+            return Ok(Some((found.rule, found.occurrence, rule.reverse())));
+        }
+        Ok(self
+            .simp_binder_rule(target, rule, premises)?
+            .map(|evidence| (evidence, target.clone(), false)))
+    }
+
     /// Lift equality of an occurrence through a constant-result context. A
     /// dependent context is not silently coerced into homogeneous congruence.
     fn simp_occurrence_equality(
@@ -181,6 +207,12 @@ impl Context {
                 body,
                 binder_info,
                 ..
+            }
+            | ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
             } = scan.term.node()
             {
                 // Applications share an arena context index; cloning a whole
@@ -189,6 +221,13 @@ impl Context {
                     Some(index) => frames[index].inner.clone(),
                     None => outer.clone(),
                 };
+                if matches!(scan.term.node(), ExprNode::ForallE { .. })
+                    && !self.simp_known_proposition(&scan.term)?
+                {
+                    // The pin's dependent non-Prop Pi path only performs
+                    // definitional simplification, not theorem rewriting.
+                    continue;
+                }
                 let enclosing = self.txn.lctx.clone();
                 let mut local = self.equality_local(binder_type.clone())?;
                 local.binder_info = *binder_info;
@@ -212,7 +251,15 @@ impl Context {
                         while let Some(at) = current {
                             self.tick()?;
                             let frame = &frames[at];
-                            let (_, lifted) = self.simp_close_lambda(frame, next, evidence)?;
+                            let (_, lifted) = match frame.binder.node() {
+                                ExprNode::Lam { .. } => {
+                                    self.simp_close_lambda(frame, next, evidence)?
+                                }
+                                ExprNode::ForallE { .. } => {
+                                    self.simp_close_forall(frame, next, evidence)?
+                                }
+                                _ => unreachable!("only opened binders have frames"),
+                            };
                             (next, evidence) = self.simp_occurrence_equality(
                                 &frame.root,
                                 &frame.binder,
@@ -235,10 +282,7 @@ impl Context {
             }
             // Binder bodies are entered only by the scoped path above. Domains
             // and arbitrary type-level Pi congruence are not rewrite targets.
-            if matches!(
-                scan.term.node(),
-                ExprNode::ForallE { .. } | ExprNode::LetE { .. }
-            ) {
+            if matches!(scan.term.node(), ExprNode::LetE { .. }) {
                 continue;
             }
             for child in children(&scan.term).into_iter().rev().flatten() {
