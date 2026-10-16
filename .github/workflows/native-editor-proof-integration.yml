@@ -61,7 +61,7 @@ jobs:
           cargo test --locked -p fln-olean --lib extension_write::
           cargo test --locked -p fln-olean --lib rebuild::
           cargo test --locked -p fln-elab --lib source::subst::
-          cargo test --locked -p fln --test source_subst --test source_subst_operand --no-fail-fast
+          cargo test --locked -p fln --test source_subst --test source_subst_operand --test source_subst_data --no-fail-fast
           cargo test --locked -p fln-server
           cargo test --locked -p fln-cli --lib source_check::lsp::dependencies
           cargo test --locked -p fln-cli --test lsp_proof_modules --test lsp_stdio_e2e --test source_module_check --no-fail-fast
@@ -95,9 +95,9 @@ jobs:
         shell: python
         run: |
           import json, os, pathlib, re, subprocess
-          source = pathlib.Path('crates/fln/tests/source_subst_operand.rs').read_text()
-          cases = re.findall(r'"(theorem (?:t|bad) [^"\\]*(?:\\.[^"\\]*)*)"', source)
-          assert len(cases) >= 14, 'shared source fixture inventory unexpectedly shrank'
+          source = '\n'.join(pathlib.Path('crates/fln/tests/' + name).read_text() for name in ('source_subst_operand.rs', 'source_subst_data.rs'))
+          cases = re.findall(r'"((?:theorem (?:t|bad) |def t |universe )[^"\\]*(?:\\.[^"\\]*)*)"', source)
+          assert len(cases) >= 18, 'shared source fixture inventory unexpectedly shrank'
           lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
           fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'substitution.lean'
           for index, quoted in enumerate(cases):
