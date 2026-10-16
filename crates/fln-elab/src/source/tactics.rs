@@ -19,6 +19,7 @@ pub(in crate::source) mod eliminate;
 mod empty;
 mod equality;
 mod extensionality;
+mod false_or_by_contra;
 mod guard;
 mod guard_hyp;
 mod index_equations;
@@ -985,6 +986,16 @@ impl Context {
                     name,
                     proposition,
                 });
+            } else if kind == &parser_kind(&["Tactic", "falseOrByContra"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(
+                    keyword,
+                    "false_or_by_contra",
+                    "contradiction preparation tactic",
+                )?;
+                self.false_or_by_contra_proof_goal(proof, goal)?;
             } else if kind == &parser_kind(&["Tactic", "tacticExfalso"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

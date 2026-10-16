@@ -2,7 +2,14 @@ name: Native contradiction preparation
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/fln-contradiction-tactic.yml']
+    paths:
+      - '.github/workflows/fln-contradiction-tactic.yml'
+      - 'crates/fln-parse/src/proofs.rs'
+      - 'crates/fln-parse/tests/false_or_by_contra.rs'
+      - 'crates/fln-elab/src/source/tactics.rs'
+      - 'crates/fln-elab/src/source/tactics/**'
+      - 'crates/fln/tests/source_false_or_by_contra.rs'
+      - 'crates/fln-cli/tests/source_false_or_by_contra.rs'
 permissions:
   contents: read
 jobs:
@@ -10,8 +17,6 @@ jobs:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: write
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -23,112 +28,30 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Apply reviewed candidate without overwriting concurrent goal-identity changes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          def blob(data):
-              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          manifest = {
-              'crates/fln-elab/src/source/tactics.rs': '59434310c7eafe07657ab4b6a65e9daeb4d86c0b',
-              'crates/fln-parse/src/proofs.rs': '514f3835788ed221f9c1f7d884fa78c3f4781ae5',
-              'crates/fln-elab/src/source/tactics/false_or_by_contra.rs': None,
-              'crates/fln-parse/tests/false_or_by_contra.rs': None,
-              'crates/fln/tests/source_false_or_by_contra.rs': None,
-              'crates/fln-cli/tests/source_false_or_by_contra.rs': None,
-          }
-          req = urllib.request.Request(
-              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/915d1d232534e029c327c9a542be4d03fd25cb3b',
-              headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
-          with urllib.request.urlopen(req, timeout=60) as response:
-              result = json.load(response)
-          payload = base64.b64decode(result['content'])
-          assert blob(payload) == '915d1d232534e029c327c9a542be4d03fd25cb3b'
-          patch = gzip.decompress(base64.b64decode(payload, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == 'fe7a4310daac49b3a200fc39015e8c21e37f265e6bad5b8855e13db9b47356bc'
-          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
-          assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
-          for path, before in manifest.items():
-              file = pathlib.Path(path)
-              assert not file.is_symlink()
-              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'contradiction-evidence'
-          root.mkdir()
-          (root / 'paths.json').write_text(json.dumps(paths))
-          (root / 'candidate.patch').write_bytes(patch)
-          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          subprocess.run(['git', 'apply', '--check', str(root / 'candidate.patch')], check=True)
-          subprocess.run(['git', 'apply', str(root / 'candidate.patch')], check=True)
-      - name: Format changed implementation and tests
+      - name: Check changed source formatting
         shell: bash
         run: |
           set -euo pipefail
           rustup show active-toolchain
           rustc -Vv
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'contradiction-evidence'
-          paths = json.loads((root / 'paths.json').read_text())
-          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths], check=True)
-          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *paths], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          PY
-      - name: Test canonical syntax and native proof preparation
+          rustfmt --edition 2024 --config skip_children=true --check \
+            crates/fln-elab/src/source/tactics.rs \
+            crates/fln-elab/src/source/tactics/false_or_by_contra.rs \
+            crates/fln-parse/src/proofs.rs \
+            crates/fln-parse/tests/false_or_by_contra.rs \
+            crates/fln/tests/source_false_or_by_contra.rs \
+            crates/fln-cli/tests/source_false_or_by_contra.rs
+          git diff --check
+      - name: Test canonical syntax and native proof obligations
         run: |
           set -euo pipefail
           cargo test --locked -p fln-parse --test false_or_by_contra -- --nocapture
-          cargo test --locked -p fln --test source_false_or_by_contra --test source_goal_identities -- --nocapture --test-threads=1
-      - name: Test installed CLI and retained classical and closing tactics
-        run: |
-          set -euo pipefail
+          cargo test --locked -p fln --test source_false_or_by_contra --test source_goal_identities --test source_core_closing_tactics --test source_classical_tactics -- --nocapture --test-threads=1
           cargo test --locked -p fln-cli --test source_false_or_by_contra -- --nocapture
-          cargo test --locked -p fln --test source_core_closing_tactics --test source_classical_tactics -- --nocapture --test-threads=1
-      - name: Check elaborator and changed targets without relaxing warnings
+      - name: Check elaborator and affected targets without relaxing warnings
         run: |
           set -euo pipefail
           cargo clippy --locked -p fln-elab --lib -- -D warnings
           cargo clippy --locked -p fln-parse --test false_or_by_contra -- -D warnings
           cargo clippy --locked -p fln --test source_false_or_by_contra --test source_goal_identities -- -D warnings
           cargo clippy --locked -p fln-cli --test source_false_or_by_contra -- -D warnings
-      - name: Retain immutable tested source blobs for direct main publication
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, hashlib, json, os, pathlib, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'contradiction-evidence'
-          paths = json.loads((root / 'paths.json').read_text())
-          blobs = {}
-          for path in paths:
-              data = pathlib.Path(path).read_bytes()
-              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs',
-                  data=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode(),
-                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result['sha'] == expected, path
-              blobs[path] = expected
-          receipt = {'base': (root / 'base.txt').read_text().strip(), 'blobs': blobs, 'published_branch': False}
-          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
-          print('FLN_CONTRADICTION_TESTED_BLOBS ' + json.dumps(receipt), flush=True)
-      - name: Retain relevant open functional work for follow-on implementation
-        shell: python
-        run: |
-          import json, os, pathlib
-          rows = [json.loads(line) for line in pathlib.Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          matches = [row for row in rows if row.get('status') in ('open', 'in_progress') and row.get('priority', 4) <= 1 and any(word in (row.get('title', '') + ' ' + row.get('description', '')).lower() for word in ('tactic', 'source', 'elaborat'))]
-          result = [{'id': row.get('id'), 'title': row.get('title'), 'status': row.get('status'), 'priority': row.get('priority'), 'description': row.get('description', '')[:1500]} for row in matches]
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'contradiction-evidence'
-          (root / 'open-functional-beads.json').write_text(json.dumps(result, indent=2))
-          print(json.dumps(result[:20], indent=2))
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: contradiction-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/contradiction-evidence
-          retention-days: 7
-          if-no-files-found: warn

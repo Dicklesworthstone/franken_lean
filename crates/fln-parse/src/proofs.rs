@@ -352,6 +352,7 @@ pub(crate) fn tactic(
             "conv",
             "infer_instance",
             "exfalso",
+            "false_or_by_contra",
             "clear",
             "norm_cast",
             // `syntax (name := done) "done" : tactic` (`Init/Tactics.lean`).
@@ -372,6 +373,9 @@ pub(crate) fn tactic(
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word])),
+        // An imported token table may classify the tactic keyword as a symbol.
+        // Do not change the lexer's policy for ordinary declaration names.
+        TokenKind::Symbol(symbol) if symbol == "false_or_by_contra" => Some("false_or_by_contra"),
         // `suffices` is a keyword token, not an identifier.
         TokenKind::Symbol(symbol) if symbol == "suffices" => Some("suffices"),
         TokenKind::Symbol(symbol) if symbol == "exists" => Some("exists"),
@@ -646,6 +650,7 @@ fn local_tactic(
         | "ac_rfl"
         | "infer_instance"
         | "exfalso"
+        | "false_or_by_contra"
         | "sorry"
         | "admit"
         | "done"
@@ -738,6 +743,7 @@ fn local_tactic(
         // `tacticNorm_cast__` (`Init/Tactics.lean`).
         "infer_instance" => "tacticInfer_instance",
         "exfalso" => "tacticExfalso",
+        "false_or_by_contra" => "falseOrByContra",
         "sorry" => "tacticSorry",
         "admit" => "tacticAdmit",
         "norm_cast" => "tacticNorm_cast__",
