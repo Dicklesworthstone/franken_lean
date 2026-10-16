@@ -123,6 +123,13 @@ impl Preparation<'_> {
         visited: &mut usize,
         limits: IngressLimits,
     ) -> Result<Option<IntrinsicBinding>, IngressError> {
+        // Typed diagnostic adapters are private to this preparation, and their
+        // complete logical and extern contracts have already been checked.
+        // Do not cache them in the scalar catalog or resolve them by spelling.
+        if let Some(binding) = self.diagnostic_intrinsic_binding(requested) {
+            charge_catalog_node(visited, limits)?;
+            return Ok(Some(binding));
+        }
         self.native_intrinsics.binding(
             self.environment,
             requested,
