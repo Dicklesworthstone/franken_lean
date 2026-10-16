@@ -22,6 +22,12 @@ impl Context {
                 *self = trial;
                 return Ok(term);
             }
+            Err(error) if observation_complete(&error) => {
+                // This is a successful read-only observation, not a failed
+                // candidate. Preserve its payload and propagate the stop.
+                *self = trial;
+                return Err(error);
+            }
             Err(error) if definite_mismatch(&error) => error,
             Err(error) => return Err(error),
         };
@@ -37,6 +43,10 @@ impl Context {
                 Ok(term)
             }
             Ok(None) => Err(original_error),
+            Err(error) if observation_complete(&error) => {
+                *self = retry;
+                Err(error)
+            }
             Err(error) if instances::nonmatch(&error) => Err(original_error),
             Err(error) => Err(error),
         }
@@ -98,14 +108,9 @@ impl Context {
             rhs: equality.lhs.clone(),
         };
         let reverse_proof = self.symm(
-            &equality.level,
-            &equality.alpha,
-            &equality.lhs,
-            &equality.rhs,
-            proof.clone(),
-        );
-        self.substitution_transport(&reverse, abstracted, operand, reverse_proof)
-            .map(Some)
+            &equality.level, &equality.alpha, &equality.lhs, &equality.rhs, proof.clone(),
+        )?;
+        self.substitution_transport(&reverse, abstracted, operand, reverse_proof).map(Some)
     }
 }
 
@@ -119,3 +124,12 @@ fn definite_mismatch(error: &NatDefinitionElabError) -> bool {
                 })
         )
 }
+
+fn observation_complete(error: &NatDefinitionElabError) -> bool {
+    matches!(error,
+        NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)
+    )
+}
+
+#[cfg(test)]
+mod tests;

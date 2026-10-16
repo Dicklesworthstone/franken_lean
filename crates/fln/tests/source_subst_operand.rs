@@ -71,3 +71,51 @@ fn a_failed_retry_does_not_poison_tactic_backtracking() {
     let result = check(source);
     assert!(matches!(result, Ok(Outcome::Complete(_))), "{result:?}");
 }
+
+#[test]
+fn direct_and_retried_casts_preserve_read_only_editor_observations() {
+    use fln::source_check::inspect::{ObservationKind, SourceObservation};
+    use fln::source_check::modules::{
+        SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+    };
+    use fln::{Name, SourceModuleInput};
+
+    for source in [
+        "theorem pending (P : Nat → Prop) (a b : Nat) (h : a = b) (hp : P a) : P b := h ▸ hp",
+        "theorem pending (P : Nat → Prop) (a b : Nat) (h : a = b) (hp : P b) : P b := h ▸ hp",
+        "theorem pending (P : Nat → Prop) (a b : Nat) (h : a = b) (hp : P b) : P b := h ▸ (hp : P b)",
+    ] {
+        for kind in [ObservationKind::Term, ObservationKind::TermGoal] {
+            let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+            let base = Engine::with_source_seed(admission).unwrap().into_complete().unwrap();
+            let mut session = SourceModuleSession::new(
+                base,
+                KVMap::new(),
+                SourceModuleCheckLimits::new(SourceCheckLimits::new(admission)),
+                SourceModuleCacheLimits::default(),
+            );
+            let name = Name::from_components(["Main"]);
+            let result = session.inspect(
+                &[SourceModuleInput { name: &name, source: source.as_bytes() }],
+                &name,
+                source.rfind("hp").unwrap(),
+                kind,
+            ).unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                .into_complete().unwrap();
+            assert!(!result.prefix.checked.checked.engine.environment()
+                .contains(&Name::from_components(["pending"])));
+            match result.observation {
+                Some(SourceObservation::Term { type_, locals, range, .. }) => {
+                    assert_eq!(&source[range], "hp");
+                    assert_eq!(type_, locals.find_by_user_name(&Name::from_components(["hp"])).unwrap().type_);
+                }
+                Some(SourceObservation::Goals { goals, range }) => {
+                    assert_eq!(&source[range], "hp");
+                    assert_eq!(goals.len(), 1);
+                    assert_eq!(goals[0].target, goals[0].locals.find_by_user_name(&Name::from_components(["hp"])).unwrap().type_);
+                }
+                None => panic!("cast trial discarded its observation: {source}"),
+            }
+        }
+    }
+}

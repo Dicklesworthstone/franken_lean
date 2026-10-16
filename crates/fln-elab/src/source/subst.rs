@@ -3,7 +3,7 @@
 //! (`Lean/Elab/BuiltinNotation.lean:457`).
 //!
 //! `h : a = b` rewrites `e`. With an expected type `T`, the motive abstracts `b` in `T`, or
-//! failing that `a` (with `h` reversed by `Eq.symm`); `e` is elaborated against the motive at
+//! failing that `a` (with `h` reversed by an ordinary equality recursor); `e` is elaborated against the motive at
 //! the other side, and the result is `@Eq.rec α a motive e b h`. Without an expected type,
 //! `e`'s own type is abstracted at `a`, or failing that at `b`.
 //!
@@ -127,7 +127,7 @@ impl Context {
                     if !abstracted.has_loose_bvars() {
                         return Err(refuse(SubstError::ExpectedNotMentioned));
                     }
-                    proof = self.symm(&level, &alpha, &lhs, &rhs, proof);
+                    proof = self.symm(&level, &alpha, &lhs, &rhs, proof)?;
                     std::mem::swap(&mut lhs, &mut rhs);
                 }
                 let operand_expected = self.substitute(&abstracted, &lhs)?;
@@ -137,8 +137,9 @@ impl Context {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
                 };
-                let operand =
-                    self.substitution_operand(operand, &operand_expected, &oriented, &proof)?;
+                let operand = self.substitution_operand(
+                    operand, &operand_expected, &oriented, &proof,
+                )?;
                 (abstracted, operand)
             }
             None => {
@@ -151,17 +152,14 @@ impl Context {
                     if !abstracted.has_loose_bvars() {
                         return Err(refuse(SubstError::NotMentioned));
                     }
-                    proof = self.symm(&level, &alpha, &lhs, &rhs, proof);
+                    proof = self.symm(&level, &alpha, &lhs, &rhs, proof)?;
                     std::mem::swap(&mut lhs, &mut rhs);
                 }
                 (abstracted, operand)
             }
         };
         self.substitution_transport(
-            &Equality { level, alpha, lhs, rhs },
-            abstracted,
-            operand,
-            proof,
+            &Equality { level, alpha, lhs, rhs }, abstracted, operand, proof,
         )
     }
 
@@ -212,13 +210,34 @@ impl Context {
         })
     }
 
-    /// `@Eq.symm α a b h : b = a`.
-    fn symm(&self, level: &Level, alpha: &Expr, lhs: &Expr, rhs: &Expr, proof: Expr) -> Expr {
-        [alpha.clone(), lhs.clone(), rhs.clone(), proof]
-            .into_iter()
-            .fold(
-                Expr::const_(Name::from_components(["Eq", "symm"]), vec![level.clone()]),
-                Expr::app,
-            )
+    /// Derive `b = a` from `h : a = b` using only admitted `Eq.rec` and
+    /// `Eq.refl`. The minimal source seed deliberately does not declare an
+    /// `Eq.symm` helper; neither forward retries nor reverse casts may invent it.
+    fn symm(
+        &mut self,
+        level: &Level,
+        alpha: &Expr,
+        lhs: &Expr,
+        rhs: &Expr,
+        proof: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let equality = Equality {
+            level: level.clone(),
+            alpha: alpha.clone(),
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        };
+        let x = Expr::bvar(0).map_err(|_| failure(SourceInferenceError::Scope))?;
+        let abstracted = eq(level, alpha, x, lhs.clone());
+        let reflexivity = [alpha.clone(), lhs.clone()].into_iter().fold(
+            Expr::const_(Name::from_components(["Eq", "refl"]), vec![level.clone()]),
+            Expr::app,
+        );
+        let operand = Typed {
+            value: reflexivity,
+            type_: eq(level, alpha, lhs.clone(), lhs.clone()),
+        };
+        self.substitution_transport(&equality, abstracted, operand, proof)
+            .map(|term| term.value)
     }
 }
