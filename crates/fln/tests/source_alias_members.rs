@@ -117,7 +117,5 @@ fn aliases_neither_create_namespaces_nor_prove_false_equalities() {
             "{source}"
         );
     }
-    accepted(&format!(
-        "{prefix}theorem qualified : Inner.x = 7 := rfl\n"
-    ));
+    accepted(&format!("{prefix}theorem qualified : Inner.x = 7 := rfl\n"));
 }

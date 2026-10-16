@@ -337,13 +337,43 @@ pub(crate) fn apply_module_control_command(
             offset,
             message,
         };
-        // A module file's public world receives no alias here: refused, never dropped.
-        if public.is_some() {
-            return Err(refuse("export in a module file is not implemented".into()));
-        }
+        scopes
+            .check_limits(&control)
+            .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
         let aliases = scopes
             .export_aliases(engine.environment(), namespace, names)
             .map_err(refuse)?;
+        if let Some(public) = public {
+            // `elabExport` adds aliasExtension entries regardless of the section's
+            // declaration visibility (Lean/Elab/BuiltinCommand.lean). The native
+            // journal currently requires every target to exist, so a private-only
+            // target remains an explicit unsupported case, never a dropped alias
+            // or a copied declaration. Public targets retain their distinct checked
+            // implementations/signatures in the two worlds.
+            let mut next = public.engine().clone();
+            for (alias, declaration) in aliases {
+                if !next.environment().contains(&declaration) {
+                    return Err(refuse(format!(
+                        "export of a private-only declaration `{}` requires hidden alias metadata",
+                        declaration.to_display_string()
+                    )));
+                }
+                next.environment =
+                    fln_elab::aliases::register(next.environment(), &alias, &declaration)
+                        .map_err(|error| refuse(error.to_string()))?;
+            }
+            return match public
+                .publish(engine, next, Vec::new(), &scopes.public_scope(), options)
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
+            {
+                Outcome::Complete(next) => {
+                    *engine = next;
+                    Ok(Outcome::Complete(()))
+                }
+                Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+            };
+        }
         let mut environment = engine.environment.clone();
         for (alias, declaration) in aliases {
             environment = fln_elab::aliases::register(&environment, &alias, &declaration)
