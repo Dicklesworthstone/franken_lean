@@ -297,7 +297,20 @@ impl Context {
             return Err(error(TacticError::ExpectedProposition));
         }
         let proposition = self.instantiate(&proposition.value)?;
-        let dictionary = self.decision_dictionary(&proposition)?;
+        // The pin's by_cases macro opens Classical while elaborating the
+        // dependent conditional (Init/ByCases.lean). Activate its *registered*
+        // scoped instances rather than manufacturing a propDecidable call:
+        // ordinary priorities, local dictionaries and erasures still matter.
+        // The scope ends before either branch, including after a failed search.
+        self.tick()?;
+        let mut scopes = self.source_scope.instance_scopes.clone();
+        scopes
+            .activate(&self.txn.env, &Name::from_components(["Classical"]))
+            .map_err(instances::registry_error)?;
+        let saved = std::mem::replace(&mut self.source_scope.instance_scopes, scopes);
+        let dictionary = self.decision_dictionary(&proposition);
+        self.source_scope.instance_scopes = saved;
+        let dictionary = dictionary?;
         let target_type = self
             .known_type(&goal.target)?
             .ok_or_else(|| error(TacticError::ExpectedGoal))?;
