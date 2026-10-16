@@ -52,7 +52,7 @@ enum RequestContract {
     Initialize,
     Shutdown,
     DiagnosticWait,
-    NoInformationQuery,
+    PlainTermGoal,
     PlainGoal,
     Hover,
     Completion,
@@ -71,7 +71,7 @@ impl RequestContract {
             "textDocument/hover" => Self::Hover,
             "textDocument/completion" => Self::Completion,
             "textDocument/definition" => Self::Definition,
-            "$/lean/plainTermGoal" => Self::NoInformationQuery,
+            "$/lean/plainTermGoal" => Self::PlainTermGoal,
             "$/lean/rpc/connect" | "$/lean/rpc/call" => Self::UnsupportedRpc,
             _ => Self::UnknownMethod,
         }
@@ -82,7 +82,7 @@ impl RequestContract {
             Self::Initialize => "initialize",
             Self::Shutdown => "shutdown",
             Self::DiagnosticWait => "diagnostic-wait",
-            Self::NoInformationQuery => "no-information-query",
+            Self::PlainTermGoal => "plain-term-goal",
             Self::PlainGoal => "plain-goal",
             Self::Hover => "hover",
             Self::Completion => "completion",
@@ -533,6 +533,7 @@ fn classify_method_response(
         ),
         (
             RequestContract::PlainGoal
+            | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition,
@@ -540,6 +541,11 @@ fn classify_method_response(
         ) if value.trim() == "null" => Ok(MethodResponseClass::NoInformationQueryResult),
         (RequestContract::PlainGoal, ResponseShape::Result(value))
             if crate::json::plain_goal_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
+        (RequestContract::PlainTermGoal, ResponseShape::Result(value))
+            if crate::json::plain_term_goal_result(value) =>
         {
             Ok(MethodResponseClass::SemanticQueryResult)
         }
@@ -563,6 +569,7 @@ fn classify_method_response(
         }
         (
             RequestContract::PlainGoal
+            | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition,
@@ -570,6 +577,7 @@ fn classify_method_response(
         ) => Ok(MethodResponseClass::SemanticQueryError),
         (
             RequestContract::PlainGoal
+            | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition,
@@ -580,6 +588,7 @@ fn classify_method_response(
         ),
         (
             RequestContract::PlainGoal
+            | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition,
@@ -587,19 +596,6 @@ fn classify_method_response(
         ) => mismatch(
             format!("error code {code}"),
             "InvalidParams, RequestFailed, or RequestCancelled",
-        ),
-        (RequestContract::NoInformationQuery, ResponseShape::Result(value))
-            if value.trim() == "null" =>
-        {
-            Ok(MethodResponseClass::NoInformationQueryResult)
-        }
-        (RequestContract::NoInformationQuery, ResponseShape::Result(value)) => mismatch(
-            result_kind(value).to_string(),
-            "the current null no-information result",
-        ),
-        (RequestContract::NoInformationQuery, ResponseShape::Error(code)) => mismatch(
-            format!("error code {code}"),
-            "the current null no-information result",
         ),
         (RequestContract::UnsupportedRpc, ResponseShape::Error(REQUEST_FAILED_CODE)) => {
             Ok(MethodResponseClass::RpcUnsupportedError)
@@ -878,7 +874,7 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "{{\"schema\":\"fln.lsp-client-server-correlation/7\",",
             "\"clientSessionSchema\":\"fln.lsp-client-session/3\",",
             "\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\",",
-            "\"methodResponseSchema\":\"fln.lsp-method-response/3\",",
+            "\"methodResponseSchema\":\"fln.lsp-method-response/4\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -1014,7 +1010,7 @@ mod tests {
         assert_eq!(stats.cancellation_target_id_bytes, 0);
         let receipt = render_correlation(stats);
         assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/7\""));
-        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/3\""));
+        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/4\""));
         assert!(receipt.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
         assert!(receipt.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
         assert!(receipt.contains("\"methodContractResponses\":3"));
@@ -1346,3 +1342,7 @@ mod tests {
         assert_eq!(stats.unknown_method_not_found_errors, 1);
     }
 }
+
+#[cfg(test)]
+#[path = "correlation/term_goal_tests.rs"]
+mod term_goal_tests;
