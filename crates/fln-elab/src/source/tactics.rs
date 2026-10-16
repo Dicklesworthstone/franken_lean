@@ -283,8 +283,10 @@ enum Work<'a> {
     EndScript(Vec<&'a Syntax>, usize),
 }
 #[derive(Clone)]
+// The lexical barrier restores both options and tactic-local instances.
 struct OptionScope<'a> {
     options: KVMap,
+    instance_scopes: crate::instances::scoped::ActiveScopes,
     instructions: Vec<&'a Syntax>,
     cursor: usize,
 }
@@ -691,9 +693,9 @@ impl Context {
                         return Err(error(TacticError::ExplicitFailure));
                     }
                     if let Syntax::Node { kind, args, .. } = instruction
-                        && kind == &parser_kind(&["Tactic", "set_option"])
+                        && control::is_scope(kind)
                     {
-                        self.start_tactic_options(proof, args)?;
+                        self.start_tactic_scope(proof, kind, args)?;
                         continue;
                     }
                 }
@@ -809,12 +811,12 @@ impl Context {
                 return Err(error(TacticError::UnsolvedGoals { count }));
             };
             if let Syntax::Node { kind, args, .. } = instruction
-                && kind == &parser_kind(&["Tactic", "set_option"])
+                && control::is_scope(kind)
             {
                 // Finish the preceding tactic's queued branches and close
-                // actions before changing options for this instruction.
+                // actions before changing lexical state for this instruction.
                 proof.work.push(Work::Goal(goal));
-                self.start_tactic_options(proof, args)?;
+                self.start_tactic_scope(proof, kind, args)?;
                 continue;
             }
             proof.cursor += 1;
