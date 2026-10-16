@@ -983,6 +983,38 @@ impl Context {
                     name,
                     proposition,
                 });
+            } else if kind == &parser_kind(&["Tactic", "tacticExfalso"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "exfalso", "exfalso tactic")?;
+                let instance_start = self.instance_goals.len();
+                let term = self.constant(&Name::from_components(["False", "elim"]))?;
+                self.apply_proof_term(proof, goal, term, instance_start)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticInfer_instance"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "infer_instance", "instance synthesis tactic")?;
+                self.txn.lctx = goal.lctx.clone();
+                if let Err(problem) = self.validate_instance_binder(&goal.target) {
+                    if matches!(
+                        problem,
+                        NatDefinitionElabError::Inference(
+                            SourceInferenceError::InvalidInstanceBinder
+                        )
+                    ) {
+                        return Err(error(TacticError::NoMatchingAssumption));
+                    }
+                    return Err(problem);
+                }
+                let value = self.instance_hole(goal.target.clone())?;
+                self.resolve_instances(true)?;
+                let value = self.instantiate(&value)?;
+                if value.has_expr_mvar() || value.has_level_mvar() {
+                    return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+                }
+                self.close_proof_goal(goal, value)?;
             } else if kind == &parser_kind(&["Tactic", "decide"]) {
                 let [keyword, config] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
