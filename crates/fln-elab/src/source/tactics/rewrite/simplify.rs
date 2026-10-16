@@ -34,6 +34,36 @@ impl SimpRule<'_> {
 }
 
 impl Context {
+    /// Expand explicitly selected definitions for the `unfold` tactic.
+    /// Resolution, safety and local-shadowing semantics are shared with explicit
+    /// simp unfolding; callers decide which proof-state locations are replaced.
+    pub(in crate::source) fn unfold_tactic_expression(
+        &mut self,
+        names: &[Syntax],
+        target: &Expr,
+    ) -> Result<(Expr, bool), NatDefinitionElabError> {
+        let mut current = target.clone();
+        let mut changed = false;
+        for syntax in names {
+            self.tick()?;
+            match self.unfold_simp_term(syntax, false, &current)? {
+                UnfoldResult::NotDefinition => {
+                    let name = match syntax {
+                        Syntax::Ident { val, .. } => val.clone(),
+                        _ => return Err(error(TacticError::MalformedScript)),
+                    };
+                    return Err(error(TacticError::UnfoldFailed(name)));
+                }
+                UnfoldResult::Unchanged => {}
+                UnfoldResult::Changed(next) => {
+                    current = next;
+                    changed = true;
+                }
+            }
+        }
+        Ok((current, changed))
+    }
+
     /// Recognize a refutation only when the antecedent is known to be a
     /// proposition. An unknown sort is not permission to guess Prop.
     pub(super) fn simp_negated_proposition(

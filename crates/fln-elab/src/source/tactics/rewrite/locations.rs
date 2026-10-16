@@ -3,14 +3,14 @@
 //! identity under an inaccessible name; otherwise it leaves the live context.
 use super::*;
 
-pub(super) struct RewriteLocations {
-    pub(super) hypotheses: Vec<Name>,
-    pub(super) target: bool,
-    pub(super) all: bool,
+pub(in crate::source) struct RewriteLocations {
+    pub(in crate::source) hypotheses: Vec<Name>,
+    pub(in crate::source) target: bool,
+    pub(in crate::source) all: bool,
 }
 
 impl Context {
-    pub(super) fn rewrite_locations(
+    pub(in crate::source) fn rewrite_locations(
         &mut self,
         syntax: &Syntax,
     ) -> Result<Option<RewriteLocations>, NatDefinitionElabError> {

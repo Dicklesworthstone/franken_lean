@@ -30,6 +30,7 @@ mod relations;
 mod rewrite;
 mod search;
 mod trace;
+mod unfold;
 pub(in crate::source) use refine::RefinementFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,7 @@ pub enum TacticError {
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
+    UnfoldFailed(Name),
     RewriteLocation,
     RewriteMetavariablePattern,
     SimplificationNoProgress,
@@ -178,6 +180,11 @@ impl std::fmt::Display for TacticError {
                 "rewrite location must name an available local hypothesis"
             ),
             Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
+            Self::UnfoldFailed(name) => write!(
+                f,
+                "unfold failed for `{}` in the selected location",
+                name.to_display_string()
+            ),
             Self::RewriteMetavariablePattern => {
                 write!(f, "rewrite pattern has an unresolved metavariable head")
             }
@@ -1067,6 +1074,8 @@ impl Context {
                     }
                     _ => return Err(error(TacticError::MalformedScript)),
                 }
+            } else if kind == &parser_kind(&["Tactic", "unfold"]) {
+                self.unfold_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rwSeq"])
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
             {
