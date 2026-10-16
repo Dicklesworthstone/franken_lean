@@ -335,8 +335,17 @@ impl Engine {
         };
         let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
         let candidate = if is_theorem {
-            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel)
-                .map(|declaration| (declaration, true, true, false, Vec::new()))
+            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel).map(
+                |theorem| {
+                    (
+                        theorem.declaration,
+                        true,
+                        true,
+                        theorem.noncomputable,
+                        theorem.local_functions,
+                    )
+                },
+            )
         } else {
             fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
                 .map(|instance| {

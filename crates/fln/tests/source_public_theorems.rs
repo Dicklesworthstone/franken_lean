@@ -379,3 +379,157 @@ fn public_simp_and_protected_attributes_work_in_both_worlds_without_exposing_pro
             .is_empty()
     );
 }
+
+#[test]
+fn public_proof_helpers_are_independently_checked_and_stay_in_the_private_world() {
+    let base = Engine::builder().build_empty();
+    let api = "module\nprelude\nprivate def secret (P : Prop) (h : P) : P := h\npublic theorem witness (P : Prop) (h : P) : P :=\n  let rec helper : P := secret P h\n  helper\npublic theorem fromWhere (P : Prop) (h : P) : P := helper where\n  helper : P := secret P h\nprivate theorem useLifted (P : Prop) (h : P) : P := witness.helper P h";
+    let local = complete(&base, &[("Api", api)]);
+    let env = local.checked.engine.environment();
+    for name in ["witness.helper", "fromWhere.helper"] {
+        let Some(ConstantInfo::Thm(helper)) = env.find(&n(name)) else {
+            panic!("missing checked proof helper {name}");
+        };
+        for expr in [&helper.base.type_, &helper.value] {
+            assert!(!expr.has_fvar() && !expr.has_loose_bvars());
+            assert!(!expr.has_expr_mvar() && !expr.has_level_mvar());
+        }
+    }
+    let imported = complete(
+        &base,
+        &[
+            (
+                "Main",
+                "prelude\nimport Api\ntheorem client (P : Prop) (h : P) : P := witness P h",
+            ),
+            ("Api", api),
+        ],
+    );
+    let env = imported.checked.engine.environment();
+    assert!(matches!(
+        env.find(&n("witness")),
+        Some(ConstantInfo::Axiom(_))
+    ));
+    for name in ["witness.helper", "fromWhere.helper"] {
+        assert!(!env.contains(&n(name)));
+        let client =
+            format!("prelude\nimport Api\ntheorem leak (P : Prop) (h : P) : P := {name} P h");
+        assert!(
+            matches!(check(&base, &[("Main", &client), ("Api", api)]), Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+        );
+    }
+    assert!(base.environment().is_empty());
+}
+
+#[test]
+fn dead_and_nested_public_proof_helpers_keep_names_and_do_not_publish_on_failure() {
+    let base = Engine::builder().build_empty();
+    let api = "module\nprelude\npublic theorem witness (P : Prop) (h : P) : P :=\n  let rec outer : P :=\n    let rec inner : P := h\n    inner\n  let rec unused : P := h\n  outer";
+    let local = complete(&base, &[("Api", api)]);
+    for name in ["witness.outer", "witness.outer.inner", "witness.unused"] {
+        assert!(
+            matches!(
+                local.checked.engine.environment().find(&n(name)),
+                Some(ConstantInfo::Thm(_))
+            ),
+            "{name}"
+        );
+    }
+    let root = base.logical_root(&KVMap::new());
+    for body in [
+        "let rec helper : P := h; let rec helper : P := h; helper",
+        "let rec unused : Q := h; h",
+    ] {
+        let source =
+            format!("module\nprelude\npublic theorem bad (P Q : Prop) (h : P) : P := {body}");
+        assert!(check(&base, &[("Api", &source)]).is_err(), "{source}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    assert_eq!(
+        complete(&base, &[("Api", api)]).checked.result_logical_root,
+        local.checked.result_logical_root
+    );
+}
+
+#[test]
+fn execution_retains_each_polymorphic_proof_helper_receipt_without_exporting_it() {
+    let api = "module\nprelude\npublic theorem poly.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x :=\n  let rec helper (y : A) (hy : P y) : P y := hy\n  helper x h\nprivate theorem localUse.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x := poly.helper P x h";
+    let main = "prelude\nimport Api\ntheorem client.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x := poly P x h";
+    let names = [n("Main"), n("Api")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: main.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: api.as_bytes(),
+        },
+    ];
+    let executed = fln::source_check::modules::imported::SourceOleanImport::empty(&KVMap::new())
+        .execute_source_modules(
+            &inputs,
+            &names[0],
+            &KVMap::new(),
+            SourceProgramLimits::new(EngineExecutionLimits::new(limits().source.admission.kernel)),
+            None,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let private = executed
+        .modules
+        .iter()
+        .find(|module| module.module == names[1])
+        .unwrap();
+    let proof = &private.commands.batch.source_admissions[0].admission;
+    assert_eq!(
+        proof.admissions.len(),
+        2,
+        "owner and helper need separate council receipts"
+    );
+    assert_eq!(
+        proof.admissions[0].base_logical_root,
+        proof.base_logical_root
+    );
+    assert_eq!(
+        proof.admissions[0].result_logical_root,
+        proof.admissions[1].base_logical_root
+    );
+    assert_eq!(
+        proof.admissions[1].result_logical_root,
+        proof.result_logical_root
+    );
+    let Some(ConstantInfo::Thm(helper)) = proof.engine.environment().find(&n("poly.helper")) else {
+        panic!("a proof helper needs its own checked theorem");
+    };
+    assert_eq!(helper.base.level_params, [n("u")]);
+    let public = executed
+        .modules
+        .last()
+        .unwrap()
+        .commands
+        .batch
+        .engine
+        .environment();
+    assert!(!public.contains(&n("poly.helper")));
+    let Some(ConstantInfo::Axiom(signature)) = public.find(&n("poly")) else {
+        panic!("the imported owner is an exact signature");
+    };
+    assert_eq!(signature.base.level_params, [n("u")]);
+    let checked = complete(
+        &Engine::builder().build_empty(),
+        &[("Main", main), ("Api", api)],
+    );
+    assert_eq!(
+        executed
+            .modules
+            .last()
+            .unwrap()
+            .commands
+            .batch
+            .engine
+            .logical_root(&KVMap::new()),
+        checked.checked.result_logical_root
+    );
+}

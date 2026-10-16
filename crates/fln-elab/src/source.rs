@@ -4529,15 +4529,23 @@ fn probe_header_visibility(
 }
 
 /// Elaborate a public theorem's header and proof in their respective worlds.
-/// This produces only an untrusted candidate, never an exported assumption or
-/// an environment successor. Its proof must pass ordinary declaration admission.
+/// This produces only untrusted candidates, never an exported assumption or
+/// an environment successor. The proof and every named local helper must pass
+/// separate ordinary admissions in the private world before publication.
 pub fn elaborate_public_theorem(
     syntax: &Syntax,
     worlds: &TheoremWorlds<'_>,
     kernel: Budget,
-) -> Result<Declaration, NatDefinitionElabError> {
+) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let mut context = Context::public_theorem(syntax, worlds, kernel)?;
-    definition_in_context(syntax, &mut context)
+    let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
+    Ok(ElaboratedDeclaration {
+        declaration,
+        local_functions,
+        irreducible: false,
+        noncomputable: context.noncomputable_definition,
+    })
 }
 
 impl Context {
