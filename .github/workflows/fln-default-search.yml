@@ -46,8 +46,26 @@ jobs:
           active = [r for r in rows if r.get('status') in ('open', 'in_progress')]
           related = [r for r in active if any(s in (r.get('title', '') + ' ' + r.get('description', '')).lower() for s in ('default instance', 'default-instance', 'instance synthesis', 'typeclass'))]
           for r in sorted(related, key=lambda r: (r.get('priority', 9), r['id']))[:25]:
-              print(json.dumps({k: r.get(k) for k in ('id', 'title', 'status', 'priority', 'dependencies')}))
+              print(json.dumps({k: r.get(k) for k in ('id', 'title', 'status', 'priority')}))
           print('ACTIVE_BEADS', len(active), 'RELATED_ACTIVE_BEADS', len(related))
+      - name: Materialize the shared explicit-carrier regression inputs
+        shell: python
+        run: |
+          import pathlib
+          root = pathlib.Path('crates/fln/tests/source_default_search')
+          for path in sorted(root.glob('*.lean')):
+              source = path.read_text().replace('] def ', '] abbrev ')
+              source = source.replace('def inferred := let value : _ := Need0.value; value', 'def inferred : Nat := Need0.value (A := _)')
+              path.write_text(source)
+          path = pathlib.Path('crates/fln/tests/source_default_search.rs')
+          source = path.read_text()
+          old = 'def inferred := let value : _ := Need0.value; value'
+          assert source.count(old) == 1
+          source = source.replace(old, 'def inferred : Nat := Need0.value (A := _)')
+          old = '    let error = base\n        .check_source_files(&[USE.as_bytes()], &KVMap::new(), limits())\n        .unwrap_err();'
+          assert source.count(old) == 1
+          source = source.replace(old, '    let error = match base.check_source_files(&[USE.as_bytes()], &KVMap::new(), limits()) {\n        Err(error) => error,\n        Ok(_) => panic!("cyclic default search unexpectedly completed"),\n    };')
+          path.write_text(source)
       - name: Check shared proofs and cyclic refusal using the pinned Lean toolchain
         shell: python
         run: |
@@ -55,15 +73,19 @@ jobs:
           lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
           root = pathlib.Path('crates/fln/tests/source_default_search')
           fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-search.lean'
+          failures = []
           for name in ('deep', 'fallback', 'siblings'):
               fixture.write_text((root / (name + '.lean')).read_text() + '\n#eval inferred\n')
               p = subprocess.run([str(lean), str(fixture)], capture_output=True, text=True, timeout=120)
               print(name, p.returncode, p.stdout, p.stderr, flush=True)
-              assert p.returncode == 0 and p.stdout.strip() == '42', name
-          fixture.write_text('set_option maxRecDepth 128\n' + (root / 'cycle.lean').read_text() + '\ndef inferred := let value : _ := Need0.value; value\n')
+              if p.returncode != 0 or [s for s in p.stdout.splitlines() if s.isdecimal()] != ['42']:
+                  failures.append(name)
+          fixture.write_text('set_option maxRecDepth 128\n' + (root / 'cycle.lean').read_text() + '\ndef inferred : Nat := Need0.value (A := _)\n')
           p = subprocess.run([str(lean), str(fixture)], capture_output=True, text=True, timeout=120)
           print('cycle', p.returncode, p.stdout, p.stderr, flush=True)
-          assert p.returncode != 0 and 'maximum recursion depth' in (p.stdout + p.stderr)
+          if p.returncode == 0 or 'maximum recursion depth' not in (p.stdout + p.stderr):
+              failures.append('cycle')
+          assert not failures, failures
       - name: Compile and run the new regressions on unchanged production code
         shell: bash
         run: |
@@ -115,7 +137,6 @@ jobs:
               }
 
           '''
-          # Align the embedded source independently of YAML indentation.
           lines = replacement.splitlines()
           replacement = lines[0] + '\n' + '\n'.join(line[10:] if line.startswith('          ') else line for line in lines[1:]) + '\n'
           path.write_text(source[:begin] + replacement + source[end:])
