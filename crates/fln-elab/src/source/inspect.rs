@@ -16,6 +16,10 @@ pub use super::instances::audit::{
 pub enum ObservationKind {
     Goals,
     Term,
+    /// A term's type in its actual local context, including the inferred-type
+    /// fallback used by the pin's plainTermGoal. The observation is `Goals`
+    /// with one provisional goal, never a declaration-admission certificate.
+    TermGoal,
 }
 
 /// A live obligation, not an accepted proof. Types and locals are instantiated
@@ -53,11 +57,17 @@ enum Site {
     By(Range<usize>),
     End(Range<usize>),
     Term(Range<usize>),
+    TermGoal {
+        range: Range<usize>,
+        /// None identifies an identifier; nodes retain their exact parser kind.
+        kind: Option<Name>,
+    },
 }
 impl Site {
     fn range(&self) -> &Range<usize> {
         match self {
             Self::Tactic(r) | Self::By(r) | Self::End(r) | Self::Term(r) => r,
+            Self::TermGoal { range, .. } => range,
         }
     }
 }
@@ -203,7 +213,21 @@ fn select(
         };
         spans.insert(std::ptr::from_ref(node), span.clone());
         let Some(r) = span else { continue };
-        if wanted == ObservationKind::Term && matches!(node, Syntax::Ident { .. }) {
+        if wanted == ObservationKind::TermGoal {
+            match node {
+                Syntax::Ident { .. } => sites.push(Site::TermGoal {
+                    range: r,
+                    kind: None,
+                }),
+                Syntax::Node { kind, .. } if kind.parent() == parser_kind(&["Term"]) => {
+                    sites.push(Site::TermGoal {
+                        range: r,
+                        kind: Some(kind.clone()),
+                    });
+                }
+                _ => {}
+            }
+        } else if wanted == ObservationKind::Term && matches!(node, Syntax::Ident { .. }) {
             sites.push(Site::Term(r));
         } else if wanted == ObservationKind::Goals
             && let Syntax::Node { kind, args, .. } = node
@@ -321,19 +345,25 @@ impl Context {
         Ok(result)
     }
     pub(super) fn observes_term(&self, syntax: &Syntax) -> bool {
-        let Some(Probe {
-            site: Site::Term(range),
-            ..
-        }) = &self.inspection
-        else {
+        let Some(probe) = &self.inspection else {
             return false;
         };
-        matches!(syntax, Syntax::Ident { .. })
-            && syntax.info().pos(true).is_some_and(|p| p.0 == range.start)
-            && syntax
-                .info()
-                .end_pos(true)
-                .is_some_and(|p| p.0 == range.end)
+        match &probe.site {
+            Site::Term(range) => {
+                matches!(syntax, Syntax::Ident { .. })
+                    && syntax.info().pos(true).is_some_and(|p| p.0 == range.start)
+                    && syntax.info().end_pos(true).is_some_and(|p| p.0 == range.end)
+            }
+            // The driver schedules the existing post-term observation task.
+            // Exact spans are checked there with the charged traversal below;
+            // this inexpensive prefilter adds no unbudgeted subtree walk.
+            Site::TermGoal { kind, .. } => match (kind, syntax) {
+                (None, Syntax::Ident { .. }) => true,
+                (Some(selected), Syntax::Node { kind, .. }) => selected == kind,
+                _ => false,
+            },
+            _ => false,
+        }
     }
     pub(super) fn observe_term(
         &mut self,
@@ -343,6 +373,21 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         if !self.observes_term(syntax) {
             return Ok(());
+        }
+        if let Some(Probe {
+            site: Site::TermGoal { range, .. },
+            ..
+        }) = &self.inspection
+        {
+            let selected = range.clone();
+            if self.observation_extent(syntax)?.as_ref() != Some(&selected) {
+                return Ok(());
+            }
+            // Expected-typed holes already carry their actual domain; an
+            // inference-only term carries its inferred type. Observe before
+            // declaration finalization, which would refuse unfinished holes.
+            // An invalid selected term still fails rather than inventing info.
+            return self.observe_goals(&[(term.type_, locals)]);
         }
         self.flush(true)?;
         let expression = self.instantiate(&term.value)?;
@@ -362,12 +407,23 @@ impl Context {
         keyword: &Syntax,
         goal: &tactics::ProofGoal,
     ) -> Result<(), NatDefinitionElabError> {
-        if let Some(Probe {
-            site: Site::By(range),
-            ..
-        }) = &self.inspection
-            && keyword.info().pos(true).is_some_and(|p| p.0 == range.start)
-        {
+        let selected = self.inspection.as_ref().is_some_and(|probe| {
+            let range = match &probe.site {
+                Site::By(range) => range,
+                Site::TermGoal {
+                    range,
+                    kind: Some(kind),
+                } if kind == &parser_kind(&["Term", "byTactic"])
+                    || kind == &parser_kind(&["Term", "byTactic'"]) =>
+                {
+                    range
+                }
+                _ => return false,
+            };
+            keyword.info().pos(true).is_some_and(|p| p.0 == range.start)
+        });
+        if selected {
+            // The by-term's expected goal exists before its first tactic runs.
             return self.observe_goals(&[(goal.target.clone(), goal.lctx.clone())]);
         }
         Ok(())
