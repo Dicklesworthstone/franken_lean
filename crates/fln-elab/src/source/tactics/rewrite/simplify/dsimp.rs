@@ -215,7 +215,11 @@ impl Context {
         budget.transparency = UnificationTransparency::Abbreviations;
         budget.zeta_delta = false;
         let result = (|| {
-            if !trial.proof_types_match_with_budget(&left, &right, budget)? {
+            // Eta may establish reflexivity, but it must not rewrite a record
+            // argument elsewhere in the goal or claim dsimp made progress.
+            let compared_left = trial.dsimp_eta_comparison(&left)?;
+            let compared_right = trial.dsimp_eta_comparison(&right)?;
+            if !trial.proof_types_match_with_budget(&compared_left, &compared_right, budget)? {
                 return Ok(None);
             }
             trial.constant(&Name::from_components(["Eq", "refl"]))?;

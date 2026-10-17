@@ -3,8 +3,9 @@
 //! The pin infers its default dsimp tag for naked `:= rfl`, but not `:= (rfl)`
 //! or `:= by rfl`. Preserve that distinction after syntax has been discarded.
 //! Before recording a tag, verify the admitted theorem's structural reflexivity
-//! proof and its generic equation at instance transparency. Module replay keeps
-//! this bounded append-ordered journal with its originating environment.
+//! proof and generic definitional equality. User-written `:= rfl` is the pin's
+//! explicit defeq-attribute path (MutualDef.elabMutualDef), not its stricter
+//! generated-theorem inference path. Module replay keeps this bounded journal.
 use super::super::super::*;
 use fln_env::constants::ConstantInfo;
 use fln_env::extensions::{

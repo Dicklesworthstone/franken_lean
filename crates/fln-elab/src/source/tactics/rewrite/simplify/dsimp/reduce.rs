@@ -426,9 +426,9 @@ impl Context {
                 }
             }
         }
-        if let Some(receiver) = self.dsimp_eta_structure(term, &head, &arguments)? {
-            return Ok(receiver);
-        }
+        // Record eta is a conversion rule, not a standalone dsimp reduction.
+        // Keep constructor-of-projections syntax unless a selected theorem
+        // rewrites it; eta remains available to reflexive-goal comparison.
         // The pin folds orphan raw numerals back into their source-level OfNat
         // spelling, unless that projection was explicitly selected for unfolding.
         // Keep raw fixture environments without numeric classes separate. In a

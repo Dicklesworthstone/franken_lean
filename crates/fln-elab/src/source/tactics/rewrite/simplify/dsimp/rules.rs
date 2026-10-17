@@ -108,9 +108,11 @@ impl Context {
         }
     }
 
-    /// Eligibility is a property of the whole theorem, not a lucky use-site
-    /// specialization. Open rigid parameters; a theorem that only reduces at
-    /// default transparency must not become a dsimp rule at one concrete input.
+    /// Validate the whole user theorem with rigid parameters, never a lucky
+    /// use-site specialization. Naked source `:= rfl` prepends the explicit
+    /// defeq attribute in the pin; that validator allows safe delta, including
+    /// irreducible definitions. Generated-equation inference is a different API.
+    /// Arbitrary local equality evidence does not enter this metadata path.
     pub(in crate::source) fn dsimp_generic_defeq(
         &mut self,
         type_: &Expr,
@@ -150,7 +152,7 @@ impl Context {
                 return Ok(false);
             };
             let mut budget = UnificationBudget::new(trial.kernel);
-            budget.transparency = UnificationTransparency::Instances;
+            budget.transparency = UnificationTransparency::SafeDefinitions;
             budget.zeta_delta = false;
             trial.proof_types_match_with_budget(&left, &right, budget)
         })();
@@ -180,8 +182,11 @@ impl Context {
                 let (_, _, left, right) = equality_target(&found.rule.type_)
                     .ok_or_else(|| error(TacticError::ExpectedEquality))?;
                 let replacement = if rule.reverse() { left } else { right };
+                // Matching remains at the selected-rule policy. Only after a
+                // tagged, admitted reflexivity rule matches may its replacement
+                // use the attribute validator's stronger conversion policy.
                 let mut budget = UnificationBudget::new(trial.kernel);
-                budget.transparency = UnificationTransparency::Instances;
+                budget.transparency = UnificationTransparency::SafeDefinitions;
                 budget.zeta_delta = false;
                 if !trial.proof_types_match_with_budget(target, &replacement, budget)? {
                     return Ok(None);

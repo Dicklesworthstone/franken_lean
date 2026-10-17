@@ -1,9 +1,21 @@
-//! Record eta is admitted only for an actual single-constructor data family,
-//! the exact generated fields, a common receiver, and a completed conversion.
+//! Record eta is used only for reflexivity comparison, never to report a
+//! changed proof state. The pin's dsimp reducer preserves the constructor form.
+//! Recognition requires an actual single-constructor data family, exact generated
+//! fields, a common receiver, and a completed conversion.
 use super::*;
 
 impl Context {
-    pub(super) fn dsimp_eta_structure(
+    pub(in crate::source) fn dsimp_eta_comparison(
+        &mut self,
+        term: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let (head, arguments) = self.dsimp_spine(term)?;
+        Ok(self
+            .dsimp_eta_structure(term, &head, &arguments)?
+            .unwrap_or_else(|| term.clone()))
+    }
+
+    fn dsimp_eta_structure(
         &mut self,
         term: &Expr,
         head: &Expr,
