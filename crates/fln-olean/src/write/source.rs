@@ -33,6 +33,10 @@ pub struct SourceMetadata {
     pub aux_recursors: Vec<Name>,
     /// Module-owned `Lean.noncomputableExt` tags, sorted by `Name.quickLt`.
     pub noncomputable: Vec<Name>,
+    /// Owned definitional-equality tags. The pin's defeq attribute also records
+    /// backward_defeq; emit both sorted tag arrays, never just the subset.
+    /// These flags are metadata, not a certificate of equality.
+    pub defeq: Vec<Name>,
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
@@ -128,6 +132,15 @@ impl Encoder {
                 "anonymous or duplicate noncomputable declaration",
             )?);
         }
+        if !metadata.defeq.is_empty() {
+            for extension in [layout::DEFEQ_EXTENSION, layout::BACKWARD_DEFEQ_EXTENSION] {
+                blocks.push(self.tagged_names_block(
+                    extension,
+                    &metadata.defeq,
+                    "anonymous or duplicate definitional-equality declaration",
+                )?);
+            }
+        }
         Ok(blocks)
     }
 
@@ -186,10 +199,13 @@ impl Encoder {
 }
 
 #[cfg(test)]
+mod defeq_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::source_extensions::{self, DecodeLimits};
-    fn header() -> OleanWriteHeader<'static> {
+    pub(super) fn header() -> OleanWriteHeader<'static> {
         OleanWriteHeader {
             version: crate::format::OLEAN_ACCEPTED_VERSIONS[0],
             flags: 1,
@@ -198,7 +214,7 @@ mod tests {
             base_addr: 2 * crate::format::REGION_ALIGN as u64,
         }
     }
-    fn input() -> ModuleWriteInput<'static> {
+    pub(super) fn input() -> ModuleWriteInput<'static> {
         ModuleWriteInput {
             is_module: false,
             imports: &[],

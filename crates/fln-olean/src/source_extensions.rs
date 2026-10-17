@@ -16,9 +16,10 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
-    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION, PROTECTED_EXTENSION,
-    REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
+    ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION, CLASS_EXTENSION,
+    DEFAULT_EXTENSION, DEFEQ_EXTENSION, EXTERN_EXTENSION, IMPLEMENTED_BY_EXTENSION,
+    INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION, PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION,
+    SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
@@ -133,6 +134,12 @@ pub struct SourceExtensions {
     pub aux_recursors: Vec<Name>,
     /// Noncomputable tags, interpreted only after checking their owning module.
     pub noncomputable: Vec<Name>,
+    /// The pin's defeq attribute tags, not evidence that an equation is true.
+    /// Source activation must bind names to their checked owning module; each
+    /// use still requires conversion and ordinary proof checking.
+    pub defeq: Vec<Name>,
+    /// Legacy-only tags remain distinct: default dsimp must not activate them.
+    pub backward_defeq: Vec<Name>,
     /// Structure fields and extends-clause metadata, still awaiting checked
     /// constructor/projection validation by the source importer.
     pub structures: Vec<StructureEntry>,
@@ -448,6 +455,8 @@ pub fn decode(
         name(crate::initializers::BUILTIN_INIT_EXTENSION),
         structure_extension_name(),
         name(format::NONCOMPUTABLE_EXTENSION),
+        name(format::DEFEQ_EXTENSION),
+        name(format::BACKWARD_DEFEQ_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -462,6 +471,8 @@ pub fn decode(
     let mut protected = BTreeSet::new();
     let mut aux_recursors = BTreeSet::new();
     let mut noncomputable = BTreeSet::new();
+    let mut defeq = BTreeSet::new();
+    let mut backward_defeq = BTreeSet::new();
     let mut structures = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
@@ -548,7 +559,19 @@ pub fn decode(
                     }
                     out.noncomputable.push(declaration);
                 }
-                _ => unreachable!("fourteen selected extension families"),
+                14 | 15 => {
+                    let declaration = reader.name(&obj)?;
+                    let (seen, names) = if kind == 14 {
+                        (&mut defeq, &mut out.defeq)
+                    } else {
+                        (&mut backward_defeq, &mut out.backward_defeq)
+                    };
+                    if declaration.is_anonymous() || !seen.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated definitional-equality tag"));
+                    }
+                    names.push(declaration);
+                }
+                _ => unreachable!("sixteen selected extension families"),
             }
         }
     }
