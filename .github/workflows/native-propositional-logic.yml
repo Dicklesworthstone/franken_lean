@@ -48,3 +48,134 @@ jobs:
         run: |
           cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
+
+  dsimp:
+    if: github.repository == 'Dicklesworthstone/franken_lean'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install repository-pinned Rust
+        run: |
+          rustup show active-toolchain
+          rustc -Vv
+      - name: Preserve the pinned compiler for offline validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=$(rustc --print sysroot)
+          tar -C "$root" --exclude=lib/rustlib/src --exclude=lib/rustlib/rustc-src -cf - bin lib | gzip -1 > "$RUNNER_TEMP/dsimp-toolchain.tar.gz"
+          sha256sum "$RUNNER_TEMP/dsimp-toolchain.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dsimp-toolchain-${{ github.sha }}
+          path: ${{ runner.temp }}/dsimp-toolchain.tar.gz
+          retention-days: 1
+          compression-level: 0
+      - name: Integrate the reviewed dispatcher on exact source identities
+        shell: python
+        run: |
+          import hashlib, pathlib
+          def change(path, expected, replacements):
+              p = pathlib.Path(path)
+              raw = p.read_bytes()
+              actual = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              assert actual == expected, (path, actual, expected)
+              text = raw.decode()
+              for before, after in replacements:
+                  assert text.count(before) == 1, (path, before)
+                  text = text.replace(before, after)
+              p.write_text(text)
+          change('crates/fln-elab/src/source/tactics.rs', '287626f7f30fd09a0166fe9211fbdbbdec4246f0', [
+              ('    SimplificationNoProgress,', '    SimplificationNoProgress,\n    DefinitionalSimplificationNoProgress,'),
+              ('            Self::SimplificationNoProgress => write!(f, "simp only made no progress"),', '            Self::SimplificationNoProgress => write!(f, "simp only made no progress"),\n            Self::DefinitionalSimplificationNoProgress => write!(f, "`dsimp` made no progress"),'),
+              ('                self.simplify_proof_goal(proof, goal, args)?;', '                self.simplify_proof_goal(proof, goal, args)?;\n            } else if kind == &parser_kind(&["Tactic", "dsimp"]) {\n                self.dsimplify_proof_goal(proof, goal, args)?;'),
+          ])
+          change('crates/fln-elab/src/source/tactics/rewrite/simplify.rs', 'aafb342d837f154a764fd4d9b121e435b2b87761', [
+              ('mod binders;', 'mod binders;\nmod dsimp;'),
+              ('        let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");', '        let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");\n        let dsimp = matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp");'),
+              ('            if simpa { "simpa" } else { "simp" },', '            if simpa { "simpa" } else if dsimp { "dsimp" } else { "simp" },'),
+          ])
+          paths = ['crates/fln-elab/src/source/tactics.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify.rs']
+          paths += ['crates/fln-elab/src/source/tactics/rewrite/simplify/dsimp.rs']
+          paths += [str(p) for p in sorted(pathlib.Path('crates/fln-elab/src/source/tactics/rewrite/simplify/dsimp').glob('*.rs'))]
+          paths += ['crates/fln/tests/source_dsimp.rs', 'crates/fln-cli/tests/source_dsimp.rs']
+          import subprocess
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths], check=True)
+          pathlib.Path('target-dsimp-paths.txt').write_text('\n'.join(paths) + '\n')
+      - name: Preserve formatted candidate blobs without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, urllib.request
+          rows = {}
+          for path in pathlib.Path('target-dsimp-paths.txt').read_text().splitlines():
+              raw = pathlib.Path(path).read_bytes()
+              expected = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=json.dumps({'encoding':'base64','content':base64.b64encode(raw).decode()}).encode(), headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type':'application/json', 'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  actual = json.load(response)['sha']
+              assert actual == expected, path
+              rows[path] = actual
+          print('DSIMP_CANDIDATE_BLOBS ' + json.dumps(rows, sort_keys=True), flush=True)
+          print('CANDIDATE_ONLY: test results below, no branch modified', flush=True)
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'dsimp-blobs.json').write_text(json.dumps(rows, sort_keys=True))
+      - name: Check reducer invariants and real declaration admission
+        run: |
+          cargo test --locked -p fln-elab --lib source::tactics::rewrite::simplify::dsimp::tests
+          cargo test --locked -p fln --test source_dsimp --test source_unfold --test source_simp_locations --no-fail-fast
+          cargo test --locked -p fln-cli --test source_dsimp
+          cargo clippy --locked -p fln-elab --lib -- -D warnings
+          echo 'DSIMP_CANDIDATE_VALIDATED: all preceding commands succeeded'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: dsimp-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/dsimp-blobs.json
+            crates/fln-elab/src/source/tactics.rs
+            crates/fln-elab/src/source/tactics/rewrite/simplify.rs
+            crates/fln-elab/src/source/tactics/rewrite/simplify/dsimp*
+            crates/fln/tests/source_dsimp*
+            crates/fln-cli/tests/source_dsimp.rs
+          retention-days: 2
+
+  dsimp-reference:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check shared source verdicts with the pinned Reference only
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          python3 -I - <<'PY'
+          import os, pathlib, subprocess
+          source = pathlib.Path('crates/fln/tests/source_dsimp.lean').read_text()
+          cases = source.split('-- CASE ')[1:]
+          assert len(cases) == 26, len(cases)
+          failures = []
+          for case in cases:
+              header, text = case.split('\n', 1)
+              name, verdict = header.split(' ')
+              assert verdict in ('accept', 'reject')
+              path = pathlib.Path(os.environ['RUNNER_TEMP']) / (name + '.lean')
+              path.write_text(text)
+              lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+              result = subprocess.run([str(lean), str(path)], capture_output=True, text=True, timeout=60)
+              print(name, verdict, result.returncode, result.stdout, result.stderr, flush=True)
+              if (result.returncode == 0) != (verdict == 'accept'):
+                  failures.append(name)
+          assert not failures, failures
+          PY
