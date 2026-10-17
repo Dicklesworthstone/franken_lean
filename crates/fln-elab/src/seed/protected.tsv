@@ -206,6 +206,7 @@ List.cons	unprotected
 List.foldl	unprotected
 List.foldr	unprotected
 List.head?	unprotected
+List.instAppend	unprotected
 List.length	unprotected
 List.map	unprotected
 List.nil	unprotected

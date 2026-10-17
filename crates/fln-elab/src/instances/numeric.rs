@@ -1,5 +1,6 @@
 //! Native candidates for numeric notation. All dictionaries and adapters are
 //! ordinary definitions: callers admit them before registering any instances.
+mod collections;
 use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, RecordSpec, record_declarations};
 use fln_core::expr::{BinderInfo, Expr, FVarId};
@@ -455,5 +456,6 @@ pub fn declarations() -> Result<NumericSeed, RecordError> {
         ),
         None,
     )?;
+    collections::append(&mut seed)?;
     Ok(seed)
 }
