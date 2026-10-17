@@ -1,6 +1,7 @@
 //! Editor source closures: accepted open buffers override disk snapshots.
 use super::*;
 use fln_server::dispatch::OpenDocumentSource;
+mod project;
 
 pub(in crate::source_check) struct Sources {
     pub(in crate::source_check) names: Vec<Name>,
@@ -12,8 +13,8 @@ pub(in crate::source_check) struct Sources {
     /// import order: `.olean` modules on the search path, as `check-source` resolves
     /// them (bead `fln-uyuz`).
     pub(in crate::source_check) olean_roots: Vec<Name>,
-    /// Where each `.olean` import's source file would be. A file appearing there
-    /// turns the import into a source import, so its importer must be rechecked.
+    /// Additional resolution inputs: missing source candidates and the package
+    /// configuration. Their changes require resolving and checking the importer.
     pub(in crate::source_check) absent_sources: Vec<PathBuf>,
 }
 
@@ -127,8 +128,17 @@ pub(in crate::source_check) fn load(
         return Err(Failure::resource("editor source exceeds its byte limit"));
     }
     let header = parse_source_header(text.as_bytes()).map_err(|e| Failure::input(e.to_string()))?;
-    // No filesystem authority is needed for import-free and untitled documents.
-    if header.imports.is_empty() && (!header.module_system || header.prelude) {
+    let discovered = match document_path(uri) {
+        Ok(path) => project::Project::discover(&path)?,
+        Err(_) => None,
+    };
+    // Untitled and standalone import-free documents keep their filesystem-free
+    // checking path. Package files retain their actual module identity even
+    // when this particular version has no imports.
+    if header.imports.is_empty()
+        && (!header.module_system || header.prelude)
+        && discovered.is_none()
+    {
         let name = if header.module_system {
             document_path(uri)
                 .ok()
@@ -161,8 +171,14 @@ pub(in crate::source_check) fn load(
         .and_then(|s| s.to_str())
         .ok_or_else(|| Failure::input("source module entry needs a UTF-8 name"))?;
     validate_component(stem)?;
-    let root = entry_path.parent().expect("normalized file parent");
-    let entry_name = Name::from_components([stem]);
+    let (project, entry_name) = match discovered {
+        Some((project, name)) => (Some(project), name),
+        None => (None, Name::from_components([stem])),
+    };
+    let root = project.as_ref().map_or_else(
+        || entry_path.parent().expect("normalized file parent"),
+        |project| project.root.as_path(),
+    );
     let mut overlays = BTreeMap::new();
     for document in documents {
         let Ok(path) = document_path(document.uri) else {
@@ -192,6 +208,9 @@ pub(in crate::source_check) fn load(
         olean_roots: Vec::new(),
         absent_sources: Vec::new(),
     };
+    if let Some(project) = &project {
+        result.absent_sources.push(project.config.clone());
+    }
     let mut external: Vec<Name> = Vec::new();
     let mut source_imports = BTreeMap::new();
     let mut by_name = BTreeMap::from([(entry_name.clone(), 0usize)]);
@@ -221,8 +240,16 @@ pub(in crate::source_check) fn load(
             }
             // No open buffer and no source file: an `.olean` import, decided exactly
             // as `check-source` decides it. An unsaved buffer still wins.
-            let (candidate, _) = module_file(root, &name, "lean")?;
-            if !overlays.contains_key(&candidate) && !local_source_exists(root, &name)? {
+            let owner = project
+                .as_ref()
+                .map(|project| project.source_root(&name))
+                .transpose()?
+                .flatten();
+            let source_root = owner.unwrap_or(root);
+            let (candidate, _) = module_file(source_root, &name, "lean")?;
+            if (project.is_some() && owner.is_none())
+                || (!overlays.contains_key(&candidate) && !local_source_exists(source_root, &name)?)
+            {
                 external.push(name);
                 result.absent_sources.push(candidate);
                 continue;
@@ -232,7 +259,7 @@ pub(in crate::source_check) fn load(
             }
             // The common resolver validates names and all on-disk path components.
             // A missing final file is legal only when an accepted editor buffer owns it.
-            let path = checked_module_path(root, &name, true)?;
+            let path = checked_module_path(source_root, &name, true)?;
             if by_path.contains_key(&path) {
                 return Err(Failure::input("source module paths alias one another"));
             }
