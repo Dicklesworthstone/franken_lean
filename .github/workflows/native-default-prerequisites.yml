@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   validate:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.event.head_commit.message == 'test(elab): validate nested default inference before direct publication'
+    if: github.repository == 'Dicklesworthstone/franken_lean'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
