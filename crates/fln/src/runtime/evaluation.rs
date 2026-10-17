@@ -37,6 +37,49 @@ fn family(label: &Name) -> Option<(Family, usize)> {
 }
 
 impl Preparation<'_> {
+    /// Match the raw CLI's logical type domain before running user code. Safe
+    /// aliases use the compiler's bounded, validated runtime normalization.
+    pub(crate) fn raw_evaluation_result_type(
+        &mut self,
+        source: &Expr,
+        io_payload: bool,
+    ) -> Result<bool, IngressError> {
+        let normalized = self.erase_runtime_type(source)?;
+        let mut current = &normalized;
+        let mut depth = 0usize;
+        while let ExprNode::App { f, a } = current.node() {
+            self.tick()?;
+            if !matches!(f.node(), ExprNode::Const { name: label, levels }
+                if label == &name("List") && levels.len() == 1)
+                || depth == 64
+            {
+                return Ok(false);
+            }
+            depth += 1;
+            current = a;
+        }
+        self.tick()?;
+        let ExprNode::Const {
+            name: label,
+            levels,
+        } = current.node()
+        else {
+            return Ok(false);
+        };
+        if io_payload
+            && depth == 0
+            && ((label == &name("Unit") && levels.is_empty())
+                || (label == &name("PUnit") && levels.as_slice() == [Level::one()]))
+        {
+            return Ok(true);
+        }
+        if !levels.is_empty() {
+            return Ok(false);
+        }
+        Ok(["Nat", "String", "Bool"].iter().any(|s| label == &name(s))
+            || (depth == 0 && ["Float", "Float32"].iter().any(|s| label == &name(s))))
+    }
+
     pub(crate) fn evaluation_presentation_type(
         &mut self,
         source: &Expr,

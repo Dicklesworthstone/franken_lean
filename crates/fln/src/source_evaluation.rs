@@ -13,6 +13,11 @@ use super::*;
 pub enum EvaluationPresentation {
     Raw,
     Lean,
+    /// Keep supported scalar/list machine values; otherwise select an actual
+    /// Repr/ToString printer before admission and execution. The retained
+    /// presentation marker distinguishes formatted text from a source String.
+    /// Missing printers and resource failures never retry Raw.
+    PreferRaw,
 }
 
 /// Presentation selected by the source adapter before ordinary admission and
@@ -200,6 +205,13 @@ pub(super) fn elaborate(
         .map_err(EngineExecutionError::Ingress)?
     {
         use fln_elab::source::evaluation::PreparedIoEvaluation;
+        if presentation == EvaluationPresentation::PreferRaw
+            && preparation
+                .raw_evaluation_result_type(&action.value, true)
+                .map_err(EngineExecutionError::Ingress)?
+        {
+            return Ok(Outcome::Complete((prepared.into_raw(), None)));
+        }
         return Ok(
             match source_records::elaboration_outcome(
                 prepared.into_io_presentation(action.monad, action.value),
@@ -217,6 +229,13 @@ pub(super) fn elaborate(
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
             },
         );
+    }
+    if presentation == EvaluationPresentation::PreferRaw
+        && preparation
+            .raw_evaluation_result_type(prepared.type_(), false)
+            .map_err(EngineExecutionError::Ingress)?
+    {
+        return Ok(Outcome::Complete((prepared.into_raw(), None)));
     }
     Ok(
         match source_records::elaboration_outcome(prepared.into_format())? {
