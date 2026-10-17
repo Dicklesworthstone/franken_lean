@@ -5,6 +5,7 @@ use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
 mod elaboration;
+mod library;
 mod local_functions;
 mod public_body;
 pub(crate) mod traces;
@@ -135,7 +136,7 @@ impl EngineBuilder {
                     },
                 )?;
         }
-        Ok(Outcome::Complete(engine))
+        library::append_lemmas(engine, limits)
     }
 
     /// Construct a bounded coercion-seed engine using configured or default calibrated limits.
