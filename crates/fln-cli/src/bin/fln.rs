@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "../module_check.rs"]
+mod module_check;
 mod support;
 
 fn main() -> std::process::ExitCode {
@@ -15,7 +17,7 @@ fn main() -> std::process::ExitCode {
             stderr: "fln: serve-lsp does not accept arguments\n".to_owned(),
             exit_code: 2,
         },
-        _ => fln_cli::run(arguments),
+        _ => module_check::dispatch(arguments),
     };
     support::write_output(output)
 }
