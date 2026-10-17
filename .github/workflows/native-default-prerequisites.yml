@@ -9,106 +9,90 @@ jobs:
   validate:
     if: github.repository == 'Dicklesworthstone/franken_lean'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Apply the identity-checked candidate in the isolated checkout
+      - name: Prepare the exact source candidate and compiler
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-analysis'
-          root.mkdir()
-          def blob(data):
-              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          path = 'crates/fln-elab/src/source/instances.rs'
-          assert blob(pathlib.Path(path).read_bytes()) == 'f9cea5186bbaba747971873c35f6e151151c4d7c'
-          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/808ad759c463c34ed1b82abdfa6509d195464018', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              payload = base64.b64decode(json.load(response)['content'])
-          assert blob(payload) == '808ad759c463c34ed1b82abdfa6509d195464018'
-          patch = gzip.decompress(payload)
-          assert hashlib.sha256(patch).hexdigest() == '8d3952df5873fced5b4db1fecf4265a91bb956f4c29afe8870a5611c244ae130'
-          (root / 'candidate.patch').write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', str(root / 'candidate.patch')], check=True)
-          subprocess.run(['git', 'apply', str(root / 'candidate.patch')], check=True)
-      - name: Install the exact toolchain and oracle
         shell: bash
         run: |
           set -euo pipefail
           rustup show active-toolchain
           rustc -Vv
-          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
-          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
-          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/default-entry" "$RUNNER_TEMP/compiler" "$RUNNER_TEMP/oracle-a" "$RUNNER_TEMP/oracle-b"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/compiler/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/compiler/source-commit.txt"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/808ad759c463c34ed1b82abdfa6509d195464018', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          with urllib.request.urlopen(req) as r:
+              patch = gzip.decompress(base64.b64decode(json.load(r)['content']))
+          assert hashlib.sha256(patch).hexdigest() == '8d3952df5873fced5b4db1fecf4265a91bb956f4c29afe8870a5611c244ae130'
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-entry/candidate.patch'
+          path.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+          subprocess.run(['git', 'apply', str(path)], check=True)
+          PY
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
-          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
-      - name: Isolate reducibility and explicit-hole behavior in the oracle
+      - name: Compare actual default selection with registered outer candidates
         shell: python
         run: |
           import os, pathlib, re, subprocess, json
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-analysis'
-          lean = pathlib.Path(os.environ['FLN_REFERENCE_LIB']) / '../../bin/lean'
-          original = pathlib.Path('crates/fln/tests/support/default_prerequisites.lean').read_text()
-          results = {}
-          for label, source in [
-              ('original', original),
-              ('reducible', re.sub(r'@\[default_instance([^]]*)\]', r'@[reducible, default_instance\1]', original)),
-              ('inferred-let', original.replace(' : _ := fetchValue', ' := fetchValue')),
-              ('inferred-let-reducible', re.sub(r'@\[default_instance([^]]*)\]', r'@[reducible, default_instance\1]', original).replace(' : _ := fetchValue', ' := fetchValue')),
-              ('direct', original.replace('let value : _ := fetchValue; value', 'fetchValue')),
-          ]:
-              file = root / (label + '.lean')
-              file.write_text(source)
-              run = subprocess.run([str(lean), str(file)], text=True, capture_output=True, timeout=120)
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-entry'
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          source = pathlib.Path('crates/fln/tests/support/default_prerequisites.lean').read_text()
+          outer = re.sub(r'(@\[default_instance[^]]*\]) def (preferred|fallback|unavailable)([^\n]* : Supply[^\n]*)', r'\1 instance \2\3', source)
+          rows = {}
+          for label, text in [('outer-instances', outer), ('outer-instances-inferred', outer.replace(' : _ := fetchValue', ' := fetchValue'))]:
+              path = root / (label + '.lean')
+              path.write_text(text)
+              run = subprocess.run([str(lean), str(path)], text=True, capture_output=True, timeout=120)
               (root / (label + '.log')).write_text(run.stdout + run.stderr)
-              results[label] = run.returncode
-              print('ORACLE_VARIANT', label, run.returncode, flush=True)
-              print(run.stdout, flush=True)
-          concrete = original.split('namespace Concrete', 1)[1].split('end Concrete', 1)[0]
-          trace = root / 'traced.lean'
-          trace.write_text('set_option trace.Elab.defaultInstance true\nnamespace Concrete\n' + concrete + '\nend Concrete\n')
-          run = subprocess.run([str(lean), str(trace)], text=True, capture_output=True, timeout=120)
-          (root / 'traced.log').write_text(run.stdout + run.stderr)
-          print(run.stdout, flush=True)
-          (root / 'oracle-results.json').write_text(json.dumps(results))
-      - name: Execute all new candidate tests independently of oracle diagnostics
+              print(label, run.returncode, run.stdout, flush=True)
+              rows[label] = run.returncode
+          (root / 'results.json').write_text(json.dumps(rows))
+      - name: Package the exact compiler and split the oracle below the artifact limit
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --offline -p fln --test source_default_prerequisites --no-fail-fast -- --nocapture --test-threads=1 |& tee "$RUNNER_TEMP/default-analysis/native.log"
-      - name: Preserve exact tools and a credential-free source snapshot for local validation
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/native-validation-tools"
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-validation-tools/source.tar.gz"
-          git rev-parse HEAD > "$RUNNER_TEMP/native-validation-tools/source-commit.txt"
-          tar -czf "$RUNNER_TEMP/native-validation-tools/rust-toolchain.tar.gz" -C "$(rustc --print sysroot)" bin lib
-          cp "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" "$RUNNER_TEMP/native-validation-tools/"
-          cd "$RUNNER_TEMP/native-validation-tools"
-          sha256sum source.tar.gz rust-toolchain.tar.gz lean-4.32.0-linux.tar.zst > SHA256SUMS
+          tar -czf "$RUNNER_TEMP/compiler/rust-toolchain.tar.gz" -C "$(rustc --print sysroot)" bin lib
+          split -b 400M "$RUNNER_TEMP/lean.tar.zst" "$RUNNER_TEMP/lean.part."
+          mv "$RUNNER_TEMP/lean.part.aa" "$RUNNER_TEMP/oracle-a/"
+          mv "$RUNNER_TEMP/lean.part.ab" "$RUNNER_TEMP/oracle-b/"
+          cd "$RUNNER_TEMP/compiler"
+          sha256sum *.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
         with:
-          name: default-analysis-${{ github.sha }}
-          path: ${{ runner.temp }}/default-analysis
+          name: default-entry-${{ github.sha }}
+          path: ${{ runner.temp }}/default-entry
           retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
         with:
-          name: native-validation-tools-${{ github.sha }}
-          path: ${{ runner.temp }}/native-validation-tools
+          name: compiler-${{ github.sha }}
+          path: ${{ runner.temp }}/compiler
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: oracle-a-${{ github.sha }}
+          path: ${{ runner.temp }}/oracle-a
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: oracle-b-${{ github.sha }}
+          path: ${{ runner.temp }}/oracle-b
           compression-level: 0
           retention-days: 1
