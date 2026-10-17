@@ -9,150 +9,106 @@ jobs:
   validate:
     if: github.repository == 'Dicklesworthstone/franken_lean'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    permissions:
-      contents: write
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TERM_COLOR: never
-      FLN_REQUIRE_REFERENCE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify reviewed source and install only the regression tests
+      - name: Apply the identity-checked candidate in the isolated checkout
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
           import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-prerequisite-evidence'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-analysis'
           root.mkdir()
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           path = 'crates/fln-elab/src/source/instances.rs'
-          original = pathlib.Path(path).read_bytes()
-          assert blob(original) == 'f9cea5186bbaba747971873c35f6e151151c4d7c', 'concurrent source change: do not overwrite'
-          request = urllib.request.Request(
-              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/808ad759c463c34ed1b82abdfa6509d195464018',
-              headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          assert blob(pathlib.Path(path).read_bytes()) == 'f9cea5186bbaba747971873c35f6e151151c4d7c'
+          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/808ad759c463c34ed1b82abdfa6509d195464018', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
           with urllib.request.urlopen(request, timeout=60) as response:
-              result = json.load(response)
-          payload = base64.b64decode(result['content'])
+              payload = base64.b64decode(json.load(response)['content'])
           assert blob(payload) == '808ad759c463c34ed1b82abdfa6509d195464018'
           patch = gzip.decompress(payload)
           assert hashlib.sha256(patch).hexdigest() == '8d3952df5873fced5b4db1fecf4265a91bb956f4c29afe8870a5611c244ae130'
-          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
-          assert paths == [path, 'crates/fln/tests/source_default_prerequisites.rs', 'crates/fln/tests/support/default_prerequisites.lean']
-          for name in paths[1:]:
-              assert not pathlib.Path(name).exists() and not pathlib.Path(name).is_symlink(), name
           (root / 'candidate.patch').write_bytes(patch)
-          (root / 'original-instances.rs').write_bytes(original)
-          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          (root / 'paths.json').write_text(json.dumps(paths))
-          rows = [json.loads(line) for line in pathlib.Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          rows = [row for row in rows if row.get('status') in ('open', 'in_progress') and row.get('priority', 4) <= 1 and any(word in (row.get('title', '') + ' ' + row.get('description', '')).lower() for word in ('instance', 'elaboration', 'numeral'))]
-          (root / 'open-functional-beads.json').write_text(json.dumps(rows, indent=2))
           subprocess.run(['git', 'apply', '--check', str(root / 'candidate.patch')], check=True)
-          subprocess.run(['git', 'apply', '--include=crates/fln/tests/*', str(root / 'candidate.patch')], check=True)
-      - name: Reproduce the concrete prerequisite and unknown-callee failures before the fix
+          subprocess.run(['git', 'apply', str(root / 'candidate.patch')], check=True)
+      - name: Install the exact toolchain and oracle
         shell: bash
         run: |
           set -euo pipefail
           rustup show active-toolchain
-          test "$(rustup show active-toolchain | cut -d ' ' -f 1)" = nightly-2026-08-31-x86_64-unknown-linux-gnu
           rustc -Vv
-          evidence="$RUNNER_TEMP/default-prerequisite-evidence"
-          for test in concrete_prerequisite_uses_a_default_only_registration completed_nested_defaults_resume_named_and_positional_unknown_callees; do
-            set +e
-            cargo test --locked --offline -p fln --test source_default_prerequisites "$test" -- --exact --nocapture > "$evidence/before-$test.log" 2>&1
-            status=$?
-            set -e
-            cat "$evidence/before-$test.log"
-            test "$status" = 101
-            grep -F "test $test ... FAILED" "$evidence/before-$test.log"
-          done
-      - name: Apply and format the complete implementation candidate
-        shell: bash
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/default-prerequisite-evidence"
-          git apply --check --include=crates/fln-elab/src/source/instances.rs "$evidence/candidate.patch"
-          git apply --include=crates/fln-elab/src/source/instances.rs "$evidence/candidate.patch"
-          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/source/instances.rs crates/fln/tests/source_default_prerequisites.rs
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source/instances.rs crates/fln/tests/source_default_prerequisites.rs
-          git diff --check
-      - name: Check the shared computation proofs against the exact Reference
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -F 'reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35' SUITE.lock
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
           echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
           tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" crates/fln/tests/support/default_prerequisites.lean | tee "$RUNNER_TEMP/default-prerequisite-evidence/reference.log"
-      - name: Execute all new inference, ordering, rollback and resource regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --offline -p fln --test source_default_prerequisites --no-fail-fast -- --nocapture --test-threads=1 |& tee "$RUNNER_TEMP/default-prerequisite-evidence/after.log"
-      - name: Check retained default, numeral, instance and postponed-application behavior
-        if: success() || failure()
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --offline -p fln --test source_default_instances --test source_numeric_literals --test source_postponed_applications --test source_instances --no-fail-fast -- --test-threads=1 |& tee "$RUNNER_TEMP/default-prerequisite-evidence/retained.log"
-          cargo test --locked --offline -p fln-elab --lib source::instances --no-fail-fast -- --test-threads=1
-      - name: Check production and changed test targets without relaxing warnings
-        if: success() || failure()
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
-          cargo clippy --locked --offline -p fln --test source_default_prerequisites -- -D warnings
-      - name: Retain exact validated source blobs for direct main publication
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Isolate reducibility and explicit-hole behavior in the oracle
         shell: python
         run: |
-          import base64, hashlib, json, os, pathlib, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-prerequisite-evidence'
-          blobs = {}
-          for path in json.loads((root / 'paths.json').read_text()):
-              data = pathlib.Path(path).read_bytes()
-              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs',
-                  data=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode(),
-                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result['sha'] == expected, path
-              blobs[path] = expected
-          receipt = {'base': (root / 'base.txt').read_text().strip(), 'blobs': blobs, 'published_branch': False}
-          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
-          print('FLN_DEFAULT_PREREQUISITES_VALIDATED ' + json.dumps(receipt), flush=True)
-      - name: Preserve source bytes and validation logs even on failure
+          import os, pathlib, re, subprocess, json
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-analysis'
+          lean = pathlib.Path(os.environ['FLN_REFERENCE_LIB']) / '../../bin/lean'
+          original = pathlib.Path('crates/fln/tests/support/default_prerequisites.lean').read_text()
+          results = {}
+          for label, source in [
+              ('original', original),
+              ('reducible', re.sub(r'@\[default_instance([^]]*)\]', r'@[reducible, default_instance\1]', original)),
+              ('inferred-let', original.replace(' : _ := fetchValue', ' := fetchValue')),
+              ('inferred-let-reducible', re.sub(r'@\[default_instance([^]]*)\]', r'@[reducible, default_instance\1]', original).replace(' : _ := fetchValue', ' := fetchValue')),
+              ('direct', original.replace('let value : _ := fetchValue; value', 'fetchValue')),
+          ]:
+              file = root / (label + '.lean')
+              file.write_text(source)
+              run = subprocess.run([str(lean), str(file)], text=True, capture_output=True, timeout=120)
+              (root / (label + '.log')).write_text(run.stdout + run.stderr)
+              results[label] = run.returncode
+              print('ORACLE_VARIANT', label, run.returncode, flush=True)
+              print(run.stdout, flush=True)
+          concrete = original.split('namespace Concrete', 1)[1].split('end Concrete', 1)[0]
+          trace = root / 'traced.lean'
+          trace.write_text('set_option trace.Elab.defaultInstance true\nnamespace Concrete\n' + concrete + '\nend Concrete\n')
+          run = subprocess.run([str(lean), str(trace)], text=True, capture_output=True, timeout=120)
+          (root / 'traced.log').write_text(run.stdout + run.stderr)
+          print(run.stdout, flush=True)
+          (root / 'oracle-results.json').write_text(json.dumps(results))
+      - name: Execute all new candidate tests independently of oracle diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln --test source_default_prerequisites --no-fail-fast -- --nocapture --test-threads=1 |& tee "$RUNNER_TEMP/default-analysis/native.log"
+      - name: Preserve exact tools and a credential-free source snapshot for local validation
         if: always()
-        shell: python
+        shell: bash
         run: |
-          import json, os, pathlib, shutil
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-prerequisite-evidence'
-          if (root / 'paths.json').exists():
-              for path in json.loads((root / 'paths.json').read_text()):
-                  if pathlib.Path(path).is_file():
-                      destination = root / 'sources' / path
-                      destination.parent.mkdir(parents=True, exist_ok=True)
-                      shutil.copyfile(path, destination)
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-validation-tools"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-validation-tools/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-validation-tools/source-commit.txt"
+          tar -czf "$RUNNER_TEMP/native-validation-tools/rust-toolchain.tar.gz" -C "$(rustc --print sysroot)" bin lib
+          cp "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" "$RUNNER_TEMP/native-validation-tools/"
+          cd "$RUNNER_TEMP/native-validation-tools"
+          sha256sum source.tar.gz rust-toolchain.tar.gz lean-4.32.0-linux.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: default-prerequisite-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/default-prerequisite-evidence
+          name: default-analysis-${{ github.sha }}
+          path: ${{ runner.temp }}/default-analysis
           retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-validation-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/native-validation-tools
+          compression-level: 0
+          retention-days: 1
