@@ -3,12 +3,17 @@
 //! lazy branches and recursors) is known. The compiler independently validates
 //! the resulting canonical signature table, captures, ownership, and calls.
 #[cfg(test)]
+mod intrinsic_types;
+#[cfg(test)]
 mod projected;
 mod recursors;
+mod signatures;
 mod stages;
 
 use super::*;
 use fln_comp::{fir::ClosureTypeId, ingress::ClosureSignature};
+
+mod administrative;
 
 impl Preparation<'_> {
     /// Recognize a literal callback after strict lets or administrative record
@@ -104,7 +109,7 @@ impl Preparation<'_> {
         if let Some(partial) = self.partially_applied_recursor(head, args)? {
             return Ok(Some(partial));
         }
-        let ExprNode::Const { name, .. } = head.node() else {
+        let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
         let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
@@ -149,6 +154,23 @@ impl Preparation<'_> {
             type_ = self.minor_apply(type_, arg.clone())?;
         }
         let type_ = self.erase_runtime_type(&type_)?;
+        if rec.all.len() == 1
+            && rec.num_indices == 0
+            && rec.num_minors >= 2
+            && let Some(shape) = self.recursor_shape(rec, levels, args)?
+            && !shape.recursive
+            && shape.constructors.len() == rec.rules.len()
+            && self
+                .saturated_variant_result(&type_, args.len() - arity)?
+                .is_some()
+        {
+            // Keep a fully supplied variant's operands for its lazy minors.
+            // Selecting a function first would require one fixed closure ABI
+            // even when those minors return the same telescope in different
+            // stages. The variant path applies actual operands in order inside
+            // the selected branch and joins only the final data result.
+            return Ok(None);
+        }
         let mut function = head.clone();
         for argument in &args[..arity] {
             self.tick()?;
@@ -325,6 +347,7 @@ impl Preparation<'_> {
     pub(crate) fn finalize_callables(
         &mut self,
         functions: &mut [FunctionBinding],
+        intrinsics: &mut [IntrinsicBinding],
     ) -> Result<Vec<ClosureSignature>, IngressError> {
         if self.interfaces.is_empty() {
             return Ok(Vec::new());
@@ -358,9 +381,19 @@ impl Preparation<'_> {
                 &mut self.visited,
             )?;
         }
+        signatures::deduplicate_unowned(&mut signatures, self.limits, &mut self.visited)?;
         let mut ranks = (0..self.interfaces.len())
             .map(|index| u32::try_from(index).map_err(|_| unsupported("callback rank width")))
             .collect::<Result<Vec<_>, _>>()?;
+        // Retain the preceding structural order across refinement rounds. A
+        // remap usually changes only some nested closure ids, leaving long
+        // sorted runs available to the metered stable merge below.
+        let mut order = Vec::new();
+        for index in 0..signatures.len() {
+            self.tick()?;
+            reserve(&mut order, self.limits.fir.max_closure_types)?;
+            order.push(index);
+        }
         let mut settled = false;
         for _ in 0..=self.interfaces.len() {
             let mut ordered = Vec::new();
@@ -370,25 +403,13 @@ impl Preparation<'_> {
                 reserve(&mut ordered, self.limits.fir.max_closure_types)?;
                 ordered.push((*owner, signature));
             }
-            // Charge the comparison/operand envelope before sorting. The bound
-            // is conservative and deterministic, not wall-clock fuel.
-            let width = ordered.len().max(1).ilog2() as usize + 1;
-            let cells = ordered
-                .iter()
-                .try_fold(0usize, |sum, (_, item)| {
-                    sum.checked_add(item.parameters.len().saturating_add(1))
-                })
-                .and_then(|sum| sum.checked_mul(width))
-                .ok_or_else(|| unsupported("callback sort work overflow"))?;
-            for _ in 0..cells {
-                self.tick()?;
-            }
-            ordered.sort_by(|(_, a), (_, b)| signature_order(a, b));
+            signatures::sort::stable_order(&ordered, &mut order, self.limits, &mut self.visited)?;
             let mut next = vec![0; ranks.len()];
             let mut rank = 0u32;
-            for (index, (owner, signature)) in ordered.iter().enumerate() {
+            for (index, &row) in order.iter().enumerate() {
                 self.tick()?;
-                if index != 0 && signature != &ordered[index - 1].1 {
+                let (owner, signature) = &ordered[row];
+                if index != 0 && signature != &ordered[order[index - 1]].1 {
                     rank = rank
                         .checked_add(1)
                         .ok_or_else(|| unsupported("callback rank width"))?;
@@ -412,6 +433,17 @@ impl Preparation<'_> {
             }
             function.result = remap_type(function.result, &ranks)?;
         }
+        // Native higher-order rows share the canonical callback ABI with
+        // function parameters, lambda captures and object fields. Their
+        // bindings were copied into the catalog before discovery completed.
+        for intrinsic in intrinsics {
+            for argument in &mut intrinsic.arguments {
+                charge_catalog_node(&mut self.visited, self.limits)?;
+                *argument = remap_type(*argument, &ranks)?;
+            }
+            charge_catalog_node(&mut self.visited, self.limits)?;
+            intrinsic.result = remap_type(intrinsic.result, &ranks)?;
+        }
         for lambda in &mut self.lambdas {
             for parameter in &mut lambda.parameters {
                 *parameter = remap_type(*parameter, &ranks)?;
@@ -429,6 +461,9 @@ impl Preparation<'_> {
         for case in &mut self.cases {
             case.result = remap_type(case.result, &ranks)?;
         }
+        for case in &mut self.nat_cases {
+            case.result = remap_type(case.result, &ranks)?;
+        }
         for case in &mut self.variant_cases {
             case.result = remap_type(case.result, &ranks)?;
         }
@@ -442,6 +477,7 @@ impl Preparation<'_> {
     }
 }
 
+#[cfg(test)]
 fn signature_order(a: &ClosureSignature, b: &ClosureSignature) -> std::cmp::Ordering {
     a.parameters
         .cmp(&b.parameters)

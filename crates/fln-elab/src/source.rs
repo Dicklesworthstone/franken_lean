@@ -25,6 +25,7 @@ pub use subst::SubstError;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
+pub mod evaluation;
 mod inductive;
 mod infer;
 mod instance_command;
@@ -38,13 +39,21 @@ pub mod inspect;
 mod matching;
 mod numeric;
 mod operators;
+mod optional;
 mod overload;
+pub mod partial;
+mod pattern_typing;
+mod public_body;
+pub use public_body::{
+    elaborate_public_definition, is_definition_body, public_definition_header_is_hidden,
+};
 mod patterns;
 mod record;
 mod record_terms;
 mod recursion;
 mod reduce;
 mod tactics;
+pub mod trace;
 
 use super::*;
 use crate::constraint::unify::{
@@ -61,8 +70,16 @@ pub enum SourceInferenceError {
     Recursion(recursion::RecursionError),
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
+    Auxiliary(crate::inductive::auxiliaries::AuxiliaryError),
     Deriving(deriving::DerivingError),
+    EvaluationPrinting(evaluation::PrintingError),
     UnknownConstant(Name),
+    /// An auto-bound implicit's type mentions a binder written after it (the pin's
+    /// `addAutoBoundImplicits`, Lean/Elab/Term/TermElabM.lean:2044-2058).
+    AutoBoundDependsOnExplicit {
+        auto: Name,
+        explicit: Name,
+    },
     /// More than one interpretation of an overloaded identifier elaborates against
     /// the expected type (the pin's `elabAppAux`), listed in the order it tries them.
     AmbiguousTerm {
@@ -91,6 +108,11 @@ pub enum SourceInferenceError {
     InvalidFieldReceiver(Name),
     LevelSyntax(LevelSyntaxError),
     ExpectedFunction,
+    /// Argument processing exhausted a known function telescope, and the
+    /// pin's imported `CoeFun` has no active global, scoped or local provider.
+    /// Unlike an initially unknown callee, this is the pin's terminal
+    /// `synthesizePendingAndNormalizeFunType` refusal, not a postponement.
+    FunctionCoercionAbsent,
     ExpectedType,
     RecordTerm(record_terms::RecordTermError),
     Record(crate::records::RecordError),
@@ -100,26 +122,33 @@ pub enum SourceInferenceError {
     /// may unfold definitions that this query must keep opaque.
     ConversionRefused(Box<Verdict>),
     Tactic(tactics::TacticError),
+    ArithmeticInconclusive(Box<fln_core::outcome::Inconclusive>),
     UnresolvedHoles {
         count: usize,
     },
     UnresolvedUniverses,
     InstanceSynthesisRequired,
-    /// An operator tree needs a coercion at a leaf. The pin inserts the
-    /// `expandCoe`-unfolded coercion; the native coercion search does not
-    /// produce that term, so this is refused rather than approximated.
-    OperatorCoercion,
     /// The pin's eliminator elaboration (`elabAsElim`) could not finish; the
     /// text is the pin's own message after "failed to elaborate eliminator, ".
     Eliminator(&'static str),
     /// A compiled declaration applies a recursor the pin's code generator does not
     /// support (`codegen.rs`, bead `franken_lean-z8j.1.6.6`).
     UnsupportedRecursor(Name),
+    /// A generated recOn has no compiled LCNF signature at the pin.
+    AuxiliaryNotCompiled(Name),
+    /// A surviving executable reference has no compiled implementation.
+    NoncomputableDependency(Name),
+    /// Invalid dependency metadata cannot become a suppressed compiler failure.
+    NoncomputableJournal(crate::noncomputable::NoncomputableError),
+    ExternJournal(crate::externs::ExternError),
+    ImplementedByJournal(crate::implemented_by::ImplementedByError),
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
+    Option(scope::options::OptionRefusal),
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
     ProtectedJournal(crate::protected_names::ProtectedError),
+    AuxiliaryJournal(crate::aux_recursors::AuxRecursorError),
     ResourceLimit,
     /// Private inspection stopped at a source boundary; never an admitted declaration.
     ObservationComplete,
@@ -249,7 +278,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
+            Self::Auxiliary(error) => write!(f, "{error}"),
             Self::Deriving(error) => write!(f, "{error}"),
+            Self::EvaluationPrinting(error) => write!(f, "{error}"),
+            Self::Option(error) => write!(f, "{error}"),
             // The pin's two wordings for `lean.unknownIdentifier`, verbatim.
             Self::UnknownConstant(name) => {
                 write!(f, "Unknown identifier `{}`", name.to_display_string())
@@ -257,6 +289,12 @@ impl std::fmt::Display for SourceInferenceError {
             Self::UnknownMemberConstant(name) => {
                 write!(f, "Unknown constant `{}`", name.to_display_string())
             }
+            Self::AutoBoundDependsOnExplicit { auto, explicit } => write!(
+                f,
+                "invalid auto implicit argument `{}`, it depends on explicitly provided argument `{}`",
+                auto.to_display_string(),
+                explicit.to_display_string()
+            ),
             // The pin's wording (`elabAppAux`), with each interpretation named as it
             // names it: a root declaration as `_root_.x`.
             Self::AmbiguousTerm {
@@ -306,8 +344,13 @@ impl std::fmt::Display for SourceInferenceError {
                 "field notation requires a usable parameter with type head `{}`",
                 name.to_display_string()
             ),
-            Self::ExpectedFunction => write!(f, "source application requires a function type"),
+            Self::ExpectedFunction | Self::FunctionCoercionAbsent => {
+                write!(f, "source application requires a function type")
+            }
             Self::Tactic(error) => write!(f, "{error}"),
+            Self::ArithmeticInconclusive(reason) => {
+                write!(f, "omega did not complete: {:?}", reason.cause)
+            }
             Self::Record(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
                 write!(f, "source type obligation failed: {outcome:?}")
@@ -326,16 +369,25 @@ impl std::fmt::Display for SourceInferenceError {
                 f,
                 "native instance search could not resolve all instance arguments"
             ),
-            Self::OperatorCoercion => write!(
-                f,
-                "operator elaboration needs a coercion to the tree's maximal type, and expanded coercion insertion is not implemented"
-            ),
             Self::Eliminator(reason) => write!(f, "failed to elaborate eliminator, {reason}"),
             Self::UnsupportedRecursor(name) => write!(
                 f,
                 "code generator does not support recursor `{}` yet, consider using 'match ... with' and/or structural recursion",
                 name.to_display_string()
             ),
+            Self::AuxiliaryNotCompiled(name) => write!(
+                f,
+                "Failed to find LCNF signature for {}",
+                name.to_display_string()
+            ),
+            Self::NoncomputableDependency(name) => write!(
+                f,
+                "failed to compile definition, consider marking it as 'noncomputable' because it depends on '{}'",
+                name.to_display_string()
+            ),
+            Self::NoncomputableJournal(error) => write!(f, "{error}"),
+            Self::ExternJournal(error) => write!(f, "{error}"),
+            Self::ImplementedByJournal(error) => write!(f, "{error}"),
             Self::InvalidInstanceBinder => write!(
                 f,
                 "instance binder must end in a registered class with inferable parameters"
@@ -343,6 +395,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
             Self::ProtectedJournal(error) => write!(f, "{error}"),
+            Self::AuxiliaryJournal(error) => write!(f, "{error}"),
             Self::ObservationComplete => {
                 write!(f, "source observation completed without admission")
             }
@@ -381,6 +434,7 @@ struct Typed {
 enum ImplicitInsertion<'a> {
     ExplicitArgument,
     ApplicationEnd,
+    InstanceQuery,
     Expected(Option<&'a Expr>),
     FieldReceiver,
 }
@@ -446,6 +500,23 @@ impl SourceEquation {
 #[derive(Clone)]
 struct Context {
     inspection: Option<inspect::Probe>,
+    traces: trace::TraceLog,
+    goal_tags: std::collections::HashMap<MVarId, Name>,
+    trace_local_names: std::collections::HashMap<FVarId, Name>,
+    // Public proof declarations fix their signatures in the exported world
+    // before their bodies may see private imports. Both environments remain
+    // untrusted elaborator inputs; complete bodies require ordinary admission.
+    private_proof_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
+    public_theorem_signature: Option<ConstantVal>,
+    private_definition_body: bool,
+    public_definition_header: Option<public_body::Header>,
+    public_instance_signature: Option<instance_command::PublicHeader>,
+    /// A frozen public instance header does not itself imply a private body:
+    /// an explicitly exposed proof is checked in the public predecessor.
+    private_instance_body: bool,
+    // Completion may observe only a resolved declaration header. The value is
+    // returned at that boundary; no body or declaration is constructed.
+    declaration_header_probe: Option<bool>,
     source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
@@ -454,6 +525,11 @@ struct Context {
     // Opaque assertions remain parameter assumptions until their continuations
     // have been checked. Visibility comes from lctx, including after rollback.
     opaque_locals: std::collections::HashSet<FVarId>,
+    // Unlike ordinary `have` values, local recursive definitions remain
+    // opaque after leaving their lexical scope, until their enclosing
+    // declaration has completed all source constraints.
+    deferred_local_functions: Vec<local_functions::Deferred>,
+    local_function_lifting: local_functions::lifting::Lifting,
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
@@ -478,6 +554,10 @@ struct Context {
     inaccessible_columns: std::collections::HashSet<Name>,
     // Only compiler-generated aliases may expose their already checked referent.
     matrix_aliases: std::collections::HashMap<FVarId, Expr>,
+    // A written match the pattern-matrix compiler lowered, by its last input's binder: the
+    // inputs in order and the alternatives' patterns, typed as the pin types them once that
+    // binder is in scope (`pattern_typing`).
+    pattern_typing_checks: std::collections::HashMap<Name, (Vec<Name>, Vec<Syntax>)>,
     // The instance registry, re-read only when it can have changed: every
     // numeric literal, operator and coercion asks it.
     registry_cache: crate::instances::RegistryCache,
@@ -487,6 +567,9 @@ struct Context {
     // Imported `protected` declarations, re-read on the same terms: an atomic
     // identifier never reaches one through a namespace or an alias.
     protected_cache: crate::protected_names::ProtectedCache,
+    // Only explicitly generated/imported auxiliary declarations receive the
+    // pin's eliminator elaboration; a declaration's suffix is insufficient.
+    auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -495,13 +578,34 @@ struct Context {
     // before the recursion context exists, as a direct `T.size l` already is.
     defining: Option<Name>,
     recursion: Option<recursion::Recursion>,
+    well_founded: Option<recursion::WellFounded>,
+    // Set only after a top-level well-founded lowering succeeds. The source
+    // declaration result carries this status to post-admission metadata.
+    well_founded_definition: bool,
+    // Enabled only by the batch-only partial-definition entry point. A recursive
+    // body needs its opaque logical interface AND its executable companion.
+    partial: Option<partial::State>,
+    // A supported compiler refusal suppressed by a noncomputable section.
+    // Only the successful declaration result can carry it to post-admission metadata.
+    noncomputable_definition: bool,
+    // A local recursive helper suspends its parent's structural compiler.
+    // Complete parent calls still lower against that parent's hypotheses
+    // before the helper closes over them as an opaque value.
+    enclosing_recursions: Vec<recursion::Recursion>,
     // Eliminator applications waiting for their expected type (`elabAsElim`'s
     // postponement), resumed after default instances run.
     postponed_eliminators: Vec<eliminator::PostponedEliminator>,
+    // Coercions whose value was still open (`mkCoe`'s `.undef`), resumed by
+    // instance synthesis and refused, as they were found, on its final pass.
+    postponed_coercions: Vec<coercions::PostponedCoercion>,
     // Resumed argument failures are delayed source diagnostics, just like the
     // pin's synthetic metavariable errors. Tactic/recursion rollback restores
     // them; a selected declaration can never discard them or admit its holes.
     postponed_application_errors: Vec<NatDefinitionElabError>,
+    // Argument queues borrow syntax from their term worklist. Nested overload
+    // trials cannot own those queues, but must know that pending synthetic work
+    // may still reveal a function type before establishing terminal failure.
+    pending_source_arguments: bool,
     // Recursors the source names directly, which a compiled declaration may not apply
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
@@ -529,9 +633,21 @@ impl Context {
         txn.budget.max_heartbeats = 1_000_000;
         Self {
             inspection: None,
+            traces: trace::TraceLog::default(),
+            goal_tags: std::collections::HashMap::new(),
+            trace_local_names: std::collections::HashMap::new(),
+            private_proof_body: None,
+            public_theorem_signature: None,
+            private_definition_body: false,
+            public_definition_header: None,
+            public_instance_signature: None,
+            private_instance_body: false,
+            declaration_header_probe: None,
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
+            deferred_local_functions: Vec::new(),
+            local_function_lifting: local_functions::lifting::Lifting::default(),
             txn,
             kernel,
             next: 0,
@@ -547,15 +663,24 @@ impl Context {
             matrix_rows: std::collections::HashSet::new(),
             inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
+            pattern_typing_checks: std::collections::HashMap::new(),
             registry_cache: crate::instances::RegistryCache::default(),
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
+            auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,
             recursion: None,
+            well_founded: None,
+            well_founded_definition: false,
+            partial: None,
+            noncomputable_definition: false,
+            enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
+            postponed_coercions: Vec::new(),
             postponed_application_errors: Vec::new(),
+            pending_source_arguments: false,
             source_recursors: Vec::new(),
         }
     }
@@ -614,17 +739,16 @@ impl Context {
     }
 
     fn constant(&mut self, name: &Name) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(term) = self.partial_group_reference(name)? {
+            return Ok(term);
+        }
         let info = self
             .txn
             .env
             .find(name)
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
-        // Elaboration's own eliminations build their recursor constants directly; one
-        // resolved here is the source's.
-        if matches!(info, fln_env::constants::ConstantInfo::Rec(_)) {
-            self.note_source_recursor(name);
-        }
+        self.note_resolved_recursor(name, &info)?;
         let base = info.constant_val();
         let mut levels = Vec::new();
         for _ in &base.level_params {
@@ -635,6 +759,87 @@ impl Context {
             value: Expr::const_(name.clone(), levels),
             type_,
         })
+    }
+
+    /// `sorry` at `type_`, as the pin elaborates it (`elabSorry`, `Lean/Elab/BuiltinNotation.lean`;
+    /// `mkLabeledSorry type (synthetic := false) (unique := true)`, `Lean/Meta/Sorry.lean`):
+    /// `sorryAx (Lean.Name → type_) false tag`. The tag makes every `sorry` a different term, so
+    /// two of them are never definitionally equal. The pin's tag is the module, the source range
+    /// and a fresh macro scope; this one is the source byte range plus a counter, so the term is
+    /// the pin's up to that label. Without `Lean.Name` and `sorryAx` the pin aborts the command;
+    /// here it is refused, naming the missing constant.
+    fn labeled_sorry(
+        &mut self,
+        syntax: &Syntax,
+        type_: Expr,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let name = |components: &[&str]| Name::from_components(components.iter().copied());
+        for required in [
+            name(&["sorryAx"]),
+            name(&["Lean", "Name"]),
+            name(&["Lean", "Name", "anonymous"]),
+            name(&["Lean", "Name", "str"]),
+            name(&["Lean", "Name", "num"]),
+            name(&["Bool", "false"]),
+        ] {
+            if !self.txn.env.contains(&required) {
+                return Err(failure(SourceInferenceError::UnknownConstant(required)));
+            }
+        }
+        let name_type = Expr::const_(name(&["Lean", "Name"]), Vec::new());
+        let labeled = Expr::forall_e(
+            Name::str(Name::anonymous(), "tag"),
+            name_type,
+            type_.clone(),
+            BinderInfo::Default,
+        );
+        let sort = match self.known_type(&labeled)? {
+            Some(sort) => self.whnf(&sort)?,
+            None => return Err(failure(SourceInferenceError::ExpectedType)),
+        };
+        let ExprNode::Sort { level } = sort.node() else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
+        let nat = |value: u64| Expr::lit(Literal::Nat(fln_core::expr::NatLit::from_u64(value)));
+        let info = match syntax {
+            Syntax::Node { args, .. } => args
+                .first()
+                .map_or(fln_syntax::source::SourceInfo::None, Syntax::info),
+            _ => syntax.info(),
+        };
+        let counter = self.next;
+        self.fresh_name()?;
+        let mut tag = Expr::app(
+            Expr::app(
+                Expr::const_(name(&["Lean", "Name", "str"]), Vec::new()),
+                Expr::const_(name(&["Lean", "Name", "anonymous"]), Vec::new()),
+            ),
+            Expr::lit(Literal::Str("_sorry".to_owned())),
+        );
+        let positions = [
+            info.pos(false).map(|pos| pos.0 as u64),
+            info.end_pos(false).map(|pos| pos.0 as u64),
+        ];
+        for component in positions.into_iter().flatten().chain([counter]) {
+            tag = Expr::app(
+                Expr::app(
+                    Expr::const_(name(&["Lean", "Name", "num"]), Vec::new()),
+                    tag,
+                ),
+                nat(component),
+            );
+        }
+        let value = Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(name(&["sorryAx"]), vec![level.clone()]),
+                    labeled,
+                ),
+                Expr::const_(name(&["Bool", "false"]), Vec::new()),
+            ),
+            tag,
+        );
+        Ok(Typed { value, type_ })
     }
 
     fn atom(
@@ -666,6 +871,9 @@ impl Context {
                     "EmptyCollection",
                     "emptyCollection",
                 ]));
+            }
+            if kind == &parser_kind(&["Term", "quotedName"]) {
+                return self.quoted_name(args);
             }
             if kind == &parser_kind(&["Term", "syntheticHole"]) {
                 let [question, label] = args.as_slice() else {
@@ -699,6 +907,20 @@ impl Context {
                     value: self.hole(type_.clone())?,
                     type_,
                 });
+            }
+            if kind == &parser_kind(&["Term", "sorry"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(keyword, "sorry", "sorry")?;
+                let type_ = match expected {
+                    Some(type_) => type_.clone(),
+                    None => {
+                        let level = self.level()?;
+                        self.hole(Expr::sort(level))?
+                    }
+                };
+                return self.labeled_sorry(syntax, type_);
             }
             let level = if kind == &parser_kind(&["Term", "type"]) {
                 Some(self.source_sort(args, true)?)
@@ -749,9 +971,12 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
+            // A template's name (macro-scoped) is a global once its scopes are erased; the
+            // exact local scan above was its only local match (`resolve_source_candidates`).
+            let hygienic = name.has_macro_scopes();
             let resolved = self
                 .resolve_source_name(name)?
-                .unwrap_or_else(|| name.clone());
+                .unwrap_or_else(|| name.erase_macro_scopes());
             // The fallback to the name as written must not reach a seed constant the pin
             // does not have: resolution already refused it (`source_unreachable`), and the
             // direct lookup below would otherwise find it anyway.
@@ -761,6 +986,7 @@ impl Context {
                 )));
             }
             if !scope::is_root_qualified(name)
+                && !hygienic
                 && let Some(local) = self.txn.lctx.find_by_user_name(&resolved)
             {
                 return Ok(Typed {
@@ -773,9 +999,27 @@ impl Context {
                 });
             }
             let name = &resolved;
+            if let Some(reference) = self
+                .partial
+                .as_ref()
+                .and_then(|state| state.reference.as_ref())
+                && &reference.name == name
+            {
+                return Ok(reference.term.clone());
+            }
             if let Some(recursion) = &self.recursion
                 && &recursion.name == name
             {
+                return Ok(recursion.reference.clone());
+            }
+            if let Some(recursion) = &self.well_founded
+                && &recursion.name == name
+            {
+                if recursion.proving {
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::RecursionInDecreasingProof,
+                    )));
+                }
                 return Ok(recursion.reference.clone());
             }
             let mut resolved = name.clone();
@@ -807,6 +1051,68 @@ impl Context {
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
         self.whnf_with_transparency(expr, UnificationTransparency::Default, true)
+    }
+
+    /// `` `a.b `` (`Term.quotedName`): the pin's `elabQuotedName` is `toExpr` of the literal's name
+    /// (`Name.toExprAux`, vendored Lean/ToExpr.lean). That is `Lean.Name.mkStrN "a" "b"` for one to
+    /// eight components, otherwise `Lean.Name.str` from `Lean.Name.anonymous`. A name literal's
+    /// components are all strings (`String.toName`). `«…»` escapes a component. A double backtick
+    /// (`doubleQuotedName`, which resolves a constant) is refused here.
+    fn quoted_name(&mut self, args: &[Syntax]) -> Result<Typed, NatDefinitionElabError> {
+        let [literal] = args else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let parts = expect_node(
+            literal,
+            &Name::str(Name::anonymous(), "name"),
+            1,
+            "name literal",
+        )?;
+        let Syntax::Atom { val, .. } = &parts[0] else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let Some(body) = val.strip_prefix('`').filter(|body| !body.starts_with('`')) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut components = Vec::new();
+        let mut current = String::new();
+        let mut escaped = false;
+        for character in body.chars() {
+            match character {
+                '«' if !escaped => escaped = true,
+                '»' if escaped => escaped = false,
+                '.' if !escaped => components.push(std::mem::take(&mut current)),
+                _ => current.push(character),
+            }
+        }
+        components.push(current);
+        if escaped || components.iter().any(String::is_empty) {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let name = |label: &str| Name::from_components(["Lean", "Name", label]);
+        let value = if components.len() <= 8 {
+            let mut value = self
+                .constant(&name(&format!("mkStr{}", components.len())))?
+                .value;
+            for component in components {
+                value = Expr::app(value, Expr::lit(Literal::Str(component)));
+            }
+            value
+        } else {
+            let mut value = self.constant(&name("anonymous"))?.value;
+            let str_ = self.constant(&name("str"))?.value;
+            for component in components {
+                value = Expr::app(
+                    Expr::app(str_.clone(), value),
+                    Expr::lit(Literal::Str(component)),
+                );
+            }
+            value
+        };
+        Ok(Typed {
+            value,
+            type_: Expr::const_(Name::from_components(["Lean", "Name"]), Vec::new()),
+        })
     }
 
     fn whnf_with_transparency(
@@ -1147,14 +1453,26 @@ impl Context {
             };
             let insert = match binder_info {
                 BinderInfo::Default => false,
-                BinderInfo::Implicit | BinderInfo::InstImplicit => {
-                    !matches!(insertion, ImplicitInsertion::Expected(None))
-                }
+                BinderInfo::Implicit => !matches!(
+                    insertion,
+                    ImplicitInsertion::Expected(None) | ImplicitInsertion::InstanceQuery
+                ),
+                BinderInfo::InstImplicit => !matches!(insertion, ImplicitInsertion::Expected(None)),
                 BinderInfo::StrictImplicit => {
                     matches!(insertion, ImplicitInsertion::ExplicitArgument)
                 }
             };
             if !insert {
+                // Field lookup consumes leading value defaults even when
+                // its receiver was written with `@` (pin `consumeImplicits`).
+                if matches!(insertion, ImplicitInsertion::FieldReceiver)
+                    && let Some(argument) = optional::default_value(binder_type)
+                {
+                    let argument = argument.clone();
+                    term.type_ = self.substitute(body, &argument)?;
+                    term.value = Expr::app(term.value, argument);
+                    continue;
+                }
                 // A completed term keeps its named type. Unfolding a
                 // function-backed monad here would store an anonymous Pi
                 // in inferred action aliases, losing the constructor that
@@ -1202,6 +1520,17 @@ impl Context {
         term: Typed,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        if self.has_optional_parameter(&term.type_)? {
+            return self.finish_optional_application(term, expected);
+        }
+        self.finish_application_implicits(term, expected)
+    }
+
+    fn finish_application_implicits(
+        &mut self,
+        term: Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         // App.processImplicitArg/processInstImplicitArg continue after the
         // last written argument even without an expected result. Strict
         // implicits still require another argument; explicit `@` bypasses us.
@@ -1225,6 +1554,7 @@ impl Context {
         }
         self.resolve_instances(false)?;
         term.value = self.lower_matrix_call(&term.value)?;
+        term.value = self.lower_well_founded_call(&term.value)?;
         Ok(term)
     }
 
@@ -1262,6 +1592,11 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // An application whose argument the pin postpones and then refuses (`pattern_typing`,
+        // R1 of franken_lean-z8j.1.6.3).
+        if let Some(expected) = &expected {
+            self.check_application_typing(syntax, expected)?;
+        }
         let syntax = self.lower_pattern_matrices(syntax)?;
         self.term_prepared(&syntax, expected)
     }
@@ -1270,6 +1605,36 @@ impl Context {
         &mut self,
         syntax: &Syntax,
         expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        // Scoped term and tactic options are dynamically restored even when a
+        // failed elaboration leaves its worklist before the closing frame.
+        // Speculative retries restore their own complete Context checkpoints.
+        let options = self.txn.options.clone();
+        let pending_source_arguments = self.pending_source_arguments;
+        let result = self.term_prepared_scoped(syntax, expected, None);
+        self.txn.options = options;
+        self.pending_source_arguments = pending_source_arguments;
+        result
+    }
+
+    fn run_decreasing_proof<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+        proof: tactics::ProofState<'a>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let options = self.txn.options.clone();
+        let pending_source_arguments = self.pending_source_arguments;
+        let result = self.term_prepared_scoped(syntax, None, Some(proof));
+        self.txn.options = options;
+        self.pending_source_arguments = pending_source_arguments;
+        result
+    }
+
+    fn term_prepared_scoped<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+        expected: Option<Expr>,
+        initial_proof: Option<tactics::ProofState<'a>>,
     ) -> Result<Typed, NatDefinitionElabError> {
         use application::postponed;
         /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
@@ -1302,6 +1667,7 @@ impl Context {
             }
         }
         enum Task<'a> {
+            RestoreOptions(KVMap),
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoBindJoinStart(Name, &'a Syntax, &'a Syntax, Expr, bool),
             DoBindJoinBody(LocalContext, FVarId, Name, &'a Syntax, Expr),
@@ -1314,6 +1680,7 @@ impl Context {
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            NomatchDiscriminant(Arguments<'a>, Vec<Typed>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
@@ -1323,7 +1690,7 @@ impl Context {
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordNext(record_terms::RecordBuild<'a>),
-            RecordField(record_terms::RecordBuild<'a>, Expr),
+            RecordField(record_terms::RecordBuild<'a>, record_terms::RecordTarget),
             Visit(&'a Syntax, Option<Expr>, bool),
             Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
@@ -1336,6 +1703,7 @@ impl Context {
             ForCollection(Option<Expr>),
             Argument(Typed, Expr, Arguments<'a>, Option<Expr>, bool),
             Apply(Typed, Arguments<'a>, Option<Expr>, bool),
+            ApplyNext(Typed, Arguments<'a>, Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
             Operator(operators::OperatorTree<'a>, Option<Expr>),
             Arrow(Option<Expr>),
@@ -1391,7 +1759,10 @@ impl Context {
             ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, Option<usize>),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
-        let mut tasks = vec![Task::Visit(syntax, expected, true)];
+        let mut tasks = vec![match initial_proof {
+            Some(proof) => Task::Proof(proof),
+            None => Task::Visit(syntax, expected, true),
+        }];
         let mut values: Vec<Typed> = Vec::new();
         enum Attempt<'a> {
             Proof(tactics::backtrack::Checkpoint<'a>, postponed::Queue<'a>),
@@ -1399,12 +1770,16 @@ impl Context {
             Argument(Box<postponed::Checkpoint<'a>>),
         }
         let mut attempts: Vec<Attempt<'_>> = Vec::new();
+        let inherited_pending_arguments = self.pending_source_arguments;
         let mut pending = postponed::Queue::default();
         loop {
             let mut blocked_application = None;
             let mut containing_argument = None;
+            let mut blocked_initial_application = None;
             let result = (|| {
                 loop {
+                    self.pending_source_arguments =
+                        inherited_pending_arguments || !pending.is_empty();
                     let closes_scope = matches!(
                         tasks.last(),
                         Some(
@@ -1442,11 +1817,9 @@ impl Context {
                                         // Rewind the whole containing argument,
                                         // not an already-closed inner lambda.
                                         // The blocker belongs to that snapshot.
-                                        blocked_application = Some(blocker);
+                                        blocked_application = Some(blocker.id);
                                         containing_argument = Some(index);
-                                        return Err(failure(
-                                            SourceInferenceError::ExpectedFunction,
-                                        ));
+                                        return Err(blocker.problem);
                                     }
                                 }
                             }
@@ -1465,6 +1838,7 @@ impl Context {
                         );
                         let syntax = checkpoint.syntax;
                         let expected = checkpoint.expected.clone();
+                        checkpoint.enter_options(self);
                         let index = attempts.len();
                         attempts.push(Attempt::Argument(Box::new(checkpoint)));
                         tasks.push(Task::ArgumentComplete(index));
@@ -1492,6 +1866,7 @@ impl Context {
                         pending.close_scope(self)?;
                     }
                     match task {
+                        Task::RestoreOptions(options) => self.txn.options = options,
                         Task::CheckArgument(syntax, expected, infer_exception_action) => {
                             if let Some(checkpoint) = postponed::Checkpoint::argument(
                                 self,
@@ -1532,6 +1907,7 @@ impl Context {
                                 let value = values.pop().expect("resumed argument visit");
                                 self.constrain(hole, &value.value)?;
                             }
+                            checkpoint.finish_options(self);
                             attempts.pop();
                         }
                         Task::DoAction(arguments, expected) => {
@@ -1600,6 +1976,12 @@ impl Context {
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "set_option"]) {
+                                    let (body, options) = self.enter_source_options(args)?;
+                                    tasks.push(Task::RestoreOptions(options));
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "recursiveContextCapture"]) {
                                     let [body] = args.as_slice() else {
                                         return Err(failure(SourceInferenceError::Scope));
@@ -1614,6 +1996,29 @@ impl Context {
                                     };
                                     tasks.push(Task::ForCollection(expected));
                                     tasks.push(Task::Visit(collection, None, true));
+                                    continue;
+                                }
+                                // A reassignment's type: the type of the variable it replaces
+                                // (`do_notation::mutation`).
+                                if kind == &parser_kind(&["Term", "nativeDoTypeOf"]) {
+                                    let [Syntax::Ident { val, .. }] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let local = self
+                                        .txn
+                                        .lctx
+                                        .find_by_user_name(val)
+                                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                                    let value = self.instantiate(&local.type_.clone())?;
+                                    let type_ = self.known_type(&value)?.ok_or_else(|| {
+                                        failure(SourceInferenceError::ExpectedType)
+                                    })?;
+                                    let term = Typed { value, type_ };
+                                    values.push(if finish {
+                                        self.finish_term(term, expected.as_ref())?
+                                    } else {
+                                        term
+                                    });
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "nativeDoJoin"]) {
@@ -1768,6 +2173,25 @@ impl Context {
                                     tasks.push(Task::BinderNext(
                                         self.start_telescope(syntax, expected, lambda)?,
                                     ));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "nofun"]) {
+                                    tasks.push(Task::Proof(
+                                        self.start_empty_function(syntax, expected)?,
+                                    ));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "nomatch"]) {
+                                    let items = self.nomatch_discriminants(syntax)?;
+                                    let arguments = Arguments::Separated(items, &[","]);
+                                    let (first, remaining) =
+                                        arguments.split_first().expect("nonempty discriminants");
+                                    tasks.push(Task::NomatchDiscriminant(
+                                        remaining,
+                                        Vec::new(),
+                                        expected,
+                                    ));
+                                    tasks.push(Task::Visit(first, None, true));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "match"])
@@ -2029,11 +2453,15 @@ impl Context {
                                     ));
                                     continue;
                                 }
-                                // The pin's `binop%`/`binrel%`/`unop%`/`rightact%`
-                                // expression trees. A notation whose function is
-                                // absent keeps the seed bridge below.
-                                if let Some(notation) = operators::pin_notation(kind)
-                                    && self.pin_notation_available(notation)?
+                                // Explicit operator elaborators resolve the authored
+                                // identifier, including local functions. Builtin notation
+                                // whose function is absent keeps the seed bridge below.
+                                let notation = operators::pin_notation(kind);
+                                if operators::explicit_operator(kind).is_some()
+                                    || match notation {
+                                        Some(notation) => self.pin_notation_available(notation)?,
+                                        None => false,
+                                    }
                                 {
                                     let tree = self.operator_tree(syntax, notation)?;
                                     let leaves = tree.leaves.clone();
@@ -2076,7 +2504,14 @@ impl Context {
                                             values.push(self.term_prepared(&nested, expected)?);
                                             continue;
                                         }
-                                        other => other?,
+                                        Ok(function) => function,
+                                        Err(problem) => {
+                                            blocked_application = self.notation_type_unavailable(
+                                                &problem,
+                                                expected.as_ref(),
+                                            )?;
+                                            return Err(problem);
+                                        }
                                     };
                                     tasks.push(Task::Apply(
                                         function,
@@ -2277,6 +2712,8 @@ impl Context {
                                         )?);
                                         continue;
                                     }
+                                    blocked_application =
+                                        self.notation_type_unavailable(&error, expected.as_ref())?;
                                     return Err(error);
                                 }
                             };
@@ -2295,6 +2732,12 @@ impl Context {
                                     }
                                     self.resolve_instances(false)?;
                                     term
+                                } else if matches!(syntax, Syntax::Ident { .. })
+                                    || syntax.kind()
+                                        == Some(&parser_kind(&["Term", "explicitUniv"]))
+                                    || syntax.kind() == Some(&parser_kind(&["Term", "dotIdent"]))
+                                {
+                                    self.finish_optional_term(term, expected.as_ref())?
                                 } else {
                                     self.finish_term(term, expected.as_ref())?
                                 }
@@ -2313,7 +2756,11 @@ impl Context {
                                     if arguments.is_empty() =>
                                 {
                                     values.push(if finish {
-                                        self.finish_term(term, expected.as_ref())?
+                                        if explicit {
+                                            self.finish_explicit_term(term, expected.as_ref())?
+                                        } else {
+                                            self.finish_optional_term(term, expected.as_ref())?
+                                        }
                                     } else {
                                         term
                                     });
@@ -2331,6 +2778,15 @@ impl Context {
                                         function, receiver, &base, arguments, expected, explicit,
                                     )?));
                                 }
+                            }
+                        }
+                        Task::NomatchDiscriminant(remaining, mut terms, expected) => {
+                            terms.push(values.pop().expect("empty match discriminant visit"));
+                            if let Some((next, rest)) = remaining.split_first() {
+                                tasks.push(Task::NomatchDiscriminant(rest, terms, expected));
+                                tasks.push(Task::Visit(next, None, true));
+                            } else {
+                                tasks.push(Task::Proof(self.start_empty_match(terms, expected)?));
                             }
                         }
                         Task::MatchDiscriminant(parts, expected) => {
@@ -2361,6 +2817,7 @@ impl Context {
                             self.sort_level(&type_)?;
                             if show && let Some(expected) = &expected {
                                 self.constrain_result_hint(&type_.value, expected)?;
+                                self.show_result_hint(&type_.value, expected)?;
                             }
                             tasks.push(Task::AscribedValue(type_.value.clone(), expected, show));
                             tasks.push(Task::Visit(syntax, Some(type_.value), true));
@@ -2403,9 +2860,17 @@ impl Context {
                                 tasks.push(Task::RecordSource(parts, expected, sources));
                                 tasks.push(Task::Visit(syntax, None, true));
                             } else {
-                                tasks.push(Task::RecordNext(
-                                    self.start_record(parts, expected, sources)?,
-                                ));
+                                let record_expected = expected.clone();
+                                match self.start_record(parts, expected, sources) {
+                                    Ok(record) => tasks.push(Task::RecordNext(record)),
+                                    Err(problem) => {
+                                        blocked_application = self.notation_type_unavailable(
+                                            &problem,
+                                            record_expected.as_ref(),
+                                        )?;
+                                        return Err(problem);
+                                    }
+                                }
                             }
                         }
                         Task::RecordSource(parts, expected, mut sources) => {
@@ -2416,20 +2881,23 @@ impl Context {
                             record_terms::RecordStep::Field {
                                 syntax,
                                 domain,
-                                codomain,
+                                target,
                             } => {
-                                tasks.push(Task::RecordField(state, codomain));
+                                tasks.push(Task::RecordField(state, target));
                                 tasks.push(Task::Visit(syntax, Some(domain), true));
                             }
-                            record_terms::RecordStep::Copy { value, codomain } => {
-                                self.accept_record_field(&mut state, &codomain, value)?;
+                            record_terms::RecordStep::Copy { value, target } => {
+                                self.accept_record_field(&mut state, &target, value)?;
                                 tasks.push(Task::RecordNext(state));
                             }
                             record_terms::RecordStep::Complete(term) => values.push(term),
+                            record_terms::RecordStep::Continue => {
+                                tasks.push(Task::RecordNext(state))
+                            }
                         },
-                        Task::RecordField(mut state, codomain) => {
+                        Task::RecordField(mut state, target) => {
                             let value = values.pop().expect("record field visit");
-                            self.accept_record_field(&mut state, &codomain, value)?;
+                            self.accept_record_field(&mut state, &target, value)?;
                             tasks.push(Task::RecordNext(state));
                         }
                         Task::ChangeTarget(mut proof, goal) => {
@@ -2497,6 +2965,16 @@ impl Context {
                                     || checkpoint.values != values.len()
                                 {
                                     return Err(failure(SourceInferenceError::Scope));
+                                }
+                                if checkpoint.inverted() {
+                                    // `fail_if_success t` and `t` succeeded: undo it and fail, to
+                                    // the enclosing attempt (whose own checkpoint restores it).
+                                    tasks.truncate(checkpoint.tasks);
+                                    values.truncate(checkpoint.values);
+                                    checkpoint.restore(self);
+                                    return Err(failure(SourceInferenceError::Tactic(
+                                        tactics::TacticError::FailIfSuccessSucceeded,
+                                    )));
                                 }
                                 checkpoint.finish(self, &mut proof);
                                 if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
@@ -2573,6 +3051,11 @@ impl Context {
                                     Some(goal.target.clone())
                                 };
                                 self.txn.lctx = goal.lctx.clone();
+                                // `exact e` elaborates `e` against the goal, as a definition
+                                // body against its type (`pattern_typing`, R1).
+                                if let Some(target) = &expected {
+                                    self.check_application_typing(syntax, target)?;
+                                }
                                 // Written arguments can insert implicit dictionaries
                                 // before apply starts opening the remaining telescope.
                                 let instance_start = apply.then_some(self.instance_goals.len());
@@ -2710,7 +3193,19 @@ impl Context {
                                     let Syntax::Node { args, .. } = head else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
-                                    values.push(self.dotted_identifier(args, expected.as_ref())?);
+                                    let function = match self
+                                        .dotted_identifier(args, expected.as_ref())
+                                    {
+                                        Ok(function) => function,
+                                        Err(problem) => {
+                                            blocked_application = self.notation_type_unavailable(
+                                                &problem,
+                                                expected.as_ref(),
+                                            )?;
+                                            return Err(problem);
+                                        }
+                                    };
+                                    values.push(function);
                                     tasks.push(Task::Function(arguments, expected, explicit));
                                 }
                                 None => {
@@ -2754,6 +3249,25 @@ impl Context {
                             values.push(self.finish_term(collection, expected.as_ref())?);
                         }
                         Task::NamedNext(mut state) => {
+                            if state.initial() {
+                                if state.has_arguments()
+                                    && self
+                                        .application_type_unavailable(state.function_type())?
+                                        .is_some()
+                                {
+                                    self.resolve_instances(false)?;
+                                    if let Some(blocker) =
+                                        self.application_type_unavailable(state.function_type())?
+                                    {
+                                        blocked_application = Some(blocker);
+                                        blocked_initial_application = Some(Task::NamedNext(state));
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    }
+                                }
+                                state.start();
+                            }
                             let next = self.next_named_argument(&mut state);
                             if matches!(
                                 &next,
@@ -2762,6 +3276,11 @@ impl Context {
                                         | SourceInferenceError::InvalidNamedArgument(_)
                                 ))
                             ) {
+                                if self.function_coercion_is_absent(state.function_type())? {
+                                    return Err(failure(
+                                        SourceInferenceError::FunctionCoercionAbsent,
+                                    ));
+                                }
                                 blocked_application =
                                     self.application_type_unavailable(state.function_type())?;
                                 if blocked_application.is_some() {
@@ -2808,6 +3327,31 @@ impl Context {
                             tasks.push(Task::NamedNext(state));
                         }
                         Task::Apply(function, arguments, expected, explicit) => {
+                            if !arguments.is_empty()
+                                && self
+                                    .application_type_unavailable(&function.type_)?
+                                    .is_some()
+                            {
+                                // Known telescopes reach ordinary synthesis in
+                                // coerce_function. Only an unavailable initial
+                                // callee needs an earlier round here.
+                                self.resolve_instances(false)?;
+                                if let Some(blocker) =
+                                    self.application_type_unavailable(&function.type_)?
+                                {
+                                    // `elabAppArgs` postpones before consuming
+                                    // arguments. Keep this continuation in its
+                                    // lexical context; defaults can resume it
+                                    // when no containing argument owns the type.
+                                    blocked_application = Some(blocker);
+                                    blocked_initial_application =
+                                        Some(Task::Apply(function, arguments, expected, explicit));
+                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                }
+                            }
+                            tasks.push(Task::ApplyNext(function, arguments, expected, explicit));
+                        }
+                        Task::ApplyNext(function, arguments, expected, explicit) => {
                             if let Some((first, rest)) = arguments.split_first() {
                                 let function = if explicit {
                                     function
@@ -2825,6 +3369,11 @@ impl Context {
                                         SourceInferenceError::ExpectedFunction
                                     ))
                                 ) {
+                                    if self.function_coercion_is_absent(&callee_type)? {
+                                        return Err(failure(
+                                            SourceInferenceError::FunctionCoercionAbsent,
+                                        ));
+                                    }
                                     blocked_application =
                                         self.application_type_unavailable(&callee_type)?;
                                 }
@@ -2835,7 +3384,7 @@ impl Context {
                                 else {
                                     return Err(failure(SourceInferenceError::ExpectedFunction));
                                 };
-                                let domain = binder_type.clone();
+                                let domain = self.projection_domain(binder_type.clone())?;
                                 let codomain = body.clone();
                                 // Propagate a known result before checking the last
                                 // explicit argument when the codomain does not depend
@@ -2862,7 +3411,7 @@ impl Context {
                         Task::Argument(function, codomain, rest, expected, explicit) => {
                             let argument = values.pop().expect("argument task follows its visit");
                             let type_ = self.substitute(&codomain, &argument.value)?;
-                            tasks.push(Task::Apply(
+                            tasks.push(Task::ApplyNext(
                                 Typed {
                                     value: Expr::app(function.value, argument.value),
                                     type_,
@@ -2992,9 +3541,16 @@ impl Context {
                                 .value
                                 .lift_loose(0, 1)
                                 .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            // The pin's `elabArrow` (vendored Lean/Elab/Binders.lean:299-303)
+                            // names the binder `a` under the reserved macro scope:
+                            // `a._@._internal._hyg.0`. It shows when an index is promoted to a
+                            // parameter (`@F.rec : {a : Nat} → …`).
                             let term = Typed {
                                 value: Expr::forall_e(
-                                    Name::anonymous(),
+                                    Name::num(
+                                        Name::from_components(["a", "_@", "_internal", "_hyg"]),
+                                        0,
+                                    ),
                                     left.value,
                                     body,
                                     BinderInfo::Default,
@@ -3061,13 +3617,24 @@ impl Context {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
                             }
+                            let value = if build.binding.recursive {
+                                self.defer_local_function(value, build.lift_name)?
+                            } else {
+                                value
+                            };
                             values.push(value);
+                            // The pin elaborates the rest of the enclosing definition with a
+                            // `let rec` (and so a `where` declaration) as a local without a value:
+                            // it becomes the auxiliary `f.g` only once `f` is complete
+                            // (`elabLetRec`, Lean/Elab/LetRec.lean:140-147: `withAuxLocalDecls`,
+                            // then `registerLetRecsToLift`). Inside `f` it cannot unfold, as a
+                            // `have` cannot; the admitted term still binds the value.
                             tasks.push(Task::LetValue(
                                 build.binding.name,
                                 None,
                                 build.binding.body,
                                 build.expected,
-                                build.binding.opaque,
+                                build.binding.opaque || build.binding.recursive,
                                 false,
                             ));
                         }
@@ -3188,6 +3755,22 @@ impl Context {
                                     value.value.clone(),
                                 );
                             }
+                            // Every input of a lowered written match is in scope now.
+                            if let Some((inputs, alternatives)) =
+                                self.pattern_typing_checks.remove(&name)
+                            {
+                                let discriminants = inputs
+                                    .iter()
+                                    .map(|input| {
+                                        self.txn.lctx.find_by_user_name(input).and_then(|decl| {
+                                            Some((decl.value.clone()?, decl.type_.clone()))
+                                        })
+                                    })
+                                    .collect::<Option<Vec<_>>>();
+                                if let Some(discriminants) = discriminants {
+                                    self.check_pattern_typing(&discriminants, &alternatives)?;
+                                }
+                            }
                             tasks.push(Task::LetBody(saved, id, name, value, opaque, inline));
                             tasks.push(Task::Visit(body, expected, true));
                         }
@@ -3230,7 +3813,38 @@ impl Context {
             match result {
                 Ok(value) => return Ok(value),
                 Err(problem) => {
-                    if !tactics::backtrack::recoverable(&problem) {
+                    if let Some(blocker) = &blocked_application
+                        && containing_argument.is_none()
+                    {
+                        let blockers = [postponed::Blocker {
+                            id: blocker.clone(),
+                            problem: problem.clone(),
+                        }];
+                        for (index, attempt) in attempts.iter().enumerate().rev() {
+                            self.tick()?;
+                            if let Attempt::Argument(checkpoint) = attempt
+                                && let Some(owner) = checkpoint.owned_blocker(self, &blockers)?
+                            {
+                                blocked_application = Some(owner.id);
+                                containing_argument = Some(index);
+                                break;
+                            }
+                        }
+                        if containing_argument.is_none() {
+                            if let Some(application) = blocked_initial_application
+                                && self.resolve_next_default_instance()?
+                            {
+                                // The pin retries postponed initial applications
+                                // between default-instance rounds. Do not close
+                                // their locals, drop pending argument work, or
+                                // refund the unsuccessful attempt's budget.
+                                tasks.push(application);
+                                continue;
+                            }
+                            return Err(problem);
+                        }
+                    }
+                    if blocked_application.is_none() && !tactics::backtrack::recoverable(&problem) {
                         return Err(problem);
                     }
                     loop {
@@ -3257,8 +3871,12 @@ impl Context {
                                 checkpoint.restore(self, &mut pending);
                                 self.tick()?;
                                 if let Some(blocker) = &blocked_application
-                                    && let Some(value) =
-                                        checkpoint.postpone(self, &mut pending, blocker)?
+                                    && let Some(value) = checkpoint.postpone(
+                                        self,
+                                        &mut pending,
+                                        blocker,
+                                        &problem,
+                                    )?
                                 {
                                     if checkpoint.hole.is_none() {
                                         values.push(value);
@@ -3657,6 +4275,14 @@ impl Context {
     }
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
+        let term = self.finish_open_universes(term)?;
+        self.require_resolved(&[term.value.clone(), term.type_.clone()])?;
+        Ok(term)
+    }
+
+    /// `finish`, but a universe hole may remain for the enclosing declaration to generalize, as
+    /// a record field's may under an auto-bound implicit (`α : Sort ?u`). A term hole may not.
+    fn finish_open_universes(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
         if let Some(error) = self.postponed_application_errors.first() {
             return Err(error.clone());
         }
@@ -3665,7 +4291,7 @@ impl Context {
         self.flush(true)?;
         let value = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
-        self.require_resolved(&[value.clone(), type_.clone()])?;
+        self.require_resolved_terms(&[value.clone(), type_.clone()])?;
         Ok(Typed { value, type_ })
     }
 }
@@ -3695,6 +4321,8 @@ impl Context {
     ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
         let mut parameters = Vec::new();
         for syntax in expect_null_args(syntax, "declaration binders")? {
+            let expanded = self.expand_optional_binder_node(syntax.clone(), false)?;
+            let syntax = &expanded;
             let Syntax::Node { kind, .. } = syntax else {
                 return Err(failure(SourceInferenceError::Scope));
             };
@@ -3759,7 +4387,22 @@ impl Context {
                 }
                 _ => return Err(failure(SourceInferenceError::ExpectedType)),
             };
-            for name in names {
+            // Local function binders may already have been expanded by the
+            // enclosing term worklist. Observe the annotation, not whether
+            // this invocation happened to rewrite the original syntax.
+            let defaulted = optional::default_value(&domain).is_some();
+            for (position, name) in names.iter().enumerate() {
+                // `toBinderViews` expands each defaulted name separately.
+                // A later name sees the preceding local, including when that
+                // local shadows a name used by the original default syntax.
+                let domain = if defaulted && position != 0 {
+                    let [_, type_syntax] = type_parts else {
+                        unreachable!("expanded default has a type annotation");
+                    };
+                    self.type_term(type_syntax)?
+                } else {
+                    domain.clone()
+                };
                 let name = match name {
                     Syntax::Ident { val, .. } => val.clone(),
                     // `_` binds a name no source identifier spells, as an unnamed instance
@@ -3783,6 +4426,229 @@ impl Context {
     }
 }
 
+/// The two checked predecessor views used by a module's public declaration. The
+/// signature sees `public`; a hidden implementation sees `private`. Scope histories are
+/// supplied separately because each anchors a different instance journal.
+#[derive(Clone, Copy)]
+pub struct TheoremWorlds<'a> {
+    pub public: &'a Environment,
+    pub private: &'a Environment,
+    pub public_scope: &'a SourceScope,
+    pub private_scope: &'a SourceScope,
+}
+
+/// Whether the parsed command is an ordinary named theorem declaration.
+pub fn is_theorem(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Command", "declaration"])
+            && args.len() == 2
+            && args[1].kind() == Some(&parser_kind(&["Command", "theorem"])))
+}
+
+/// Whether the parsed command is a named or anonymous instance declaration.
+pub fn is_instance(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Command", "declaration"])
+            && args.len() == 2
+            && args[1].kind() == Some(&parser_kind(&["Command", "instance"])))
+}
+
+/// An untrusted instance candidate and the header-selected body visibility.
+/// These flags grant no export authority: the module driver checks the actual
+/// theorem or definition before constructing and admitting its interface.
+#[derive(Debug)]
+pub struct PublicInstance {
+    pub declaration: Declaration,
+    /// Independently checked local helpers, kept in the selected body world.
+    pub local_functions: Vec<Declaration>,
+    pub proof_valued: bool,
+    pub hidden_body: bool,
+    pub noncomputable: bool,
+}
+
+/// Elaborate a public instance once, choosing its body world from the resolved
+/// header. Automatically exposed data and explicitly exposed proofs stay public;
+/// `no_expose` selects the private body world for either kind.
+/// Proof instances become theorems with frozen public types, as in the pin's
+/// `addNonRecAux`; their body exposure does not change their declaration kind.
+pub fn elaborate_public_instance(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+) -> Result<PublicInstance, NatDefinitionElabError> {
+    let mut context = Context::public_instance(syntax, worlds, kernel)?;
+    let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
+    Ok(PublicInstance {
+        local_functions,
+        proof_valued: matches!(&declaration, Declaration::Thm(_)),
+        hidden_body: context.private_instance_body,
+        noncomputable: context.noncomputable_definition,
+        declaration,
+    })
+}
+
+/// Observe whether a complete public instance header selects a private
+/// body. The syntax may contain a placeholder body: it is never elaborated.
+/// This bounded query grants no declaration or export authority.
+pub fn public_instance_header_is_hidden(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<bool, NatDefinitionElabError> {
+    let scope = scope.for_declaration(syntax)?;
+    if !is_instance(syntax) || !scope.exports_declaration() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a public instance header in a module file",
+        });
+    }
+    probe_header_visibility(syntax, environment, kernel, &scope)
+}
+
+fn probe_header_visibility(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<bool, NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope);
+    // There is no final candidate admission after a header-only query. Rigid
+    // typing failures must be observed before revealing a private body context.
+    context.attempt_depth = 1;
+    context.declaration_header_probe = Some(false);
+    match definition_in_context(syntax, &mut context) {
+        Err(NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)) => {
+            context
+                .declaration_header_probe
+                .ok_or_else(|| failure(SourceInferenceError::Scope))
+        }
+        Err(error) => Err(error),
+        Ok(_) => Err(failure(SourceInferenceError::Scope)),
+    }
+}
+
+/// Elaborate a public theorem's header and proof in their respective worlds.
+/// This produces only untrusted candidates, never an exported assumption or
+/// an environment successor. The proof and every named local helper must pass
+/// separate ordinary admissions in the private world before publication.
+pub fn elaborate_public_theorem(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
+    let mut context = Context::public_theorem(syntax, worlds, kernel)?;
+    let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
+    Ok(ElaboratedDeclaration {
+        declaration,
+        local_functions,
+        irreducible: false,
+        noncomputable: context.noncomputable_definition,
+    })
+}
+
+impl Context {
+    fn public_theorem(
+        syntax: &Syntax,
+        worlds: &TheoremWorlds<'_>,
+        kernel: Budget,
+    ) -> Result<Self, NatDefinitionElabError> {
+        let scope = worlds.public_scope.for_declaration(syntax)?;
+        if !is_theorem(syntax) || !scope.exports_declaration() {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a public theorem in a module file",
+            });
+        }
+        let mut context = Self::scoped(worlds.public, kernel, &scope);
+        context.private_proof_body = Some((
+            worlds.private.clone(),
+            worlds.private_scope.instance_scopes.clone(),
+        ));
+        Ok(context)
+    }
+
+    fn public_instance(
+        syntax: &Syntax,
+        worlds: &TheoremWorlds<'_>,
+        kernel: Budget,
+    ) -> Result<Self, NatDefinitionElabError> {
+        let scope = worlds.public_scope.for_declaration(syntax)?;
+        if !is_instance(syntax) || !scope.exports_declaration() {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a public instance in a module file",
+            });
+        }
+        let mut context = Self::scoped(worlds.public, kernel, &scope);
+        context.private_proof_body = Some((
+            worlds.private.clone(),
+            worlds.private_scope.instance_scopes.clone(),
+        ));
+        Ok(context)
+    }
+
+    /// Close and retain the exact header before changing either name resolution
+    /// or instance search. Header universes become rigid parameters here, as in
+    /// the pin's `levelMVarToParamHeaders` / theorem signature publication.
+    fn enter_public_theorem_proof(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        section_parameters: &[LocalDecl],
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let signature = self.with_closed_local_function_header(|context| {
+            let mut roots: Vec<_> = section_parameters
+                .iter()
+                .chain(parameters)
+                .map(|local| local.type_.clone())
+                .collect();
+            roots.push(expected.clone());
+            context.generalize_declaration_universes(&roots)?;
+            let mut type_ = context.instantiate(expected)?;
+            for local in section_parameters.iter().chain(parameters).rev() {
+                context.tick()?;
+                type_ = Expr::forall_e(
+                    local.user_name.clone(),
+                    context.instantiate(&local.type_)?,
+                    type_
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+            context.require_resolved(std::slice::from_ref(&type_))?;
+            if type_.has_fvar() || type_.has_loose_bvars() {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            let level_params = context.declaration_levels(std::slice::from_ref(&type_))?;
+            Ok(ConstantVal {
+                name: name.clone(),
+                level_params,
+                type_,
+            })
+        })?;
+        self.public_theorem_signature = Some(signature);
+        self.enter_private_proof()
+    }
+
+    fn enter_private_proof(&mut self) -> Result<(), NatDefinitionElabError> {
+        let (environment, instance_scopes) =
+            self.private_proof_body
+                .take()
+                .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "separate public and private predecessors for a hidden proof body",
+                })?;
+        self.txn.env = environment;
+        self.source_scope.instance_scopes = instance_scopes;
+        self.registry_cache = crate::instances::RegistryCache::default();
+        self.alias_cache = crate::aliases::AliasCache::default();
+        self.protected_cache = crate::protected_names::ProtectedCache::default();
+        self.auxiliary_cache = crate::aux_recursors::AuxRecursorCache::default();
+        Ok(())
+    }
+}
+
 pub(super) fn definition(
     syntax: &Syntax,
     environment: &Environment,
@@ -3791,14 +4657,152 @@ pub(super) fn definition(
     definition_scoped(syntax, environment, kernel, &SourceScope::default())
 }
 
+/// An untrusted source candidate and the effects selected by its successful
+/// elaboration. Effects are installed only after ordinary declaration admission;
+/// neither this value nor its flags grant publication authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElaboratedDeclaration {
+    pub declaration: Declaration,
+    /// Closed local recursive helpers. They grant no authority: callers must
+    /// admit every helper and the owner atomically through both checkers.
+    pub local_functions: Vec<Declaration>,
+    /// The definition actually used well-founded lowering. A source spelling or
+    /// a body mentioning `WellFounded.Nat.fix` does not set this effect.
+    pub irreducible: bool,
+    /// An actual supported code-generation refusal suppressed by the enclosing
+    /// noncomputable section, not merely the presence of that section.
+    pub noncomputable: bool,
+}
+
 fn definition_scoped(
     syntax: &Syntax,
     environment: &Environment,
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
-    definition_in_context(syntax, &mut context)
+    definition_scoped_with_effects(syntax, environment, kernel, scope)
+        .map(|elaborated| elaborated.declaration)
+}
+
+fn definition_scoped_with_effects(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
+    let scope = scope.for_declaration(syntax)?;
+    let mut context = Context::scoped(environment, kernel, &scope);
+    let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
+    Ok(ElaboratedDeclaration {
+        declaration,
+        local_functions,
+        irreducible: context.well_founded_definition,
+        noncomputable: context.noncomputable_definition,
+    })
+}
+
+/// Whether the pin would auto-bind `name` in a header: `autoImplicit` is on (its default) and
+/// `name` is atomic, without macro scopes, and a strict name, one character followed only by
+/// digits, subscripts, `_` or `'` (`checkValidAutoBoundImplicitName`,
+/// Lean/Elab/AutoBound.lean:31-63; `isSubScriptAlnum`, Init/Meta/Defs.lean:111-118). The pin's
+/// default `relaxedAutoImplicit` also binds any other atomic name; this engine does not, because
+/// its seed lacks names Init has (`IO`, `Int`, `Unit`), and binding those would make a variable
+/// of a constant. Such a name stays an unknown identifier: a refusal where the pin may accept.
+fn auto_bound_name(name: &Name, options: &KVMap) -> bool {
+    if !options.get_bool(&Name::from_components(["autoImplicit"]), true)
+        || name.has_macro_scopes()
+        || !name.parent().is_anonymous()
+    {
+        return false;
+    }
+    let LeafView::Str(spelled) = name.leaf_view() else {
+        return false;
+    };
+    let subscript = |c: char| {
+        let c = u32::from(c);
+        (0x2080..=0x2089).contains(&c)
+            || (0x2090..=0x209c).contains(&c)
+            || (0x1d62..=0x1d6a).contains(&c)
+            || c == 0x2c7c
+    };
+    let mut chars = spelled.chars();
+    chars.next().is_some()
+        && chars.all(|c| c.is_ascii_digit() || subscript(c) || c == '_' || c == '\'')
+}
+
+impl Context {
+    /// The pin's `withAutoBoundImplicit` (Lean/Elab/Term/TermElabM.lean:1932-1955) around a header's
+    /// binders and type: an unknown name `auto_bound_name` admits, other than `own_names`, restores
+    /// the state from before the attempt, becomes an implicit local of a fresh type, and `elaborate`
+    /// runs again. Returns those locals, in order (they precede whatever `elaborate` binds), and its
+    /// result. The pin's `addAutoBoundImplicits` refusal of an auto whose type mentions a written
+    /// binder is `refuse_auto_bound_dependencies`.
+    pub(super) fn with_auto_bound_implicits<T>(
+        &mut self,
+        own_names: &[Name],
+        mut elaborate: impl FnMut(&mut Self) -> Result<T, NatDefinitionElabError>,
+    ) -> Result<(Vec<LocalDecl>, T), NatDefinitionElabError> {
+        let mut state = self.clone();
+        let mut autos: Vec<LocalDecl> = Vec::new();
+        loop {
+            match elaborate(self) {
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
+                    found,
+                ))) if !own_names.contains(&found)
+                    && !autos.iter().any(|auto| auto.user_name == found)
+                    && auto_bound_name(&found, &self.txn.options) =>
+                {
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    *self = state;
+                    self.txn.budget.heartbeats_consumed = spent;
+                    self.tick()?;
+                    let sort = self.type_expected()?;
+                    let type_ = self.hole(sort)?;
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn
+                        .lctx
+                        .add_param(id.clone(), found, type_, BinderInfo::Implicit);
+                    autos.push(self.txn.lctx.find(&id).expect("auto-bound local").clone());
+                    state = self.clone();
+                }
+                other => return other.map(|value| (autos, value)),
+            }
+        }
+    }
+
+    /// `addAutoBoundImplicits` (Lean/Elab/Term/TermElabM.lean:2044-2058): an auto-bound implicit
+    /// precedes the written binders, so its type may not mention one.
+    pub(super) fn refuse_auto_bound_dependencies(
+        &mut self,
+        autos: &[LocalDecl],
+        written: &[LocalDecl],
+    ) -> Result<(), NatDefinitionElabError> {
+        for auto in autos {
+            let type_ = self.instantiate(&auto.type_)?;
+            for binder in written {
+                self.tick()?;
+                let abstracted = type_
+                    .abstract_fvar(&binder.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                if abstracted.has_loose_bvar(0) {
+                    return Err(failure(SourceInferenceError::AutoBoundDependsOnExplicit {
+                        auto: auto.user_name.clone(),
+                        explicit: binder.user_name.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A declaration's own short name, which its header never auto-binds (MutualDef.lean:213).
+pub(super) fn own_short_name(name: &Name) -> Vec<Name> {
+    match name.leaf_view() {
+        LeafView::Str(spelled) => vec![Name::from_components([spelled])],
+        _ => Vec::new(),
+    }
 }
 
 fn definition_in_context(
@@ -3813,6 +4817,8 @@ fn definition_in_context_named(
     context: &mut Context,
     generated_name: Option<Name>,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    let expanded = context.expand_match_alternatives(syntax)?;
+    let syntax = expanded.as_ref();
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -3827,14 +4833,46 @@ fn definition_in_context_named(
     )?;
     scope::simp::registration(syntax)?;
     let mut is_protected = false;
+    let mut is_noncomputable = false;
+    let mut is_unsafe = false;
     for (index, modifier) in modifiers.iter().enumerate() {
         match index {
             0 => doc_comment_slot(modifier)?,
             1 => {}
+            2 => {
+                scope::visibility::modifier(modifier)?;
+            }
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
+            // Validated, with the declaration kind, by `noncomputable_registration` below.
+            NONCOMPUTABLE_SLOT => is_noncomputable = noncomputable_slot(modifier)?,
+            5 => match expect_null_args(modifier, "unsafe modifier")? {
+                [] => {}
+                [modifier] => {
+                    let [keyword] = expect_node(
+                        modifier,
+                        &parser_kind(&["Command", "unsafe"]),
+                        1,
+                        "unsafe modifier",
+                    )?
+                    else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    expect_atom(keyword, "unsafe", "unsafe modifier")?;
+                    is_unsafe = true;
+                }
+                _ => return Err(failure(SourceInferenceError::Scope)),
+            },
+            6 if context
+                .partial
+                .as_ref()
+                .is_some_and(|state| state.kind == partial::Kind::Partial) =>
+            {
+                partial::validate_modifier(modifier)?
+            }
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
     }
+    noncomputable_registration(syntax)?;
     if is_protected && generated_name.is_some() {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "a named protected declaration",
@@ -3842,7 +4880,47 @@ fn definition_in_context_named(
     }
     let is_instance = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","instance"]));
     let is_theorem = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","theorem"]));
+    let is_abbrev = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","abbrev"]));
+    // `opaque` is an opaque constant whose signature is a `declSig` and whose value is
+    // optional (vendored `Lean/Elab/Declaration.lean`, `elabOpaque` via `mkDefViewOfOpaque`).
+    let is_opaque = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","opaque"]));
+    // `axiom` is `"axiom " declId declSig` (vendored `Lean/Elab/Declaration.lean`,
+    // `elabAxiom`): a theorem's header and no value.
+    let is_axiom = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","axiom"]));
+    if is_unsafe {
+        // MutualDef.check at the pin forbids unsafe theorems and unsafe
+        // partial declarations. Opaque/axiom forms need a separate source
+        // door; do not accidentally give them recursive-definition machinery.
+        if is_theorem
+            || is_opaque
+            || is_axiom
+            || context
+                .partial
+                .as_ref()
+                .is_some_and(|state| state.kind != partial::Kind::Unsafe)
+        {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "unsafe def, abbrev, or data instance without partial",
+            });
+        }
+        context.partial.get_or_insert(partial::State {
+            kind: partial::Kind::Unsafe,
+            ..partial::State::default()
+        });
+    }
+    if is_opaque {
+        let parts = expect_node(
+            &declaration[1],
+            &parser_kind(&["Command", "opaque"]),
+            4,
+            "opaque",
+        )?;
+        if expect_null_args(&parts[3], "opaque value")?.is_empty() {
+            return opaque_without_value(declaration, parts, context, generated_name);
+        }
+    }
     let instance_parts;
+    let opaque_parts;
     let definition = if is_instance {
         let parts = instance_command::parts(&declaration[1])?;
         instance_parts = [
@@ -3868,18 +4946,46 @@ fn definition_in_context_named(
             parts.value.clone(),
         ];
         &instance_parts[..]
-    } else {
+    } else if is_opaque {
         let parts = expect_node(
             &declaration[1],
-            &parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
-            if is_theorem { 4 } else { 5 },
+            &parser_kind(&["Command", "opaque"]),
+            4,
+            "opaque",
+        )?;
+        expect_atom(&parts[0], "opaque", "opaque keyword")?;
+        let [value] = expect_null_args(&parts[3], "opaque value")? else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "one opaque value",
+            });
+        };
+        opaque_parts = [
+            parts[0].clone(),
+            parts[1].clone(),
+            parts[2].clone(),
+            value.clone(),
+        ];
+        &opaque_parts[..]
+    } else {
+        // An abbreviation has the definition's optional signature and value,
+        // but no deriving slot (Lean.Parser.Command.abbrev at the pin); an axiom
+        // has a theorem's `declId declSig` and no value at all.
+        let (kind, keyword, arity) = if is_theorem {
+            ("theorem", "theorem", 4)
+        } else if is_axiom {
+            ("axiom", "axiom", 3)
+        } else if is_abbrev {
+            ("abbrev", "abbrev", 4)
+        } else {
+            ("definition", "def", 5)
+        };
+        let parts = expect_node(
+            &declaration[1],
+            &parser_kind(&["Command", kind]),
+            arity,
             "named declaration",
         )?;
-        expect_atom(
-            &parts[0],
-            if is_theorem { "theorem" } else { "def" },
-            "declaration keyword",
-        )?;
+        expect_atom(&parts[0], keyword, "declaration keyword")?;
         parts
     };
     let id = expect_node(
@@ -3905,8 +5011,16 @@ fn definition_in_context_named(
     let mut owned_name = match generated_name {
         Some(generated) => generated,
         None if anonymous_instance => Name::anonymous(),
-        None => context.enter_declaration(name)?,
+        None => {
+            let owned = context.enter_declaration(name)?;
+            if !is_axiom {
+                context.ensure_equation_names_available(&owned)?;
+            }
+            owned
+        }
     };
+    context.local_function_lifting.parent =
+        (!owned_name.is_anonymous()).then(|| owned_name.clone());
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
@@ -3917,7 +5031,7 @@ fn definition_in_context_named(
         &definition[2],
         &parser_kind(&[
             "Command",
-            if is_theorem || is_instance {
+            if is_theorem || is_instance || is_opaque || is_axiom {
                 "declSig"
             } else {
                 "optDeclSig"
@@ -3926,21 +5040,41 @@ fn definition_in_context_named(
         2,
         "declaration signature",
     )?;
-    let mut parameters = context.bind_parameters(&signature[0])?;
-    let mut expected = if is_theorem || is_instance {
-        let parts = expect_node(
-            &signature[1],
-            &parser_kind(&["Term", "typeSpec"]),
-            2,
-            "theorem type",
-        )?;
-        expect_atom(&parts[0], ":", "theorem type colon")?;
-        Some(context.type_term(&parts[1])?)
-    } else {
-        optional_type_syntax(&signature[1])?
-            .map(|syntax| context.type_term(syntax))
-            .transpose()?
-    };
+    // The pin's `withAutoBoundImplicit` (Lean/Elab/Term/TermElabM.lean:1932-1955): an unknown
+    // atomic name in the header restores the header's state, becomes an implicit local of a
+    // fresh type, and the header is elaborated again. Never the definition's own name
+    // (MutualDef.lean:213). See `auto_bound_name` for which names.
+    let mut own_names = own_short_name(name);
+    if let Some(group) = context
+        .partial
+        .as_ref()
+        .and_then(|state| state.group.as_ref())
+    {
+        for name in &group.names {
+            own_names.extend(own_short_name(name));
+        }
+    }
+    let (autos, (mut parameters, mut expected)) =
+        context.with_auto_bound_implicits(&own_names, |context| {
+            let parameters = context.bind_parameters(&signature[0])?;
+            let expected = if is_theorem || is_instance || is_opaque || is_axiom {
+                let parts = expect_node(
+                    &signature[1],
+                    &parser_kind(&["Term", "typeSpec"]),
+                    2,
+                    "theorem type",
+                )?;
+                expect_atom(&parts[0], ":", "theorem type colon")?;
+                Some(context.type_term(&parts[1])?)
+            } else {
+                optional_type_syntax(&signature[1])?
+                    .map(|syntax| context.type_term(syntax))
+                    .transpose()?
+            };
+            Ok((parameters, expected))
+        })?;
+    context.refuse_auto_bound_dependencies(&autos, &parameters)?;
+    parameters.splice(0..0, autos);
     context.infer_level_params = false;
     // Later binders may determine earlier class inputs, but the body may not
     // rescue a stuck header instance. An explicit result also closes ordinary
@@ -3958,13 +5092,54 @@ fn definition_in_context_named(
         // holes and unresolved header instances must not cross this boundary.
         context.require_resolved_terms(&types)?;
     }
+    let (proof_instance, hidden_instance) = if is_instance {
+        context.validate_instance_binder(
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?;
+        instance_command::prepare_header(
+            context,
+            &parameters,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+            &modifiers[1],
+        )?
+    } else {
+        (false, false)
+    };
     if anonymous_instance {
         let expected = expected
             .as_ref()
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         owned_name = context.generated_instance_name(&parameters, expected)?;
+        context.local_function_lifting.parent = Some(owned_name.clone());
+    }
+    if is_instance && !hidden_instance {
+        // Naming may consult the private predecessor only for collisions. Once
+        // the name is chosen, an exposed body retains only its public world.
+        context.private_proof_body = None;
+    }
+    if let Some(probe) = &mut context.declaration_header_probe {
+        *probe = if is_instance {
+            hidden_instance
+        } else {
+            context.source_scope.exports_declaration() && !context.source_scope.expose_definitions
+        };
+        return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
+    if is_axiom
+        || context
+            .partial
+            .as_ref()
+            .and_then(|state| state.group.as_ref())
+            .is_some_and(|group| group.header_only)
+    {
+        let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        return axiom_from_header(context, name, parameters, expected);
+    }
     let theorem_section_parameters = if is_theorem {
         let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
         roots.extend(expected.iter().cloned());
@@ -3974,6 +5149,36 @@ fn definition_in_context_named(
     } else {
         None
     };
+    if proof_instance && context.source_scope.exports_declaration() {
+        context.public_instance_signature = Some(instance_command::PublicHeader::freeze(
+            context,
+            name,
+            &parameters,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?);
+        if hidden_instance {
+            context.enter_private_proof()?;
+            context.private_instance_body = true;
+        }
+    } else if hidden_instance && context.source_scope.exports_declaration() {
+        context.enter_public_definition_body(&parameters, expected.as_ref())?;
+        context.private_instance_body = true;
+    } else if context.private_definition_body {
+        context.enter_public_definition_body(&parameters, expected.as_ref())?;
+    } else if context.private_proof_body.is_some() {
+        context.enter_public_theorem_proof(
+            name,
+            &parameters,
+            theorem_section_parameters
+                .as_deref()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?,
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?;
+    }
     let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
     let struct_instance;
     let empty_suffix;
@@ -4015,7 +5220,20 @@ fn definition_in_context_named(
             expect_atom(&parts[0], ":=", "definition assignment")?;
             (&parts[1], &parts[2], &parts[3])
         };
-    let termination = recursion::structural_hint(termination)?;
+    let termination = recursion::termination_hint(
+        termination,
+        !is_theorem && !is_instance && !is_abbrev && !is_opaque,
+    )?;
+    if context.partial.is_some()
+        && !matches!(
+            termination,
+            None | Some(recursion::TerminationHint::Automatic)
+        )
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "no termination_by or decreasing_by on partial def",
+        });
+    }
     // `where` declarations scope over the body as `let rec` declarations, the pin's
     // `expandWhereDecls`; each is its own group here, so a later one may call an
     // earlier one.
@@ -4028,15 +5246,8 @@ fn definition_in_context_named(
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
-    if !is_theorem && !is_instance {
+    if !is_theorem && !is_instance && !is_abbrev && !is_opaque {
         expect_empty_null(&definition[4], "absent definition clauses")?;
-    }
-    if is_instance {
-        context.validate_instance_binder(
-            expected
-                .as_ref()
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
-        )?;
     }
     let header_parameters = parameters.len();
     let generated;
@@ -4068,6 +5279,8 @@ fn definition_in_context_named(
     context.resolve_instances(true)?;
     context.resume_postponed_eliminators(true)?;
     context.flush(true)?;
+    context.complete_local_functions()?;
+    context.close_partial_group_references(&mut term)?;
     let section_parameters = if let Some(selected) = theorem_section_parameters {
         selected
     } else {
@@ -4075,14 +5288,27 @@ fn definition_in_context_named(
         roots.extend([term.type_.clone(), term.value.clone()]);
         context.section_parameters(&roots, false)?
     };
+    let public_definition_type = context
+        .public_definition_header
+        .clone()
+        .map(|header| header.close(context, &section_parameters, &term.type_))
+        .transpose()?;
+    let partial_captures = section_parameters.clone();
+    let instance_type = context
+        .public_instance_signature
+        .clone()
+        .map(|header| header.close(context, name, &section_parameters))
+        .transpose()?;
     parameters.splice(0..0, section_parameters);
     let mut universe_roots: Vec<_> = parameters
         .iter()
         .map(|parameter| parameter.type_.clone())
         .collect();
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
+    universe_roots.extend(context.local_function_lifting.roots());
     context.generalize_declaration_universes(&universe_roots)?;
     let mut term = context.finish(term)?;
+    context.close_partial_reference(&mut term, &parameters, &partial_captures)?;
     // Preserve the source's actual lambda stages. Eta-expanding a computed
     // function moves its strict initializer under a new binder and delays it
     // until an argument arrives. Native runtime preparation owns function
@@ -4115,31 +5341,212 @@ fn definition_in_context_named(
     {
         return Err(failure(SourceInferenceError::Scope));
     }
-    // The pin compiles every declaration but a theorem (`codegen.rs`).
-    if !is_theorem {
-        context.check_compiled_recursors(&term.value)?;
+    // `shouldGenCodeFor` at the pin excludes theorems and noncomputable declarations.
+    // These still pass ordinary term elaboration and council admission, but a missing
+    // runtime recursor implementation is irrelevant when no code may be generated.
+    if !is_theorem && !proof_instance && !is_noncomputable {
+        context.noncomputable_definition = context.check_definition_codegen(&term)?;
     }
-    let level_params = context.declaration_levels(&[term.type_.clone(), term.value.clone()])?;
-    let base = ConstantVal {
+    let type_ = if let Some(header) = public_definition_type {
+        context.instantiate(&header)?
+    } else {
+        instance_type.unwrap_or(term.type_)
+    };
+    let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
+    let mut base = ConstantVal {
         name: name.clone(),
         level_params,
-        type_: term.type_,
+        type_,
     };
-    if is_theorem {
+    if is_theorem || proof_instance {
+        if let Some(signature) = &context.public_theorem_signature {
+            if base.name != signature.name || base.level_params != signature.level_params {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "a public theorem proof preserving its closed signature",
+                });
+            }
+            // Equation elaboration may introduce fresh binder names or unfold
+            // a function-valued statement while building its proof. Preserve
+            // the exact original statement; ordinary theorem admission checks
+            // the produced proof against this frozen header, not that rebuilt
+            // body type. No proof can change the public declaration's type.
+            base = signature.clone();
+        }
         Ok(Declaration::Thm(fln_env::constants::TheoremVal {
             base,
             value: term.value,
             all: vec![name.clone()],
         }))
+    } else if is_opaque {
+        Ok(Declaration::Opaque(fln_env::constants::OpaqueVal {
+            base,
+            value: term.value,
+            is_unsafe: false,
+            all: vec![name.clone()],
+        }))
+    } else if context
+        .partial
+        .as_ref()
+        .is_some_and(|state| state.kind == partial::Kind::Unsafe)
+    {
+        // Basic.addAndCompileUnsafe retains direct recursive references and
+        // opaque hints. Even a nonrecursive unsafe definition stays Unsafe;
+        // it never acquires a safe logical inhabitant or companion.
+        let recursive = context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.reference.is_some());
+        let definition = DefinitionVal {
+            base,
+            value: term.value,
+            hints: if recursive {
+                ReducibilityHints::Opaque
+            } else if is_abbrev {
+                ReducibilityHints::Abbrev
+            } else {
+                ReducibilityHints::Regular(1)
+            },
+            safety: DefinitionSafety::Unsafe,
+            all: vec![name.clone()],
+        };
+        if context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.group.is_some())
+        {
+            Ok(Declaration::Mutual(vec![definition]))
+        } else {
+            Ok(Declaration::Defn(definition))
+        }
+    } else if context
+        .partial
+        .as_ref()
+        .is_some_and(|state| state.reference.is_some() || state.group.is_some())
+    {
+        base.name = Name::str(name.clone(), "_unsafe_rec");
+        Ok(Declaration::Mutual(vec![DefinitionVal {
+            all: vec![base.name.clone()],
+            base,
+            value: term.value,
+            hints: ReducibilityHints::Opaque,
+            safety: DefinitionSafety::Partial,
+        }]))
     } else {
         Ok(Declaration::Defn(DefinitionVal {
             base,
             value: term.value,
-            hints: ReducibilityHints::Regular(1),
+            hints: if is_abbrev {
+                ReducibilityHints::Abbrev
+            } else {
+                ReducibilityHints::Regular(1)
+            },
             safety: DefinitionSafety::Safe,
             all: vec![name.clone()],
         }))
     }
+}
+
+/// An axiom from its elaborated header (`elabAxiom`): the type, closed over its binders and
+/// the section variables it uses (`mkForallFVars vars type (usedOnly := true)`), with its
+/// universe parameters.
+fn axiom_from_header(
+    context: &mut Context,
+    name: &Name,
+    mut parameters: Vec<LocalDecl>,
+    expected: Expr,
+) -> Result<Declaration, NatDefinitionElabError> {
+    context.resolve_instances(true)?;
+    context.resume_postponed_eliminators(true)?;
+    context.flush(true)?;
+    let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
+    roots.push(expected.clone());
+    let section = context.section_parameters(&roots, true)?;
+    parameters.splice(0..0, section);
+    let mut universe_roots: Vec<_> = parameters
+        .iter()
+        .map(|parameter| parameter.type_.clone())
+        .collect();
+    universe_roots.push(expected.clone());
+    context.generalize_declaration_universes(&universe_roots)?;
+    let mut type_ = context.instantiate(&expected)?;
+    for local in parameters.into_iter().rev() {
+        let LocalDecl {
+            id,
+            user_name,
+            type_: domain,
+            binder_info,
+            ..
+        } = local;
+        let domain = context.instantiate(&domain)?;
+        type_ = type_
+            .abstract_fvar(&id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        type_ = Expr::forall_e(user_name, domain, type_, binder_info);
+    }
+    let type_ = context.instantiate(&type_)?;
+    context.require_resolved(std::slice::from_ref(&type_))?;
+    if type_.has_fvar() || type_.has_loose_bvars() {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let level_params = context.declaration_levels(std::slice::from_ref(&type_))?;
+    Ok(Declaration::Axiom(fln_env::constants::AxiomVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params,
+            type_,
+        },
+        is_unsafe: false,
+    }))
+}
+
+/// `opaque c : T` with no value takes the pin's `default_or_ofNonempty%` (vendored
+/// `Lean/Elab/BuiltinNotation.lean`): `default` through an `Inhabited` instance, elaborated as
+/// the written value would be. Its other half, `Classical.ofNonempty` through a `Nonempty`
+/// instance, is noncomputable, and the pin's compiler refuses it for an `opaque` that is not
+/// `noncomputable`, `@[extern]` or `@[implemented_by]` ("failed to compile definition … depends
+/// on 'Classical.ofNonempty'", measured 2026-10-11). None of those is modelled here, so a type
+/// without an `Inhabited` instance is refused, as the pin refuses it.
+fn opaque_without_value(
+    declaration: &[Syntax],
+    parts: &[Syntax],
+    context: &mut Context,
+    generated_name: Option<Name>,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let value = |term: Syntax| {
+        let null = || Syntax::node(Name::from_components(["null"]), Vec::new());
+        let declaration_value = Syntax::node(
+            parser_kind(&["Command", "declValSimple"]),
+            vec![
+                Syntax::atom(fln_syntax::source::SourceInfo::None, ":="),
+                term,
+                Syntax::node(
+                    parser_kind(&["Termination", "suffix"]),
+                    vec![null(), null()],
+                ),
+                null(),
+            ],
+        );
+        let opaque = Syntax::node(
+            parser_kind(&["Command", "opaque"]),
+            vec![
+                parts[0].clone(),
+                parts[1].clone(),
+                parts[2].clone(),
+                Syntax::node(Name::from_components(["null"]), vec![declaration_value]),
+            ],
+        );
+        Syntax::node(
+            parser_kind(&["Command", "declaration"]),
+            vec![declaration[0].clone(), opaque],
+        )
+    };
+    let identifier = |components: &[&str]| Syntax::Ident {
+        info: fln_syntax::source::SourceInfo::None,
+        raw_val: fln_syntax::source::ByteSpan::default(),
+        val: Name::from_components(components.iter().copied()),
+        preresolved: Vec::new(),
+    };
+    definition_in_context_named(&value(identifier(&["default"])), context, generated_name)
 }
 
 pub(super) fn query(
@@ -4175,6 +5582,27 @@ fn query_in(
     mut context: Context,
     evaluate: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    let (term, level_params) = query_term(syntax, &name, &mut context, evaluate)?;
+    Ok(query_declaration(
+        name,
+        term,
+        level_params,
+        if evaluate {
+            DefinitionSafety::Unsafe
+        } else {
+            DefinitionSafety::Safe
+        },
+    ))
+}
+
+fn query_term(
+    syntax: &Syntax,
+    name: &Name,
+    context: &mut Context,
+    evaluate: bool,
+) -> Result<(Typed, Vec<Name>), NatDefinitionElabError> {
+    let expanded = context.expand_match_alternatives(syntax)?;
+    let syntax = expanded.as_ref();
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
         return Err(if evaluate {
             NatDefinitionElabError::InvalidGeneratedEvaluationName
@@ -4182,22 +5610,82 @@ fn query_in(
             NatDefinitionElabError::InvalidGeneratedCheckName
         });
     }
-    let parts = expect_node(
-        syntax,
-        &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),
-        2,
-        if evaluate {
-            "Lean.Parser.Command.eval"
-        } else {
-            "Lean.Parser.Command.check"
-        },
-    )?;
-    expect_atom(
-        &parts[0],
-        if evaluate { "#eval" } else { "#check" },
-        "query keyword",
-    )?;
-    let term = context.term(&parts[1], None)?;
+    // `#synth C` (`elabSynth`, Lean/Elab/BuiltinCommand.lean:506): `C` elaborated with no
+    // expected type, its pending instances synthesized, then an instance of `C` synthesized.
+    // The candidate is that instance at type `C`; the caller prints the instance alone.
+    let synth = parser_kind(&["Command", "synth"]);
+    if !evaluate && syntax.kind() == Some(&synth) {
+        let parts = expect_node(syntax, &synth, 2, "Lean.Parser.Command.synth")?;
+        expect_atom(&parts[0], "#synth", "synth keyword")?;
+        let class = context.term(&parts[1], None)?;
+        context.resolve_instances(true)?;
+        let class = context.instantiate(&class.value)?;
+        let hole = context.instance_hole(class.clone())?;
+        context.resolve_instances(true)?;
+        context.complete_local_functions()?;
+        let term = context.finish(Typed {
+            value: hole,
+            type_: class,
+        })?;
+        return Ok((term, Vec::new()));
+    }
+    // `#print` (`Lean/Elab/Print.lean`): its identifier or string is elaborated as `#check`
+    // elaborates a term, and the caller prints from the constant or literal the candidate is.
+    let printed = (!evaluate)
+        .then(|| {
+            ["print", "printSig", "printAxioms", "printEqns"]
+                .into_iter()
+                .find(|form| syntax.kind() == Some(&parser_kind(&["Command", form])))
+        })
+        .flatten();
+    let argument = match printed {
+        Some(form) => {
+            let arity = if form == "print" { 2 } else { 3 };
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Command", form]),
+                arity,
+                "Lean.Parser.Command.print",
+            )?;
+            expect_atom(&parts[0], "#print", "print keyword")?;
+            &parts[arity - 1]
+        }
+        None => {
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),
+                2,
+                if evaluate {
+                    "Lean.Parser.Command.eval"
+                } else {
+                    "Lean.Parser.Command.check"
+                },
+            )?;
+            expect_atom(
+                &parts[0],
+                if evaluate { "#eval" } else { "#check" },
+                "query keyword",
+            )?;
+            &parts[1]
+        }
+    };
+    let mut term = context.term(argument, None)?;
+    if evaluate {
+        let (head, explicit) = context.explicit_application_head(argument)?;
+        if !explicit
+            && (matches!(head, Syntax::Ident { .. })
+                || head.kind() == Some(&parser_kind(&["Term", "explicitUniv"])))
+        {
+            // The pin elaborates an identifier through `elabAppArgs`, even
+            // with no written arguments, and synthesizes its instance binders
+            // (`Lean/Elab/App.lean`, `elabAtom`/`processInstImplicitArg`).
+            // A bare `#eval selected` must evaluate the selected dictionary's
+            // value. Do not guess ordinary implicit parameters or apply a
+            // function's explicit arguments; `@selected` stays explicit.
+            term = context.insert_implicits(term, ImplicitInsertion::InstanceQuery)?;
+        }
+    }
+    context.complete_local_functions()?;
     // `#check` generalizes universe metavariables the term leaves open to fresh
     // parameters `u_1`, `u_2`, … (the pin's `levelMVarToParam`), so `#check @List.map`
     // has a type; `#eval` needs a closed, concrete term and keeps the refusal.
@@ -4209,9 +5697,18 @@ fn query_in(
     let term = context.finish(term)?;
     // `#eval` compiles its term (`codegen.rs`); `#check` does not.
     if evaluate {
-        context.check_compiled_recursors(&term.value)?;
+        context.check_compiled_recursors(&term)?;
     }
-    Ok(Declaration::Defn(DefinitionVal {
+    Ok((term, level_params))
+}
+
+fn query_declaration(
+    name: Name,
+    term: Typed,
+    level_params: Vec<Name>,
+    safety: DefinitionSafety,
+) -> Declaration {
+    Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),
             level_params,
@@ -4219,22 +5716,45 @@ fn query_in(
         },
         value: term.value,
         hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
+        safety,
         all: vec![name],
-    }))
+    })
 }
 
 /// Registration requested by a canonical named source instance. The caller must
 /// still obtain ordinary declaration admission before installing this metadata.
+/// Use [`instance_registration_is_scoped`] to select namespace registration.
+/// [`instance_registration_is_local`] instead requests a lexical selection;
+/// its registration must never enter the persistent environment journal.
 pub fn instance_registration(
     syntax: &Syntax,
 ) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
     instance_command::registration(syntax)
 }
 
+/// Chronological global default-instance priorities requested by a declaration.
+/// Apply these only to the actual name returned by ordinary checked admission.
+pub fn default_instance_registration(syntax: &Syntax) -> Result<Vec<u32>, NatDefinitionElabError> {
+    instance_command::default_registration(syntax)
+}
+
+/// Whether an instance command requests namespace-scoped registration. Read
+/// alongside [`instance_registration`]; after admission, register in the current
+/// source namespace, which need not be the qualified declaration name's parent.
+pub fn instance_registration_is_scoped(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    instance_command::is_scoped(syntax)
+}
+
+/// Whether an instance command requests registration in its lexical source
+/// scope. The checked named declaration itself survives the end of that scope.
+pub fn instance_registration_is_local(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    instance_command::is_local(syntax)
+}
+
 /// `declModifiers`' `protected` slot: docComment, attributes, visibility, then
 /// `protected` (vendored `src/Lean/Parser/Command.lean`, `declModifiers`).
 const PROTECTED_SLOT: usize = 3;
+pub(super) const NONCOMPUTABLE_SLOT: usize = 4;
 
 /// `declModifiers`' doc comment slot: empty, or the pin's `docComment` node. A docstring adds
 /// no declaration and no meaning the kernel sees; the reference-manual links the pin validates
@@ -4276,6 +5796,88 @@ fn protected_slot(slot: &Syntax) -> Result<bool, NatDefinitionElabError> {
         _ => Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "one protected modifier",
         }),
+    }
+}
+
+/// Whether a `noncomputable` slot is set: empty, or exactly one
+/// `Lean.Parser.Command.noncomputable` node holding the keyword.
+pub(super) fn noncomputable_slot(slot: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    match expect_null_args(slot, "noncomputable modifier")? {
+        [] => Ok(false),
+        [modifier] => {
+            let parts = expect_node(
+                modifier,
+                &parser_kind(&["Command", "noncomputable"]),
+                1,
+                "noncomputable modifier",
+            )?;
+            expect_atom(&parts[0], "noncomputable", "noncomputable keyword")?;
+            Ok(true)
+        }
+        _ => Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one noncomputable modifier",
+        }),
+    }
+}
+
+/// The requested name of a noncomputable definition, abbreviation, instance or opaque.
+/// These declarations are checked but never compiled (the pin's `noncomputableExt`,
+/// vendored `src/Lean/Compiler/NoncomputableAttr.lean`). As for [`instance_registration`],
+/// an anonymous name requests the instance name generated by elaboration: the caller must
+/// take that exact name from the completed council admission, never publish the placeholder.
+/// A `noncomputable example` declares nothing. An explicit `noncomputable theorem` is the
+/// pin's error "'theorem' subsumes 'noncomputable'"; a proof-valued instance is allowed.
+pub fn noncomputable_registration(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    if !noncomputable_slot(&modifiers[NONCOMPUTABLE_SLOT])? {
+        return Ok(None);
+    }
+    let kind = |name: &str| declaration[1].kind() == Some(&parser_kind(&["Command", name]));
+    if kind("example") {
+        return Ok(None);
+    }
+    if kind("theorem") {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a computable theorem ('theorem' subsumes 'noncomputable')",
+        });
+    }
+    if kind("instance") {
+        return instance_command::registration(syntax)
+            .map(|registration| registration.map(|(name, _)| name));
+    }
+    if !kind("definition") && !kind("abbrev") && !kind("opaque") {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a noncomputable `def`, `abbrev`, `instance`, `opaque` or `example`",
+        });
+    }
+    let Syntax::Node { args, .. } = &declaration[1] else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "named declaration",
+        });
+    };
+    let id = expect_node(
+        args.get(1)
+            .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "declaration id",
+            })?,
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    match &id[0] {
+        Syntax::Ident { val, .. } if !val.is_anonymous() => Ok(Some(val.clone())),
+        _ => Err(NatDefinitionElabError::AnonymousDeclarationName),
     }
 }
 

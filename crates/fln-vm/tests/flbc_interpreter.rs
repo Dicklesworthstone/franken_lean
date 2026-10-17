@@ -4269,11 +4269,11 @@ fn typed_local_core_closures_execute_nat_and_string_captures_with_balanced_owner
     shadow::enable();
     let nat = returned(execute(&nat_program, ExecutionLimits::default(), None));
     assert_eq!(nat.value.unbox(), 42);
-    assert_eq!(nat.usage.peak_stack_depth, 2);
+    assert_eq!(nat.usage.peak_stack_depth, 1);
     drop(nat);
     let string = returned(execute(&string_program, ExecutionLimits::default(), None));
     assert_eq!(string_contents(&string.value), "core-golem");
-    assert_eq!(string.usage.peak_stack_depth, 2);
+    assert_eq!(string.usage.peak_stack_depth, 1);
     drop(string);
     let (events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "local closure execution releases every ABI object");
@@ -4758,7 +4758,9 @@ fn typed_core_partial_and_overapplication_execute_on_golem_and_marrow() {
             .iter()
             .flat_map(|function| &function.code)
             .filter_map(|instruction| match instruction {
-                Instruction::Apply { args, .. } => Some(args.len()),
+                Instruction::Apply { args, .. } | Instruction::TailApply { args, .. } => {
+                    Some(args.len())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -5042,11 +5044,11 @@ fn self_recursive_core_closures_return_acyclic_environments_and_stop_typed() {
         Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => {
                 assert!(usage.is_genuine_exhaustion());
-                assert_eq!(usage.allowed, 3);
-                assert_eq!(usage.observed, 4);
-                assert_eq!(usage.reason, ResourceReason::RecursionDepth { limit: 3 });
+                assert_eq!(usage.allowed, 100);
+                assert_eq!(usage.observed, 101);
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
-            other => panic!("expected recursive depth exhaustion, got {other:?}"),
+            other => panic!("expected recursive execution-step exhaustion, got {other:?}"),
         },
         other => panic!("expected recursive Inconclusive, got {other:?}"),
     }
@@ -5267,11 +5269,11 @@ fn mutual_recursive_core_closures_return_peers_and_stop_typed_without_cycles() {
         Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => {
                 assert!(usage.is_genuine_exhaustion());
-                assert_eq!(usage.allowed, 3);
-                assert_eq!(usage.observed, 4);
-                assert_eq!(usage.reason, ResourceReason::RecursionDepth { limit: 3 });
+                assert_eq!(usage.allowed, 100);
+                assert_eq!(usage.observed, 101);
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
-            other => panic!("expected mutual recursion depth exhaustion, got {other:?}"),
+            other => panic!("expected mutual recursion execution-step exhaustion, got {other:?}"),
         },
         other => panic!("expected mutual recursion Inconclusive, got {other:?}"),
     }
@@ -10880,7 +10882,7 @@ fn float_unary_math_and_pow_atan2_execute_on_the_owned_numerics_plane() {
         "atan2(y=1, x=0) = {quadrant}"
     );
     assert_eq!(quadrant.to_bits(), fln_libm::atan2(1.0, 0.0).to_bits());
-    // frExp and scaleB stay out of this adapter's shape: still a typed refusal.
+    // frExp's pair result remains outside this adapter's supported shape.
     let refusal = float_program(
         "extern:Float.frExp",
         vec![float_operand(r(0), false, 1.5)],
@@ -10893,6 +10895,170 @@ fn float_unary_math_and_pow_atan2_execute_on_the_owned_numerics_plane() {
             ..
         })
     ));
+}
+
+fn float_scaling_program(binary32: bool, bits: u64, exponent: i64) -> ValidatedProgram {
+    let magnitude = if exponent < 0 {
+        exponent.unsigned_abs() - 1
+    } else {
+        exponent as u64
+    };
+    let row = if exponent < 0 {
+        "extern:Int.negSucc"
+    } else {
+        "extern:Int.ofNat"
+    };
+    let float_row = if binary32 {
+        "extern:Float32.scaleB"
+    } else {
+        "extern:Float.scaleB"
+    };
+    validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Owned,
+        4,
+        vec![
+            boxed_scalar(
+                r(0),
+                if binary32 {
+                    (bits as u32).to_ne_bytes().to_vec()
+                } else {
+                    bits.to_ne_bytes().to_vec()
+                },
+            ),
+            Instruction::Nat {
+                dst: r(1),
+                value: magnitude,
+            },
+            intrinsic(r(2), row, vec![r(1)]),
+            intrinsic(r(3), float_row, vec![r(0), r(2)]),
+            Instruction::Return { src: r(3) },
+        ],
+    )])
+}
+
+#[test]
+fn float_scaling_executes_and_replays_exact_binary_boundaries() {
+    let _guard = lock();
+    // These cells force the exponent through the ordinary Int constructor
+    // intrinsic and scale through its census row, including the transition
+    // from a tagged i32 to an mpz. No compiler constant folding participates.
+    for (binary32, bits, exponent, expected) in [
+        (false, 0x3ff0_0000_0000_0000, 3, 0x4020_0000_0000_0000),
+        (false, 0xbff8_0000_0000_0000, -1, 0xbfe8_0000_0000_0000),
+        (false, 0x3ff0_0000_0000_0000, -1075, 0),
+        // Just above halfway must survive. Scaling by two host
+        // multiplications can lose this low bit before the final rounding.
+        (false, 0x3ff0_0000_0000_0001, -1075, 1),
+        (false, 0x3ff8_0000_0000_0000, -1074, 2),
+        (false, 0x3fff_ffff_ffff_ffff, -1023, 0x0010_0000_0000_0000),
+        (false, 1, 1074, 0x3ff0_0000_0000_0000),
+        (false, 0x000f_ffff_ffff_ffff, 1, 0x001f_ffff_ffff_fffe),
+        (false, 0x7fef_ffff_ffff_ffff, 1, 0x7ff0_0000_0000_0000),
+        (false, 0x8000_0000_0000_0000, -5, 0x8000_0000_0000_0000),
+        (false, 0xbff0_0000_0000_0001, -1075, 0x8000_0000_0000_0001),
+        (true, 0x3f80_0000, 3, 0x4100_0000),
+        (true, 0xbfc0_0000, -1, 0xbf40_0000),
+        (true, 0x3f80_0000, -150, 0),
+        (true, 0x3f80_0001, -150, 1),
+        (true, 0x3fc0_0000, -149, 2),
+        (true, 0x3fff_ffff, -127, 0x0080_0000),
+        (true, 1, 149, 0x3f80_0000),
+        (true, 0x007f_ffff, 1, 0x00ff_fffe),
+        (true, 0x7f7f_ffff, 1, 0x7f80_0000),
+        (true, 0x8000_0000, -5, 0x8000_0000),
+        (true, 0xbf80_0001, -150, 0x8000_0001),
+    ] {
+        let program = float_scaling_program(binary32, bits, exponent);
+        let bytes = encode_canonical(&program, CodecLimits::default()).unwrap();
+        let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        for program in [&program, &replay] {
+            let execution = returned(execute(program, ExecutionLimits::default(), None));
+            let actual = if binary32 {
+                u64::from(execution.value.try_ctor_scalar_u32(0).unwrap())
+            } else {
+                execution.value.try_ctor_scalar_u64(0).unwrap()
+            };
+            assert_eq!(
+                actual, expected,
+                "binary32={binary32}, bits={bits:x}, exponent={exponent}"
+            );
+        }
+    }
+}
+
+#[test]
+fn float_scaling_preserves_the_pins_scalar_and_mpz_int_branches() {
+    let _guard = lock();
+    for (binary32, sign, infinity, nan, one) in [
+        (
+            false,
+            1_u64 << 63,
+            0x7ff0_0000_0000_0000,
+            0x7ff8_0000_0000_0000,
+            0x3ff0_0000_0000_0000,
+        ),
+        (true, 1_u64 << 31, 0x7f80_0000, 0x7fc0_0000, 0x3f80_0000),
+    ] {
+        for (bits, exponent, expected) in [
+            (sign, i64::from(i32::MIN), sign),
+            (sign, i64::from(i32::MIN) - 1, 0),
+            (infinity, i64::from(i32::MIN), infinity),
+            (infinity, i64::from(i32::MIN) - 1, 0),
+            (nan, i64::from(i32::MIN), nan),
+            (nan, i64::from(i32::MIN) - 1, 0),
+            (one | sign, i64::from(i32::MAX), infinity | sign),
+            (one | sign, i64::from(i32::MAX) + 1, infinity | sign),
+            (sign, i64::from(i32::MAX), sign),
+            (sign, i64::from(i32::MAX) + 1, 0),
+            (nan, i64::from(i32::MAX) + 1, nan),
+        ] {
+            let execution = returned(execute(
+                &float_scaling_program(binary32, bits, exponent),
+                ExecutionLimits::default(),
+                None,
+            ));
+            let actual = if binary32 {
+                u64::from(execution.value.try_ctor_scalar_u32(0).unwrap())
+            } else {
+                execution.value.try_ctor_scalar_u64(0).unwrap()
+            };
+            assert_eq!(
+                actual, expected,
+                "binary32={binary32}, bits={bits:x}, exponent={exponent}"
+            );
+        }
+        let row = if binary32 {
+            "extern:Float32.scaleB"
+        } else {
+            "extern:Float.scaleB"
+        };
+        let bad = float_program(
+            row,
+            vec![
+                float_operand(r(0), binary32, 1.0),
+                Instruction::String {
+                    dst: r(1),
+                    value: "not an Int".to_owned(),
+                },
+            ],
+            true,
+        );
+        assert!(matches!(
+            execute(&bad, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            })
+        ));
+        let recovered = returned(execute(
+            &float_scaling_program(binary32, one, 0),
+            ExecutionLimits::default(),
+            None,
+        ));
+        assert_eq!(float_contents(&recovered.value, binary32), 1.0);
+    }
 }
 
 #[test]

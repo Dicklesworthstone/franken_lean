@@ -87,10 +87,49 @@ pub fn mutual_inductive_declaration(
     specs: &[InductiveSpec],
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
+    build_mutual(specs, budget, None)
+}
+
+/// [`mutual_inductive_declaration`] for a block whose trailing parameters were
+/// written as indices and promoted (the Reference's `fixedIndicesToParams`).
+/// `promoted[f][c]` holds constructor `c` of family `f`'s own binders for those
+/// parameters, as in `inductive_with_promoted_parameters`: only the constructor
+/// types read them; each family type binds the promoted parameters by its own
+/// index binders, and the recursors by the first family's.
+pub(crate) fn mutual_inductive_with_promoted_parameters(
+    specs: &[InductiveSpec],
+    budget: RecordBudget,
+    promoted: &[Vec<Vec<LocalDecl>>],
+) -> Result<Declaration, InductiveError> {
+    build_mutual(specs, budget, Some(promoted))
+}
+
+fn build_mutual(
+    specs: &[InductiveSpec],
+    budget: RecordBudget,
+    promoted: Option<&[Vec<Vec<LocalDecl>>]>,
+) -> Result<Declaration, InductiveError> {
     if !(2..=8).contains(&specs.len()) {
         return Err(InductiveError::InvalidTelescope);
     }
     let first = &specs[0];
+    if let Some(promoted) = promoted
+        && (promoted.len() != specs.len()
+            || promoted.iter().zip(specs).any(|(family, spec)| {
+                family.len() != spec.constructors.len()
+                    || family.iter().any(|own| {
+                        own.len() > first.parameters.len()
+                            || own
+                                .iter()
+                                .zip(&first.parameters[first.parameters.len() - own.len()..])
+                                .any(|(binder, parameter)| {
+                                    binder.id != parameter.id || binder.is_let()
+                                })
+                    })
+            }))
+    {
+        return Err(InductiveError::InvalidTelescope);
+    }
     let mut builder = Builder {
         remaining: budget.max_nodes,
     };
@@ -176,12 +215,23 @@ pub fn mutual_inductive_declaration(
     let mut constructor_names = Vec::new();
     let mut family_constructors = vec![Vec::new(); specs.len()];
     for (family, spec) in specs.iter().enumerate() {
-        for ctor in &spec.constructors {
+        for (position, ctor) in spec.constructors.iter().enumerate() {
             builder.tick()?;
             if !matches!(ctor.name.leaf_view(), LeafView::Str(s) if !s.is_empty())
                 || !ctor.name.parent().is_anonymous()
             {
                 return Err(InductiveError::InvalidName);
+            }
+            if let Some(promoted) = promoted {
+                let own = &promoted[family][position];
+                let shared = first.parameters.len() - own.len();
+                for (offset, binder) in own.iter().enumerate() {
+                    let scope: HashSet<_> = first.parameters[..shared + offset]
+                        .iter()
+                        .map(|p| p.id.clone())
+                        .collect();
+                    scan(&mut builder, &binder.type_, &scope, specs)?;
+                }
             }
             let name = spec.name.append_core(&ctor.name);
             if !names.insert(name.clone()) {
@@ -316,7 +366,12 @@ pub fn mutual_inductive_declaration(
             ctor.result_indices.iter().cloned(),
         );
         let ty = builder.close(&ctor.fields, ty, false, false)?;
-        let ty = builder.close(&first.parameters, ty, false, true)?;
+        let own = promoted.map_or(&[][..], |promoted| {
+            promoted[entry.family][cidx[entry.family] as usize].as_slice()
+        });
+        let ty = builder.close(own, ty, false, false)?;
+        let shared = &first.parameters[..first.parameters.len() - own.len()];
+        let ty = builder.close(shared, ty, false, true)?;
         constructors.push(ConstructorVal {
             base: ConstantVal {
                 name: constructor_names[index].clone(),
@@ -409,7 +464,9 @@ pub fn mutual_inductive_declaration(
             false,
             false,
         )?;
-        let ty = builder.close(&first.parameters, ty, false, false)?;
+        // A family type keeps its own parameter binder names (they differ only
+        // for promoted indices; identities, domains and styles are checked equal).
+        let ty = builder.close(&spec.parameters, ty, false, false)?;
         let indices =
             u32::try_from(spec.indices.len()).map_err(|_| InductiveError::ResourceLimit)?;
         types.push(InductiveVal {

@@ -125,6 +125,77 @@ fn check_then_refuse_suffixes(prefix: &str, expected: &[&str], refusals: &[(&str
 }
 
 #[test]
+fn installed_beq_deriving_checks_recursive_data_and_executes() {
+    let source = "inductive Chain (A : Type) where\n\
+                  | nil\n| cons (head : A) (tail : Chain A)\n\
+                  deriving BEq\n\
+                  def xs : Chain Nat := Chain.cons 7 (Chain.cons 9 Chain.nil)\n\
+                  theorem same : (xs == xs) = true := by rfl\n\
+                  theorem changed : (xs == Chain.cons 7 (Chain.cons 8 Chain.nil)) = false := by rfl";
+    check_then_refuse_suffixes(
+        source,
+        &["\"theorems\":2", "\"executed\":false"],
+        &[
+            ("theorem wrong : (xs == Chain.nil) = true := by rfl", None),
+            (
+                "structure Bad where\n run : Nat -> Nat\nderiving BEq",
+                Some("failed to generate BEq"),
+            ),
+            (
+                "structure Bad where\n n : Nat\nderiving BEq, UnknownHandler",
+                Some("unsupported deriving handler"),
+            ),
+        ],
+    );
+    let program = file(&format!(
+        "{source}\n#eval if xs == xs then 42 else 0\n#eval if xs == Chain.nil then 0 else 42\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n42\n");
+}
+
+#[test]
+fn installed_decidable_eq_deriving_checks_proofs_and_executes_recursive_decisions() {
+    let source = "inductive Chain (A : Type) where\n\
+                  | nil\n| cons (head : A) (tail : Chain A)\n\
+                  deriving DecidableEq\n\
+                  def xs : Chain Nat := Chain.cons 7 (Chain.cons 9 Chain.nil)\n\
+                  def ys : Chain Nat := Chain.cons 7 (Chain.cons 8 Chain.nil)\n\
+                  theorem same : xs = xs := by decide\n\
+                  theorem changed : Not (xs = ys) := by decide";
+    check_then_refuse_suffixes(
+        source,
+        &["\"theorems\":2", "\"executed\":false"],
+        &[
+            ("theorem wrong : xs = ys := by decide", None),
+            (
+                "structure Bad where\n run : Nat -> Nat\nderiving DecidableEq",
+                Some("failed to generate DecidableEq"),
+            ),
+            (
+                "structure Bad where\n n : Nat\nderiving BEq, DecidableEq, UnknownHandler",
+                Some("unsupported deriving handler"),
+            ),
+        ],
+    );
+    let program = file(&format!(
+        "{source}\n#eval if xs = xs then 42 else 0\n#eval if xs = ys then 0 else 42\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"42\n42\n");
+}
+
+#[test]
 fn installed_structural_hints_check_selected_parameters_and_execute() {
     let source = "def tally (acc n : Nat) : Nat := match n with\n\
                   | .zero => acc\n| .succ k => tally (acc + 1) k\n\
@@ -947,9 +1018,13 @@ fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors(
     let prefix = file(
         "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k",
     );
-    let good = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    let good = file(
+        "def identity : Tower 1 := fun x => x\ntheorem ok : identity (9 : Nat) = (9 : Nat) := by rfl",
+    );
     let bad = file("def ambiguous (n : Nat) : Tower n := fun x => x");
-    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+    // `identity`'s domain is `Tower 0`, as at the pin, which has no `OfNat (Tower 0) 9` (2026-10-10).
+    let bare = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&bare, false), (&good, true)] {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["check-source", "--json"])
             .arg(&prefix)
@@ -2801,5 +2876,40 @@ fn an_unknown_constant_is_refused_by_its_name() {
             stderr.contains(&format!("Unknown identifier `{name}`")),
             "{stderr}"
         );
+    }
+}
+
+/// The pin admits a file's own `axiom` silently; this report counts them, because every
+/// theorem that uses one trusts it. Axioms of the base (none in the seed) are not counted, and
+/// a file without any keeps the plain wording.
+#[test]
+fn a_files_own_axioms_are_counted_in_the_report() {
+    let axioms = file(
+        "axiom unproven : False\naxiom pick {α : Type} (a : α) : α\ntheorem bad : 0 = 1 := False.elim unproven\n",
+    );
+    let plain = file("theorem t : True := True.intro\n");
+    for (path, json, expected) in [
+        (&axioms, true, "\"theorems\":1,\"axioms\":2,"),
+        (&plain, true, "\"theorems\":1,\"axioms\":0,"),
+        (
+            &axioms,
+            false,
+            "Checked 3 source commands (1 theorems, 2 axioms asserted without proof) in 1 files;",
+        ),
+        (
+            &plain,
+            false,
+            "Checked 1 source commands (1 theorems) in 1 files;",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.arg("check-source");
+        if json {
+            command.arg("--json");
+        }
+        let output = command.arg(path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(expected), "{stdout}");
     }
 }

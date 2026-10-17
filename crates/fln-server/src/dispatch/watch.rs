@@ -23,7 +23,7 @@ impl Registration {
         write_protocol_message(
             output,
             format!(
-                r#"{{"jsonrpc":"2.0","id":"{REQUEST_ID}","method":"client/registerCapability","params":{{"registrations":[{{"id":"{REQUEST_ID}","method":"workspace/didChangeWatchedFiles","registerOptions":{{"watchers":[{{"globPattern":"**/*.lean","kind":7}}]}}}}]}}}}"#,
+                r#"{{"jsonrpc":"2.0","id":"{REQUEST_ID}","method":"client/registerCapability","params":{{"registrations":[{{"id":"{REQUEST_ID}","method":"workspace/didChangeWatchedFiles","registerOptions":{{"watchers":[{{"globPattern":"**/*.lean","kind":7}},{{"globPattern":"**/lakefile.toml","kind":7}}]}}}}]}}}}"#,
             ),
         )
     }
@@ -100,6 +100,7 @@ mod tests {
             DecodedField::Valid("client/registerCapability".to_owned())
         );
         assert!(body.contains(r#""globPattern":"**/*.lean","kind":7"#));
+        assert!(body.contains(r#""globPattern":"**/lakefile.toml","kind":7"#));
     }
     #[test]
     fn response_ids_roles_and_completion_are_not_document_authority() {

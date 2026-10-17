@@ -10,6 +10,10 @@ use fln_elab::instances::{self, InstanceRegistryError};
 use fln_olean::region::{OleanView, OpaqueExtensionBlock};
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[path = "imported/implemented_by.rs"]
+mod implemented_by;
+#[path = "imported/structures.rs"]
+mod structures;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {
@@ -25,6 +29,12 @@ pub struct SourceOleanImportLimits {
     /// same at every count ([`Engine::check_olean_modules_scheduled`]); only its
     /// wall time depends on it.
     pub jobs: OleanFrontierJobs,
+    /// How many threads run the import's work that is not a council: decoding
+    /// the closure and measuring its declarations when a `reuse-verified` record
+    /// is re-proved, and capturing each module's extension payloads. Each piece
+    /// reads only bytes the caller supplied, and the import is the same at every
+    /// count, so a caller may allow more here than council workers.
+    pub read_jobs: OleanFrontierJobs,
 }
 impl SourceOleanImportLimits {
     /// Capture may use as many bytes as the caller allows the artifacts
@@ -41,6 +51,7 @@ impl SourceOleanImportLimits {
             max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
             jobs: OleanFrontierJobs::SERIAL,
+            read_jobs: OleanFrontierJobs::SERIAL,
         }
     }
 }
@@ -57,12 +68,27 @@ pub struct SourceMetadataReport {
     /// `protected` declarations (the pin's `protectedExt`), activated so that an
     /// atomic identifier does not resolve to one.
     pub protected: usize,
+    /// Internal auxiliary-recursion tags (the pin's `auxRecExt`), activated
+    /// only for this module's own admitted definitions.
+    pub aux_recursors: usize,
+    /// Compilation restrictions owned by this module, including partial companions.
+    pub noncomputable: usize,
+    /// Original structure fields and direct-parent metadata, validated against
+    /// this module's checked constructor and projection interfaces.
+    pub structures: usize,
     /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
     /// `instances` transparency instance selection runs at.
     pub reducibility: usize,
     /// Explicit native-call intentions (the pin's `Lean.externAttr`), retained
     /// only for this module's own admitted declarations.
     pub externs: usize,
+    /// Compatible executable replacements, bound to this module's own checked
+    /// declarations and to targets in its actual import closure.
+    pub implemented_by: usize,
+    /// Ordered initialization entries retained for executable-body classification.
+    /// No initialization action is executed by importing metadata.
+    pub regular_initializers: usize,
+    pub builtin_initializers: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -285,8 +311,19 @@ impl Engine {
             metadata::PROTECTED_EXTENSION,
             metadata::REDUCIBILITY_EXTENSION,
             metadata::EXTERN_EXTENSION,
+            metadata::IMPLEMENTED_BY_EXTENSION,
+            metadata::AUX_RECURSOR_EXTENSION,
+            fln_olean::initializers::REGULAR_INIT_EXTENSION,
+            fln_olean::initializers::BUILTIN_INIT_EXTENSION,
         ]
         .map(|name| Name::from_components(name.split('.')));
+        let selected: Vec<_> = selected
+            .into_iter()
+            .chain([
+                metadata::structure_extension_name(),
+                Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
+            ])
+            .collect();
         let mut blocks: Vec<_> = selected
             .iter()
             .map(|name| OpaqueExtensionBlock {
@@ -298,8 +335,8 @@ impl Engine {
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
         // Each module's capture reads only its own parts, so the walks run
-        // `limits.jobs` at once; the cumulative byte allowance is charged below in
-        // replay order, exactly as when one walk followed another.
+        // `limits.read_jobs` at once; the cumulative byte allowance is charged below
+        // in replay order, exactly as when one walk followed another.
         cancelled!("source-olean/capture");
         let mut captures = capture_modules(&checked, &order, &inputs, &limits).into_iter();
         for &index in &order {
@@ -316,8 +353,14 @@ impl Engine {
                 scoped_instances: 0,
                 aliases: 0,
                 protected: 0,
+                aux_recursors: 0,
+                noncomputable: 0,
+                structures: 0,
                 reducibility: 0,
                 externs: 0,
+                implemented_by: 0,
+                regular_initializers: 0,
+                builtin_initializers: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -346,6 +389,12 @@ impl Engine {
                         4 => report.protected = block.entries.len(),
                         5 => report.reducibility = block.entries.len(),
                         6 => report.externs = block.entries.len(),
+                        7 => report.implemented_by = block.entries.len(),
+                        8 => report.aux_recursors = block.entries.len(),
+                        9 => report.regular_initializers = block.entries.len(),
+                        10 => report.builtin_initializers = block.entries.len(),
+                        11 => report.structures = block.entries.len(),
+                        12 => report.noncomputable = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -364,14 +413,29 @@ impl Engine {
         cancelled!("source-olean/before-metadata-decode");
         let decoded =
             metadata::decode(&blocks, limits.metadata).map_err(SourceOleanImportError::Decode)?;
+        let mut implementation_scopes = implemented_by::Scopes::new(
+            &checked,
+            &decoded.implemented_by,
+            limits.metadata.max_objects,
+        )?;
+        let mut structure_scopes =
+            structures::Scopes::new(&checked, &decoded.structures, limits.metadata.max_objects)?;
+        let mut structure_rows = decoded.structures.into_iter();
         let mut classes = decoded.classes.into_iter();
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
         let mut aliases = decoded.aliases.into_iter();
         let mut protected = decoded.protected.into_iter();
+        let mut aux_recursors = decoded.aux_recursors.into_iter();
+        let mut noncomputable = decoded.noncomputable.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
+        let mut implementations = decoded.implemented_by.into_iter();
+        let mut regular_initializers = decoded.initializers.regular.into_iter();
+        let mut builtin_initializers = decoded.initializers.builtin.into_iter();
         let mut engine = checked.engine.clone();
+        let mut executable_opaques = (*engine.executable_opaques).clone();
+        let mut runtime_initializers = (*engine.runtime_initializers).clone();
         let bound = engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut journals = BTreeMap::new();
         // One activation for the whole closure: the registries are read once and
@@ -379,6 +443,27 @@ impl Engine {
         let mut activation = R::new(engine.environment.clone());
         for (&index, report) in order.iter().zip(&mut reports) {
             let before = activation.environment().clone();
+            if report.structures != 0 {
+                cancelled!("source-olean/structure");
+                let rows = match structures::module(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    report.structures,
+                    &mut structure_rows,
+                    &mut structure_scopes,
+                    &limits,
+                    cancellation,
+                )? {
+                    Outcome::Complete(rows) => rows,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                activation = activation.register_structures(&rows).map_err(|problem| {
+                    structures::error(&report.module, &report.module, problem)
+                })?;
+            }
             for _ in 0..report.classes {
                 cancelled!("source-olean/class");
                 let row = classes.next().ok_or(SourceOleanImportError::Internal(
@@ -514,6 +599,49 @@ impl Engine {
                     reason,
                 }
             })?;
+            if report.aux_recursors != 0 {
+                cancelled!("source-olean/auxiliary-recursor");
+                let tagged: Vec<Name> = aux_recursors.by_ref().take(report.aux_recursors).collect();
+                if tagged.len() != report.aux_recursors {
+                    return Err(SourceOleanImportError::Internal(
+                        "auxiliary-recursor count changed during decode",
+                    ));
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.aux_recursors,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for declaration in &tagged {
+                    cancelled!("source-olean/auxiliary-recursor-owner");
+                    owners.validate(activation.environment(), &report.module, declaration)?;
+                }
+                activation = activation
+                    .register_aux_recursors(&tagged)
+                    .map_err(|error| auxiliary_error(&report.module, error))?;
+            }
+            if report.noncomputable != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.noncomputable,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.noncomputable {
+                    cancelled!("source-olean/noncomputable");
+                    let declaration =
+                        noncomputable
+                            .next()
+                            .ok_or(SourceOleanImportError::Internal(
+                                "noncomputable count changed during decode",
+                            ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation
+                        .register_noncomputable(&declaration)
+                        .map_err(|error| noncomputable_error(&report.module, error))?;
+                }
+            }
             for _ in 0..report.reducibility {
                 cancelled!("source-olean/reducibility");
                 let row = reducibility.next().ok_or(SourceOleanImportError::Internal(
@@ -540,7 +668,7 @@ impl Engine {
             }
             if report.externs != 0 {
                 cancelled!("source-olean/extern-owner-index");
-                let mut owners = ExternOwners::new(
+                let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
                     report.externs,
                     limits.check.max_declarations,
@@ -560,29 +688,129 @@ impl Engine {
                         .map_err(|error| extern_error(&report.module, &row.declaration, error))?;
                 }
             }
+            if report.implemented_by != 0 {
+                cancelled!("source-olean/implemented-by-owner-index");
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.implemented_by,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.implemented_by {
+                    cancelled!("source-olean/implemented-by");
+                    let row = implementations
+                        .next()
+                        .ok_or(SourceOleanImportError::Internal(
+                            "implemented_by count changed during decode",
+                        ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    implementation_scopes.validate(
+                        &checked,
+                        &self.environment,
+                        activation.environment(),
+                        index,
+                        &row,
+                    )?;
+                    activation = activation
+                        .register_implemented_by(&row.declaration, &row.implementation)
+                        .map_err(|error| {
+                            implemented_by::error(&report.module, &row.declaration, error)
+                        })?;
+                }
+            }
+            // Parametric attributes export their complete journal in the private
+            // part (Lean/Attributes.lean, registerParametricAttribute). Capture
+            // required that part for a module-system artifact, so absence here
+            // means no initializer, not a filtered public view. Each entry must
+            // belong to this module; a sibling cannot change another global's
+            // executable interpretation through forged initialization metadata.
+            for (count, rows) in [
+                (report.regular_initializers, &mut regular_initializers),
+                (report.builtin_initializers, &mut builtin_initializers),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    count,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..count {
+                    cancelled!("source-olean/initializer");
+                    let row = rows.next().ok_or(SourceOleanImportError::Internal(
+                        "initializer count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    validate_initializer(activation.environment(), &report.module, &row)?;
+                    if row.initializer.is_some() {
+                        runtime_initializers.insert(row.declaration);
+                    }
+                }
+            }
+            for constant in &checked.modules[index].decoded.constants {
+                cancelled!("source-olean/opaque-value");
+                if let ConstantInfo::Opaque(opaque) = constant
+                    && !opaque.is_unsafe
+                    && !runtime_initializers.contains(&opaque.base.name)
+                    && activation.environment().find(&opaque.base.name) == Some(constant)
+                {
+                    executable_opaques.insert(opaque.base.name.clone());
+                }
+            }
             journals.insert(
                 report.module.clone(),
                 (before, activation.environment().clone()),
             );
         }
-        engine.environment = activation.finish().map_err(|_| {
-            SourceOleanImportError::Internal(
-                "the activated registries disagree with their kept state",
-            )
+        engine.environment = activation.finish().map_err(|problem| {
+            if problem == InstanceRegistryError::Limit {
+                SourceOleanImportError::Limit("activated registry readback")
+            } else {
+                SourceOleanImportError::Internal(
+                    "the activated registries disagree with their kept state",
+                )
+            }
         })?;
-        if classes.next().is_some()
+        // Validate the complete graph once. A later registration can introduce
+        // a cycle through an earlier module; no partial activation escapes it.
+        implemented_by::validate_journal(&engine.environment)?;
+        fln_elab::aux_recursors::AuxRecursors::read(&engine.environment)
+            .map_err(|error| auxiliary_error(&roots.first().cloned().unwrap_or_default(), error))?;
+        fln_elab::noncomputable::read(&engine.environment).map_err(|error| {
+            noncomputable_error(&roots.first().cloned().unwrap_or_default(), error)
+        })?;
+        fln_elab::records::imported::ImportedStructures::read(&engine.environment).map_err(
+            |problem| {
+                structures::error(
+                    &roots.first().cloned().unwrap_or_default(),
+                    &roots.first().cloned().unwrap_or_default(),
+                    problem,
+                )
+            },
+        )?;
+        if structure_rows.next().is_some()
+            || classes.next().is_some()
             || instances.next().is_some()
             || defaults.next().is_some()
             || aliases.next().is_some()
             || protected.next().is_some()
+            || aux_recursors.next().is_some()
+            || noncomputable.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
+            || implementations.next().is_some()
+            || regular_initializers.next().is_some()
+            || builtin_initializers.next().is_some()
         {
             return Err(SourceOleanImportError::Internal(
                 "decoded metadata escaped its module inventory",
             ));
         }
         cancelled!("source-olean/before-publication");
+        engine.executable_opaques = std::sync::Arc::new(executable_opaques);
+        engine.runtime_initializers = std::sync::Arc::new(runtime_initializers);
         // Adding metadata changes the logical root, but not the declarations
         // represented by the retained independent-checker projection.
         if bound {
@@ -601,8 +829,8 @@ impl Engine {
     }
 }
 
-/// Every module's extension payloads, in replay `order`, `limits.jobs` modules at
-/// once. Each walk may use the whole capture allowance; the caller charges the
+/// Every module's extension payloads, in replay `order`, `limits.read_jobs` modules
+/// at once. Each walk may use the whole capture allowance; the caller charges the
 /// cumulative allowance in order, so a closure over it is still refused.
 fn capture_modules(
     checked: &CheckedOleanSet,
@@ -638,7 +866,7 @@ fn capture_modules(
                 error,
             })
     };
-    let threads = limits.jobs.threads.get().min(order.len());
+    let threads = limits.read_jobs.threads.get().min(order.len());
     if threads <= 1 {
         return order.iter().map(|&index| capture(index)).collect();
     }
@@ -695,6 +923,14 @@ trait Registrar: Sized {
         self,
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError>;
+    fn register_aux_recursors(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError>;
+    fn register_noncomputable(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError>;
     fn register_reducibility(
         self,
         declaration: &Name,
@@ -705,6 +941,15 @@ trait Registrar: Sized {
         declaration: &Name,
         entries: Vec<fln_elab::externs::ExternEntry>,
     ) -> std::result::Result<Self, fln_elab::externs::ExternError>;
+    fn register_implemented_by(
+        self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError>;
+    fn register_structures(
+        self,
+        rows: &[fln_elab::records::imported::StructureEntry],
+    ) -> std::result::Result<Self, fln_elab::records::RecordError>;
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError>;
 }
 
@@ -749,6 +994,18 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
         self.register_protected(declarations)
     }
+    fn register_aux_recursors(
+        self,
+        declarations: &[Name],
+    ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
+        self.register_aux_recursors(declarations)
+    }
+    fn register_noncomputable(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
+        self.register_noncomputable(declaration)
+    }
     fn register_reducibility(
         self,
         declaration: &Name,
@@ -762,6 +1019,19 @@ impl Registrar for instances::imported::ImportActivation {
         entries: Vec<fln_elab::externs::ExternEntry>,
     ) -> std::result::Result<Self, fln_elab::externs::ExternError> {
         self.register_extern(declaration, entries)
+    }
+    fn register_implemented_by(
+        self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
+        self.register_implemented_by(declaration, implementation)
+    }
+    fn register_structures(
+        self,
+        rows: &[fln_elab::records::imported::StructureEntry],
+    ) -> std::result::Result<Self, fln_elab::records::RecordError> {
+        self.register_structures(rows)
     }
     fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
         self.finish()
@@ -796,16 +1066,16 @@ fn reducibility_status(
     }
 }
 
-/// Extern attributes cannot be applied to an imported declaration at the pin.
+/// Parametric attributes cannot be applied to an imported declaration at the pin.
 /// Retain the exact checked owner, rather than accepting any ambient name that
 /// happens to have the expected spelling. Both allocations are bounded before
-/// construction; the index exists only for a module with extern rows.
-struct ExternOwners<'a> {
+/// construction; the index exists only for a module with selected attribute rows.
+struct AttributeOwners<'a> {
     declarations: Vec<&'a ConstantInfo>,
     seen: HashSet<Name>,
 }
 
-impl<'a> ExternOwners<'a> {
+impl<'a> AttributeOwners<'a> {
     fn new(
         constants: &'a [ConstantInfo],
         rows: usize,
@@ -814,19 +1084,17 @@ impl<'a> ExternOwners<'a> {
     ) -> Result<Self> {
         if constants.len() > max_declarations {
             return Err(SourceOleanImportError::Limit(
-                "extern declaration ownership index",
+                "attribute declaration ownership index",
             ));
         }
         if rows > max_entries {
-            return Err(SourceOleanImportError::Limit(
-                "extern attribute ownership rows",
-            ));
+            return Err(SourceOleanImportError::Limit("attribute ownership rows"));
         }
         let mut declarations = Vec::new();
         declarations
             .try_reserve_exact(constants.len())
             .map_err(|_| {
-                SourceOleanImportError::Limit("extern declaration ownership allocation")
+                SourceOleanImportError::Limit("attribute declaration ownership allocation")
             })?;
         declarations.extend(constants.iter());
         declarations.sort_unstable_by(|left, right| {
@@ -837,12 +1105,12 @@ impl<'a> ExternOwners<'a> {
             .any(|pair| pair[0].constant_val().name == pair[1].constant_val().name)
         {
             return Err(SourceOleanImportError::Internal(
-                "checked module repeats an extern owner declaration",
+                "checked module repeats an attribute owner declaration",
             ));
         }
         let mut seen = HashSet::new();
         seen.try_reserve(rows)
-            .map_err(|_| SourceOleanImportError::Limit("extern attribute ownership allocation"))?;
+            .map_err(|_| SourceOleanImportError::Limit("attribute ownership allocation"))?;
         Ok(Self { declarations, seen })
     }
 
@@ -856,20 +1124,58 @@ impl<'a> ExternOwners<'a> {
             .declarations
             .binary_search_by(|info| info.constant_val().name.cmp(declaration))
             .map_err(|_| {
-                error("an extern attribute does not belong to this module's checked declarations")
+                error("an attribute does not belong to this module's checked declarations")
             })?;
         if env.find(declaration) != Some(self.declarations[position]) {
             return Err(error(
-                "an extern owner differs from its active admitted declaration",
+                "an attribute owner differs from its active admitted declaration",
             ));
         }
         if !self.seen.insert(declaration.clone()) {
-            return Err(error(
-                "duplicate extern attribute for one module declaration",
-            ));
+            return Err(error("duplicate attribute for one module declaration"));
         }
         Ok(())
     }
+}
+
+/// Match the pin's exact `IO T` / `IO Unit` attribute contract without reducing
+/// any body or running an action (Lean/Compiler/InitAttr.lean, getParam).
+fn validate_initializer(
+    env: &Environment,
+    module: &Name,
+    row: &fln_olean::initializers::InitEntry,
+) -> Result<()> {
+    fn io_argument(type_: &Expr) -> Option<&Expr> {
+        if let ExprNode::App { f, a } = type_.node()
+            && let ExprNode::Const { name, .. } = f.node()
+            && *name == Name::from_components(["IO"])
+        {
+            Some(a)
+        } else {
+            None
+        }
+    }
+    let error = |reason| SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration: row.declaration.clone(),
+        reason,
+    };
+    let owner = env
+        .find(&row.declaration)
+        .ok_or_else(|| error("an initialized declaration is not admitted"))?;
+    if let Some(initializer) = &row.initializer {
+        let action = env.find(initializer).ok_or_else(|| {
+            error("an initializer names no admitted declaration")
+        })?;
+        if io_argument(&action.constant_val().type_) != Some(&owner.constant_val().type_) {
+            return Err(error("an initializer must have type IO of its declaration's exact type"));
+        }
+    } else if !io_argument(&owner.constant_val().type_).is_some_and(|type_| {
+        matches!(type_.node(), ExprNode::Const { name, .. } if *name == Name::from_components(["Unit"]))
+    }) {
+        return Err(error("an anonymous initialization action must have type IO Unit"));
+    }
+    Ok(())
 }
 
 fn extern_entry(entry: metadata::ExternEntry) -> fln_elab::externs::ExternEntry {
@@ -900,6 +1206,54 @@ fn extern_error(
     SourceOleanImportError::Metadata {
         module: module.clone(),
         declaration: declaration.clone(),
+        reason,
+    }
+}
+
+fn auxiliary_error(
+    module: &Name,
+    error: fln_elab::aux_recursors::AuxRecursorError,
+) -> SourceOleanImportError {
+    use fln_elab::aux_recursors::AuxRecursorError;
+    let (declaration, reason) = match error {
+        AuxRecursorError::Limit => {
+            return SourceOleanImportError::Limit("auxiliary-recursor journal");
+        }
+        AuxRecursorError::UnknownDeclaration(name) => {
+            (name, "an auxiliary tag names no admitted declaration")
+        }
+        AuxRecursorError::NotDefinition(name) => (name, "an auxiliary tag names a non-definition"),
+        AuxRecursorError::Duplicate(name) => (
+            name,
+            "a definition is tagged as an auxiliary recursor twice",
+        ),
+        AuxRecursorError::Malformed => (module.clone(), "malformed auxiliary-recursor journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
+        reason,
+    }
+}
+
+fn noncomputable_error(
+    module: &Name,
+    error: fln_elab::noncomputable::NoncomputableError,
+) -> SourceOleanImportError {
+    use fln_elab::noncomputable::NoncomputableError;
+    let (declaration, reason) = match error {
+        NoncomputableError::Limit => return SourceOleanImportError::Limit("noncomputable journal"),
+        NoncomputableError::UnknownDeclaration(name) => {
+            (name, "a noncomputable tag names no admitted declaration")
+        }
+        NoncomputableError::Duplicate(name) => {
+            (name, "a declaration is tagged noncomputable twice")
+        }
+        NoncomputableError::Malformed => (module.clone(), "malformed noncomputable journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
         reason,
     }
 }
@@ -996,12 +1350,15 @@ pub(super) mod tests {
     }
 
     pub(in crate::source_check::modules) fn pinned_lib() -> Option<std::path::PathBuf> {
-        let lib = std::env::var_os("HOME")
+        let lib = std::env::var_os("FLN_REFERENCE_LIB")
             .map(std::path::PathBuf::from)
-            .map(|home| {
-                home.join(".elan/toolchains")
-                    .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
-                    .join("lib/lean")
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    std::path::PathBuf::from(home)
+                        .join(".elan/toolchains")
+                        .join(format!("leanprover--lean4---{OLEAN_PIN_TAG}"))
+                        .join("lib/lean")
+                })
             })
             .filter(|lib| lib.join("Init/Prelude.olean").is_file());
         assert!(
@@ -1051,11 +1408,13 @@ pub(super) mod tests {
     }
 
     pub(in crate::source_check::modules) fn limits(threads: usize) -> SourceOleanImportLimits {
+        let jobs = OleanFrontierJobs {
+            threads: NonZeroUsize::new(threads).expect("a positive thread count"),
+            worker_stack_bytes: STACK,
+        };
         SourceOleanImportLimits {
-            jobs: OleanFrontierJobs {
-                threads: NonZeroUsize::new(threads).expect("a positive thread count"),
-                worker_stack_bytes: STACK,
-            },
+            jobs,
+            read_jobs: jobs,
             ..SourceOleanImportLimits::new(OleanCheckLimits::new(
                 1 << 30,
                 Budget::for_stack_bytes(STACK),
@@ -1169,6 +1528,60 @@ pub(super) mod tests {
         });
     }
 
+    #[test]
+    fn pinned_opaque_identity_runs_after_complete_private_metadata() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let closure = closure(&lib, &["Init.Core"]);
+        let all = inputs(&closure);
+        let roots = [n("Init.Core")];
+        on_import_stack(|| {
+            let imported = import(&all, &roots, limits(1))
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert!(matches!(
+                imported.engine.environment().find(&n("Lean.opaqueId")),
+                Some(ConstantInfo::Opaque(_))
+            ));
+            let run = imported
+                .engine
+                .execute_source_commands_with_checks(
+                    b"#eval Lean.opaqueId 42",
+                    &KVMap::new(),
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let evaluation = run.batch.executions.last().unwrap();
+            assert_eq!(
+                closed_vm_value(&evaluation.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+            let replay =
+                execute_flbc_artifact(&evaluation.flbc_artifact, &KVMap::new(), Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+            // A public journal can omit initialized globals. Missing private
+            // metadata must fail before any opaque's value becomes executable.
+            let mut incomplete = all.clone();
+            let owner = incomplete
+                .iter_mut()
+                .find(|module| module.name == &roots[0])
+                .unwrap();
+            owner.private_artifact = None;
+            assert!(import(&incomplete, &roots, limits(1)).is_err());
+        });
+    }
+
     /// The per-call registration functions, one row at a time: the semantics a
     /// batched [`instances::imported::ImportActivation`] must equal.
     pub(super) struct Sequential(Environment);
@@ -1213,6 +1626,18 @@ pub(super) mod tests {
         ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
             fln_elab::protected_names::register_module(&self.0, declarations).map(Sequential)
         }
+        fn register_aux_recursors(
+            self,
+            declarations: &[Name],
+        ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
+            fln_elab::aux_recursors::register_module(&self.0, declarations).map(Sequential)
+        }
+        fn register_noncomputable(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
+            fln_elab::noncomputable::register(&self.0, declaration).map(Sequential)
+        }
         fn register_reducibility(
             self,
             declaration: &Name,
@@ -1226,6 +1651,19 @@ pub(super) mod tests {
             entries: Vec<fln_elab::externs::ExternEntry>,
         ) -> std::result::Result<Self, fln_elab::externs::ExternError> {
             fln_elab::externs::register(&self.0, declaration, entries).map(Sequential)
+        }
+        fn register_implemented_by(
+            self,
+            declaration: &Name,
+            implementation: &Name,
+        ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
+            fln_elab::implemented_by::register(&self.0, declaration, implementation).map(Sequential)
+        }
+        fn register_structures(
+            self,
+            rows: &[fln_elab::records::imported::StructureEntry],
+        ) -> std::result::Result<Self, fln_elab::records::RecordError> {
+            fln_elab::records::imported::register(&self.0, rows).map(Sequential)
         }
         fn finish(self) -> std::result::Result<Environment, InstanceRegistryError> {
             Ok(self.0)
@@ -1350,7 +1788,19 @@ pub(super) mod tests {
                     }),
                 ),
                 (
-                    "a default candidate registered twice",
+                    "a non-instance declaration registered as a default",
+                    Box::new(|env: &Environment| {
+                        let declaration = n("Nat.add");
+                        (
+                            outcome::<instances::imported::ImportActivation>(env, |r| {
+                                r.register_default(&declaration, 100)
+                            }),
+                            outcome::<Sequential>(env, |r| r.register_default(&declaration, 100)),
+                        )
+                    }),
+                ),
+                (
+                    "a default candidate registered twice is preserved",
                     Box::new(|env: &Environment| {
                         let declaration = n("instInhabitedNat");
                         (
@@ -1393,7 +1843,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 refused, 3,
-                "three planted rows are refused, the control is not"
+                "three invalid rows are refused; ordinary upserts and repeated defaults succeed"
             );
         });
     }

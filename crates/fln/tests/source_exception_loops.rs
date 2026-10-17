@@ -79,6 +79,284 @@ def continues : Logged Nat := do
 }
 
 #[test]
+fn bare_nested_loop_blocks_forward_exits_without_running_the_outer_suffix() {
+    execute(
+        &base(),
+        r#"
+def nestedStop : Logged Nat := do
+  for n in items do
+    do
+      note n
+      break
+    note 9
+  return 7
+def nestedContinue : Logged Nat := do
+  for n in items do
+    do
+      note n
+      continue
+    note 9
+  return 7
+def nestedFallthrough : Logged Nat := do
+  for n in items do
+    do
+      note n
+    note 9
+  return 7
+#eval observed nestedStop
+#eval observed nestedContinue
+#eval observed nestedFallthrough
+"#,
+        &["1007", "12007", "1929007"],
+    );
+}
+
+#[test]
+fn nested_loop_blocks_keep_cleanup_order_and_the_outer_lexical_scope() {
+    execute(
+        &base(),
+        r#"
+def nestedCleanup (stop : Bool) : Logged Nat := do
+  for n in items do
+    try
+      do
+        note n
+        do
+          if stop then break else continue
+    finally
+      note 3
+    note 9
+  return 7
+def nestedScope : Logged Nat := do
+  for n in items do
+    do
+      let n := 4
+      note n
+    note n
+  return 7
+#eval observed (nestedCleanup true)
+#eval observed (nestedCleanup false)
+#eval observed nestedScope
+"#,
+        &["13007", "1323007", "4142007"],
+    );
+}
+
+#[test]
+fn nested_cleanup_blocks_preserve_typing_and_term_do_scope_boundaries() {
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        // A discarded loop action still has to return Unit.
+        "def bad : Logged Nat := do { for n in items do { try { do { mark n } } finally { note 3 }; note 9 }; return 7 }",
+        // Parenthesized term-do owns a distinct loop scope.
+        "def bad : Logged Nat := do { for n in items do { try { (do { break } : Logged PUnit) } finally { note 3 } }; return 7 }",
+        // Dead branches are not permission to skip type checking.
+        "def bad : Logged Nat := do { for n in items do { try { do { if false then note true else continue } } finally { note 3 } }; return 7 }",
+        // Inner local bindings cannot escape into the outer continuation.
+        "def bad : Logged Nat := do { for n in items do { try { do { let hidden := n; note hidden }; note hidden } finally { note 3 } }; return 7 }",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+    execute(
+        &engine,
+        "def recovered : Logged Nat := do { for n in items do { try { do { note n; continue } } finally { note 3 }; note 9 }; return 7 }\n#eval observed recovered",
+        &["1323007"],
+    );
+}
+
+#[test]
+fn nested_value_bindings_inside_cleanup_keep_typed_values_and_loop_exits() {
+    execute(
+        &base(),
+        r#"
+def boundContinue (early : Bool) : Logged Nat := do
+  for n in items do
+    try
+      let b : Bool ← do
+        note n
+        if early then continue
+        succeed false
+      note (if b then 5 else 6)
+    finally
+      note 3
+    note 9
+  return 7
+def boundStop : Logged Nat := do
+  for n in items do
+    try
+      let value : Nat ← do
+        note n
+        if n == 1 then break
+        succeed 4
+      note value
+    finally
+      note 3
+    note 9
+  return 7
+#eval observed (boundContinue true)
+#eval observed (boundContinue false)
+#eval observed boundStop
+"#,
+        &["1323007", "16392639007", "13007"],
+    );
+}
+
+#[test]
+fn terminal_value_branches_and_nested_bindings_share_the_right_completion() {
+    execute(
+        &base(),
+        r#"
+def tailChoice (early : Bool) : Logged Nat := do
+  for n in items do
+    try
+      let value : Nat ← do
+        note n
+        if early then continue else succeed (n + 4)
+      note value
+    finally
+      note 3
+    note 9
+  return 7
+def tailMatch : Logged Nat := do
+  for n in items do
+    try
+      let value : Nat ← do
+        note n
+        match n with
+        | Nat.zero => continue
+        | Nat.succ k => succeed (k + 4)
+      note value
+    finally
+      note 3
+    note 9
+  return 7
+def nestedValues : Logged Nat := do
+  for n in items do
+    try
+      let n : Nat ← do
+        note n
+        let value : Bool ← do
+          if n == 1 then continue else succeed true
+        if value then succeed 4 else succeed 5
+      note n
+    finally
+      note 3
+    note 9
+  return 7
+#eval observed (tailChoice true)
+#eval observed (tailChoice false)
+#eval observed tailMatch
+#eval observed nestedValues
+"#,
+        &["1323007", "15392639007", "14392539007", "132439007"],
+    );
+}
+
+#[test]
+fn bound_actions_in_handlers_keep_nonlocal_returns_and_cleanup_effects() {
+    execute(
+        &base(),
+        r#"
+def boundReturn (early : Bool) : Logged Nat := do
+  for n in items do
+    try
+      let value : Bool ← do
+        note n
+        if early then return 42 else succeed true
+      note (if value then 5 else 6)
+    finally
+      note 3
+    note 9
+  return 7
+def handlerValue : Logged Nat := do
+  for n in items do
+    try
+      note n
+      (raise (4 : Nat) : Logged PUnit)
+    catch e =>
+      let value ← do
+        note e
+        if n == 1 then continue
+        succeed 5
+      note value
+    finally
+      note 3
+    note 9
+  return 7
+#eval observed (boundReturn true)
+#eval observed (boundReturn false)
+#eval observed handlerValue
+"#,
+        &["13042", "15392539007", "14324539007"],
+    );
+}
+
+#[test]
+fn nested_value_refusals_keep_annotations_types_and_lexical_boundaries() {
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        // Binding an action's result cannot erase its declared carrier.
+        "def bad : Logged Nat := do { for n in items do { try { let b : Bool ← do { succeed n }; note n } finally { note 3 } }; return 7 }",
+        // Inactive branches still need the normal completion's carrier.
+        "def bad : Logged Nat := do { for n in items do { try { let b : Bool ← do { if true then continue else succeed n }; note n } finally { note 3 } }; return 7 }",
+        // A dead normal continuation does not erase a malformed annotation.
+        "def bad : Logged Nat := do { for n in items do { try { let b : 1 ← do { continue }; note n } finally { note 3 } }; return 7 }",
+        // Absent else supplies Unit, not a guessed Bool value.
+        "def bad : Logged Nat := do { for n in items do { try { let b : Bool ← do { if true then continue }; note n } finally { note 3 } }; return 7 }",
+        // Parenthesized do owns its own loop scope even as a bound action.
+        "def bad : Logged Nat := do { for n in items do { try { let b : Bool ← (do { continue }); note n } finally { note 3 } }; return 7 }",
+        // A nested body's local cannot become free in the continuation.
+        "def bad : Logged Nat := do { for n in items do { try { let b : Nat ← do { let hidden := n; succeed hidden }; note hidden } finally { note 3 } }; return 7 }",
+        // A bound normal value cannot change an outer return's type.
+        "def bad : Logged Nat := do { for n in items do { try { let b : Bool ← do { if true then return true else succeed false }; note n } finally { note 3 } }; return 7 }",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+    execute(
+        &engine,
+        "def recovered : Logged Nat := do { for n in items do { try { let b : Bool ← do { note n; if n == 1 then continue else succeed true }; note (if b then 4 else 5) } finally { note 3 } }; return 7 }\n#eval observed recovered",
+        &["13243007"],
+    );
+}
+
+#[test]
+fn generic_nested_binding_values_do_not_need_new_monad_or_loop_instances() {
+    checked(
+        &base(),
+        r#"
+def genericBound {M : Type -> Type} [Pure M] [Bind M] [Functor M]
+    [MonadExcept Nat M] [MonadFinally M] {R A B : Type} [ForIn M R A]
+    (xs : R) (stop : Bool) (normal : A -> M B)
+    (consume : B -> M PUnit) (cleanup : M PUnit) : M PUnit := do
+  for x in xs do
+    try
+      let value : B ← do
+        if stop then continue
+        normal x
+      consume value
+    finally
+      cleanup
+"#,
+    );
+}
+
+#[test]
 fn conditional_exits_and_normal_completion_do_not_replay_the_suffix() {
     execute(
         &base(),

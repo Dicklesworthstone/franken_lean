@@ -75,7 +75,11 @@ fn native_goal_and_hover_results_have_typed_counters() {
 
 #[test]
 fn no_information_and_typed_nonanswers_remain_distinct() {
-    for method in ["$/lean/plainGoal", "textDocument/hover"] {
+    for method in [
+        "$/lean/plainGoal",
+        "$/lean/plainTermGoal",
+        "textDocument/hover",
+    ] {
         accepted(
             method,
             r#""result":null"#,
@@ -169,11 +173,11 @@ fn native_completion_and_definition_results_have_typed_counters() {
             );
         }
     }
-    // Term goals have no native answer yet, so only null passes there.
+    // Term-goal results have their own payload, distinct from tactic goals.
     accepted(
         "$/lean/plainTermGoal",
-        r#""result":null"#,
-        "\"noInformationQueryResults\":1",
+        r#""result":{"goal":"x : A\n⊢ A","range":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}}}"#,
+        "\"semanticQueryResults\":1",
     );
 }
 
@@ -280,6 +284,10 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
     ) -> Result<Option<fln_server::dispatch::semantic::Answer>, String> {
         use fln_server::dispatch::semantic::{Answer, CompletionItem, QueryKind};
         Ok(Some(match query.kind {
+            QueryKind::TermGoal => Answer::TermGoal {
+                goal: "x : A\n⊢ A".to_owned(),
+                range: 4..7,
+            },
             QueryKind::Completion => Answer::Completion {
                 items: vec![CompletionItem {
                     label: "value".to_owned(),
@@ -293,7 +301,10 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
                 source: "def value := 1".to_owned(),
                 range: 4..9,
             },
-            QueryKind::Goals | QueryKind::Hover => return Ok(None),
+            QueryKind::Goals
+            | QueryKind::Hover
+            | QueryKind::InteractiveGoals
+            | QueryKind::InteractiveTermGoal => return Ok(None),
         }))
     }
     fn check(
@@ -349,6 +360,7 @@ fn the_real_dispatchers_answers_pass_and_a_planted_wrong_answer_fails() {
         r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Main.lean","version":7,"text":"😀val"}}}"#,
         r#"{"jsonrpc":"2.0","id":"completion","method":"textDocument/completion","params":{"textDocument":{"uri":"file:///Main.lean"},"position":{"line":0,"character":5}}}"#,
         r#"{"jsonrpc":"2.0","id":"definition","method":"textDocument/definition","params":{"textDocument":{"uri":"file:///Main.lean"},"position":{"line":0,"character":3}}}"#,
+        r#"{"jsonrpc":"2.0","id":"term","method":"$/lean/plainTermGoal","params":{"textDocument":{"uri":"file:///Main.lean"},"position":{"line":0,"character":3}}}"#,
         r#"{"jsonrpc":"2.0","id":"end","method":"shutdown"}"#,
         r#"{"jsonrpc":"2.0","method":"exit"}"#,
     ]
@@ -371,6 +383,12 @@ fn the_real_dispatchers_answers_pass_and_a_planted_wrong_answer_fails() {
         .iter()
         .position(|body| body.contains(r#""id":"definition","result":{"uri":"file:///Lib.lean""#))
         .expect("the dispatcher answered definition with a Location");
+    let term = server
+        .iter()
+        .position(|body| body.contains(r#""id":"term","result":{"goal":"#))
+        .expect("the dispatcher answered with a term goal");
+    assert!(server[term].contains(r#""start":{"line":0,"character":2}"#));
+    assert!(server[term].contains(r#""end":{"line":0,"character":5}"#));
 
     let honest = correlate(&client, &server);
     let receipt = String::from_utf8(honest.stdout).unwrap();
@@ -379,13 +397,14 @@ fn the_real_dispatchers_answers_pass_and_a_planted_wrong_answer_fails() {
         "{receipt}{}",
         String::from_utf8_lossy(&honest.stderr)
     );
-    assert!(receipt.contains("\"semanticQueryResults\":2"), "{receipt}");
+    assert!(receipt.contains("\"semanticQueryResults\":3"), "{receipt}");
     assert!(
         receipt.contains("\"methodContractViolations\":0"),
         "{receipt}"
     );
 
     for (index, from, to) in [
+        (term, r#""character":5}"#, r#""character":2}"#),
         (
             completion,
             r#""insertTextFormat":1"#,

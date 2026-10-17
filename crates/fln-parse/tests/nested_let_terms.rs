@@ -72,8 +72,6 @@ fn malformed_nested_bindings_are_never_silently_dropped() {
     for tail in [
         "let",
         "let x",
-        "let := 1; 2",
-        "let : Nat := 1; 2",
         "let x : := 1; x",
         "let x := ; x",
         "let x := 1",

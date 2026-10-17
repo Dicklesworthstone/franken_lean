@@ -2,23 +2,51 @@
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
 pub mod options;
+mod reserved;
 pub mod simp;
 pub mod variables;
+pub(super) mod visibility;
 use crate::aliases::AliasTable;
 use crate::protected_names::ProtectedNames;
 use fln_core::name::LeafView;
+pub use visibility::command_scope;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceScope {
     pub namespace: Name,
+    /// A `module` file's declarations are private by default. This is the
+    /// actual source module identity, not a namespace opened by the user.
+    /// Private names follow the pin's `mkPrivateNameCore` encoding.
+    pub private_module: Option<Name>,
+    /// The enclosing public section's default, or the effective visibility of
+    /// a single declaration after [`Self::for_declaration`]. Module identity is
+    /// retained independently so private aliases still resolve locally.
+    pub public_declarations: bool,
+    /// `@[expose] section`'s inherited definition-body default. A declaration's
+    /// own `expose`/`no_expose` attributes override this on its effective clone.
+    pub expose_definitions: bool,
+    /// The pin's inherited `noncomputable section`: declaration code-generation
+    /// failures may mark the checked declaration noncomputable. Queries still
+    /// require executable code, and successful definitions are not blanket-tagged.
+    pub noncomputable_section: bool,
     pub opened: Vec<Name>,
+    /// `open X (a b)`'s `OpenDecl.explicit a X.a`, each with `opened.len()` when it was added,
+    /// so resolution reads simple and explicit open declarations in one order, as the pin's
+    /// single `openDecls` list.
+    pub explicit_opens: Vec<(usize, Name, Name)>,
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
     pub instance_scopes: crate::instances::scoped::ActiveScopes,
+    /// `attribute [local simp] x`'s rules, in order: `simp`'s default set until this scope ends.
+    /// They are never registered, as the pin keeps local attributes out of the `.olean`.
+    pub local_simp: Vec<simp::SimpEntry>,
     /// Set only by an engine in `frontier` mode: a compiled declaration may then apply
     /// a recursor the pin's code generator refuses (`codegen.rs`, bead
     /// `franken_lean-z8j.1.6.6`). Not a lexical scope; every command inherits it.
     pub frontier_recursors: bool,
+    /// The embedding engine's untrusted arithmetic accelerator. This capability
+    /// is inherited by lexical scopes but is never exported as module metadata.
+    pub arithmetic: Option<crate::arithmetic::ArithmeticProvider>,
     /// Options `set_option` set and [`options::admit`] honors, until the end of the enclosing
     /// section or namespace. Every elaboration in this scope starts with them.
     pub options: KVMap,
@@ -33,6 +61,20 @@ pub enum ScopeError {
     VariableSelectionLimit,
     /// `protected` on an atomic name in the root namespace (the pin's `mkDeclName`).
     ProtectedOutsideNamespace,
+    PrivateShadowsPublic(Name),
+    PublicShadowsPrivate(Name),
+    /// One of the pin's reserved-name predicates claims the name ([`reserved`]).
+    ReservedName(Name),
+    /// The pin declares this auxiliary with its definition (`reserved::is_declared_auxiliary`).
+    AuxiliaryDeclared(Name),
+    /// A definition's equation name is already declared (`ensureEqnReservedNamesAvailable`).
+    ReservedNameTaken {
+        declaration: Name,
+        taken: Name,
+    },
+    /// A section variable used by a declaration whose binder elaborates differently in the
+    /// declaration's scope than at its `variable` command (the pin elaborates it again there).
+    ReinterpretedVariable(Name),
 }
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,6 +94,37 @@ impl std::fmt::Display for ScopeError {
             Self::ProtectedOutsideNamespace => {
                 write!(f, "protected declarations must be in a namespace")
             }
+            Self::PrivateShadowsPublic(name) => write!(
+                f,
+                "private declaration `{}` conflicts with an existing public declaration",
+                name.to_display_string()
+            ),
+            Self::PublicShadowsPrivate(name) => write!(
+                f,
+                "public declaration `{}` conflicts with an existing private declaration",
+                name.to_display_string()
+            ),
+            Self::ReservedName(name) => {
+                write!(f, "`{}` is a reserved name", name.to_display_string())
+            }
+            Self::AuxiliaryDeclared(name) => {
+                write!(
+                    f,
+                    "`{}` has already been declared",
+                    name.to_display_string()
+                )
+            }
+            Self::ReservedNameTaken { declaration, taken } => write!(
+                f,
+                "failed to declare `{}` because `{}` has already been declared",
+                declaration.to_display_string(),
+                taken.to_display_string()
+            ),
+            Self::ReinterpretedVariable(name) => write!(
+                f,
+                "section variable `{}` elaborates differently here than at its `variable` command",
+                name.to_display_string()
+            ),
             Self::Ambiguous(name, candidates) => {
                 write!(f, "ambiguous name `{}`: ", name.to_display_string())?;
                 for (i, candidate) in candidates.iter().enumerate() {
@@ -127,6 +200,49 @@ fn settle(name: &Name, found: Vec<Name>) -> Result<Option<Name>, ScopeError> {
 
 impl SourceScope {
     pub fn declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
+        self.user_declaration_name(name)
+            .map(|name| self.visible_name(&name))
+    }
+
+    /// Apply effective visibility to an already qualified generated name.
+    pub(super) fn visible_name(&self, name: &Name) -> Name {
+        if self.public_declarations {
+            name.clone()
+        } else {
+            self.private_name(name)
+        }
+    }
+
+    pub(super) fn private_name(&self, name: &Name) -> Name {
+        self.private_module.as_ref().map_or_else(
+            || name.clone(),
+            |module| {
+                Name::num(Name::from_components(["_private"]).append_core(module), 0)
+                    .append_core(name)
+            },
+        )
+    }
+
+    /// Recover a local declaration's user-facing namespace for scope tracking.
+    /// An unrelated module's private names are never aliases in this scope.
+    pub fn user_name(&self, name: &Name) -> Name {
+        let Some(module) = &self.private_module else {
+            return name.clone();
+        };
+        let prefix = Name::num(Name::from_components(["_private"]).append_core(module), 0);
+        let mut cursor = name.clone();
+        let mut suffix = Vec::new();
+        while cursor != prefix {
+            match cursor.leaf_view() {
+                LeafView::Str(part) => suffix.push(part.to_owned()),
+                _ => return name.clone(),
+            }
+            cursor = cursor.parent();
+        }
+        Name::from_components(suffix.iter().rev().map(String::as_str))
+    }
+
+    fn user_declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
         let parts = components(name)?;
         if parts.is_empty() {
             return Err(ScopeError::InvalidName);
@@ -183,9 +299,11 @@ impl SourceScope {
     /// list after `eraseDups`, so the root declaration first, then the opened
     /// namespaces, most recently opened first.
     ///
-    /// Not modelled: `open X (y)`, `open X hiding y` and `open X renaming`, whose
-    /// explicit names the pin resolves without the protection test, and the
-    /// projection fallback (`loop p (s::projs)`), which field notation handles.
+    /// An explicit open (`open X (y)`, `OpenDecl.explicit y X.y`) answers `y` with `X.y`, and
+    /// `y.z` with `X.y.z` when that exists, without the protection test.
+    ///
+    /// Not modelled: `open X hiding y` and `open X renaming`, and the projection fallback
+    /// (`loop p (s::projs)`), which field notation handles.
     pub fn resolve_with_aliases(
         &self,
         name: &Name,
@@ -200,17 +318,32 @@ impl SourceScope {
         let mut exists = |candidate: &Name| {
             !crate::seed::protected::source_unreachable(candidate) && declared(candidate)
         };
+        // Internally generated field/method names may already carry this
+        // module's private prefix. Do not prefix them a second time.
+        if self.user_name(name) != *name {
+            return Ok(exists(name).then(|| name.clone()));
+        }
+        let resolve = |candidate: &Name, exists: &mut dyn FnMut(&Name) -> bool| {
+            let private = self.private_name(candidate);
+            if private != *candidate && exists(&private) {
+                Some(private)
+            } else {
+                exists(candidate).then(|| candidate.clone())
+            }
+        };
         let parts = components(name)?;
         if parts.first().is_some_and(|p| p == "_root_") {
             let absolute = Name::from_components(parts[1..].iter().map(String::as_str));
-            return Ok(exists(&absolute).then_some(absolute));
+            return Ok(resolve(&absolute, &mut exists));
         }
         let atomic = parts.len() == 1;
         let qualified =
             |namespace: &Name, found: &mut Vec<Name>, exists: &mut dyn FnMut(&Name) -> bool| {
                 let candidate = namespace.append_core(name);
-                if !(atomic && protected.contains(&candidate)) && exists(&candidate) {
-                    found.push(candidate.clone());
+                if let Some(target) = resolve(&candidate, exists)
+                    && !(atomic && protected.contains(&target))
+                {
+                    found.push(target);
                 }
                 for target in aliases.targets(&candidate) {
                     if !(atomic && protected.contains(target)) {
@@ -229,18 +362,44 @@ impl SourceScope {
             namespace = namespace.parent();
         }
         // 2. `resolveExact env id`: only a non-atomic name.
-        if !atomic && exists(name) {
-            return Ok(Some(name.clone()));
+        if !atomic && let Some(target) = resolve(name, &mut exists) {
+            return Ok(Some(target));
         }
         // 3. The root declaration, then `resolveOpenDecls` over the open declarations,
         // most recent first, each prepending what it finds, then the root aliases.
         let mut found = Vec::new();
-        if exists(name) {
-            found.push(name.clone());
+        if let Some(target) = resolve(name, &mut exists) {
+            found.push(target);
         }
-        for opened in self.opened.iter().rev() {
+        // The open declarations in the order they were made: each explicit open recorded with
+        // the number of simple opens before it.
+        let mut decls: Vec<Result<&Name, (&Name, &Name)>> = Vec::new();
+        for position in 0..=self.opened.len() {
+            for (at, opened_id, resolved) in &self.explicit_opens {
+                if *at == position {
+                    decls.push(Err((opened_id, resolved)));
+                }
+            }
+            if let Some(opened) = self.opened.get(position) {
+                decls.push(Ok(opened));
+            }
+        }
+        for decl in decls.into_iter().rev() {
             let mut here = Vec::new();
-            qualified(opened, &mut here, &mut exists);
+            match decl {
+                Ok(opened) => qualified(opened, &mut here, &mut exists),
+                // `resolveOpenDecls`'s `OpenDecl.explicit openedId resolvedId`.
+                Err((opened_id, resolved)) => {
+                    if opened_id == name {
+                        here.push(resolved.clone());
+                    } else if let Some(rest) = strip_name_prefix(name, opened_id) {
+                        let candidate = resolved.append_core(&rest);
+                        if exists(&candidate) {
+                            here.push(candidate);
+                        }
+                    }
+                }
+            }
             here.append(&mut found);
             found = here;
         }
@@ -253,6 +412,18 @@ impl SourceScope {
         pooled.append(&mut found);
         settle(name, pooled)
     }
+}
+
+/// `name` with the strict prefix `prefix` removed (`Name.replacePrefix`'s test `isPrefixOf`).
+fn strip_name_prefix(name: &Name, prefix: &Name) -> Option<Name> {
+    let parts = components(name).ok()?;
+    let head = components(prefix).ok()?;
+    if head.is_empty() || parts.len() <= head.len() || parts[..head.len()] != head[..] {
+        return None;
+    }
+    Some(Name::from_components(
+        parts[head.len()..].iter().map(String::as_str),
+    ))
 }
 
 impl Context {
@@ -280,6 +451,19 @@ impl Context {
         &mut self,
         name: &Name,
     ) -> Result<Result<Option<Name>, Vec<Name>>, NatDefinitionElabError> {
+        // A name a notation's template supplies carries the expansion's macro scopes
+        // (`Name.addMacroScope`). The pin's `resolveName` matches locals by the scoped name,
+        // which no binder of the use site has (the template's own binders were matched exactly
+        // before resolution), and `resolveGlobalName` reads it with the scopes erased: so a
+        // template's `f` means the global `f` even where the use site binds a local `f`.
+        let hygienic = name.has_macro_scopes();
+        let erased;
+        let name = if hygienic {
+            erased = name.erase_macro_scopes();
+            &erased
+        } else {
+            name
+        };
         // The scope is externally supplied through the embeddable API as well.
         // Charge its complete search width before scanning even an empty env.
         for _ in 0..self
@@ -307,7 +491,8 @@ impl Context {
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         // A protected declaration's own recursive reference by its atomic name
         // is held back too: the pin names that local `<namespace>.<short>`.
-        let atomic = components(name).map_err(error)?.len() == 1;
+        let user_name = self.source_scope.user_name(name);
+        let atomic = components(&user_name).map_err(error)?.len() == 1 && user_name == *name;
         let held_back_recursion =
             |candidate: &Name| atomic && self.protected_declaration.as_ref() == Some(candidate);
         // The declaration being defined is a local of its own body at the pin (the
@@ -315,23 +500,36 @@ impl Context {
         // exists here: `namespace A` / `def foo : Nat := foo` names `A.foo`, never a
         // root `foo`, and `open P` never makes `foo` mean `P.foo` there.
         let local = |candidate: &Name| {
-            self.txn.lctx.find_by_user_name(candidate).is_some()
+            !hygienic && self.txn.lctx.find_by_user_name(candidate).is_some()
                 || self
                     .recursion
                     .as_ref()
                     .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
+                || self
+                    .well_founded
+                    .as_ref()
+                    .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
                 || (self.defining.as_ref() == Some(candidate) && !held_back_recursion(candidate))
+                || self
+                    .partial
+                    .as_ref()
+                    .and_then(|state| state.group.as_ref())
+                    .is_some_and(|group| group.names.contains(candidate))
         };
         // Locals first: the pin's `resolveLocalName` runs before `resolveGlobalName`
         // (vendored `src/Lean/Elab/Term.lean`, `resolveName`), so a local, or the
         // declaration's own recursive reference, named at the current namespace or a
         // parent is never one candidate among globals. `_root_.x` names no local.
-        if !is_root_qualified(name) {
+        if !is_root_qualified(name) && !hygienic {
             let mut namespace = self.source_scope.namespace.clone();
             loop {
                 let candidate = namespace.append_core(name);
                 if local(&candidate) {
                     return Ok(Ok(Some(candidate)));
+                }
+                let private = self.source_scope.private_name(&candidate);
+                if private != candidate && local(&private) {
+                    return Ok(Ok(Some(private)));
                 }
                 if namespace.is_anonymous() {
                     break;
@@ -375,14 +573,56 @@ impl Context {
         name: &Name,
     ) -> Result<Name, NatDefinitionElabError> {
         self.tick()?;
+        let user_name = self
+            .source_scope
+            .user_declaration_name(name)
+            .map_err(error)?;
+        if self.source_scope.private_module.is_some()
+            && !self.source_scope.public_declarations
+            && self.txn.env.contains(&user_name)
+        {
+            return Err(error(ScopeError::PrivateShadowsPublic(user_name)));
+        }
+        self.source_scope
+            .check_public_name(&user_name, &self.txn.env)?;
         let name = self.source_scope.declaration_name(name).map_err(error)?;
-        self.source_scope.namespace = name.parent();
+        let private = self.source_scope.private_name(&user_name);
+        if reserved::is_declared_auxiliary(&self.txn.env, &name)
+            || reserved::is_declared_auxiliary(&self.txn.env, &user_name)
+        {
+            return Err(error(ScopeError::AuxiliaryDeclared(name)));
+        }
+        if reserved::is_reserved(&self.txn.env, &user_name)
+            || reserved::is_reserved(&self.txn.env, &private)
+        {
+            return Err(error(ScopeError::ReservedName(name)));
+        }
+        self.source_scope.namespace = user_name.parent();
         Ok(name)
+    }
+
+    /// `ensureEqnReservedNamesAvailable`, which the pin runs for every definition, theorem,
+    /// abbreviation, instance and `opaque` (Lean/Elab/PreDefinition/Main.lean:306,
+    /// Structural/Eqns.lean:159), not for an axiom or an inductive type.
+    pub(super) fn ensure_equation_names_available(
+        &mut self,
+        declaration: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.tick()?;
+        match reserved::taken_equation_name(&self.txn.env, declaration) {
+            Some(taken) => Err(error(ScopeError::ReservedNameTaken {
+                declaration: declaration.clone(),
+                taken,
+            })),
+            None => Ok(()),
+        }
     }
 }
 
 /// Candidates only. The caller must use the same kernel/council publication as
 /// an unscoped declaration; scope resolution cannot mint a checked declaration.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects`] instead.
 pub fn elaborate_definition(
     syntax: &Syntax,
     env: &Environment,
@@ -390,6 +630,17 @@ pub fn elaborate_definition(
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     super::definition_scoped(syntax, env, kernel, scope)
+}
+
+/// Elaborate the candidate and its explicit source effects in one transaction.
+/// The caller must check the declaration before installing any returned effect.
+pub fn elaborate_definition_with_effects(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<super::ElaboratedDeclaration, NatDefinitionElabError> {
+    super::definition_scoped_with_effects(syntax, env, kernel, scope)
 }
 
 /// An `#eval` candidate (a generated definition) with names resolved in `scope`. As for
@@ -428,6 +679,15 @@ pub fn elaborate_example(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    let mut context = Context::scoped(env, kernel, scope);
+    example_in_context(syntax, name, &mut context)
+}
+
+pub(super) fn example_in_context(
+    syntax: &Syntax,
+    name: Name,
+    context: &mut Context,
+) -> Result<Declaration, NatDefinitionElabError> {
     use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
 
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
@@ -448,7 +708,12 @@ pub fn elaborate_example(
     // Attribute execution is a separate effect. Refuse unsupported modifiers
     // instead of silently losing an attribute failure when the scratch closes.
     super::doc_comment_slot(&modifiers[0])?;
-    for modifier in &modifiers[1..] {
+    for (index, modifier) in modifiers.iter().enumerate().skip(1) {
+        // `noncomputable example`: the pin's examples are never compiled anyway.
+        if index == super::NONCOMPUTABLE_SLOT {
+            super::noncomputable_slot(modifier)?;
+            continue;
+        }
         expect_empty_null(modifier, "unmodified example")?;
     }
     let example = expect_node(
@@ -488,8 +753,7 @@ pub fn elaborate_example(
         parser_kind(&["Command", "declaration"]),
         vec![declaration[0].clone(), definition],
     );
-    let mut context = Context::scoped(env, kernel, scope);
-    super::definition_in_context_named(&candidate, &mut context, Some(name))
+    super::definition_in_context_named(&candidate, context, Some(name))
 }
 
 /// Recognize the canonical command shape; elaboration still validates its body.
@@ -544,11 +808,18 @@ mod tests {
     fn export_aliases_resolve_beside_declarations_at_each_namespace() {
         let scope = SourceScope {
             namespace: n("Outer"),
+            private_module: None,
+            public_declarations: false,
+            expose_definitions: false,
+            noncomputable_section: false,
             opened: vec![n("O")],
+            explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            local_simp: Vec::new(),
             frontier_recursors: false,
+            arithmetic: None,
             options: KVMap::new(),
         };
         let env = [
@@ -729,12 +1000,19 @@ mod tests {
         let aliases = AliasTable::read(&env).unwrap();
         let protected = ProtectedNames::read(&env).unwrap();
         let scope = |namespace: &str, opened: &[&str]| SourceScope {
+            private_module: None,
+            public_declarations: false,
+            expose_definitions: false,
+            noncomputable_section: false,
             namespace: n(namespace),
             opened: opened.iter().map(|o| n(o)).collect(),
+            explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            local_simp: Vec::new(),
             frontier_recursors: false,
+            arithmetic: None,
             options: KVMap::new(),
         };
         let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
@@ -798,12 +1076,19 @@ mod tests {
     #[test]
     fn namespace_prefixes_root_escapes_and_ambiguous_opens_have_distinct_rules() {
         let scope = SourceScope {
+            private_module: None,
+            public_declarations: false,
+            expose_definitions: false,
+            noncomputable_section: false,
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
+            explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            local_simp: Vec::new(),
             frontier_recursors: false,
+            arithmetic: None,
             options: KVMap::new(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];

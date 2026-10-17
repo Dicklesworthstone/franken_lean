@@ -1,4 +1,4 @@
-//! Recognize native arithmetic from its complete admitted logical model.
+//! Recognize native execution from its complete admitted logical model.
 //!
 //! The Reference decorates the model with hygienic binder labels and borrowed
 //! metadata. Those annotations do not change the de Bruijn term or its native
@@ -8,11 +8,21 @@
 
 use super::*;
 use std::collections::HashSet;
+pub(super) mod array_fold;
+pub(super) mod array_iteration;
+pub(super) mod diagnostics;
+pub(super) mod float;
 pub(super) mod io;
+mod nat_div_mod;
 pub(super) mod st;
+mod string_append;
+pub(super) mod string_bootstrap;
+pub(super) mod string_bytes;
+pub(super) mod string_from_list;
 mod string_internal;
 mod string_length;
 pub(super) mod string_push;
+pub(super) use string_append::imported_string_append_matches;
 pub(super) use string_internal::imported_string_internal_matches;
 pub(super) use string_length::imported_string_length_matches;
 
@@ -118,7 +128,7 @@ pub(super) fn imported_nat_matches(
     limits: IngressLimits,
 ) -> Result<bool, IngressError> {
     let Some(declarations) = fln_elab::seed::imported_nat_intrinsic_model_declarations(name) else {
-        return Ok(false);
+        return nat_div_mod::matches(environment, name, &mut None, visited, limits);
     };
     let mut comparison = Comparison { visited, limits };
     for declaration in declarations {
@@ -127,6 +137,28 @@ pub(super) fn imported_nat_matches(
         }
     }
     Ok(true)
+}
+
+/// Equality transport depends on the complete admitted family, including the
+/// computational recursor rule. Hygienic labels and transparent metadata do
+/// not change that model; all other structure remains part of the contract.
+pub(super) fn equality_family_matches(
+    environment: &Environment,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    Comparison { visited, limits }.declaration(environment, fln_elab::seed::eq_seed_declaration())
+}
+
+/// Quotient erasure requires all four primitive declarations, not just a
+/// constant named Quot or the signature of the operation being compiled.
+pub(super) fn quotient_family_matches(
+    environment: &Environment,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    Comparison { visited, limits }
+        .declaration(environment, fln_elab::seed::quotient_seed_declaration())
 }
 
 struct Comparison<'a> {
@@ -187,6 +219,14 @@ impl Comparison<'_> {
         match expected {
             Declaration::Defn(value) => self.constant(environment, ConstantInfo::Defn(value)),
             Declaration::Opaque(value) => self.constant(environment, ConstantInfo::Opaque(value)),
+            Declaration::Quotient(values) => {
+                for value in values {
+                    if !self.constant(environment, ConstantInfo::Quot(value))? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             Declaration::Inductive(block) => {
                 for value in block.types {
                     if !self.constant(environment, ConstantInfo::Induct(value))? {
@@ -238,6 +278,7 @@ impl Comparison<'_> {
             (ConstantInfo::Opaque(a), ConstantInfo::Opaque(b)) => {
                 a.is_unsafe == b.is_unsafe && a.all == b.all
             }
+            (ConstantInfo::Quot(a), ConstantInfo::Quot(b)) => a.kind == b.kind,
             (ConstantInfo::Induct(a), ConstantInfo::Induct(b)) => {
                 a.num_params == b.num_params
                     && a.num_indices == b.num_indices

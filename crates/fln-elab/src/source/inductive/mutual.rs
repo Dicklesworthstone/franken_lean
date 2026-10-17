@@ -2,7 +2,7 @@
 //! All headers precede all bodies. The sole output is one candidate authority unit
 //! for the ordinary kernel and independent-checker admission path.
 use super::*;
-use crate::inductive::mutual_inductive_declaration;
+use crate::inductive::mutual_inductive_with_promoted_parameters;
 use fln_core::name::LeafView;
 use std::collections::HashSet;
 
@@ -135,10 +135,21 @@ pub(in crate::source) fn elaborate_mutual(
             };
             p.id = id.clone();
         }
-        for index in &mut h.indices {
+        // Indices get block-unique identities too: promotion renames a
+        // sibling's constructor fields onto the first family's indices, and
+        // locals from different members' contexts may share a name.
+        let mut index_replacements = Vec::new();
+        for (j, index) in h.indices.iter_mut().enumerate() {
             let ty = h.context.instantiate(&index.type_)?;
             h.context.require_resolved(std::slice::from_ref(&ty))?;
-            index.type_ = rename(&mut h.context, ty, &replacements)?;
+            let ty = rename(&mut h.context, ty, &replacements)?;
+            index.type_ = rename(&mut h.context, ty, &index_replacements)?;
+            let id = FVarId(Name::num(
+                Name::num(Name::from_components(["_fln_mutual_index"]), family as u64),
+                j as u64,
+            ));
+            index_replacements.push((index.id.clone(), Expr::fvar(id.clone())));
+            index.id = id;
         }
         // Canonicalize written parameters without discarding the lexical
         // section context used by their domains and by later constructor fields.
@@ -214,6 +225,7 @@ pub(in crate::source) fn elaborate_mutual(
     let family_names: Vec<_> = headers.iter().map(|h| h.name.clone()).collect();
     let mut all_bodies = Vec::new();
     let mut inferred = Level::one();
+    let mut base = LocalContext::new();
     for (i, h) in headers.iter_mut().enumerate() {
         for ((id, name), ty) in ids.iter().zip(&family_names).zip(&initial_types) {
             h.context.tick()?;
@@ -221,6 +233,9 @@ pub(in crate::source) fn elaborate_mutual(
                 .txn
                 .lctx
                 .add_param(id.clone(), name.clone(), ty.clone(), BinderInfo::Default);
+        }
+        if i == 0 {
+            base = h.context.txn.lctx.clone();
         }
         let result = bodies(
             &mut h.context,
@@ -238,13 +253,66 @@ pub(in crate::source) fn elaborate_mutual(
         }
         all_bodies.push(result);
     }
+    // The pin promotes a prefix of indices fixed across the whole block to
+    // parameters (`fixedIndicesToParams` over every member): measured at the pin,
+    // `Tree`/`Forest : Nat → Type` whose constructors all take and return `(n : Nat)`
+    // print `number of parameters: 1`. The family types are unchanged; every
+    // member's promoted parameters are the first member's indices.
+    let count = {
+        let families: Vec<_> = headers
+            .iter()
+            .zip(&all_bodies)
+            .zip(&ids)
+            .map(|((h, body), id)| (h.indices.clone(), id.clone(), body.constructors.clone()))
+            .collect();
+        let families: Vec<_> = families
+            .iter()
+            .map(|(indices, id, constructors)| PromotionFamily {
+                indices,
+                id,
+                constructors,
+            })
+            .collect();
+        let parameters = headers[0].parameters.clone();
+        promotable_indices(&mut headers[0].context, &base, &parameters, &families)?
+    };
+    let mut promoted: Vec<Vec<Vec<LocalDecl>>> = all_bodies
+        .iter()
+        .map(|body| vec![Vec::new(); body.constructors.len()])
+        .collect();
+    if count > 0 {
+        let lead: Vec<LocalDecl> = headers[0].indices[..count].to_vec();
+        for ((h, body), own_binders) in headers.iter_mut().zip(&mut all_bodies).zip(&mut promoted) {
+            let own: Vec<LocalDecl> = h.indices.drain(..count).collect();
+            let to_lead: Vec<_> = own
+                .iter()
+                .zip(&lead)
+                .map(|(own, lead)| (own.id.clone(), Expr::fvar(lead.id.clone())))
+                .collect();
+            for index in &mut h.indices {
+                index.type_ = rename(&mut h.context, index.type_.clone(), &to_lead)?;
+            }
+            *own_binders =
+                promote_constructors(&mut h.context, &lead, &mut body.constructors, None)?;
+            // A member keeps its own binder name in its own type; the identity,
+            // domain and binder style are the first member's, as the block shares them.
+            h.parameters
+                .extend(own.into_iter().zip(&lead).map(|(mut own, lead)| {
+                    own.id = lead.id.clone();
+                    own.type_ = lead.type_.clone();
+                    own.binder_info = lead.binder_info;
+                    own
+                }));
+        }
+    }
     let result_level = explicit.unwrap_or(inferred);
     let final_types = headers
         .iter()
         .map(|h| family_type(h, &result_level, budget))
         .collect::<Result<Vec<_>, _>>()?;
     let mut roots = final_types.clone();
-    for body in &all_bodies {
+    for (body, own_binders) in all_bodies.iter().zip(&promoted) {
+        roots.extend(own_binders.iter().flatten().map(|b| b.type_.clone()));
         for ctor in &body.constructors {
             roots.extend(ctor.fields.iter().map(|f| f.type_.clone()));
             roots.extend(ctor.result_indices.iter().cloned());
@@ -300,7 +368,10 @@ pub(in crate::source) fn elaborate_mutual(
         replacements.push((id, value));
     }
     let mut specs = Vec::new();
-    for (mut h, mut body) in headers.into_iter().zip(all_bodies) {
+    for ((mut h, mut body), own_binders) in headers.into_iter().zip(all_bodies).zip(&mut promoted) {
+        for binder in own_binders.iter_mut().flatten() {
+            binder.type_ = rename(&mut h.context, binder.type_.clone(), &replacements)?;
+        }
         for ctor in &mut body.constructors {
             for field in &mut ctor.fields {
                 field.type_ = rename(&mut h.context, field.type_.clone(), &replacements)?;
@@ -319,6 +390,6 @@ pub(in crate::source) fn elaborate_mutual(
             result_level: result_level.clone(),
         });
     }
-    mutual_inductive_declaration(&specs, budget)
+    mutual_inductive_with_promoted_parameters(&specs, budget, &promoted)
         .map_err(|e| failure(SourceInferenceError::Inductive(e)))
 }

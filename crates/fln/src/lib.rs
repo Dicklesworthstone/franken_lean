@@ -25,23 +25,25 @@
 //! long-lived server transport remains a separate, unfinished product surface.
 
 #![forbid(unsafe_code)]
-// The one unstable feature, for one hook: a refused host allocation must unwind
-// to the frontier's per-module guard instead of aborting every thread at once
-// (fln-frontier-oom-abort-w9dx; see `install_host_allocation_failure_hook`).
-#![feature(alloc_error_hook)]
+// Allocation failure unwinds to the import frontier's per-module guard; bounded
+// runtime Format projection also uses fallible boxes for untrusted output.
+#![feature(alloc_error_hook, allocator_api)]
 
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;
 mod source_evaluation;
 mod source_execution;
+pub mod source_format;
 mod source_intrinsics;
+pub mod source_main;
 #[cfg(test)]
 mod source_nat_add_binding_tests;
 mod source_records;
+pub use source_records::SourceDeclarationAdmission;
 #[cfg(test)]
 mod source_seed_names;
-pub use fln_rt::obj::{CapturedStdout, StdoutCapture, StdoutCaptureError};
+pub use fln_rt::obj::{CapturedStdout, StdoutCapture, StdoutCaptureError, flush_native_stdout};
 pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 
 pub use fln_checker::admit::{
@@ -171,7 +173,10 @@ pub use fln_vm::interpreter::{
     ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit, nat_decimal,
     value_kind as vm_value_kind,
 };
-pub use source_evaluation::{IoEvaluationOutcome, IoEvaluationProjectionError};
+pub use source_evaluation::{
+    EvaluationPresentation, EvaluationResultPresentation, IoEvaluationOutcome,
+    IoEvaluationProjectionError,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -613,6 +618,7 @@ pub fn decode_flbc_product_sidecar(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceRunSidecarBuildError {
     EmptyExecutionBatch,
+    SourceProgramInputs { reason: &'static str },
     UnsupportedTarget { target: String },
     Closure(ProductSidecarBuildRefusal),
 }
@@ -622,6 +628,9 @@ impl std::fmt::Display for SourceRunSidecarBuildError {
         match self {
             Self::EmptyExecutionBatch => {
                 f.write_str("cannot bind a sidecar to an empty execution batch")
+            }
+            Self::SourceProgramInputs { reason } => {
+                write!(f, "cannot bind the source program inputs: {reason}")
             }
             Self::UnsupportedTarget { target } => {
                 write!(
@@ -733,6 +742,39 @@ pub fn independent_reading(parts: &[&[u8]], limits: OleanDecodeLimits) -> Indepe
 /// The checker's own reading of one artifact, by name, as its seat consults it.
 struct ArtifactReadings(std::collections::HashMap<CheckerName, fln_hash::domain::Digest>);
 
+/// An unread artifact and a refused allocation both leave the checker without
+/// an answer, but only the allocation can recover when sibling workers stop.
+#[derive(Debug)]
+enum ArtifactReadingsError {
+    Unavailable(String),
+    AllocationFailure { requested: usize },
+}
+
+impl fmt::Display for ArtifactReadingsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(reason) => formatter.write_str(reason),
+            Self::AllocationFailure { requested } => {
+                write!(formatter, "could not reserve {requested} checker readings")
+            }
+        }
+    }
+}
+
+impl ArtifactReadingsError {
+    fn into_nonanswer<T>(self) -> Result<Outcome<T>, OleanCheckError> {
+        match self {
+            Self::Unavailable(reason) => Ok(Outcome::Inconclusive(
+                Inconclusive::dependency_unavailable(reason),
+            )),
+            Self::AllocationFailure { requested } => Err(OleanCheckError::AllocationFailure {
+                resource: ".olean independent checker readings",
+                requested,
+            }),
+        }
+    }
+}
+
 /// Why the checker seat will not vouch for a declaration as the artifact's.
 enum ReadingObjection {
     /// Its reading of the artifact says something else: one decoder is wrong, and
@@ -773,25 +815,39 @@ impl ArtifactReadings {
     /// Index a reading, or say why there is none to consult. An artifact the
     /// checker could not read, or that names one constant twice, gives it no
     /// independent answer about any of its declarations.
-    fn new(reading: &IndependentReading) -> Result<Self, String> {
+    fn new(reading: &IndependentReading) -> Result<Self, ArtifactReadingsError> {
+        Self::new_with_reserve(reading, |index, count| index.try_reserve(count))
+    }
+
+    /// Fault tests refuse this allocation through the same typed constructor
+    /// used by the council, without changing the global allocator.
+    fn new_with_reserve(
+        reading: &IndependentReading,
+        reserve: impl FnOnce(
+            &mut std::collections::HashMap<CheckerName, fln_hash::domain::Digest>,
+            usize,
+        ) -> Result<(), std::collections::TryReserveError>,
+    ) -> Result<Self, ArtifactReadingsError> {
         let entries = match reading {
             IndependentReading::Read(entries) => entries,
             IndependentReading::Unread(reason) => {
-                return Err(format!(
+                return Err(ArtifactReadingsError::Unavailable(format!(
                     "fln-checker could not read the .olean itself: {reason}"
-                ));
+                )));
             }
         };
         let mut readings = std::collections::HashMap::new();
-        readings
-            .try_reserve(entries.len())
-            .map_err(|_| format!("could not reserve {} checker readings", entries.len()))?;
+        reserve(&mut readings, entries.len()).map_err(|_| {
+            ArtifactReadingsError::AllocationFailure {
+                requested: entries.len(),
+            }
+        })?;
         for (name, digest) in entries {
             if readings.insert(name.clone(), *digest).is_some() {
-                return Err(format!(
+                return Err(ArtifactReadingsError::Unavailable(format!(
                     "fln-checker read `{}` twice in one .olean",
                     checker_name_text(name)
-                ));
+                )));
             }
         }
         Ok(Self(readings))
@@ -1791,6 +1847,28 @@ pub struct CheckedOleanModule {
     pub declarations: Vec<OleanCheckedDeclaration>,
 }
 
+/// Whether a module stopped because the host refused memory. An explicit
+/// checking/decode allowance, a silent council and an unsupported construct do
+/// not belong here: retrying those with the same budget cannot remove another
+/// worker's memory pressure.
+fn olean_host_memory_refusal(error: &OleanCheckError) -> bool {
+    fn admission(error: &EngineAdmissionError) -> bool {
+        match error {
+            EngineAdmissionError::BatchDeclaration { error, .. } => admission(error),
+            EngineAdmissionError::AllocationFailure { .. } => true,
+            _ => false,
+        }
+    }
+    match error {
+        OleanCheckError::AllocationFailure { .. } | OleanCheckError::HostMemory { .. } => true,
+        OleanCheckError::Admission(error) => admission(error),
+        OleanCheckError::Decode(error) | OleanCheckError::ModuleDecode { error, .. } => {
+            error.is_host_allocation_refusal()
+        }
+        _ => false,
+    }
+}
+
 /// The frontier's verdict for a module whose check ended in an error.
 ///
 /// FL-INV-07: a council whose objecting seats were all silent or ran out
@@ -1919,6 +1997,7 @@ fn frontier_guarded(
         let error = frontier_unwound(payload);
         FrontierDone {
             index,
+            host_memory_refusal: olean_host_memory_refusal(&error),
             verdict: frontier_error_verdict(error.clone()),
             accepted: None,
             engine: None,
@@ -1931,13 +2010,15 @@ fn frontier_guarded(
 /// What an unwind out of a module check means: the host refused an allocation,
 /// or one of our invariants broke. A panic is never a verdict.
 fn frontier_unwound(payload: Box<dyn std::any::Any + Send>) -> OleanCheckError {
+    olean_unwound(payload, "a frontier module check panicked")
+}
+
+fn olean_unwound(payload: Box<dyn std::any::Any + Send>, detail: &'static str) -> OleanCheckError {
     match payload.downcast::<HostAllocationFailure>() {
         Ok(failure) => OleanCheckError::HostMemory {
             requested: failure.requested,
         },
-        Err(_) => OleanCheckError::InternalInvariant {
-            detail: "a frontier module check panicked",
-        },
+        Err(_) => OleanCheckError::InternalInvariant { detail },
     }
 }
 
@@ -1964,7 +2045,39 @@ pub enum OleanModuleVerdict {
 pub struct OleanFrontierRow {
     pub name: Name,
     pub verdict: OleanModuleVerdict,
+    /// Total time spent checking this module, including a refused first attempt.
     pub elapsed: std::time::Duration,
+    /// A first attempt refused host memory while another module was in flight.
+    /// When present, the final verdict above comes from one full retry with no
+    /// other module check in flight, under the original limits. No more than one
+    /// retry is made, and neither attempt is an additional module row.
+    pub memory_retry: Option<OleanFrontierMemoryRetry>,
+    /// An initial parallel decode refused host memory and was repeated once
+    /// after every decoder worker exited. A successful decode is only input to
+    /// the council: its result here does not imply this row was accepted.
+    /// Decode times are separate from the checking time in `elapsed`.
+    pub decode_memory_retry: Option<OleanDecodeMemoryRetry>,
+}
+
+/// The first attempt of a module checked again in isolation. Its final attempt
+/// is the enclosing row's verdict and `elapsed - first_elapsed`.
+#[derive(Debug)]
+pub struct OleanFrontierMemoryRetry {
+    pub first_refusal: Inconclusive,
+    pub first_elapsed: std::time::Duration,
+}
+
+/// Both attempts of an initial decode retried without another decoder running.
+/// The same bytes and limits are used again; successfully decoded sibling
+/// artifacts remain available for import planning.
+#[derive(Debug)]
+pub struct OleanDecodeMemoryRetry {
+    pub first_error: OleanCheckError,
+    pub first_elapsed: std::time::Duration,
+    pub retry_elapsed: std::time::Duration,
+    /// `Ok(())` means the artifact decoded. Declarations still need the ordinary
+    /// K1 and independent-checker judgments before they can be admitted.
+    pub retry_result: Result<(), OleanCheckError>,
 }
 
 /// What a frontier observer is told: `Started` just before a module's
@@ -1983,6 +2096,14 @@ pub enum OleanFrontierEvent<'a> {
         position: usize,
         total: usize,
         module: &'a Name,
+    },
+    /// A host-memory refusal is retried only after all other module checks have
+    /// finished. This is attempt two, not another module or a settled verdict.
+    Retrying {
+        position: usize,
+        total: usize,
+        module: &'a Name,
+        previous: &'a OleanFrontierMemoryRetry,
     },
     Settled {
         position: usize,
@@ -2009,9 +2130,9 @@ pub struct OleanFrontier {
     pub rows: Vec<OleanFrontierRow>,
 }
 
-/// How a frontier run spreads its modules over threads. Neither field changes a
-/// row or the returned engine (or its absence); see
-/// [`Engine::check_olean_frontier_scheduled`].
+/// How a frontier run spreads its modules over threads. Logical checking uses
+/// only each module's own closure. A concurrent host-memory refusal is retried
+/// once in isolation; timings and attempt records can differ with this count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OleanFrontierJobs {
     /// Modules checked at once. One checks every module on the calling thread.
@@ -2039,6 +2160,7 @@ struct FrontierAccepted {
 }
 
 /// The accepted import a module's closure engine starts from, and its closure.
+#[derive(Clone)]
 struct FrontierBase {
     engine: std::sync::Arc<Engine>,
     closure: std::sync::Arc<BTreeSet<usize>>,
@@ -2057,9 +2179,29 @@ struct FrontierJob {
     retain: bool,
 }
 
+/// Only the already accepted, shared imports survive a failed attempt. The
+/// attempted module's decoded constants and checker state are dropped by the
+/// worker; its unchanged input bytes are decoded again for the isolated retry.
+#[derive(Clone)]
+struct FrontierRetryImports {
+    base: Option<FrontierBase>,
+    closure: Vec<std::sync::Arc<FrontierAccepted>>,
+}
+
+struct FrontierWork {
+    index: usize,
+    position: usize,
+    /// Absent only for a retry, whose original artifact was dropped.
+    artifact: Option<DecodedOlean>,
+    imports: FrontierRetryImports,
+}
+
 struct FrontierDone {
     index: usize,
     verdict: OleanModuleVerdict,
+    /// Derived from the original typed error, before its public nonanswer is
+    /// rendered. Never inferred by matching diagnostic text.
+    host_memory_refusal: bool,
     accepted: Option<FrontierAccepted>,
     /// The engine after checking an accepted module: its closure's environment
     /// plus what it admitted. A scheduler keeps it only while a module not yet
@@ -3175,67 +3317,228 @@ fn decode_olean_module_input(
     decode_olean_module_input_with(module, limits, CheckerReading::Read)
 }
 
-/// Decode every module of a set, `jobs.threads` at once, each result at its
-/// module's index.
+struct OleanModuleDecode {
+    result: Result<DecodedOlean, OleanCheckError>,
+    memory_retry: Option<OleanDecodeMemoryRetry>,
+}
+
+struct TimedOleanDecode {
+    result: Result<DecodedOlean, OleanCheckError>,
+    elapsed: std::time::Duration,
+}
+
+fn guarded_olean_decode(
+    decode: impl FnOnce() -> Result<DecodedOlean, OleanCheckError>,
+) -> TimedOleanDecode {
+    let started = std::time::Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode))
+        .unwrap_or_else(|payload| Err(olean_unwound(payload, "an .olean module decode panicked")));
+    TimedOleanDecode {
+        result,
+        elapsed: started.elapsed(),
+    }
+}
+
+/// Decode every module of a set, initially `jobs.threads` at once, each result
+/// at its module's input index. The first host-memory refusal closes parallel
+/// dispatch. After those workers exit, retry each memory-refused decode that
+/// overlapped another once, then decode any unstarted modules one at a time.
 ///
-/// A module's decode reads only its own parts, so the results do not depend on the
-/// thread count or on which worker took which module; only the wall time does. The
-/// outer `Err` is a failure to start a worker, never a property of an artifact.
+/// This ends the parallel workers and releases transient decoding state.
+/// Successful sibling artifacts remain, so it does not promise the memory
+/// footprint of a fresh serial run. Explicit budgets and artifact errors are
+/// never retried. The outer `Err` denotes orchestration failure; module errors
+/// stay at their input index.
 fn decode_olean_module_inputs(
     modules: &[OleanModuleInput<'_>],
     limits: OleanCheckLimits,
     reading: CheckerReading,
     jobs: OleanFrontierJobs,
-) -> Result<Vec<Result<DecodedOlean, OleanCheckError>>, OleanCheckError> {
-    let threads = jobs.threads.get().min(modules.len());
+) -> Result<Vec<OleanModuleDecode>, OleanCheckError> {
+    decode_olean_module_inputs_using(modules.len(), jobs, &|index| {
+        decode_olean_module_input_with(&modules[index], limits, reading)
+    })
+}
+
+/// Keep fault injection at the decoder boundary, so tests exercise the same
+/// dispatch, unwinding, retry and collection paths as real artifact reads.
+fn decode_olean_module_inputs_using(
+    count: usize,
+    jobs: OleanFrontierJobs,
+    decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
+) -> Result<Vec<OleanModuleDecode>, OleanCheckError> {
+    let allocation = |_| OleanCheckError::AllocationFailure {
+        resource: ".olean decoder work records",
+        requested: count,
+    };
+    let mut results = Vec::new();
+    results.try_reserve_exact(count).map_err(allocation)?;
+    let threads = jobs.threads.get().min(count);
     if threads <= 1 {
-        return Ok(modules
-            .iter()
-            .map(|module| decode_olean_module_input_with(module, limits, reading))
-            .collect());
+        for index in 0..count {
+            results.push(OleanModuleDecode {
+                result: guarded_olean_decode(|| decode(index)).result,
+                memory_retry: None,
+            });
+        }
+        return Ok(results);
     }
     /// The decoder is iterative; this only has to hold its ordinary frames.
     const MIN_DECODE_STACK_BYTES: usize = 8 << 20;
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Result<DecodedOlean, OleanCheckError>>>> = modules
-        .iter()
-        .map(|_| std::sync::Mutex::new(None))
-        .collect();
+    let stack_bytes = jobs.worker_stack_bytes.max(MIN_DECODE_STACK_BYTES);
+    struct Dispatch {
+        next: usize,
+        running: Vec<usize>,
+        overlapped: Vec<bool>,
+        completed: Vec<Option<TimedOleanDecode>>,
+        memory_refused: bool,
+    }
+    let mut running = Vec::new();
+    running.try_reserve_exact(threads).map_err(allocation)?;
+    let mut overlapped = Vec::new();
+    overlapped.try_reserve_exact(count).map_err(allocation)?;
+    overlapped.resize(count, false);
+    let mut completed = Vec::new();
+    completed.try_reserve_exact(count).map_err(allocation)?;
+    completed.resize_with(count, || None);
+    let dispatch = std::sync::Mutex::new(Dispatch {
+        next: 0,
+        running,
+        overlapped,
+        completed,
+        memory_refused: false,
+    });
+    let lock_failure = |_| OleanCheckError::InternalInvariant {
+        detail: "the .olean decode dispatcher was poisoned",
+    };
     std::thread::scope(|scope| -> Result<(), OleanCheckError> {
+        let mut workers = Vec::new();
+        workers.try_reserve_exact(threads).map_err(allocation)?;
         for worker in 0..threads {
-            let (next, slots) = (&next, &slots);
-            std::thread::Builder::new()
-                .name(format!("fln-olean-decode-{worker}"))
-                .stack_size(jobs.worker_stack_bytes.max(MIN_DECODE_STACK_BYTES))
-                .spawn_scoped(scope, move || {
-                    loop {
-                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(module) = modules.get(index) else {
-                            return;
-                        };
-                        let result = decode_olean_module_input_with(module, limits, reading);
-                        if let Ok(mut slot) = slots[index].lock() {
-                            *slot = Some(result);
+            let dispatch = &dispatch;
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("fln-olean-decode-{worker}"))
+                    .stack_size(stack_bytes)
+                    .spawn_scoped(scope, move || -> Result<(), OleanCheckError> {
+                        loop {
+                            let index = {
+                                let mut state = dispatch.lock().map_err(lock_failure)?;
+                                if state.memory_refused || state.next == count {
+                                    return Ok(());
+                                }
+                                let index = state.next;
+                                state.next += 1;
+                                if !state.running.is_empty() {
+                                    state.overlapped[index] = true;
+                                    // The earlier worker overlaps too, even if it
+                                    // was alone when it first claimed its module.
+                                    for at in 0..state.running.len() {
+                                        let other = state.running[at];
+                                        state.overlapped[other] = true;
+                                    }
+                                }
+                                state.running.push(index);
+                                index
+                            };
+                            let attempt = guarded_olean_decode(|| decode(index));
+                            let mut state = dispatch.lock().map_err(lock_failure)?;
+                            if attempt
+                                .result
+                                .as_ref()
+                                .is_err_and(olean_host_memory_refusal)
+                            {
+                                // Claim and stop share this lock: no fresh job can
+                                // slip into the parallel pool after this refusal.
+                                state.memory_refused = true;
+                            }
+                            let at = state
+                                .running
+                                .iter()
+                                .position(|active| *active == index)
+                                .ok_or(OleanCheckError::InternalInvariant {
+                                    detail: "a finished .olean decode was not running",
+                                })?;
+                            state.running.swap_remove(at);
+                            state.completed[index] = Some(attempt);
                         }
-                    }
-                })
-                .map_err(|_| OleanCheckError::InternalInvariant {
-                    detail: "could not start an .olean decode worker thread",
-                })?;
+                    })
+                    .map_err(|_| OleanCheckError::InternalInvariant {
+                        detail: "could not start an .olean decode worker thread",
+                    })?,
+            );
+        }
+        for worker in workers {
+            worker.join().map_err(|payload| {
+                olean_unwound(payload, "an .olean decode dispatcher worker panicked")
+            })??;
         }
         Ok(())
     })?;
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .ok()
-                .flatten()
-                .ok_or(OleanCheckError::InternalInvariant {
-                    detail: "an .olean decode worker left a module undecoded",
+    let mut state = dispatch
+        .into_inner()
+        .map_err(|_| OleanCheckError::InternalInvariant {
+            detail: "the .olean decode dispatcher was poisoned",
+        })?;
+    let needs_isolation = state.next < count
+        || state.completed.iter().enumerate().any(|(index, attempt)| {
+            state.overlapped[index]
+                && attempt.as_ref().is_some_and(|attempt| {
+                    attempt
+                        .result
+                        .as_ref()
+                        .is_err_and(olean_host_memory_refusal)
                 })
-        })
-        .collect()
+        });
+    let finish = move || -> Result<Vec<OleanModuleDecode>, OleanCheckError> {
+        for index in 0..count {
+            let first = match state.completed[index].take() {
+                Some(first) => first,
+                None if index >= state.next => guarded_olean_decode(|| decode(index)),
+                None => {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "an .olean decode worker left a claimed module undecoded",
+                    });
+                }
+            };
+            let (result, memory_retry) = match first.result {
+                Err(error) if state.overlapped[index] && olean_host_memory_refusal(&error) => {
+                    let retry = guarded_olean_decode(|| decode(index));
+                    let memory_retry = OleanDecodeMemoryRetry {
+                        first_error: error,
+                        first_elapsed: first.elapsed,
+                        retry_elapsed: retry.elapsed,
+                        retry_result: retry.result.as_ref().map(|_| ()).map_err(Clone::clone),
+                    };
+                    (retry.result, Some(memory_retry))
+                }
+                result => (result, None),
+            };
+            results.push(OleanModuleDecode {
+                result,
+                memory_retry,
+            });
+        }
+        Ok(results)
+    };
+    if !needs_isolation {
+        return finish();
+    }
+    // The whole first pool has joined. Retrying on one new worker preserves the
+    // original decoder stack allowance; the host may cache exited thread stacks.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("fln-olean-decode-isolated".to_owned())
+            .stack_size(stack_bytes)
+            .spawn_scoped(scope, finish)
+            .map_err(|_| OleanCheckError::InternalInvariant {
+                detail: "could not start an isolated .olean decode worker thread",
+            })?
+            .join()
+            .map_err(|payload| {
+                olean_unwound(payload, "an isolated .olean decode worker panicked")
+            })?
+    })
 }
 
 fn decode_olean_module_input_with(
@@ -3701,6 +4004,8 @@ impl EngineBuilder {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -3716,6 +4021,9 @@ impl EngineBuilder {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            // An environment of unknown provenance runs no opaque value.
+            executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -3738,6 +4046,8 @@ impl EngineBuilder {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -3851,6 +4161,16 @@ impl EngineBuilder {
                 detail: "Nat recursion source reducibility registration failed",
             })?;
         }
+        // These are the seed's already checked generated definitions. The
+        // helper `Nat.brecOn.go` deliberately has no tag of its own, matching
+        // the pin's auxRecExt; it is identified through its tagged parent.
+        let auxiliary_names = ["Nat.casesOn", "Nat.below", "Nat.brecOn"]
+            .map(|name| Name::from_components(name.split('.')));
+        engine.environment =
+            fln_elab::aux_recursors::register_module(&engine.environment, &auxiliary_names)
+                .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                    detail: "source seed auxiliary-recursion registration failed",
+                })?;
         for class in ["Inhabited", "Decidable"] {
             engine.environment = fln_elab::instances::register_class(
                 &engine.environment,
@@ -3950,6 +4270,14 @@ pub struct Engine {
     imported_environment: Option<Environment>,
     /// Direct import edges retained from each checked module's decoded header.
     imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
+    /// Admitted opaques whose stored values have executable meaning: handed
+    /// declarations, or imported declarations whose complete private metadata
+    /// excludes a named initializer. Externs and companions still take precedence.
+    executable_opaques: std::sync::Arc<BTreeSet<Name>>,
+    /// Imported globals whose regular or builtin initializer supplies the runtime
+    /// value. Their stored values and recursive companions are placeholders,
+    /// never executable fallbacks. Import records rebuild this from artifact data.
+    runtime_initializers: std::sync::Arc<BTreeSet<Name>>,
     epoch: ModuleEpoch,
     mode: Mode,
     reproducibility: ReproducibilityProfile,
@@ -4158,6 +4486,8 @@ impl Engine {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: Self::pinned_epoch(),
             mode: Mode::DEFAULT,
             reproducibility: ReproducibilityProfile::Standard,
@@ -4181,6 +4511,8 @@ impl Engine {
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
             imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
             epoch: state.graph().epoch().clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -4203,6 +4535,13 @@ impl Engine {
     fn base_source_scope(&self) -> fln_elab::source::scope::SourceScope {
         fln_elab::source::scope::SourceScope {
             frontier_recursors: self.mode.permits_frontier(),
+            arithmetic: Some(fln_elab::arithmetic::ArithmeticProvider(
+                if self.mode.permits_frontier() {
+                    fln_anvil::omega::solve_with_integer_search
+                } else {
+                    fln_anvil::omega::solve
+                },
+            )),
             ..fln_elab::source::scope::SourceScope::default()
         }
     }
@@ -4265,6 +4604,12 @@ impl Engine {
     /// Modules admitted from `.olean` artifacts into this engine's environment.
     pub fn imported_modules(&self) -> &BTreeSet<Name> {
         &self.imported_modules
+    }
+
+    /// The environment the named imports alone produced, when they were admitted over an
+    /// empty base: a constant it holds came from an `.olean`, not from source.
+    pub fn imported_environment(&self) -> Option<&Environment> {
+        self.imported_environment.as_ref()
     }
 
     /// The deterministic identity of this snapshot under the caller's exact
@@ -4599,11 +4944,19 @@ impl Engine {
     /// admitted, merged in frontier order under the rule the serial planner applies
     /// to a repeated name. An identical copy is one constant; a copy that subsumes
     /// or is subsumed by the first keeps the first; any other pair is a
-    /// `DuplicateDeclaration` for the importing module. So a verdict depends only on
-    /// the module and its closure, never on what ran beside it or finished first,
-    /// and the rows and the returned engine are the same at every thread count.
-    /// `Decided` events arrive in row order; `Started` events arrive as modules are
-    /// dispatched, which above one thread is not row order.
+    /// `DuplicateDeclaration` for the importing module. The logical context does
+    /// not depend on another module's completion order.
+    /// A module refused host memory while other checks were in flight is retried
+    /// once after those workers finish, under the same limits. Only that retry's
+    /// verdict is settled; both attempts remain in its row. The retry does not
+    /// raise budgets or assume any declaration. Other resource stops are final.
+    /// The initial decode pass follows the same once-only retry rule, stops
+    /// parallel dispatch at the first host-memory refusal and completes unstarted
+    /// decodes serially. Its attempts are recorded separately from the council's.
+    /// Retained artifacts and unrelated host memory remain; this is not a claim
+    /// of resource-independent verdicts.
+    /// `Decided` events arrive in row order; `Started` and `Retrying` events arrive
+    /// as modules are dispatched, which above one thread is not row order.
     pub fn check_olean_frontier_scheduled(
         &self,
         modules: &[OleanModuleInput<'_>],
@@ -4612,11 +4965,43 @@ impl Engine {
         jobs: OleanFrontierJobs,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
     ) -> Result<OleanFrontier, OleanCheckError> {
+        self.check_olean_frontier_using(
+            modules,
+            limits,
+            jobs,
+            on_event,
+            &|job| self.frontier_check_module(job, options, limits),
+            &|index| decode_olean_module_input_with(&modules[index], limits, CheckerReading::Read),
+        )
+    }
+
+    /// The scheduler's decoding and checking operations are private so fault
+    /// tests can refuse a real job at its worker boundary without installing a
+    /// global allocator or changing any successful declaration-admission path.
+    fn check_olean_frontier_using(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        check: &(dyn Fn(FrontierJob) -> FrontierDone + Sync),
+        decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
+    ) -> Result<OleanFrontier, OleanCheckError> {
         let owners = olean_module_owners(modules, limits)?;
+        let mut decode_memory_retries = Vec::new();
+        decode_memory_retries
+            .try_reserve_exact(modules.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean decode retry records",
+                requested: modules.len(),
+            })?;
         let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> =
-            decode_olean_module_inputs(modules, limits, CheckerReading::Read, jobs)?
+            decode_olean_module_inputs_using(modules.len(), jobs, decode)?
                 .into_iter()
-                .map(Some)
+                .map(|entry| {
+                    decode_memory_retries.push(entry.memory_retry);
+                    Some(entry.result)
+                })
                 .collect();
 
         let mut dependencies: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); modules.len()];
@@ -4718,17 +5103,58 @@ impl Engine {
         let mut rows = Vec::with_capacity(count);
         let threads = jobs.threads.get();
 
-        let base = self;
-        let check = |job: FrontierJob| base.frontier_check_module(job, options, limits);
+        let run = |work: FrontierWork| {
+            let FrontierWork {
+                index,
+                position,
+                artifact,
+                imports,
+            } = work;
+            let started = std::time::Instant::now();
+            frontier_guarded(index, false, started, || {
+                let artifact = match artifact {
+                    Some(artifact) => Ok(artifact),
+                    None => decode_olean_module_input_with(
+                        &modules[index],
+                        limits,
+                        CheckerReading::Read,
+                    ),
+                };
+                match artifact {
+                    Ok(artifact) => {
+                        let mut done = check(FrontierJob {
+                            index,
+                            position,
+                            name: modules[index].name.clone(),
+                            artifact,
+                            base: imports.base,
+                            closure: imports.closure,
+                            retain: false,
+                        });
+                        done.elapsed = started.elapsed();
+                        done
+                    }
+                    Err(error) => FrontierDone {
+                        index,
+                        host_memory_refusal: olean_host_memory_refusal(&error),
+                        verdict: frontier_error_verdict(error),
+                        accepted: None,
+                        engine: None,
+                        elapsed: started.elapsed(),
+                        retained: None,
+                    },
+                }
+            })
+        };
         std::thread::scope(|scope| -> Result<(), OleanCheckError> {
-            let (job_sender, job_receiver) = std::sync::mpsc::channel::<FrontierJob>();
+            let (job_sender, job_receiver) = std::sync::mpsc::channel::<FrontierWork>();
             let (done_sender, done_receiver) = std::sync::mpsc::channel::<FrontierDone>();
             let job_receiver = std::sync::Arc::new(std::sync::Mutex::new(job_receiver));
             if threads > 1 {
                 for worker in 0..threads {
                     let job_receiver = std::sync::Arc::clone(&job_receiver);
                     let done_sender = done_sender.clone();
-                    let check = &check;
+                    let run = &run;
                     std::thread::Builder::new()
                         .name(format!("fln-frontier-{worker}"))
                         .stack_size(jobs.worker_stack_bytes)
@@ -4739,7 +5165,7 @@ impl Engine {
                                     Err(_) => return,
                                 };
                                 let Ok(job) = next else { return };
-                                if done_sender.send(check(job)).is_err() {
+                                if done_sender.send(run(job)).is_err() {
                                     return;
                                 }
                             }
@@ -4753,6 +5179,12 @@ impl Engine {
 
             let mut running = vec![false; count];
             let mut in_flight = 0_usize;
+            let mut overlapped = vec![false; count];
+            let mut retry_imports: Vec<Option<FrontierRetryImports>> = vec![None; count];
+            let mut memory_retries: Vec<Option<OleanFrontierMemoryRetry>> =
+                (0..count).map(|_| None).collect();
+            let mut retry_pending = BTreeSet::new();
+            let mut isolated_running = None;
             // A council result's row, reported the moment it exists.
             let settle =
                 |index: usize,
@@ -4772,7 +5204,9 @@ impl Engine {
                  decided: &mut Vec<bool>,
                  accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
                  engines: &mut FrontierEngines,
-                 pending_rows: &mut Vec<Option<OleanFrontierRow>>| {
+                 pending_rows: &mut Vec<Option<OleanFrontierRow>>,
+                 memory_retry: Option<OleanFrontierMemoryRetry>,
+                 decode_memory_retry: Option<OleanDecodeMemoryRetry>| {
                     running[done.index] = false;
                     decided[done.index] = true;
                     accepted[done.index] = done.accepted.map(std::sync::Arc::new);
@@ -4780,7 +5214,13 @@ impl Engine {
                     pending_rows[done.index] = Some(OleanFrontierRow {
                         name: modules[done.index].name.clone(),
                         verdict: done.verdict,
-                        elapsed: done.elapsed,
+                        elapsed: done.elapsed.saturating_add(
+                            memory_retry
+                                .as_ref()
+                                .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed),
+                        ),
+                        memory_retry,
+                        decode_memory_retry,
                     });
                 };
             loop {
@@ -4788,7 +5228,10 @@ impl Engine {
                 let mut ready = Vec::new();
                 for index in &order {
                     let index = *index;
-                    if decided[index] || running[index] {
+                    if decided[index]
+                        || running[index]
+                        || retry_pending.contains(&(position[index], index))
+                    {
                         continue;
                     }
                     let verdict = match &decoded[index] {
@@ -4820,12 +5263,17 @@ impl Engine {
                             detail: "frontier module was visited twice",
                         }),
                     };
+                    // A blocked module's decoded bodies are no longer needed.
+                    // Release them before any isolated retry has to allocate.
+                    decoded[index] = None;
                     decided[index] = true;
                     engines.release(index, &closures, false)?;
                     let row = pending_rows[index].insert(OleanFrontierRow {
                         name: modules[index].name.clone(),
                         verdict,
                         elapsed: std::time::Duration::ZERO,
+                        memory_retry: None,
+                        decode_memory_retry: decode_memory_retries[index].take(),
                     });
                     on_event(OleanFrontierEvent::Settled {
                         position: position[index] + 1,
@@ -4851,7 +5299,48 @@ impl Engine {
                 }
 
                 let mut dispatched = 0_usize;
-                for index in ready {
+                if isolated_running.is_none()
+                    && in_flight == 0
+                    && let Some((_, index)) = retry_pending.pop_first()
+                {
+                    let imports =
+                        retry_imports[index]
+                            .take()
+                            .ok_or(OleanCheckError::InternalInvariant {
+                                detail: "an isolated retry lost its accepted import closure",
+                            })?;
+                    let previous = memory_retries[index].as_ref().ok_or(
+                        OleanCheckError::InternalInvariant {
+                            detail: "an isolated retry has no first memory refusal",
+                        },
+                    )?;
+                    on_event(OleanFrontierEvent::Retrying {
+                        position: position[index] + 1,
+                        total: count,
+                        module: modules[index].name,
+                        previous,
+                    });
+                    running[index] = true;
+                    isolated_running = Some(index);
+                    in_flight = 1;
+                    job_sender
+                        .send(FrontierWork {
+                            index,
+                            position: position[index],
+                            artifact: None,
+                            imports,
+                        })
+                        .map_err(|_| OleanCheckError::InternalInvariant {
+                            detail: "every frontier worker thread has stopped",
+                        })?;
+                }
+                // A queued refusal drains the current workers before retrying.
+                // Once that retry starts, no new job may overlap it, including
+                // when it was the last entry in the pending retry queue.
+                for index in ready
+                    .into_iter()
+                    .filter(|_| retry_pending.is_empty() && isolated_running.is_none())
+                {
                     if in_flight >= threads {
                         break;
                     }
@@ -4872,6 +5361,14 @@ impl Engine {
                         total: count,
                         module: modules[index].name,
                     });
+                    if in_flight > 0 {
+                        overlapped[index] = true;
+                        for (other, active) in running.iter().enumerate() {
+                            if *active {
+                                overlapped[other] = true;
+                            }
+                        }
+                    }
                     running[index] = true;
                     in_flight += 1;
                     dispatched += 1;
@@ -4897,11 +5394,28 @@ impl Engine {
                             &mut accepted,
                             &mut engines,
                             &mut pending_rows,
+                            None,
+                            decode_memory_retries[index].take(),
                         );
                         settle(index, &pending_rows, on_event);
                         break;
                     }
-                    if job_sender.send(job).is_err() {
+                    retry_imports[index] = Some(FrontierRetryImports {
+                        base: job.base.clone(),
+                        closure: job.closure.clone(),
+                    });
+                    if job_sender
+                        .send(FrontierWork {
+                            index,
+                            position: position[index],
+                            artifact: Some(job.artifact),
+                            imports: FrontierRetryImports {
+                                base: job.base,
+                                closure: job.closure,
+                            },
+                        })
+                        .is_err()
+                    {
                         return Err(OleanCheckError::InternalInvariant {
                             detail: "every frontier worker thread has stopped",
                         });
@@ -4928,6 +5442,27 @@ impl Engine {
                         })?;
                 in_flight -= 1;
                 let index = done.index;
+                if done.host_memory_refusal && overlapped[index] && memory_retries[index].is_none()
+                {
+                    let OleanModuleVerdict::Inconclusive(first_refusal) = done.verdict else {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "a host-memory refusal was not a typed nonanswer",
+                        });
+                    };
+                    running[index] = false;
+                    memory_retries[index] = Some(OleanFrontierMemoryRetry {
+                        first_refusal,
+                        first_elapsed: done.elapsed,
+                    });
+                    retry_pending.insert((position[index], index));
+                    continue;
+                }
+                if isolated_running == Some(index) {
+                    isolated_running = None;
+                }
+                // Drop completed jobs' extra closure references before a queued
+                // retry is dispatched. Only imports the run still needs remain.
+                retry_imports[index] = None;
                 record(
                     done,
                     &mut running,
@@ -4935,6 +5470,8 @@ impl Engine {
                     &mut accepted,
                     &mut engines,
                     &mut pending_rows,
+                    memory_retries[index].take(),
+                    decode_memory_retries[index].take(),
                 );
                 settle(index, &pending_rows, on_event);
             }
@@ -5395,6 +5932,8 @@ impl Engine {
             imported_modules: std::sync::Arc::new(imported),
             imported_environment,
             imported_module_dependencies: std::sync::Arc::new(dependencies),
+            executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+            runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -5442,6 +5981,7 @@ impl Engine {
             FrontierDone {
                 index,
                 verdict,
+                host_memory_refusal: false,
                 accepted,
                 engine,
                 elapsed: started.elapsed(),
@@ -5449,8 +5989,11 @@ impl Engine {
             }
         };
         let failed = |error: OleanCheckError| {
+            let host_memory_refusal = olean_host_memory_refusal(&error);
             let retained = retain.then(|| FrontierRetained::Failed(error.clone()));
-            finish(frontier_error_verdict(error), None, retained)
+            let mut done = finish(frontier_error_verdict(error), None, retained);
+            done.host_memory_refusal = host_memory_refusal;
+            done
         };
         let engine = match self.frontier_closure_engine(&job) {
             Ok(engine) => engine,
@@ -5555,7 +6098,7 @@ impl Engine {
             .iter()
             .zip(decode_olean_module_inputs(modules, limits, reading, jobs)?)
         {
-            decoded.push(Some((module.name.clone(), artifact?)));
+            decoded.push(Some((module.name.clone(), artifact.result?)));
         }
 
         // The per-module companion guard (see `decode_olean_module_artifacts`)
@@ -5780,11 +6323,7 @@ impl Engine {
         // independent answer about any of them.
         let readings = match ArtifactReadings::new(&decoded.independent) {
             Ok(readings) => readings,
-            Err(reason) => {
-                return Ok(Outcome::Inconclusive(Inconclusive::dependency_unavailable(
-                    reason,
-                )));
-            }
+            Err(error) => return error.into_nonanswer(),
         };
         // A constant already present is reported checked because the primary
         // decode equals one admitted earlier, and no council reviews it.
@@ -6000,7 +6539,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
-        let admitted = match self.admit_declaration_unrooted(
+        let mut admitted = match self.admit_declaration_unrooted(
             declaration,
             options,
             limits,
@@ -6010,6 +6549,13 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        // No artifact metadata exists for a handed declaration, so its value is
+        // what the pin's compiler runs (`toDecl`, `value? (allowOpaque := true)`).
+        if let Declaration::Opaque(value) = &admitted.declaration {
+            let mut names = (*self.executable_opaques).clone();
+            names.insert(value.base.name.clone());
+            admitted.engine.executable_opaques = std::sync::Arc::new(names);
+        }
         // `self` is immutable, so its root is the same before or after the council.
         let base_logical_root = self.logical_root(options);
         let result_logical_root = admitted.engine.environment.logical_root(options);
@@ -6136,6 +6682,8 @@ impl Engine {
                 imported_module_dependencies: std::sync::Arc::clone(
                     &self.imported_module_dependencies,
                 ),
+                executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+                runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
                 epoch: self.epoch.clone(),
                 mode: self.mode,
                 reproducibility: self.reproducibility,
@@ -6232,6 +6780,7 @@ impl Engine {
             base_logical_root,
             result_logical_root,
             admissions,
+            local_instance: None,
         }))
     }
 
@@ -6245,12 +6794,15 @@ impl Engine {
         source: &[u8],
         options: &KVMap,
         limits: EngineAdmissionLimits,
-    ) -> Result<Outcome<DeclarationAdmission>, EngineExecutionError> {
+    ) -> Result<Outcome<SourceDeclarationAdmission>, EngineExecutionError> {
+        // Under an entered grammar (`source_check::grammar`) the file's notations expand first,
+        // as `source_records::parse_scoped_command` expands them.
         let parsed = fln_parse::parse_definition(source)
+            .and_then(fln_parse::ParsedDefinition::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
-        let declaration = match source_records::elaboration_outcome(
-            fln_elab::elaborate_definition_in_scope_with_budget(
+        let elaborated = match source_records::elaboration_outcome(
+            fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
@@ -6261,10 +6813,26 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let default_priorities = fln_elab::source::default_instance_registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let registration = fln_elab::source::instance_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let instance_namespace = fln_elab::source::instance_registration_is_scoped(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .then(|| self.base_source_scope().namespace);
+        let local = fln_elab::source::instance_registration_is_local(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let reducibility = fln_elab::source::scope::simp::reducibility(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let noncomputable = fln_elab::source::noncomputable_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         let protected = fln_elab::source::protected_registration(parsed.syntax())
@@ -6279,33 +6847,77 @@ impl Engine {
                     ),
                 ))
             })?;
-        let declared = match &declaration {
-            Declaration::Defn(definition) => Some(definition.base.name.clone()),
-            _ => None,
-        };
         let result = self
-            .admit_declaration(declaration, options, limits)
+            .admit_declaration(elaborated.declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut admitted) => {
-                if let Some((name, priority)) = registration {
-                    // An anonymous instance: the name its elaboration generated.
-                    let name = match (name.is_anonymous(), declared) {
-                        (true, Some(declared)) => declared,
-                        _ => name,
-                    };
-                    admitted.engine.environment = fln_elab::instances::register_instance(
+                source_records::apply_admission_effects(
+                    &mut admitted,
+                    elaborated.irreducible,
+                    options,
+                )?;
+                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax())
+                    && let Declaration::Thm(theorem) = &admitted.declaration
+                {
+                    admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
                         admitted.engine.environment(),
+                        &theorem.base.name,
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if let Some((name, priority)) = registration {
+                    // A proof instance is admitted as a theorem. Both it and
+                    // a data definition register the actual completed name,
+                    // including names generated for anonymous instances.
+                    let declared = match &admitted.declaration {
+                        Declaration::Defn(definition) => &definition.base.name,
+                        Declaration::Thm(theorem) => &theorem.base.name,
+                        _ => {
+                            return Err(EngineExecutionError::NotImplemented {
+                                feature: "an instance command must admit a definition or theorem",
+                            });
+                        }
+                    };
+                    let name = if name.is_anonymous() {
+                        declared.clone()
+                    } else {
+                        self.base_source_scope()
+                            .declaration_name(&name)
+                            .map_err(|error| {
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::NameScope(error),
+                                    ),
+                                ))
+                            })?
+                    };
+                    if &name != declared {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "instance metadata must name the completed checked declaration",
+                        });
+                    }
+                    admitted.engine = match admitted.engine.register_checked_source_instance(
                         &name,
                         priority,
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
-                            ),
-                        ))
-                    })?;
+                        instance_namespace.as_ref(),
+                        local,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if !default_priorities.is_empty() {
+                    admitted.engine = admitted.engine.register_checked_source_defaults(
+                        &admitted.declaration,
+                        &default_priorities,
+                    )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some((name, priority, reverse)) = simp {
@@ -6332,12 +6944,40 @@ impl Engine {
                     })?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
+                if let Some((name, status)) = reducibility {
+                    let name = fln_elab::source::scope::SourceScope::default()
+                        .declaration_name(&name)
+                        .map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::NameScope(error),
+                                ),
+                            ))
+                        })?;
+                    admitted.engine.environment =
+                        source_records::set_reducibility(&admitted.engine, &name, status)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if let Some(name) = noncomputable {
+                    admitted.engine.environment = source_records::tag_noncomputable(
+                        &admitted.engine,
+                        &admitted.declaration,
+                        &name,
+                        &self.base_source_scope(),
+                    )?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
                 if let Some(name) = protected {
                     admitted.engine.environment =
                         source_records::tag_protected(&admitted.engine, &name)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                Outcome::Complete(admitted)
+                return self.finish_local_function_admission(
+                    admitted,
+                    &elaborated.local_functions,
+                    options,
+                    limits,
+                );
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -6495,6 +7135,7 @@ impl Engine {
                     checked_type,
                     environment_root: admission.base_logical_root,
                     checker: admission.checker,
+                    scope: scope.clone(),
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -6523,7 +7164,27 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
-        let partitioned = fln_parse::partition_source_module(source)
+        self.execute_source_commands_with_presentation(
+            source,
+            options,
+            limits,
+            EvaluationPresentation::Raw,
+        )
+    }
+
+    /// Execute an import-free command stream with an explicitly selected
+    /// evaluation presentation. `Raw` retains the original checked result;
+    /// `Lean` requests actual Repr/ToString instances for supported pure values.
+    pub fn execute_source_commands_with_presentation(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        presentation: EvaluationPresentation,
+    ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
+        let partitioned = grammar
+            .enter(|| fln_parse::partition_source_module(source))
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         if !partitioned.imports.is_empty() {
@@ -6536,12 +7197,23 @@ impl Engine {
                 self.empty_source_command_execution(options),
             ));
         }
-        self.execute_source_command_stream(partitioned.commands, options, limits, true, &[])
+        self.execute_source_command_stream(
+            partitioned.commands,
+            options,
+            limits,
+            true,
+            &[],
+            None,
+            None,
+            None,
+            presentation,
+        )
     }
 
     fn empty_source_command_execution(&self, options: &KVMap) -> SourceCommandBatchExecution {
         let root = self.logical_root(options);
         SourceCommandBatchExecution {
+            scope: self.base_source_scope(),
             batch: DefinitionBatchExecution {
                 engine: self.clone(),
                 base_logical_root: root,
@@ -6557,9 +7229,12 @@ impl Engine {
             outputs: Vec::new(),
             checks: Vec::new(),
             guards: Vec::new(),
+            warnings: Vec::new(),
+            traces: Vec::new(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_source_command_stream(
         &self,
         commands: Vec<(fln_parse::BytePos, &[u8])>,
@@ -6567,6 +7242,10 @@ impl Engine {
         limits: EngineExecutionLimits,
         allow_checks: bool,
         file_starts: &[usize],
+        private_module: Option<&Name>,
+        source_module: Option<&Name>,
+        mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
+        presentation: EvaluationPresentation,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -6602,6 +7281,13 @@ impl Engine {
             }
         })?;
         let mut guards: Vec<SourceGuard> = Vec::new();
+        let mut trace_messages = Vec::new();
+        let mut trace_bytes = 0usize;
+        // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
+        // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
+        let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
+        // `#exit`'s warning (`elabExit`); the partition made it the last command.
+        let mut exit_warning: Option<SourceWarning> = None;
         let mut evaluation_indices = Vec::new();
         evaluation_indices
             .try_reserve_exact(command_count)
@@ -6628,7 +7314,16 @@ impl Engine {
         }
         let mut file_base = engine.environment.clone();
         let mut file_starts = file_starts.iter().copied().peekable();
-        let mut scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+        let mut scopes = source_check::scopes::Scopes::new(&engine);
+        scopes.current.private_module = private_module.cloned();
+        // The syntax a file declares extends the grammar of its commands after it
+        // (`source_check::grammar`). The stream was partitioned before any of it was declared.
+        let mut grammar = source_check::grammar::SourceGrammar::for_engine(
+            &engine,
+            source_module,
+            private_module.is_some(),
+        )?;
+        grammar.extend_scopes(&mut scopes);
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
             .enumerate()
@@ -6645,6 +7340,7 @@ impl Engine {
             let (command_index, original_offset, command_source) = match step {
                 Step::Command(index, offset, source) => (index, offset, source),
                 Step::Scope(index, transition) => {
+                    grammar.observe(&transition);
                     scopes
                         .check_limits(&transition)
                         .map_err(|(resource, limit)| {
@@ -6655,23 +7351,33 @@ impl Engine {
                             )
                         })?;
                     scopes
-                        .transition(transition, engine.environment())
+                        .transition_worlds(
+                            transition,
+                            engine.environment(),
+                            public.as_ref().map(|world| world.engine().environment()),
+                        )
                         .map_err(|error| {
                             scope_error(index, fln_parse::BytePos(0), error.message())
                         })?;
                     continue;
                 }
             };
-            // Flattened source sets retain declaration order, but a new file
-            // starts a fresh lexical scope and cannot change a predecessor's
-            // reducibility. Consume each boundary once: `open ... in` and
-            // `set_option ... in` revisit their command index during expansion.
+            // Consume each file boundary once, including when a temporary
+            // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
                 file_starts.next();
                 file_base = engine.environment.clone();
-                scopes = source_check::scopes::Scopes::new(engine.environment(), engine.mode());
+                scopes = source_check::scopes::Scopes::new(&engine);
+                scopes.current.private_module = private_module.cloned();
+                grammar = source_check::grammar::SourceGrammar::for_engine(
+                    &engine,
+                    source_module,
+                    private_module.is_some(),
+                )?;
+                grammar.extend_scopes(&mut scopes);
             }
-            let control = fln_parse::command_scope::parse(command_source)
+            let control = grammar
+                .enter(|| fln_parse::command_scope::parse(command_source))
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -6683,6 +7389,17 @@ impl Engine {
                 use fln_parse::command_scope::ScopeCommand;
                 match control {
                     ScopeCommand::Trivia => {}
+                    // The command ends at its `#exit` token, so the warning sits there.
+                    ScopeCommand::Exit => {
+                        exit_warning = Some(SourceWarning {
+                            command_index,
+                            at: fln_parse::BytePos(
+                                original_offset.0
+                                    + command_source.len().saturating_sub("#exit".len()),
+                            ),
+                            message: "using 'exit' to interrupt Lean".to_owned(),
+                        });
+                    }
                     ScopeCommand::OpenIn {
                         names,
                         scoped,
@@ -6696,6 +7413,25 @@ impl Engine {
                         for step in [
                             Step::Scope(command_index, ScopeCommand::Section(None)),
                             Step::Scope(command_index, open),
+                            Step::Command(
+                                command_index,
+                                fln_parse::BytePos(original_offset.0 + body),
+                                &command_source[body..],
+                            ),
+                            Step::Scope(command_index, ScopeCommand::End(None)),
+                        ]
+                        .into_iter()
+                        .rev()
+                        {
+                            queue.push_front(step);
+                        }
+                    }
+                    // The pin's `in` macro for any other head: `section <head> <command> end`,
+                    // the head run as the command it is.
+                    ScopeCommand::In { head, body } => {
+                        for step in [
+                            Step::Scope(command_index, ScopeCommand::Section(None)),
+                            Step::Command(command_index, original_offset, &command_source[..head]),
                             Step::Command(
                                 command_index,
                                 fln_parse::BytePos(original_offset.0 + body),
@@ -6729,8 +7465,8 @@ impl Engine {
                     }
                     // The guarded command runs as written, as the pin's `runAndCollectMessages`
                     // runs it; its messages are judged by the presentation, against `expected`.
-                    // A spec (`(drop …)`, `(whitespace := …)`, …) is not read, and a guard inside
-                    // a guard would judge one command twice: both are refused, never ignored.
+                    // Retain the parsed policy for the judge. A nested guard and unavailable
+                    // message sources remain explicit capability refusals.
                     ScopeCommand::GuardMsgs {
                         expected,
                         specified,
@@ -6741,8 +7477,60 @@ impl Engine {
                             error: Box::new(EngineExecutionError::NotImplemented { feature }),
                             at: Some(original_offset),
                         };
-                        if specified {
-                            return Err(not_implemented("`#guard_msgs` with a specification"));
+                        // `#guard_msgs` is syntax `Init/Notation.lean` declares
+                        // (`Lean.guardMsgsCmd`). A world built from `.olean`s that does not reach
+                        // it reads the command as an unknown token, as the pin does ("expected
+                        // token"); the seed stands for the implicit `Init`, which declares it.
+                        if !engine.imported_modules.is_empty()
+                            && !engine
+                                .environment()
+                                .contains(&Name::from_components(["Lean", "guardMsgsCmd"]))
+                        {
+                            let keyword = command_source
+                                .windows(b"#guard_msgs".len())
+                                .position(|window| window == b"#guard_msgs")
+                                .unwrap_or(0);
+                            return Err(EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::Frontend(
+                                    DefinitionFrontendError::Parse(
+                                        fln_parse::NatDefinitionParseError::OutsideSeedGrammar {
+                                            at: fln_parse::BytePos(original_offset.0 + keyword),
+                                            expected:
+                                                fln_parse::NatDefinitionExpectation::DefinitionKeyword,
+                                        },
+                                    ),
+                                )),
+                                at: Some(original_offset),
+                            });
+                        }
+                        let spec = if specified {
+                            grammar
+                                .enter(|| {
+                                    fln_parse::command_scope::guard_spec::parse(
+                                        command_source,
+                                        body,
+                                    )
+                                })
+                                .map_err(|error| EngineExecutionError::BatchCommand {
+                                    index: command_index,
+                                    error: Box::new(EngineExecutionError::Frontend(
+                                        DefinitionFrontendError::Parse(error),
+                                    )),
+                                    at: Some(original_offset),
+                                })?
+                        } else {
+                            fln_parse::command_scope::guard_spec::GuardSpec::default()
+                        };
+                        if spec.positions {
+                            return Err(not_implemented("`#guard_msgs` with message positions"));
+                        }
+                        // We cannot recover and reproduce failed command diagnostics yet.
+                        // Never implement `drop error` by ignoring a failed computation.
+                        if spec.action(fln_parse::command_scope::guard_spec::Severity::Error)
+                            == fln_parse::command_scope::guard_spec::Action::Drop
+                        {
+                            return Err(not_implemented("`#guard_msgs` dropping error messages"));
                         }
                         if guards
                             .last()
@@ -6752,11 +7540,14 @@ impl Engine {
                         }
                         // The pin passes such a guard by capturing the command's errors,
                         // warnings or traces, whose text this engine does not reproduce. Running
-                        // the command here would turn the pin's pass into a rejection.
+                        // the command here would turn the pin's pass into a rejection. The one
+                        // warning it does reproduce, "declaration uses `sorry`", is judged.
                         if expected.lines().any(|line| {
-                            ["error:", "warning:", "trace:"]
-                                .iter()
-                                .any(|severity| line.trim_start().starts_with(severity))
+                            let line = line.trim_start();
+                            line != "warning: declaration uses `sorry`"
+                                && ["error:", "warning:", "trace:"]
+                                    .iter()
+                                    .any(|severity| line.starts_with(severity))
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error, warning or trace message",
@@ -6765,6 +7556,7 @@ impl Engine {
                         guards.push(SourceGuard {
                             command_index,
                             expected,
+                            spec,
                         });
                         queue.push_front(Step::Command(
                             command_index,
@@ -6774,8 +7566,10 @@ impl Engine {
                     }
                     ScopeCommand::Namespace(_)
                     | ScopeCommand::Section(_)
+                    | ScopeCommand::SectionWithModifiers { .. }
                     | ScopeCommand::End(_)
                     | ScopeCommand::Open(_)
+                    | ScopeCommand::OpenExplicit { .. }
                     | ScopeCommand::OpenScoped(_)
                     | ScopeCommand::SetOption { .. }
                     | ScopeCommand::Universe(_)
@@ -6784,14 +7578,18 @@ impl Engine {
                     | ScopeCommand::Omit(_)
                     | ScopeCommand::Simp(_)
                     | ScopeCommand::Instance(_)
+                    | ScopeCommand::Export { .. }
                     | ScopeCommand::Reducibility(_) => {
-                        match source_check::apply_control_command(
+                        grammar.observe(&control);
+                        match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
                             &file_base,
                             control,
                             limits.kernel,
                             (0, command_index, original_offset.0),
+                            public.as_deref_mut(),
+                            options,
                         )
                         .map_err(|error| {
                             EngineExecutionError::BatchCommand {
@@ -6812,9 +7610,81 @@ impl Engine {
                 }
                 continue;
             }
-            let scope = scopes.current.clone();
+            // A command that declares syntax extends the grammar and runs nothing.
+            if grammar
+                .declare(
+                    command_source,
+                    source_check::grammar::resolver(engine.environment(), &scopes.current),
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?
+            {
+                grammar.extend_scopes(&mut scopes);
+                continue;
+            }
+            let scope = if public.is_some() {
+                grammar
+                    .enter(|| scopes.command_scope(command_source))
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(original_offset),
+                    })?
+            } else {
+                scopes.current.clone()
+            };
+            let warn_sorry = scope
+                .options
+                .get_bool(&Name::from_components(["warn", "sorry"]), true);
+            warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
             let scoped = scope != fln_elab::source::scope::SourceScope::default();
-            if fln_parse::command_scope::mutual::parse(command_source)
+            if scope.exports_declaration()
+                && let Some(public) = public.as_deref_mut()
+            {
+                // Public interfaces are fixed in the export world; a theorem
+                // alone checks its hidden proof privately before publication.
+                // Queries continue to observe the complete private world.
+                let (next, admission) = match grammar
+                    .enter(|| {
+                        public.admit_command(
+                            &engine,
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                            &scopes.current,
+                        )
+                    })
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(result) => result,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                engine = next;
+                scopes
+                    .admitted_batch(
+                        &admission,
+                        engine.environment(),
+                        Some(public.engine().environment()),
+                    )
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
+                source_admissions.push(SourceCommandAdmission {
+                    command_index,
+                    admission,
+                });
+                continue;
+            }
+            if grammar
+                .enter(|| fln_parse::command_scope::mutual::parse(command_source))
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -6827,13 +7697,15 @@ impl Engine {
                 // Keep the whole mutual block on the existing two-checker
                 // admission path. Never publish members sequentially or treat
                 // declarations as VM executions merely to advance the stream.
-                let admission = match engine
-                    .admit_source_command_in_scope(
-                        command_source,
-                        options,
-                        limits.admission(),
-                        &scope,
-                    )
+                let admission = match grammar
+                    .enter(|| {
+                        engine.admit_source_command_in_scope(
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                        )
+                    })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
@@ -6843,9 +7715,11 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
-                }
+                scopes
+                    .admitted_batch(&admission, admission.engine.environment(), None)
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -6853,7 +7727,11 @@ impl Engine {
                 });
                 continue;
             }
-            let parsed = fln_parse::parse_source_command(command_source)
+            let parsed = grammar
+                .enter(|| {
+                    fln_parse::parse_source_command(command_source)
+                        .and_then(fln_parse::ParsedSourceCommand::expanded)
+                })
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -6863,22 +7741,45 @@ impl Engine {
                 })?;
             // An inline `@[simp]` is registered (or, on an example, refused) only by the
             // admission path `check_source_files` uses; the paths below would drop it.
-            let has_inline_simp = matches!(
-                parsed.kind(),
-                SourceCommandKind::Definition | SourceCommandKind::Example
-            ) && fln_elab::source::scope::simp::registration(parsed.syntax())
-                .map_err(DefinitionFrontendError::Elaborate)
-                .map_err(EngineExecutionError::Frontend)
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(error),
-                    at: Some(original_offset),
-                })?
-                .is_some();
+            let has_inline_simp =
+                matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Definition | SourceCommandKind::Example
+                ) && (fln_elab::source::scope::simp::registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some()
+                    || fln_elab::source::scope::simp::reducibility(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_some());
+            let has_inline_default =
+                matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Definition | SourceCommandKind::Example
+                ) && !fln_elab::source::default_instance_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_empty();
             if matches!(
                 parsed.kind(),
                 SourceCommandKind::Check | SourceCommandKind::Example
-            ) && !has_inline_simp
+            ) && !(has_inline_simp || has_inline_default)
             {
                 let is_example = parsed.kind() == SourceCommandKind::Example;
                 if !allow_checks && !is_example {
@@ -6888,13 +7789,27 @@ impl Engine {
                         at: Some(original_offset),
                     });
                 }
-                let checked = match engine.check_parsed_source_command_in_scope(
-                    parsed,
-                    options,
-                    limits.admission(),
-                    command_index,
-                    &scope,
-                ) {
+                let observed =
+                    if is_example && fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                        engine.check_observed_source_example(
+                            parsed,
+                            options,
+                            limits.admission(),
+                            command_index,
+                            &scope,
+                        )
+                    } else {
+                        engine
+                            .check_parsed_source_command_in_scope(
+                                parsed,
+                                options,
+                                limits.admission(),
+                                command_index,
+                                &scope,
+                            )
+                            .map(|outcome| outcome.map_complete(|check| (check, Vec::new())))
+                    };
+                let (checked, traces) = match observed {
                     Ok(Outcome::Complete(checked)) => checked,
                     Ok(Outcome::Inconclusive(reason)) => {
                         return Ok(Outcome::Inconclusive(reason));
@@ -6910,6 +7825,15 @@ impl Engine {
                         });
                     }
                 };
+                source_records::traces::append(
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    traces,
+                    &checked.parsed,
+                    engine.environment(),
+                    command_index,
+                    original_offset,
+                )?;
                 let check_index = checks.len();
                 checks.push(checked);
                 outputs.push(if is_example {
@@ -6936,18 +7860,55 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_some();
+            // A noncomputable declaration is checked, never compiled (the pin's `noncomputableExt`).
+            let is_noncomputable = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                && fln_elab::source::noncomputable_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some();
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
+                || fln_elab::source::partial::is_partial(parsed.syntax())
                 || is_instance
                 || has_inline_simp
+                || has_inline_default
+                || is_noncomputable
+                || (scope.noncomputable_section
+                    && parsed.kind() == fln_parse::SourceCommandKind::Definition)
             {
-                let admission = match engine
-                    .admit_source_command_in_scope(
-                        command_source,
-                        options,
-                        limits.admission(),
-                        &scope,
-                    )
+                let (admission, traces) = match grammar
+                    .enter(|| {
+                        if fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                            engine
+                                .admit_observed_source_definition(
+                                    &parsed,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                )
+                                .map(|outcome| {
+                                    outcome.map_complete(|observed| {
+                                        (observed.admission, observed.traces)
+                                    })
+                                })
+                        } else {
+                            engine
+                                .admit_source_command_in_scope(
+                                    command_source,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                )
+                                .map(|outcome| {
+                                    outcome.map_complete(|admission| (admission, Vec::new()))
+                                })
+                        }
+                    })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
@@ -6957,9 +7918,20 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
-                }
+                source_records::traces::append(
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    traces,
+                    &parsed,
+                    engine.environment(),
+                    command_index,
+                    original_offset,
+                )?;
+                scopes
+                    .admitted_batch(&admission, admission.engine.environment(), None)
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -6969,70 +7941,230 @@ impl Engine {
             }
 
             let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
-            let declaration = source_records::elaboration_outcome(match parsed.kind() {
-                fln_parse::SourceCommandKind::Evaluation => {
-                    let name = fresh_generated_command_name(engine.environment(), command_index)
-                        .map_err(|error| EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        })?;
-                    if scoped {
-                        fln_elab::elaborate_evaluation_in_scope_with_budget(
+            // `#guard` is syntax `Init/Guard.lean` declares (`Lean.Parser.Command.guardCmd`). A
+            // world built from `.olean`s that does not reach it reads the command as an unknown
+            // token, as the pin does ("expected token"); the seed stands for the implicit `Init`,
+            // which declares it. The same rule as `#guard_msgs`'s, above.
+            let guard_command = Name::from_components(["Lean", "Parser", "Command", "guardCmd"]);
+            if is_evaluation
+                && parsed.syntax().kind() == Some(&guard_command)
+                && !engine.imported_modules.is_empty()
+                && !engine.environment().contains(&guard_command)
+            {
+                let keyword = command_source
+                    .windows(b"#guard".len())
+                    .position(|window| window == b"#guard")
+                    .unwrap_or(0);
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Parse(
+                            fln_parse::NatDefinitionParseError::OutsideSeedGrammar {
+                                at: fln_parse::BytePos(original_offset.0 + keyword),
+                                expected: fln_parse::NatDefinitionExpectation::DefinitionKeyword,
+                            },
+                        ),
+                    )),
+                    at: Some(original_offset),
+                });
+            }
+            let mut traces = Vec::new();
+            let declaration = if is_evaluation {
+                let name = fresh_generated_command_name(engine.environment(), command_index)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
+                source_evaluation::elaborate(
+                    &engine,
+                    parsed.syntax(),
+                    name,
+                    &scope,
+                    options,
+                    limits,
+                    presentation,
+                )
+                .map(|outcome| {
+                    outcome.map_complete(|(declaration, presentation)| {
+                        (
+                            fln_elab::source::ElaboratedDeclaration {
+                                declaration,
+                                local_functions: Vec::new(),
+                                irreducible: false,
+                                noncomputable: false,
+                            },
+                            presentation,
+                        )
+                    })
+                })
+            } else if fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                source_records::elaboration_outcome(fln_elab::source::trace::elaborate_definition(
+                    parsed.syntax(),
+                    engine.environment(),
+                    limits.kernel,
+                    &scope,
+                ))
+                .map(|outcome| {
+                    outcome.map_complete(|observed| {
+                        traces = observed.traces;
+                        (observed.candidate, None)
+                    })
+                })
+            } else {
+                source_records::elaboration_outcome(match parsed.kind() {
+                    fln_parse::SourceCommandKind::Definition if scoped => {
+                        fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                             parsed.syntax(),
-                            name,
                             engine.environment(),
                             limits.kernel,
                             &scope,
                         )
-                    } else {
-                        fln_elab::elaborate_evaluation_in_with_budget(
+                    }
+                    fln_parse::SourceCommandKind::Definition => {
+                        fln_elab::elaborate_definition_with_effects_in_with_budget(
                             parsed.syntax(),
-                            name,
                             engine.environment(),
                             limits.kernel,
                         )
                     }
-                }
-                fln_parse::SourceCommandKind::Definition if scoped => {
-                    fln_elab::elaborate_definition_in_scope_with_budget(
-                        parsed.syntax(),
-                        engine.environment(),
-                        limits.kernel,
-                        &scope,
-                    )
-                }
-                fln_parse::SourceCommandKind::Definition => {
-                    fln_elab::elaborate_definition_in_with_budget(
-                        parsed.syntax(),
-                        engine.environment(),
-                        limits.kernel,
-                    )
-                }
-                fln_parse::SourceCommandKind::Check | fln_parse::SourceCommandKind::Example => {
-                    return Err(EngineExecutionError::UnexpectedPublication {
-                        detail: "source check escaped its scratch-only command branch",
-                    });
-                }
-            })
+                    fln_parse::SourceCommandKind::Check
+                    | fln_parse::SourceCommandKind::Example
+                    | fln_parse::SourceCommandKind::Evaluation => {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "source check escaped its scratch-only command branch",
+                        });
+                    }
+                })
+                .map(|outcome| outcome.map_complete(|declaration| (declaration, None)))
+            }
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: command_index,
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
-            let declaration = match declaration {
+            let (elaborated, evaluation_presentation) = match declaration {
                 Outcome::Complete(declaration) => declaration,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
+            source_records::traces::append(
+                &mut trace_messages,
+                &mut trace_bytes,
+                traces,
+                &parsed,
+                engine.environment(),
+                command_index,
+                original_offset,
+            )?;
+            let fln_elab::source::ElaboratedDeclaration {
+                declaration,
+                local_functions,
+                irreducible,
+                noncomputable,
+            } = elaborated;
+            if noncomputable {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "a noncomputable section declaration escaped its admission-only route",
+                });
+            }
+            // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
+            // a later command's atomic name does not reach it through its namespace, an `open` or
+            // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).
+            let protected = if !is_evaluation
+                && fln_elab::source::protected_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some()
+            {
+                match &declaration {
+                    Declaration::Defn(value) => Some(value.base.name.clone()),
+                    Declaration::Thm(value) => Some(value.base.name.clone()),
+                    Declaration::Opaque(value) => Some(value.base.name.clone()),
+                    Declaration::Axiom(value) => Some(value.base.name.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if matches!(
+                evaluation_presentation,
+                Some(
+                    EvaluationResultPresentation::IoFormat { .. }
+                        | EvaluationResultPresentation::IoUnit
+                )
+            ) && guards
+                .last()
+                .is_some_and(|guard| guard.command_index == command_index)
+            {
+                // IO effects are not isolated into guard messages. Refuse
+                // before executing the action, never after its stdout or
+                // filesystem effects have already escaped the guard.
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`#guard_msgs` over an IO action",
+                    }),
+                    at: Some(original_offset),
+                });
+            }
             // Parametric definitions are checked templates, not standalone VM
             // entry points. Compile concrete uses on demand; never use a failed
             // compilation as a reason to silently admit an executable command.
             let is_template = !is_evaluation
                 && matches!(&declaration,
                 Declaration::Defn(definition) if runtime::is_template(definition));
-            if matches!(declaration, Declaration::Thm(_)) || is_template {
-                let admission = match engine
+            // A named proof definition has no runtime result. Classify its
+            // closed header before compilation, then retain its original
+            // definition and the ordinary dual-admission evidence below.
+            let is_proof_definition = match &declaration {
+                Declaration::Defn(definition) if !is_evaluation && !is_template => {
+                    match source_records::declaration_is_proposition(
+                        engine.environment(),
+                        &definition.base,
+                        limits.kernel,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                        Outcome::Complete(proof) => proof,
+                        Outcome::Inconclusive(reason) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Outcome::InternalFault(fault) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                    }
+                }
+                _ => false,
+            };
+            // A definition that uses `sorry` is admitted with its warning and never run: the pin
+            // compiles it and fails only when it is evaluated.
+            let uses_sorry = !is_evaluation
+                && source_execution::uses_sorry(&declaration).map_err(|error| {
+                    EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    }
+                })?;
+            // A theorem, an opaque constant and an axiom have no body to execute here; they
+            // are admitted, as a template or a proof definition is.
+            if matches!(
+                declaration,
+                Declaration::Thm(_) | Declaration::Opaque(_) | Declaration::Axiom(_)
+            ) || is_template
+                || is_proof_definition
+                || uses_sorry
+            {
+                let mut admission = match engine
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -7043,9 +8175,39 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                for row in &admission.admissions {
-                    scopes.admitted(&row.declaration);
+                source_records::apply_batch_effects(&mut admission, irreducible, options).map_err(
+                    |error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    },
+                )?;
+                if let Some(name) = &protected {
+                    admission.engine.environment =
+                        source_records::tag_protected(&admission.engine, name).map_err(
+                            |error| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            },
+                        )?;
+                    admission.result_logical_root = admission.engine.logical_root(options);
                 }
+                let admission = match engine.finish_local_function_batch(
+                    admission,
+                    &local_functions,
+                    options,
+                    limits.admission(),
+                )? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                scopes
+                    .admitted_batch(&admission, admission.engine.environment(), None)
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
                 engine = admission.engine.clone();
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
@@ -7067,8 +8229,9 @@ impl Engine {
                 }
                 merged
             });
-            let execution = match engine.execute_definition_entry(
+            let mut execution = match engine.execute_definition_entry_with_helpers(
                 declaration,
+                &local_functions,
                 scoped_options.as_ref().unwrap_or(options),
                 limits,
                 entry,
@@ -7086,11 +8249,53 @@ impl Engine {
                     });
                 }
             };
+            source_records::apply_execution_effects(
+                &mut execution,
+                irreducible,
+                scoped_options.as_ref().unwrap_or(options),
+            )
+            .map_err(|error| EngineExecutionError::BatchCommand {
+                index: command_index,
+                error: Box::new(error),
+                at: Some(original_offset),
+            })?;
+            if let Some(name) = &protected {
+                execution.engine.environment =
+                    source_records::tag_protected(&execution.engine, name).map_err(|error| {
+                        EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        }
+                    })?;
+                execution.result_logical_root = execution
+                    .engine
+                    .logical_root(scoped_options.as_ref().unwrap_or(options));
+            }
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
+            execution.evaluation_presentation = evaluation_presentation;
+            if !is_evaluation {
+                for helper in &execution.local_functions {
+                    scopes.admitted(&helper.declaration);
+                }
+            }
             let execution_index = executions.len();
-            engine = execution.engine.clone();
+            // Printer candidates retain their checked successor in the
+            // execution evidence, but never become source declarations.
+            // Raw evaluation and silent Unit actions keep their established
+            // transitions; mapped IO printers remain private as well.
+            if !matches!(
+                evaluation_presentation,
+                Some(
+                    EvaluationResultPresentation::Format { .. }
+                        | EvaluationResultPresentation::IoFormat { .. }
+                        | EvaluationResultPresentation::Guard
+                )
+            ) {
+                engine = execution.engine.clone();
+            }
             executions.push(execution);
             execution_command_indices.push(command_index);
             if is_evaluation {
@@ -7110,8 +8315,59 @@ impl Engine {
                 requested: execution_command_indices.len(),
             })?;
         execution_indices.extend_from_slice(&execution_command_indices);
+        if source_module.is_some() {
+            engine.environment = grammar.record(engine.environment())?;
+        }
         let result_logical_root = engine.logical_root(options);
+        if let Some(public) = public {
+            public.retain_scope(scopes.public_scope());
+        }
+        // The pin's `warnIfUsesSorry` runs on every declaration a command adds, an `example`'s
+        // included; a definition with `sorry` is admitted above, never executed.
+        let mut sorry_commands = BTreeSet::new();
+        let declarations = source_admissions
+            .iter()
+            .flat_map(|row| {
+                row.admission
+                    .admissions
+                    .iter()
+                    .map(move |admitted| (row.command_index, &admitted.declaration))
+            })
+            .chain(outputs.iter().filter_map(|output| {
+                match output {
+                    SourceCommandOutput::Example {
+                        command_index,
+                        check_index,
+                    } => checks
+                        .get(*check_index)
+                        .map(|check| (*command_index, &check.declaration)),
+                    _ => None,
+                }
+            }));
+        for (command, declaration) in declarations {
+            if !sorry_commands.contains(&command) && source_execution::uses_sorry(declaration)? {
+                sorry_commands.insert(command);
+            }
+        }
+        let mut warnings: Vec<SourceWarning> = sorry_commands
+            .into_iter()
+            .filter_map(|command| {
+                let &(offset, source, warn) = warning_sites.get(&command)?;
+                warn.then(|| SourceWarning {
+                    command_index: command,
+                    at: fln_parse::BytePos(
+                        offset.0
+                            + fln_parse::command_scope::declaration_warning_offset(source)
+                                .unwrap_or(0),
+                    ),
+                    message: "declaration uses `sorry`".to_owned(),
+                })
+            })
+            .collect();
+        // The last command, so the order by command stays.
+        warnings.extend(exit_warning);
         Ok(Outcome::Complete(SourceCommandBatchExecution {
+            scope: scopes.current,
             batch: DefinitionBatchExecution {
                 engine,
                 base_logical_root,
@@ -7127,6 +8383,8 @@ impl Engine {
             outputs,
             checks,
             guards,
+            warnings,
+            traces: trace_messages,
         }))
     }
 
@@ -7143,7 +8401,9 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<TerminalSourceCheck>, EngineExecutionError> {
-        let mut commands = fln_parse::partition_definition_commands(source)
+        let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
+        let mut commands = grammar
+            .enter(|| fln_parse::partition_definition_commands(source))
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         let terminal_index =
@@ -7159,7 +8419,8 @@ impl Engine {
                 .ok_or(EngineExecutionError::UnexpectedPublication {
                     detail: "source command partition lost its terminal command",
                 })?;
-        let terminal = fln_parse::parse_source_command(terminal_source)
+        let terminal = grammar
+            .enter(|| fln_parse::parse_source_command(terminal_source))
             .map_err(|error| error.with_original_offset(terminal_offset))
             .map_err(DefinitionFrontendError::Parse)
             .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7171,7 +8432,8 @@ impl Engine {
             return Err(EngineExecutionError::TerminalCheckRequired);
         }
         for (index, (original_offset, command_source)) in commands.iter().enumerate() {
-            let parsed = fln_parse::parse_source_command(command_source)
+            let parsed = grammar
+                .enter(|| fln_parse::parse_source_command(command_source))
                 .map_err(|error| error.with_original_offset(*original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7199,8 +8461,14 @@ impl Engine {
         let query_engine = definition_prefix
             .as_ref()
             .map_or(self, |completed| &completed.engine);
-        let checked = query_engine
-            .check_source_command(terminal_source, options, limits.admission())
+        let checked = grammar
+            .enter(|| {
+                let terminal = terminal
+                    .expanded()
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(EngineExecutionError::Frontend)?;
+                query_engine.check_parsed_source_command(terminal, options, limits.admission(), 0)
+            })
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: terminal_index,
                 error: Box::new(error),
@@ -7488,6 +8756,10 @@ impl Engine {
                 limits,
                 true,
                 &[],
+                None,
+                None,
+                None,
+                EvaluationPresentation::Raw,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -7521,6 +8793,10 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .is_some()
+            || fln_elab::source::scope::simp::reducibility(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_some()
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(
@@ -7534,17 +8810,21 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .is_some()
+            || !fln_elab::source::default_instance_registration(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_empty()
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(
                     fln_elab::NatDefinitionElabError::UnexpectedSyntax {
-                        expected: "an executable definition; use check-source for instance declarations",
+                        expected: "an executable definition; use check-source for instance attributes",
                     },
                 ),
             ));
         }
-        let declaration = match source_records::elaboration_outcome(
-            fln_elab::elaborate_definition_in_scope_with_budget(
+        let elaborated = match source_records::elaboration_outcome(
+            fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
@@ -7555,7 +8835,26 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        self.execute_definition(declaration, options, limits)
+        Ok(
+            match self.execute_definition_entry_with_helpers(
+                elaborated.declaration,
+                &elaborated.local_functions,
+                options,
+                limits,
+                source_evaluation::Entry::Value,
+            )? {
+                Outcome::Complete(mut execution) => {
+                    source_records::apply_execution_effects(
+                        &mut execution,
+                        elaborated.irreducible,
+                        options,
+                    )?;
+                    Outcome::Complete(execution)
+                }
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     /// Execute the bounded Nat definitions in a nonempty sequence of source
@@ -7627,16 +8926,17 @@ impl Engine {
                 requested: sources.len(),
             }
         })?;
+        let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
         for source in sources {
-            let partitioned = fln_parse::partition_source_module(source).map_err(|error| {
-                EngineExecutionError::BatchCommand {
+            let partitioned = grammar
+                .enter(|| fln_parse::partition_source_module(source))
+                .map_err(|error| EngineExecutionError::BatchCommand {
                     index: commands.len(),
                     error: Box::new(EngineExecutionError::Frontend(
                         DefinitionFrontendError::Parse(error),
                     )),
                     at: None,
-                }
-            })?;
+                })?;
             if !partitioned.imports.is_empty() {
                 return Err(EngineExecutionError::ImportsRequireResolver {
                     imports: partitioned.imports,
@@ -7918,6 +9218,10 @@ impl Engine {
                 limits,
                 policy.allow_scratch_checks(),
                 &file_starts,
+                None,
+                None,
+                None,
+                EvaluationPresentation::Raw,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -8007,6 +9311,11 @@ impl Engine {
                     at: None,
                 });
             }
+            if !mixed.traces.is_empty() {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "raw tactic traces in a source module build without a message channel",
+                });
+            }
             let SourceCommandBatchExecution {
                 mut batch,
                 command_count,
@@ -8036,6 +9345,10 @@ impl Engine {
                 limits,
                 false,
                 file_starts,
+                None,
+                None,
+                None,
+                EvaluationPresentation::Raw,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.
@@ -8049,7 +9362,12 @@ impl Engine {
                             at: None,
                         });
                     }
-                    None => Outcome::Complete(completed.batch),
+                    None if completed.traces.is_empty() => Outcome::Complete(completed.batch),
+                    None => {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "raw tactic traces without a command output channel",
+                        });
+                    }
                 },
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -8168,6 +9486,17 @@ impl Engine {
         limits: EngineExecutionLimits,
         entry: source_evaluation::Entry,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        self.execute_definition_entry_with_helpers(declaration, &[], options, limits, entry)
+    }
+
+    fn execute_definition_entry_with_helpers(
+        &self,
+        declaration: Declaration,
+        helpers: &[Declaration],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        entry: source_evaluation::Entry,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
         let (expression, declared_type) = match &declaration {
             Declaration::Defn(definition) => {
                 (definition.value.clone(), definition.base.type_.clone())
@@ -8206,7 +9535,32 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress);
+        // Check every generated helper BEFORE running any body. A bad helper
+        // cannot turn a rejected source command into observable IO effects.
+        let admission = match self.finish_local_function_admission(
+            admission,
+            helpers,
+            options,
+            limits.admission(),
+        )? {
+            Outcome::Complete(admission) => admission,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // An unsafe recursive definition is its own executable body. Its
+        // recursive constant exists only in the checked successor, unlike a
+        // safe source definition's already-admitted executable companion.
+        // Never use an unchecked header to make the compiler accept the call.
+        let executable_environment = if matches!(&admission.declaration,
+            Declaration::Defn(definition) if definition.safety == DefinitionSafety::Unsafe)
+        {
+            admission.engine.environment()
+        } else {
+            self.environment()
+        };
+        let mut preparation = runtime::Preparation::new(executable_environment, limits.ingress)
+            .with_executable_opaques(&self.executable_opaques)
+            .with_runtime_initializers(&self.runtime_initializers);
         let evaluated = match entry {
             source_evaluation::Entry::Value => None,
             source_evaluation::Entry::Evaluation => preparation
@@ -8225,7 +9579,7 @@ impl Engine {
             .expression_at_type(&expression, Some(declared_type.clone()))
             .map_err(EngineExecutionError::Ingress)?;
         let mut catalog = executable_dependencies(
-            &self.environment,
+            executable_environment,
             &expression,
             limits.ingress,
             &mut preparation,
@@ -8240,7 +9594,7 @@ impl Engine {
             .refine_expression_captures(&expression)
             .map_err(EngineExecutionError::Ingress)?;
         let interfaces = preparation
-            .finalize_callables(&mut catalog.functions)
+            .finalize_callables(&mut catalog.functions, &mut catalog.intrinsics)
             .map_err(EngineExecutionError::Ingress)?;
         let ingress = fln_comp::ingress::lower_closed_expr_at_result(
             &expression,
@@ -8253,8 +9607,15 @@ impl Engine {
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
-        let lowered =
-            fln_comp::fir::lower_to_flbc(ingress.fir()).map_err(EngineExecutionError::Lowering)?;
+        // Run the program with matchers absorbed and known closures called
+        // directly, as the pin's compiler builds it. If the simplified program
+        // is refused by either validator, lower the one ingress produced, so
+        // the simplification can change how fast a program runs, never whether.
+        let lowered = fln_comp::fir::optimize(ingress.fir(), limits.ingress.fir)
+            .ok()
+            .and_then(|optimized| fln_comp::fir::lower_to_flbc(&optimized).ok())
+            .map_or_else(|| fln_comp::fir::lower_to_flbc(ingress.fir()), Ok)
+            .map_err(EngineExecutionError::Lowering)?;
         let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
             .map_err(EngineExecutionError::Codec)?;
         let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
@@ -8274,11 +9635,13 @@ impl Engine {
             declaration: admission.declaration,
             runtime_type,
             io_result_types,
+            evaluation_presentation: None,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
             exit,
             checker: admission.checker,
+            local_functions: admission.admissions.into_iter().skip(1).collect(),
         }))
     }
 }
@@ -9496,6 +10859,13 @@ fn executable_dependencies(
     let mut resolved = BTreeSet::new();
     let mut visited_nodes = 0usize;
     collect_executable_constants(source, &mut pending, &mut visited_nodes, limits)?;
+    // A noncomputable declaration has no runtime binding, so code that depends on it is refused
+    // as a constant outside the runtime catalogs (the pin: "failed to compile definition ...
+    // because it depends on 'a', which is 'noncomputable'").
+    let noncomputable =
+        fln_elab::noncomputable::read(environment).map_err(|_| IngressError::UnsupportedNode {
+            kind: "malformed noncomputable journal",
+        })?;
 
     let maximum_functions = limits.fir.max_functions.saturating_sub(1);
     let mut scalar_constructors = Vec::new();
@@ -9522,7 +10892,7 @@ fn executable_dependencies(
         let Some(name) = pending.pop_first() else {
             break;
         };
-        if !resolved.insert(name.clone()) {
+        if !resolved.insert(name.clone()) || noncomputable.contains(&name) {
             continue;
         }
         if let Some(binding) = source_scalar_constructor_binding(environment, &name) {
@@ -9536,22 +10906,32 @@ fn executable_dependencies(
             continue;
         }
         let intrinsic = match preparation
-            .st_intrinsic_binding(&name)
+            .nat_primitive_intrinsic_binding(&name)
+            .or_else(|| preparation.st_intrinsic_binding(&name))
             .or_else(|| preparation.io_intrinsic_binding(&name))
             .or_else(|| preparation.fs_intrinsic_binding(&name))
+            .or_else(|| preparation.float_intrinsic_binding(&name))
             .or_else(|| preparation.stdout_intrinsic_binding(&name))
             .or_else(|| preparation.string_push_intrinsic_binding(&name))
+            .or_else(|| preparation.text_equality_intrinsic_binding(&name))
+            .or_else(|| preparation.string_bootstrap_intrinsic_binding(&name))
+            .or_else(|| preparation.string_bytes_intrinsic_binding(&name))
         {
             Some(binding) => Some(binding),
-            None => executable_intrinsic_binding_cached(
-                environment,
-                &name,
-                &mut visited_nodes,
-                limits,
-                &mut preparation.externs,
-            )?,
+            None => {
+                preparation.catalog_native_intrinsic_binding(&name, &mut visited_nodes, limits)?
+            }
         };
         if let Some(binding) = intrinsic {
+            if preparation.nat_primitive_intrinsic_alias(&binding, &intrinsics, &mut functions)?
+                || preparation.string_bytes_intrinsic_alias(
+                    &binding,
+                    &intrinsics,
+                    &mut functions,
+                )?
+            {
+                continue;
+            }
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {
@@ -9561,12 +10941,17 @@ fn executable_dependencies(
             intrinsics.push(binding);
             continue;
         }
-        let definition = preparation.executable_definition(&name)?;
-        let Some(definition) = definition else {
-            continue;
-        };
-        let Some(mut signature) = preparation.signature(&definition, true)? else {
-            continue;
+        let mut signature = match preparation.partial_stage_signature(&name)? {
+            Some(signature) => signature,
+            None => {
+                let Some(definition) = preparation.executable_definition(&name)? else {
+                    continue;
+                };
+                let Some(signature) = preparation.signature(&definition, true)? else {
+                    continue;
+                };
+                signature
+            }
         };
         signature.body = preparation.expression(&signature.body)?;
         let observed = functions.len().saturating_add(1);
@@ -9666,6 +11051,12 @@ fn executable_intrinsic_binding_cached(
     } else if let Some(binding) = source_intrinsic_binding(environment, name) {
         Some(binding)
     } else if source_intrinsics::imported_string_internal_matches(
+        environment,
+        name,
+        externs,
+        visited_nodes,
+        limits,
+    )? || source_intrinsics::imported_string_append_matches(
         environment,
         name,
         externs,
@@ -10441,6 +11832,10 @@ pub struct DeclarationBatchAdmission {
     pub result_logical_root: LogicalRoot,
     /// Every completed admission in input order, including root transitions.
     pub admissions: Vec<DeclarationAdmission>,
+    /// A checked source instance to select only in the caller's current lexical
+    /// scope. Its declaration and reducibility are in `engine`, but its local
+    /// registration is never part of a persistent environment or module export.
+    pub local_instance: Option<(Name, u32)>,
 }
 
 /// The authoritative outputs of one completed bounded engine run.
@@ -10458,6 +11853,9 @@ pub struct DefinitionExecution {
     /// Present only when the source command explicitly requested IO evaluation.
     /// The public projection validates the retained logical ST/EST result.
     io_result_types: Option<source_evaluation::IoResultTypes>,
+    /// Set only by the opt-in source command adapter after executing a checked
+    /// printer or a checked silent Unit action. Raw APIs never set this marker.
+    evaluation_presentation: Option<EvaluationResultPresentation>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.
@@ -10468,6 +11866,10 @@ pub struct DefinitionExecution {
     pub exit: VmExit,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+    /// Separate checked helper transitions, after the primary declaration.
+    /// Empty for raw declaration execution; source APIs retain these receipts
+    /// and the final engine only when the entire helper batch succeeds.
+    pub local_functions: Vec<DeclarationAdmission>,
 }
 
 /// One bounded `#check` query or anonymous example validated by both checker seats.
@@ -10488,6 +11890,9 @@ pub struct SourceCheck {
     pub environment_root: LogicalRoot,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+    /// The scope in force at the command (namespace, `open`s): its output names constants
+    /// the way they resolve there, as the pin's delaborator does.
+    pub scope: fln_elab::source::scope::SourceScope,
 }
 
 /// One completed definition-only source prefix followed by a terminal check.
@@ -10535,12 +11940,53 @@ pub enum SourceCommandOutput {
 #[derive(Debug)]
 pub struct SourceCommandBatchExecution {
     pub batch: DefinitionBatchExecution,
+    /// Final source scope, including the module identity needed to present its
+    /// private declarations by their source names. This grants no authority.
+    pub scope: fln_elab::source::scope::SourceScope,
     pub command_count: usize,
     pub execution_command_indices: Vec<usize>,
     pub outputs: Vec<SourceCommandOutput>,
     pub checks: Vec<SourceCheck>,
     /// Commands run under `#guard_msgs`, in command order, at most one per command.
     pub guards: Vec<SourceGuard>,
+    /// Warnings the pin would log, in command order, at most one per command.
+    pub warnings: Vec<SourceWarning>,
+    /// Raw tactic messages, captured in execution order (including backtracked branches).
+    pub traces: Vec<SourceTraceMessage>,
+}
+
+pub use source_records::traces::SourceTraceMessage;
+
+/// A warning a source command produced. The only one today is the pin's "declaration uses
+/// `sorry`" (`warnIfUsesSorry`, `Lean/AddDecl.lean`): a command whose admitted declarations
+/// mention `sorryAx`, while `warn.sorry` is true. `at` is the file offset the pin positions it
+/// at (`fln_parse::command_scope::declaration_warning_offset`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceWarning {
+    pub command_index: usize,
+    pub at: fln_parse::BytePos,
+    pub message: String,
+}
+
+/// Whether a constant's type or value mentions `sorryAx`, the pin's `hasSorry`
+/// (`Lean/Util/Sorry.lean`). A reference walk that cannot finish answers `true`, so a report
+/// built on it never hides a `sorry` it could not rule out.
+pub fn constant_uses_sorry(info: &ConstantInfo) -> bool {
+    let sorry = Name::from_components(["sorryAx"]);
+    let value = match info {
+        ConstantInfo::Defn(value) => Some(&value.value),
+        ConstantInfo::Thm(value) => Some(&value.value),
+        ConstantInfo::Opaque(value) => Some(&value.value),
+        _ => None,
+    };
+    let mut spent = 0;
+    std::iter::once(&info.constant_val().type_)
+        .chain(value)
+        .any(|expr| {
+            let mut references = BTreeSet::new();
+            collect_constant_references(expr, &mut references, &mut spent, usize::MAX)
+                .map_or(true, |()| references.contains(&sorry))
+        })
 }
 
 /// `#guard_msgs` around one source command (bead `fln-guard-msgs-lls1`). The command ran as
@@ -10550,6 +11996,8 @@ pub struct SourceCommandBatchExecution {
 pub struct SourceGuard {
     pub command_index: usize,
     pub expected: String,
+    /// Parsed comparison/filter policy, retained for the presentation that judges messages.
+    pub spec: fln_parse::command_scope::guard_spec::GuardSpec,
 }
 
 /// A closed dependency graph followed by its selected entry command stream.
@@ -10590,7 +12038,11 @@ pub struct DefinitionBatchExecution {
     pub base_logical_root: LogicalRoot,
     /// The final environment identity under the same options.
     pub result_logical_root: LogicalRoot,
-    /// Every completed definition in input order, including its root transition.
+    /// Completed definitions and evaluations in input order, each retaining
+    /// its checked root transition. Pure and mapped IO printer evaluations
+    /// keep private scratch successors as execution evidence; those successors
+    /// are absent from `engine` and do not form part of the published command-
+    /// stream chain. Silent Unit actions retain their ordinary IO transition.
     pub executions: Vec<DefinitionExecution>,
     /// Canonical dependency order for a closed source-module execution.
     /// Empty for declaration batches and legacy caller-ordered source batches.
@@ -10831,6 +12283,126 @@ pub fn build_source_run_flbc_sidecar(
         .map_err(SourceRunSidecarBuildError::Closure)
 }
 
+/// Bind an explicit import program's final entry execution to every source
+/// module and admitted artifact part that produced it. Module executions keep
+/// their own roots: sibling import worlds are never flattened into a fictitious
+/// batch. Imported metadata and private declarations are bound by the original
+/// artifact bytes as well as the checked logical roots. This is the same
+/// standard product binding as [`build_source_run_flbc_sidecar`], not a
+/// certificate of source reproducibility or permission to execute the Reference.
+/// The caller must supply the complete artifact inventory used for admission;
+/// the public execution report cannot reconstruct omitted import bytes. The
+/// CLI supplies its resolver's entire retained closure, including companions.
+pub fn build_source_program_flbc_sidecar(
+    sources: &[SourceModuleInput<'_>],
+    imports: &[OleanModuleInput<'_>],
+    options: &KVMap,
+    toolchain_image: &[u8],
+    completed: &source_check::modules::execution::SourceProgramExecution,
+) -> Result<FlbcProductSidecarV1, SourceRunSidecarBuildError> {
+    let entry = completed
+        .modules
+        .last()
+        .ok_or(SourceRunSidecarBuildError::EmptyExecutionBatch)?;
+    let final_execution = entry
+        .commands
+        .batch
+        .executions
+        .last()
+        .ok_or(SourceRunSidecarBuildError::EmptyExecutionBatch)?;
+    let mismatch = |reason| SourceRunSidecarBuildError::SourceProgramInputs { reason };
+    let mut by_name = BTreeMap::new();
+    for source in sources {
+        if by_name.insert(source.name, source.source).is_some() {
+            return Err(mismatch("duplicate source module"));
+        }
+    }
+    if by_name.len() != completed.modules.len() {
+        return Err(mismatch(
+            "source modules do not cover the completed program",
+        ));
+    }
+    let mut ordered_sources = Vec::new();
+    for module in &completed.modules {
+        let source = by_name
+            .remove(&module.module)
+            .ok_or_else(|| mismatch("completed module has no unique source input"))?;
+        if module.commands.batch.engine.mode() != entry.commands.batch.engine.mode() {
+            return Err(mismatch("module modes disagree"));
+        }
+        ordered_sources.push((module, source));
+    }
+    let mut ordered_imports = BTreeMap::new();
+    for import in imports {
+        if ordered_imports.insert(import.name, import).is_some() {
+            return Err(mismatch("duplicate imported artifact module"));
+        }
+    }
+    let source_bytes = material_bytes("fln.source-program.sources/1", |writer| {
+        writer.u64(ordered_sources.len() as u64);
+        for (module, source) in &ordered_sources {
+            writer.bytes(&module.module.to_canonical_bytes());
+            writer.bytes(source);
+        }
+    });
+    let semantic_bytes = material_bytes("fln.source-program.semantic-inputs/1", |writer| {
+        writer.u64(ordered_sources.len() as u64);
+        for (module, _) in &ordered_sources {
+            writer.bytes(&module.module.to_canonical_bytes());
+            writer.bytes(&semantic_input_material(&module.commands.batch));
+            writer.u64(module.commands.checks.len() as u64);
+            for check in &module.commands.checks {
+                writer.bytes(&check.environment_root.0.0);
+            }
+        }
+        writer.u64(ordered_imports.len() as u64);
+        for (name, import) in &ordered_imports {
+            writer.bytes(&name.to_canonical_bytes());
+            for part in [
+                Some(import.artifact),
+                import.server_artifact,
+                import.private_artifact,
+            ] {
+                writer.u8(u8::from(part.is_some()));
+                if let Some(bytes) = part {
+                    writer.u64(bytes.len() as u64);
+                    // Hash in place: a large Init closure must not be copied
+                    // merely to build its bounded standard-profile sidecar.
+                    writer.bytes(
+                        &fln_hash::domain::hash(
+                            fln_hash::domain::Domain::ArtifactClosureComponent,
+                            bytes,
+                        )
+                        .0,
+                    );
+                }
+            }
+        }
+    });
+    let coordinates = current_source_run_coordinates(entry.commands.batch.engine.mode())?;
+    let mut material = source_run_material(&[], options, toolchain_image, &entry.commands.batch);
+    for (component, bytes) in &mut material {
+        match component {
+            ClosureComponent::Sources => {
+                *bytes = std::borrow::Cow::Borrowed(source_bytes.as_slice());
+            }
+            ClosureComponent::SemanticInputs => {
+                *bytes = std::borrow::Cow::Borrowed(semantic_bytes.as_slice());
+            }
+            _ => {}
+        }
+    }
+    let entries: Vec<_> = material
+        .iter()
+        .map(|(component, bytes)| ClosureMaterialV1 {
+            component: *component,
+            bytes: bytes.as_ref(),
+        })
+        .collect();
+    FlbcProductSidecarV1::build_standard(coordinates, &entries, &final_execution.flbc_artifact)
+        .map_err(SourceRunSidecarBuildError::Closure)
+}
+
 /// Validate a sidecar against exact FLBC bytes and every current source-run component
 /// the consumer can independently rederive. Source bytes and elaborated logical roots
 /// are intentionally not reconstructed from executable output; v1 is a standard
@@ -10848,6 +12420,7 @@ pub fn verify_source_run_flbc_sidecar(
             SourceRunSidecarVerificationError::UnsupportedTarget { target }
         }
         SourceRunSidecarBuildError::EmptyExecutionBatch
+        | SourceRunSidecarBuildError::SourceProgramInputs { .. }
         | SourceRunSidecarBuildError::Closure(_) => {
             unreachable!("coordinate derivation cannot inspect an execution closure")
         }
@@ -11350,6 +12923,14 @@ pub(crate) fn assert_engines_identical(left: &Engine, right: &Engine, what: &str
     assert_eq!(
         left.imported_module_dependencies, right.imported_module_dependencies,
         "{what}: import edges"
+    );
+    assert_eq!(
+        left.executable_opaques, right.executable_opaques,
+        "{what}: executable opaques"
+    );
+    assert_eq!(
+        left.runtime_initializers, right.runtime_initializers,
+        "{what}: runtime initializers"
     );
     assert_eq!(left.epoch, right.epoch, "{what}: epoch");
     assert_eq!(left.mode, right.mode, "{what}: mode");
@@ -13772,6 +15353,883 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum MemoryRetryControl {
+        Accept,
+        ReadingIndexRefusal,
+        RefuseAgain,
+        InvalidProof,
+    }
+
+    /// The real frontier scheduler, decoder, K1 and independent checker over a
+    /// diamond import graph. Only the first worker-boundary memory refusals are
+    /// planted. B and C overlap; E is ready behind them, and D needs both.
+    fn run_frontier_memory_retry(control: MemoryRetryControl, threads: usize) {
+        use super::{OleanFrontierEvent, OleanModuleVerdict};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Barrier, Mutex};
+
+        let module = |name: &str, constants: &[ConstantInfo], imports: &[&str]| {
+            (
+                fixture_name(name),
+                olean_with_imports(constants, &fixture_imports(imports)),
+            )
+        };
+        let set = vec![
+            module(
+                "Fixture.A",
+                &[
+                    fixture_axiom("Fixture.P", Expr::sort(Level::zero())),
+                    fixture_axiom("Fixture.p", fixture_constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            module(
+                "Fixture.B",
+                &[fixture_theorem(
+                    "Fixture.h",
+                    if matches!(control, MemoryRetryControl::InvalidProof) {
+                        Expr::sort(Level::zero())
+                    } else {
+                        fixture_constant("Fixture.p")
+                    },
+                )],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.C",
+                &[fixture_theorem("Fixture.q", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.D",
+                &[fixture_theorem(
+                    "Fixture.child",
+                    fixture_constant("Fixture.h"),
+                )],
+                &["Fixture.B", "Fixture.C"],
+            ),
+            module(
+                "Fixture.E",
+                &[fixture_axiom(
+                    "Fixture.other",
+                    fixture_constant("Fixture.P"),
+                )],
+                &["Fixture.A"],
+            ),
+        ];
+        let inputs = fixture_inputs(&set);
+        let limits = OleanCheckLimits::new(set.iter().map(|(_, b)| b.len()).sum(), test_budget());
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let active = AtomicUsize::new(0);
+        let rendezvous = Barrier::new(2);
+        let attempts = Mutex::new(BTreeMap::<Name, usize>::new());
+        let artifacts = Mutex::new(BTreeMap::<Name, super::DecodedOlean>::new());
+        let mut retrying = None;
+        let mut retries = Vec::new();
+        let mut settled = BTreeSet::new();
+        let mut decided = Vec::new();
+
+        struct Active<'a>(&'a AtomicUsize);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let frontier = engine
+            .check_olean_frontier_using(
+                &inputs,
+                limits,
+                fixture_jobs(threads),
+                &mut |event| match event {
+                    OleanFrontierEvent::Started { .. } => {
+                        assert!(
+                            retrying.is_none(),
+                            "a fresh job overlapped an isolated retry"
+                        );
+                    }
+                    OleanFrontierEvent::Retrying {
+                        module, previous, ..
+                    } => {
+                        assert_eq!(active.load(Ordering::SeqCst), 0, "workers must drain first");
+                        assert!(retrying.replace(module.clone()).is_none());
+                        assert!(matches!(
+                            previous.first_refusal.cause,
+                            fln_core::outcome::InconclusiveCause::DependencyUnavailable { .. }
+                        ));
+                        retries.push(module.clone());
+                    }
+                    OleanFrontierEvent::Settled { row, .. } => {
+                        assert!(
+                            settled.insert(row.name.clone()),
+                            "one settled row per module"
+                        );
+                        if retrying.as_ref() == Some(&row.name) {
+                            retrying = None;
+                        }
+                    }
+                    OleanFrontierEvent::Decided { row, .. } => decided.push(row.name.clone()),
+                },
+                &|job| {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = Active(&active);
+                    let attempt = {
+                        let mut attempts = attempts.lock().expect("attempt log lock");
+                        let at = attempts.entry(job.name.clone()).or_default();
+                        *at += 1;
+                        *at
+                    };
+                    {
+                        let mut artifacts = artifacts.lock().expect("artifact log lock");
+                        if let Some(first) = artifacts.get(&job.name) {
+                            assert_eq!(
+                                first, &job.artifact,
+                                "retry decodes the same full artifact"
+                            );
+                        } else {
+                            artifacts.insert(job.name.clone(), job.artifact.clone());
+                        }
+                    }
+                    let memory_root = matches!(
+                        job.name.to_display_string().as_str(),
+                        "Fixture.B" | "Fixture.C"
+                    );
+                    if memory_root && attempt == 1 && threads > 1 {
+                        rendezvous.wait();
+                    }
+                    if memory_root && attempt == 1
+                        || (job.name == fixture_name("Fixture.B")
+                            && matches!(control, MemoryRetryControl::RefuseAgain))
+                    {
+                        let index = job.index;
+                        if matches!(control, MemoryRetryControl::ReadingIndexRefusal) {
+                            let started = std::time::Instant::now();
+                            let error = super::ArtifactReadings::new_with_reserve(
+                                &job.artifact.independent,
+                                // Produce a real TryReserveError without asking
+                                // the host to consume an enormous allocation.
+                                |readings, _| readings.try_reserve(usize::MAX),
+                            )
+                            .err()
+                            .expect("the reading index reservation is refused");
+                            let error = error
+                                .into_nonanswer::<()>()
+                                .expect_err("a reading-index allocation stays a typed check error");
+                            assert!(matches!(&error, OleanCheckError::AllocationFailure {
+                                resource: ".olean independent checker readings",
+                                requested,
+                            } if *requested == job.artifact.constants.len()));
+                            let host_memory_refusal = super::olean_host_memory_refusal(&error);
+                            assert!(host_memory_refusal);
+                            drop(job);
+                            return super::FrontierDone {
+                                index,
+                                host_memory_refusal,
+                                verdict: super::frontier_error_verdict(error),
+                                accepted: None,
+                                engine: None,
+                                elapsed: started.elapsed(),
+                                retained: None,
+                            };
+                        }
+                        drop(job);
+                        return super::frontier_guarded(
+                            index,
+                            false,
+                            std::time::Instant::now(),
+                            || {
+                                std::panic::panic_any(super::HostAllocationFailure {
+                                    requested: 4096,
+                                })
+                            },
+                        );
+                    }
+                    if attempt == 2 {
+                        assert_eq!(active.load(Ordering::SeqCst), 1, "retry must run alone");
+                    }
+                    engine.frontier_check_module(job, &options, limits)
+                },
+                &|index| {
+                    super::decode_olean_module_input_with(
+                        &inputs[index],
+                        limits,
+                        super::CheckerReading::Read,
+                    )
+                },
+            )
+            .expect("a memory refusal is a module result, not a scheduler failure");
+        assert_eq!(
+            frontier.rows.len(),
+            set.len(),
+            "retries are not extra modules"
+        );
+        assert_eq!(settled.len(), set.len());
+        assert_eq!(
+            decided,
+            set.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+        );
+        assert!(retrying.is_none());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let row = |name: &str| {
+            frontier
+                .rows
+                .iter()
+                .find(|row| row.name == fixture_name(name))
+                .expect("fixture row")
+        };
+        let attempts = attempts.into_inner().expect("attempt counts");
+        for name in ["Fixture.B", "Fixture.C"] {
+            assert_eq!(
+                attempts[&fixture_name(name)],
+                if threads == 1 { 1 } else { 2 }
+            );
+            assert_eq!(row(name).memory_retry.is_some(), threads > 1);
+            if let Some(retry) = &row(name).memory_retry {
+                assert!(row(name).elapsed >= retry.first_elapsed);
+            }
+        }
+        if threads == 1 {
+            assert!(retries.is_empty(), "a refusal while alone is final");
+            assert!(matches!(
+                row("Fixture.B").verdict,
+                OleanModuleVerdict::Inconclusive(_)
+            ));
+            assert!(matches!(
+                row("Fixture.D").verdict,
+                OleanModuleVerdict::Blocked { .. }
+            ));
+            return;
+        }
+        assert_eq!(
+            retries,
+            [fixture_name("Fixture.B"), fixture_name("Fixture.C")]
+        );
+        assert!(matches!(
+            row("Fixture.C").verdict,
+            OleanModuleVerdict::Accepted { .. }
+        ));
+        assert!(row("Fixture.E").memory_retry.is_none());
+        match control {
+            MemoryRetryControl::Accept | MemoryRetryControl::ReadingIndexRefusal => {
+                assert!(
+                    frontier
+                        .rows
+                        .iter()
+                        .all(|row| matches!(row.verdict, OleanModuleVerdict::Accepted { .. }))
+                );
+                let baseline = engine
+                    .check_olean_frontier(&inputs, &options, limits)
+                    .expect("unplanted control");
+                assert_eq!(
+                    frontier
+                        .engine
+                        .as_ref()
+                        .expect("accepted closure")
+                        .logical_root(&options),
+                    baseline
+                        .engine
+                        .as_ref()
+                        .expect("control closure")
+                        .logical_root(&options),
+                    "retry publishes exactly the fully checked control environment",
+                );
+                assert!(baseline.rows.iter().all(|row| row.memory_retry.is_none()));
+            }
+            MemoryRetryControl::RefuseAgain => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Inconclusive(_)
+                ));
+                assert!(matches!(
+                    row("Fixture.D").verdict,
+                    OleanModuleVerdict::Blocked { .. }
+                ));
+            }
+            MemoryRetryControl::InvalidProof => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Failed(_)
+                ));
+                assert!(matches!(
+                    row("Fixture.D").verdict,
+                    OleanModuleVerdict::Blocked { .. }
+                ));
+            }
+        }
+        let accepted = frontier
+            .engine
+            .as_ref()
+            .expect("accepted modules still merge");
+        assert_eq!(
+            accepted.environment().contains(&fixture_name("Fixture.h")),
+            matches!(
+                control,
+                MemoryRetryControl::Accept | MemoryRetryControl::ReadingIndexRefusal
+            )
+        );
+        assert_eq!(
+            accepted
+                .environment()
+                .contains(&fixture_name("Fixture.child")),
+            matches!(
+                control,
+                MemoryRetryControl::Accept | MemoryRetryControl::ReadingIndexRefusal
+            )
+        );
+    }
+
+    #[test]
+    fn frontier_memory_retry_drains_workers_rechecks_and_unblocks_importers() {
+        run_frontier_memory_retry(MemoryRetryControl::Accept, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_recovers_a_checker_reading_index_allocation() {
+        run_frontier_memory_retry(MemoryRetryControl::ReadingIndexRefusal, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_stops_after_one_isolated_refusal() {
+        run_frontier_memory_retry(MemoryRetryControl::RefuseAgain, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_cannot_admit_a_refused_proof_or_its_importers() {
+        run_frontier_memory_retry(MemoryRetryControl::InvalidProof, 2);
+    }
+
+    #[test]
+    fn frontier_memory_retry_does_not_repeat_a_refusal_that_was_already_alone() {
+        run_frontier_memory_retry(MemoryRetryControl::Accept, 1);
+    }
+
+    #[test]
+    fn frontier_memory_retry_uses_typed_refusals_not_diagnostic_text() {
+        let memory_errors = [
+            OleanCheckError::HostMemory { requested: 4096 },
+            OleanCheckError::AllocationFailure {
+                resource: "test",
+                requested: 3,
+            },
+            OleanCheckError::Admission(EngineAdmissionError::BatchDeclaration {
+                index: 1,
+                error: Box::new(EngineAdmissionError::AllocationFailure {
+                    resource: "test declaration",
+                    requested: 4,
+                }),
+            }),
+            OleanCheckError::Decode(OleanDecodeError::Declaration(
+                OleanDeclarationError::AllocationRefused { requested: 7 },
+            )),
+            OleanCheckError::ModuleDecode {
+                module: fixture_name("Fixture.Decode"),
+                error: OleanDecodeError::Declaration(OleanDeclarationError::AllocationRefused {
+                    requested: 7,
+                }),
+            },
+        ];
+        for error in memory_errors {
+            assert!(super::olean_host_memory_refusal(&error), "{error:?}");
+        }
+        let other_errors = [
+            OleanCheckError::DeclarationLimit {
+                observed: 2,
+                limit: 1,
+            },
+            OleanCheckError::Admission(EngineAdmissionError::CouncilNoAnswer {
+                summary: "host memory: this text is not an allocation error".to_owned(),
+            }),
+            OleanCheckError::Admission(EngineAdmissionError::KernelRejected {
+                class: RejectClass::LooseBVar,
+                message: "host memory".to_owned(),
+            }),
+            OleanCheckError::InternalInvariant {
+                detail: "host memory",
+            },
+            OleanCheckError::Decode(OleanDecodeError::Declaration(
+                OleanDeclarationError::Budget {
+                    visited: 6,
+                    budget: 5,
+                },
+            )),
+        ];
+        for error in other_errors {
+            assert!(!super::olean_host_memory_refusal(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn checker_reading_index_unavailability_does_not_become_a_memory_refusal() {
+        use super::{ArtifactReadings, ArtifactReadingsError, Inconclusive, IndependentReading};
+
+        for description in [
+            "host memory: diagnostic text only",
+            "object budget exhausted after 5",
+        ] {
+            let reading = IndependentReading::Unread(description.to_owned());
+            let error = ArtifactReadings::new_with_reserve(&reading, |_, _| {
+                panic!("an unread artifact must not reserve a reading index")
+            })
+            .err()
+            .expect("the checker has no reading");
+            assert!(matches!(error, ArtifactReadingsError::Unavailable(_)));
+            assert_eq!(
+                error.to_string(),
+                format!("fln-checker could not read the .olean itself: {description}")
+            );
+            assert_eq!(
+                error
+                    .into_nonanswer::<()>()
+                    .expect("unread input is not an allocation error"),
+                Outcome::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                    "fln-checker could not read the .olean itself: {description}"
+                ))),
+            );
+        }
+
+        let bytes = standalone_olean(&binder_declarations(BinderInfo::Default));
+        let decoded = decode_olean_artifact(&bytes, OleanDecodeLimits::new(bytes.len()))
+            .expect("real artifact decodes");
+        let IndependentReading::Read(mut entries) = decoded.independent else {
+            panic!("the independent reader also reads the fixture");
+        };
+        let first = entries.first().expect("a nonempty reading").clone();
+        let expected = format!(
+            "fln-checker read `{}` twice in one .olean",
+            super::checker_name_text(&first.0)
+        );
+        let control = ArtifactReadings::new(&IndependentReading::Read(entries.clone()))
+            .unwrap_or_else(|error| panic!("a valid reading is indexed: {error}"));
+        assert_eq!(control.0.len(), entries.len());
+        entries.push(first);
+        let error = ArtifactReadings::new(&IndependentReading::Read(entries))
+            .err()
+            .expect("a repeated reader name is unavailable");
+        assert!(matches!(error, ArtifactReadingsError::Unavailable(_)));
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(
+            error
+                .into_nonanswer::<()>()
+                .expect("a duplicate reading is not an allocation error"),
+            Outcome::Inconclusive(Inconclusive::dependency_unavailable(expected)),
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum DecodeRetryControl {
+        Accept,
+        RefuseAgain,
+        InvalidProof,
+        MalformedArtifact,
+        FirstBudget,
+        FirstPanic,
+        RetryPanic,
+    }
+
+    /// Real bytes, both readers, import planning and the full council. Only
+    /// worker-boundary failures are planted; no decoded value is substituted.
+    fn run_initial_decode_memory_retry(control: DecodeRetryControl) {
+        use super::{OleanFrontierEvent, OleanModuleVerdict};
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let module = |name: &str, constants: &[ConstantInfo], imports: &[&str]| {
+            (
+                fixture_name(name),
+                olean_with_imports(constants, &fixture_imports(imports)),
+            )
+        };
+        let mut set = [
+            module(
+                "Fixture.A",
+                &[
+                    fixture_axiom("Fixture.P", Expr::sort(Level::zero())),
+                    fixture_axiom("Fixture.p", fixture_constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            module(
+                "Fixture.B",
+                &[fixture_theorem(
+                    "Fixture.h",
+                    if matches!(control, DecodeRetryControl::InvalidProof) {
+                        Expr::sort(Level::zero())
+                    } else {
+                        fixture_constant("Fixture.p")
+                    },
+                )],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.C",
+                &[fixture_theorem("Fixture.q", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.D",
+                &[fixture_theorem(
+                    "Fixture.child",
+                    fixture_constant("Fixture.h"),
+                )],
+                &["Fixture.B", "Fixture.C"],
+            ),
+        ];
+        if matches!(control, DecodeRetryControl::MalformedArtifact) {
+            set[1].1[0] ^= u8::MAX;
+        }
+        // Input order disagrees with import order; B and A are the two initial
+        // workers, and D/C have not started when both refuse memory.
+        let inputs: Vec<_> = [1, 0, 3, 2]
+            .into_iter()
+            .map(|index| OleanModuleInput {
+                name: &set[index].0,
+                artifact: &set[index].1,
+                server_artifact: None,
+                private_artifact: None,
+            })
+            .collect();
+        let limits = OleanCheckLimits::new(
+            set.iter().map(|(_, bytes)| bytes.len()).sum(),
+            test_budget(),
+        );
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let active = AtomicUsize::new(0);
+        let rendezvous = Barrier::new(2);
+        let attempts = Mutex::new(vec![0_usize; inputs.len()]);
+        let calls = Mutex::new(Vec::new());
+        let transient = Mutex::new(Vec::new());
+        let mut settled = BTreeSet::new();
+        let mut checked = BTreeSet::new();
+        let mut decided = Vec::new();
+        struct Active<'a>(&'a AtomicUsize);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let frontier = engine
+            .check_olean_frontier_using(
+                &inputs,
+                limits,
+                fixture_jobs(2),
+                &mut |event| match event {
+                    OleanFrontierEvent::Started { module, .. } => {
+                        checked.insert(module.clone());
+                    }
+                    OleanFrontierEvent::Settled { row, .. } => {
+                        assert!(settled.insert(row.name.clone()));
+                    }
+                    OleanFrontierEvent::Decided { row, .. } => decided.push(row.name.clone()),
+                    OleanFrontierEvent::Retrying { .. } => {
+                        panic!("these council checks do not refuse memory")
+                    }
+                },
+                &|job| engine.frontier_check_module(job, &options, limits),
+                &|index| {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = Active(&active);
+                    let attempt = {
+                        let mut attempts = attempts.lock().expect("attempt counts");
+                        attempts[index] += 1;
+                        attempts[index]
+                    };
+                    calls.lock().expect("decode calls").push((index, attempt));
+                    if index < 2 && attempt == 1 {
+                        let allocation = Arc::new(());
+                        transient
+                            .lock()
+                            .expect("transient decode state")
+                            .push(Arc::downgrade(&allocation));
+                        // Allocate a real decoded artifact before the planted
+                        // failure. Its owned terms must be dropped before retry.
+                        let _decoded = super::decode_olean_module_input_with(
+                            &inputs[index],
+                            limits,
+                            super::CheckerReading::Read,
+                        );
+                        rendezvous.wait();
+                        if index == 0 {
+                            match control {
+                                DecodeRetryControl::FirstBudget => {
+                                    return Err(OleanCheckError::ModuleDecode {
+                                        module: inputs[index].name.clone(),
+                                        error: OleanDecodeError::Declaration(
+                                            OleanDeclarationError::Budget {
+                                                visited: 6,
+                                                budget: 5,
+                                            },
+                                        ),
+                                    });
+                                }
+                                DecodeRetryControl::FirstPanic => {
+                                    panic!("decoder invariant fixture")
+                                }
+                                _ => std::panic::panic_any(super::HostAllocationFailure {
+                                    requested: 4096,
+                                }),
+                            }
+                        }
+                        return Err(OleanCheckError::ModuleDecode {
+                            module: inputs[index].name.clone(),
+                            error: OleanDecodeError::Declaration(
+                                OleanDeclarationError::AllocationRefused { requested: 8192 },
+                            ),
+                        });
+                    }
+                    let isolated = std::thread::current()
+                        .name()
+                        .is_some_and(|name| name == "fln-olean-decode-isolated");
+                    if attempt > 1 || isolated {
+                        assert!(isolated, "a retry runs on the isolated decoder");
+                        assert_eq!(
+                            active.load(Ordering::SeqCst),
+                            1,
+                            "retries and unstarted decodes run alone"
+                        );
+                        assert!(
+                            transient
+                                .lock()
+                                .expect("transient decode state")
+                                .iter()
+                                .all(|allocation| allocation.upgrade().is_none()),
+                            "first-attempt state must be released before retry"
+                        );
+                    } else {
+                        // A non-memory first error does not close dispatch. A fresh
+                        // job may be claimed before the sibling reports its OOM.
+                        assert!(matches!(
+                            control,
+                            DecodeRetryControl::FirstBudget | DecodeRetryControl::FirstPanic
+                        ));
+                    }
+                    if index == 0 {
+                        match control {
+                            DecodeRetryControl::RefuseAgain => {
+                                return Err(OleanCheckError::HostMemory { requested: 4096 });
+                            }
+                            DecodeRetryControl::RetryPanic => {
+                                panic!("isolated decoder invariant fixture")
+                            }
+                            _ => {}
+                        }
+                    }
+                    super::decode_olean_module_input_with(
+                        &inputs[index],
+                        limits,
+                        super::CheckerReading::Read,
+                    )
+                },
+            )
+            .expect("decode refusal is a module result, not a dispatcher failure");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(frontier.rows.len(), set.len());
+        assert_eq!(settled.len(), set.len());
+        let mut unique = decided.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), set.len());
+        let row = |name: &str| {
+            frontier
+                .rows
+                .iter()
+                .find(|row| row.name == fixture_name(name))
+                .expect("fixture row")
+        };
+        let repeated_b = !matches!(
+            control,
+            DecodeRetryControl::FirstBudget | DecodeRetryControl::FirstPanic
+        );
+        assert_eq!(
+            *attempts.lock().expect("attempt counts"),
+            [if repeated_b { 2 } else { 1 }, 2, 1, 1]
+        );
+        let calls = calls.into_inner().expect("decode calls");
+        if repeated_b {
+            assert_eq!(
+                &calls[2..],
+                [(0, 2), (1, 2), (2, 1), (3, 1)],
+                "drain, retry in input order, then finish unstarted modules serially"
+            );
+        } else {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(_, attempt)| *attempt == 2)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [(1, 2)]
+            );
+        }
+        assert!(frontier.rows.iter().all(|row| row.memory_retry.is_none()));
+        assert!(
+            row("Fixture.A")
+                .decode_memory_retry
+                .as_ref()
+                .is_some_and(|retry| retry.retry_result.is_ok())
+        );
+        assert_eq!(row("Fixture.B").decode_memory_retry.is_some(), repeated_b);
+        for name in ["Fixture.C", "Fixture.D"] {
+            assert!(row(name).decode_memory_retry.is_none());
+        }
+        let result = frontier
+            .engine
+            .as_ref()
+            .expect("accepted fixture declarations merge");
+        if matches!(control, DecodeRetryControl::Accept) {
+            assert!(
+                frontier
+                    .rows
+                    .iter()
+                    .all(|row| matches!(row.verdict, OleanModuleVerdict::Accepted { .. }))
+            );
+            assert_eq!(
+                decided,
+                set.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+            );
+            assert!(
+                row("Fixture.B")
+                    .decode_memory_retry
+                    .as_ref()
+                    .expect("B decode retry")
+                    .retry_result
+                    .is_ok()
+            );
+            let baseline = engine
+                .check_olean_frontier(&inputs, &options, limits)
+                .expect("serial fixture frontier");
+            assert_eq!(
+                result.logical_root(&options),
+                baseline
+                    .engine
+                    .expect("baseline merge")
+                    .logical_root(&options)
+            );
+            assert_eq!(checked.len(), inputs.len());
+            return;
+        }
+        assert!(
+            result
+                .environment()
+                .find(&fixture_name("Fixture.h"))
+                .is_none()
+        );
+        assert!(
+            result
+                .environment()
+                .find(&fixture_name("Fixture.child"))
+                .is_none()
+        );
+        assert!(
+            matches!(&row("Fixture.D").verdict, OleanModuleVerdict::Blocked { by } if *by == fixture_name("Fixture.B"))
+        );
+        assert!(!checked.contains(&fixture_name("Fixture.D")));
+        match control {
+            DecodeRetryControl::RefuseAgain => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Inconclusive(_)
+                ));
+                assert!(matches!(
+                    row("Fixture.B")
+                        .decode_memory_retry
+                        .as_ref()
+                        .expect("B retry")
+                        .retry_result,
+                    Err(OleanCheckError::HostMemory { .. })
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::InvalidProof => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Failed(OleanCheckError::Admission(_))
+                ));
+                assert!(
+                    row("Fixture.B")
+                        .decode_memory_retry
+                        .as_ref()
+                        .expect("B retry")
+                        .retry_result
+                        .is_ok()
+                );
+                assert!(
+                    checked.contains(&fixture_name("Fixture.B")),
+                    "successful decode must still reach the council"
+                );
+            }
+            DecodeRetryControl::MalformedArtifact => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Failed(OleanCheckError::ModuleDecode { .. })
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::FirstBudget => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::Inconclusive(_)
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::FirstPanic | DecodeRetryControl::RetryPanic => {
+                assert!(matches!(
+                    row("Fixture.B").verdict,
+                    OleanModuleVerdict::InternalFault(_)
+                ));
+                assert!(!checked.contains(&fixture_name("Fixture.B")));
+            }
+            DecodeRetryControl::Accept => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_restores_the_import_graph_and_rechecks_every_declaration() {
+        run_initial_decode_memory_retry(DecodeRetryControl::Accept);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_stops_after_one_refusal_and_blocks_importers() {
+        run_initial_decode_memory_retry(DecodeRetryControl::RefuseAgain);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_cannot_admit_an_invalid_proof() {
+        run_initial_decode_memory_retry(DecodeRetryControl::InvalidProof);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_redecodes_and_refuses_malformed_bytes() {
+        run_initial_decode_memory_retry(DecodeRetryControl::MalformedArtifact);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_does_not_retry_explicit_budgets_or_panics() {
+        run_initial_decode_memory_retry(DecodeRetryControl::FirstBudget);
+        run_initial_decode_memory_retry(DecodeRetryControl::FirstPanic);
+        run_initial_decode_memory_retry(DecodeRetryControl::RetryPanic);
+    }
+
+    #[test]
+    fn initial_decode_memory_retry_does_not_repeat_an_already_isolated_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let results = super::decode_olean_module_inputs_using(1, fixture_jobs(4), &|_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(super::HostAllocationFailure { requested: 4096 })
+        })
+        .expect("an isolated allocation refusal is a module result");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            results[0].result,
+            Err(OleanCheckError::HostMemory { requested: 4096 })
+        ));
+        assert!(results[0].memory_retry.is_none());
+    }
+
     /// The scheduled door's answer is the serial door's, value for value.
     fn assert_same_set_answer(
         serial: &Result<Outcome<super::CheckedOleanSet>, OleanCheckError>,
@@ -14783,6 +17241,156 @@ mod tests {
         ));
         super::verify_source_run_flbc_sidecar(&bytes, &product, b"exact toolchain image")
             .expect("both negative controls recover on exact inputs");
+    }
+
+    #[test]
+    fn source_program_sidecar_binds_siblings_order_and_each_imported_artifact_part() {
+        use super::source_check::modules::execution::{
+            SourceModuleExecution, SourceProgramExecution,
+        };
+
+        let engine = seeded_engine();
+        let options = KVMap::new();
+        let names = ["Left", "Right", "Main"].map(|name| Name::from_components([name]));
+        let bytes: [&[u8]; 3] = [b"def left := 11", b"def right := 22", b"#eval (42 : Nat)"];
+        let mut program = SourceProgramExecution {
+            modules: names
+                .iter()
+                .zip(bytes)
+                .map(|(name, source)| SourceModuleExecution {
+                    module: name.clone(),
+                    commands: engine
+                        .execute_source_commands_with_checks(source, &options, test_limits())
+                        .unwrap()
+                        .into_complete()
+                        .unwrap(),
+                })
+                .collect(),
+        };
+        let sources: Vec<_> = names
+            .iter()
+            .zip(bytes)
+            .map(|(name, source)| super::SourceModuleInput { name, source })
+            .collect();
+        // The sidecar hashes artifact inputs; it does not admit them. These
+        // distinct byte strings exercise that binding, while the installed
+        // CLI tests below this API use genuinely admitted .olean imports.
+        let external_names = ["External", "Other"].map(|name| Name::from_components([name]));
+        let parts = [
+            b"exported".to_vec(),
+            b"server".to_vec(),
+            b"private".to_vec(),
+        ];
+        let imports = [
+            OleanModuleInput {
+                name: &external_names[0],
+                artifact: &parts[0],
+                server_artifact: Some(&parts[1]),
+                private_artifact: Some(&parts[2]),
+            },
+            OleanModuleInput {
+                name: &external_names[1],
+                artifact: b"other",
+                server_artifact: None,
+                private_artifact: None,
+            },
+        ];
+        let build = |sources: &[super::SourceModuleInput<'_>],
+                     imports: &[OleanModuleInput<'_>],
+                     program: &SourceProgramExecution| {
+            super::build_source_program_flbc_sidecar(
+                sources,
+                imports,
+                &options,
+                b"exact toolchain image",
+                program,
+            )
+            .unwrap()
+        };
+        let original = build(&sources, &imports, &program);
+        let product = &program
+            .modules
+            .last()
+            .unwrap()
+            .commands
+            .batch
+            .executions
+            .last()
+            .unwrap()
+            .flbc_artifact;
+        super::verify_source_run_flbc_sidecar(
+            &super::encode_flbc_product_sidecar(&original),
+            product,
+            b"exact toolchain image",
+        )
+        .unwrap();
+
+        let mut source_permutation = sources.clone();
+        source_permutation.reverse();
+        let mut import_permutation = imports;
+        import_permutation.reverse();
+        assert_eq!(
+            build(&source_permutation, &import_permutation, &program),
+            original,
+            "caller discovery order is not source execution order"
+        );
+
+        for part in 0..3 {
+            let mut changed = parts.clone();
+            changed[part][0] ^= 1;
+            let mut modified = imports;
+            modified[0] = OleanModuleInput {
+                name: &external_names[0],
+                artifact: &changed[0],
+                server_artifact: Some(&changed[1]),
+                private_artifact: Some(&changed[2]),
+            };
+            let rebound = build(&sources, &modified, &program);
+            assert_ne!(
+                rebound.component_root(super::ClosureComponent::SemanticInputs),
+                original.component_root(super::ClosureComponent::SemanticInputs),
+                "artifact part {part} must be bound"
+            );
+            assert_eq!(
+                rebound.product_root(),
+                original.product_root(),
+                "binding an input never recompiles or changes the product"
+            );
+        }
+        let mut without_private = imports;
+        without_private[0].private_artifact = None;
+        assert_ne!(
+            build(&sources, &without_private, &program).closure_root(),
+            original.closure_root()
+        );
+
+        let mut changed_source = sources.clone();
+        changed_source[0].source = b"def left := 11 -- retained sibling comment";
+        let rebound = build(&changed_source, &imports, &program);
+        assert_ne!(
+            rebound.component_root(super::ClosureComponent::Sources),
+            original.component_root(super::ClosureComponent::Sources)
+        );
+        assert_eq!(rebound.product_root(), original.product_root());
+
+        program.modules.swap(0, 1);
+        assert_ne!(
+            build(&sources, &imports, &program).closure_root(),
+            original.closure_root(),
+            "completed sibling order is retained rather than flattened"
+        );
+        program.modules.swap(0, 1);
+        assert_eq!(build(&sources, &imports, &program), original);
+        assert!(matches!(
+            super::build_source_program_flbc_sidecar(
+                &sources[..2],
+                &imports,
+                &options,
+                b"exact toolchain image",
+                &program
+            ),
+            Err(super::SourceRunSidecarBuildError::SourceProgramInputs { .. })
+        ));
     }
 
     #[test]
@@ -16654,7 +19262,8 @@ mod tests {
             .check_source_command(b"#check Missing", &options, test_limits().admission())
             .expect_err("an unknown check term has no guessed type");
         assert!(matches!(unknown, EngineExecutionError::Frontend(_)));
-        assert!(unknown.to_string().contains("no inferable type"));
+        // The pin: `error(lean.unknownIdentifier): Unknown identifier `Missing`` (v4.32.0).
+        assert!(unknown.to_string().contains("Unknown identifier `Missing`"));
         assert_eq!(engine.logical_root(&options), before);
 
         let interleaved = engine
@@ -19632,6 +22241,7 @@ mod tests {
                 // assertions below.
                 super::FrontierDone {
                     index: 7,
+                    host_memory_refusal: false,
                     verdict: super::OleanModuleVerdict::Accepted {
                         declarations: block.len(),
                     },

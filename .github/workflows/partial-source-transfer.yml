@@ -1,0 +1,115 @@
+name: Prepare partial definition source
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/partial-source-transfer.yml', '.github/patches/fln-source-partial/request.json']
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare readable identity-checked Rust source without executing it or moving a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I -S - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, subprocess, urllib.request
+          repository = os.environ['GITHUB_REPOSITORY']
+          assert repository == 'Dicklesworthstone/franken_lean'
+          def oid(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def api(path, data=None):
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + repository + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          def blob(sha):
+              assert re.fullmatch('[0-9a-f]{40}', sha)
+              entry = api('/git/blobs/' + sha)
+              assert entry['encoding'] == 'base64' and entry['size'] <= 2_000_000
+              data = base64.b64decode(entry['content'], validate=False)
+              assert len(data) <= 2_000_000 and oid(data) == sha
+              data.decode('utf-8')
+              return data
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          request_path = '.github/patches/fln-source-partial/request.json'
+          request_bytes = pathlib.Path(request_path).read_bytes()
+          request_oid = git('rev-parse', 'HEAD:' + request_path)
+          assert oid(request_bytes) == request_oid
+          manifest = json.loads(request_bytes)
+          assert set(manifest) == {'schema', 'files', 'patches'}
+          assert manifest['schema'] == 'fln-readable-source-v1'
+          files = manifest['files']
+          assert isinstance(files, dict) and 0 < len(files) <= 64
+          base = git('rev-parse', 'HEAD')
+          for path, identities in files.items():
+              assert re.fullmatch(r'crates/[A-Za-z0-9_-]+/(src|tests)/[A-Za-z0-9_./-]+\.rs', path)
+              target = pathlib.Path(path)
+              assert '..' not in target.parts and not target.is_symlink()
+              assert not any(parent.is_symlink() for parent in target.parents)
+              assert set(identities) == {'before', 'after'}
+              assert re.fullmatch('[0-9a-f]{40}', identities['after'])
+              before = identities['before']
+              if before is None:
+                  assert not target.exists(), 'new path already exists: ' + path
+              else:
+                  assert re.fullmatch('[0-9a-f]{40}', before)
+                  assert git('rev-parse', 'HEAD:' + path) == before, 'stale base: ' + path
+                  assert target.is_file() and oid(target.read_bytes()) == before
+          assert isinstance(manifest['patches'], list) and 0 < len(manifest['patches']) <= 8
+          patches = [blob(sha) for sha in manifest['patches']]
+          assert sum(map(len, patches)) <= 2_000_000
+          patched = set()
+          for patch in patches:
+              rows = subprocess.check_output(['git', 'apply', '--numstat', '-'], input=patch).decode().splitlines()
+              for row in rows:
+                  added, removed, path = row.split('\t')
+                  assert added.isdigit() and removed.isdigit()
+                  assert path in files and files[path]['before'] is not None and path not in patched
+                  patched.add(path)
+          assert patched == {path for path, ids in files.items() if ids['before'] is not None}
+          for patch in patches:
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          for path, identities in files.items():
+              target = pathlib.Path(path)
+              if identities['before'] is None:
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with target.open('xb') as stream:
+                      stream.write(blob(identities['after']))
+              assert target.is_file() and not target.is_symlink()
+              data = target.read_bytes()
+              assert oid(data) == identities['after'], 'candidate identity mismatch: ' + path
+              result = api('/git/blobs', {'content': data.decode('utf-8'), 'encoding': 'utf-8'})
+              assert result['sha'] == identities['after']
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          subprocess.run(['git', 'add', '--', *files], check=True)
+          tree = git('write-tree')
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'partial-readable-source'
+          out.mkdir()
+          receipt = {'base': base, 'tree': tree, 'request_blob': request_oid,
+                     'branch_updated': False, 'files': files}
+          (out / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(out / 'source.tar.gz'), tree], check=True)
+          print(json.dumps(receipt))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: partial-source-${{ github.run_id }}
+          path: ${{ runner.temp }}/partial-readable-source
+          retention-days: 2
+          if-no-files-found: error

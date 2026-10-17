@@ -32,7 +32,9 @@ pub mod obj {
     pub use fln_unsafe_abi::handle::stdout_capture::{
         CapturedStdout, StdoutCapture, StdoutCaptureError,
     };
-    pub use fln_unsafe_abi::handle::{EXTERNAL_FINALIZED, Obj, StdioPutStrError};
+    pub use fln_unsafe_abi::handle::{
+        EXTERNAL_FINALIZED, Obj, StdioPutStrError, flush_native_stdout,
+    };
     pub use fln_unsafe_abi::rc::Header;
     /// Ownership-shadow controls: deterministic replay events, quarantine
     /// discipline, and fault detection (plan §6.2 hardened builds).
@@ -47,4 +49,11 @@ pub mod obj {
 /// and Golem's `IO.getNumHeartbeats` / `IO.setNumHeartbeats` intrinsic rows.
 pub mod heartbeat {
     pub use fln_unsafe_abi::{allocation_heartbeats, set_allocation_heartbeats};
+}
+
+/// Language diagnostics shared by generated native code and Golem. These
+/// report runtime effects only; no kernel or declaration authority crosses
+/// this boundary. Panic reporting observes the existing runtime panic policy.
+pub mod diagnostics {
+    pub use fln_unsafe_abi::{report_panic, trace_message};
 }

@@ -5,6 +5,8 @@ use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportL
 use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
 use fln_olean::source_extensions::{self, ClassEntry, DecodeLimits};
 
+#[path = "defaults.rs"]
+mod defaults;
 #[path = "instances.rs"]
 mod instances;
 
@@ -114,7 +116,7 @@ fn only_owned_class_rows_are_exported_across_a_diamond() {
     let built = compiled(&[
         (
             "Main",
-            "prelude\nimport Left Right\nclass Outer (A : Type) where\n  apply : A -> A",
+            "prelude\nimport Left\nimport Right\nclass Outer (A : Type) where\n  apply : A -> A",
         ),
         ("Left", "prelude\nimport Base"),
         ("Right", "prelude\nimport Base"),

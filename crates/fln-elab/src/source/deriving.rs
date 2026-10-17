@@ -4,6 +4,8 @@
 //! hypotheses, then assuming inhabited parameters and retaining only used ones.
 use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
+mod beq;
+mod decidable_eq;
 mod repr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +13,8 @@ pub enum DerivingError {
     UnsupportedHandler(Name),
     UnsupportedFamily(Name),
     CannotDerive(Name),
+    CannotDeriveBEq(Name),
+    CannotDeriveDecidableEq(Name),
     CannotDeriveRepr(Name),
 }
 
@@ -39,6 +43,16 @@ impl std::fmt::Display for DerivingError {
             Self::CannotDeriveRepr(name) => write!(
                 f,
                 "failed to generate Repr instance for {}",
+                name.to_display_string()
+            ),
+            Self::CannotDeriveBEq(name) => write!(
+                f,
+                "failed to generate BEq instance for {}",
+                name.to_display_string()
+            ),
+            Self::CannotDeriveDecidableEq(name) => write!(
+                f,
+                "failed to generate DecidableEq instance for {}",
                 name.to_display_string()
             ),
         }
@@ -485,7 +499,10 @@ pub fn elaborate_handler(
     let mut context = Context::scoped(environment, kernel, scope);
     let handler_name = context.resolve_source_name(handler)?;
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
-    if !is_repr && handler_name.as_ref() != Some(&named("Inhabited")) {
+    let is_beq = handler_name.as_ref() == Some(&named("BEq"));
+    let is_decidable_eq = handler_name.as_ref() == Some(&named("DecidableEq"));
+    if !is_repr && !is_beq && !is_decidable_eq && handler_name.as_ref() != Some(&named("Inhabited"))
+    {
         return Err(failure(SourceInferenceError::Deriving(
             DerivingError::UnsupportedHandler(handler.clone()),
         )));
@@ -496,11 +513,17 @@ pub fn elaborate_handler(
     let Some(ConstantInfo::Induct(family)) = environment.find(type_name) else {
         return Err(unsupported(type_name));
     };
-    if family.num_indices != 0 || family.is_unsafe {
+    if family.is_unsafe || (family.num_indices != 0 && !is_repr) {
         return Err(unsupported(type_name));
     }
     let budget = crate::records::RecordBudget::default();
-    if family.num_params as usize > budget.max_binders || family.ctors.len() > budget.max_binders {
+    if family.num_params as usize > budget.max_binders
+        || family.num_indices as usize
+            > budget
+                .max_binders
+                .saturating_sub(family.num_params as usize)
+        || family.ctors.len() > budget.max_binders
+    {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     context.level_params = family.base.level_params.clone();
@@ -543,6 +566,22 @@ pub fn elaborate_handler(
                 .expect("inserted parameter")
                 .clone(),
         );
+    }
+    if is_beq {
+        return match beq::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveBEq(type_name.clone()),
+            ))),
+            result => result,
+        };
+    }
+    if is_decidable_eq {
+        return match decidable_eq::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveDecidableEq(type_name.clone()),
+            ))),
+            result => result,
+        };
     }
     if is_repr {
         return match repr::elaborate(&mut context, family, &parameters, &target, is_record) {

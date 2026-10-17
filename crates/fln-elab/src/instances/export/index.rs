@@ -5,7 +5,7 @@
 //! normalization are explicit unsupported results, never guessed paths. This
 //! keeps an exported path independent of later reducibility changes.
 use super::*;
-use fln_core::expr::{FVarId, Literal};
+use fln_core::expr::{FVarId, Literal, NatLit};
 
 enum Error {
     Unsupported,
@@ -29,6 +29,24 @@ struct Indexer<'a> {
     imported_classes: &'a BTreeMap<Name, imported::ClassParameters>,
     remaining: &'a mut usize,
     locals: Vec<Local>,
+}
+
+/// The source driver keeps an ascription `(e : T)` as the identity let `let _ : T := e; #0`
+/// (inductive.rs `without_ascription`); the pin's elaborated term, which it indexes, is `e`.
+fn without_ascription(expr: &Expr) -> Expr {
+    let mut expr = expr;
+    while let ExprNode::LetE {
+        decl_name,
+        value,
+        body,
+        ..
+    } = expr.node()
+        && decl_name.is_anonymous()
+        && matches!(body.node(), ExprNode::BVar { idx: 0 })
+    {
+        expr = value;
+    }
+    expr.clone()
 }
 
 pub(super) fn derive(
@@ -68,15 +86,7 @@ impl Indexer<'_> {
             .env
             .find(declaration)
             .ok_or_else(|| InstanceRegistryError::UnknownDeclaration(declaration.clone()))?;
-        let safe = match info {
-            ConstantInfo::Defn(value) => value.safety == DefinitionSafety::Safe,
-            ConstantInfo::Thm(_) => true,
-            ConstantInfo::Opaque(value) => !value.is_unsafe,
-            ConstantInfo::Axiom(value) => !value.is_unsafe,
-            ConstantInfo::Ctor(value) => !value.is_unsafe,
-            _ => false,
-        };
-        if !safe {
+        if !instance_declaration_is_supported(info) {
             return Err(InstanceRegistryError::InvalidInstance(declaration.clone()).into());
         }
         let mut target = info.constant_val().type_.clone();
@@ -176,7 +186,7 @@ impl Indexer<'_> {
             self.tick()?;
             match head.node() {
                 ExprNode::App { f, a } => {
-                    args.push(a.clone());
+                    args.push(without_ascription(a));
                     head = f;
                 }
                 ExprNode::MData { data, expr } if data.is_empty() => head = expr,
@@ -520,6 +530,62 @@ impl Indexer<'_> {
         Ok(ignored)
     }
 
+    /// DiscrTree recognizes numeral syntax before inspecting a constant's
+    /// reduction policy (vendored Lean/Meta/DiscrTree/Main.lean `toNatLit?`).
+    /// In particular, an elaborated `OfNat.ofNat` numeral is one literal key,
+    /// including when its dictionary is an ordinary definition. Failing to
+    /// index it changes equal-priority instance order against indexed rows.
+    fn numeral(&mut self, expr: &Expr) -> Result<Option<Literal>> {
+        let mut current = expr.clone();
+        let mut successors = 0u64;
+        let value = loop {
+            self.tick()?;
+            let (head, args) = self.spine(&current)?;
+            match head.node() {
+                ExprNode::Lit {
+                    literal: Literal::Nat(value),
+                } if args.is_empty() => {
+                    *self.remaining = self
+                        .remaining
+                        .checked_sub(value.limbs_le().len())
+                        .ok_or(InstanceRegistryError::Limit)?;
+                    break value.clone();
+                }
+                ExprNode::Const { name, .. }
+                    if *name == Name::from_components(["Nat", "zero"]) && args.is_empty() =>
+                {
+                    break NatLit::from_u64(0);
+                }
+                ExprNode::Const { name, .. }
+                    if *name == Name::from_components(["Nat", "succ"]) && args.len() == 1 =>
+                {
+                    successors = successors
+                        .checked_add(1)
+                        .ok_or(InstanceRegistryError::Limit)?;
+                    current = args[0].clone();
+                }
+                ExprNode::Const { name, .. }
+                    if *name == Name::from_components(["OfNat", "ofNat"]) && args.len() == 3 =>
+                {
+                    current = args[1].clone();
+                }
+                _ => return Ok(None),
+            }
+        };
+        if successors == 0 {
+            return Ok(Some(Literal::Nat(value)));
+        }
+        *self.remaining = self
+            .remaining
+            .checked_sub(value.limbs_le().len().saturating_add(1))
+            .ok_or(InstanceRegistryError::Limit)?;
+        let value = fln_bignum::interop::bignat_from_literal(&value)
+            .add(&fln_bignum::nat::BigNat::from_u64(successors));
+        Ok(Some(Literal::Nat(
+            fln_bignum::interop::literal_from_bignat(&value),
+        )))
+    }
+
     fn path(&mut self, target: &Expr) -> Result<Vec<discr_tree::Key>> {
         use discr_tree::Key;
         let mut keys = Vec::new();
@@ -530,6 +596,11 @@ impl Indexer<'_> {
                 keys.push(Key::Star);
                 continue;
             };
+            let expr = without_ascription(&expr);
+            if !root && let Some(literal) = self.numeral(&expr)? {
+                keys.push(Key::Lit(literal));
+                continue;
+            }
             let (head, args) = self.spine(&expr)?;
             let arity = u32::try_from(args.len()).map_err(|_| InstanceRegistryError::Limit)?;
             let key = match head.node() {

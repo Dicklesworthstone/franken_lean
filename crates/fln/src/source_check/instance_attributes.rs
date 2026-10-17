@@ -18,10 +18,26 @@ pub(super) fn apply(
     command: usize,
     offset: usize,
 ) -> Result<Environment, SourceCheckError> {
+    if attribute.erase {
+        return Err(SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message: "instance erasure requires the source scope driver".into(),
+        });
+    }
     if attribute.declarations.len() > MAX_DECLARATIONS {
         return Err(SourceCheckError::Limit {
             resource: "instance attribute declarations",
             limit: MAX_DECLARATIONS,
+        });
+    }
+    if attribute.is_default && attribute.scoped {
+        return Err(SourceCheckError::Scope {
+            file,
+            command,
+            offset,
+            message: "default instances require global registration".into(),
         });
     }
     if attribute.scoped && scope.namespace.is_anonymous() {
@@ -50,6 +66,22 @@ pub(super) fn apply(
                 offset,
                 message: format!("Unknown constant `{}`", requested.to_display_string()),
             })?;
+        if attribute.is_default {
+            next = fln_elab::instances::defaults::register(&next, &name, attribute.priority)
+                .map_err(|error| SourceCheckError::Command {
+                    file,
+                    command,
+                    offset,
+                    error: Box::new(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ),
+                    )),
+                })?;
+            continue;
+        }
         // The standalone attribute does not acquire the `instance` command's
         // implicitReducible default (Lean/ReducibilityAttrs.lean:205–220).
         // Preserve an unrecorded declaration's previous status before the

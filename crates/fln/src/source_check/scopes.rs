@@ -1,18 +1,25 @@
 //! Section lifetimes affect source resolution, not the checked environment. Ending
 //! a section restores lookup/universe state but never removes its declarations.
 use super::*;
+use fln_elab::instances::scoped::ActiveScopes;
 use fln_elab::source::scope::{SourceScope, components};
 use fln_parse::command_scope::ScopeCommand;
 use std::collections::BTreeSet;
+
+mod instance_erasure;
 
 #[derive(Clone)]
 struct Frame {
     label: Option<String>,
     saved: SourceScope,
+    public_instances: ActiveScopes,
 }
 #[derive(Default)]
 pub(crate) struct Scopes {
     pub current: SourceScope,
+    // Public and private journals have different rows and insertion positions.
+    // Each namespace activation must retain the boundary in its own world.
+    public_instances: ActiveScopes,
     stack: Vec<Frame>,
     namespaces: BTreeSet<Name>,
 }
@@ -63,6 +70,15 @@ impl Scopes {
         command: ScopeCommand,
         env: &Environment,
     ) -> Result<(), TransitionError> {
+        self.transition_worlds(command, env, None)
+    }
+
+    pub fn transition_worlds(
+        &mut self,
+        command: ScopeCommand,
+        env: &Environment,
+        public_env: Option<&Environment>,
+    ) -> Result<(), TransitionError> {
         match command {
             ScopeCommand::Namespace(name) => {
                 let parts = components(&name).map_err(|e| TransitionError::Scope(e.to_string()))?;
@@ -78,10 +94,30 @@ impl Scopes {
                         .instance_scopes
                         .activate(env, &self.current.namespace)
                         .map_err(TransitionError::Registry)?;
+                    if let Some(public_env) = public_env {
+                        self.public_instances
+                            .activate(public_env, &self.current.namespace)
+                            .map_err(TransitionError::Registry)?;
+                    }
                 }
             }
-            ScopeCommand::Open(names) => return self.transition_open(names, false, env),
-            ScopeCommand::OpenScoped(names) => return self.transition_open(names, true, env),
+            ScopeCommand::Open(names) => {
+                return self.transition_open(names, false, env, public_env);
+            }
+            ScopeCommand::OpenExplicit { namespace, names } => {
+                let resolved = self
+                    .explicit_opens(env, &namespace, &names)
+                    .map_err(TransitionError::Scope)?;
+                let position = self.current.opened.len();
+                for (opened_id, declaration) in resolved {
+                    self.current
+                        .explicit_opens
+                        .push((position, opened_id, declaration));
+                }
+            }
+            ScopeCommand::OpenScoped(names) => {
+                return self.transition_open(names, true, env, public_env);
+            }
             other => self.apply(other).map_err(TransitionError::Scope)?,
         }
         Ok(())
@@ -92,8 +128,10 @@ impl Scopes {
         names: Vec<Name>,
         scoped_only: bool,
         env: &Environment,
+        public_env: Option<&Environment>,
     ) -> Result<(), TransitionError> {
         let mut next = self.current.clone();
+        let mut public_instances = self.public_instances.clone();
         let registry =
             fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
         for namespace in registry.instance_namespaces() {
@@ -111,13 +149,129 @@ impl Scopes {
                 next.instance_scopes
                     .activate(env, &namespace)
                     .map_err(TransitionError::Registry)?;
+                if let Some(public_env) = public_env {
+                    public_instances
+                        .activate(public_env, &namespace)
+                        .map_err(TransitionError::Registry)?;
+                }
                 if !scoped_only {
                     Self::add_open(&mut next, namespace).map_err(TransitionError::Scope)?;
                 }
             }
         }
         self.current = next;
+        self.public_instances = public_instances;
         Ok(())
+    }
+
+    /// The same lexical state with activation chronology from the public
+    /// journal. Selection only clones a snapshot; it never opens a namespace.
+    pub fn public_scope(&self) -> SourceScope {
+        let mut scope = self.current.clone();
+        scope.instance_scopes = self.public_instances.clone();
+        scope
+    }
+
+    pub fn command_scope(
+        &self,
+        source: &[u8],
+    ) -> Result<SourceScope, fln_elab::NatDefinitionFrontendError> {
+        let mut scope = self.current.for_command_source(source)?;
+        if scope.exports_declaration() {
+            scope.instance_scopes = self.public_instances.clone();
+        }
+        Ok(scope)
+    }
+
+    /// `open Ns (a b …)`: each name with the one declaration `ns ++ name` it denotes among the
+    /// namespaces `Ns` resolves to (`resolveNameUsingNamespacesCore`).
+    fn explicit_opens(
+        &self,
+        env: &Environment,
+        namespace: &Name,
+        names: &[Name],
+    ) -> Result<Vec<(Name, Name)>, String> {
+        let namespaces = self.resolve_open_in(&self.current, namespace)?;
+        if namespaces.is_empty() {
+            return Err(format!(
+                "unknown namespace `{}`",
+                namespace.to_display_string()
+            ));
+        }
+        self.namespace_members(env, &namespaces, names)
+    }
+
+    /// `elabExport` uses the same member resolver as an explicit open, and
+    /// rejects a single namespace equal to the enclosing namespace.
+    pub fn export_aliases(
+        &self,
+        env: &Environment,
+        namespace: &Name,
+        names: &[Name],
+    ) -> Result<Vec<(Name, Name)>, String> {
+        let namespaces = self.resolve_open_in(&self.current, namespace)?;
+        if namespaces.is_empty() {
+            return Err(format!(
+                "unknown namespace `{}`",
+                namespace.to_display_string()
+            ));
+        }
+        if namespaces == [self.current.namespace.clone()] {
+            return Err("invalid 'export', self export".into());
+        }
+        Ok(self
+            .namespace_members(env, &namespaces, names)?
+            .into_iter()
+            .map(|(name, declaration)| (self.current.namespace.append_core(&name), declaration))
+            .collect())
+    }
+
+    fn namespace_members(
+        &self,
+        env: &Environment,
+        namespaces: &[Name],
+        names: &[Name],
+    ) -> Result<Vec<(Name, Name)>, String> {
+        let table = fln_elab::aliases::AliasTable::read(env).map_err(|error| error.to_string())?;
+        let protected = fln_elab::protected_names::ProtectedNames::read(env)
+            .map_err(|error| error.to_string())?;
+        let mut aliases = Vec::with_capacity(names.len());
+        for name in names {
+            // The pin's `OpenDecl.resolveId` first tries the exact declaration,
+            // including protected names. Only an absent exact name falls back to
+            // ordinary global resolution; this is what permits re-exported aliases.
+            // A failed namespace does not mask a unique success in another one.
+            let mut candidates = Vec::new();
+            let mut last_error = None;
+            for ns in namespaces {
+                let qualified = ns.append_core(name);
+                if env.contains(&qualified) {
+                    candidates.push(qualified);
+                    continue;
+                }
+                match self.current.resolve_with_aliases(
+                    &qualified,
+                    |candidate| env.contains(candidate),
+                    &table,
+                    &protected,
+                ) {
+                    Ok(Some(declaration)) => candidates.push(declaration),
+                    Ok(None) => {}
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            let [declaration] = candidates.as_slice() else {
+                return Err(if candidates.is_empty() {
+                    last_error.unwrap_or_else(|| {
+                        format!("unknown declaration `{}`", name.to_display_string())
+                    })
+                } else {
+                    format!("ambiguous identifier `{}`", name.to_display_string())
+                });
+            };
+            aliases.push((name.clone(), declaration.clone()));
+        }
+        Ok(aliases)
     }
 
     /// Namespace lookup is not global-constant lookup. The Reference's
@@ -175,23 +329,138 @@ impl Scopes {
         Ok(())
     }
 
-    /// A file's initial scope. `mode` decides only whether its compiled declarations may
-    /// apply recursors the pin's code generator refuses (frontier only, bead
-    /// `franken_lean-z8j.1.6.6`).
-    pub fn new(env: &Environment, mode: fln_core::mode::Mode) -> Self {
-        let mut scopes = Self::default();
-        scopes.current.frontier_recursors = mode.permits_frontier();
-        for (name, _) in env.constants() {
+    /// A file's initial lexical scope retains the engine's native capabilities
+    /// and its mode's code generation permissions.
+    pub fn new(engine: &Engine) -> Self {
+        let mut scopes = Self {
+            current: engine.base_source_scope(),
+            ..Self::default()
+        };
+        for (name, _) in engine.environment().constants() {
             scopes.observe(name);
         }
         scopes
     }
+
+    /// Resume an editor's completed lexical prefix. Preserve both journals'
+    /// original activation points; only the pending wrappers may activate new
+    /// namespaces. Namespace discovery grants no declaration authority and is
+    /// bounded independently by the editor's lookup limits.
+    pub(super) fn from_checked_prefix(
+        current: SourceScope,
+        public_instances: ActiveScopes,
+        env: &Environment,
+        max_names: usize,
+        max_name_bytes: usize,
+    ) -> Result<Self, (&'static str, usize)> {
+        let mut scopes = Self {
+            current,
+            public_instances,
+            ..Self::default()
+        };
+        for (index, (name, _)) in env.constants().enumerate() {
+            if index >= max_names {
+                return Err(("completion scope candidates", max_names));
+            }
+            let mut current = name.clone();
+            let mut bytes = 0usize;
+            while !current.is_anonymous() {
+                let component = match current.leaf_view() {
+                    fln_core::name::LeafView::Str(text) => text.len(),
+                    fln_core::name::LeafView::Num(value) => value.to_string().len(),
+                    fln_core::name::LeafView::Anonymous => unreachable!(),
+                };
+                bytes = bytes
+                    .checked_add(component)
+                    .and_then(|bytes| bytes.checked_add(1))
+                    .filter(|bytes| *bytes <= max_name_bytes)
+                    .ok_or(("completion scope name bytes", max_name_bytes))?;
+                current = current.parent();
+            }
+            let mut parent = scopes.current.user_name(name).parent();
+            while !parent.is_anonymous() && !scopes.namespaces.contains(&parent) {
+                if scopes.namespaces.len() >= max_names {
+                    return Err(("completion scope namespaces", max_names));
+                }
+                scopes.namespaces.insert(parent.clone());
+                parent = parent.parent();
+            }
+        }
+        Ok(scopes)
+    }
+
     fn observe(&mut self, name: &Name) {
-        let mut parent = name.parent();
+        let mut parent = self.current.user_name(name).parent();
         while !parent.is_anonymous() && self.namespaces.insert(parent.clone()) {
             parent = parent.parent();
         }
     }
+    pub(super) fn observe_syntax(&mut self, declaration: &Name) {
+        self.observe(declaration);
+    }
+
+    /// Publish source-only selection after the command's declarations have
+    /// passed both checkers. Public and private worlds keep distinct journal
+    /// anchors, and neither view advances if either activation fails.
+    pub fn admitted_batch(
+        &mut self,
+        batch: &DeclarationBatchAdmission,
+        env: &Environment,
+        public_env: Option<&Environment>,
+    ) -> Result<(), TransitionError> {
+        if let Some((name, priority)) = &batch.local_instance {
+            let mut instances = self.current.instance_scopes.clone();
+            let mut public_instances = self.public_instances.clone();
+            instances
+                .register_local(env, name, *priority)
+                .map_err(TransitionError::Registry)?;
+            if let Some(public_env) = public_env {
+                public_instances
+                    .register_local(public_env, name, *priority)
+                    .map_err(TransitionError::Registry)?;
+            }
+            self.current.instance_scopes = instances;
+            self.public_instances = public_instances;
+        }
+        for row in &batch.admissions {
+            self.admitted(&row.declaration);
+        }
+        Ok(())
+    }
+
+    /// `attribute [local instance] x …`: each declaration, resolved in this scope, selected as a
+    /// local instance until the scope ends, in the public world too, as [`Self::admitted_batch`]
+    /// selects a `local instance` declaration.
+    pub fn local_instance_attribute(
+        &mut self,
+        env: &Environment,
+        public_env: Option<&Environment>,
+        requested: &[Name],
+        priority: u32,
+    ) -> Result<(), String> {
+        let mut instances = self.current.instance_scopes.clone();
+        let mut public_instances = self.public_instances.clone();
+        for requested in requested {
+            let name = self
+                .current
+                .resolve(requested, |name| env.contains(name))
+                .map_err(|error| error.to_string())?
+                // The pin's words for a name nothing resolves (`realizeGlobalConstNoOverload`).
+                .ok_or_else(|| format!("Unknown constant `{}`", requested.to_display_string()))?;
+            instances
+                .register_local(env, &name, priority)
+                .map_err(|error| format!("{error:?}"))?;
+            if let Some(public_env) = public_env {
+                public_instances
+                    .register_local(public_env, &name, priority)
+                    .map_err(|error| format!("{error:?}"))?;
+            }
+        }
+        self.current.instance_scopes = instances;
+        self.public_instances = public_instances;
+        Ok(())
+    }
+
     pub fn admitted(&mut self, declaration: &Declaration) {
         match declaration {
             Declaration::Axiom(v) => self.observe(&v.base.name),
@@ -222,10 +491,14 @@ impl Scopes {
         const MAX_DEPTH: usize = 256;
         const MAX_ITEMS: usize = 4096;
         let added_scopes = match command {
-            ScopeCommand::Namespace(name) | ScopeCommand::Section(Some(name)) => {
-                components(name).map_or(MAX_DEPTH + 1, |parts| parts.len())
+            ScopeCommand::Namespace(name)
+            | ScopeCommand::Section(Some(name))
+            | ScopeCommand::SectionWithModifiers {
+                name: Some(name), ..
+            } => components(name).map_or(MAX_DEPTH + 1, |parts| parts.len()),
+            ScopeCommand::Section(None) | ScopeCommand::SectionWithModifiers { name: None, .. } => {
+                1
             }
-            ScopeCommand::Section(None) => 1,
             _ => 0,
         };
         if self.stack.len().saturating_add(added_scopes) > MAX_DEPTH {
@@ -249,6 +522,12 @@ impl Scopes {
             ScopeCommand::Instance(_) => {
                 return Err("instance attributes require an environment transition".into());
             }
+            ScopeCommand::Export { .. } => {
+                return Err("export requires an environment transition".into());
+            }
+            ScopeCommand::OpenExplicit { .. } => {
+                return Err("explicit opening requires an environment transition".into());
+            }
             ScopeCommand::Reducibility(_) => {
                 return Err("reducibility attributes require an environment transition".into());
             }
@@ -271,8 +550,8 @@ impl Scopes {
             ScopeCommand::Simp(_) => {
                 return Err("simp attributes require an environment transition".into());
             }
-            ScopeCommand::OpenIn { .. } => {
-                return Err("`open … in` is expanded by the command loop, never applied".into());
+            ScopeCommand::OpenIn { .. } | ScopeCommand::In { .. } => {
+                return Err("`… in` is expanded by the command loop, never applied".into());
             }
             ScopeCommand::Namespace(name) | ScopeCommand::Section(Some(name)) => {
                 // Each structural component is its own scope at the Reference.
@@ -285,6 +564,7 @@ impl Scopes {
                     self.stack.push(Frame {
                         label: Some(part.clone()),
                         saved: self.current.clone(),
+                        public_instances: self.public_instances.clone(),
                     });
                     if namespace {
                         self.current.namespace = Name::str(self.current.namespace.clone(), part);
@@ -296,7 +576,37 @@ impl Scopes {
                 self.stack.push(Frame {
                     label: None,
                     saved: self.current.clone(),
+                    public_instances: self.public_instances.clone(),
                 });
+            }
+            ScopeCommand::SectionWithModifiers {
+                name,
+                public,
+                expose,
+                noncomputable,
+            } => {
+                let labels = match name {
+                    Some(name) => {
+                        let parts = components(&name).map_err(|e| e.to_string())?;
+                        if parts.is_empty() || parts.iter().any(|part| part == "_root_") {
+                            return Err("invalid section label".into());
+                        }
+                        parts.into_iter().map(Some).collect::<Vec<_>>()
+                    }
+                    None => vec![None],
+                };
+                // The pin pushes each dotted component separately and inherits
+                // the flags before entering the next one (`BuiltinCommand`).
+                for label in labels {
+                    self.stack.push(Frame {
+                        label,
+                        saved: self.current.clone(),
+                        public_instances: self.public_instances.clone(),
+                    });
+                    self.current.public_declarations |= public;
+                    self.current.expose_definitions |= expose;
+                    self.current.noncomputable_section |= noncomputable;
+                }
             }
             ScopeCommand::End(label) => {
                 let labels: Vec<_> = label
@@ -317,7 +627,9 @@ impl Scopes {
                     return Err("end label does not match the innermost scope(s)".into());
                 }
                 for _ in labels {
-                    self.current = self.stack.pop().expect("validated end depth").saved;
+                    let frame = self.stack.pop().expect("validated end depth");
+                    self.current = frame.saved;
+                    self.public_instances = frame.public_instances;
                 }
             }
             ScopeCommand::Open(names) => {
@@ -360,7 +672,8 @@ impl Scopes {
             ScopeCommand::GuardMsgs { .. } => {
                 return Err("`#guard_msgs` needs the executing `lean` front door".into());
             }
-            ScopeCommand::Trivia => {}
+            // `#exit` changes no scope; the partition has already dropped what follows it.
+            ScopeCommand::Trivia | ScopeCommand::Exit => {}
         }
         Ok(())
     }
@@ -478,6 +791,84 @@ mod tests {
         open(&mut scopes, &["A", "B"]);
         scopes.apply(ScopeCommand::End(None)).unwrap();
         assert_eq!(scopes.current, before);
+    }
+
+    #[test]
+    fn public_exposure_defaults_follow_each_dotted_section_frame() {
+        let mut scopes = Scopes::default();
+        scopes.current.private_module = Some(n("Main"));
+        let original = scopes.current.clone();
+        scopes
+            .apply(ScopeCommand::SectionWithModifiers {
+                name: Some(n("Outer.Inner")),
+                public: true,
+                expose: true,
+                noncomputable: false,
+            })
+            .unwrap();
+        assert!(scopes.current.public_declarations);
+        assert!(scopes.current.expose_definitions);
+        assert!(scopes.current.namespace.is_anonymous());
+        let private = scopes
+            .current
+            .for_command_source(b"private def identity (a : Type) (x : a) : a := x")
+            .unwrap();
+        assert!(!private.public_declarations);
+        assert!(scopes.current.public_declarations);
+        scopes.apply(ScopeCommand::End(Some(n("Inner")))).unwrap();
+        assert!(scopes.current.public_declarations);
+        assert!(scopes.current.expose_definitions);
+        scopes.apply(ScopeCommand::Namespace(n("Local"))).unwrap();
+        assert!(scopes.current.public_declarations);
+        scopes.apply(ScopeCommand::End(Some(n("Local")))).unwrap();
+        scopes.apply(ScopeCommand::End(Some(n("Outer")))).unwrap();
+        assert_eq!(scopes.current, original);
+    }
+
+    #[test]
+    fn nested_exposure_section_inherits_public_visibility_then_restores_it() {
+        let mut scopes = Scopes::default();
+        let original = scopes.current.clone();
+        scopes
+            .apply(ScopeCommand::SectionWithModifiers {
+                name: None,
+                public: true,
+                expose: false,
+                noncomputable: false,
+            })
+            .unwrap();
+        let public = scopes.current.clone();
+        scopes
+            .apply(ScopeCommand::SectionWithModifiers {
+                name: None,
+                public: false,
+                expose: true,
+                noncomputable: false,
+            })
+            .unwrap();
+        assert!(scopes.current.public_declarations);
+        assert!(scopes.current.expose_definitions);
+        scopes.apply(ScopeCommand::End(None)).unwrap();
+        assert_eq!(scopes.current, public);
+        scopes.apply(ScopeCommand::End(None)).unwrap();
+        assert_eq!(scopes.current, original);
+    }
+
+    #[test]
+    fn modified_sections_charge_the_same_depth_bound_as_plain_sections() {
+        let mut scopes = Scopes::default();
+        for _ in 0..255 {
+            scopes.apply(ScopeCommand::Section(None)).unwrap();
+        }
+        let command = ScopeCommand::SectionWithModifiers {
+            name: Some(n("A.B")),
+            public: true,
+            expose: true,
+            noncomputable: false,
+        };
+        assert_eq!(scopes.check_limits(&command), Err(("scope depth", 256)));
+        assert!(!scopes.current.public_declarations);
+        assert!(!scopes.current.expose_definitions);
     }
 
     #[test]

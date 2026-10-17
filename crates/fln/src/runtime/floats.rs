@@ -1,8 +1,11 @@
-//! Lower closed scientific literals only after both checking engines admitted
-//! the exact seed declaration. The checked kernel expression is never changed.
+//! Lower closed scientific literals after checking their complete source model.
+//! The checked kernel expression is never changed. Imported words cross the
+//! native boundary through private adapters and retain their logical records.
 use super::*;
 use fln_core::expr::NatLit;
 use fln_vm::scientific::{ScientificFloatWidth, scientific_float_bits};
+mod imported;
+pub(super) use imported::Store;
 
 impl Preparation<'_> {
     /// Referencing a verified primitive function executes none of its body.
@@ -22,15 +25,10 @@ impl Preparation<'_> {
         if !levels.is_empty() {
             return Ok(false);
         }
-        if executable_intrinsic_binding_cached(
-            self.environment,
-            callee,
-            &mut self.visited,
-            self.limits,
-            &mut self.externs,
-        )?
-        .is_some()
-        {
+        if self.native_intrinsic_binding(callee)?.is_some() {
+            return Ok(true);
+        }
+        if source_intrinsics::float::is_primitive(callee) && self.imported_float_model()? {
             return Ok(true);
         }
         if callee != &name("Float.ofScientific") && callee != &name("Float32.ofScientific") {
@@ -39,7 +37,7 @@ impl Preparation<'_> {
         let canonical = matches!(
             (self.environment.find(callee), fln_elab::seed::float_intrinsic_seed_declaration(callee)),
             (Some(ConstantInfo::Axiom(actual)), Some(Declaration::Axiom(expected))) if actual == &expected
-        );
+        ) || self.imported_float_model()?;
         if canonical {
             source_intrinsics::check_selected_extern_attribute(
                 self.environment,
@@ -110,12 +108,17 @@ impl Preparation<'_> {
             // Expose the actual checked body rather than assuming anything
             // about its dictionary or the definitions it references. Those
             // dependencies must still reduce to the canonical opaque primitive.
-            if let (Some(ConstantInfo::Defn(actual)), Some(Declaration::Defn(expected))) = (
-                self.environment.find(callee),
-                fln_elab::seed::float_intrinsic_seed_declaration(callee),
-            ) && actual == &expected
-                && let ExprNode::Lam { body, .. } = actual.value.node()
-            {
+            if let Some(ConstantInfo::Defn(actual)) = self.environment.find(callee).cloned() {
+                let canonical = matches!(
+                    fln_elab::seed::float_intrinsic_seed_declaration(callee),
+                    Some(Declaration::Defn(expected)) if actual == expected
+                ) || self.imported_float_model()?;
+                if !canonical {
+                    return Ok(None);
+                }
+                let ExprNode::Lam { body, .. } = actual.value.node() else {
+                    return Ok(None);
+                };
                 source_intrinsics::check_selected_extern_attribute(
                     self.environment,
                     callee,
@@ -147,7 +150,8 @@ impl Preparation<'_> {
             (Some(ConstantInfo::Defn(actual)), Declaration::Defn(expected)) => actual == &expected,
             _ => false,
         };
-        if !canonical {
+        let imported = !canonical && self.imported_float_model()?;
+        if !canonical && !imported {
             return Err(unsupported("noncanonical scientific conversion"));
         }
         let Some(mantissa) = self.scientific_nat_literal(&arguments[0])? else {
@@ -172,11 +176,19 @@ impl Preparation<'_> {
             ScientificFloatWidth::Float => ("Float.ofBits", "UInt64.ofNat"),
             ScientificFloatWidth::Float32 => ("Float32.ofBits", "UInt32.ofNat"),
         };
-        if source_intrinsic_binding(self.environment, &name(float)).is_none()
-            || source_intrinsic_binding(self.environment, &name(integer)).is_none()
-        {
-            return Err(unsupported("noncanonical scientific bit conversion"));
-        }
+        let (float, integer) = if imported {
+            (
+                self.float_bind_primitive(&name(float))?,
+                self.float_bind_primitive(&name(integer))?,
+            )
+        } else {
+            if source_intrinsic_binding(self.environment, &name(float)).is_none()
+                || source_intrinsic_binding(self.environment, &name(integer)).is_none()
+            {
+                return Err(unsupported("noncanonical scientific bit conversion"));
+            }
+            (name(float), name(integer))
+        };
         source_intrinsics::check_selected_extern_attribute(
             self.environment,
             callee,
@@ -209,9 +221,9 @@ impl Preparation<'_> {
             observed: max_bytes.saturating_add(1),
         })?;
         Ok(Some(Expr::app(
-            Expr::const_(name(float), vec![]),
+            Expr::const_(float, vec![]),
             Expr::app(
-                Expr::const_(name(integer), vec![]),
+                Expr::const_(integer, vec![]),
                 Expr::lit(Literal::Nat(NatLit::from_u64(bits))),
             ),
         )))

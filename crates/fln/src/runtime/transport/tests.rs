@@ -3,7 +3,7 @@ use fln_core::level::Level;
 
 #[test]
 fn equality_transport_requires_every_canonical_family_object() {
-    for mutation in 0..4 {
+    for mutation in 0..8 {
         let Declaration::Inductive(mut block) = fln_elab::seed::eq_seed_declaration() else {
             panic!("equality block");
         };
@@ -11,7 +11,11 @@ fn equality_transport_requires_every_canonical_family_object() {
             0 => {}
             1 => block.types[0].num_indices += 1,
             2 => block.ctors[0].num_fields += 1,
-            _ => block.recursors[0].rules[0].rhs = nat::literal(0),
+            3 => block.recursors[0].rules[0].rhs = nat::literal(0),
+            4 => block.recursors[0].k = false,
+            5 => block.recursors[0].base.level_params.swap(0, 1),
+            6 => block.recursors[0].base.type_ = Expr::sort(Level::zero()),
+            _ => block.types[0].is_unsafe = true,
         }
         let mut environment = Environment::new();
         for value in block.types {
@@ -28,6 +32,20 @@ fn equality_transport_requires_every_canonical_family_object() {
         assert_eq!(prep.equality_family_checked, mutation == 0);
         assert!(prep.lambdas.is_empty());
         assert!(prep.constructors.is_empty());
+        if mutation == 0 {
+            let mut bounded = Preparation::new(
+                &environment,
+                IngressLimits {
+                    max_nodes: 1,
+                    ..IngressLimits::default()
+                },
+            );
+            assert!(matches!(
+                bounded.check_equality_family(),
+                Err(IngressError::ResourceLimit { .. })
+            ));
+            assert!(!bounded.equality_family_checked);
+        }
     }
     assert!(
         Preparation::new(&Environment::new(), IngressLimits::default())

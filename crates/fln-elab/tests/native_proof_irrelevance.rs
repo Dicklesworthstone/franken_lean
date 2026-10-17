@@ -199,6 +199,39 @@ fn distinct_local_proofs_compare_in_both_directions_without_assignment() {
 }
 
 #[test]
+fn direct_proof_irrelevance_can_be_disabled_without_disabling_beta_or_leaking_assignments() {
+    let (mut tx, proposition, h, k) = proofs();
+    let function = local(&mut tx, "consume", pi(proposition.clone(), nat()));
+    let first = hole(&mut tx, "beforeDisabledProof", nat(), MetavarKind::Natural);
+    let before = tx.clone();
+    let mut disabled = budget();
+    disabled.proof_irrelevance = false;
+    for (left, right) in [
+        (h.clone(), k.clone()),
+        (
+            Expr::app(function.clone(), h.clone()),
+            Expr::app(function, k.clone()),
+        ),
+    ] {
+        assert!(matches!(
+            tx.unify_many_with(
+                &[(Expr::mvar(first.clone()), num(9)), (left, right)],
+                disabled,
+                &|| false,
+            ),
+            Err(UnificationError::Deferred(_))
+        ));
+        unchanged(&tx, &before);
+    }
+    let identity = Expr::app(lam(proposition, bv(0)), h.clone());
+    tx.unify(&identity, &h, disabled).unwrap();
+    unchanged(&tx, &before);
+    // The policy belongs to this request; ordinary proof comparison still works.
+    tx.unify(&h, &k, budget()).unwrap();
+    unchanged(&tx, &before);
+}
+
+#[test]
 fn different_propositions_and_ordinary_data_are_not_proof_irrelevant() {
     let (mut tx, _, h, _) = proofs();
     let q = local(&mut tx, "Q", prop());

@@ -118,6 +118,24 @@ pub(super) fn plain_goal_result(value: &str) -> bool {
         }
     }
 }
+
+/// The native plainTermGoal profile: one nonempty rendered goal and a nonempty
+/// LSP range. The decoded-text and wire ceilings match `dispatch/semantic.rs`.
+/// This checks response shape, not the goal's truth or its source correspondence.
+pub(super) fn plain_term_goal_result(value: &str) -> bool {
+    if value.len() > 1024 * 1024 {
+        return false;
+    }
+    let root = RawField::Value(value);
+    matches!(
+        object_string_member(root, "goal"),
+        DecodedField::Valid(goal) if !goal.is_empty() && goal.len() <= 64 * 1024
+    ) && matches!(
+        range_points(object_member(root, "range")),
+        Some((start, end)) if start < end
+    )
+}
+
 pub(super) fn hover_result(value: &str) -> bool {
     if value.len() > 1024 * 1024 {
         return false;

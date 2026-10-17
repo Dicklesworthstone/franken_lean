@@ -6,8 +6,10 @@
 //! This module has no declaration-publication authority. Assignment validation
 //! and all-or-nothing publication remain in the parent solver.
 mod k;
+mod memo;
 mod nat;
 mod quotient;
+mod string;
 
 use super::*;
 use fln_env::constants::RecursorVal;
@@ -23,6 +25,9 @@ struct DeltaCandidate {
 }
 
 enum Continuation {
+    Remember {
+        subject: Expr,
+    },
     Nat {
         head: Expr,
         arguments: Vec<Expr>,
@@ -38,6 +43,12 @@ enum Continuation {
         structure: Name,
         index: u64,
         arguments: Vec<Expr>,
+        expanded_literal: bool,
+    },
+    ClassProjection {
+        head: Expr,
+        arguments: Vec<Expr>,
+        projection: crate::records::projection::ClassProjection,
     },
     Recursor {
         head: Expr,
@@ -45,6 +56,7 @@ enum Continuation {
         arguments: Vec<Expr>,
         prefix: usize,
         major: usize,
+        expanded_literal: bool,
     },
 }
 
@@ -96,8 +108,13 @@ impl Engine<'_> {
         let mut head = expr.clone();
         let mut args = Vec::new();
         let mut continuations = Vec::new();
+        // This invocation cannot assign holes or change locals, the environment
+        // or transparency. Completed demands therefore have one interpretation.
+        // The cache dies before the caller can mutate any of those inputs.
+        let mut memo = memo::DemandMemo::default();
+        let mut complete = false;
         'reduce: loop {
-            loop {
+            while !complete {
                 self.meter.tick()?;
                 match head.node() {
                     ExprNode::Proj {
@@ -109,8 +126,10 @@ impl Engine<'_> {
                             structure: struct_name.clone(),
                             index: *idx,
                             arguments: std::mem::take(&mut args),
+                            expanded_literal: false,
                         });
-                        head = expr.clone();
+                        (head, args, complete) =
+                            self.demand(expr.clone(), &mut memo, &mut continuations)?;
                     }
                     ExprNode::MData { expr, .. } => head = expr.clone(),
                     ExprNode::LetE { value, body, .. } => head = self.substitute(body, value)?,
@@ -146,7 +165,8 @@ impl Engine<'_> {
                                 operation,
                                 values: Vec::new(),
                             });
-                            head = operand;
+                            (head, args, complete) =
+                                self.demand(operand, &mut memo, &mut continuations)?;
                             continue;
                         }
                         match self.work.env.find(name) {
@@ -194,6 +214,47 @@ impl Engine<'_> {
                                     levels,
                                 )?;
                             }
+                            Some(ConstantInfo::Defn(definition))
+                                if self.budget.transparency
+                                    == UnificationTransparency::Instances
+                                    && definition.base.level_params.len() == levels.len() =>
+                            {
+                                // `WHNF.unfoldProjInst?`: the class field may be
+                                // semireducible, but its receiver must project at
+                                // instances transparency. A stuck receiver keeps
+                                // the original named call, not a bare Expr::Proj.
+                                let Some(projection) =
+                                    crate::records::projection::class_projection(
+                                        &self.work.env,
+                                        definition,
+                                        || self.meter.node(),
+                                    )?
+                                else {
+                                    break;
+                                };
+                                if args.len() <= projection.parameters
+                                    || crate::reducibility::table(&self.work.env)
+                                        .map_err(UnificationError::Reducibility)?
+                                        .status(name)
+                                        == crate::reducibility::Reducibility::Irreducible
+                                    || !self
+                                        .projection_registry
+                                        .read(&self.work.env)
+                                        .map_err(UnificationError::InstanceRegistry)?
+                                        .is_class(&projection.structure)
+                                {
+                                    break;
+                                }
+                                let receiver =
+                                    args[args.len() - projection.parameters - 1].clone();
+                                continuations.push(Continuation::ClassProjection {
+                                    head,
+                                    arguments: std::mem::take(&mut args),
+                                    projection,
+                                });
+                                (head, args, complete) =
+                                    self.demand(receiver, &mut memo, &mut continuations)?;
+                            }
                             Some(ConstantInfo::Quot(_)) => {
                                 let Some(major) = self.quotient_major_index(&head, args.len())?
                                 else {
@@ -205,7 +266,8 @@ impl Engine<'_> {
                                     arguments: std::mem::take(&mut args),
                                     major,
                                 });
-                                head = value;
+                                (head, args, complete) =
+                                    self.demand(value, &mut memo, &mut continuations)?;
                             }
                             Some(ConstantInfo::Rec(recursor)) => {
                                 // Iota is independent of delta transparency. Do not
@@ -240,8 +302,10 @@ impl Engine<'_> {
                                     arguments: std::mem::take(&mut args),
                                     prefix,
                                     major,
+                                    expanded_literal: false,
                                 });
-                                head = value;
+                                (head, args, complete) =
+                                    self.demand(value, &mut memo, &mut continuations)?;
                             }
                             _ => break,
                         }
@@ -249,9 +313,15 @@ impl Engine<'_> {
                     _ => break,
                 }
             }
+            // Cache hits are already weak-head results, even when they are
+            // stuck eliminators. Resume their consumer without re-entering them.
+            complete = false;
             while let Some(continuation) = continuations.pop() {
                 self.meter.tick()?;
                 match continuation {
+                    Continuation::Remember { subject } => {
+                        memo.remember(subject, &head, &args, &mut self.meter)?;
+                    }
                     Continuation::Nat {
                         head: operation_head,
                         arguments: mut outer,
@@ -265,13 +335,14 @@ impl Engine<'_> {
                             values.push(value);
                             if values.len() < operation.arity() {
                                 head = outer[outer.len() - values.len() - 1].clone();
-                                args = Vec::new();
                                 continuations.push(Continuation::Nat {
                                     head: operation_head,
                                     arguments: outer,
                                     operation,
                                     values,
                                 });
+                                (head, args, complete) =
+                                    self.demand(head, &mut memo, &mut continuations)?;
                                 continue 'reduce;
                             }
                             if let Some(value) = self.evaluate_nat(operation, &values)? {
@@ -308,7 +379,21 @@ impl Engine<'_> {
                         structure,
                         index,
                         arguments: outer,
+                        expanded_literal,
                     } => {
+                        if !expanded_literal
+                            && args.is_empty()
+                            && let Some(expanded) = self.string_literal_constructor(&head)?
+                        {
+                            continuations.push(Continuation::Projection {
+                                structure,
+                                index,
+                                arguments: outer,
+                                expanded_literal: true,
+                            });
+                            head = expanded;
+                            continue 'reduce;
+                        }
                         if let Some(field) = crate::records::constructor_field(
                             &self.work.env,
                             &structure,
@@ -324,13 +409,49 @@ impl Engine<'_> {
                         head = Expr::proj(structure, index, head);
                         args = outer;
                     }
+                    Continuation::ClassProjection {
+                        head: projection_head,
+                        arguments: mut outer,
+                        projection,
+                    } => {
+                        if let Some(field) = crate::records::constructor_field(
+                            &self.work.env,
+                            &projection.structure,
+                            projection.index,
+                            &head,
+                            &args,
+                        ) {
+                            outer.truncate(outer.len() - projection.parameters - 1);
+                            head = field;
+                            args = outer;
+                            continue 'reduce;
+                        }
+                        head = projection_head;
+                        args = outer;
+                    }
                     Continuation::Recursor {
                         head: rec_head,
                         recursor,
                         arguments: mut outer,
                         prefix,
                         major,
+                        expanded_literal,
                     } => {
+                        if !expanded_literal
+                            && args.is_empty()
+                            && let Some(expanded) = self.string_literal_constructor(&head)?
+                        {
+                            continuations.push(Continuation::Recursor {
+                                head: rec_head,
+                                recursor,
+                                arguments: outer,
+                                prefix,
+                                major,
+                                expanded_literal: true,
+                            });
+                            head = expanded;
+                            continue 'reduce;
+                        }
                         let reduced =
                             self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?;
                         let reduced = match reduced {
@@ -426,8 +547,9 @@ impl Engine<'_> {
     /// already run. Unfold one permitted side, preferring reducible definitions
     /// and then greater definitional height for ground terms. Each resulting
     /// equation returns to the metered worklist; we never force both complete
-    /// normal forms before comparing them. The pin's further projection,
-    /// matcher and argument-congruence heuristics are not claimed here.
+    /// normal forms before comparing them. Metavariable argument congruence
+    /// has already had its reversible trial before this rung. The pin's further
+    /// projection and matcher heuristics are not claimed here.
     pub(super) fn lazy_delta(
         &mut self,
         left: &Expr,

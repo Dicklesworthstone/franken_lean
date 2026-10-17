@@ -1,7 +1,9 @@
 //! Later argument types unblock earlier higher-order source applications.
 #![forbid(unsafe_code)]
 
-use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckLimits};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name, SourceCheckLimits,
+};
 
 fn limits() -> SourceCheckLimits {
     SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
@@ -25,7 +27,11 @@ fn check(base: &Engine, source: &str) -> Engine {
 }
 
 fn evaluate(source: &str, expected: &str) {
-    let result = engine()
+    evaluate_in(&engine(), source, expected);
+}
+
+fn evaluate_in(base: &Engine, source: &str, expected: &str) {
+    let result = base
         .execute_source_definitions(
             &[source.as_bytes()],
             &KVMap::new(),
@@ -45,6 +51,86 @@ fn evaluate(source: &str, expected: &str) {
 }
 
 const USE: &str = "def use {A : Type} (run : A -> Nat) (value : A) : Nat := run value";
+
+const DEFAULT_CALLABLE: &str = "class Provider (A : Type) where
+  value : A
+def supplied {A : Type} [Provider A] : A := Provider.value
+instance functionProvider : Provider ((n : Nat) -> Nat) :=
+  { value := fun n => n + 22 }";
+
+fn with_default(source: &str, candidate: &str) -> Engine {
+    let base = check(&engine(), source);
+    // Default attributes are imported but not yet accepted by the source
+    // command grammar. Register this already checked candidate through the
+    // same native journal that final source synthesis consumes.
+    let env = fln_elab::instances::defaults::register(
+        base.environment(),
+        &Name::from_components([candidate]),
+        100,
+    )
+    .expect("register the admitted default candidate");
+    Engine::from_environment(env)
+}
+
+#[test]
+fn initially_unknown_root_callees_resume_after_default_synthesis() {
+    let base = with_default(DEFAULT_CALLABLE, "functionProvider");
+    for application in ["f 20", "f (n := 20)"] {
+        // The annotation inserts supplied's implicits before binding f, so
+        // this call starts at an unknown carrier rather than a polymorphic Pi.
+        let source = format!("def result : Nat := let f : _ := supplied; {application}");
+        check(
+            &base,
+            &format!("{source}\ntheorem computes : result = 42 := by rfl"),
+        );
+        evaluate_in(&base, &format!("{source}\n#eval result"), "42");
+    }
+}
+
+#[test]
+fn root_callable_default_synthesis_preserves_resource_stops_and_failure() {
+    let base = with_default(DEFAULT_CALLABLE, "functionProvider");
+    let root = base.logical_root(&KVMap::new());
+    let source = "def result : Nat := by first
+      | exact (let f : _ := supplied; f 20)
+      | exact 0
+    theorem computes : result = 42 := by rfl";
+    check(&base, source);
+    let mut stopped = 0;
+    for steps in [100, 1_000] {
+        let mut low = limits();
+        low.admission.kernel = low.admission.kernel.narrowed(steps, 256);
+        match base.check_source_files(&[source.as_bytes()], &KVMap::new(), low) {
+            Ok(fln::Outcome::Inconclusive(_)) => stopped += 1,
+            Err(error) => {
+                assert!(
+                    matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+                    "steps={steps}: {error:?}"
+                );
+                stopped += 1;
+            }
+            Ok(fln::Outcome::Complete(_)) => {}
+            result => panic!("resource stop swallowed: {result:?}"),
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    assert!(stopped > 0);
+    let nonfunction = "class Provider (A : Type) where
+      value : A
+    def supplied {A : Type} [Provider A] : A := Provider.value
+    instance natProvider : Provider Nat := { value := 42 }";
+    let base = with_default(nonfunction, "natProvider");
+    let root = base.logical_root(&KVMap::new());
+    let error = base
+        .check_source_files(
+            &[b"def bad : Nat := let f : _ := supplied; f 20"],
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("a default value does not turn Nat into a function");
+    assert_eq!(error.disposition().0, "elaboration", "{error:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+}
 
 #[test]
 fn later_values_determine_unannotated_callable_parameters() {

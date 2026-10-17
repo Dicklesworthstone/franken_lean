@@ -102,11 +102,21 @@ use std::process::Command;
 const PIN_TAG: &str = "leanprover--lean4---v4.32.0";
 
 fn pinned_lean() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".elan/toolchains")
-        .join(PIN_TAG)
-        .join("bin/lean");
-    path.is_file().then_some(path)
+    let found = std::env::var("HOME").ok().and_then(|home| {
+        let path = PathBuf::from(home)
+            .join(".elan/toolchains")
+            .join(PIN_TAG)
+            .join("bin/lean");
+        path.is_file().then_some(path)
+    });
+    // The repository's convention for pin-gated tests: where a lane requires the pin, a
+    // missing pin is a failure, never a SKIP that reports ok (bead fln-lst4).
+    assert!(
+        found.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "FLN_REQUIRE_REFERENCE is set and the pinned Reference {PIN_TAG} is absent: \
+         this differential would skip instead of run"
+    );
+    found
 }
 
 // ---------------------------------------------------------------------------

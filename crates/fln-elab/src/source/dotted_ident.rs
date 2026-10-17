@@ -3,9 +3,9 @@
 //!
 //! The namespace of `.c` is read off the expected type:
 //!
-//! 1. `c` must be atomic, and the expected type must be known. The pin postpones while it is
-//!    not; this elaborator has no postponement here, so it refuses where the pin would wait,
-//!    which can refuse a program the pin accepts but never accepts one it rejects;
+//! 1. `c` must be atomic, and the expected type must be known. The application
+//!    worklist postpones the containing argument while a metavariable prevents
+//!    resolving the namespace, preserving the source scope and options;
 //! 2. the expected type is put in weak head normal form *without* unfolding definitions
 //!    (`whnfCore`), and the bodies of its `∀`s are entered (`withForallBody`), so
 //!    `.some : Nat → Option Nat` reads `Option`;
@@ -146,7 +146,10 @@ impl Context {
 
     /// `withForallBody`: `whnfCore`, then the body of every `∀`. A body that still has loose
     /// bound variables is read structurally; only its head is consulted.
-    fn dotted_result_type(&mut self, type_: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(in crate::source) fn dotted_result_type(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let mut type_ = self.whnf_with_transparency(type_, UnificationTransparency::None, false)?;
         while let ExprNode::ForallE { body, .. } = type_.node() {
             self.tick()?;
@@ -217,7 +220,7 @@ impl Context {
     /// `unfoldDefinition?` at the default transparency: when the head is a safe definition
     /// that is not `@[irreducible]`, its value at the head's levels, applied to the head's
     /// arguments.
-    fn unfold_head_definition(
+    pub(super) fn unfold_head_definition(
         &mut self,
         type_: &Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {

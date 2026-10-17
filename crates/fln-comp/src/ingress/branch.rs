@@ -15,6 +15,18 @@ pub struct BoolCaseBinding {
     pub result: fir::ValueType,
 }
 
+/// An untrusted binding for `name major when_zero when_successor`.
+///
+/// Both branches have the closure signature `(Nat) -> result` and receive the
+/// original major premise. The compiler branches directly on its native Nat
+/// representation, including wide naturals. This control operation does not
+/// resolve a source equality function or add an extern contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NatCaseBinding {
+    pub name: Name,
+    pub result: fir::ValueType,
+}
+
 /// All callable inputs to the expression compiler. Empty catalogs preserve the
 /// previous compiler behavior; merely naming a case primitive grants no authority.
 #[derive(Clone, Copy, Default)]
@@ -22,6 +34,7 @@ pub struct CallableBindings<'a> {
     pub functions: &'a [FunctionBinding],
     pub lambdas: &'a [LambdaBinding],
     pub bool_cases: &'a [BoolCaseBinding],
+    pub nat_cases: &'a [NatCaseBinding],
     pub constructor_cases: &'a [ConstructorCaseBinding],
     pub empty_cases: &'a [EmptyCaseBinding],
 }
@@ -33,53 +46,96 @@ pub(super) fn prepare(
     limits: IngressLimits,
 ) -> Result<(), IngressError> {
     for (index, case) in cases.iter().enumerate() {
-        let source_index = source_offset.saturating_add(index);
-        if case.name.is_anonymous() {
-            return Err(IngressError::AnonymousFunctionName {
-                binding: source_index,
-            });
-        }
-        if is_check_system_name(&case.name) {
-            return Err(IngressError::CheckSystemFunctionNameCollision {
-                binding: source_index,
-            });
-        }
-        charge(IngressResource::ContextDepth, 3, limits.max_context_depth)?;
-        let ownership = default_callable_result_ownership(case.result);
-        let closure = catalog
-            .closure_types
-            .iter()
-            .find(|signature| {
-                signature.parameters == [fir::ValueType::Bool]
-                    && signature.parameter_ownership == [ArgumentOwnership::Borrowed]
-                    && signature.result == case.result
-                    && signature.result_ownership == ownership
-            })
-            .ok_or(IngressError::UnsupportedNode {
-                kind: "Boolean case branch signature",
-            })?;
-        let parameters = vec![
+        prepare_case(
+            catalog,
+            &case.name,
+            case.result,
             fir::ValueType::Bool,
-            fir::ValueType::Closure(closure.id),
-            fir::ValueType::Closure(closure.id),
-        ];
-        try_push(
-            &mut catalog.functions,
-            PreparedFunction {
-                source_index,
-                name: case.name.clone(),
-                universe_arity: 0,
-                id: fir::FunctionId::new(0),
-                parameters,
-                parameter_ownership: borrowed_argument_ownership(3)?,
-                result: case.result,
-                result_ownership: ownership,
-                body: PreparedFunctionBody::BoolCase,
-            },
-            IngressResource::ProgramTables,
-            limits.fir.max_functions.saturating_sub(1),
+            source_offset.saturating_add(index),
+            limits,
         )?;
     }
+    Ok(())
+}
+
+pub(super) fn prepare_nat(
+    catalog: &mut PreparedCatalog<'_>,
+    cases: &[NatCaseBinding],
+    source_offset: usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    for (index, case) in cases.iter().enumerate() {
+        prepare_case(
+            catalog,
+            &case.name,
+            case.result,
+            fir::ValueType::Nat,
+            source_offset.saturating_add(index),
+            limits,
+        )?;
+    }
+    Ok(())
+}
+
+fn prepare_case(
+    catalog: &mut PreparedCatalog<'_>,
+    name: &Name,
+    result: fir::ValueType,
+    selector: fir::ValueType,
+    source_index: usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    if name.is_anonymous() {
+        return Err(IngressError::AnonymousFunctionName {
+            binding: source_index,
+        });
+    }
+    if is_check_system_name(name) {
+        return Err(IngressError::CheckSystemFunctionNameCollision {
+            binding: source_index,
+        });
+    }
+    charge(IngressResource::ContextDepth, 3, limits.max_context_depth)?;
+    let ownership = default_callable_result_ownership(result);
+    let closure = catalog
+        .closure_types
+        .iter()
+        .find(|signature| {
+            signature.parameters == [selector]
+                && signature.parameter_ownership == [ArgumentOwnership::Borrowed]
+                && signature.result == result
+                && signature.result_ownership == ownership
+        })
+        .ok_or(IngressError::UnsupportedNode {
+            kind: match selector {
+                fir::ValueType::Nat => "Nat case branch signature",
+                _ => "Boolean case branch signature",
+            },
+        })?;
+    let parameters = vec![
+        selector,
+        fir::ValueType::Closure(closure.id),
+        fir::ValueType::Closure(closure.id),
+    ];
+    try_push(
+        &mut catalog.functions,
+        PreparedFunction {
+            source_index,
+            name: name.clone(),
+            universe_arity: 0,
+            id: fir::FunctionId::new(0),
+            parameters,
+            parameter_ownership: borrowed_argument_ownership(3)?,
+            result,
+            result_ownership: ownership,
+            body: match selector {
+                fir::ValueType::Nat => PreparedFunctionBody::NatCase,
+                _ => PreparedFunctionBody::BoolCase,
+            },
+        },
+        IngressResource::ProgramTables,
+        limits.fir.max_functions.saturating_sub(1),
+    )?;
     Ok(())
 }
 
@@ -179,6 +235,7 @@ mod tests {
                 functions: &[],
                 lambdas: &lambdas,
                 bool_cases: cases,
+                nat_cases: &[],
                 constructor_cases: &[],
                 empty_cases: &[],
             },
@@ -245,3 +302,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod nat_tests;

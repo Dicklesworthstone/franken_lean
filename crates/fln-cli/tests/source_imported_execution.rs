@@ -1,11 +1,18 @@
-//! The installed FlN raw-result front door over actual admitted import bytes.
-//! Reference `#eval` formatting is a different surface: Init.Prelude alone
-//! does not supply Repr/ToString for these natural-number evaluations.
+//! Installed source execution over actual admitted import bytes.
+//! FlN retains its raw result surface; the Lean door selects checked printers.
+//! Init.Prelude alone does not supply Repr/ToString for natural-number evaluations.
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[path = "source_imported_execution/io_printing.rs"]
+mod io_printing;
+#[path = "source_imported_execution/main_run.rs"]
+mod main_run;
+#[path = "source_imported_execution/string_interpolation.rs"]
+mod string_interpolation;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -13,11 +20,17 @@ struct Workspace(PathBuf);
 impl Workspace {
     fn new(case: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "fln-program-{case}-{}-{}",
+            "fln-program-{case}-{}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        // PIDs can recur across sandboxed invocations. Reusing a fixture root
+        // can make a missing-import test accidentally load a previous Init.
+        std::fs::create_dir(&path).unwrap();
         Self(path)
     }
 
@@ -33,7 +46,8 @@ impl Workspace {
 
     fn invoke(&self, verb: &str, entry: &Path, lib: Option<&Path>, extra: &[&str]) -> Run {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
-            .args([verb, "--json"])
+            .args(verb.split_ascii_whitespace())
+            .arg("--json")
             .args(extra)
             .arg(entry)
             .env("LEAN_PATH", lib.unwrap_or(&self.0))
@@ -46,6 +60,16 @@ impl Workspace {
             stderr: String::from_utf8(output.stderr).unwrap(),
         }
     }
+}
+
+// These two installed IO fixtures use the same Lean binary and actual import
+// roots. A serial validation can explicitly share verified admission records;
+// ordinary test invocations retain each workspace's private store.
+fn full_io_records(workspace: &Workspace) -> PathBuf {
+    std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .filter(|directory| directory.is_absolute())
+        .unwrap_or_else(|| workspace.0.join("records"))
 }
 
 #[derive(Debug)]
@@ -112,6 +136,123 @@ fn without_import_report(text: &str) -> String {
     let (before, rest) = text.split_once(",\"oleanImports\":{").unwrap();
     let (_, after) = rest.split_once('}').unwrap();
     format!("{before}{after}")
+}
+
+/// The pin compiles an opaque from its value unless a companion, extern or init
+/// attribute selects another implementation (`Compiler/LCNF/ToDecl.lean`, `toDecl`).
+/// With `import Init` and `Left.lean` built by the pin, `opaque own : Nat := 5`,
+/// `opaque left : Nat := 20` and the value-less `opaque bare : Nat` evaluate to 5, 20
+/// and 0 there (measured 2026-10-11). Source opaques and fully admitted imported
+/// opaques run their stored values when complete initializer journals rule out
+/// initialization. This legacy artifact carries its complete empty journals in
+/// one file; initialized globals and incomplete module-system artifacts remain
+/// refused by the importer/runtime controls in `source_implemented_by`.
+#[test]
+fn source_and_fully_admitted_imported_opaques_execute_their_stored_values() {
+    let Some(lib) = pinned_lib() else { return };
+    let ws = Workspace::new("opaque-values");
+    ws.write(
+        "Left.lean",
+        "prelude\nimport Init.Prelude\nopaque left : Nat := 20\nopaque bare : Nat\n",
+    );
+    let main = ws.write(
+        "Main.lean",
+        "prelude\nimport Left\nopaque own : Nat := 5\n#eval own\n#eval left\n#eval bare\n",
+    );
+    let ran = ws.run(&main, Some(&lib), &[]);
+    let text = ran.complete();
+    for (command, value) in [(1, 5), (2, 20), (3, 0)] {
+        assert!(
+            text.contains(&format!(
+                "\"command\":{command},\"event\":\"evaluation\",\"kind\":\"nat\",\"value\":{value},"
+            )),
+            "{text}"
+        );
+    }
+
+    let name = |text: &str| fln::Name::from_components(text.split('.'));
+    let left = fln::ConstantInfo::Opaque(fln::OpaqueVal {
+        base: fln::ConstantVal {
+            name: name("left"),
+            level_params: vec![],
+            type_: fln::Expr::const_(name("Nat"), vec![]),
+        },
+        value: fln::Expr::lit(fln::Literal::Nat(fln::NatLit::from_u64(20))),
+        is_unsafe: false,
+        all: vec![name("left")],
+    });
+    let bytes = fln::encode_olean_module(
+        fln::OleanModuleWriteInput {
+            is_module: false,
+            imports: &[fln::OleanModuleImport {
+                module: name("Init.Prelude"),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            }],
+            constants: &[left],
+            extra_const_names: &[],
+        },
+        fln::OleanWriteHeader {
+            version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+            flags: 1,
+            lean_version: fln::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+            githash: fln::OLEAN_PIN_COMMIT,
+            base_addr: 2 * fln::OLEAN_REGION_ALIGN as u64,
+        },
+        fln::OleanWriteBudget::default(),
+    )
+    .unwrap()
+    .bytes;
+    let artifact = Workspace::new("opaque-artifact");
+    let objects = artifact.0.join("objects");
+    std::fs::create_dir(&objects).unwrap();
+    std::fs::write(objects.join("Left.olean"), bytes).unwrap();
+    let search = PathBuf::from(std::env::join_paths([objects, lib]).unwrap());
+    let main = artifact.write(
+        "Main.lean",
+        "prelude\nimport Left\n#eval (3 : Nat)\n#eval left\n",
+    );
+    let ran = artifact.run(&main, Some(&search), &[]);
+    let text = ran.complete();
+    for (command, value) in [(0, 3), (1, 20)] {
+        assert!(
+            text.contains(&format!(
+                "\"command\":{command},\"event\":\"evaluation\",\"kind\":\"nat\",\"value\":{value},"
+            )),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn caller_execution_ceilings_apply_after_real_import_admission() {
+    let Some(lib) = pinned_lib() else { return };
+    let ws = Workspace::new("imported-execution-limits");
+    let main = ws.write(
+        "Main.lean",
+        "prelude\nimport Init.Prelude\n#check Nat\n#eval id (42 : Nat)\n",
+    );
+    let completed = ws.run(
+        &main,
+        Some(&lib),
+        &["--jobs=1", "--fln-max-steps=10000", "--fln-max-frames=128"],
+    );
+    let text = completed.complete();
+    assert!(
+        text.contains("\"schema\":\"fln.source-program/1\""),
+        "{text}"
+    );
+    assert!(text.contains("\"value\":42"), "{text}");
+    for (flag, reason) in [
+        ("--fln-max-steps=0", "ExecutionSteps"),
+        ("--fln-max-frames=0", "RecursionDepth"),
+    ] {
+        let stopped = ws.run(&main, Some(&lib), &["--jobs=1", flag]);
+        let stderr = stopped.refused("inconclusive", 3);
+        assert!(stderr.contains("\"authority\":false"), "{stopped:?}");
+        assert!(stderr.contains(reason), "{stopped:?}");
+    }
 }
 
 #[test]
@@ -259,7 +400,11 @@ fn prelude_is_an_empty_world_and_local_legacy_runs_keep_their_contract() {
     assert!(text.contains("\"executions\":0"), "{text}");
     ws.write("Main.lean", "prelude\n#check Nat\n");
     let unknown = ws.run(&main, None, &[]);
-    assert!(unknown.refused("input", 1).contains("\"authority\":false"));
+    // The pin, in this empty world: `error(lean.unknownIdentifier): Unknown identifier `Nat``
+    // (v4.32.0, 2026-10-12), an elaboration refusal.
+    let refused = unknown.refused("elaboration", 1);
+    assert!(refused.contains("\"authority\":false"), "{refused}");
+    assert!(refused.contains("Unknown identifier `Nat`"), "{refused}");
 
     ws.write("Local.lean", "prelude\ninductive Token where\n  | mk\n");
     ws.write("Main.lean", "prelude\nimport Local\n#check Token\n");
@@ -374,20 +519,784 @@ fn imports_limits_original_offsets_and_publication_refusals_are_atomic() {
         "Main.lean",
         "prelude\ninductive Token where\n  | mk\n#check Token\n",
     );
-    for (option, name) in [
-        ("--emit-flbc", "result.flbc"),
-        ("--emit-olean-snapshot", "result.olean"),
+    for (option, name, class, code, detail) in [
+        (
+            "--emit-flbc",
+            "result.flbc",
+            "execution",
+            1,
+            "entry module has no executed",
+        ),
+        (
+            "--emit-olean-snapshot",
+            "result.olean",
+            "capability",
+            5,
+            "snapshot publication",
+        ),
     ] {
         let path = ws.0.join(name);
         let emitted = ws.run(&main, None, &[option, path.to_str().unwrap()]);
-        assert!(
-            emitted
-                .refused("capability", 5)
-                .contains("artifact publication")
-        );
+        assert!(emitted.refused(class, code).contains(detail));
         assert!(!path.exists(), "a refused program must not publish {name}");
     }
     ws.run(&main, None, &[]).complete();
+}
+
+/// Build an actual standalone .olean with the installed producer, then import
+/// its checked declarations through the ordinary module admission path. No
+/// Reference installation or synthetic import receipt is needed for this case.
+fn compiled_export_library(workspace: &Workspace) -> PathBuf {
+    let source = workspace.write("Producer.lean", "def double (n : Nat) : Nat := Nat.add n n\ndef importedAnswer (n : Nat) : Nat := Nat.add (double n) 2\ndef finalValue : Nat := 0\n");
+    let library = workspace.0.join("External.olean");
+    workspace
+        .run(
+            &source,
+            None,
+            &["--emit-olean-snapshot", library.to_str().unwrap()],
+        )
+        .complete();
+    library
+}
+
+#[test]
+fn imported_flbc_and_sidecar_survive_without_sources_or_import_artifacts() {
+    let workspace = Workspace::new("imported-artifact-closure");
+    let library = compiled_export_library(&workspace);
+    workspace.write(
+        "Left.lean",
+        "prelude\nimport External\ndef left (n : Nat) : Nat := importedAnswer n\n",
+    );
+    let right_source = "prelude\nimport External\ndef right : Nat := 3\n";
+    workspace.write("Right.lean", right_source);
+    let source = "prelude\nimport Left\nimport Right\n#eval Nat.add (left 20) right\n";
+    let entry = workspace.write("Main.lean", source);
+    let produce = |label: &str| {
+        let product = workspace.0.join(format!("{label}.flbc"));
+        let sidecar = workspace.0.join(format!("{label}.sidecar"));
+        let run = workspace.run(
+            &entry,
+            None,
+            &[
+                "--emit-flbc",
+                product.to_str().unwrap(),
+                "--emit-sidecar",
+                sidecar.to_str().unwrap(),
+                "--jobs=1",
+            ],
+        );
+        let output = run.complete();
+        assert!(output.contains("\"value\":45"), "{run:?}");
+        assert!(
+            output.contains("\"emittedFlbc\":{") && output.contains("\"emittedSidecar\":{"),
+            "{run:?}"
+        );
+        assert!(
+            output.contains("\"module\":\"Main\",\"command\":0"),
+            "{run:?}"
+        );
+        assert!(output.contains("\"profile\":\"standard\""), "{run:?}");
+        (product, sidecar)
+    };
+    let (product, sidecar) = produce("first");
+    let first_product = std::fs::read(&product).unwrap();
+    let first_sidecar = std::fs::read(&sidecar).unwrap();
+    let (repeat_product, repeat_sidecar) = produce("repeat");
+    assert_eq!(std::fs::read(repeat_product).unwrap(), first_product);
+    assert_eq!(std::fs::read(repeat_sidecar).unwrap(), first_sidecar);
+
+    // An unchanged answer is not an unchanged source closure. A sibling's
+    // comment leaves the compiled code alone but changes the input binding.
+    workspace.write(
+        "Right.lean",
+        format!("{right_source}-- retained sibling input\n"),
+    );
+    let (changed_product, changed_sidecar) = produce("changed-source");
+    assert_eq!(std::fs::read(changed_product).unwrap(), first_product);
+    let changed =
+        fln::decode_flbc_product_sidecar(&std::fs::read(changed_sidecar).unwrap()).unwrap();
+    let original = fln::decode_flbc_product_sidecar(&first_sidecar).unwrap();
+    assert_ne!(changed.closure_root(), original.closure_root());
+    assert_eq!(changed.product_root(), original.product_root());
+
+    // The consumer gets no usable source or imported artifact. Every called
+    // imported definition has to be retained inside the validated bytecode.
+    workspace.write("Main.lean", "deliberately malformed source");
+    workspace.write("Left.lean", "deliberately malformed source");
+    workspace.write("Right.lean", "deliberately malformed source");
+    std::fs::write(&library, b"deliberately malformed imported artifact").unwrap();
+    let consume = workspace.invoke(
+        "flbc run",
+        &product,
+        None,
+        &["--sidecar", sidecar.to_str().unwrap()],
+    );
+    let output = consume.complete();
+    assert!(
+        output.contains("\"returnValue\":45") && output.contains("\"verified\":true"),
+        "{consume:?}"
+    );
+    let unbound = workspace.invoke("flbc run", &product, None, &[]);
+    assert!(unbound.complete().contains("\"returnValue\":45"));
+
+    let mut corrupt = first_product.clone();
+    corrupt[0] ^= 1;
+    let corrupted = workspace.write("corrupted.flbc", corrupt);
+    let refused = workspace.invoke(
+        "flbc run",
+        &corrupted,
+        None,
+        &["--sidecar", sidecar.to_str().unwrap()],
+    );
+    assert!(refused.refused("sidecar", 1).contains("product"));
+    assert!(
+        workspace
+            .invoke(
+                "flbc run",
+                &product,
+                None,
+                &["--sidecar", sidecar.to_str().unwrap()]
+            )
+            .complete()
+            .contains("\"returnValue\":45")
+    );
+}
+
+#[test]
+fn imported_artifact_publication_keeps_failed_sources_and_existing_outputs_atomic() {
+    let workspace = Workspace::new("imported-artifact-refusals");
+    compiled_export_library(&workspace);
+    let source = "prelude\nimport External\n#eval importedAnswer 20\n";
+    let entry = workspace.write("Main.lean", source);
+    let product = workspace.0.join("result.flbc");
+    let sidecar = workspace.0.join("result.sidecar");
+    let emit = [
+        "--emit-flbc",
+        product.to_str().unwrap(),
+        "--emit-sidecar",
+        sidecar.to_str().unwrap(),
+    ];
+    workspace.write("Main.lean", format!("{source}def broken : Nat := absent\n"));
+    let late = workspace.run(&entry, None, &emit);
+    assert_ne!(late.code, 0, "{late:?}");
+    assert!(late.stdout.is_empty(), "{late:?}");
+    assert!(!product.exists() && !sidecar.exists());
+
+    workspace.write("Main.lean", source);
+    let mut limits = emit.to_vec();
+    limits.push("--fln-max-steps=0");
+    workspace
+        .run(&entry, None, &limits)
+        .refused("inconclusive", 3);
+    assert!(!product.exists() && !sidecar.exists());
+
+    // `#guard_msgs` is syntax `Init.Notation` declares, which this `.olean` world does not
+    // reach: the pin reads an unknown token there ("expected token", exit 1), and so does this
+    // door (111d5cc2), a parse refusal at the `#guard_msgs`. Either way nothing is published.
+    workspace.write(
+        "Main.lean",
+        "prelude\nimport External\n/-- info: 999 -/\n#guard_msgs in\n#eval (42 : Nat)\n",
+    );
+    assert!(
+        workspace
+            .run(&entry, None, &emit)
+            .refused("input", 1)
+            .contains("parse refused source")
+    );
+    assert!(!product.exists() && !sidecar.exists());
+
+    workspace.write(
+        "Dependency.lean",
+        "prelude\nimport External\n#eval (7 : Nat)\n",
+    );
+    workspace.write("Main.lean", "prelude\nimport Dependency\n#check Nat\n");
+    assert!(
+        workspace
+            .run(&entry, None, &emit)
+            .refused("execution", 1)
+            .contains("entry module has no executed")
+    );
+    assert!(
+        !product.exists() && !sidecar.exists(),
+        "a dependency's execution is not the entry product"
+    );
+
+    workspace.write("Main.lean", source);
+    workspace.write("result.flbc", b"existing product");
+    workspace.run(&entry, None, &emit).refused("output", 1);
+    assert_eq!(std::fs::read(&product).unwrap(), b"existing product");
+    assert!(
+        !sidecar.exists(),
+        "known product collision must not publish a sidecar"
+    );
+    let fresh_product = workspace.0.join("fresh.flbc");
+    workspace.write("result.sidecar", b"existing sidecar");
+    workspace
+        .run(
+            &entry,
+            None,
+            &[
+                "--emit-flbc",
+                fresh_product.to_str().unwrap(),
+                "--emit-sidecar",
+                sidecar.to_str().unwrap(),
+            ],
+        )
+        .refused("output", 1);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"existing sidecar");
+    assert!(!fresh_product.exists());
+    let fresh_sidecar = workspace.0.join("fresh.sidecar");
+    workspace
+        .run(
+            &entry,
+            None,
+            &[
+                "--emit-flbc",
+                fresh_product.to_str().unwrap(),
+                "--emit-sidecar",
+                fresh_sidecar.to_str().unwrap(),
+            ],
+        )
+        .complete();
+    assert!(fresh_product.is_file() && fresh_sidecar.is_file());
+}
+
+#[test]
+fn pinned_prelude_imports_can_publish_replayable_bytecode_and_a_verified_sidecar() {
+    let Some(library) = pinned_lib() else { return };
+    let workspace = Workspace::new("pinned-import-artifact");
+    let entry = workspace.write(
+        "Main.lean",
+        "prelude\nimport Init.Prelude\ndef answer : Nat := id 42\n#eval answer\n",
+    );
+    let product = workspace.0.join("pinned.flbc");
+    let sidecar = workspace.0.join("pinned.sidecar");
+    let emitted = workspace.run(
+        &entry,
+        Some(&library),
+        &[
+            "--emit-flbc",
+            product.to_str().unwrap(),
+            "--emit-sidecar",
+            sidecar.to_str().unwrap(),
+            "--jobs=1",
+        ],
+    );
+    assert!(emitted.complete().contains("\"value\":42"));
+    let replayed = workspace.invoke(
+        "flbc run",
+        &product,
+        None,
+        &["--sidecar", sidecar.to_str().unwrap()],
+    );
+    assert!(replayed.complete().contains("\"returnValue\":42"));
+    assert!(replayed.stdout.contains("\"verified\":true"));
+}
+
+/// `#synth C` prints the instance the pin's `synthInstance` finds, bare (`logInfo val`), named as
+/// the delaborator names it; an instance that cannot be found is refused, as the pin refuses
+/// it ("failed to synthesize", exit 1). The expected text is the pinned v4.32.0's stdout for
+/// the same file (2026-10-12).
+#[test]
+fn synth_prints_the_instance_it_finds() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-synth");
+    let found = workspace.write(
+        "Synth.lean",
+        "prelude\nimport Init.Core\n#synth Inhabited Nat\n#synth Inhabited (List Nat)\n\
+         #synth BEq Nat\n#synth Add Nat\n#synth Decidable (2 = 3)\n",
+    );
+    let ours = lean_door(&workspace, &found, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            "instInhabitedNat\ninstInhabitedList\ninstBEqOfDecidableEq\ninstAddNat\n\
+             instDecidableEqNat 2 3\n",
+            ""
+        ),
+        "{ours:?}"
+    );
+    let missing = workspace.write(
+        "Missing.lean",
+        "prelude\nimport Init.Core\n#synth Inhabited Empty\n",
+    );
+    let refused = lean_door(&workspace, &missing, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
+/// `#print` (`Lean/Elab/Print.lean`) for constants the file declares: the header with its
+/// attributes (`@[reducible]` for an `abbrev`, `@[defeq]` for a `:= rfl` body), the value after
+/// `:=` and a line, an inductive's constructors, a string, and `#print axioms`. The values also
+/// pin the printer: `{α}` for an implicit `fun` binder, a proof under `fun` shown in full (the
+/// root is a proof), no field notation on a theorem (`Nat.add_zero n`) but through `@&`
+/// (`n.pred`), `∀` binders named per RFC #1834, and `↑` for `Init`'s `@[coe]` functions.
+/// The expected text is the pinned v4.32.0's stdout for the same file
+/// (2026-10-12). A constant the door cannot print the pin's way (here, a structure instance) is
+/// refused, never printed otherwise.
+#[test]
+fn print_shows_declarations_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-print");
+    let shown = workspace.write(
+        "Print.lean",
+        "prelude\nimport Init.Core\n\
+         universe u\n\
+         def ident {α : Sort u} (a : α) : α := a\n\
+         def double (n : Nat) : Nat := n + n\n\
+         theorem double_zero : double 0 = 0 := rfl\n\
+         theorem by_tac (p : Prop) (h : p) : p := by exact h\n\
+         abbrev Two : Nat := 2\n\
+         @[irreducible] def hid : Nat := 5\n\
+         axiom Magic : Nat\n\
+         opaque secret : Nat\n\
+         inductive Vec (α : Type u) : Nat → Type u where\n\
+         \x20 | nil : Vec α 0\n\
+         \x20 | cons (a : α) {n : Nat} (v : Vec α n) : Vec α (n + 1)\n\
+         protected def Vec.pick : Nat := 0\n\
+         theorem keep (p q : Prop) (h : p) (k : p → q) : q := k h\n\
+         theorem nz (n : Nat) : n + 0 = n := Nat.add_zero n\n\
+         def prev (n : Nat) : Nat := Nat.pred n\n\
+         #print ident\n#print sig double\n#print double_zero\n#print by_tac\n#print Two\n\
+         #print hid\n#print Magic\n#print secret\n#print Vec\n#print Vec.pick\n\
+         #print keep\n#print nz\n#print prev\n\
+         #print \"hello there\"\n#print axioms double\n#print axioms Magic\n",
+    );
+    let ours = lean_door(&workspace, &shown, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            "def ident.{u} : {α : Sort u} → α → α :=\nfun {α} a => a\n\
+             def double : Nat → Nat\n\
+             @[defeq] theorem double_zero : double 0 = 0 :=\nrfl\n\
+             theorem by_tac : ∀ (p : Prop), p → p :=\nfun p h => h\n\
+             @[reducible] def Two : Nat :=\n2\n\
+             @[irreducible] def hid : Nat :=\n5\n\
+             axiom Magic : Nat\n\
+             opaque secret : Nat\n\
+             inductive Vec.{u} : Type u → Nat → Type u\nnumber of parameters: 1\n\
+             constructors:\nVec.nil : {α : Type u} → Vec α 0\n\
+             Vec.cons : {α : Type u} → α → {n : Nat} → Vec α n → Vec α (n + 1)\n\
+             protected def Vec.pick : Nat :=\n0\n\
+             theorem keep : ∀ (p q : Prop), p → (p → q) → q :=\nfun p q h k => k h\n\
+             theorem nz : ∀ (n : Nat), n + 0 = n :=\nfun n => Nat.add_zero n\n\
+             def prev : Nat → Nat :=\nfun n => n.pred\n\
+             hello there\n\
+             'double' does not depend on any axioms\n\
+             'Magic' depends on axioms: [Magic]\n",
+            ""
+        ),
+        "{ours:?}"
+    );
+    // In a proposition an explicit binder whose domain is not a proposition keeps its name
+    // (RFC #1834); outside one, or over a proposition, it is an arrow.
+    let binders = workspace.write(
+        "Binders.lean",
+        "prelude\nimport Init.Core\nset_option linter.unusedVariables false\n\
+         def natToType : Nat → Type := fun _ => Nat\n\
+         theorem a1 (n : Nat) (elem : natToType n) (c : Char) : n = n := rfl\n\
+         theorem a2 : ∀ (n : Nat), Nat → n = n := fun n _ => rfl\n\
+         theorem a3 (p : Prop) (h : p) (k : Nat) : p := h\n\
+         theorem a4 (n m : Nat) (h : n = m) : m = n := h.symm\n\
+         def a5 (n : Nat) (k : Nat → Prop) : Prop := k n\n\
+         #check @a1\n#check @a2\n#check @a3\n#check @a4\n#check @a5\n\
+         #check ∀ (x : Nat) (y : Nat), x = y\n#check (Nat → Nat) → True\n",
+    );
+    let named = lean_door(&workspace, &binders, &lib);
+    assert_eq!(
+        (named.code, named.stdout.as_str()),
+        (
+            0,
+            "a1 : ∀ (n : Nat) (elem : natToType n) (c : Char), n = n\n\
+             a2 : ∀ (n a : Nat), n = n\n\
+             a3 : ∀ (p : Prop), p → ∀ (k : Nat), p\n\
+             a4 : ∀ (n m : Nat), n = m → m = n\n\
+             a5 : Nat → (Nat → Prop) → Prop\n\
+             ∀ (x y : Nat), x = y : Prop\n\
+             ∀ (a : Nat → Nat), True : Prop\n"
+        ),
+        "{named:?}"
+    );
+    // A function the pinned `Init` registers with `@[coe]` is `↑x` (`coeDelaborator`).
+    let coercions = workspace.write(
+        "Coercions.lean",
+        "prelude\nimport Init.Data.Int.Basic\n\
+         def f1 (a : Int) (b c : Nat) : Int := a + (b - c)\n\
+         def f2 (a : Int) (b c : Nat) : Int := b - c + a\n\
+         #print f1\n#print f2\n#check fun (n : Nat) => (n : Int)\n",
+    );
+    let coerced = lean_door(&workspace, &coercions, &lib);
+    assert_eq!(
+        (coerced.code, coerced.stdout.as_str()),
+        (
+            0,
+            "def f1 : Int → Nat → Nat → Int :=\nfun a b c => a + (↑b - ↑c)\n\
+             def f2 : Int → Nat → Nat → Int :=\nfun a b c => ↑b - ↑c + a\n\
+             fun n => ↑n : Nat → Int\n"
+        ),
+        "{coerced:?}"
+    );
+    // Axioms sort by `Name.cmp`, prefixes first: `aa` before `Ba.x`, which a sort of the
+    // printed names would invert.
+    let axioms = workspace.write(
+        "Axioms.lean",
+        "prelude\nimport Init.Core\naxiom Ba.x : Nat\naxiom aa : Nat\n\
+         theorem both : Ba.x + aa = Ba.x + aa := rfl\n#print axioms both\n",
+    );
+    let sorted = lean_door(&workspace, &axioms, &lib);
+    assert_eq!(
+        (sorted.code, sorted.stdout.as_str()),
+        (0, "'both' depends on axioms: [aa, Ba.x]\n"),
+        "{sorted:?}"
+    );
+    // A labeled `sorryAx (Lean.Name → Nat) false tag` is `sorry` (`delabSorry`).
+    let sorry = workspace.write(
+        "Sorry.lean",
+        "prelude\nimport Init.Core\ndef later : Nat := sorry\n#print later\n",
+    );
+    let printed = lean_door(&workspace, &sorry, &lib);
+    assert_eq!(printed.code, 0, "{printed:?}");
+    assert!(
+        printed
+            .stdout
+            .ends_with(":3:4: warning: declaration uses `sorry`\ndef later : Nat :=\nsorry\n"),
+        "{printed:?}"
+    );
+    // An imported constant's `defeq` and `meta` tags are not decoded, so its header is refused;
+    // the pin prints `@[defeq] protected theorem Nat.add_zero : ∀ (n : Nat), n + 0 = n`.
+    let imported = workspace.write(
+        "Imported.lean",
+        "prelude\nimport Init.Core\n#print sig Nat.add_zero\n",
+    );
+    let refused_import = lean_door(&workspace, &imported, &lib);
+    assert_eq!(refused_import.code, 5, "{refused_import:?}");
+    assert!(refused_import.stdout.is_empty(), "{refused_import:?}");
+    // The pin prints `{ default := 7 }`; this door does not reproduce structure instances.
+    let instance = workspace.write(
+        "Instance.lean",
+        "prelude\nimport Init.Core\ninstance foo : Inhabited Nat := ⟨7⟩\n#print foo\n",
+    );
+    let refused = lean_door(&workspace, &instance, &lib);
+    assert_eq!(refused.code, 5, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
+/// `#exit` is the pin's terminal command (`elabExit`, `Parser.isTerminalCommand`): it warns
+/// and the file ends there. The pinned binary beside the library is compared when present.
+#[test]
+fn exit_stops_the_file_with_the_pins_warning() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-exit");
+    // Nothing after `#exit` is read, not even text no grammar parses; a comment naming it
+    // is not it.
+    let entry = workspace.write(
+        "Main.lean",
+        "prelude\ninductive T where | a\n-- a comment that mentions #exit\n#exit\n\
+         def broken : T := nonsense ((\n",
+    );
+    let file = entry.display();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            format!("{file}:4:0: warning: using 'exit' to interrupt Lean\n").as_str(),
+            ""
+        ),
+        "{ours:?}"
+    );
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    match pinned {
+        Some(pinned) => {
+            let theirs = Command::new(pinned)
+                .arg(&entry)
+                .env("LEAN_PATH", &lib)
+                .output()
+                .expect("run the pinned lean");
+            assert!(theirs.status.success(), "{theirs:?}");
+            assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+        }
+        None => eprintln!("SKIP: no pinned lean beside the library; stdout was not compared"),
+    }
+}
+
+/// `sorry` elaborates to the pin's `sorryAx (Lean.Name → T) false tag` and every declaration
+/// that uses it is admitted with the pin's warning, positioned at the declared name, or at the
+/// keyword for an `example`, an anonymous instance and a structure; `warn.sorry false` silences
+/// it. The expected bytes are the pinned v4.32.0's on this file (measured 2026-10-11), and the
+/// pinned binary beside the library is compared again when present. `check-source` prints no
+/// warnings, so it counts the declarations instead.
+#[test]
+fn sorry_is_admitted_with_the_pins_warnings() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-sorry");
+    let entry = workspace.write(
+        "Main.lean",
+        "prelude\nimport Init.Prelude\nexample : Eq 1 2 := sorry\nclass C where\n  x : Nat\n\
+         instance : C := sorry\n/-- doc -/\nprotected def Foo.bar : Nat := sorry\n\
+         set_option warn.sorry false in\ntheorem quiet : Eq 1 2 := sorry\n\
+         instance named : C := sorry\ntheorem two : Eq 2 2 := Eq.refl 2\n\
+         structure S where\n  x : Nat := sorry\n",
+    );
+    let file = entry.display();
+    let expected: String = ["3:0", "6:0", "8:14", "11:9", "13:0"]
+        .iter()
+        .map(|at| format!("{file}:{at}: warning: declaration uses `sorry`\n"))
+        .collect();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stderr.as_str()), (0, ""), "{ours:?}");
+    assert_eq!(ours.stdout, expected);
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    match pinned {
+        Some(pinned) => {
+            let theirs = Command::new(pinned)
+                .arg(&entry)
+                .env("LEAN_PATH", &lib)
+                .output()
+                .expect("run the pinned lean");
+            assert!(theirs.status.success(), "{theirs:?}");
+            assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+        }
+        None => eprintln!("SKIP: no pinned lean beside the library; stdout was not compared"),
+    }
+    // `instC`, `Foo.bar`, `quiet` (silenced, still a use), `named` and `S.x`'s default.
+    let checked = workspace.invoke("check-source", &entry, Some(&lib), &[]);
+    assert_eq!(checked.code, 0, "{checked:?}");
+    assert!(
+        checked
+            .stdout
+            .contains("\"theorems\":2,\"axioms\":0,\"sorryDeclarations\":5,"),
+        "{checked:?}"
+    );
+    // Each `sorry` is its own term: two of them are not definitionally equal, at the pin too.
+    let distinct = workspace.write(
+        "Distinct.lean",
+        "prelude\nimport Init.Prelude\nexample : Eq (sorry : Nat) sorry := Eq.refl _\n",
+    );
+    let refused = lean_door(&workspace, &distinct, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
+/// The tactic `sorry` is `macro "sorry" : tactic => `(tactic| exact sorry)` in
+/// `Init/Tactics.lean`: where the imports reach it, `by sorry` warns as the term does (the pin's
+/// bytes, measured 2026-10-11, and compared again with the pinned binary when present); where they
+/// stop at `Init.Prelude` the pin reads `sorry` as an unexpected token, and this door refuses it.
+#[test]
+fn the_sorry_tactic_exists_where_init_tactics_is_imported() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-sorry-tactic");
+    let body = "theorem u : Eq 2 2 := by sorry\ntheorem v : Eq 2 3 := by\n  sorry\n";
+    let entry = workspace.write(
+        "Tactics.lean",
+        format!("prelude\nimport Init.Tactics\n{body}"),
+    );
+    let file = entry.display();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stderr.as_str()), (0, ""), "{ours:?}");
+    assert_eq!(
+        ours.stdout,
+        format!(
+            "{file}:3:8: warning: declaration uses `sorry`\n\
+             {file}:4:8: warning: declaration uses `sorry`\n"
+        )
+    );
+    if let Some(pinned) = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file())
+    {
+        let theirs = Command::new(pinned)
+            .arg(&entry)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .expect("run the pinned lean");
+        assert!(theirs.status.success(), "{theirs:?}");
+        assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+    }
+    let unreached = workspace.write(
+        "Prelude.lean",
+        format!("prelude\nimport Init.Prelude\n{body}"),
+    );
+    let refused = lean_door(&workspace, &unreached, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.contains("Lean.Parser.Tactic.tacticSorry"),
+        "{refused:?}"
+    );
+}
+
+/// `admit` is `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`): it warns as
+/// the tactic `sorry` does where the imports reach it (the pin's bytes, compared with the pinned
+/// binary when present), and is refused where they stop at `Init.Prelude`.
+#[test]
+fn the_admit_tactic_is_the_sorry_tactic() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-admit-tactic");
+    let body = "theorem u : Eq 2 2 := by admit\ntheorem v : Eq 2 3 := by\n  admit\n";
+    let entry = workspace.write(
+        "Tactics.lean",
+        format!("prelude\nimport Init.Tactics\n{body}"),
+    );
+    let file = entry.display();
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stderr.as_str()), (0, ""), "{ours:?}");
+    assert_eq!(
+        ours.stdout,
+        format!(
+            "{file}:3:8: warning: declaration uses `sorry`\n\
+             {file}:4:8: warning: declaration uses `sorry`\n"
+        )
+    );
+    if let Some(pinned) = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file())
+    {
+        let theirs = Command::new(pinned)
+            .arg(&entry)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .expect("run the pinned lean");
+        assert!(theirs.status.success(), "{theirs:?}");
+        assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+    }
+    let unreached = workspace.write(
+        "Prelude.lean",
+        format!("prelude\nimport Init.Prelude\n{body}"),
+    );
+    let refused = lean_door(&workspace, &unreached, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+}
+
+/// `#guard_msgs` is syntax `Init/Notation.lean` declares. A `prelude` file whose imports reach
+/// it judges its guard (the pin passes this one and prints nothing); one whose imports stop at
+/// `Init.Prelude` is refused, as the pin refuses it ("expected token", exit 1). Before the
+/// check, this door judged the guard there too and passed it.
+#[test]
+fn guard_msgs_exists_only_where_init_notation_is_imported() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-guard-world");
+    let body =
+        "/-- warning: declaration uses `sorry` -/\n#guard_msgs in\ntheorem t : Eq 1 2 := sorry\n";
+    let reached = workspace.write(
+        "Reached.lean",
+        format!("prelude\nimport Init.Notation\n{body}"),
+    );
+    let ours = lean_door(&workspace, &reached, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (0, "", ""),
+        "{ours:?}"
+    );
+    let unreached = workspace.write(
+        "Unreached.lean",
+        format!("prelude\nimport Init.Prelude\n{body}"),
+    );
+    let refused = lean_door(&workspace, &unreached, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.contains("parse refused source") && refused.stderr.contains("byte 69"),
+        "{refused:?}"
+    );
+}
+
+/// A decidable proposition where a `Bool` is expected is `decide p` (`decPropToBool`,
+/// `Init/Coe.lean`), also while a numeral's type is still open: the pin postpones such a
+/// coercion until the default instance fixes it (`mkCoe`'s `.undef`). Before that
+/// postponement this door refused `(2 = 1 + 1 : Bool)` with a type mismatch. Each file was
+/// run through the pin first.
+#[test]
+fn decidable_propositions_coerce_to_bool() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-decide-coercion");
+    let decide = workspace.write(
+        "Decide.lean",
+        "prelude\nimport Init.Core\ndef b : Bool := (2 = 1 + 1 : Bool)\n\
+         theorem b_true : b = true := rfl\ndef w : Bool := (2 = 3 : Bool)\n\
+         theorem w_false : w = false := rfl\n",
+    );
+    let ours = lean_door(&workspace, &decide, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (0, "", ""),
+        "{ours:?}"
+    );
+    // `p` is a definition with no `Decidable` instance: the pin's type mismatch.
+    let opaque = workspace.write(
+        "Opaque.lean",
+        "prelude\nimport Init.Core\ndef p : Prop := 2 = 1 + 1\ndef bad : Bool := (p : Bool)\n",
+    );
+    let refused = lean_door(&workspace, &opaque, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stderr.contains("Type mismatch"), "{refused:?}");
+    // An overloaded `foo` against `Bool`: `A.foo 2 : Prop`, whose numeral still waits for its
+    // default instance, is no interpretation, as at the pin (it accepts, through `B.foo`). The
+    // pin keeps a delayed coercion only as a sole success, so an overload trial does not
+    // postpone one; one that did would read as a second success, "Ambiguous term".
+    let overloaded = workspace.write(
+        "Overloaded.lean",
+        "prelude\nimport Init.Core\nnamespace A\ndef foo {α : Type} (_ : α) : Prop := True\n\
+         end A\nnamespace B\ndef foo (n : Nat) : Bool := n == 2\nend B\nopen A B\n\
+         def t : Bool := foo 2\ntheorem t_true : t = true := rfl\n",
+    );
+    let ours = lean_door(&workspace, &overloaded, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (0, "", ""),
+        "{ours:?}"
+    );
+}
+
+/// `#check` names a constant in a term as the pin's delaborator does (`unresolveNameGlobal`):
+/// by the shortest spelling that resolves back to it, so an `export`ed one by its alias
+/// (`Option.some` is `some`, `Decidable.decide` is `decide`, and `Lean.MonadRef.getRef`, exported
+/// inside `namespace Lean`, is `Lean.getRef`), and one the current namespace or an `open`
+/// reaches by its suffix. A signature still heads with the whole name. `!`, `&&`,
+/// `||` and `!=` print as their notations. The expected text is the pinned `lean`'s stdout
+/// for the same file (2026-10-11).
+#[test]
+fn check_prints_names_the_way_they_resolve() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-check-names");
+    let file = workspace.write(
+        "Names.lean",
+        "prelude\nimport Init.Core\n#check some 3\n#check (none : Option Nat)\n\
+         #check decide (1 = 1)\n#check fun (b : Bool) => !b && true || b != false\n\
+         #check (default : Nat)\n#check Bool.false\n#check Option.some\n#check @Option.some\n\
+         namespace Nat\n#check Nat.succ 2\nend Nat\nopen Nat in\n#check Nat.succ 1\n\
+         #check Nat.succ 1\n#check @Lean.MonadRef.getRef\n",
+    );
+    let ours = lean_door(&workspace, &file, &lib);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str(), ours.stderr.as_str()),
+        (
+            0,
+            "some 3 : Option Nat\nnone : Option Nat\ndecide (1 = 1) : Bool\n\
+             fun b => !b && true || b != false : Bool → Bool\ndefault : Nat\n\
+             Bool.false : Bool\nOption.some.{u} {α : Type u} (val : α) : Option α\n\
+             @some : {α : Type u_1} → α → Option α\nsucc 2 : Nat\nsucc 1 : Nat\n\
+             Nat.succ 1 : Nat\n\
+             @Lean.getRef : {m : Type → Type} → [self : Lean.MonadRef m] → m Lean.Syntax\n",
+            ""
+        ),
+        "{ours:?}"
+    );
 }
 
 /// The drop-in `lean` on one file, with the search path and the record store
@@ -400,7 +1309,36 @@ fn lean_door(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
         .output()
         .expect("run the installed lean");
     Run {
-        code: output.status.code().expect("normal process exit"),
+        code: output
+            .status
+            .code()
+            .unwrap_or_else(|| panic!("lean terminated: {output:?}")),
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+}
+
+fn lean_stdin(workspace: &Workspace, source: &[u8], lib: &Path, extra: &[&str]) -> Run {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg("--stdin")
+        .args(extra)
+        .current_dir(&workspace.0)
+        .env("LEAN_PATH", lib)
+        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("records"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the installed lean with standard input");
+    child.stdin.take().unwrap().write_all(source).unwrap();
+    let output = child.wait_with_output().unwrap();
+    Run {
+        code: output
+            .status
+            .code()
+            .unwrap_or_else(|| panic!("lean terminated: {output:?}")),
         stdout: String::from_utf8(output.stdout).unwrap(),
         stderr: String::from_utf8(output.stderr).unwrap(),
     }
@@ -453,15 +1391,97 @@ fn the_lean_door_runs_a_file_that_imports_a_compiled_module() {
     );
 }
 
-/// What did not change, and what a missing import now says. No pin is needed:
-/// the search path is an empty directory.
+/// The actual imported Repr class selects a checked user printer. Its result
+/// reaches presentation as Format: quoted text is not quoted a second time,
+/// line constructors retain trailing newlines, and #guard_msgs sees the text.
+/// These expectations follow the explicit text/line constructors in the source;
+/// this test does not claim a fresh execution of the Reference compiler.
 #[test]
-fn the_lean_door_keeps_its_local_route_and_names_an_import_that_is_nowhere() {
+fn the_lean_door_uses_checked_printers_and_keeps_guard_messages_unquoted() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-checked-printers");
+    let definitions = r#"prelude
+import Init.Data.Repr
+inductive Printed where
+  | value
+instance : Repr Printed where
+  reprPrec _ _ := Std.Format.text "\"already rendered λ\""
+inductive Terminated where
+  | value
+instance : Repr Terminated where
+  reprPrec _ _ := Std.Format.text "already terminated\n"
+inductive Multiline where
+  | value
+instance : Repr Multiline where
+  reprPrec _ _ := Std.Format.append (Std.Format.text "first")
+    (Std.Format.append Std.Format.line (Std.Format.append (Std.Format.text "second")
+      (Std.Format.append Std.Format.line Std.Format.line)))
+"#;
+    let entry = workspace.write(
+        "Printed.lean",
+        format!(
+            "{definitions}#eval true\n#eval (42 : Nat)\n#eval Printed.value\n\
+             /-- info: \"already rendered λ\" -/\n#guard_msgs in\n#eval Printed.value\n\
+             #eval Terminated.value\n#eval Multiline.value\n\
+             /--\ninfo: first\nsecond\n\n-/\n#guard_msgs in\n#eval Multiline.value\n"
+        ),
+    );
+    let printed = lean_door(&workspace, &entry, &lib);
+    assert_eq!(printed.code, 0, "{printed:?}");
+    assert!(printed.stderr.is_empty(), "{printed:?}");
+    assert_eq!(
+        printed.stdout, "true\n42\n\"already rendered λ\"\nalready terminated\nfirst\nsecond\n\n",
+        "{printed:?}"
+    );
+
+    // The record store is reused for the same imported closure. A failed
+    // guarded message still discards an earlier otherwise successful output.
+    let mismatch = workspace.write(
+        "Mismatch.lean",
+        format!(
+            "{definitions}#eval true\n\
+             /-- info: a different message -/\n#guard_msgs in\n#eval Printed.value\n"
+        ),
+    );
+    let refused = lean_door(&workspace, &mismatch, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("Docstring on `#guard_msgs` does not match generated message"),
+        "{refused:?}"
+    );
+    assert!(
+        refused.stderr.contains("info: \"already rendered λ\""),
+        "{refused:?}"
+    );
+
+    // The raw FlN door keeps the original Nat payload even in a world with
+    // actual printer instances; it does not serialize the new Format result.
+    let raw = workspace.write(
+        "Raw.lean",
+        "prelude\nimport Init.Data.Repr\n#eval (42 : Nat)\n",
+    );
+    let raw = workspace.run(&raw, Some(&lib), &["--jobs=1"]);
+    assert!(
+        raw.complete().contains("\"kind\":\"nat\",\"value\":42"),
+        "{raw:?}"
+    );
+}
+
+/// Ordinary Lean source must resolve Init, even without an explicit import.
+/// No pin is needed to test a missing dependency or a small source-only world.
+#[test]
+fn ordinary_lean_requires_init_and_keeps_prelude_local_to_each_module() {
     let workspace = Workspace::new("lean-door-local");
     let empty = workspace.0.join("lib");
     std::fs::create_dir_all(&empty).unwrap();
 
-    let missing = workspace.write("Missing.lean", "import No.Such.Module\n\n#eval 1\n");
+    let missing = workspace.write(
+        "Missing.lean",
+        "prelude\nimport No.Such.Module\n\n#eval 1\n",
+    );
     let refused = lean_door(&workspace, &missing, &empty);
     assert_eq!(refused.code, 1, "{refused:?}");
     assert!(refused.stdout.is_empty(), "{refused:?}");
@@ -473,19 +1493,248 @@ fn the_lean_door_keeps_its_local_route_and_names_an_import_that_is_nowhere() {
     );
     assert!(refused.stderr.contains("nor an .olean on the search path"));
 
-    // A headerless file never had imports to resolve.
+    // These previously ran in a synthetic seed despite the missing Init.
     let plain = workspace.write(
         "Plain.lean",
         "def g (n : Nat) : Nat := n + 2\n\n#eval g 40\n",
     );
-    let ran = lean_door(&workspace, &plain, &empty);
-    assert_eq!((ran.code, ran.stdout.as_str()), (0, "42\n"), "{ran:?}");
-
-    // An import that is a local source file is still loaded as source.
     workspace.write("Helper.lean", "def h (n : Nat) : Nat := n + 2\n");
     let local = workspace.write("UsesHelper.lean", "import Helper\n\n#eval h 40\n");
-    let ran = lean_door(&workspace, &local, &empty);
-    assert_eq!((ran.code, ran.stdout.as_str()), (0, "42\n"), "{ran:?}");
+    for entry in [&plain, &local] {
+        let refused = lean_door(&workspace, entry, &empty);
+        assert_eq!(refused.code, 1, "{refused:?}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert!(
+            refused
+                .stderr
+                .contains("import `Init` is neither a source file"),
+            "{refused:?}"
+        );
+    }
+
+    workspace.write("Init.lean", "prelude\ninductive Marker where\n  | token\n");
+    workspace.write("Helper.lean", "def marker : Marker := Marker.token\n");
+    for header in ["", "prelude\n"] {
+        let entry = workspace.write(
+            "UsesHelper.lean",
+            format!("{header}import Helper\n#check marker\n"),
+        );
+        let ran = lean_door(&workspace, &entry, &empty);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (0, "marker : Marker\n", ""),
+            "{ran:?}"
+        );
+    }
+
+    // An entry's own Init cannot leak into a prelude dependency.
+    workspace.write(
+        "Helper.lean",
+        "prelude\ndef marker : Marker := Marker.token\n",
+    );
+    let entry = workspace.write("UsesHelper.lean", "import Helper\n#check marker\n");
+    let refused = lean_door(&workspace, &entry, &empty);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.contains("Unknown identifier `Marker`"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn stdin_is_a_virtual_lean_module_with_real_import_resolution() {
+    let workspace = Workspace::new("lean-stdin-imports");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+    let on_disk = workspace.write("stdin.lean", "this file must not be read or overwritten\n");
+    let original = std::fs::read(&on_disk).unwrap();
+    let refused = lean_stdin(&workspace, b"#check Nat\n", &empty, &[]);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("import `Init` is neither a source file"),
+        "{refused:?}"
+    );
+
+    let own = lean_stdin(
+        &workspace,
+        b"prelude\ninductive Local where\n  | value\n#check Local\n",
+        &empty,
+        &[],
+    );
+    assert_eq!(
+        (own.code, own.stdout.as_str(), own.stderr.as_str()),
+        (0, "Local : Type\n", ""),
+        "{own:?}"
+    );
+    workspace.write("Init.lean", "prelude\ninductive Marker where\n  | token\n");
+    workspace.write("Helper.lean", "def marker : Marker := Marker.token\n");
+    for (source, extra) in [
+        (b"#check Marker\n".as_slice(), vec![]),
+        (b"import Helper\n#check Marker\n", vec!["--threads=0"]),
+        (b"import Helper\n#check Marker\n", vec!["-j2"]),
+    ] {
+        let ran = lean_stdin(&workspace, source, &empty, &extra);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (0, "Marker : Type\n", ""),
+            "{ran:?}"
+        );
+    }
+    let stopped = lean_stdin(
+        &workspace,
+        b"import Helper\n#check marker\n",
+        &empty,
+        &["--max-bytes=80"],
+    );
+    assert_eq!(stopped.code, 3, "{stopped:?}");
+    assert!(stopped.stdout.is_empty(), "{stopped:?}");
+    assert!(
+        stopped.stderr.contains("imported Lean source exceeded")
+            && stopped.stderr.contains("input limit"),
+        "{stopped:?}"
+    );
+    let missing = lean_stdin(&workspace, b"prelude\nimport Missing\n", &empty, &[]);
+    assert_eq!(missing.code, 1, "{missing:?}");
+    assert!(missing.stdout.is_empty(), "{missing:?}");
+    assert!(
+        missing
+            .stderr
+            .contains("import `Missing` is neither a source file"),
+        "{missing:?}"
+    );
+    assert_eq!(std::fs::read(on_disk).unwrap(), original);
+}
+
+#[test]
+fn stdin_uses_the_pinned_virtual_module_identity() {
+    let workspace = Workspace::new("stdin-module-identity");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+    workspace.write("stdin.lean", "prelude\ninductive Local where\n  | value\n");
+    let imported = lean_stdin(
+        &workspace,
+        b"prelude\nimport stdin\n#check Local\n",
+        &empty,
+        &[],
+    );
+    assert_eq!(
+        (
+            imported.code,
+            imported.stdout.as_str(),
+            imported.stderr.as_str()
+        ),
+        (0, "Local : Type\n", ""),
+        "{imported:?}"
+    );
+    // The pin's anonymous main module is `_stdin`, so an import back to it
+    // is a cycle even when an unrelated `_stdin.lean` exists on disk.
+    workspace.write("_stdin.lean", "prelude\n");
+    workspace.write("Helper.lean", "prelude\nimport _stdin\n");
+    let cycle = lean_stdin(&workspace, b"prelude\nimport Helper\n", &empty, &[]);
+    assert_eq!(cycle.code, 1, "{cycle:?}");
+    assert!(cycle.stdout.is_empty(), "{cycle:?}");
+    assert!(
+        cycle.stderr.contains("cycle") && cycle.stderr.contains("_stdin"),
+        "{cycle:?}"
+    );
+}
+
+#[test]
+fn dependency_message_guards_fail_ordinary_files_and_stdin() {
+    let workspace = Workspace::new("ordinary-dependency-guard");
+    let empty = workspace.0.join("lib");
+    std::fs::create_dir_all(&empty).unwrap();
+    workspace.write(
+        "Dependency.lean",
+        "prelude\ninductive N where\n  | z\n/-- info: unexpected -/\n#guard_msgs in\ndef value : N := N.z\n",
+    );
+    let source = b"prelude\nimport Dependency\n#check value\n";
+    let entry = workspace.write("Main.lean", source);
+    for ran in [
+        lean_door(&workspace, &entry, &empty),
+        lean_stdin(&workspace, source, &empty, &[]),
+    ] {
+        assert_eq!(ran.code, 1, "{ran:?}");
+        assert!(ran.stdout.is_empty(), "{ran:?}");
+        assert!(ran.stderr.contains("guard-msgs"), "{ran:?}");
+    }
+    // This independent entry error would win if dependency guards were only
+    // judged after the full module graph had already executed.
+    let blocked = lean_stdin(
+        &workspace,
+        b"prelude\nimport Dependency\n#check missingAfterGuard\n",
+        &empty,
+        &[],
+    );
+    assert_eq!(blocked.code, 1, "{blocked:?}");
+    assert!(blocked.stdout.is_empty(), "{blocked:?}");
+    assert!(blocked.stderr.contains("guard-msgs"), "{blocked:?}");
+    assert!(!blocked.stderr.contains("missingAfterGuard"), "{blocked:?}");
+    // A matching silent guard completes, with only entry output published.
+    workspace.write(
+        "Dependency.lean",
+        "prelude\ninductive N where\n  | z\n#guard_msgs in\ndef value : N := N.z\n",
+    );
+    let recovered = lean_stdin(&workspace, source, &empty, &[]);
+    assert_eq!(
+        (
+            recovered.code,
+            recovered.stdout.as_str(),
+            recovered.stderr.as_str()
+        ),
+        (0, "value : N\n", ""),
+        "{recovered:?}"
+    );
+}
+
+/// The ordinary path must admit the real Init closure and use its printers.
+/// A main declaration is checked but only --run may invoke it.
+#[test]
+fn ordinary_file_and_stdin_admit_actual_init_without_invoking_main() {
+    let Some(library) = pinned_lib() else { return };
+    assert!(library.join("Init.olean").is_file());
+    let workspace = Workspace::new("ordinary-lean-init");
+    let source =
+        b"#check Int\n#eval (42 : Nat)\ndef main : IO Unit := IO.println \"main must not run\"\n";
+    let entry = workspace.write("Main.lean", source);
+    for ran in [
+        lean_door(&workspace, &entry, &library),
+        lean_stdin(&workspace, source, &library, &[]),
+    ] {
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (0, "Int : Type\n42\n", ""),
+            "{ran:?}"
+        );
+    }
+    // The same admitted closure is available to ordinary local dependencies.
+    workspace.write("Helper.lean", "def answer : Int := 42\n");
+    let entry = workspace.write(
+        "UsesHelper.lean",
+        "import Helper\n#check answer\n#eval (42 : Nat)\n",
+    );
+    let ran = lean_door(&workspace, &entry, &library);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+        (0, "answer : Int\n42\n", ""),
+        "{ran:?}"
+    );
+    let stopped = lean_stdin(&workspace, source, &library, &["--fln-max-steps=0"]);
+    assert_eq!(stopped.code, 3, "{stopped:?}");
+    assert!(stopped.stdout.is_empty(), "{stopped:?}");
+    let invalid = lean_stdin(
+        &workspace,
+        b"#check Int\n#eval (42 : Nat)\n#check missing\n",
+        &library,
+        &[],
+    );
+    assert_eq!(invalid.code, 1, "{invalid:?}");
+    assert!(invalid.stdout.is_empty(), "{invalid:?}");
+    assert!(invalid.stderr.contains("missing"), "{invalid:?}");
 }
 
 /// `prelude` means no imports at all, not even the implicit one. The door used
@@ -554,9 +1803,13 @@ fn a_prelude_world_without_init_never_prints_an_eval() {
     assert_eq!(refused.code, 5, "{refused:?}");
     assert!(refused.stdout.is_empty(), "{refused:?}");
     assert!(
+        refused.stderr.starts_with("lean: capability: "),
+        "{refused:?}"
+    );
+    assert!(
         refused
             .stderr
-            .starts_with("lean: capability: this prelude file's imports do not reach `Init`"),
+            .contains("#eval requires an existing Repr or ToString instance"),
         "{refused:?}"
     );
 }

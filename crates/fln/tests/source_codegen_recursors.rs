@@ -98,6 +98,8 @@ fn a_compiled_declaration_that_applies_a_recursor_to_data_is_refused() {
         format!("def f (t : T) : Nat := T.rec {count}\n"),
         format!("def f (t : T) : Nat := T.rec (motive := fun _ => Nat) {count}\n"),
         format!("def f (t : T) : Nat := @T.rec (fun _ => Nat) {count}\n"),
+        format!("def f (t : T) : Nat := T.rec.{{1}} {count}\n"),
+        format!("def f (t : T) : Nat := @T.rec.{{1}} (fun _ => Nat) {count}\n"),
         // Unapplied, it is still compiled code.
         "def f : Nat -> (T -> Nat -> Nat) -> T -> Nat := @T.rec (fun _ => Nat)\n".to_owned(),
         format!("example (t : T) : Nat := T.rec (motive := fun _ => Nat) {count}\n"),

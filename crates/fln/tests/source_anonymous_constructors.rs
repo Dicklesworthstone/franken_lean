@@ -95,22 +95,15 @@ fn extra_arguments_nest_into_the_last_field() {
     );
 }
 
-/// Not yet: `[⟨1, 2⟩, ⟨3, 4⟩] : List Point`. The pin accepts it because `elabAppArgs`
-/// propagates the expected type `List Point` into `List.cons`'s `α` before elaborating the
-/// arguments (`propagateExpectedType`), and `elabAnonymousCtor` postpones while its expected
-/// type is still a metavariable. This elaborator propagates only at the last argument and has
-/// no postponement, so `⟨1, 2⟩` meets an unknown expected type and is refused with the pin's
-/// own message for that case. A refusal, never an approximation.
+/// The pin accepts this original frontier fixture: an element waits until the
+/// surrounding `List.cons` application determines its expected type.
 #[test]
-fn an_unknown_element_type_is_refused_until_expected_types_propagate() {
+fn list_elements_wait_for_the_expected_constructor_type() {
     let source = format!("{POINT}def k : List Point := [⟨1, 2⟩, ⟨3, 4⟩]");
-    let error = check(&source).expect_err(&source);
-    assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
     assert!(
-        error
-            .to_string()
-            .contains("The expected type of this term could not be determined"),
-        "{error}"
+        matches!(check(&source), Ok(Outcome::Complete(_))),
+        "{source}: {:?}",
+        check(&source)
     );
 }
 

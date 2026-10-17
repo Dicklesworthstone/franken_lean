@@ -159,23 +159,36 @@ fn mutual_type_computation_exposes_function_binders_during_source_inference() {
 
 #[test]
 fn indexed_polymorphic_mutual_reduction_preserves_function_children_and_universes() {
-    let (engine, limits) = with_families(&[
-        "inductive T.{u} (A : Type u) : A -> Type u where | node (x : A) (children : Nat -> F A x) : T A x",
-        "inductive F.{u} (A : Type u) : A -> Type u where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x",
-    ]);
-    let source = "def functionType.{u} (A : Type u) (x : A) (t : T A x) : Type u := match t with | .node y children => A -> A\n\
-                  def run.{u} (A : Type u) (x : A) (f : functionType A x (T.node x (fun n => F.nil x))) : A := f x\n\
-                  theorem atNat : run Nat 7 (fun x => x) = 7 := by rfl\n\
-                  theorem atType : run (Type) Nat (fun x => x) = Nat := by rfl";
-    engine
-        .check_source_files(
-            &[source.as_bytes()],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits),
-        )
-        .unwrap_or_else(|e| panic!("{e:?}"))
-        .into_complete()
-        .unwrap();
+    // As written the pin promotes `x` to a parameter, so only `_` may stand there; with
+    // `F.first` (first field not its index) `x` stays an index and `y` names it. The pin
+    // accepts both programs, and refuses `.node y children` over the promoted block (Type
+    // mismatch).
+    let promoted = "inductive F.{u} (A : Type u) : A -> Type u where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x";
+    let indexed = "inductive F.{u} (A : Type u) : A -> Type u where | nil (x : A) : F A x | cons (x : A) (t : T A x) : F A x | first (y : A) (x : A) : F A x";
+    for (family, pattern) in [
+        (promoted, ".node _ children"),
+        (indexed, ".node y children"),
+    ] {
+        let (engine, limits) = with_families(&[
+            "inductive T.{u} (A : Type u) : A -> Type u where | node (x : A) (children : Nat -> F A x) : T A x",
+            family,
+        ]);
+        let source = format!(
+            "def functionType.{{u}} (A : Type u) (x : A) (t : T A x) : Type u := match t with | {pattern} => A -> A\n\
+             def run.{{u}} (A : Type u) (x : A) (f : functionType A x (T.node x (fun n => F.nil x))) : A := f x\n\
+             theorem atNat : run Nat 7 (fun x => x) = 7 := by rfl\n\
+             theorem atType : run (Type) Nat (fun x => x) = Nat := by rfl"
+        );
+        engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap_or_else(|e| panic!("{family}: {e:?}"))
+            .into_complete()
+            .unwrap();
+    }
 }
 
 #[test]

@@ -1,0 +1,1584 @@
+//! Exhaustive constructor matching lowered to an admitted dependent recursor.
+//!
+//! The match compiler is untrusted. It neither evaluates the discriminant to
+//! choose a branch nor admits any declarations. Every branch remains an actual
+//! minor premise in the generated term. Constrained indices may justify omitted
+//! constructors only through retained contradiction proofs; supplied impossible
+//! alternatives are refused rather than erased. Both checkers validate the term.
+use super::*;
+use fln_env::constants::ConstantInfo;
+use fln_env::constants::ConstructorVal;
+use std::collections::{HashMap, HashSet};
+mod conditional_order;
+mod mutual;
+mod nomatch;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchError {
+    ExpectedInductive,
+    ExpectedCondition,
+    UnsupportedFamily,
+    UnrefinedIndices,
+    UnrefinedIndexPattern,
+    InvalidPattern,
+    DuplicateConstructor,
+    MissingConstructor,
+    WrongArity,
+    /// A named variable in a constructor parameter's position. Only a promoted
+    /// index makes a parameter explicit; the pin elaborates its argument as an
+    /// inaccessible term (`isNextArgAccessible`, vendored
+    /// Lean/Elab/PatternVar.lean:178-188), so only `_` fits there.
+    InaccessibleParameter,
+    DuplicateVariable,
+    UnreachableRow,
+}
+impl std::fmt::Display for MatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExpectedInductive => "match discriminant requires a known inductive type",
+            Self::ExpectedCondition => {
+                "conditional requires Bool or a decidable proposition; named evidence requires Prop"
+            }
+            Self::UnsupportedFamily => {
+                "elimination requires a supported single family with direct recursion"
+            }
+            Self::UnrefinedIndices => {
+                "indexed elimination currently requires distinct parameter locals as indices"
+            }
+            Self::UnrefinedIndexPattern => {
+                "direct constructor-field indices require index-pattern refinement"
+            }
+            Self::InvalidPattern => {
+                "match requires a constructor with variable fields or a final catch-all"
+            }
+            Self::DuplicateConstructor => "match repeats a constructor or a catch-all",
+            Self::MissingConstructor => "match does not cover every constructor",
+            Self::WrongArity => "constructor pattern has the wrong number of explicit fields",
+            Self::InaccessibleParameter => {
+                "a constructor parameter is inaccessible in a pattern; only `_` may stand there"
+            }
+            Self::DuplicateVariable => "constructor pattern repeats a variable",
+            Self::UnreachableRow => "pattern matrix contains a redundant or unreachable source row",
+        })
+    }
+}
+fn error(reason: MatchError) -> NatDefinitionElabError {
+    failure(SourceInferenceError::Match(reason))
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MatchParts<'a> {
+    pub(super) discriminant: &'a Syntax,
+    pub(super) equation: Option<&'a Syntax>,
+    alternatives: &'a [Syntax],
+    pub(super) generated: bool,
+    /// A `match` as written in the source, not one a sugar or the compiler produced.
+    written: bool,
+    conditional: Option<ConditionalParts<'a>>,
+}
+#[derive(Clone, Copy)]
+struct ConditionalParts<'a> {
+    binding: Option<&'a Name>,
+    yes: &'a Syntax,
+    no: &'a Syntax,
+}
+impl MatchParts<'_> {
+    pub(in crate::source) fn is_conditional(&self) -> bool {
+        self.conditional.is_some()
+    }
+}
+pub(super) struct MatchPatterns<'a> {
+    pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
+    pub(super) fallback: Option<(Option<Name>, &'a Syntax)>,
+}
+pub(super) enum MatchStart<'a> {
+    Regular(Box<MatchBuild<'a>>),
+    Refined(tactics::ProofState<'a>),
+}
+struct Branch<'a> {
+    constructor: fln_env::constants::ConstructorVal,
+    fields: Option<Vec<Option<Name>>>,
+    whole: Option<Name>,
+    syntax: &'a Syntax,
+}
+struct DirectMatch<'a> {
+    syntax: Option<&'a Syntax>,
+    whole: Option<Name>,
+}
+pub(super) struct MatchBuild<'a> {
+    direct: Option<DirectMatch<'a>>,
+    recursive: bool,
+    unrefined_capture: bool,
+    saved: LocalContext,
+    target: Expr,
+    major: Typed,
+    family: Name,
+    parameters: Vec<Expr>,
+    indices: Vec<LocalDecl>,
+    generalized: Vec<LocalDecl>,
+    motive_obligation: Option<Typed>,
+    levels: Vec<Level>,
+    recursor: Typed,
+    branches: std::collections::VecDeque<Branch<'a>>,
+    conditional_order: Option<conditional_order::ConditionalOrder>,
+}
+pub(super) struct BranchBinders {
+    // Old indices whose direct field patterns lack an index-equation witness.
+    // A branch may use the fresh constructor fields, but not capture these
+    // original locals (including transitively through retained lets/types).
+    unrefined: HashSet<FVarId>,
+    hypotheses: Vec<(FVarId, FVarId)>,
+    locals: Vec<LocalDecl>,
+    type_: Expr,
+}
+pub(super) enum MatchStep<'a> {
+    Branch {
+        syntax: &'a Syntax,
+        expected: Expr,
+        binders: BranchBinders,
+    },
+    Complete(Typed),
+}
+
+pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
+    if let Syntax::Ident { val, .. } = syntax {
+        if val.is_anonymous() || !val.parent().is_anonymous() {
+            return Err(error(MatchError::InvalidPattern));
+        }
+        return Ok(Some(val.clone()));
+    }
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Term", "hole"]),
+        1,
+        "wildcard pattern",
+    )?;
+    expect_atom(&parts[0], "_", "wildcard")?;
+    Ok(None)
+}
+impl Context {
+    /// How many of `constructor`'s parameter binders are explicit. Parameters
+    /// the family declared are implicit in its constructors; a promoted index
+    /// keeps the binder its constructor wrote, which may be explicit.
+    fn explicit_parameter_binders(
+        &mut self,
+        constructor: &fln_env::constants::ConstructorVal,
+    ) -> Result<usize, NatDefinitionElabError> {
+        let mut type_ = &constructor.base.type_;
+        let mut explicit = 0;
+        for _ in 0..constructor.num_params {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_info, body, ..
+            } = type_.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if *binder_info == BinderInfo::Default {
+                explicit += 1;
+            }
+            type_ = body;
+        }
+        Ok(explicit)
+    }
+
+    /// Independent local indices can be generalized without inventing index
+    /// equalities. Repeated, fixed and let-bound indices need an equation
+    /// refinement compiler, so they are not silently treated as independent.
+    pub(super) fn elimination_index_locals(
+        &mut self,
+        values: &[Expr],
+    ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
+        let mut seen = HashSet::new();
+        let mut indices = Vec::new();
+        for value in values {
+            self.tick()?;
+            let value = self.instantiate(value)?;
+            let ExprNode::FVar { id } = value.node() else {
+                return Err(error(MatchError::UnrefinedIndices));
+            };
+            let local = self
+                .txn
+                .lctx
+                .find(id)
+                .cloned()
+                .ok_or_else(|| error(MatchError::UnrefinedIndices))?;
+            if local.value.is_some() || !seen.insert(id.clone()) {
+                return Err(error(MatchError::UnrefinedIndices));
+            }
+            indices.push(local);
+        }
+        Ok(indices)
+    }
+
+    pub(super) fn elimination_result_indices(
+        &mut self,
+        type_: &Expr,
+        family: &Name,
+        parameters: usize,
+        indices: usize,
+    ) -> Result<Vec<Expr>, NatDefinitionElabError> {
+        let type_ = self.whnf(type_)?;
+        let mut head = &type_;
+        let mut values = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            values.push(a.clone());
+            head = f;
+        }
+        if !matches!(head.node(), ExprNode::Const { name, .. } if name == family)
+            || values.len() != parameters + indices
+        {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
+        values.reverse();
+        Ok(values.split_off(parameters))
+    }
+
+    pub(super) fn match_parts<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<MatchParts<'a>, NatDefinitionElabError> {
+        // The pin's `if` notations (`Init/Prelude.lean`): `termIfThenElse` and, with evidence,
+        // `termDepIfThenElse`, whose name is a `binderIdent`.
+        let dependent = syntax.kind() == Some(&Name::from_components(["termDepIfThenElse"]));
+        if dependent || syntax.kind() == Some(&Name::from_components(["termIfThenElse"])) {
+            let kind = syntax.kind().expect("a node").clone();
+            let parts = expect_node(syntax, &kind, if dependent { 8 } else { 6 }, "conditional")?;
+            let (binding, rest) = if dependent {
+                let name = expect_node(
+                    &parts[1],
+                    &Name::from_components(["Lean", "binderIdent"]),
+                    1,
+                    "conditional evidence",
+                )?;
+                expect_atom(&parts[2], ":", "conditional evidence separator")?;
+                let Syntax::Ident { val, .. } = &name[0] else {
+                    return Err(error(MatchError::InvalidPattern));
+                };
+                if val.is_anonymous() || !val.parent().is_anonymous() {
+                    return Err(error(MatchError::InvalidPattern));
+                }
+                (Some(val), &parts[3..])
+            } else {
+                (None, &parts[1..])
+            };
+            expect_atom(&parts[0], "if", "conditional keyword")?;
+            expect_atom(&rest[1], "then", "conditional then")?;
+            expect_atom(&rest[3], "else", "conditional else")?;
+            return Ok(MatchParts {
+                discriminant: &rest[0],
+                equation: None,
+                alternatives: &[],
+                generated: true,
+                written: false,
+                conditional: Some(ConditionalParts {
+                    binding,
+                    yes: &rest[2],
+                    no: &rest[4],
+                }),
+            });
+        }
+        if syntax.kind() == Some(&parser_kind(&["Term", "ifThenElse"])) {
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Term", "ifThenElse"]),
+                7,
+                "conditional",
+            )?;
+            expect_atom(&parts[0], "if", "conditional keyword")?;
+            expect_atom(&parts[3], "then", "conditional then")?;
+            expect_atom(&parts[5], "else", "conditional else")?;
+            let binding = match expect_null_args(&parts[1], "conditional evidence")? {
+                [] => None,
+                [Syntax::Ident { val, .. }, colon]
+                    if !val.is_anonymous() && val.parent().is_anonymous() =>
+                {
+                    expect_atom(colon, ":", "conditional evidence separator")?;
+                    Some(val)
+                }
+                _ => return Err(error(MatchError::InvalidPattern)),
+            };
+            return Ok(MatchParts {
+                discriminant: &parts[2],
+                equation: None,
+                alternatives: &[],
+                generated: true,
+                written: false,
+                conditional: Some(ConditionalParts {
+                    binding,
+                    yes: &parts[4],
+                    no: &parts[6],
+                }),
+            });
+        }
+        let generated = syntax.kind() == Some(&parser_kind(&["Term", "matchMatrix"]));
+        let parts = expect_node(
+            syntax,
+            &parser_kind(&["Term", if generated { "matchMatrix" } else { "match" }]),
+            6,
+            "match expression",
+        )?;
+        expect_atom(&parts[0], "match", "match keyword")?;
+        expect_empty_null(&parts[1], "unsupported generalizing annotation")?;
+        expect_empty_null(&parts[2], "unsupported explicit motive")?;
+        let [discriminant] = expect_null_args(&parts[3], "single discriminant")? else {
+            return Err(error(MatchError::InvalidPattern));
+        };
+        let discriminant = expect_node(
+            discriminant,
+            &parser_kind(&["Term", "matchDiscr"]),
+            2,
+            "discriminant",
+        )?;
+        let equation = match expect_null_args(&discriminant[0], "pattern equality binder")? {
+            [] => None,
+            [name, colon]
+                if matches!(name, Syntax::Ident { val, .. }
+                    if !val.is_anonymous() && val.parent().is_anonymous())
+                    || matches!(name, Syntax::Atom { val, .. } if val == "_") =>
+            {
+                expect_atom(colon, ":", "pattern equality colon")?;
+                Some(name)
+            }
+            _ => return Err(error(MatchError::InvalidPattern)),
+        };
+        expect_atom(&parts[4], "with", "match alternatives keyword")?;
+        let alternatives = expect_node(
+            &parts[5],
+            &parser_kind(&["Term", "matchAlts"]),
+            1,
+            "match alternatives",
+        )?;
+        let alternatives = expect_null_args(&alternatives[0], "match alternatives")?;
+        if alternatives.is_empty() {
+            return Err(error(MatchError::MissingConstructor));
+        }
+        if alternatives.len() > 256 {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        Ok(MatchParts {
+            discriminant: &discriminant[1],
+            equation,
+            alternatives,
+            generated,
+            written: matches!(&parts[0], Syntax::Atom { info, .. }
+                if matches!(info, fln_syntax::source::SourceInfo::Original { .. })),
+            conditional: None,
+        })
+    }
+
+    pub(super) fn match_apply(
+        &mut self,
+        mut function: Typed,
+        argument: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        self.tick()?;
+        let type_ = self.whnf(&function.type_)?;
+        let ExprNode::ForallE {
+            binder_type, body, ..
+        } = type_.node()
+        else {
+            return Err(error(MatchError::UnsupportedFamily));
+        };
+        self.constrain_type(&argument.type_, binder_type)?;
+        function.value = Expr::app(function.value, argument.value.clone());
+        function.type_ = self.substitute(body, &argument.value)?;
+        Ok(function)
+    }
+
+    fn indexed_match_motive(
+        &mut self,
+        target: &Expr,
+        major: &Typed,
+        family_type: &Expr,
+        indices: &[LocalDecl],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let body = if let ExprNode::FVar { id } = major.value.node() {
+            target
+                .abstract_fvar(id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?
+        } else {
+            target.clone()
+        };
+        let mut motive = Expr::lam(
+            Name::anonymous(),
+            family_type.clone(),
+            body,
+            BinderInfo::Default,
+        );
+        for index in indices.iter().rev() {
+            self.tick()?;
+            motive = Expr::lam(
+                index.user_name.clone(),
+                self.instantiate(&index.type_)?,
+                motive
+                    .abstract_fvar(&index.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                index.binder_info,
+            );
+        }
+        Ok(motive)
+    }
+
+    pub(super) fn start_match<'a>(
+        &mut self,
+        parts: MatchParts<'a>,
+        mut major: Typed,
+        expected: Option<Expr>,
+    ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
+        if let Some(binding) = parts.conditional.as_ref().map(|c| c.binding.is_some()) {
+            let mut type_ = self.whnf(&major.type_)?;
+            let boolean = Expr::const_(Name::from_components(["Bool"]), vec![]);
+            // A conditional never refines its condition, as the pin's `ite`/`dite` never do: the
+            // case split below is on a copy of the condition (`start_refined_match`), so a branch
+            // that needs `b` replaced (`if b then Or.inl rfl else Or.inr rfl` against
+            // `b = true ∨ b = false`) is refused, as at the pin. `if h : b` is the pin's
+            // `dite (b = true)`, its evidence `h : b = true`: the decided proposition below.
+            if type_ == boolean && binding {
+                major = Typed {
+                    value: [
+                        boolean.clone(),
+                        major.value,
+                        Expr::const_(Name::from_components(["Bool", "true"]), vec![]),
+                    ]
+                    .into_iter()
+                    .fold(
+                        Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                        Expr::app,
+                    ),
+                    type_: Expr::sort(Level::zero()),
+                };
+                type_ = Expr::sort(Level::zero());
+            }
+            if type_ == Expr::sort(Level::zero()) {
+                // Keep the condition in the checked dictionary's type and both
+                // branches in the ordinary Decidable recursor. No source branch
+                // is selected by evaluating a proposition or a host Boolean.
+                // The instance problem is `Decidable c` for the condition as
+                // elaborated, as the pin's `ite` poses it. Normalizing `c` first
+                // turned `n < 5` into `Nat.le (Nat.succ n) 5`, which no stored
+                // instance path matches (bead fln-52qv).
+                let proposition = self.instantiate(&major.value)?;
+                let type_ = Expr::app(
+                    Expr::const_(Name::from_components(["Decidable"]), vec![]),
+                    proposition,
+                );
+                let dictionary = self.instance_hole(type_.clone())?;
+                // Retain the original proposition as a checked local value.
+                major = Typed {
+                    value: Expr::let_e(
+                        self.fresh_name()?,
+                        Expr::sort(Level::zero()),
+                        major.value,
+                        dictionary
+                            .lift_loose(0, 1)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                        false,
+                    ),
+                    type_,
+                };
+                self.resolve_instances(false)?;
+            } else if type_ != boolean {
+                return Err(error(MatchError::ExpectedCondition));
+            }
+        }
+        // A match as written is refused where the pin refuses its patterns' types; the lowering
+        // below would solve index equations the pin leaves alone (`pattern_typing`).
+        if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
+            self.check_pattern_typing(
+                &[(major.value.clone(), major.type_.clone())],
+                parts.alternatives,
+            )?;
+        }
+        // Keep the existing direct/index-polymorphic path, including recursive
+        // call lowering. Only the precise index-shape refusal selects the
+        // equation-refining backend; typing faults and resource stops propagate.
+        let recursive = self.is_recursive_match(&major.value);
+        let well_founded = self.well_founded_continuation().is_some();
+        if well_founded && parts.equation.is_some() {
+            // That backend substitutes the whole local dependency cone. A
+            // well-founded call must preserve original captured arguments;
+            // named-equation support needs the same dedicated treatment.
+            return Err(error(MatchError::UnrefinedIndices));
+        }
+        if well_founded && parts.generated && parts.conditional.is_none() {
+            major = self.well_founded_match_input(major)?;
+        }
+        if parts.equation.is_some() || parts.generated && !recursive && !well_founded {
+            // Earlier columns may occur in later discriminant types. The
+            // shared elimination engine generalizes that entire dependency
+            // cone; treating each split as an independent case loses it.
+            return self
+                .start_refined_match(parts, major, expected, recursive)
+                .map(MatchStart::Refined);
+        }
+        let saved = self.clone();
+        match self.start_regular_match(parts, major.clone(), expected.clone()) {
+            Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
+            ))) if !well_founded => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = saved;
+                self.txn.budget.heartbeats_consumed = spent;
+                self.start_refined_match(parts, major, expected, recursive)
+                    .map(MatchStart::Refined)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn start_regular_match<'a>(
+        &mut self,
+        parts: MatchParts<'a>,
+        major: Typed,
+        expected: Option<Expr>,
+    ) -> Result<MatchBuild<'a>, NatDefinitionElabError> {
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let family_type = self.whnf(&major.type_)?;
+        let mut head = &family_type;
+        let mut parameters = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            parameters.push(a.clone());
+            head = f;
+        }
+        parameters.reverse();
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Err(error(MatchError::ExpectedInductive));
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name).cloned() else {
+            return Err(error(MatchError::ExpectedInductive));
+        };
+        if family.is_unsafe
+            || family.num_nested != 0
+            || family.all.is_empty()
+            || family.all.len() > 8
+            || !family.all.contains(name)
+            || parameters.len() != family.num_params as usize + family.num_indices as usize
+            || levels.len() != family.base.level_params.len()
+        {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
+        if family.ctors.len() > 256 {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        let recursor_name = Name::str(name.clone(), "rec");
+        let Some(ConstantInfo::Rec(rec)) = self.txn.env.find(&recursor_name).cloned() else {
+            return Err(error(MatchError::UnsupportedFamily));
+        };
+        if rec.is_unsafe
+            || rec.num_indices != family.num_indices
+            || rec.num_params != family.num_params
+            || rec.num_motives as usize != family.all.len()
+            || (family.all.len() == 1 && rec.num_minors as usize != family.ctors.len())
+            || rec.rules.len() != family.ctors.len()
+            || rec.all != family.all
+            || !(rec.base.level_params == family.base.level_params
+                || (rec.base.level_params.len() == levels.len() + 1
+                    && rec.base.level_params[1..] == family.base.level_params))
+        {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
+        let index_values = parameters.split_off(family.num_params as usize);
+        let target = match expected {
+            Some(target) => self.instantiate(&target)?,
+            None => {
+                let sort = self.type_expected()?;
+                self.hole(sort)?
+            }
+        };
+        let recursive = self.recursive_match(&major.value);
+        // A match is a single-family case split, not mutual function recursion.
+        // The latter needs a separate call-graph and decreasing-argument proof.
+        if recursive && family.all.len() > 1 {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
+        // A sole variable/wildcard pattern does not refine any index. Lower it
+        // to a checked local binding, retaining the original discriminant type.
+        // In particular, `match xs with | _ => xs` must not force `xs` to have
+        // every constructor's result type.
+        if !recursive && parts.alternatives.len() == 1 {
+            let alt = expect_node(
+                &parts.alternatives[0],
+                &parser_kind(&["Term", "matchAlt"]),
+                4,
+                "match alternative",
+            )?;
+            expect_atom(&alt[0], "|", "alternative separator")?;
+            if !matches!(&alt[2], Syntax::Atom { val, .. } if val == "=>" || val == "↦") {
+                return Err(error(MatchError::InvalidPattern));
+            }
+            if let [sequence] = expect_null_args(&alt[1], "single pattern sequence")?
+                && let [pattern] = expect_null_args(sequence, "single pattern")?
+                && let Ok(whole) = pattern_name(pattern)
+                && !whole.as_ref().is_some_and(|name| {
+                    matches!(self.txn.env.find(name), Some(ConstantInfo::Ctor(_)))
+                        || (family.base.name == Name::from_components(["Bool"])
+                            && matches!(name.to_display_string().as_str(), "true" | "false"))
+                })
+            {
+                return Ok(MatchBuild {
+                    direct: Some(DirectMatch {
+                        syntax: Some(&alt[3]),
+                        whole,
+                    }),
+                    recursive,
+                    unrefined_capture: false,
+                    saved: self.txn.lctx.clone(),
+                    target,
+                    major: major.clone(),
+                    family: name.clone(),
+                    parameters,
+                    indices: Vec::new(),
+                    generalized: Vec::new(),
+                    motive_obligation: None,
+                    levels: levels.clone(),
+                    // Replaced by the checked body before completion.
+                    recursor: major,
+                    branches: std::collections::VecDeque::new(),
+                    conditional_order: None,
+                });
+            }
+        }
+        // A constructor field used verbatim as a result index needs an actual
+        // equation connecting it to the caller's index. Without that witness
+        // the direct path must reject even valid captures of the original
+        // index through a local alias or dependent hypothesis. Select the
+        // checked-equation backend before elaborating any branch, so no source
+        // expression is dropped or replayed merely because it uses that name.
+        // Structural recursive roots keep their dedicated hypothesis lowering.
+        if !recursive && self.match_has_field_indices(&family)? {
+            return Err(error(MatchError::UnrefinedIndexPattern));
+        }
+        let indices = self.elimination_index_locals(&index_values)?;
+        if recursive {
+            let changing: HashSet<_> = indices.iter().map(|index| index.id.clone()).collect();
+            for parameter in &parameters {
+                if !self.elimination_reads(parameter)?.is_disjoint(&changing) {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+            }
+        }
+        // Generalizing later parameters must not rescue an ill-typed original
+        // index motive (for example a captured P : Vec A n -> Type). Preserve
+        // that original lambda as an ordinary checked let obligation. Its type
+        // reconstruction is untrusted; both final checking engines check the
+        // lambda's actual applications, including an unused ill-typed value.
+        let motive_obligation = if indices.is_empty() {
+            None
+        } else {
+            let value = self.indexed_match_motive(&target, &major, &family_type, &indices)?;
+            let type_ = self
+                .known_type(&value)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            Some(Typed { value, type_ })
+        };
+        let mut generalized = Vec::new();
+        if recursive {
+            self.recursive_indices(name, &parameters, &indices)?;
+        } else if !indices.is_empty() || self.well_founded_continuation().is_some() {
+            // Well-founded matches specialize the private continuation and
+            // dependent hypotheses too. Genuine source lets remain captured,
+            // retaining their original values in recursive call arguments.
+            let mut dependencies: HashSet<_> =
+                indices.iter().map(|index| index.id.clone()).collect();
+            // Parameters stay fixed. Index domains, however, form a telescope:
+            // a later domain may refer to preceding indices. Closing the motive
+            // in family order captures those dependencies without inventing an
+            // equality between a fixed expression and a constructor result.
+            for value in &parameters {
+                if !self.elimination_reads(value)?.is_disjoint(&dependencies) {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+            }
+            let mut preceding = HashSet::new();
+            for index in &indices {
+                if self
+                    .elimination_reads(&index.type_)?
+                    .iter()
+                    .any(|id| dependencies.contains(id) && !preceding.contains(id))
+                {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+                preceding.insert(index.id.clone());
+            }
+            let major_id = if let ExprNode::FVar { id } = major.value.node() {
+                dependencies.insert(id.clone());
+                Some(id)
+            } else {
+                None
+            };
+            for local in self.txn.lctx.clone().decls() {
+                if local.value.is_none()
+                    && local.binder_info != BinderInfo::InstImplicit
+                    && major_id != Some(&local.id)
+                    && !indices.iter().any(|index| index.id == local.id)
+                    && !self
+                        .elimination_reads(&local.type_)?
+                        .is_disjoint(&dependencies)
+                {
+                    dependencies.insert(local.id.clone());
+                    generalized.push(local.clone());
+                }
+            }
+        }
+        let mut motive_target = if recursive {
+            self.recursive_target(&target)?
+        } else {
+            target.clone()
+        };
+        for local in generalized.iter().rev() {
+            self.tick()?;
+            motive_target = Expr::forall_e(
+                local.user_name.clone(),
+                self.instantiate(&local.type_)?,
+                motive_target
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
+        let target_type = self
+            .known_type(&motive_target)?
+            .ok_or_else(|| error(MatchError::ExpectedInductive))?;
+        let universe = self.sort_level(&Typed {
+            value: motive_target.clone(),
+            type_: target_type,
+        })?;
+        let motive = self.indexed_match_motive(&motive_target, &major, &family_type, &indices)?;
+        let motive_type = self
+            .known_type(&motive)?
+            .ok_or_else(|| error(MatchError::ExpectedInductive))?;
+        let mut rec_levels = if rec.base.level_params == family.base.level_params {
+            Vec::new()
+        } else {
+            vec![universe.clone()]
+        };
+        rec_levels.extend(levels.iter().cloned());
+        let mut recursor = Typed {
+            value: Expr::const_(recursor_name, rec_levels.clone()),
+            type_: self.instantiate_params(&rec.base.type_, &rec.base.level_params, &rec_levels)?,
+        };
+        for parameter in &parameters {
+            let type_ = self
+                .known_type(parameter)?
+                .ok_or_else(|| error(MatchError::ExpectedInductive))?;
+            recursor = self.match_apply(
+                recursor,
+                Typed {
+                    value: parameter.clone(),
+                    type_,
+                },
+            )?;
+        }
+        let motive = Typed {
+            value: motive,
+            type_: motive_type,
+        };
+        recursor = if family.all.len() == 1 {
+            self.match_apply(recursor, motive)?
+        } else {
+            self.specialize_mutual_match(recursor, &family, &rec, motive, &motive_target, universe)?
+        };
+        let MatchPatterns {
+            constructors: mut patterns,
+            fallback,
+        } = self.match_patterns(parts, name, &family.ctors)?;
+        let mut branches = std::collections::VecDeque::new();
+        let mut seen = HashSet::new();
+        for rule in &rec.rules {
+            self.tick()?;
+            if !family.ctors.contains(&rule.ctor) || !seen.insert(rule.ctor.clone()) {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&rule.ctor).cloned()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if constructor.induct != *name
+                || constructor.is_unsafe
+                || constructor.num_params != family.num_params
+                || constructor.num_fields != rule.nfields
+                || constructor.base.level_params != family.base.level_params
+            {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            let (fields, whole, syntax) =
+                if let Some((fields, syntax)) = patterns.remove(&rule.ctor) {
+                    (Some(fields), None, syntax)
+                } else if let Some((whole, syntax)) = &fallback {
+                    (None, whole.clone(), *syntax)
+                } else {
+                    return Err(error(MatchError::MissingConstructor));
+                };
+            branches.push_back(Branch {
+                constructor,
+                fields,
+                whole,
+                syntax,
+            });
+        }
+        let conditional_order = self.order_well_founded_conditional(
+            parts.conditional.is_some(),
+            name,
+            &recursor,
+            &mut branches,
+        )?;
+        Ok(MatchBuild {
+            direct: None,
+            recursive,
+            unrefined_capture: false,
+            saved: self.txn.lctx.clone(),
+            target,
+            major,
+            family: name.clone(),
+            parameters,
+            indices,
+            generalized,
+            motive_obligation,
+            levels: levels.clone(),
+            recursor,
+            branches,
+            conditional_order,
+        })
+    }
+
+    /// One pattern parser serves ordinary and equation-refining matches. Syntax
+    /// is borrowed from the original source; no generated tactic script or
+    /// reparsing can erase a branch's annotations, references, or provenance.
+    /// Read only admitted constructor signatures. A bound result index in the
+    /// innermost field slots denotes a field, while the higher slots are fixed
+    /// parameters. Compound indices are not assumed injective by this test.
+    pub(super) fn match_has_field_indices(
+        &mut self,
+        family: &fln_env::constants::InductiveVal,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if family.num_indices == 0 {
+            return Ok(false);
+        }
+        for name in &family.ctors {
+            self.tick()?;
+            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(name).cloned() else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if constructor.induct != family.base.name || constructor.num_params != family.num_params
+            {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            let mut result = &constructor.base.type_;
+            for _ in 0..u64::from(constructor.num_params) + u64::from(constructor.num_fields) {
+                self.tick()?;
+                let ExprNode::ForallE { body, .. } = result.node() else {
+                    return Err(error(MatchError::UnsupportedFamily));
+                };
+                result = body;
+            }
+            for _ in 0..family.num_indices {
+                self.tick()?;
+                let ExprNode::App { f, a } = result.node() else {
+                    return Err(error(MatchError::UnsupportedFamily));
+                };
+                if matches!(a.node(), ExprNode::BVar { idx } if *idx < constructor.num_fields) {
+                    return Ok(true);
+                }
+                result = f;
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn match_patterns<'a>(
+        &mut self,
+        parts: MatchParts<'a>,
+        name: &Name,
+        constructors: &[Name],
+    ) -> Result<MatchPatterns<'a>, NatDefinitionElabError> {
+        let mut patterns = HashMap::new();
+        if let Some(conditional) = parts.conditional {
+            let (no, yes, fields) = if name == &Name::from_components(["Bool"]) {
+                ("false", "true", vec![])
+            } else if name == &Name::from_components(["Decidable"]) {
+                ("isFalse", "isTrue", vec![conditional.binding.cloned()])
+            } else {
+                return Err(error(MatchError::ExpectedCondition));
+            };
+            let no = Name::str(name.clone(), no);
+            let yes = Name::str(name.clone(), yes);
+            if constructors.len() != 2
+                || !constructors.contains(&no)
+                || !constructors.contains(&yes)
+            {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            patterns.insert(no, (fields.clone(), conditional.no));
+            patterns.insert(yes, (fields, conditional.yes));
+            return Ok(MatchPatterns {
+                constructors: patterns,
+                fallback: None,
+            });
+        }
+        let mut fallback = None;
+        for (index, syntax) in parts.alternatives.iter().enumerate() {
+            self.tick()?;
+            let alt = expect_node(
+                syntax,
+                &parser_kind(&["Term", "matchAlt"]),
+                4,
+                "match alternative",
+            )?;
+            expect_atom(&alt[0], "|", "alternative separator")?;
+            if !matches!(&alt[2], Syntax::Atom { val, .. } if val == "=>" || val == "↦") {
+                return Err(error(MatchError::InvalidPattern));
+            }
+            let [sequence] = expect_null_args(&alt[1], "single pattern sequence")? else {
+                return Err(error(MatchError::InvalidPattern));
+            };
+            let [pattern] = expect_null_args(sequence, "single pattern")? else {
+                return Err(error(MatchError::InvalidPattern));
+            };
+            let (head, arguments) = if let Syntax::Node { kind, args, .. } = pattern
+                && kind == &parser_kind(&["Term", "app"])
+            {
+                let [head, args] = args.as_slice() else {
+                    return Err(error(MatchError::InvalidPattern));
+                };
+                (head, expect_null_args(args, "pattern fields")?)
+            } else {
+                (pattern, &[][..])
+            };
+            let constructor_name = if head == &patterns::anonymous_head() {
+                // `⟨…⟩` names the family's only constructor (`elabAnonymousCtor`).
+                match constructors {
+                    [only] => Some(only.clone()),
+                    [] => {
+                        return Err(failure(SourceInferenceError::AnonymousCtor(
+                            anonymous_ctor::AnonymousCtorError::NoConstructors,
+                        )));
+                    }
+                    _ => {
+                        return Err(failure(SourceInferenceError::AnonymousCtor(
+                            anonymous_ctor::AnonymousCtorError::ManyConstructors,
+                        )));
+                    }
+                }
+            } else if let Syntax::Node { kind, .. } = head
+                && kind == &parser_kind(&["Term", "dotIdent"])
+            {
+                let fields = expect_node(head, kind, 2, "relative constructor")?;
+                expect_atom(&fields[0], ".", "relative constructor prefix")?;
+                let Syntax::Ident { val, .. } = &fields[1] else {
+                    return Err(error(MatchError::InvalidPattern));
+                };
+                Some(name.append_core(val))
+            } else if let Syntax::Ident { val, .. } = head {
+                let resolved = if name == &Name::from_components(["Bool"])
+                    && matches!(val.to_display_string().as_str(), "true" | "false")
+                {
+                    name.append_core(val)
+                } else {
+                    self.resolve_source_name(val)?
+                        .unwrap_or_else(|| val.clone())
+                };
+                if matches!(self.txn.env.find(&resolved), Some(ConstantInfo::Ctor(_))) {
+                    Some(resolved)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(constructor_name) = constructor_name {
+                if !constructors.contains(&constructor_name) {
+                    return Err(error(MatchError::InvalidPattern));
+                }
+                let mut fields = arguments
+                    .iter()
+                    .map(pattern_name)
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Explicit constructor parameters, which only a promoted index has,
+                // take a written argument each; the pin makes them inaccessible
+                // (`isNextArgAccessible`, vendored Lean/Elab/PatternVar.lean:178-188),
+                // so only `_` may stand there, and the fields follow them. A match
+                // the pattern-matrix compiler generated names every column with an
+                // unspellable numeric name; dropped here, that column is bound by
+                // nothing, and an alias of it is refused (`inaccessible_columns`).
+                let Some(ConstantInfo::Ctor(constructor)) =
+                    self.txn.env.find(&constructor_name).cloned()
+                else {
+                    return Err(error(MatchError::UnsupportedFamily));
+                };
+                let parameters = self.explicit_parameter_binders(&constructor)?;
+                if fields.len() < parameters {
+                    return Err(error(MatchError::WrongArity));
+                }
+                let inaccessible = |field: &Option<Name>| match field {
+                    None => true,
+                    Some(name) => {
+                        parts.generated
+                            && name.parent().is_anonymous()
+                            && matches!(name.leaf_view(), LeafView::Num(_))
+                    }
+                };
+                if !fields[..parameters].iter().all(inaccessible) {
+                    return Err(error(MatchError::InaccessibleParameter));
+                }
+                // A generated column dropped here binds nothing; remember it, so a
+                // source alias of it is refused as the pin refuses it.
+                for column in fields.drain(..parameters).flatten() {
+                    self.inaccessible_columns.insert(column);
+                }
+                let mut names = HashSet::new();
+                if fields
+                    .iter()
+                    .flatten()
+                    .any(|field| !names.insert(field.clone()))
+                {
+                    return Err(error(MatchError::DuplicateVariable));
+                }
+                if patterns
+                    .insert(constructor_name, (fields, &alt[3]))
+                    .is_some()
+                {
+                    return Err(error(MatchError::DuplicateConstructor));
+                }
+            } else {
+                if !arguments.is_empty()
+                    || index + 1 != parts.alternatives.len()
+                    || fallback.is_some()
+                {
+                    return Err(error(MatchError::InvalidPattern));
+                }
+                fallback = Some((pattern_name(head)?, &alt[3]));
+            }
+        }
+        // Do not silently discard a written branch: even an unreachable bad
+        // term must not vanish before checking. Redundant catch-alls are a
+        // visible unsupported pattern in this exhaustive, disjoint profile.
+        if fallback.is_some() && patterns.len() == constructors.len() {
+            if parts.generated {
+                fallback = None;
+            } else {
+                return Err(error(MatchError::DuplicateConstructor));
+            }
+        }
+        Ok(MatchPatterns {
+            constructors: patterns,
+            fallback,
+        })
+    }
+
+    /// Recursion belongs to the admitted constructor's uninstantiated signature.
+    /// A parameter instantiated with this same family is still payload data, not
+    /// a recursive child (for example the head of List (List Nat)). Counting
+    /// occurrences after parameter substitution invents nonexistent hypotheses.
+    pub(super) fn constructor_recursive_fields(
+        &mut self,
+        constructor: &ConstructorVal,
+    ) -> Result<Vec<bool>, NatDefinitionElabError> {
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&constructor.induct) else {
+            return Err(error(MatchError::UnsupportedFamily));
+        };
+        let families = family.all.clone();
+        let mut telescope = constructor.base.type_.clone();
+        for _ in 0..constructor.num_params {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            telescope = body.clone();
+        }
+        let mut flags = Vec::new();
+        for _ in 0..constructor.num_fields {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = telescope.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let domain = self.whnf(binder_type)?;
+            let mut head = &domain;
+            // The admitted signature owns positivity. Count one hypothesis
+            // for a function-valued child, not one per function argument.
+            while let ExprNode::ForallE { body, .. } = head.node() {
+                self.tick()?;
+                head = body;
+            }
+            while let ExprNode::App { f, .. } = head.node() {
+                self.tick()?;
+                head = f;
+            }
+            let recursive =
+                matches!(head.node(), ExprNode::Const { name, .. } if families.contains(name));
+            if !recursive {
+                let mut pending = vec![&domain];
+                let mut seen = HashSet::new();
+                while let Some(expr) = pending.pop() {
+                    self.tick()?;
+                    if !seen.insert(expr.allocation_identity()) {
+                        continue;
+                    }
+                    match expr.node() {
+                        ExprNode::Const { name, .. } if families.contains(name) => {
+                            return Err(error(MatchError::UnsupportedFamily));
+                        }
+                        ExprNode::App { f, a } => {
+                            pending.push(a);
+                            pending.push(f);
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            pending.push(body);
+                            pending.push(binder_type);
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            pending.push(body);
+                            pending.push(value);
+                            pending.push(type_);
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            pending.push(expr)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            flags.push(recursive);
+            telescope = body.clone();
+        }
+        Ok(flags)
+    }
+
+    pub(super) fn next_match_branch<'a>(
+        &mut self,
+        state: &mut MatchBuild<'a>,
+    ) -> Result<MatchStep<'a>, NatDefinitionElabError> {
+        self.txn.lctx = state.saved.clone();
+        if let Some(direct) = &mut state.direct {
+            let Some(syntax) = direct.syntax.take() else {
+                return Ok(MatchStep::Complete(
+                    self.finish_term(state.recursor.clone(), Some(&state.target))?,
+                ));
+            };
+            // Bind even a wildcard: the original value and its type remain in
+            // the core term, so an unused malformed argument cannot disappear.
+            let id = FVarId(self.fresh_name()?);
+            self.txn.lctx.add_let(
+                id.clone(),
+                direct.whole.clone().unwrap_or_else(Name::anonymous),
+                state.major.type_.clone(),
+                state.major.value.clone(),
+            );
+            return Ok(MatchStep::Branch {
+                syntax,
+                expected: state.target.clone(),
+                binders: BranchBinders {
+                    unrefined: HashSet::new(),
+                    hypotheses: Vec::new(),
+                    locals: vec![self.txn.lctx.find(&id).expect("whole-match binder").clone()],
+                    type_: state.target.clone(),
+                },
+            });
+        }
+        let Some(branch) = state.branches.pop_front() else {
+            if state.unrefined_capture {
+                return Err(error(MatchError::UnrefinedIndexPattern));
+            }
+            let mut result = state.recursor.clone();
+            for index in &state.indices {
+                result = self.match_apply(
+                    result,
+                    Typed {
+                        value: Expr::fvar(index.id.clone()),
+                        type_: index.type_.clone(),
+                    },
+                )?;
+            }
+            result = self.match_apply(result, state.major.clone())?;
+            for local in &state.generalized {
+                let type_ = self.instantiate(&local.type_)?;
+                result = self.match_apply(
+                    result,
+                    Typed {
+                        value: Expr::fvar(local.id.clone()),
+                        type_,
+                    },
+                )?;
+            }
+            if state.recursive {
+                for argument in self.recursive_arguments() {
+                    let type_ = self
+                        .known_type(&argument)?
+                        .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+                    result = self.match_apply(
+                        result,
+                        Typed {
+                            value: argument,
+                            type_,
+                        },
+                    )?;
+                }
+            }
+            if let Some(obligation) = &state.motive_obligation {
+                result.value = Expr::let_e(
+                    Name::anonymous(),
+                    obligation.type_.clone(),
+                    obligation.value.clone(),
+                    result.value,
+                    false,
+                );
+            }
+            return Ok(MatchStep::Complete(
+                self.finish_term(result, Some(&state.target))?,
+            ));
+        };
+        if state.recursive {
+            self.recursive_branch_context()?;
+        }
+        if branch.constructor.num_fields > 256 {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        let minor_type = if let Some(order) = &mut state.conditional_order {
+            self.next_ordered_conditional_domain(order)?
+        } else {
+            let type_ = self.whnf(&state.recursor.type_)?;
+            let ExprNode::ForallE {
+                binder_type: minor_type,
+                ..
+            } = type_.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            minor_type.clone()
+        };
+        let mut target = minor_type.clone();
+        let mut locals = Vec::new();
+        let mut constructor =
+            Expr::const_(branch.constructor.base.name.clone(), state.levels.clone());
+        for parameter in &state.parameters {
+            constructor = Expr::app(constructor, parameter.clone());
+        }
+        let mut recursive_fields = Vec::new();
+        let mut consumed = 0;
+        for recursive_field in self.constructor_recursive_fields(&branch.constructor)? {
+            self.tick()?;
+            target = self.whnf(&target)?;
+            let ExprNode::ForallE {
+                binder_type,
+                binder_info,
+                body,
+                ..
+            } = target.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let name = if *binder_info == BinderInfo::Default {
+                if let Some(fields) = &branch.fields {
+                    let field = fields
+                        .get(consumed)
+                        .ok_or_else(|| error(MatchError::WrongArity))?;
+                    consumed += 1;
+                    field.clone().unwrap_or_else(Name::anonymous)
+                } else {
+                    Name::anonymous()
+                }
+            } else {
+                Name::anonymous()
+            };
+            let id = FVarId(self.fresh_name()?);
+            if recursive_field {
+                recursive_fields.push(id.clone());
+            }
+            self.txn
+                .lctx
+                .add_param(id.clone(), name, binder_type.clone(), *binder_info);
+            locals.push(self.txn.lctx.find(&id).expect("branch binder").clone());
+            let argument = Expr::fvar(id);
+            constructor = Expr::app(constructor, argument.clone());
+            target = self.substitute(body, &argument)?;
+        }
+        if branch
+            .fields
+            .as_ref()
+            .is_some_and(|fields| fields.len() != consumed)
+        {
+            return Err(error(MatchError::WrongArity));
+        }
+        let mut unrefined = HashSet::new();
+        if !state.indices.is_empty() {
+            let constructor_type = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            for (original, index) in state.indices.iter().zip(self.elimination_result_indices(
+                &constructor_type,
+                &state.family,
+                state.parameters.len(),
+                state.indices.len(),
+            )?) {
+                let index = self.whnf(&index)?;
+                // No equation relates this fresh field to the outer index.
+                // Preserve that boundary by checking what the elaborated branch
+                // actually captures, instead of refusing every branch of the
+                // family (which also blocked correctly refined recursion).
+                if let ExprNode::FVar { id } = index.node()
+                    && locals.iter().any(|local| &local.id == id)
+                {
+                    unrefined.insert(original.id.clone());
+                }
+            }
+        }
+        // Recursion hypotheses are actual recursor arguments, but ordinary
+        // match syntax does not expose them as names to its branch program.
+        let mut hypotheses = Vec::new();
+        for field in recursive_fields {
+            self.tick()?;
+            target = self.whnf(&target)?;
+            let ExprNode::ForallE {
+                binder_type,
+                binder_info,
+                body,
+                ..
+            } = target.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let id = FVarId(self.fresh_name()?);
+            hypotheses.push((field, id.clone()));
+            locals.push(LocalDecl {
+                id: id.clone(),
+                user_name: Name::anonymous(),
+                type_: binder_type.clone(),
+                value: None,
+                binder_info: *binder_info,
+                index: self.txn.lctx.len(),
+            });
+            target = self.substitute(body, &Expr::fvar(id))?;
+        }
+        if state.recursive {
+            // Lower applications while local aliases and dependent function
+            // arguments are still open, even in a single-column root match.
+            // The same private registration used by matrices hides these
+            // hypotheses from ordinary proof and instance search.
+            self.register_matrix_hypotheses(&mut locals, &hypotheses)?;
+        }
+        if state.recursive {
+            let constructor_type = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            self.recursive_index_aliases(&mut locals, &constructor_type)?;
+            self.recursive_major_alias(&mut locals, &constructor, &constructor_type)?;
+        }
+        if let Some(whole) = branch.whole {
+            let id = FVarId(self.fresh_name()?);
+            let type_ = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            self.txn.lctx.add_let(id.clone(), whole, type_, constructor);
+            locals.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("whole-pattern binder")
+                    .clone(),
+            );
+        }
+        for local in &state.generalized {
+            self.tick()?;
+            target = self.whnf(&target)?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = target.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let name = if locals
+                .iter()
+                .any(|binder| binder.user_name == local.user_name)
+            {
+                Name::anonymous()
+            } else {
+                local.user_name.clone()
+            };
+            let id = FVarId(self.fresh_name()?);
+            self.txn
+                .lctx
+                .add_param(id.clone(), name, binder_type.clone(), *binder_info);
+            locals.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("generalized match binder")
+                    .clone(),
+            );
+            target = self.substitute(body, &Expr::fvar(id))?;
+        }
+        if state.recursive {
+            target = self.recursive_parameters(&mut locals, target)?;
+        }
+        // Expose the instantiated motive, but preserve the branch's named
+        // result type. Eagerly unfolding State/Reader here loses the monad
+        // before nested do notation can select its dictionary. Ordinary source
+        // conversion still unfolds safe definitions when checking the branch.
+        let expected =
+            self.whnf_with_transparency(&target, UnificationTransparency::Abbreviations, true)?;
+        // Fresh generalized parameters shadow their old source names. Clear
+        // the old locals only when no retained type or let value needs them;
+        // otherwise a captured let would lose its actual free-variable scope.
+        // In particular, obsolete dictionaries must not stay searchable merely
+        // because their replacement was given the same name.
+        // Well-founded calls may retain old identities through cached proof
+        // transports. Those ambient locals remain privately available, while
+        // ordinary source proof and instance search see the specialized ones.
+        if !state.generalized.is_empty()
+            && !self.hide_well_founded_match_locals(&state.generalized)?
+        {
+            let candidates: HashSet<_> = state
+                .generalized
+                .iter()
+                .map(|local| local.id.clone())
+                .collect();
+            let context = self.txn.lctx.clone();
+            let target_reads = self.elimination_reads(&expected)?;
+            let mut reads = Vec::new();
+            for local in context.decls() {
+                let mut dependencies = self.elimination_reads(&local.type_)?;
+                if let Some(value) = &local.value {
+                    dependencies.extend(self.elimination_reads(value)?);
+                }
+                reads.push(dependencies);
+            }
+            let mut retained = vec![true; context.len()];
+            for (index, local) in context.decls().iter().enumerate().rev() {
+                self.tick()?;
+                if !candidates.contains(&local.id) || target_reads.contains(&local.id) {
+                    continue;
+                }
+                let mut needed = false;
+                for (other, dependencies) in reads.iter().enumerate() {
+                    self.tick()?;
+                    if other != index && retained[other] && dependencies.contains(&local.id) {
+                        needed = true;
+                        break;
+                    }
+                }
+                if !needed {
+                    retained[index] = false;
+                }
+            }
+            self.txn.lctx = LocalContext::new();
+            for (local, keep) in context.decls().iter().zip(retained) {
+                if keep {
+                    if let Some(value) = &local.value {
+                        self.txn.lctx.add_let(
+                            local.id.clone(),
+                            local.user_name.clone(),
+                            local.type_.clone(),
+                            value.clone(),
+                        );
+                    } else {
+                        self.txn.lctx.add_param(
+                            local.id.clone(),
+                            local.user_name.clone(),
+                            local.type_.clone(),
+                            local.binder_info,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(MatchStep::Branch {
+            syntax: branch.syntax,
+            expected,
+            binders: BranchBinders {
+                unrefined,
+                hypotheses,
+                locals,
+                type_: minor_type.clone(),
+            },
+        })
+    }
+
+    pub(super) fn accept_match_branch(
+        &mut self,
+        state: &mut MatchBuild<'_>,
+        binders: BranchBinders,
+        branch: Typed,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let mut value = self.instantiate(&branch.value)?;
+        if state.recursive {
+            value = self.lower_recursive_calls(&value, &binders.hypotheses)?;
+        }
+        for local in binders.locals.into_iter().rev() {
+            self.tick()?;
+            let domain = self.instantiate(&local.type_)?;
+            value = value
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            value = if let Some(local_value) = local.value {
+                Expr::let_e(
+                    local.user_name,
+                    domain,
+                    self.instantiate(&local_value)?,
+                    value,
+                    false,
+                )
+            } else {
+                Expr::lam(local.user_name, domain, value, local.binder_info)
+            };
+        }
+        if !binders.unrefined.is_empty() {
+            let mut pending: Vec<_> = self.elimination_reads(&value)?.into_iter().collect();
+            let mut seen = HashSet::new();
+            while let Some(id) = pending.pop() {
+                self.tick()?;
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if binders.unrefined.contains(&id) {
+                    // Finish the other branches first. An actual unresolved
+                    // self-reference there must still select the existing
+                    // recursive elaboration retry, which rebinds the indices.
+                    // A nonrecursive match still refuses before completion.
+                    state.unrefined_capture = true;
+                    break;
+                }
+                if let Some(local) = state.saved.find(&id) {
+                    pending.extend(self.elimination_reads(&local.type_)?);
+                    if let Some(value) = &local.value {
+                        pending.extend(self.elimination_reads(value)?);
+                    }
+                }
+            }
+        }
+        self.txn.lctx = state.saved.clone();
+        if state.direct.is_some() {
+            state.recursor = Typed {
+                value,
+                type_: binders.type_,
+            };
+            return Ok(());
+        }
+        let value = Typed {
+            value,
+            type_: binders.type_,
+        };
+        if !self.accept_ordered_conditional_minor(state, value.clone())? {
+            state.recursor = self.match_apply(state.recursor.clone(), value)?;
+        }
+        Ok(())
+    }
+}

@@ -4,10 +4,15 @@
 //! admitted recursor rules. Stuck majors are rebuilt once and unwound, never
 //! resubmitted in an unproductive loop. Neither reduction nor transparency can
 //! publish a declaration or eliminate an original source typing obligation.
+mod imported_smart;
+#[cfg(test)]
+mod projection_tests;
 mod quotient;
+#[cfg(test)]
+mod selected_k_tests;
 
 use super::*;
-use fln_env::constants::{ConstantInfo, RecursorVal};
+use fln_env::constants::{ConstantInfo, DefinitionVal, RecursorVal};
 
 enum Continuation {
     Quotient {
@@ -20,11 +25,34 @@ enum Continuation {
         index: u64,
         arguments: Vec<Expr>,
     },
+    ClassProjection {
+        head: Expr,
+        arguments: Vec<Expr>,
+        projection: crate::records::projection::ClassProjection,
+    },
     Recursor {
         head: Expr,
         recursor: RecursorVal,
         arguments: Vec<Expr>,
     },
+}
+
+/// Ordinary WHNF keeps its syntactic K gate. Explicitly selected unfolding
+/// may check closed endpoint equations to traverse dependent branch transports.
+#[derive(Clone, Copy)]
+enum KEndpointCheck {
+    Syntactic,
+    Kernel,
+}
+
+/// [`Context::smart_unfolding`]'s verdict on one delta step.
+enum SmartUnfolding {
+    /// Not a source structural definition: ordinary delta.
+    Plain,
+    /// A match did not reach an alternative, or the application is partial: nothing unfolds.
+    Folded,
+    /// The alternative reached, standing for the application to the first `consumed` arguments.
+    Alternative { value: Expr, consumed: usize },
 }
 
 fn recursor_prefix(recursor: &RecursorVal) -> Result<usize, NatDefinitionElabError> {
@@ -97,7 +125,12 @@ impl Context {
                     }
                     ExprNode::Const { name, levels } => match self.txn.env.find(name).cloned() {
                         Some(ConstantInfo::Defn(definition)) => {
-                            if definition.safety != DefinitionSafety::Safe || !match transparency {
+                            // `whnfCore` unfolds applied auxiliary recursors even
+                            // when ordinary delta is disabled. Their admitted
+                            // journal, not a casesOn/brecOn suffix, selects them.
+                            let auxiliary =
+                                !arguments.is_empty() && self.is_auxiliary_recursor(name)?;
+                            if definition.safety != DefinitionSafety::Safe || !auxiliary && !match transparency {
                                 UnificationTransparency::None => false,
                                 UnificationTransparency::Abbreviations => {
                                     crate::reducibility::table(&self.txn.env)
@@ -140,10 +173,68 @@ impl Context {
                                 }
                                 UnificationTransparency::SafeDefinitions => true,
                             } {
-                                break;
+                                // Class fields stay semireducible in the pin,
+                                // but `unfoldProjInst?` can project a dictionary
+                                // whose constructor is exposed at instances
+                                // transparency. Do not unfold a named ordinary
+                                // definition supplying that dictionary.
+                                if transparency != UnificationTransparency::Instances
+                                    || definition.base.level_params.len() != levels.len()
+                                {
+                                    break;
+                                }
+                                let env = self.txn.env.clone();
+                                let Some(projection) =
+                                    crate::records::projection::class_projection(
+                                        &env,
+                                        &definition,
+                                        || self.tick(),
+                                    )?
+                                else {
+                                    break;
+                                };
+                                if arguments.len() <= projection.parameters
+                                    || crate::reducibility::table(&self.txn.env)
+                                        .map_err(|error| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                UnificationError::Reducibility(error),
+                                            )))
+                                        })?
+                                        .status(name)
+                                        == crate::reducibility::Reducibility::Irreducible
+                                    || !self.instance_registry()?.is_class(&projection.structure)
+                                {
+                                    break;
+                                }
+                                let receiver =
+                                    arguments[arguments.len() - projection.parameters - 1].clone();
+                                continuations.push(Continuation::ClassProjection {
+                                    head,
+                                    arguments: std::mem::take(&mut arguments),
+                                    projection,
+                                });
+                                head = receiver;
+                                continue;
                             }
                             if definition.base.level_params.len() != levels.len() {
                                 return Err(failure(SourceInferenceError::Scope));
+                            }
+                            match self.smart_unfolding(
+                                &definition,
+                                levels,
+                                &arguments,
+                                transparency,
+                                zeta_delta,
+                                KEndpointCheck::Syntactic,
+                            )? {
+                                SmartUnfolding::Plain => {}
+                                SmartUnfolding::Folded => break,
+                                SmartUnfolding::Alternative { value, consumed } => {
+                                    changed = true;
+                                    arguments.truncate(arguments.len() - consumed);
+                                    head = value;
+                                    continue;
+                                }
                             }
                             changed = true;
                             head = self.instantiate_params(
@@ -231,6 +322,27 @@ impl Context {
                         head = Expr::proj(structure, index, head);
                         arguments = outer;
                     }
+                    Continuation::ClassProjection {
+                        head: projection_head,
+                        arguments: mut outer,
+                        projection,
+                    } => {
+                        if let Some(field) = crate::records::constructor_field(
+                            &self.txn.env,
+                            &projection.structure,
+                            projection.index,
+                            &head,
+                            &arguments,
+                        ) {
+                            changed = true;
+                            outer.truncate(outer.len() - projection.parameters - 1);
+                            head = field;
+                            arguments = outer;
+                            continue 'reduce;
+                        }
+                        head = projection_head;
+                        arguments = outer;
+                    }
                     Continuation::Recursor {
                         head: rec_head,
                         recursor,
@@ -268,6 +380,197 @@ impl Context {
         }
     }
 
+    /// One explicitly selected simp unfolding. Keep a structural definition's
+    /// head intact until enough arguments expose a checked smart alternative;
+    /// unfolding its bare constant first loses the recursive call identities.
+    pub(in crate::source) fn unfold_selected_definition(
+        &mut self,
+        term: &Expr,
+        definition: &DefinitionVal,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut head = term.clone();
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f.clone();
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(term.clone());
+        };
+        if name != &definition.base.name || definition.safety != DefinitionSafety::Safe {
+            return Ok(term.clone());
+        }
+        if definition.base.level_params.len() != levels.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let unfolding = self.smart_unfolding(
+            definition,
+            levels,
+            &arguments,
+            UnificationTransparency::None,
+            false,
+            KEndpointCheck::Kernel,
+        )?;
+        let unfolding = match unfolding {
+            SmartUnfolding::Plain => {
+                self.imported_smart_unfolding(definition, levels, &arguments)?
+            }
+            result => result,
+        };
+        let value = match unfolding {
+            SmartUnfolding::Folded => return Ok(term.clone()),
+            SmartUnfolding::Plain => {
+                self.instantiate_params(&definition.value, &definition.base.level_params, levels)?
+            }
+            SmartUnfolding::Alternative { value, consumed } => {
+                arguments.truncate(arguments.len() - consumed);
+                value
+            }
+        };
+        self.rebuild_application(value, arguments)
+    }
+
+    /// The pin's smart unfolding (vendored Lean/Meta/WHNF.lean:871-930) of a source structural
+    /// definition applied to `arguments`, this reduction's reversed spine. The pin unfolds such a
+    /// definition only through its `_sunfold` companion
+    /// (Lean/Elab/PreDefinition/Structural/SmartUnfolding.lean): the original body, recursive
+    /// calls still naming the definition, whose matches must reach an alternative, or nothing
+    /// unfolds at all. So `Tower 1` is `Tower 0 → Tower 0` there, never the compiled recursor's
+    /// `Nat.rec … 0 → Nat.rec … 0`, whose domain even instance transparency reduces to `Nat`
+    /// (a numeral at it would find `instOfNatNat`); and `Tower n` stays `Tower n`. A source
+    /// structural definition carries that body as its original-body obligation
+    /// (`recursion::structural_obligation_name`). A `match` compiles to recursor applications,
+    /// so each fully applied recursor met at the head before an alternative is one of them.
+    /// Dependent index matching also inserts equality transports. During selected
+    /// unfolding, the kernel may establish their closed endpoint equations;
+    /// otherwise a known constructor branch could be discarded as a stuck match.
+    /// Ordinary WHNF does not gain this conversion step.
+    fn smart_unfolding(
+        &mut self,
+        definition: &DefinitionVal,
+        levels: &[Level],
+        arguments: &[Expr],
+        transparency: UnificationTransparency,
+        zeta_delta: bool,
+        endpoints: KEndpointCheck,
+    ) -> Result<SmartUnfolding, NatDefinitionElabError> {
+        let mut body = &definition.value;
+        let mut lambdas = 0usize;
+        while let ExprNode::Lam { body: inner, .. } = body.node() {
+            self.tick()?;
+            lambdas += 1;
+            body = inner;
+        }
+        let ExprNode::LetE {
+            decl_name, value, ..
+        } = body.node()
+        else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let Some(header) = super::recursion::structural_obligation_parameters(decl_name) else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let ExprNode::Lam { body: checked, .. } = value.node() else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let ExprNode::LetE {
+            value: original, ..
+        } = checked.node()
+        else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        let Some(outer) = lambdas.checked_sub(header) else {
+            return Ok(SmartUnfolding::Plain);
+        };
+        // The pin unfolds neither a bare `f` nor an application missing the argument its match
+        // inspects; an application short of any parameter stays folded here.
+        if arguments.len() < lambdas {
+            return Ok(SmartUnfolding::Folded);
+        }
+        let supplied: Vec<Expr> = arguments.iter().rev().take(lambdas).cloned().collect();
+        // `self` is the definition at the parameters bound outside its header (section
+        // variables): the reference its recursive calls were elaborated against.
+        let mut reference = Expr::const_(definition.base.name.clone(), levels.to_vec());
+        for argument in &supplied[..outer] {
+            self.tick()?;
+            reference = Expr::app(reference, argument.clone());
+        }
+        let original = self.instantiate_params(original, &definition.base.level_params, levels)?;
+        let mut substitution = supplied;
+        substitution.push(reference);
+        let mut current = original
+            .subst_loose(0, &substitution)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        loop {
+            self.tick()?;
+            let mut head = current.clone();
+            let mut spine = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.tick()?;
+                spine.push(a.clone());
+                head = f.clone();
+            }
+            current = match head.node() {
+                ExprNode::MData { expr, .. } => self.rebuild_application(expr.clone(), spine)?,
+                ExprNode::LetE { value, body, .. } => {
+                    let body = self.substitute(body, value)?;
+                    self.rebuild_application(body, spine)?
+                }
+                ExprNode::Lam { body, .. } if !spine.is_empty() => {
+                    let argument = spine.pop().expect("nonempty application spine");
+                    let body = self.substitute(body, &argument)?;
+                    self.rebuild_application(body, spine)?
+                }
+                ExprNode::Const { name, .. } => {
+                    let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(name).cloned() else {
+                        break;
+                    };
+                    let major = recursor_major(&recursor)?;
+                    if recursor.is_unsafe || major >= spine.len() {
+                        break;
+                    }
+                    let position = spine.len() - major - 1;
+                    // The pin reads an offset major as `Nat.succ a` (`cleanupNatOffsetMajor`), so
+                    // `Tower (n + 1)` exposes `Tower n`, never the seed `Nat.add`'s recursion.
+                    let mut major_head = match super::pattern_typing::offset_major(&spine[position])
+                    {
+                        Some(major) => major,
+                        None => {
+                            self.reduce_source_head(&spine[position], transparency, zeta_delta)?
+                        }
+                    };
+                    let mut major_arguments = Vec::new();
+                    while let ExprNode::App { f, a } = major_head.node() {
+                        self.tick()?;
+                        major_arguments.push(a.clone());
+                        major_head = f.clone();
+                    }
+                    let reduced = match self.source_iota(
+                        &head,
+                        &recursor,
+                        &spine,
+                        &major_head,
+                        &major_arguments,
+                    )? {
+                        Some(reduced) => Some(reduced),
+                        None => self.source_k_iota_checked(&head, &recursor, &spine, endpoints)?,
+                    };
+                    let Some(reduced) = reduced else {
+                        return Ok(SmartUnfolding::Folded);
+                    };
+                    spine.truncate(position);
+                    self.rebuild_application(reduced, spine)?
+                }
+                _ => break,
+            };
+        }
+        Ok(SmartUnfolding::Alternative {
+            value: current,
+            consumed: lambdas,
+        })
+    }
+
     /// An admitted nullary K recursor can reduce an unknown proof only when
     /// its spine-derived major domain is exactly the constructor result. This
     /// sufficient gate does not equate unknown indices or assign metavariables.
@@ -277,6 +580,20 @@ impl Context {
         head: &Expr,
         recursor: &RecursorVal,
         arguments: &[Expr],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.source_k_iota_checked(head, recursor, arguments, KEndpointCheck::Syntactic)
+    }
+
+    /// Selected unfolding may encounter dependent equality transports after the
+    /// constructor branch is known. Their endpoints need not be syntactically
+    /// identical. Validate that equation without assigning holes; ordinary
+    /// reduction retains its narrower syntactic gate.
+    fn source_k_iota_checked(
+        &mut self,
+        head: &Expr,
+        recursor: &RecursorVal,
+        arguments: &[Expr],
+        endpoints: KEndpointCheck,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         if !recursor.k
             || recursor.all.len() != 1
@@ -346,7 +663,12 @@ impl Context {
             result = self.substitute(body, parameter)?;
         }
         self.tick()?;
-        if result != *binder_type {
+        if result != *binder_type
+            && (matches!(endpoints, KEndpointCheck::Syntactic)
+                || result.has_loose_bvars()
+                || binder_type.has_loose_bvars()
+                || !self.coercion_kernel_eq(result, binder_type.clone())?)
+        {
             return Ok(None);
         }
         let mut value = self.instantiate_params(&rule.rhs, &recursor.base.level_params, levels)?;
@@ -800,7 +1122,7 @@ mod source_k_tests {
     use fln_kernel::capability::{Published, admit};
     use fln_kernel::council::{Council, CouncilOutcome, convene};
 
-    fn environment() -> Environment {
+    pub(super) fn environment() -> Environment {
         let budget = Budget::for_stack_bytes(1024 * 1024);
         let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
         let declaration = crate::seed::equality::eq_seed_declaration();
@@ -820,13 +1142,13 @@ mod source_k_tests {
         };
         publication.environment
     }
-    fn nat() -> Expr {
+    pub(super) fn nat() -> Expr {
         Expr::const_(Name::from_components(["Nat"]), vec![])
     }
-    fn number(value: u64) -> Expr {
+    pub(super) fn number(value: u64) -> Expr {
         Expr::lit(Literal::Nat(NatLit::from_u64(value)))
     }
-    fn cast(left: Expr, right: Expr, value: Expr) -> Expr {
+    pub(super) fn cast(left: Expr, right: Expr, value: Expr) -> Expr {
         let equality = [nat(), left.clone(), Expr::bvar(0).unwrap()]
             .into_iter()
             .fold(

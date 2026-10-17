@@ -141,7 +141,7 @@ fn installed_record_imports_and_declaration_only_files_work() {
         .is_empty()
     );
     std::fs::write(&ops, "def leak (p : Point) : Nat := p.x").unwrap();
-    std::fs::write(&entry, "import Types Ops\n#eval 42").unwrap();
+    std::fs::write(&entry, "import Types\nimport Ops\n#eval 42").unwrap();
     let failed = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(&entry)
         .output()

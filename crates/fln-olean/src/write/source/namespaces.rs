@@ -85,7 +85,10 @@ pub(super) fn encode(
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
             && metadata.instances.is_empty()
+            && metadata.defaults.is_empty()
             && metadata.protected.is_empty()
+            && metadata.aux_recursors.is_empty()
+            && metadata.noncomputable.is_empty()
             && metadata.reducibility.is_empty()
         {
             encode_module(input, header, budget)

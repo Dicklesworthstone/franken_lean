@@ -23,7 +23,7 @@ def package : Package := by
   exact Nat
   exact 7
 
-theorem package_ok : package.value = 7 := by rfl
+theorem package_ok : package.value = (7 : Nat) := by rfl
 
 def identity : forall A : Type, A -> A := by
   refine fun A x => ?_

@@ -130,6 +130,12 @@ impl PendingArtifact {
         checked: &Environment,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
+        if header.module_system {
+            return Err(SourceModuleCheckError::ImportContext {
+                module: name.clone(),
+                reason: "module-system .olean emission requires public/private split artifacts",
+            });
+        }
         let mut constants = Vec::new();
         for (name, constant) in checked.constants() {
             meter.work(1)?;
@@ -226,6 +232,33 @@ impl PendingArtifact {
             });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let defaults = fln_elab::instances::defaults::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::instances::InstanceRegistryError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: meter.limits.max_work,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::instances::defaults::journal_name(),
+                    reason: "invalid default instance metadata export",
+                },
+            })?;
+        meter.work(defaults.work)?;
+        meter.bytes(defaults.bytes_examined)?;
+        for row in defaults.entries {
+            meter.work(1)?;
+            metadata
+                .defaults
+                .push(fln_olean::source_extensions::DefaultEntry {
+                    class: row.class,
+                    declaration: row.candidate.declaration,
+                    priority: row.candidate.priority,
+                });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let exported = fln_elab::reducibility::export::statuses(base, checked, remaining).map_err(
             |error| match error {
                 fln_elab::reducibility::ReducibilityError::Limit => SourceModuleCheckError::Limit {
@@ -292,6 +325,69 @@ impl PendingArtifact {
             meter.work(1)?;
             if !inherited.contains(tagged) {
                 metadata.protected.push(tagged.clone());
+            }
+        }
+        // Auxiliary tags belong to the module that generated the definition;
+        // dependencies' tags stay in their own artifacts, including diamonds.
+        let auxiliaries = |env: &Environment| {
+            fln_elab::aux_recursors::AuxRecursors::read(env).map_err(|_| {
+                SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::aux_recursors::journal_name(),
+                    reason: "invalid auxiliary-recursor journal",
+                }
+            })
+        };
+        let inherited = auxiliaries(base)?;
+        for tagged in auxiliaries(checked)?.iter() {
+            meter.work(1)?;
+            if !inherited.contains(tagged) {
+                if base.contains(tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::aux_recursors::journal_name(),
+                        reason: "a module cannot tag an imported auxiliary recursor",
+                    });
+                }
+                metadata.aux_recursors.push(tagged.clone());
+            }
+        }
+        // Compilation effects belong only to their declaring module. Preserve
+        // explicit tags and generated partial-companion tags without copying
+        // dependencies' journals or changing their executable interpretation.
+        let noncomputable = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::noncomputable::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::noncomputable::read(env).map_err(|error| match error {
+                fln_elab::noncomputable::NoncomputableError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "native noncomputable tags",
+                        limit: fln_elab::noncomputable::MAX_ROWS,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::noncomputable::journal_name(),
+                    reason: "invalid noncomputable-declaration journal",
+                },
+            })
+        };
+        let inherited = noncomputable(base, meter)?;
+        for tagged in noncomputable(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::noncomputable::journal_name(),
+                        reason: "a module cannot tag an imported noncomputable declaration",
+                    });
+                }
+                metadata.noncomputable.push(tagged);
             }
         }
         Ok(Self {

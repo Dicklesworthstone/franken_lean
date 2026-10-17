@@ -837,3 +837,172 @@ fn record_eta_composes_with_function_eta_and_miller_patterns() {
         assert!(report.expression_assignments.is_empty());
     }
 }
+
+// Structure eta inside a rigid suffix is conversion, not an invitation to
+// solve the argument's field metavariables or invert its projections.
+fn record_suffix_problem(
+    txn: &mut ElabTxn,
+    domain: Expr,
+    left: Expr,
+    right: Expr,
+) -> (MVarId, Expr, Expr, Expr) {
+    let pi = |domain, body| Expr::forall_e(name("arg"), domain, body, BinderInfo::Default);
+    let wrap = local(txn, "wrap", pi(domain, constant("Nat")));
+    let g = local(txn, "g", pi(constant("Nat"), constant("Nat")));
+    let f = goal(txn, "f", pi(constant("Nat"), constant("Nat")));
+    let lhs = Expr::app(Expr::mvar(f.clone()), Expr::app(wrap.clone(), left));
+    let rhs = Expr::app(g.clone(), Expr::app(wrap, right));
+    (f, g, lhs, rhs)
+}
+
+#[test]
+fn record_eta_suffix_recovers_a_head_without_unfolding_or_field_assignments() {
+    for reverse_record in [false, true] {
+        for reverse_equation in [false, true] {
+            let mut txn = transaction();
+            let record = local(&mut txn, "record", constant("PairN"));
+            let expanded = mk(
+                "PairN",
+                [proj("PairN", 0, &record), proj("PairN", 1, &record)],
+            );
+            let (left, right) = if reverse_record {
+                (record, expanded)
+            } else {
+                (expanded, record)
+            };
+            let (f, g, lhs, rhs) = record_suffix_problem(&mut txn, constant("PairN"), left, right);
+            let report = if reverse_equation {
+                txn.unify(&rhs, &lhs, budget())
+            } else {
+                txn.unify(&lhs, &rhs, budget())
+            }
+            .unwrap();
+            assert_eq!(report.expression_assignments, vec![f.clone()]);
+            assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
+            assert!(report.kernel_checks > 0);
+        }
+    }
+}
+
+#[test]
+fn dependent_record_eta_suffix_keeps_earlier_fields_bound_to_the_same_receiver() {
+    let mut txn = transaction();
+    let a = binder("type", Expr::sort(Level::one()));
+    let mut dependent = spec(
+        "Dependent",
+        vec![],
+        vec![a.clone(), binder("value", Expr::fvar(a.id))],
+    );
+    dependent.result_level = Level::one().succ().unwrap();
+    add_record(&mut txn, dependent);
+    let record = local(&mut txn, "record", constant("Dependent"));
+    let expanded = mk(
+        "Dependent",
+        [proj("Dependent", 0, &record), proj("Dependent", 1, &record)],
+    );
+    let (f, g, lhs, rhs) = record_suffix_problem(&mut txn, constant("Dependent"), expanded, record);
+    txn.unify(&lhs, &rhs, budget()).unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
+}
+
+#[test]
+fn empty_record_eta_suffix_checks_the_complete_parameterized_type() {
+    let mut txn = transaction();
+    let type_ = apply(constant("EmptyBox"), [constant("Nat")]);
+    let record = local(&mut txn, "record", type_.clone());
+    let expanded = mk("EmptyBox", [constant("Nat")]);
+    let (f, g, lhs, rhs) = record_suffix_problem(&mut txn, type_, expanded, record);
+    txn.unify(&lhs, &rhs, budget()).unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
+}
+
+#[test]
+fn record_eta_suffix_does_not_solve_a_field_or_singleton_receiver_hole() {
+    for singleton in [false, true] {
+        let mut txn = transaction();
+        let (type_, lhs, rhs) = if singleton {
+            let type_ = apply(constant("Box"), [constant("Nat")]);
+            let record = goal(&mut txn, "record", type_);
+            (
+                constant("Nat"),
+                proj("Box", 0, &Expr::mvar(record)),
+                numeral(7),
+            )
+        } else {
+            let record = local(&mut txn, "record", constant("PairN"));
+            let field = goal(&mut txn, "field", constant("Nat"));
+            let expanded = mk("PairN", [Expr::mvar(field), proj("PairN", 1, &record)]);
+            (constant("PairN"), expanded, record)
+        };
+        let (_, _, lhs, rhs) = record_suffix_problem(&mut txn, type_, lhs, rhs);
+        let before = txn.clone();
+        assert!(txn.unify(&lhs, &rhs, budget()).is_err());
+        unchanged(&txn, &before);
+    }
+}
+
+#[test]
+fn record_eta_suffix_does_not_erase_parameters_or_wrong_fields() {
+    for empty in [false, true] {
+        let mut txn = transaction();
+        let (type_, lhs, rhs) = if empty {
+            let type_ = apply(constant("EmptyBox"), [constant("Nat")]);
+            let record = local(&mut txn, "record", type_.clone());
+            (type_, mk("EmptyBox", [constant("Bool")]), record)
+        } else {
+            let record = local(&mut txn, "record", constant("PairN"));
+            (
+                constant("PairN"),
+                mk("PairN", [numeral(7), proj("PairN", 1, &record)]),
+                record,
+            )
+        };
+        let (_, _, lhs, rhs) = record_suffix_problem(&mut txn, type_, lhs, rhs);
+        let before = txn.clone();
+        assert!(txn.unify(&lhs, &rhs, budget()).is_err());
+        unchanged(&txn, &before);
+    }
+}
+
+#[test]
+fn record_eta_suffix_cancellation_and_assignment_limits_preserve_the_transaction() {
+    use std::cell::Cell;
+    let mut base = transaction();
+    let record = local(&mut base, "record", constant("PairN"));
+    let expanded = mk(
+        "PairN",
+        [proj("PairN", 0, &record), proj("PairN", 1, &record)],
+    );
+    let (_, _, lhs, rhs) = record_suffix_problem(&mut base, constant("PairN"), expanded, record);
+    let calls = Cell::new(0_usize);
+    base.clone()
+        .unify_many_with(&[(lhs.clone(), rhs.clone())], budget(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .unwrap();
+    let total = calls.get();
+    assert!(total > 4);
+    for stop in [1, total / 4, total / 2, 3 * total / 4, total] {
+        let mut txn = base.clone();
+        calls.set(0);
+        assert_eq!(
+            txn.unify_many_with(&[(lhs.clone(), rhs.clone())], budget(), &|| {
+                calls.set(calls.get() + 1);
+                calls.get() >= stop
+            })
+            .unwrap_err(),
+            UnificationError::Cancelled
+        );
+        unchanged(&txn, &base);
+    }
+    let mut txn = base.clone();
+    let mut limits = budget();
+    limits.max_assignments = 0;
+    assert_eq!(
+        txn.unify(&lhs, &rhs, limits).unwrap_err(),
+        UnificationError::AssignmentLimit { limit: 0 }
+    );
+    unchanged(&txn, &base);
+    txn.unify(&lhs, &rhs, budget()).unwrap();
+}

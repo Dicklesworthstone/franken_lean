@@ -148,3 +148,17 @@ recursive fields now have constructor-derived independent admission support;
 see [Native parameterized recursion](NATIVE_PARAMETERIZED_RECURSION.md). Shapes
 outside that documented lane remain explicit checker vetoes.
 The source proof state is not yet a complete interactive MCP/LSP tactic service.
+
+### Selected unfolding through dependent index transports
+
+`simp only [f, ih]` retains the recursive calls of a source structural definition
+when its chosen constructor branch contains dependent equality transports.
+Their endpoint equations are checked by the kernel in the actual local context;
+unknown indices are not assigned to make a branch reduce. This additional
+conversion is confined to explicitly selected unfolding. Ordinary reduction,
+instance transparency, stuck structural majors, and partial applications keep
+their existing behavior. Resource nonanswers propagate, and both declaration
+checkers still validate completed proofs.
+
+`examples/native_indexed_smart_unfolding.lean` exercises a two-index dependent
+family, an induction proof, and an explicitly supplied child equality.

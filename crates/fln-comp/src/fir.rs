@@ -17,6 +17,9 @@ use fln_rt::abi;
 use std::collections::VecDeque;
 use std::fmt;
 
+mod optimize;
+pub use optimize::optimize;
+
 /// The only FIR schema accepted by this prototype.
 ///
 /// Version 6 makes semantic boxing boundaries explicit while preserving the

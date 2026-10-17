@@ -1,0 +1,523 @@
+diff --git a/crates/fln-parse/src/command_scope/instances.rs b/crates/fln-parse/src/command_scope/instances.rs
+--- a/crates/fln-parse/src/command_scope/instances.rs
++++ b/crates/fln-parse/src/command_scope/instances.rs
+@@ -1,7 +1,9 @@
+ //! Global, namespace-scoped and local instance attributes, and global default candidates. A local
+-//! instance is never a persistent registration: it holds until the enclosing scope ends. Erasure
+-//! is not read.
++//! instance is never a persistent registration: it holds until the enclosing scope ends.
++//! Erasure is a separate state-only operation and never exports a registration change.
+ use super::*;
++
++mod erasure;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct InstanceAttribute {
+@@ -11,6 +13,9 @@
+     pub is_default: bool,
+     /// `attribute [local instance] x`: selected until the enclosing `section`/`namespace` ends.
+     pub local: bool,
++    /// `attribute [-instance] x`: remove a currently active instance in this lexical scope.
++    /// Priority and registration-kind fields do not describe this operation.
++    pub erase: bool,
+ }
+ 
+ /// Inspect the existing scope-command token stream, preserving original source
+@@ -19,4 +24,7 @@
+     view: &SourceView,
+     tokens: &[LexedToken],
+ ) -> Result<Option<InstanceAttribute>, DefinitionParseError> {
++    if let Some(attribute) = erasure::parse(view, tokens)? {
++        return Ok(Some(attribute));
++    }
+     let is = |at: usize, text: &str| {
+@@ -103,5 +103,6 @@
+         scoped,
+         is_default,
+         local,
++        erase: false,
+     }))
+ }
+@@ -243,5 +243,4 @@
+             "attribute [scoped instance, simp] d",
+             "attribute [scoped local instance] d",
+-            "attribute [-instance] d",
+             "attribute [«instance»] d",
+         ] {
+diff --git a/crates/fln/src/source_check/scopes.rs b/crates/fln/src/source_check/scopes.rs
+--- a/crates/fln/src/source_check/scopes.rs
++++ b/crates/fln/src/source_check/scopes.rs
+@@ -6,5 +6,7 @@
+ use fln_parse::command_scope::ScopeCommand;
+ use std::collections::BTreeSet;
+ 
++mod instance_erasure;
++
+ #[derive(Clone)]
+ struct Frame {
+diff --git a/crates/fln/src/source_check.rs b/crates/fln/src/source_check.rs
+--- a/crates/fln/src/source_check.rs
++++ b/crates/fln/src/source_check.rs
+@@ -400,3 +400,32 @@
++    // Erasure changes only the lexical selection state. In particular it must
++    // not enter the persistent registration branch below or a module export.
++    if let ScopeCommand::Instance(attribute) = &control
++        && attribute.erase
++    {
++        let (file, command, offset) = position;
++        if attribute.local || attribute.scoped || attribute.is_default {
++            return Err(SourceCheckError::Scope {
++                file,
++                command,
++                offset,
++                message: "instance erasure has no registration kind".into(),
++            });
++        }
++        if attribute.declarations.len() > 4096 {
++            return Err(SourceCheckError::Limit {
++                resource: "instance erasure declarations",
++                limit: 4096,
++            });
++        }
++        scopes
++            .erase_instance_attribute(
++                engine.environment(),
++                public.as_ref().map(|world| world.engine().environment()),
++                &attribute.declarations,
++            )
++            .map_err(|error| error.into_source(file, command, offset))?;
++        return Ok(Outcome::Complete(()));
++    }
+     // `attribute [local instance] x`: selected until the enclosing scope ends, as a `local
+     // instance` declaration is; nothing is written to the persistent registration journal.
+     if let ScopeCommand::Instance(attribute) = &control
+diff --git a/crates/fln/src/source_check/instance_attributes.rs b/crates/fln/src/source_check/instance_attributes.rs
+--- a/crates/fln/src/source_check/instance_attributes.rs
++++ b/crates/fln/src/source_check/instance_attributes.rs
+@@ -19,3 +19,11 @@
+     offset: usize,
+ ) -> Result<Environment, SourceCheckError> {
++    if attribute.erase {
++        return Err(SourceCheckError::Scope {
++            file,
++            command,
++            offset,
++            message: "instance erasure requires the source scope driver".into(),
++        });
++    }
+     if attribute.declarations.len() > MAX_DECLARATIONS {
+diff --git a/crates/fln-parse/src/command_scope/instances/erasure.rs b/crates/fln-parse/src/command_scope/instances/erasure.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c38eb83fa854b8b7c920478aa7adab5429f3461f
+--- /dev/null
++++ b/crates/fln-parse/src/command_scope/instances/erasure.rs
+@@ -0,0 +1,115 @@
++//! The state-only `attribute [-instance]` command. Erasure has no priority or
++//! attribute-kind parameter and is distinct from persistent registration.
++use super::*;
++
++pub(super) fn parse(
++    view: &SourceView,
++    tokens: &[LexedToken],
++) -> Result<Option<InstanceAttribute>, DefinitionParseError> {
++    let is = |at: usize, text: &str| {
++        tokens.get(at).is_some_and(|token| {
++            matches!(&token.kind, TokenKind::Symbol(_) | TokenKind::Ident(_))
++                && view.normalized().span_str(token.extent) == Some(text)
++        })
++    };
++    if !(is(0, "attribute") && is(1, "[") && is(2, "-") && is(3, "instance")) {
++        return Ok(None);
++    }
++    let bad = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
++        at: original_position(view, tokens, at),
++        expected: NatDefinitionExpectation::EndOfCommand,
++    };
++    if !is(4, "]") {
++        return Err(bad(4));
++    }
++    let mut declarations = Vec::new();
++    for (at, token) in tokens.iter().enumerate().skip(5) {
++        let TokenKind::Ident(name) = &token.kind else {
++            return Err(bad(at));
++        };
++        declarations.push(name.clone());
++    }
++    if declarations.is_empty() {
++        return Err(bad(5));
++    }
++    Ok(Some(InstanceAttribute {
++        declarations,
++        priority: 1000,
++        scoped: false,
++        is_default: false,
++        local: false,
++        erase: true,
++    }))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::command_scope::{ScopeCommand, parse as parse_command, partition};
++
++    #[test]
++    fn erasure_keeps_structural_names_and_is_not_registration() {
++        let source = "/- 😀 -/\r\nattribute /- a -/ [- /- b -/ instance] A.«b.c» d";
++        let Some(ScopeCommand::Instance(attribute)) = parse_command(source.as_bytes()).unwrap()
++        else {
++            panic!("instance erasure expected");
++        };
++        assert!(attribute.erase);
++        assert!(!attribute.local && !attribute.scoped && !attribute.is_default);
++        assert_eq!(attribute.declarations, [
++            Name::from_components(["A", "b.c"]),
++            Name::from_components(["d"]),
++        ]);
++        for source in ["attribute [instance] d", "attribute [local instance] d",
++                       "attribute [scoped instance] d", "attribute [default_instance] d"] {
++            let Some(ScopeCommand::Instance(attribute)) = parse_command(source.as_bytes()).unwrap()
++            else { panic!("instance attribute expected"); };
++            assert!(!attribute.erase, "{source}");
++        }
++    }
++
++    #[test]
++    fn erasure_refuses_parameters_modifiers_empty_lists_and_unconsumed_tokens() {
++        for source in [
++            "attribute [-instance]",
++            "attribute [-instance 7] d",
++            "attribute [-instance, simp] d",
++            "attribute [-instance] d, e",
++            "attribute [-instance] d := 0",
++            "attribute [-instance] d [simp]",
++            "attribute [local -instance] d",
++            "attribute [scoped -instance] d",
++            "attribute [-«instance»] d",
++            "attribute [-default_instance] d",
++        ] {
++            assert!(parse_command(source.as_bytes()).is_err(), "{source}");
++        }
++    }
++
++    #[test]
++    fn erasure_errors_report_original_crlf_and_unicode_offsets() {
++        let source = "/- 😀 -/\r\nattribute [-instance 7] d";
++        assert_eq!(parse_command(source.as_bytes()).unwrap_err().primary_offset(),
++            Some(BytePos(source.find('7').unwrap())));
++        let source = "/- 😀 -/\r\nattribute [-instance] d, e";
++        assert_eq!(parse_command(source.as_bytes()).unwrap_err().primary_offset(),
++            Some(BytePos(source.find(',').unwrap())));
++    }
++
++    #[test]
++    fn erasure_in_is_one_command_with_a_scoped_head_and_exact_original_bytes() {
++        let source = "attribute [-instance] A.d in\r\ndef selected : Nat := 7\r\ndef after : Nat := 8\r\n";
++        let commands = partition(source.as_bytes()).unwrap();
++        assert_eq!(commands.len(), 2);
++        assert_eq!(commands.iter().flat_map(|(_, bytes)| bytes.iter().copied()).collect::<Vec<_>>(),
++            source.as_bytes());
++        let Some(ScopeCommand::In { head, body }) = parse_command(commands[0].1).unwrap()
++        else { panic!("scoped command wrapper expected"); };
++        assert!(body > head);
++        let Some(ScopeCommand::Instance(attribute)) = parse_command(&commands[0].1[..head]).unwrap()
++        else { panic!("erasure head expected"); };
++        assert!(attribute.erase);
++        assert_eq!(attribute.declarations, [Name::from_components(["A", "d"])]);
++        assert!(commands[0].1[body..].starts_with(b"def selected"));
++    }
++}
+diff --git a/crates/fln/src/source_check/scopes/instance_erasure.rs b/crates/fln/src/source_check/scopes/instance_erasure.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdca060674144a236a7d1d23b7e9509c9e74e2dd
+--- /dev/null
++++ b/crates/fln/src/source_check/scopes/instance_erasure.rs
+@@ -0,0 +1,159 @@
++//! Lexical instance removal over checked declarations, with separate public and
++//! private journal anchors and atomic publication of the complete command.
++use super::{Scopes, TransitionError};
++use crate::Environment;
++use fln_core::name::Name;
++use fln_elab::instances::InstanceRegistry;
++
++impl Scopes {
++    pub(crate) fn erase_instance_attribute(
++        &mut self,
++        env: &Environment,
++        public_env: Option<&Environment>,
++        requested: &[Name],
++    ) -> Result<(), TransitionError> {
++        if requested.len() > 4096 {
++            return Err(TransitionError::Scope("instance erasure declarations limit exceeded".into()));
++        }
++        let aliases = fln_elab::aliases::AliasTable::read(env)
++            .map_err(|error| TransitionError::Scope(format!("{error:?}")))?;
++        let protected = fln_elab::protected_names::ProtectedNames::read(env)
++            .map_err(|error| TransitionError::Scope(format!("{error:?}")))?;
++        let mut instances = self.current.instance_scopes.clone();
++        let mut public_instances = self.public_instances.clone();
++        for requested in requested {
++            let name = self.current.resolve_with_aliases(
++                requested, |name| env.contains(name), &aliases, &protected,
++            )
++            .map_err(|error| TransitionError::Scope(error.to_string()))?
++            .ok_or_else(|| TransitionError::Scope(format!(
++                "Unknown constant `{}`", requested.to_display_string(),
++            )))?;
++            instances.erase(env, &name).map_err(TransitionError::Registry)?;
++            if let Some(public_env) = public_env {
++                // A private instance has no selection to erase in the public
++                // world. Validate that world's journal even then: unreadable
++                // metadata is not evidence that no public instance exists.
++                let registry = InstanceRegistry::read_with_scopes(public_env, &public_instances)
++                    .map_err(TransitionError::Registry)?;
++                if registry.is_instance(&name) {
++                    public_instances.erase(public_env, &name)
++                        .map_err(TransitionError::Registry)?;
++                }
++            }
++        }
++        // A late name, registration, history, or public-world failure reaches
++        // neither assignment. The environment itself is never changed here.
++        self.current.instance_scopes = instances;
++        self.public_instances = public_instances;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use fln_core::{expr::Expr, level::Level};
++    use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
++    use fln_parse::command_scope::ScopeCommand;
++
++    fn n(name: &str) -> Name { Name::from_components(name.split('.')) }
++    fn axiom(name: &str, type_: Expr) -> ConstantInfo {
++        ConstantInfo::Axiom(AxiomVal {
++            base: ConstantVal { name: n(name), level_params: Vec::new(), type_ },
++            is_unsafe: false,
++        })
++    }
++    fn fixture() -> Environment {
++        let env = Environment::new()
++            .add_decl(axiom("C", Expr::sort(Level::one()))).unwrap()
++            .add_decl(axiom("N.chosen", Expr::const_(n("C"), Vec::new()))).unwrap()
++            .add_decl(axiom("ordinary", Expr::const_(n("C"), Vec::new()))).unwrap();
++        let env = fln_elab::instances::register_class(&env, &n("C")).unwrap();
++        fln_elab::instances::register_instance(&env, &n("N.chosen"), 1000).unwrap()
++    }
++    fn active(env: &Environment, scopes: &fln_elab::instances::scoped::ActiveScopes, name: &str) -> bool {
++        InstanceRegistry::read_with_scopes(env, scopes).unwrap().is_instance(&n(name))
++    }
++
++    #[test]
++    fn erasure_resolves_namespaces_and_aliases_to_exact_declarations() {
++        let env = fln_elab::aliases::register(&fixture(), &n("alias"), &n("N.chosen")).unwrap();
++        let mut scopes = Scopes::default();
++        scopes.current.namespace = n("N");
++        scopes.erase_instance_attribute(&env, None, &[n("chosen")])
++            .unwrap_or_else(|error| panic!("{}", error.message()));
++        assert!(!active(&env, &scopes.current.instance_scopes, "N.chosen"));
++        let mut scopes = Scopes::default();
++        scopes.erase_instance_attribute(&env, None, &[n("alias")])
++            .unwrap_or_else(|error| panic!("{}", error.message()));
++        assert!(!active(&env, &scopes.current.instance_scopes, "N.chosen"));
++    }
++
++    #[test]
++    fn a_late_failure_rolls_back_both_worlds() {
++        let env = fixture();
++        let mut scopes = Scopes::default();
++        let private_before = scopes.current.instance_scopes.clone();
++        let public_before = scopes.public_instances.clone();
++        assert!(scopes.erase_instance_attribute(&env, Some(&env),
++            &[n("N.chosen"), n("ordinary")]).is_err());
++        assert_eq!(scopes.current.instance_scopes, private_before);
++        assert_eq!(scopes.public_instances, public_before);
++        assert!(active(&env, &scopes.current.instance_scopes, "N.chosen"));
++        assert!(active(&env, &scopes.public_instances, "N.chosen"));
++    }
++
++    #[test]
++    fn public_and_private_scopes_restore_their_own_erasure_histories() {
++        let public = fixture();
++        let private = public.add_decl(axiom("privateChoice", Expr::const_(n("C"), Vec::new()))).unwrap();
++        let private = fln_elab::instances::register_instance(&private, &n("privateChoice"), 2000).unwrap();
++        let mut scopes = Scopes::default();
++        scopes.transition_worlds(ScopeCommand::Section(None), &private, Some(&public))
++            .unwrap_or_else(|error| panic!("{}", error.message()));
++        scopes.erase_instance_attribute(&private, Some(&public), &[n("N.chosen"), n("privateChoice")])
++            .unwrap_or_else(|error| panic!("{}", error.message()));
++        assert!(!active(&private, &scopes.current.instance_scopes, "N.chosen"));
++        assert!(!active(&private, &scopes.current.instance_scopes, "privateChoice"));
++        assert!(!active(&public, &scopes.public_instances, "N.chosen"));
++        scopes.transition_worlds(ScopeCommand::End(None), &private, Some(&public))
++            .unwrap_or_else(|error| panic!("{}", error.message()));
++        assert!(active(&private, &scopes.current.instance_scopes, "privateChoice"));
++        assert!(active(&public, &scopes.public_instances, "N.chosen"));
++    }
++
++    #[test]
++    fn an_unreadable_public_journal_cannot_publish_a_private_erasure() {
++        let env = fixture();
++        let broken_public = env
++            .push_extension_entry(
++                &n("FrankenLean.sourceInstances.v1"),
++                b"FLNINST\x02".to_vec(),
++            )
++            .unwrap();
++        let mut scopes = Scopes::default();
++        let private_before = scopes.current.instance_scopes.clone();
++        let public_before = scopes.public_instances.clone();
++        let result = scopes.erase_instance_attribute(
++            &env,
++            Some(&broken_public),
++            &[n("N.chosen")],
++        );
++        assert!(matches!(result, Err(TransitionError::Registry(_))));
++        assert_eq!(scopes.current.instance_scopes, private_before);
++        assert_eq!(scopes.public_instances, public_before);
++        assert!(active(&env, &scopes.current.instance_scopes, "N.chosen"));
++    }
++
++    #[test]
++    fn an_unknown_name_and_an_excessive_batch_publish_nothing() {
++        let env = fixture();
++        let mut scopes = Scopes::default();
++        let before = scopes.current.instance_scopes.clone();
++        let error = scopes.erase_instance_attribute(&env, None, &[n("absent")]);
++        assert!(matches!(error, Err(TransitionError::Scope(message)) if message == "Unknown constant `absent`"));
++        assert!(scopes.erase_instance_attribute(&env, None, &vec![n("N.chosen"); 4097]).is_err());
++        assert_eq!(scopes.current.instance_scopes, before);
++    }
++}
+diff --git a/crates/fln/tests/source_instance_erasure.rs b/crates/fln/tests/source_instance_erasure.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..06fc8b54c157f53ceee23bc133ef1881a0311b09
+--- /dev/null
++++ b/crates/fln/tests/source_instance_erasure.rs
+@@ -0,0 +1,123 @@
++//! Source-to-council regression cells for state-only instance erasure.
++//! These use the native source seed, not the pinned Reference artifacts.
++#![forbid(unsafe_code)]
++use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits};
++use fln_elab::instances::InstanceRegistry;
++
++fn admission() -> EngineAdmissionLimits {
++    EngineAdmissionLimits::new(Budget::for_stack_bytes(2 << 20))
++}
++fn seed() -> Engine {
++    Engine::with_source_seed(admission()).unwrap().into_complete().unwrap()
++}
++fn check(base: &Engine, source: &str) -> Engine {
++    base.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(admission()))
++        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
++        .into_complete().expect("the checking council completes").engine
++}
++const FIXTURE: &str = r#"
++class Marker where
++  value : Nat
++instance low : Marker := Marker.mk 4
++instance high : Marker := Marker.mk 9
++def read [m : Marker] : Nat := @Marker.value m
++"#;
++
++#[test]
++fn erasure_changes_the_selected_dictionary_and_end_restores_it() {
++    let base = check(&seed(), FIXTURE);
++    check(&base, r#"
++theorem before : read = 9 := by rfl
++section
++attribute [-instance] high
++theorem inside : read = 4 := by rfl
++section
++attribute [-instance] low
++end
++theorem afterInner : read = 4 := by rfl
++end
++theorem afterOuter : read = 9 := by rfl
++"#);
++}
++
++#[test]
++fn erasure_in_affects_only_its_wrapped_command() {
++    let base = check(&seed(), FIXTURE);
++    check(&base, r#"
++attribute [-instance] high in
++theorem temporarilyLow : read = 4 := by rfl
++theorem highAgain : read = 9 := by rfl
++"#);
++}
++
++#[test]
++fn reregistration_restores_availability_without_changing_tie_order() {
++    let base = check(&seed(), FIXTURE);
++    check(&base, r#"
++attribute [-instance] high
++theorem lowSelected : read = 4 := by rfl
++attribute [instance] high
++theorem highRestored : read = 9 := by rfl
++attribute [-instance] low
++attribute [instance] low
++theorem originalTieOrder : read = 9 := by rfl
++"#);
++}
++
++#[test]
++fn namespace_and_local_instances_can_be_removed_without_exporting_the_removal() {
++    let base = check(&seed(), FIXTURE);
++    check(&base, r#"
++namespace N
++scoped instance preferred : Marker := Marker.mk 12
++end N
++open scoped N
++theorem scopedBefore : read = 12 := by rfl
++section
++attribute [-instance] N.preferred
++theorem scopedHidden : read = 9 := by rfl
++local instance temporary : Marker := Marker.mk 15
++theorem localBefore : read = 15 := by rfl
++attribute [-instance] temporary
++theorem localHidden : read = 9 := by rfl
++end
++theorem scopedRestored : read = 12 := by rfl
++"#);
++}
++
++#[test]
++fn erasure_alone_preserves_the_environment_and_its_logical_root() {
++    let base = check(&seed(), FIXTURE);
++    let result = check(&base, "attribute [-instance] high\n");
++    assert_eq!(result.environment(), base.environment());
++    assert_eq!(result.logical_root(&KVMap::new()), base.logical_root(&KVMap::new()));
++    assert!(InstanceRegistry::read(result.environment()).unwrap()
++        .is_instance(&Name::from_components(["high"])));
++    check(&result, "theorem nextFile : read = 9 := by rfl\n");
++}
++
++#[test]
++fn erasure_does_not_escape_a_file_in_an_ordered_source_batch() {
++    let base = check(&seed(), FIXTURE);
++    let first = b"attribute [-instance] high\ntheorem firstFile : read = 4 := by rfl\n";
++    let second = b"theorem secondFile : read = 9 := by rfl\n";
++    base.check_source_files(&[first, second], &KVMap::new(), SourceCheckLimits::new(admission()))
++        .unwrap().into_complete().expect("file boundaries restore lexical selection");
++}
++
++#[test]
++fn absent_duplicate_and_required_instance_removals_do_not_turn_into_acceptance() {
++    let base = check(&seed(), FIXTURE);
++    let before = base.logical_root(&KVMap::new());
++    for source in [
++        "attribute [-instance] absent\n",
++        "attribute [-instance] read\n",
++        "attribute [-instance] high high\n",
++        "attribute [-instance] low high\ndef cannotSynthesize : Nat := read\n",
++        "attribute [-instance] high\ntheorem cannotUseRemoved : read = 9 := by rfl\n",
++    ] {
++        assert!(base.check_source_files(&[source.as_bytes()], &KVMap::new(),
++            SourceCheckLimits::new(admission())).is_err(), "{source}");
++        assert_eq!(base.logical_root(&KVMap::new()), before);
++    }
++}

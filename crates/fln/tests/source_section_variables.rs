@@ -180,22 +180,55 @@ theorem escapedWorks : Outer.escaped 8 = 8 := by rfl"#,
     assert_eq!(binders(&e, "Outer.shadow").len(), 1);
 }
 
+/// The pin keeps a `variable` command's syntax and elaborates it again in each declaration. After
+/// `open Second`, `x : Carrier` is ambiguous there (the pin's `stable` takes a `sorry`), and inside
+/// `namespace Second` it names `Second.Carrier`. A declaration using such a variable is refused
+/// here, never checked against the earlier `First.Carrier`; each refused program is refused by the
+/// pin too, or accepted by it only with the reinterpreted (or `sorry`) type. Every verdict was
+/// taken from the pinned `lean` v4.32.0 first.
 #[test]
-fn variable_type_names_are_not_reinterpreted_after_open_changes() {
-    checked(
-        &engine(),
-        r#"namespace First
-def Carrier := Nat
-end First
-namespace Second
-def Carrier := Bool
-end Second
-open First
-variable (x : Carrier)
-open Second
-def stable := x
-theorem correct : stable 7 = 7 := by rfl"#,
-    );
+fn variable_types_are_elaborated_again_in_each_declaration() {
+    let base = engine();
+    let carriers = "namespace First\ndef Carrier := Nat\nend First\nnamespace Second\ndef Carrier := Bool\nend Second\n";
+    let declared = format!("{carriers}open First\nvariable (x : Carrier)\n");
+    for source in [
+        // The pin: `rfl` fails (`stable` takes a `sorry`); accepted here before.
+        format!(
+            "{declared}open Second\ndef stable := x\ntheorem correct : stable (7 : Nat) = (7 : Nat) := by rfl"
+        ),
+        // The pin: `x : Second.Carrier`, so `(7 : Nat)` is a type mismatch; accepted here before.
+        "def Carrier := Nat\nvariable (x : Carrier)\nnamespace Second\ndef Carrier := Bool\n\
+         def stable := x\ntheorem t : stable (7 : Nat) = (7 : Nat) := rfl\nend Second"
+            .to_owned(),
+        // The pin accepts only with `x : sorry` ("declaration uses `sorry`").
+        format!("{declared}open Second\ndef stable := x\ntheorem correct : stable 7 = 7 := by rfl"),
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+    }
+    for source in [
+        // `Third` has no `Carrier`: the binder elaborates as before.
+        format!(
+            "{carriers}namespace Third\ndef Other := Bool\nend Third\nopen First\nvariable (x : Carrier)\n\
+             open Third\ndef stable := x\ntheorem correct : stable (7 : Nat) = (7 : Nat) := by rfl"
+        ),
+        // A declaration that does not use the variable.
+        format!("{declared}open Second\ndef other : Nat := 5\ntheorem t : other = 5 := rfl"),
+        // Declared before the `open`.
+        format!(
+            "{declared}def stable := x\nopen Second\ntheorem correct : stable (7 : Nat) = (7 : Nat) := by rfl"
+        ),
+        // A binder of the same command that still elaborates as before.
+        format!(
+            "{carriers}open First\nvariable (n : Nat) (x : Carrier)\nopen Second\ndef twice := n + n\n\
+             theorem t : twice 3 = 6 := rfl"
+        ),
+    ] {
+        checked(&base, &source);
+    }
 }
 
 #[test]

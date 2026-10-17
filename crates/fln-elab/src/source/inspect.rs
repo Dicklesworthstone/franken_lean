@@ -16,12 +16,19 @@ pub use super::instances::audit::{
 pub enum ObservationKind {
     Goals,
     Term,
+    /// A term's type in its actual local context, including the inferred-type
+    /// fallback used by the pin's plainTermGoal. The observation is `Goals`
+    /// with one provisional goal, never a declaration-admission certificate.
+    TermGoal,
 }
 
 /// A live obligation, not an accepted proof. Types and locals are instantiated
 /// through the same metavariable store used by the native tactic driver.
 #[derive(Debug, Clone)]
 pub struct ObservedGoal {
+    /// Existing tactic obligation; inferred term types do not invent a metavariable.
+    pub id: Option<MVarId>,
+    pub user_name: Option<Name>,
     pub target: Expr,
     pub locals: LocalContext,
 }
@@ -53,11 +60,17 @@ enum Site {
     By(Range<usize>),
     End(Range<usize>),
     Term(Range<usize>),
+    TermGoal {
+        range: Range<usize>,
+        /// None identifies an identifier; nodes retain their exact parser kind.
+        kind: Option<Name>,
+    },
 }
 impl Site {
     fn range(&self) -> &Range<usize> {
         match self {
             Self::Tactic(r) | Self::By(r) | Self::End(r) | Self::Term(r) => r,
+            Self::TermGoal { range, .. } => range,
         }
     }
 }
@@ -79,17 +92,82 @@ pub fn declaration(
     offset: usize,
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
+    let scope = scope.for_declaration(syntax)?;
+    let mut context = Context::scoped(environment, kernel, &scope);
+    declaration_in_context(syntax, &mut context, offset, kind)
+}
+
+/// Observe a module's public theorem with its exported header and private proof
+/// in the same worlds used by ordinary elaboration. A proof observation cannot
+/// change or rescue an incomplete exported signature.
+pub fn public_theorem(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
+    let mut context = Context::public_theorem(syntax, worlds, kernel)?;
+    declaration_in_context(syntax, &mut context, offset, kind)
+}
+
+/// A provisional observation and the world actually entered at its position.
+/// Header observations never select the hidden implementation's instance scope.
+#[derive(Debug)]
+pub struct PublicInstanceObservation {
+    pub observation: Option<SourceObservation>,
+    pub private_body: bool,
+}
+
+pub fn public_instance(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<PublicInstanceObservation, NatDefinitionElabError> {
+    let mut context = Context::public_instance(syntax, worlds, kernel)?;
+    let observation = declaration_in_context(syntax, &mut context, offset, kind)?;
+    Ok(PublicInstanceObservation {
+        observation,
+        private_body: context.private_instance_body,
+    })
+}
+
+/// Observe a hidden definition using exactly the same public-header/private-
+/// implementation transition as admission. The flag is set only when that
+/// transition actually occurred, never by the cursor's spelling or position.
+pub fn public_definition(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<PublicInstanceObservation, NatDefinitionElabError> {
+    let mut context = Context::public_definition(syntax, worlds, kernel)?;
+    let observation = declaration_in_context(syntax, &mut context, offset, kind)?;
+    Ok(PublicInstanceObservation {
+        observation,
+        private_body: context.public_definition_header.is_some(),
+    })
+}
+
+fn declaration_in_context(
+    syntax: &Syntax,
+    context: &mut Context,
+    offset: usize,
+    kind: ObservationKind,
+) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
     // There will be no final declaration admission to discharge earlier rigid
     // equations. Check them when generated instead of deferring to that door.
     context.attempt_depth = 1;
-    let Some(site) = select(&mut context, syntax, offset, kind)? else {
+    let Some(site) = select(context, syntax, offset, kind)? else {
         return Ok(None);
     };
     context.inspection = Some(Probe { site, result: None });
-    match definition_in_context(syntax, &mut context) {
+    match definition_in_context(syntax, context) {
         Err(NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)) => {
-            Ok(context.inspection.and_then(|probe| probe.result))
+            Ok(context.inspection.take().and_then(|probe| probe.result))
         }
         Ok(_) => Ok(None),
         Err(error) => Err(error),
@@ -138,7 +216,21 @@ fn select(
         };
         spans.insert(std::ptr::from_ref(node), span.clone());
         let Some(r) = span else { continue };
-        if wanted == ObservationKind::Term && matches!(node, Syntax::Ident { .. }) {
+        if wanted == ObservationKind::TermGoal {
+            match node {
+                Syntax::Ident { .. } => sites.push(Site::TermGoal {
+                    range: r,
+                    kind: None,
+                }),
+                Syntax::Node { kind, .. } if kind.parent() == parser_kind(&["Term"]) => {
+                    sites.push(Site::TermGoal {
+                        range: r,
+                        kind: Some(kind.clone()),
+                    });
+                }
+                _ => {}
+            }
+        } else if wanted == ObservationKind::Term && matches!(node, Syntax::Ident { .. }) {
             sites.push(Site::Term(r));
         } else if wanted == ObservationKind::Goals
             && let Syntax::Node { kind, args, .. } = node
@@ -256,19 +348,28 @@ impl Context {
         Ok(result)
     }
     pub(super) fn observes_term(&self, syntax: &Syntax) -> bool {
-        let Some(Probe {
-            site: Site::Term(range),
-            ..
-        }) = &self.inspection
-        else {
+        let Some(probe) = &self.inspection else {
             return false;
         };
-        matches!(syntax, Syntax::Ident { .. })
-            && syntax.info().pos(true).is_some_and(|p| p.0 == range.start)
-            && syntax
-                .info()
-                .end_pos(true)
-                .is_some_and(|p| p.0 == range.end)
+        match &probe.site {
+            Site::Term(range) => {
+                matches!(syntax, Syntax::Ident { .. })
+                    && syntax.info().pos(true).is_some_and(|p| p.0 == range.start)
+                    && syntax
+                        .info()
+                        .end_pos(true)
+                        .is_some_and(|p| p.0 == range.end)
+            }
+            // The driver schedules the existing post-term observation task.
+            // Exact spans are checked there with the charged traversal below;
+            // this inexpensive prefilter adds no unbudgeted subtree walk.
+            Site::TermGoal { kind, .. } => match (kind, syntax) {
+                (None, Syntax::Ident { .. }) => true,
+                (Some(selected), Syntax::Node { kind, .. }) => selected == kind,
+                _ => false,
+            },
+            _ => false,
+        }
     }
     pub(super) fn observe_term(
         &mut self,
@@ -278,6 +379,34 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         if !self.observes_term(syntax) {
             return Ok(());
+        }
+        if let Some(Probe {
+            site: Site::TermGoal { range, .. },
+            ..
+        }) = &self.inspection
+        {
+            let selected = range.clone();
+            if self.observation_extent(syntax)?.as_ref() != Some(&selected) {
+                return Ok(());
+            }
+            // Expected-typed holes already carry their actual domain; an
+            // inference-only term carries its inferred type. Observe before
+            // declaration finalization, which would refuse unfinished holes.
+            // An invalid selected term still fails rather than inventing info.
+            self.flush(true)?;
+            let target = self.instantiate(&term.type_)?;
+            let locals = self.observation_locals(&locals)?;
+            let probe = self.inspection.as_mut().expect("selected term-goal probe");
+            probe.result = Some(SourceObservation::Goals {
+                range: probe.site.range().clone(),
+                goals: vec![ObservedGoal {
+                    id: None,
+                    user_name: None,
+                    target,
+                    locals,
+                }],
+            });
+            return Err(failure(SourceInferenceError::ObservationComplete));
         }
         self.flush(true)?;
         let expression = self.instantiate(&term.value)?;
@@ -297,13 +426,24 @@ impl Context {
         keyword: &Syntax,
         goal: &tactics::ProofGoal,
     ) -> Result<(), NatDefinitionElabError> {
-        if let Some(Probe {
-            site: Site::By(range),
-            ..
-        }) = &self.inspection
-            && keyword.info().pos(true).is_some_and(|p| p.0 == range.start)
-        {
-            return self.observe_goals(&[(goal.target.clone(), goal.lctx.clone())]);
+        let selected = self.inspection.as_ref().is_some_and(|probe| {
+            let range = match &probe.site {
+                Site::By(range) => range,
+                Site::TermGoal {
+                    range,
+                    kind: Some(kind),
+                } if kind == &parser_kind(&["Term", "byTactic"])
+                    || kind == &parser_kind(&["Term", "byTactic'"]) =>
+                {
+                    range
+                }
+                _ => return false,
+            };
+            keyword.info().pos(true).is_some_and(|p| p.0 == range.start)
+        });
+        if selected {
+            // The by-term's expected goal exists before its first tactic runs.
+            return self.observe_goals(std::slice::from_ref(goal));
         }
         Ok(())
     }
@@ -327,7 +467,7 @@ impl Context {
     pub(super) fn observe_proof_end(
         &mut self,
         extent: Option<&Range<usize>>,
-        goals: &[(Expr, LocalContext)],
+        goals: &[tactics::ProofGoal],
     ) -> Result<(), NatDefinitionElabError> {
         if self.observes_goal(None, extent)? {
             self.observe_goals(goals)?;
@@ -336,14 +476,23 @@ impl Context {
     }
     pub(super) fn observe_goals(
         &mut self,
-        goals: &[(Expr, LocalContext)],
+        goals: &[tactics::ProofGoal],
     ) -> Result<(), NatDefinitionElabError> {
         self.flush(true)?;
         let mut observed = Vec::new();
-        for (target, locals) in goals {
-            let target = self.instantiate(target)?;
-            let locals = self.observation_locals(locals)?;
-            observed.push(ObservedGoal { target, locals });
+        for goal in goals {
+            let target = self.instantiate(&goal.target)?;
+            let locals = self.observation_locals(&goal.lctx)?;
+            observed.push(ObservedGoal {
+                id: Some(goal.id.clone()),
+                user_name: self
+                    .goal_tags
+                    .get(&goal.id)
+                    .filter(|name| !name.is_anonymous())
+                    .cloned(),
+                target,
+                locals,
+            });
         }
         let probe = self.inspection.as_mut().expect("selected probe");
         probe.result = Some(SourceObservation::Goals {

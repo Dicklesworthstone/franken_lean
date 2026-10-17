@@ -128,6 +128,11 @@ d3_say() { printf 'd3-root-attr-guard: %s\n' "$1" >&2; }
 # disables another guard is worse than no guard. So every passing path runs it.
 pass() {
     local chained='.git/hooks/pre-commit'
+    # Under pre-merge-commit (FLN_HOOK_MODE=merge) the hook git would otherwise
+    # have run is .git/hooks/pre-merge-commit, so that is the one to chain.
+    if [ "${FLN_HOOK_MODE:-}" = merge ]; then
+        chained='.git/hooks/pre-merge-commit'
+    fi
     if [ -x "$chained" ] && ! [ "$chained" -ef "${BASH_SOURCE[0]}" ]; then
         exec "$chained" "$@"
     fi
@@ -185,6 +190,123 @@ path_changes_in_prospective_tree() {
 
 repo_root=$(git rev-parse --show-toplevel) || undecided 'not inside a git work tree'
 cd "$repo_root" || undecided "cannot enter $repo_root"
+
+# ---- rustfmt on the prospective tree ----------------------------------------
+# Bead fln-fmt-check-at-commit-time-ofo5. product-gate's first stage is
+# `cargo fmt --check`, and when it fails clippy and every workspace test are
+# skipped for everyone. From 2026-10-07 23:36Z to 2026-10-13 that stage failed on
+# every run, so main executed no workspace test for about 5.5 days. 0e173336
+# reformatted 20 files; two commits in the next 20 minutes re-broke 4, and a merge
+# commit re-broke another. A check that runs after the push is read by nobody in
+# time. This one runs at the moment of the mistake, for the author.
+#
+# What it judges, and why each detail matters:
+#   * The PROSPECTIVE blob of every .rs file the commit adds or modifies under
+#     crates/ or tools/, read from git's index (`git cat-file blob :<path>`). That
+#     is what lands, including under `git commit -o`, where git hands the hook a
+#     temporary index built from the working tree.
+#   * It formats the blob through stdin with the pinned toolchain's rustfmt and
+#     compares bytes. NOT `rustfmt --check` on stdin: measured with rustfmt
+#     1.10.0-nightly (2026-08-30), `--check` reading stdin prints the diff and
+#     EXITS 0, so its status would pass every file. NOT rustfmt on a path either:
+#     that recurses into out-of-line `mod` children and reports files the commit
+#     never touched.
+#   * In stdin mode rustfmt ignores rustfmt.toml's `format_generated_files =
+#     false`, so the `@generated` rule is applied here: a marker in the first five
+#     lines skips the file, as rustfmt itself would.
+#   * Scope is crates/ and tools/. Measured at f3eb2ee5 over all 1,726 tracked .rs
+#     files, the only other paths this check would flag were the copies under
+#     .github/patches/, which no cargo fmt run formats.
+#   * A blob rustfmt cannot parse is NOT refused, only named: cargo fmt formats
+#     only the module tree, so an unparseable file is either an orphan or a
+#     deliberately broken fixture, and in a real module the compiler refuses it
+#     anyway. That errs toward passing, as the D3 half does.
+#   * rustfmt missing from PATH refuses as COULD NOT DECIDE (exit 2): every pane
+#     has it, and passing would restore exactly the state this exists to end.
+#
+# Merge commits never run pre-commit: git runs pre-merge-commit. That hook execs
+# this one with FLN_HOOK_MODE=merge, so a merge is judged exactly as a commit is,
+# every half of this file included (the prospective tree is the index git builds
+# for the merge). Two measured reasons, both from 2026-10-13: unformatted code
+# reached main through a merge (9e3bdcb3), and merge 708d616b took one parent's
+# ci/VERIFICATION_MANIFEST.jsonl wholesale, dropping 8 rows and keeping an unsorted
+# one, which left main's manifest invalid until 68c28615 repaired it.
+RUSTFMT_SCOPE_PATTERN='^(crates|tools)/.*\.rs$'
+rustfmt_say() { printf 'rustfmt-guard: %s\n' "$1" >&2; }
+
+rustfmt_changed_files() {
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+        git diff --cached --name-only --no-renames --diff-filter=AM HEAD
+    else
+        git ls-files --cached
+    fi
+}
+
+rustfmt_guard() {
+    local candidates path workdir input output rustfmt_head unformatted='' unjudged=''
+    local -a config_args=()
+    candidates=$(rustfmt_changed_files | grep -E "$RUSTFMT_SCOPE_PATTERN" || true)
+    [ -n "$candidates" ] || return 0
+    if ! command -v rustfmt >/dev/null 2>&1; then
+        rustfmt_say 'COULD NOT DECIDE — this commit changes .rs files and no rustfmt is on PATH.'
+        rustfmt_say 'Refusing rather than passing: an unformatted file stops product-gate at its'
+        rustfmt_say 'first stage, before clippy or any test runs. Install the pinned toolchain'
+        rustfmt_say "(rust-toolchain.toml lists rustfmt) or re-run with --no-verify and say why."
+        exit 2
+    fi
+    workdir=$(mktemp -d "${TMPDIR:-/tmp}/fln-rustfmt-guard.XXXXXXXX") || {
+        rustfmt_say 'COULD NOT DECIDE — cannot create a scratch directory'
+        exit 2
+    }
+    input="$workdir/input.rs"
+    output="$workdir/output.rs"
+    # The prospective rustfmt.toml, so a commit that changes the configuration is
+    # judged under the configuration it lands.
+    if git cat-file -e ':rustfmt.toml' 2>/dev/null; then
+        git cat-file blob ':rustfmt.toml' > "$workdir/rustfmt.toml"
+        config_args=(--config-path "$workdir/rustfmt.toml")
+    fi
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if ! git cat-file blob ":$path" > "$input" 2>/dev/null; then
+            unjudged="${unjudged}    ${path} (prospective blob unreadable)"$'\n'
+            continue
+        fi
+        # A variable, not `head | grep -q`: under pipefail that pipeline races on
+        # SIGPIPE exactly as the D3 half below documents.
+        rustfmt_head=$(head -n 5 "$input")
+        if [[ "$rustfmt_head" == *@generated* ]]; then
+            continue
+        fi
+        if ! rustfmt --edition 2024 "${config_args[@]}" --emit stdout < "$input" > "$output" 2>/dev/null; then
+            unjudged="${unjudged}    ${path} (rustfmt could not parse it)"$'\n'
+            continue
+        fi
+        if ! cmp -s "$input" "$output"; then
+            unformatted="${unformatted}    ${path}"$'\n'
+        fi
+    done <<< "$candidates"
+    rm -f "$input" "$output" "$workdir/rustfmt.toml"
+    rmdir "$workdir" 2>/dev/null || true
+    if [ -n "$unjudged" ]; then
+        rustfmt_say 'not judged here (erring toward passing; product-gate still formats the module tree):'
+        printf '%s' "$unjudged" >&2
+    fi
+    if [ -n "$unformatted" ]; then
+        rustfmt_say 'REFUSED — rustfmt would reformat these files as this commit writes them:'
+        printf '%s' "$unformatted" >&2
+        rustfmt_say ''
+        rustfmt_say "product-gate's first stage is \`cargo fmt --check\`. An unformatted file there"
+        rustfmt_say 'skips clippy and every workspace test for every pane until someone reformats it'
+        rustfmt_say '(bead fln-fmt-check-at-commit-time-ofo5).'
+        rustfmt_say ''
+        rustfmt_say 'Fix: format exactly these files (never their submodules), then commit again:'
+        rustfmt_say "  rustfmt --edition 2024 --unstable-features --skip-children $(printf '%s' "$unformatted" | tr -s ' \n' ' ')"
+        exit 1
+    fi
+}
+
+rustfmt_guard
 
 # ---- D3 crate-root attribute ------------------------------------------------
 # Deliberately BEFORE the projection half's early exit. A commit that adds a

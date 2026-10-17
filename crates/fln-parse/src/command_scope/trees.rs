@@ -2,9 +2,9 @@
 //!
 //! [`super::parse`] reads what a scope command does to the environment; this module reads how the
 //! pin's parser builds it. The two accept the same commands except where the checker does not
-//! model what the tree says: a `section` with a header (`public`, `noncomputable`, `meta`,
-//! `@[expose]`) has a tree here, and [`parse_source_command`] hands it to the checker as a command
-//! it does not read, which refuses it.
+//! model what the tree says: `meta` sections retain their trees
+//! for explicit refusal. Public, exposure and noncomputable section flags have both a typed
+//! command and the original pin-shaped syntax tree.
 use super::*;
 
 /// The pin's tree for a scope command (`namespace`, `section`, `end`, `open`, `universe`,
@@ -51,9 +51,12 @@ fn scope_tree(
         ))
     };
     let node = |kind: &str, args: Vec<Syntax>| Syntax::node(parser_kind(&["Command", kind]), args);
-    // `variable`, `include` and `omit` may end at a top-level `in` before a command
+    // `variable`, `include`, `omit` and `attribute` may end at a top-level `in` before a command
     // (`Command.in`); the head is read up to it.
-    let stop = if matches!(keyword.as_str(), "variable" | "include" | "omit") {
+    let stop = if matches!(
+        keyword.as_str(),
+        "variable" | "include" | "omit" | "attribute"
+    ) {
         let mut depth = 0usize;
         let mut stop = tokens.len();
         for (at, token) in tokens.iter().enumerate().skip(1) {
@@ -126,13 +129,16 @@ fn scope_tree(
         }
         "attribute" => {
             let leaves = leaves()?;
-            return attributes::command_syntax(view, tokens, &leaves);
+            let Some(tree) = attributes::command_syntax(view, &tokens[..stop], &leaves)? else {
+                return Ok(None);
+            };
+            tree
         }
         "open" => return open(source, view, tokens),
         "set_option" => return set_option(source, view, tokens),
         _ => {
             let leaves = leaves()?;
-            return Ok(section(&leaves, tokens)?.map(|(tree, _)| tree));
+            return Ok(section(view, &leaves, tokens)?.map(|(tree, _)| tree));
         }
     };
     if stop < tokens.len() {
@@ -145,35 +151,81 @@ fn scope_tree(
 /// `section`: `sectionHeader "section" (ident)?`, with `sectionHeader := ("@[" "expose" "]")?
 /// ("public")? ("noncomputable")? ("meta")?`, each optional slot a node of its own. Also returns
 /// whether the header is not empty.
-#[inline(never)]
-fn section(
-    leaves: &Leaves,
-    tokens: &[LexedToken],
-) -> Result<Option<(Syntax, bool)>, DefinitionParseError> {
-    let word = |at: usize, text: &str| match tokens.get(at).map(|t| &t.kind) {
-        Some(TokenKind::Symbol(s)) => s == text,
-        Some(TokenKind::Ident(name)) => *name == Name::from_components([text]),
-        _ => false,
+struct SectionParts {
+    expose: bool,
+    slots: [Option<usize>; 3],
+    keyword: usize,
+    name: Option<usize>,
+}
+
+fn section_parts(view: &SourceView, tokens: &[LexedToken]) -> Option<SectionParts> {
+    let word = |at: usize, text: &str| {
+        tokens
+            .get(at)
+            .is_some_and(|token| view.normalized().span_str(token.extent) == Some(text))
     };
     let mut at = 0;
     let expose = word(0, "@[") && word(1, "expose") && word(2, "]");
     if expose {
         at = 3;
     }
-    let mut slots = Vec::new();
-    for keyword in ["public", "noncomputable", "meta"] {
-        slots.push(word(at, keyword).then_some(at));
+    let mut slots = [None; 3];
+    for (slot, keyword) in slots.iter_mut().zip(["public", "noncomputable", "meta"]) {
+        *slot = word(at, keyword).then_some(at);
         if word(at, keyword) {
             at += 1;
         }
     }
     if !matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "section") {
-        return Ok(None);
+        return None;
     }
     let name = match tokens.len() - at {
         1 => None,
         2 if matches!(&tokens[at + 1].kind, TokenKind::Ident(_)) => Some(at + 1),
-        _ => return Ok(None),
+        _ => return None,
+    };
+    Some(SectionParts {
+        expose,
+        slots,
+        keyword: at,
+        name,
+    })
+}
+
+/// Recognize the supported lexical section flags from the same scan used to
+/// build its exact syntax tree. Unsupported scope effects keep their tree and
+/// are refused by the ordinary source-command path.
+pub(super) fn modified_section(view: &SourceView, tokens: &[LexedToken]) -> Option<ScopeCommand> {
+    let parts = section_parts(view, tokens)?;
+    if parts.keyword == 0 || parts.slots[2].is_some() {
+        return None;
+    }
+    let name = parts.name.map(|at| match &tokens[at].kind {
+        TokenKind::Ident(name) => name.clone(),
+        _ => unreachable!("section_parts validated the name"),
+    });
+    Some(ScopeCommand::SectionWithModifiers {
+        name,
+        public: parts.slots[0].is_some(),
+        expose: parts.expose,
+        noncomputable: parts.slots[1].is_some(),
+    })
+}
+
+#[inline(never)]
+fn section(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+) -> Result<Option<(Syntax, bool)>, DefinitionParseError> {
+    let Some(SectionParts {
+        expose,
+        slots,
+        keyword: at,
+        name,
+    }) = section_parts(view, tokens)
+    else {
+        return Ok(None);
     };
     let atom = |at: usize, text: &str| -> Result<Syntax, DefinitionParseError> {
         Ok(Syntax::Atom {
@@ -209,10 +261,9 @@ fn section(
     )))
 }
 
-/// A scope command as its tree, for `parse_source_command`, which reaches it for a `section` with
-/// a header (`public section`, `noncomputable section`, …): [`super::parse`] does not read one as
-/// a scope, and the checker models neither the module system's visibility nor `noncomputable`
-/// scopes, so it refuses the command. `None` for a command with no such tree.
+/// A scope command as its tree for `parse_source_command`. The typed scope door
+/// consumes public/expose section flags; other header effects retain this exact
+/// tree so the checker can refuse them. `None` for a command with no such tree.
 pub(crate) fn unread(source: &[u8]) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -335,6 +386,37 @@ pub(crate) fn open_declaration(
     }))
 }
 
+/// `optionValue := "true" <|> "false" <|> str <|> num` (each a non-reserved symbol or a literal)
+/// at token `at`; `None` for anything else.
+pub(crate) fn option_value(
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    at: usize,
+) -> Result<Option<Syntax>, NatDefinitionParseError> {
+    Ok(Some(match &tokens[at].kind {
+        _ if term_locals::word(tokens, at, "true") || term_locals::word(tokens, at, "false") => {
+            // nonReservedSymbolFnAux compares the raw identifier spelling, not
+            // its resolved name: an escaped identifier is not a boolean token.
+            Syntax::Atom {
+                info: leaves.leaf(at)?.info(),
+                val: if term_locals::word(tokens, at, "true") {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_owned(),
+            }
+        }
+        TokenKind::Literal(LiteralKind::Nat) => {
+            Syntax::node(Name::str(Name::anonymous(), "num"), vec![leaves.leaf(at)?])
+        }
+        TokenKind::Literal(LiteralKind::Str) => {
+            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaves.leaf(at)?])
+        }
+        _ => return Ok(None),
+    }))
+}
+
 /// `set_option ident optionValue`, `optionValue := "true" <|> "false" <|> str <|> num` (each a
 /// non-reserved symbol or a literal), optionally followed by `in <command>`.
 #[inline(never)]
@@ -353,28 +435,8 @@ fn set_option(
         return Ok(None);
     }
     let leaves = Leaves::build(view.normalized(), tokens)?;
-    let value = match &tokens[2].kind {
-        TokenKind::Ident(name)
-            if *name == Name::from_components(["true"])
-                || *name == Name::from_components(["false"]) =>
-        {
-            Syntax::Atom {
-                info: leaves.leaf(2)?.info(),
-                val: if *name == Name::from_components(["true"]) {
-                    "true"
-                } else {
-                    "false"
-                }
-                .to_owned(),
-            }
-        }
-        TokenKind::Literal(LiteralKind::Nat) => {
-            Syntax::node(Name::str(Name::anonymous(), "num"), vec![leaves.leaf(2)?])
-        }
-        TokenKind::Literal(LiteralKind::Str) => {
-            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaves.leaf(2)?])
-        }
-        _ => return Ok(None),
+    let Some(value) = option_value(&leaves, tokens, 2)? else {
+        return Ok(None);
     };
     let command = Syntax::node(
         parser_kind(&["Command", "set_option"]),
@@ -470,5 +532,68 @@ fn first_leaf_info(syntax: &mut Syntax) -> Option<&mut SourceInfo> {
     match node {
         Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => Some(info),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod noncomputable_section_tests {
+    use super::*;
+
+    #[test]
+    fn section_flags_preserve_the_pin_tree_and_original_command_boundaries() {
+        for (source, public, expose) in [
+            ("noncomputable section", false, false),
+            ("public noncomputable section", true, false),
+            ("@[expose] public noncomputable section", true, true),
+        ] {
+            assert_eq!(
+                super::super::parse(source.as_bytes()).unwrap(),
+                Some(ScopeCommand::SectionWithModifiers {
+                    name: None,
+                    public,
+                    expose,
+                    noncomputable: true,
+                })
+            );
+            assert_eq!(
+                tree(source.as_bytes()).unwrap().unwrap().kind(),
+                Some(&parser_kind(&["Command", "section"]))
+            );
+        }
+        let source = b"/- leading -/\r\n@[expose]\r\npublic\r\nnoncomputable\r\nsection A.B\r\ndef x := 7\r\nend B\r\nend A\r\n";
+        let commands = super::super::partition(source).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(
+            super::super::parse(commands[0].1).unwrap(),
+            Some(ScopeCommand::SectionWithModifiers {
+                noncomputable: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            source
+        );
+    }
+
+    #[test]
+    fn escaped_and_unsupported_modifiers_do_not_acquire_section_authority() {
+        for source in [
+            "«noncomputable» section",
+            "noncomputable meta section",
+            "noncomputable public section",
+            "noncomputable noncomputable section",
+        ] {
+            assert!(
+                !matches!(
+                    super::super::parse(source.as_bytes()),
+                    Ok(Some(ScopeCommand::SectionWithModifiers { .. }))
+                ),
+                "{source}"
+            );
+        }
     }
 }

@@ -24,6 +24,8 @@ fn fixture() -> Environment {
     // A named family whose ordinary reduction hides the constructor head.
     // The method below is an explicit type fixture; each source consumer is
     // still elaborated and checked by the normal declaration admission door.
+    // A value for arbitrary `m Nat` cannot be implemented by this axiom;
+    // the positive consumers are explicitly logical/noncomputable.
     let environment = environment
         .add_decl(ConstantInfo::Defn(DefinitionVal {
             base: ConstantVal {
@@ -116,7 +118,7 @@ fn bare_method_identifiers_receive_the_expected_type_constructor() {
     ] {
         accepted(
             &environment,
-            &format!("def inferred (receiver : Nat) : ReaderLike Nat := {value}"),
+            &format!("noncomputable def inferred (receiver : Nat) : ReaderLike Nat := {value}"),
         );
     }
 }
@@ -127,7 +129,7 @@ fn only_the_last_field_path_component_receives_the_result_expectation() {
     for value in ["receiver.identity.asReader", "(receiver.identity).asReader"] {
         accepted(
             &environment,
-            &format!("def inferred (receiver : Nat) : ReaderLike Nat := {value}"),
+            &format!("noncomputable def inferred (receiver : Nat) : ReaderLike Nat := {value}"),
         );
     }
 }

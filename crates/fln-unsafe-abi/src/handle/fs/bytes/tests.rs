@@ -1,4 +1,4 @@
-use super::{FileReadError, Obj, byte_result_transport};
+use super::{FileIoError, FileReadError, Obj, byte_result_transport};
 use crate::shadow::{self, EventKind};
 use crate::tests::lock;
 use std::io::Write;
@@ -55,6 +55,145 @@ fn no_leaks() {
         )),
         "ownership faults: {events:?}"
     );
+}
+
+fn written(packet: &Obj) {
+    assert_eq!(packet.header().tag, 0);
+    assert_eq!(packet.header().other, 7);
+    assert_eq!(packet.try_ctor_child(0).unwrap().unbox(), 0);
+    assert_eq!(packet.try_ctor_child(1).unwrap().unbox(), 1);
+    for index in 2..5 {
+        assert_eq!(packet.try_ctor_child(index).unwrap().unbox(), 0);
+    }
+    for index in 5..7 {
+        assert_eq!(
+            packet
+                .try_ctor_child(index)
+                .unwrap()
+                .try_string_view()
+                .unwrap()
+                .3,
+            [0]
+        );
+    }
+}
+
+#[test]
+fn binary_write_preserves_raw_prefix_spare_capacity_aliases_and_borrows() {
+    let _guard = lock();
+    let source = path("write-source");
+    let destination = path("write-destination");
+    let input = [0, 0xff, 0x80, b'\n', 0xe2, 0x82, b'Z'];
+    std::fs::write(&source, input).unwrap();
+    shadow::enable();
+    {
+        let reader = open(&source, 0);
+        // A positive short read initializes only its salient prefix. The
+        // remaining native allocation has never been initialized or copied.
+        let read_packet = reader
+            .try_file_read(&word(4096), &Obj::mk_nat(0), 4096)
+            .unwrap();
+        let buffer = read_packet.try_ctor_child(0).unwrap();
+        let view = buffer.try_sarray_view().unwrap();
+        assert_eq!((view.0, view.1, view.2), (1, input.len(), 4096));
+        assert_eq!(view.3, input);
+        let buffer_alias = buffer.clone_ref();
+        let handle = open(&destination, 1);
+        let alias = handle.clone_ref();
+        let world = Obj::mk_nat(0);
+        let before = (handle.header().rc, buffer.header().rc);
+        written(&handle.try_file_write(&buffer, &world).unwrap());
+        assert_eq!((handle.header().rc, buffer.header().rc), before);
+        assert_eq!(world.unbox(), 0);
+        assert_eq!(buffer.try_sarray_view().unwrap().3, input);
+        drop(handle);
+        drop(buffer);
+        written(&alias.try_file_write(&buffer_alias, &world).unwrap());
+    }
+    no_leaks();
+    assert_eq!(std::fs::read(&destination).unwrap(), input.repeat(2));
+    assert_eq!(std::fs::read(&source).unwrap(), input);
+}
+
+#[test]
+fn binary_write_empty_and_read_only_errors_follow_native_status() {
+    let _guard = lock();
+    let path = path("write-read-only");
+    let input = [0, 0xff, 0x80, b'Z'];
+    std::fs::write(&path, input).unwrap();
+    shadow::enable();
+    {
+        let handle = open(&path, 0);
+        let empty = Obj::mk_sarray(1, &[]);
+        let world = Obj::mk_nat(0);
+        written(&handle.try_file_write(&empty, &world).unwrap());
+        let buffer = Obj::mk_sarray(1, &input);
+        let before = (handle.header().rc, buffer.header().rc);
+        let failure = handle.try_file_write(&buffer, &world).unwrap();
+        assert_eq!((handle.header().rc, buffer.header().rc), before);
+        assert_eq!(failure.try_ctor_child(0).unwrap().unbox(), 0);
+        assert_eq!(failure.try_ctor_child(1).unwrap().unbox(), 0);
+        assert_eq!(failure.try_ctor_child(2).unwrap().unbox(), 12);
+        assert_eq!(
+            failure.try_ctor_child(3).unwrap().unbox(),
+            crate::stdio::EBADF as usize
+        );
+        assert_eq!(failure.try_ctor_child(4).unwrap().unbox(), 0);
+        written(&handle.try_file_write(&empty, &world).unwrap());
+        assert_eq!(buffer.try_sarray_view().unwrap().3, input);
+    }
+    no_leaks();
+    assert_eq!(std::fs::read(&path).unwrap(), input);
+}
+
+#[test]
+fn binary_write_validates_all_borrowed_inputs_before_effects() {
+    let _guard = lock();
+    let path = path("write-preconditions");
+    std::fs::write(&path, b"untouched").unwrap();
+    shadow::enable();
+    {
+        let handle = open(&path, 3);
+        let buffer = Obj::mk_sarray(1, &[0, 0xff]);
+        let world = Obj::mk_nat(0);
+        for bad_world in [Obj::mk_nat(1), Obj::mk_ctor(0, vec![], &[])] {
+            assert!(matches!(
+                handle.try_file_write(&buffer, &bad_world),
+                Err(FileIoError::InvalidWorld)
+            ));
+        }
+        for bad_buffer in [
+            Obj::mk_nat(0),
+            Obj::mk_string("wrong representation"),
+            Obj::mk_ctor(0, vec![Obj::mk_sarray(1, &[1])], &[]),
+            Obj::mk_array(vec![Obj::mk_nat(1)]),
+            Obj::mk_sarray(2, &[1, 2]),
+        ] {
+            assert!(matches!(
+                handle.try_file_write(&bad_buffer, &world),
+                Err(FileIoError::InvalidByteArray)
+            ));
+        }
+        let malformed = Obj::mk_sarray(1, &[0xee]);
+        malformed.plant_sarray_size(2);
+        let rejected = handle.try_file_write(&malformed, &world);
+        malformed.restore_sarray_size(1);
+        assert!(matches!(rejected, Err(FileIoError::InvalidByteArray)));
+        for bad_handle in [
+            Obj::mk_nat(0),
+            Obj::mk_ref(Obj::mk_nat(0)),
+            Obj::mk_external_counting(),
+            Obj::mk_closure(2, vec![]),
+        ] {
+            assert!(matches!(
+                bad_handle.try_file_write(&buffer, &world),
+                Err(FileIoError::InvalidHandle)
+            ));
+        }
+        assert_eq!(buffer.try_sarray_view().unwrap().3, [0, 0xff]);
+    }
+    no_leaks();
+    assert_eq!(std::fs::read(&path).unwrap(), b"untouched");
 }
 
 #[test]

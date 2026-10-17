@@ -1,0 +1,1454 @@
+//! Post-admission monomorphization of type arguments and concrete dictionaries.
+//!
+//! Derived names never enter the logical environment. Dictionary selection is
+//! permitted only for closed constructor values with inert fields, and runtime
+//! beta reduction introduces strict lets: it never duplicates or drops an
+//! action. Both the original theorem checking and FIR validation remain intact.
+mod arguments;
+mod heads;
+mod imported_lists;
+mod imported_nat;
+mod pure;
+mod scope;
+
+use super::*;
+use fln_core::level::Level;
+use fln_env::constants::DefinitionSafety;
+use std::collections::HashMap;
+
+struct NormalizedDefinition {
+    original: DefinitionVal,
+    normalized: DefinitionVal,
+}
+
+#[derive(Default)]
+pub(super) struct Store {
+    // Cached only after the complete immutable decision-family contract checks.
+    pub(super) decision_family_checked: bool,
+    list_recursion_checked: bool,
+    nat_recursion_checked: bool,
+    definitions: BTreeMap<Name, DefinitionVal>,
+    normalized_definitions: HashMap<Name, NormalizedDefinition>,
+    pure: pure::Store,
+    heads: heads::Store,
+    pub(super) index_types: super::indexed::cache::Store,
+    pub(super) receiver_queries: super::projections::query::Store,
+    factory_values: HashMap<Expr, Expr>,
+    pub(super) executable_projections: HashMap<(Name, u64, Expr), Expr>,
+    pub(super) instances: HashMap<arguments::InstanceKey, Name>,
+    types: HashMap<Expr, Expr>,
+    constructor_types: HashMap<Name, Expr>,
+}
+pub(super) fn closed(expr: &Expr) -> bool {
+    !expr.has_loose_bvars()
+        && !expr.has_fvar()
+        && !expr.has_expr_mvar()
+        && !expr.has_level_mvar()
+        && !expr.has_level_param()
+}
+fn application(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
+    args.into_iter().fold(head, Expr::app)
+}
+
+/// A closed proposition with no environment dependencies. This lives only in
+/// compiler-private types after admission; it never supplies a proof or chooses
+/// the value of a Decidable dictionary. Keeping it distinct from Sort 0 matters:
+/// Prop itself is a type, not a proposition whose inhabitants can be erased.
+fn erased_proposition() -> Expr {
+    Expr::forall_e(
+        Name::anonymous(),
+        Expr::sort(Level::zero()),
+        Expr::forall_e(
+            Name::anonymous(),
+            Expr::bvar(0).expect("fixed proposition domain"),
+            Expr::bvar(1).expect("fixed proposition result"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    )
+}
+
+impl Preparation<'_> {
+    /// A known Prop domain is layout-independent even if its argument mentions
+    /// runtime locals. Ordinary type arguments still require a closed value;
+    /// neither an unknown universe nor a type family is guessed to be Prop.
+    pub(super) fn proposition_parameter(&mut self, domain: &Expr) -> Result<bool, IngressError> {
+        let domain = self.type_head(domain)?;
+        Ok(matches!(domain.node(), ExprNode::Sort { level } if level.is_zero()))
+    }
+
+    /// The admitted parameter type can identify a predicate without inspecting
+    /// or evaluating the supplied predicate value. Preserve its full telescope
+    /// and its Prop result; a decision procedure is a separate runtime argument.
+    /// Original binder domains keep genuine type/value dependencies open, and
+    /// unknown universes never become evidence for a Prop-valued parameter.
+    pub(super) fn erased_proposition_argument(
+        &mut self,
+        domain: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut type_ = domain.clone();
+        let mut binders = Vec::new();
+        loop {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            if let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = normal.node()
+            {
+                reserve(&mut binders, self.limits.max_context_depth)?;
+                binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                type_ = body.clone();
+            } else if self.proposition_parameter(&normal)? {
+                break;
+            } else {
+                return Ok(None);
+            }
+        }
+        let mut value = erased_proposition();
+        for (name, domain, info) in binders.into_iter().rev() {
+            self.tick()?;
+            value = Expr::lam(name, domain, value, info);
+        }
+        Ok(closed(&value).then_some(value))
+    }
+
+    pub(super) fn forget_constructor_type(&mut self, name: &Name) {
+        self.specializations.constructor_types.remove(name);
+    }
+
+    pub(super) fn remember_constructor_type(
+        &mut self,
+        name: Name,
+        type_: Expr,
+    ) -> Result<(), IngressError> {
+        self.specializations
+            .constructor_types
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: self
+                    .specializations
+                    .constructor_types
+                    .len()
+                    .saturating_add(1),
+            })?;
+        self.specializations.constructor_types.insert(name, type_);
+        Ok(())
+    }
+    /// Register only the fully model-checked Array traversal template. This
+    /// private definition must participate in the same callable and universe
+    /// specialization paths as ordinary executable definitions.
+    pub(super) fn remember_array_iteration_definition(
+        &mut self,
+        definition: DefinitionVal,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let name = &definition.base.name;
+        if name != &Name::from_components(["_fln_runtime_array_forIn"])
+            || self.environment.contains(name)
+            || self.has_private_callable(name)
+        {
+            return Err(unsupported(
+                "Array iteration private callable name collision",
+            ));
+        }
+        let observed = self.specializations.definitions.len().saturating_add(1);
+        if observed > self.limits.fir.max_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.fir.max_functions,
+                observed,
+            });
+        }
+        self.specializations
+            .definitions
+            .insert(name.clone(), definition);
+        Ok(())
+    }
+
+    /// Register only the fully model-checked bounded Array fold template.
+    /// It uses the ordinary private callable and universe specialization paths.
+    pub(super) fn remember_array_fold_definition(
+        &mut self,
+        definition: DefinitionVal,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let name = &definition.base.name;
+        if name != &Name::from_components(["_fln_runtime_array_foldlM"])
+            || self.environment.contains(name)
+            || self.has_private_callable(name)
+        {
+            return Err(unsupported("Array fold private callable name collision"));
+        }
+        let observed = self.specializations.definitions.len().saturating_add(1);
+        if observed > self.limits.fir.max_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.fir.max_functions,
+                observed,
+            });
+        }
+        self.specializations
+            .definitions
+            .insert(name.clone(), definition);
+        Ok(())
+    }
+
+    pub(crate) fn specialized_definition(&self, name: &Name) -> Option<DefinitionVal> {
+        self.specializations.definitions.get(name).cloned()
+    }
+
+    pub(in crate::runtime) fn canonical_definition_generation(&self) -> usize {
+        self.specializations.definitions.len()
+    }
+
+    /// Private function, constructor and native-primitive identities remain
+    /// eligible for callable preparation without logical declarations. This is
+    /// only a dispatch filter: ordinary signature and contract checks still run.
+    pub(super) fn has_private_callable(&self, name: &Name) -> bool {
+        self.is_partial_stage(name)
+            || self.specializations.definitions.contains_key(name)
+            || self.specializations.constructor_types.contains_key(name)
+            || self.nat_primitive_intrinsic_type(name).is_some()
+            || self.st_intrinsic_type(name).is_some()
+            || self.io_intrinsic_type(name).is_some()
+            || self.fs_intrinsic_type(name).is_some()
+            || self.float_intrinsic_type(name).is_some()
+            || self.stdout_intrinsic_type(name).is_some()
+            || self.string_push_intrinsic_type(name).is_some()
+            || self.text_equality_intrinsic_type(name).is_some()
+            || self.string_bootstrap_intrinsic_type(name).is_some()
+            || self.string_bytes_intrinsic_type(name).is_some()
+    }
+
+    fn definition(&self, name: &Name) -> Option<DefinitionVal> {
+        match self.environment.find(name) {
+            Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
+                Some(definition.clone())
+            }
+            _ => self
+                .specialized_definition(name)
+                .filter(|definition| definition.safety == DefinitionSafety::Safe),
+        }
+    }
+    pub(super) fn universe_instance(
+        &mut self,
+        source: &Expr,
+        params: &[Name],
+        levels: &[Level],
+    ) -> Result<Expr, IngressError> {
+        pure::universe_instance(self, source, params, levels)
+    }
+    pub(super) fn substitution(&mut self, body: &Expr, value: &Expr) -> Result<Expr, IngressError> {
+        pure::substitution(self, body, value)
+    }
+    pub(super) fn lift(&mut self, expr: &Expr, amount: u32) -> Result<Expr, IngressError> {
+        scope::charge(self, expr, scope::Operation::Lift(amount))?;
+        expr.lift_loose(0, amount)
+            .map_err(|_| unsupported("runtime specialization scope"))
+    }
+
+    pub(super) fn type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
+        heads::type_head(self, source)
+    }
+
+    fn reduce_type_head(&mut self, source: &Expr) -> Result<Expr, IngressError> {
+        // A projection whose receiver unfolds to its family's constructor
+        // selects that field, as definitional unfolding does (a boxed slot's
+        // type `p.carrier` names a concrete type). Pending projections are
+        // explicit frames, never host recursion. A projection that does not
+        // reduce is returned exactly as written, with its receiver unchanged.
+        let mut projections: Vec<(Expr, Vec<Expr>)> = Vec::new();
+        let (mut head, mut args) = self.spine(source)?;
+        args.reverse();
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, a } => {
+                    reserve(&mut args, self.limits.max_application_args)?;
+                    args.push(a.clone());
+                    head = f.clone();
+                }
+                ExprNode::MData { expr, .. } => head = expr.clone(),
+                ExprNode::LetE { body, value, .. } => head = self.substitution(body, value)?,
+                ExprNode::Lam { body, .. } if !args.is_empty() => {
+                    head = self.substitution(body, &args.pop().expect("type argument"))?
+                }
+                ExprNode::Proj { expr, .. } => {
+                    let receiver = expr.clone();
+                    reserve(&mut projections, self.limits.max_context_depth)?;
+                    projections.push((head.clone(), std::mem::take(&mut args)));
+                    head = receiver;
+                }
+                ExprNode::Const { name, levels } => {
+                    if self.preserve_io_world_type(&head, &args)? {
+                        break;
+                    }
+                    if let Some(carrier) = self.fs_type_head(&head, &args)? {
+                        head = carrier;
+                        args.clear();
+                        continue;
+                    }
+                    if let Some(carrier) = self.st_type_head(&head, &args)? {
+                        head = carrier;
+                        args.clear();
+                        continue;
+                    }
+                    if let Some(definition) = self.definition(name)
+                        && definition.base.level_params.len() == levels.len()
+                    {
+                        head = self.universe_instance(
+                            &definition.value,
+                            &definition.base.level_params,
+                            levels,
+                        )?;
+                        continue;
+                    }
+                    let Some(field) = projections
+                        .last()
+                        .and_then(|(projection, _)| self.projected_field(projection, &head, &args))
+                    else {
+                        break;
+                    };
+                    let (_, outer) = projections.pop().expect("pending projection");
+                    head = field;
+                    args = outer;
+                }
+                _ => break,
+            }
+        }
+        if let Some((projection, outer)) = projections.into_iter().next() {
+            return Ok(application(projection, outer.into_iter().rev()));
+        }
+        Ok(application(head, args.into_iter().rev()))
+    }
+
+    /// The field `projection` selects from `head` applied to the reversed
+    /// `args`, when that is a saturated constructor of the projected family.
+    fn projected_field(&self, projection: &Expr, head: &Expr, args: &[Expr]) -> Option<Expr> {
+        let ExprNode::Proj {
+            struct_name, idx, ..
+        } = projection.node()
+        else {
+            return None;
+        };
+        let ExprNode::Const { name, .. } = head.node() else {
+            return None;
+        };
+        let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name) else {
+            return None;
+        };
+        let parameters = ctor.num_params as usize;
+        let fields = ctor.num_fields as usize;
+        let index = usize::try_from(*idx).ok()?;
+        if ctor.is_unsafe
+            || ctor.induct != *struct_name
+            || index >= fields
+            || args.len() != parameters.checked_add(fields)?
+        {
+            return None;
+        }
+        // `args` holds the application in reverse order.
+        args.get(args.len() - 1 - (parameters + index)).cloned()
+    }
+    pub(super) fn type_parameter(&mut self, type_: &Expr) -> Result<bool, IngressError> {
+        Ok(self.type_parameter_sort(type_)?.is_some())
+    }
+
+    /// A type parameter or type-valued function is classified from its admitted
+    /// domain alone. The terminal universe also distinguishes propositions and
+    /// predicates, whose supplied bodies remain inert logical metadata.
+    pub(super) fn type_parameter_sort(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<Option<Level>, IngressError> {
+        let mut type_ = self.type_head(type_)?;
+        loop {
+            self.tick()?;
+            match type_.node() {
+                ExprNode::Sort { level } => return Ok(Some(level.clone())),
+                ExprNode::ForallE { body, .. } => type_ = self.type_head(body)?,
+                _ => return Ok(None),
+            }
+        }
+    }
+    /// Normalize only type expressions; executable values do not pass through
+    /// this delta/beta/zeta reducer. The memo table owns its expression keys.
+    pub(crate) fn normalize_type(&mut self, input: &Expr) -> Result<Expr, IngressError> {
+        enum Work {
+            Enter(Expr),
+            Finish(Expr, Expr),
+        }
+        let mut work = vec![Work::Enter(input.clone())];
+        while let Some(item) = work.pop() {
+            self.tick()?;
+            match item {
+                Work::Enter(source) => {
+                    if self.specializations.types.contains_key(&source) {
+                        continue;
+                    }
+                    let head = self.type_head(&source)?;
+                    reserve(&mut work, self.limits.max_nodes)?;
+                    work.push(Work::Finish(source, head.clone()));
+                    let mut push = |child: &Expr| -> Result<(), IngressError> {
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Work::Enter(child.clone()));
+                        Ok(())
+                    };
+                    match head.node() {
+                        ExprNode::App { f, a } => {
+                            push(a)?;
+                            push(f)?;
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            push(body)?;
+                            push(binder_type)?;
+                        }
+                        _ => {}
+                    }
+                }
+                Work::Finish(source, head) => {
+                    let child = |expr: &Expr| {
+                        self.specializations
+                            .types
+                            .get(expr)
+                            .cloned()
+                            .ok_or_else(|| unsupported("runtime type postorder"))
+                    };
+                    let value = match head.node() {
+                        ExprNode::App { f, a } => Expr::app(child(f)?, child(a)?),
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::lam(
+                            binder_name.clone(),
+                            child(binder_type)?,
+                            child(body)?,
+                            *binder_info,
+                        ),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::forall_e(
+                            binder_name.clone(),
+                            child(binder_type)?,
+                            child(body)?,
+                            *binder_info,
+                        ),
+                        _ => head,
+                    };
+                    self.specializations.types.try_reserve(1).map_err(|_| {
+                        IngressError::AllocationFailure {
+                            resource: IngressResource::Nodes,
+                            requested: self.specializations.types.len() + 1,
+                        }
+                    })?;
+                    self.specializations.types.insert(source, value);
+                }
+            }
+        }
+        self.specializations
+            .types
+            .get(input)
+            .cloned()
+            .ok_or_else(|| unsupported("runtime type result"))
+    }
+    pub(super) fn normalize_definition_signature(
+        &mut self,
+        definition: &DefinitionVal,
+    ) -> Result<DefinitionVal, IngressError> {
+        self.tick()?;
+        // Only canonical ground specializations have a stable source identity
+        // throughout this preparation. Local signatures and modified copies
+        // still take the full path, even if they reuse a familiar name.
+        let cacheable = definition.base.level_params.is_empty()
+            && closed(&definition.base.type_)
+            && closed(&definition.value)
+            && self.specializations.definitions.get(&definition.base.name) == Some(definition);
+        if cacheable
+            && let Some(entry) = self
+                .specializations
+                .normalized_definitions
+                .get(&definition.base.name)
+            && entry.original == *definition
+        {
+            return Ok(entry.normalized.clone());
+        }
+        let mut result = definition.clone();
+        result.base.type_ = self.erase_runtime_type(&definition.base.type_)?;
+        let mut body = self.erase_proofs(&definition.value, Some(definition.base.type_.clone()))?;
+        let mut binders = Vec::new();
+        while let ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body: inner,
+            binder_info,
+        } = body.node()
+        {
+            self.tick()?;
+            let depth = binders.len().saturating_add(1);
+            if depth > self.limits.max_context_depth {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::ContextDepth,
+                    limit: self.limits.max_context_depth,
+                    observed: depth,
+                });
+            }
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((
+                binder_name.clone(),
+                self.normalize_type(binder_type)?,
+                *binder_info,
+            ));
+            body = inner.clone();
+        }
+        for (name, type_, info) in binders.into_iter().rev() {
+            body = Expr::lam(name, type_, body, info);
+        }
+        result.value = self.lower_projections(&body)?;
+        if cacheable && closed(&result.base.type_) && closed(&result.value) {
+            self.tick()?;
+            let entries = &mut self.specializations.normalized_definitions;
+            let additional = usize::from(!entries.contains_key(&definition.base.name));
+            let observed = entries.len().saturating_add(additional);
+            if observed > self.limits.fir.max_functions {
+                return Err(IngressError::ResourceLimit {
+                    resource: IngressResource::ProgramTables,
+                    limit: self.limits.fir.max_functions,
+                    observed,
+                });
+            }
+            entries
+                .try_reserve(additional)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: observed,
+                })?;
+            // Completed layout/closure registrations remain in this
+            // preparation; later discovery rolls back only its own additions.
+            // Keep the canonical logical body untouched for type reduction.
+            entries.insert(
+                definition.base.name.clone(),
+                NormalizedDefinition {
+                    original: definition.clone(),
+                    normalized: result.clone(),
+                },
+            );
+        }
+        Ok(result)
+    }
+    /// Recognize inert closed values without running arbitrary functions.
+    /// Lambda bodies are not evaluated. Every constructor field must be inert,
+    /// including fields a projection would otherwise discard.
+    fn static_value(&mut self, input: &Expr) -> Result<bool, IngressError> {
+        if !closed(input) {
+            return Ok(false);
+        }
+        let mut work = vec![input.clone()];
+        while let Some(expr) = work.pop() {
+            self.tick()?;
+            let (head, args) = self.spine(&expr)?;
+            if let ExprNode::Const { name, .. } = head.node()
+                && self.has_implementation(name)?
+            {
+                return Ok(false);
+            }
+            match head.node() {
+                ExprNode::Lam { .. }
+                | ExprNode::ForallE { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Lit { .. }
+                    if args.is_empty() => {}
+                ExprNode::Const { name, levels } => match self.environment.find(name) {
+                    Some(ConstantInfo::Ctor(ctor))
+                        if !ctor.is_unsafe
+                            && args.len()
+                                == ctor.num_params as usize + ctor.num_fields as usize =>
+                    {
+                        // A value parameter can execute work even when it is
+                        // absent from the runtime field layout. Erasing a
+                        // dictionary must not discard that computation.
+                        for parameter in &args[..ctor.num_params as usize] {
+                            if self.instance_factory_value(parameter)?.is_none() {
+                                return Ok(false);
+                            }
+                        }
+                        for field in args.into_iter().skip(ctor.num_params as usize) {
+                            reserve(&mut work, self.limits.max_nodes)?;
+                            work.push(field);
+                        }
+                    }
+                    Some(ConstantInfo::Induct(_)) => {} // checked type value
+                    Some(ConstantInfo::Axiom(_))
+                        if args.is_empty() && self.inert_native_function(&head)? => {}
+                    Some(ConstantInfo::Defn(definition))
+                        if args.is_empty()
+                            && definition.safety == DefinitionSafety::Safe
+                            && definition.base.level_params.len() == levels.len() =>
+                    {
+                        let value = self.universe_instance(
+                            &definition.value,
+                            &definition.base.level_params,
+                            levels,
+                        )?;
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(value);
+                    }
+                    _ => return Ok(false),
+                },
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+    pub(super) fn static_projection(
+        &mut self,
+        family: &Name,
+        index: u64,
+        value: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        // Native ST handles have no ordinary record fields. In particular a
+        // source constructor/projection cannot relabel a raw opaque carrier as
+        // a cell whose contents received the checked Nat representation.
+        if self.st_ref_record_forbidden(family)? {
+            return Ok(None);
+        }
+        if !self.static_value(value)? {
+            return self.single_field_projection(family, index, value);
+        }
+        let mut value = value.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = self.spine(&value)?;
+            let ExprNode::Const { name, levels } = head.node() else {
+                return Ok(None);
+            };
+            match self.environment.find(name) {
+                Some(ConstantInfo::Ctor(ctor))
+                    if !ctor.is_unsafe
+                        && ctor.induct == *family
+                        && args.len() == ctor.num_params as usize + ctor.num_fields as usize =>
+                {
+                    let Ok(index) = usize::try_from(index) else {
+                        return Ok(None);
+                    };
+                    if index >= ctor.num_fields as usize {
+                        return Ok(None);
+                    }
+                    return Ok(Some(args[ctor.num_params as usize + index].clone()));
+                }
+                Some(ConstantInfo::Defn(definition))
+                    if args.is_empty() && definition.safety == DefinitionSafety::Safe =>
+                {
+                    value = self.universe_instance(
+                        &definition.value,
+                        &definition.base.level_params,
+                        levels,
+                    )?
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    /// A single-field constructor projection retains its only executable
+    /// field. Unlike a multi-field projection, the field need not be inert.
+    /// Only inert factory arguments and constructor parameters may disappear;
+    /// computed arguments and strict lets keep the ordinary runtime path.
+    fn single_field_projection(
+        &mut self,
+        family: &Name,
+        index: u64,
+        input: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if index != 0 || !closed(input) {
+            return Ok(None);
+        }
+        let mut value = input.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = self.spine(&value)?;
+            if let ExprNode::Const { name, .. } = head.node()
+                && self.has_implementation(name)?
+            {
+                return Ok(None);
+            }
+            match head.node() {
+                ExprNode::Const { name, levels } => match self.environment.find(name) {
+                    Some(ConstantInfo::Ctor(ctor))
+                        if !ctor.is_unsafe
+                            && ctor.induct == *family
+                            && ctor.num_fields == 1
+                            && args.len() == ctor.num_params as usize + 1 =>
+                    {
+                        for parameter in &args[..ctor.num_params as usize] {
+                            if self.instance_factory_value(parameter)?.is_none() {
+                                return Ok(None);
+                            }
+                        }
+                        return Ok(args.last().cloned());
+                    }
+                    Some(ConstantInfo::Defn(definition))
+                        if definition.safety == DefinitionSafety::Safe
+                            && definition.base.level_params.len() == levels.len() =>
+                    {
+                        value = application(
+                            self.universe_instance(
+                                &definition.value,
+                                &definition.base.level_params,
+                                levels,
+                            )?,
+                            args,
+                        );
+                    }
+                    _ => return Ok(None),
+                },
+                ExprNode::Lam { body, .. } if !args.is_empty() => {
+                    let Some(argument) = self.instance_factory_value(&args[0])? else {
+                        return Ok(None);
+                    };
+                    value = application(
+                        self.substitution(body, &argument)?,
+                        args[1..].iter().cloned(),
+                    );
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    fn static_head(&mut self, input: &Expr) -> Result<Expr, IngressError> {
+        let mut value = input.clone();
+        loop {
+            self.tick()?;
+            match value.node() {
+                ExprNode::MData { expr, .. } => value = expr.clone(),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+                        break;
+                    };
+                    value = field;
+                }
+                ExprNode::Const { name, levels } => {
+                    if !self.static_value(&value)? {
+                        break;
+                    }
+                    let Some(definition) = self.definition(name) else {
+                        break;
+                    };
+                    value = self.universe_instance(
+                        &definition.value,
+                        &definition.base.level_params,
+                        levels,
+                    )?;
+                }
+                _ => break,
+            }
+        }
+        Ok(value)
+    }
+    /// Expose a concrete dictionary field and eliminate its type lambdas. For
+    /// runtime lambdas, retain strict evaluation and sharing with a let binder.
+    pub(super) fn static_apply(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        if args.is_empty() {
+            return Ok(None);
+        }
+        if matches!(head.node(), ExprNode::LetE { .. } | ExprNode::MData { .. })
+            && let Some(literal) = self.inert_callable(head)?
+        {
+            return Ok(Some(application(literal, args.iter().cloned())));
+        }
+        // A let in function position must finish its strict initializer before
+        // evaluating any application argument. Reassociate without substituting
+        // the initializer, preserving sharing and exposing literal lambda tails.
+        if let ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } = head.node()
+        {
+            if matches!(body.node(), ExprNode::BVar { idx: 0 })
+                && self.saturated_variant_ascription(value, type_, args.len())?
+            {
+                // A checked identity ascription must not make a fully supplied
+                // variant join at a shared callback ABI before its operands
+                // reach the selected branch. The initializer still occurs
+                // once, before every argument; strict prefixes stay intact.
+                return Ok(Some(application(value.clone(), args.iter().cloned())));
+            }
+            let mut lifted = Vec::new();
+            for argument in args {
+                reserve(&mut lifted, self.limits.max_application_args)?;
+                lifted.push(self.lift(argument, 1)?);
+            }
+            return Ok(Some(Expr::let_e(
+                decl_name.clone(),
+                type_.clone(),
+                value.clone(),
+                application(body.clone(), lifted),
+                *non_dep,
+            )));
+        }
+        let original = head.clone();
+        let mut head = head.clone();
+        if let ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } = head.node()
+        {
+            let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+                return Ok(None);
+            };
+            head = field;
+        }
+        let mut consumed = 0;
+        loop {
+            self.tick()?;
+            let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = head.node()
+            else {
+                break;
+            };
+            let Some(argument) = args.get(consumed) else {
+                break;
+            };
+            // Constructing a syntactic lambda executes none of its body. It
+            // can be substituted capture-avoidantly without duplicating or
+            // dropping an action. This also exposes mutual-match minor
+            // premises hidden behind the elaborator's local helper lambdas.
+            // A call that *returns* a function must still use the strict let.
+            if let Some(proposition) = self.erased_proposition_argument(binder_type)? {
+                head = self.substitution(body, &proposition)?;
+                consumed += 1;
+                continue;
+            }
+            if let Some(literal) = self.inert_callable(argument)? {
+                let literal = self.retain_substituted_callable_type(literal, binder_type, body)?;
+                head = self.substitution(body, &literal)?;
+                consumed += 1;
+                continue;
+            }
+            if self.type_parameter(binder_type)? && closed(argument) {
+                head = self.substitution(body, argument)?;
+                consumed += 1;
+                continue;
+            }
+            let mut remaining = Vec::new();
+            for argument in &args[consumed + 1..] {
+                reserve(&mut remaining, self.limits.max_application_args)?;
+                remaining.push(self.lift(argument, 1)?);
+            }
+            return Ok(Some(Expr::let_e(
+                binder_name.clone(),
+                self.normalize_type(binder_type)?,
+                argument.clone(),
+                application(body.clone(), remaining),
+                false,
+            )));
+        }
+        if consumed == 0 && head == original {
+            return Ok(None);
+        }
+        Ok(Some(application(head, args[consumed..].iter().cloned())))
+    }
+    /// Only admitted executable entries can become callable values. A familiar
+    /// axiom name is insufficient: intrinsics require the complete admitted
+    /// native contract and any selected extern metadata.
+    /// Ground constructors use the same telescope that produced their layout.
+    /// A lambda passed where the callee's parameter takes more arguments than the lambda binds
+    /// (`List`'s `ForIn` passes `fun a _ => f a` where `forIn'` calls back with three) is
+    /// eta-expanded to the parameter's full telescope: `fun a h b => f a b`. A Pi type is one
+    /// flat closure signature, so the staged lambda's closure type is not the parameter's. A
+    /// lambda is seen through the anonymous `let` that annotates its staged type. One whose
+    /// body is a strict `let` keeps its stages: expanding would move that work under the new
+    /// binders. Other arguments, and callees with no known telescope, are returned as they are.
+    pub(super) fn eta_expand_callbacks(
+        &mut self,
+        head: &Expr,
+        mut args: Vec<Expr>,
+    ) -> Result<Vec<Expr>, IngressError> {
+        if !args.iter().any(|arg| annotated_lambda(arg).is_some()) {
+            return Ok(args);
+        }
+        let Some(mut type_) = self.callable_type(head)? else {
+            return Ok(args);
+        };
+        for arg in &mut args {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                break;
+            };
+            let next = self.substitution(body, arg)?;
+            if let Some(lambda) = annotated_lambda(arg) {
+                let parameter = self.normalize_type(binder_type)?;
+                if let Some(expanded) = self.eta_expand_lambda(lambda, &parameter)? {
+                    *arg = match arg.node() {
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            body,
+                            non_dep,
+                            ..
+                        } => Expr::let_e(
+                            decl_name.clone(),
+                            type_.clone(),
+                            expanded,
+                            body.clone(),
+                            *non_dep,
+                        ),
+                        _ => expanded,
+                    };
+                }
+            }
+            type_ = next;
+        }
+        Ok(args)
+    }
+
+    /// `lambda` with the binders its normalized `parameter` telescope has beyond its own.
+    fn eta_expand_lambda(
+        &mut self,
+        lambda: &Expr,
+        parameter: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut binders = Vec::new();
+        let mut body = lambda.clone();
+        let mut remaining = parameter.clone();
+        while let ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body: inner,
+            binder_info,
+        } = body.node()
+        {
+            self.tick()?;
+            let ExprNode::ForallE { body: rest, .. } = remaining.node() else {
+                return Ok(None);
+            };
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            let (inner, rest) = (inner.clone(), rest.clone());
+            body = inner;
+            remaining = rest;
+        }
+        let mut extra = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body: rest,
+            binder_info,
+        } = remaining.node()
+        {
+            self.tick()?;
+            extra.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            let rest = rest.clone();
+            remaining = rest;
+        }
+        if extra.is_empty() || matches!(body.node(), ExprNode::LetE { .. } | ExprNode::MData { .. })
+        {
+            return Ok(None);
+        }
+        let count = u32::try_from(extra.len()).map_err(|_| unsupported("callback arity"))?;
+        let mut expanded = self.lift(&body, count)?;
+        for index in (0..count).rev() {
+            let variable =
+                Expr::bvar(index).map_err(|_| unsupported("callback eta-expansion scope"))?;
+            expanded = Expr::app(expanded, variable);
+        }
+        // Innermost first: the last extra binder, out to the lambda's first.
+        for (name, type_, info) in binders.into_iter().chain(extra).rev() {
+            expanded = Expr::lam(name, type_, expanded, info);
+        }
+        Ok(Some(expanded))
+    }
+
+    pub(super) fn callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
+        self.original_callable_type(head)?
+            .map(|type_| self.erase_runtime_type(&type_))
+            .transpose()
+    }
+
+    fn original_callable_type(&mut self, head: &Expr) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        self.tick()?;
+        if levels.is_empty()
+            && let Some(type_) = self.partial_stage_type(name)
+        {
+            return Ok(Some(type_));
+        }
+        if levels.is_empty()
+            && let Some(type_) = self
+                .nat_primitive_intrinsic_type(name)
+                .or_else(|| self.st_intrinsic_type(name))
+                .or_else(|| self.io_intrinsic_type(name))
+                .or_else(|| self.fs_intrinsic_type(name))
+                .or_else(|| self.float_intrinsic_type(name))
+                .or_else(|| self.stdout_intrinsic_type(name))
+                .or_else(|| self.string_push_intrinsic_type(name))
+                .or_else(|| self.text_equality_intrinsic_type(name))
+                .or_else(|| self.string_bootstrap_intrinsic_type(name))
+                .or_else(|| self.string_bytes_intrinsic_type(name))
+        {
+            return Ok(Some(type_));
+        }
+        if let Some(definition) = self.executable_definition(name)? {
+            return self
+                .universe_instance(
+                    &definition.base.type_,
+                    &definition.base.level_params,
+                    levels,
+                )
+                .map(Some);
+        }
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        if let Some(type_) = self.specializations.constructor_types.get(name) {
+            return Ok(Some(type_.clone()));
+        }
+        // An opaque without an authorized executable body needs a native
+        // contract authorizing the same callable telescope used for a
+        // saturated invocation, including its selected extern. The ordinary
+        // partial-call path then captures supplied values in strict lets and
+        // emits a saturated native call inside a checked closure.
+        if self.native_intrinsic_binding(name)?.is_some() {
+            return Ok(self
+                .environment
+                .find(name)
+                .map(|info| info.constant_val().type_.clone()));
+        }
+        if let Some(ConstantInfo::Ctor(constructor)) = self.environment.find(name) {
+            if name == &super::name("Nat.succ") {
+                self.check_nat_family()?;
+                return Ok(Some(constructor.base.type_.clone()));
+            }
+            let family = Expr::const_(constructor.induct.clone(), vec![]);
+            self.value_type(&family)?;
+            return Ok(self.specializations.constructor_types.get(name).cloned());
+        }
+        Ok(None)
+    }
+
+    /// Global partial applications retain supplied arguments in strict lets and
+    /// return a closure over them. The inner call is saturated; neither the
+    /// function nor an argument is executed during this transformation.
+    pub(super) fn partial_call(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        self.partial_call_with_remaining(head, args, None)
+    }
+
+    /// A constructor that erased a hidden carrier retains its checked concrete
+    /// remaining telescope at the outer callback boundary. Its saturated inner
+    /// call still uses the erased object layout, so ingress inserts the actual
+    /// ABI conversions. The caller must first prove storage compatibility for
+    /// every remaining field; this never casts an existing closure interface.
+    pub(super) fn partial_call_with_remaining(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+        concrete_remaining: Option<&Expr>,
+    ) -> Result<Option<Expr>, IngressError> {
+        // These private entries are emitted only at their real prefix arity.
+        // Their remaining Pi is a returned closure, not missing arguments.
+        if matches!(head.node(), ExprNode::Const { name, .. } if self.is_partial_stage(name)) {
+            return Ok(None);
+        }
+        let Some(mut type_) = self.callable_type(head)? else {
+            return Ok(None);
+        };
+        // An unspecialized constructor still has its logical name after its
+        // type fields have been erased. Preserve those verified inert slots
+        // in the saturated inner call: replacing them by let-bound variables
+        // would make constructor preparation mistake them for fresh carrier
+        // arguments. Ordinary Boolean/proof fields have no such exemption.
+        let mut type_fields = Vec::new();
+        if let ExprNode::Const { name, levels } = head.node()
+            && levels.is_empty()
+            && self.specializations.constructor_types.contains_key(name)
+            && let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name)
+            && ctor.num_params == 0
+            && ctor.base.level_params.is_empty()
+            && let Some(shape) = self.record_shape(&Expr::const_(ctor.induct.clone(), vec![]))?
+            && let Some(constructor) = shape.constructors.iter().find(|ctor| &ctor.name == name)
+        {
+            for field in &constructor.type_fields {
+                self.tick()?;
+                reserve(&mut type_fields, self.limits.max_context_depth)?;
+                type_fields.push(*field);
+            }
+        }
+        let mut supplied = Vec::new();
+        for argument in args {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            let domain = self.normalize_type(binder_type)?;
+            if self.value_type(&domain)?.is_none() {
+                return Ok(None);
+            }
+            reserve(&mut supplied, self.limits.max_context_depth)?;
+            supplied.push((binder_name.clone(), domain, argument.clone()));
+            type_ = self.substitution(body, argument)?;
+        }
+        let remaining_type = self.normalize_type(concrete_remaining.unwrap_or(&type_))?;
+        if !matches!(remaining_type.node(), ExprNode::ForallE { .. }) {
+            return Ok(None);
+        }
+        if self.value_type(&remaining_type)?.is_none() {
+            return Ok(None);
+        }
+        let mut remaining = Vec::new();
+        let mut type_ = &remaining_type;
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = type_.node()
+        {
+            self.tick()?;
+            // Runtime interfaces are nondependent; an index may not become a
+            // guessed field or a callback type when the binder is erased.
+            if body.has_loose_bvars() {
+                return Ok(None);
+            }
+            reserve(&mut remaining, self.limits.max_context_depth)?;
+            remaining.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            type_ = body;
+        }
+        let depth =
+            u32::try_from(supplied.len()).map_err(|_| unsupported("partial application depth"))?;
+        let total = supplied
+            .len()
+            .checked_add(remaining.len())
+            .ok_or_else(|| unsupported("partial application depth"))?;
+        let mut value = head.clone();
+        for index in (0..total).rev() {
+            self.tick()?;
+            let position = total - 1 - index;
+            let argument = if type_fields.get(position) == Some(&true)
+                && supplied
+                    .get(position)
+                    .is_some_and(|(_, _, value)| value == &proofs::erased_value())
+            {
+                proofs::erased_value()
+            } else {
+                Expr::bvar(
+                    u32::try_from(index).map_err(|_| unsupported("partial application index"))?,
+                )
+                .map_err(|_| unsupported("partial application index"))?
+            };
+            value = Expr::app(value, argument);
+        }
+        for (index, (name, domain, info)) in remaining.into_iter().enumerate().rev() {
+            let offset = depth
+                .checked_add(
+                    u32::try_from(index).map_err(|_| unsupported("partial application depth"))?,
+                )
+                .ok_or_else(|| unsupported("partial application depth"))?;
+            value = Expr::lam(name, self.lift(&domain, offset)?, value, info);
+        }
+        let mut result = Expr::let_e(
+            Name::anonymous(),
+            self.lift(&remaining_type, depth)?,
+            value,
+            Expr::bvar(0).map_err(|_| unsupported("partial result"))?,
+            false,
+        );
+        for (index, (name, domain, argument)) in supplied.into_iter().enumerate().rev() {
+            let offset =
+                u32::try_from(index).map_err(|_| unsupported("partial application depth"))?;
+            result = Expr::let_e(
+                name,
+                self.lift(&domain, offset)?,
+                self.lift(&argument, offset)?,
+                result,
+                false,
+            );
+        }
+        Ok(Some(result))
+    }
+    /// Give literal callback tails a checked type by sharing all arguments
+    /// in left-to-right lets. The ordinary closure converter then derives their
+    /// interfaces, captures and ownership; no body is executed to infer a type.
+    pub(super) fn annotate_call(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut has_literal = false;
+        for argument in args {
+            if self.has_literal_callable_tail(argument)? {
+                has_literal = true;
+                break;
+            }
+        }
+        if !has_literal {
+            return Ok(None);
+        }
+        let Some(mut type_) = self.callable_type(head)? else {
+            return Ok(None);
+        };
+        let mut needs_annotation = false;
+        let mut bindings = Vec::new();
+        for argument in args {
+            self.tick()?;
+            let normal = self.type_head(&type_)?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            // A motive is literal lambda syntax too, but its Sort-valued
+            // domain gives it no runtime closure. Wrapping that argument alone
+            // in a type let would be undone by static let elimination and
+            // recreate this same call indefinitely. Inspect the instantiated
+            // domain, including preceding real arguments, before selecting an
+            // annotation for an executable callback.
+            if !needs_annotation
+                && !self.type_parameter(binder_type)?
+                && self.has_literal_callable_tail(argument)?
+            {
+                needs_annotation = true;
+            }
+            reserve(&mut bindings, self.limits.max_context_depth)?;
+            bindings.push((
+                binder_name.clone(),
+                self.normalize_type(binder_type)?,
+                argument.clone(),
+            ));
+            type_ = self.substitution(body, argument)?;
+        }
+        if !needs_annotation {
+            return Ok(None);
+        }
+        let mut result = head.clone();
+        for index in (0..bindings.len()).rev() {
+            result = Expr::app(
+                result,
+                Expr::bvar(
+                    u32::try_from(index).map_err(|_| unsupported("runtime callback scope"))?,
+                )
+                .map_err(|_| unsupported("runtime callback scope"))?,
+            );
+        }
+        for (index, (name, type_, argument)) in bindings.into_iter().enumerate().rev() {
+            let depth = u32::try_from(index).map_err(|_| unsupported("runtime callback depth"))?;
+            result = Expr::let_e(
+                name,
+                self.lift(&type_, depth)?,
+                self.lift(&argument, depth)?,
+                result,
+                false,
+            );
+        }
+        Ok(Some(result))
+    }
+}
+
+/// `arg` itself when it is a lambda, or the lambda that an anonymous annotating `let _ : T := λ; _`
+/// returns.
+fn annotated_lambda(arg: &Expr) -> Option<&Expr> {
+    match arg.node() {
+        ExprNode::Lam { .. } => Some(arg),
+        ExprNode::LetE { value, body, .. }
+            if matches!(value.node(), ExprNode::Lam { .. })
+                && matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
+        {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_class_intrinsics_require_the_exact_admitted_seed_contract() {
+        let name = name("Nat.sub");
+        let Declaration::Axiom(mut axiom) =
+            fln_elab::seed::source_intrinsic_seed_declaration(&name).unwrap()
+        else {
+            panic!("intrinsic axiom");
+        };
+        // Imported metadata alone is untrusted. A familiar name with a
+        // different telescope cannot gain code merely by becoming a callback.
+        axiom.base.type_ = Expr::forall_e(
+            Name::anonymous(),
+            Expr::const_(super::name("String"), vec![]),
+            Expr::const_(super::name("Nat"), vec![]),
+            BinderInfo::Default,
+        );
+        let environment = Environment::new()
+            .add_decl(ConstantInfo::Axiom(axiom))
+            .unwrap();
+        let head = Expr::const_(name, vec![]);
+        assert!(
+            Preparation::new(&environment, IngressLimits::default())
+                .partial_call(&head, &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Preparation::new(&Environment::new(), IngressLimits::default())
+                .partial_call(&head, &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn private_constructor_callback_names_do_not_create_layout_authority() {
+        let environment = Environment::new();
+        let name = Name::num(Name::num(super::name("_fln_runtime_data"), 0), 1);
+        assert!(
+            Preparation::new(&environment, IngressLimits::default())
+                .partial_call(&Expr::const_(name, vec![]), &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Preparation::new(&environment, IngressLimits::default())
+                .partial_call(&Expr::const_(super::name("Nat.succ"), vec![]), &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deeply_nested_type_normalization_uses_heap_frames_and_a_real_work_limit() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let scalar = Expr::const_(name("Nat"), vec![]);
+                let mut type_ = scalar.clone();
+                for _ in 0..600 {
+                    type_ = Expr::forall_e(
+                        Name::anonymous(),
+                        scalar.clone(),
+                        type_,
+                        BinderInfo::Default,
+                    );
+                }
+                let environment = Environment::new();
+                let mut limits = IngressLimits {
+                    max_nodes: 20_000,
+                    ..IngressLimits::default()
+                };
+                let mut preparation = Preparation::new(&environment, limits);
+                assert_eq!(preparation.normalize_type(&type_).unwrap(), type_);
+                limits.max_nodes = 10;
+                assert!(matches!(
+                    Preparation::new(&environment, limits).normalize_type(&type_),
+                    Err(IngressError::ResourceLimit {
+                        resource: IngressResource::Nodes,
+                        ..
+                    })
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn expanding_substitutions_are_charged_before_calling_core_substitution() {
+        let scalar = Expr::const_(name("Nat"), vec![]);
+        let mut replacement = scalar.clone();
+        for _ in 0..30 {
+            replacement = Expr::app(replacement, scalar.clone());
+        }
+        let mut body = Expr::bvar(0).unwrap();
+        for _ in 0..30 {
+            body = Expr::app(body, Expr::bvar(0).unwrap());
+        }
+        let environment = Environment::new();
+        let limits = IngressLimits {
+            max_nodes: 200,
+            ..IngressLimits::default()
+        };
+        // A closed replacement at depth zero is cloned, not copied into a new
+        // tree per occurrence. Keep this original fixture as the positive
+        // control: its former product-of-tree-sizes rejection was spurious.
+        let mut expected = replacement.clone();
+        for _ in 0..30 {
+            expected = Expr::app(expected, replacement.clone());
+        }
+        assert_eq!(
+            Preparation::new(&environment, limits)
+                .substitution(&body, &replacement)
+                .unwrap(),
+            expected
+        );
+        // An open replacement under a binder genuinely must be lifted. Its
+        // work is still charged before invoking the core transform.
+        let mut open = Expr::bvar(0).unwrap();
+        for _ in 0..30 {
+            open = Expr::app(open, scalar.clone());
+        }
+        let under_binder = Expr::lam(
+            Name::anonymous(),
+            scalar,
+            body.lift_loose(0, 1).unwrap(),
+            BinderInfo::Default,
+        );
+        assert!(matches!(
+            Preparation::new(&environment, limits).substitution(&under_binder, &open),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            })
+        ));
+    }
+}

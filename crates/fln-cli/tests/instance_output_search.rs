@@ -42,8 +42,12 @@ fn installed_checker_infers_repeated_outputs_in_both_parameter_modes() {
             let previous = depth - 1;
             source.push_str(&format!("class C{depth} (A : {mode} Type) where\n  value : A\ninstance c{depth} {{A B : Type}} [first : C{previous} A] [second : C{previous} B] : C{depth} Nat := C{depth}.mk 7\n"));
         }
+        // The solution doubles at each level, so it is far larger than the pin's default
+        // `synthInstance.maxSize` (128): there the request is refused (`failed to synthesize`), as it
+        // is here since df2f1d37. The test measures tabling, not that limit, so it raises the limit
+        // as a user would; both the pin (v4.32.0, 2026-10-11) and this checker accept then.
         source.push_str(
-            "def result : C12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl\n",
+            "set_option synthInstance.maxSize 8192\ndef result : C12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl\n",
         );
         complete(run(mode, &source));
     }

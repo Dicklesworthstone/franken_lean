@@ -146,19 +146,25 @@ impl Context {
         let id = FVarId(self.fresh_name()?);
         match target.node() {
             ExprNode::ForallE {
+                binder_name,
                 binder_type,
                 body,
                 binder_info,
-                ..
             } => {
+                self.trace_introduced_name(&id, &name, binder_name);
                 goal.target = self.substitute(body, &Expr::fvar(id.clone()))?;
                 self.txn
                     .lctx
                     .add_param(id.clone(), name, binder_type.clone(), *binder_info);
             }
             ExprNode::LetE {
-                type_, value, body, ..
+                decl_name: binder_name,
+                type_,
+                value,
+                body,
+                ..
             } => {
+                self.trace_introduced_name(&id, &name, binder_name);
                 goal.target = self.substitute(body, &Expr::fvar(id.clone()))?;
                 self.txn
                     .lctx

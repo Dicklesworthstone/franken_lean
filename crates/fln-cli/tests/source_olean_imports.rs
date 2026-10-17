@@ -67,7 +67,7 @@ fn a_real_prelude_import_is_council_admitted_and_journaled() {
     );
     assert!(
         stdout.contains(
-            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":1,\"declarations\":2314}"
+            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":1,\"modules\":1,\"declarations\":2314}"
         ),
         "{stdout}"
     );
@@ -201,7 +201,7 @@ fn the_report_is_byte_identical_at_one_and_several_jobs() {
     assert_eq!(serial.0, Some(0), "{serial:?}");
     assert!(
         serial.1.contains(
-            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"modules\":7,"
+            "\"oleanImports\":{\"trust\":\"recheck\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":7,\"modules\":7,"
         ),
         "{serial:?}"
     );
@@ -345,4 +345,29 @@ fn existential_notation_and_nested_anonymous_constructors() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("\"commands\":4"), "{stdout}");
     assert!(stdout.contains("\"theorems\":3"), "{stdout}");
+}
+
+/// Over the real `Init.Prelude`, which declares ten axioms of its own (`Classical.choice`,
+/// `sorryAx`, eight `unsafe` ones), the report counts only the file's one. A value-less
+/// `opaque` is `default` where its type is `Inhabited`; where it is only `Nonempty` the pin
+/// refuses it at the `opaque` ("failed to compile definition … depends on
+/// 'Classical.ofNonempty'", exit 1, measured 2026-10-11), and so does this checker. The two
+/// fixtures differ only in that instance.
+#[test]
+fn an_opaque_needs_an_inhabited_type_and_only_the_files_axioms_are_counted() {
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let (code, stdout, stderr) = check_source("opaque_inhabited");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for expected in ["\"commands\":6", "\"theorems\":1", "\"axioms\":1,"] {
+        assert!(stdout.contains(expected), "{stdout}");
+    }
+    // A refusal is reported on stderr, and names the `opaque` (command 2).
+    let (code, stdout, stderr) = check_source("opaque_nonempty");
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("\"outcome\":\"elaboration\""), "{stderr}");
+    assert!(stderr.contains("command 2,"), "{stderr}");
 }

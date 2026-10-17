@@ -1,0 +1,80 @@
+name: Native instance selection landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/patches/instance-selection/**
+      - scripts/land_instance_selection.sh
+      - .github/workflows/fln-instance-selection-landing.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-instance-selection-landing
+  cancel-in-progress: false
+
+jobs:
+  validate-and-land:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Retain exact source baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > "$RUNNER_TEMP/instance-baseline-sha.txt"
+          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/instance-baseline.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instance-selection-baseline
+          path: |
+            ${{ runner.temp }}/instance-baseline-sha.txt
+            ${{ runner.temp }}/instance-baseline.tar.gz
+          retention-days: 3
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
+      - name: Retain the pinned compiler for offline implementation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysroot=$(rustc --print sysroot)
+          tar -C "$sysroot" -czf "$RUNNER_TEMP/pinned-rust.tar.gz" bin lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instance-selection-pinned-compiler
+          path: ${{ runner.temp }}/pinned-rust.tar.gz
+          retention-days: 1
+      - name: Compile, test, and publish each complete implementation stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/land_instance_selection.sh 2>&1 | tee "$RUNNER_TEMP/instance-selection.log"
+      - name: Retain exact candidate source and publication state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short > "$RUNNER_TEMP/instance-candidate-status.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/instance-candidate-sha.txt"
+          git ls-files -co --exclude-standard -z | tar --null -T - -czf "$RUNNER_TEMP/instance-candidate.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: instance-selection-results
+          path: |
+            ${{ runner.temp }}/instance-selection.log
+            ${{ runner.temp }}/instance-candidate-status.txt
+            ${{ runner.temp }}/instance-candidate-sha.txt
+            ${{ runner.temp }}/instance-candidate.tar.gz
+          retention-days: 7

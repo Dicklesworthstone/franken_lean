@@ -174,6 +174,28 @@ pub fn declaration_root<'a>(
     root_of_sorted(count, decls, 0, std::iter::empty(), options.as_ref())
 }
 
+/// The root [`LogicalRootBuilder::finalize`] gives for a builder holding exactly `decls` and
+/// `extensions`, with `options` set. Both streams must be strictly ascending by canonical name
+/// bytes, which is the builder's own iteration order, and each count must be its stream's
+/// length. A caller that keeps every name's canonical bytes roots its table without the
+/// builder's copy and map of every name.
+pub fn sorted_logical_root<'a, 'b>(
+    decl_count: usize,
+    decls: impl IntoIterator<Item = (&'a [u8], &'a Digest)>,
+    extension_count: usize,
+    extensions: impl IntoIterator<Item = (&'b [u8], &'b Digest)>,
+    options: &KVMap,
+) -> LogicalRoot {
+    let options = hash(Domain::OptionsSet, &options.to_canonical_bytes());
+    root_of_sorted(
+        decl_count,
+        decls,
+        extension_count,
+        extensions,
+        Some(&options),
+    )
+}
+
 /// The one encoding of a logical root, hashed as it is written.
 fn root_of_sorted<'a, 'b>(
     decl_count: usize,

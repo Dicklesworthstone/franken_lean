@@ -17,12 +17,16 @@ fn replacement_lifting_is_charged_at_its_actual_binder_depth() {
     let value = Expr::app(b(0), b(1));
     let body = Expr::lam(name("x"), nat(), b(1), BinderInfo::Default);
     // Lam enter/exit + Nat clone + BVar enter/exit + lifted App and two BVars.
-    let mut preparation = Preparation::new(&environment, limits(11));
+    let mut envelope = Preparation::new(&environment, limits(11));
+    charge(&mut envelope, &body, Operation::Substitute(&value)).unwrap();
+    assert_eq!(envelope.visited, 11);
+    // The public path additionally charges exact-cache lookup and completion.
+    let mut preparation = Preparation::new(&environment, limits(13));
     assert_eq!(
         preparation.substitution(&body, &value).unwrap(),
         Expr::lam(name("x"), nat(), Expr::app(b(1), b(2)), BinderInfo::Default)
     );
-    assert_eq!(preparation.visited, 11);
+    assert_eq!(preparation.visited, 13);
     let mut bounded = Preparation::new(&environment, limits(10));
     assert!(matches!(
         bounded.substitution(&body, &value),

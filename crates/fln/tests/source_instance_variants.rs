@@ -35,7 +35,7 @@ fn repeated_unknown_semi_outputs_share_answers_and_keep_known_output_filters() {
     let base = checked(&engine(), &source);
     checked(
         &base,
-        "def result : Semi12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
+        "set_option synthInstance.maxSize 8192 in\ndef result : Semi12 Nat := inferInstance\ntheorem correct : result.value = 7 := by rfl",
     );
     assert!(
         base.check_source_files(
@@ -48,7 +48,10 @@ fn repeated_unknown_semi_outputs_share_answers_and_keep_known_output_filters() {
 }
 
 #[test]
-fn fresh_semi_output_cycle_can_use_a_productive_base_instance() {
+fn fresh_semi_output_cycle_resumes_its_new_answer_before_the_older_base_waiter() {
+    // The pin wakes the open query's self-consumer before the root consumer.
+    // The Nat answer with tag 7 produces Bool with tag 8, whose wakeup
+    // completes the root with 9 before the older Nat continuation yields 8.
     checked(
         &engine(),
         r#"class Choose (A : semiOutParam Type) where
@@ -56,7 +59,7 @@ fn fresh_semi_output_cycle_can_use_a_productive_base_instance() {
 instance (priority := 500) base : Choose Nat := Choose.mk 7
 instance (priority := 2000) step {A : Type} [next : Choose A] : Choose Bool := Choose.mk (next.tag + 1)
 def result : Choose Bool := inferInstance
-theorem cycleRecovered : result.tag = 8 := by rfl"#,
+theorem cycleRecovered : result.tag = 9 := by rfl"#,
     );
 }
 
@@ -113,7 +116,7 @@ fn structured_semi_outputs_share_substitutions_without_erasing_their_shape() {
     let base = checked(&engine(), &source);
     checked(
         &base,
-        "def result : Tree12 (Box Nat) := inferInstance\ntheorem correct : result.tag = 7 := by rfl",
+        "set_option synthInstance.maxSize 8192 in\ndef result : Tree12 (Box Nat) := inferInstance\ntheorem correct : result.tag = 7 := by rfl",
     );
     assert!(
         base.check_source_files(
@@ -126,7 +129,9 @@ fn structured_semi_outputs_share_substitutions_without_erasing_their_shape() {
 }
 
 #[test]
-fn structured_variant_cycles_reach_the_base_without_confusing_fixed_outputs() {
+fn structured_variant_cycles_resume_new_answers_before_older_base_waiters() {
+    // Preserve the same pinned LIFO wakeup order when the shared open query
+    // has the structured type Choose (Box ?A), rather than Choose ?A.
     checked(
         &engine(),
         r#"structure Box (A : Type) where
@@ -136,6 +141,6 @@ class Choose (A : semiOutParam Type) where
 instance (priority := 500) base : Choose (Box Nat) := Choose.mk 7
 instance (priority := 2000) step {A : Type} [next : Choose (Box A)] : Choose (Box Bool) := Choose.mk (next.tag + 1)
 def result : Choose (Box Bool) := inferInstance
-theorem recovered : result.tag = 8 := by rfl"#,
+theorem recovered : result.tag = 9 := by rfl"#,
     );
 }

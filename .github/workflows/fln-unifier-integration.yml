@@ -37,6 +37,11 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv | tee target/unifier-integration/compiler.txt
+      - name: Test pending synthesis and assignment safety
+        run: cargo test --locked -p fln-elab --test native_unification_pending --no-fail-fast
+      - name: Test higher-order and pending source instances
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --test source_instances --test source_pending_instances --no-fail-fast
       - name: Run native elaborator tests
         shell: bash
         run: |

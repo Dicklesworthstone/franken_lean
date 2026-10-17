@@ -196,3 +196,40 @@ def run : State Nat := do
 
 #[path = "source_for_membership/unless_tests.rs"]
 mod unless_tests;
+
+
+#[test]
+fn quoted_membership_proofs_keep_hygienic_identities_through_checked_execution() {
+    let base = engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let checked = checked(
+        &base,
+        r#"
+def h : Nat := 900
+def x : Nat := 800
+macro "proofVisit " n:term:max outside:term:max : term => `(do {
+  for h : x in $n do { checkWitness $n x h }
+  return $outside })
+def visit (h : Nat) : Id Nat := proofVisit (7 : Nat) h
+theorem visit_value : visit 42 = 42 := rfl
+"#,
+    );
+    let run = checked
+        .execute_source_definitions(
+            &[b"#eval visit 42"],
+            &options,
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &run.executions[0].exit else {
+        panic!("membership loop did not return")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(base.logical_root(&options), before);
+}

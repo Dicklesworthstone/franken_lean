@@ -13,6 +13,12 @@ mod fallback;
 pub(super) struct Prefix {
     keyword: usize,
     sequence_only: bool,
+    /// `unless …`/`for …` in term position (`Term.termUnless`, `Term.termFor`): one element,
+    /// given its term kind by [`Prefix::finish`].
+    term_element: bool,
+    /// The keyword that opened this sequence: `do`, or a `repeat` statement's own keyword
+    /// (`doRepeat := "repeat " doSeq`).
+    keyword_text: &'static str,
     baseline: usize,
     braces: Option<(usize, Option<usize>)>,
     items: Vec<Syntax>,
@@ -20,6 +26,8 @@ pub(super) struct Prefix {
     annotation: Option<Syntax>,
     collection: Option<Syntax>,
     pattern: Option<Syntax>,
+    /// A local function's binders (`let f {n : Nat} (x : Nat) := …`), read where its header ends.
+    binders: Option<Vec<Syntax>>,
     phase: Phase,
 }
 #[derive(Clone, Copy)]
@@ -35,6 +43,23 @@ enum Statement {
         position: BytePos,
     },
     Return(usize),
+    /// `repeat seq` (`doRepeat`): its keyword opens the body's sequence, as `do` would.
+    Repeat {
+        keyword: usize,
+        position: BytePos,
+    },
+    /// The body has closed at `until`; the next term is the postcondition.
+    RepeatUntil {
+        keyword: usize,
+        until: usize,
+        position: BytePos,
+    },
+    /// `return` with no value: no term follows on its line (`doReturn`'s `checkLineEq`). Its
+    /// keyword is the frame's one leaf, as a jump's is.
+    BareReturn {
+        keyword: usize,
+        position: BytePos,
+    },
     Unless {
         keyword: usize,
         position: BytePos,
@@ -67,11 +92,15 @@ enum Statement {
         mutable: Option<usize>,
         /// `x := e` / `x ← e` (`doReassign`, `doReassignArrow`): `keyword` is the name.
         reassign: bool,
+        /// `let rec`'s `rec` (`doLetRec`).
+        recursive: Option<usize>,
     },
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Pattern,
+    /// A `for`'s bracketed binder, a term up to its `in`.
+    ForBinder,
     Annotation,
     Collection,
     Value,
@@ -122,6 +151,15 @@ fn closing_bracket(tokens: &[LexedToken], open: usize, end: usize) -> Option<usi
         }
     }
     None
+}
+/// Whether the `return` at `at` has no value: `"return" (ppSpace checkLineEq termParser)?` takes
+/// a term only on its own line, and none starts at a delimiter or separator.
+pub(super) fn bare_return(view: &SourceView, tokens: &[LexedToken], at: usize, end: usize) -> bool {
+    at + 1 >= end
+        || newline(view, tokens, at + 1)
+        || closing(tokens, at + 1)
+        || word(tokens, at + 1, ";")
+        || word(tokens, at + 1, "until")
 }
 fn closing(tokens: &[LexedToken], at: usize) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind),
@@ -178,6 +216,8 @@ impl Prefix {
         let mut p = Self {
             keyword,
             sequence_only: false,
+            term_element: false,
+            keyword_text: "do",
             baseline: column(view, tokens, *cursor),
             braces,
             items: Vec::new(),
@@ -185,6 +225,7 @@ impl Prefix {
             annotation: None,
             collection: None,
             pattern: None,
+            binders: None,
             phase: Phase::Value,
         };
         p.begin(view, tokens, cursor, end)?;
@@ -202,6 +243,19 @@ impl Prefix {
         prefix.sequence_only = true;
         Ok(prefix)
     }
+    /// `unless c do s` and `for x in xs do s` in term position (`Lean/Parser/Do.lean`'s
+    /// `termUnless` and `termFor`): the grammar is the do element's own, so this reads exactly
+    /// one element at the keyword `cursor` points to. What follows belongs to the enclosing term.
+    pub(super) fn element(
+        view: &SourceView,
+        tokens: &[LexedToken],
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let mut prefix = Self::start(view, tokens, *cursor, cursor, end)?;
+        prefix.term_element = true;
+        Ok(prefix)
+    }
     fn begin(
         &mut self,
         view: &SourceView,
@@ -215,20 +269,28 @@ impl Prefix {
         self.annotation = None;
         self.collection = None;
         self.pattern = None;
+        self.binders = None;
         self.phase = Phase::Value;
         let at = *cursor;
         // `doHave := "have" letConfig letDecl`: `doLet`'s declaration, with no `mut` and no arrow.
         let have = word(tokens, at, "have");
         if word(tokens, at, "let") || have {
             let mutable = (!have && word(tokens, at + 1, "mut")).then_some(at + 1);
-            let name = at + 1 + usize::from(mutable.is_some());
+            // `doLetRec := group("let " "rec ") letRecDecls`: one declaration here.
+            let recursive =
+                (!have && mutable.is_none() && word(tokens, at + 1, "rec")).then_some(at + 1);
+            let name = at + 1 + usize::from(mutable.is_some()) + usize::from(recursive.is_some());
             if name >= end || word(tokens, name, "mut") || word(tokens, name, "rec") {
                 return Err(refuse(view, tokens, name));
             }
             // `have : T := v` binds `this` (`letId`'s `hygieneInfo`): the binding's name is then
             // the keyword itself.
             let anonymous = have && (word(tokens, name, ":") || word(tokens, name, ":="));
-            let (name, marker) = if anonymous { (at, name) } else { (name, name + 1) };
+            let (name, marker) = if anonymous {
+                (at, name)
+            } else {
+                (name, name + 1)
+            };
             let named = anonymous
                 || (matches!(tokens[name].kind, TokenKind::Ident(_))
                     && (word(tokens, marker, ":")
@@ -248,10 +310,14 @@ impl Prefix {
                     assignment: None,
                     mutable: None,
                     reassign: false,
+                    recursive,
                 };
                 self.phase = Phase::Pattern;
                 *cursor = name;
                 return Ok(());
+            }
+            if recursive.is_some() && (word(tokens, marker, "←") || word(tokens, marker, "<-")) {
+                return Err(refuse(view, tokens, marker));
             }
             let (colon, assignment) = if word(tokens, marker, ":") {
                 self.phase = Phase::Annotation;
@@ -266,8 +332,23 @@ impl Prefix {
                 assignment,
                 mutable,
                 reassign: false,
+                recursive,
             };
             *cursor = marker + 1;
+        } else if word(tokens, at, "for")
+            && (word(tokens, at + 1, "⟨") || word(tokens, at + 1, "("))
+        {
+            // `doForDecl := (atomic(ident " : "))? termParser " in " …`: a bracketed binder is a
+            // pattern, read as a term up to its `in` (`for ⟨a, b⟩ in l do`).
+            self.statement = Statement::For {
+                keyword: at,
+                name: at + 1,
+                witness: None,
+                in_at: at + 1,
+                position: original_position(view, tokens, at),
+            };
+            self.phase = Phase::ForBinder;
+            *cursor = at + 1;
         } else if word(tokens, at, "for") {
             let mut name = at + 1;
             let witness = if word(tokens, name + 1, ":") {
@@ -309,8 +390,10 @@ impl Prefix {
             self.phase = Phase::Collection;
             *cursor = at + 1;
         } else if word(tokens, at, "while") {
-            let name = (matches!(tokens.get(at + 1).map(|t| &t.kind), Some(TokenKind::Ident(_)))
-                && word(tokens, at + 2, ":"))
+            let name = (matches!(
+                tokens.get(at + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) && word(tokens, at + 2, ":"))
             .then_some(at + 1);
             self.statement = Statement::While {
                 keyword: at,
@@ -343,6 +426,18 @@ impl Prefix {
                 is_break: word(tokens, at, "break"),
                 position: original_position(view, tokens, at),
             };
+        } else if word(tokens, at, "repeat") {
+            // The keyword stays for the term driver, which opens the body's sequence at it
+            // (`repeat_keyword`).
+            self.statement = Statement::Repeat {
+                keyword: at,
+                position: original_position(view, tokens, at),
+            };
+        } else if word(tokens, at, "return") && bare_return(view, tokens, at, end) {
+            self.statement = Statement::BareReturn {
+                keyword: at,
+                position: original_position(view, tokens, at),
+            };
         } else if word(tokens, at, "return") {
             self.statement = Statement::Return(at);
             *cursor += 1;
@@ -361,6 +456,7 @@ impl Prefix {
                 assignment: Some(at + 1),
                 mutable: None,
                 reassign: true,
+                recursive: None,
             };
             *cursor = at + 2;
         } else if (word(tokens, at, "(") || word(tokens, at, "⟨"))
@@ -380,12 +476,14 @@ impl Prefix {
                 assignment: None,
                 mutable: None,
                 reassign: true,
+                recursive: None,
             };
             self.phase = Phase::Pattern;
         } else {
             // These belong to doElem, not ordinary term application. Unsupported
             // control forms must not be laundered into calls to user declarations.
-            for unsupported in ["repeat", "catch", "finally", "let_expr"] {
+            // `until` is consumed only by the repeat whose body just closed.
+            for unsupported in ["until", "catch", "finally", "let_expr"] {
                 if word(tokens, at, unsupported) {
                     return Err(refuse(view, tokens, at));
                 }
@@ -403,9 +501,30 @@ impl Prefix {
     /// The token index of the `break`/`continue` this element is, if it is a jump. Both are
     /// builtin tokens at the pin (`doBreak`, `doContinue`), so the ordinary term frame cannot
     /// read them as an identifier leaf; the driver hands the keyword to the frame itself.
+    /// The `repeat` keyword this element was classified as, while its body is still unread.
+    pub(super) fn repeat_keyword(&self) -> Option<usize> {
+        match self.statement {
+            Statement::Repeat { keyword, .. } if self.phase == Phase::Value => Some(keyword),
+            _ => None,
+        }
+    }
+    /// A sequence opened by a `repeat` statement's keyword rather than `do`.
+    pub(super) fn repeat_body(
+        view: &SourceView,
+        tokens: &[LexedToken],
+        keyword: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        let mut prefix = Self::start(view, tokens, keyword, cursor, end)?;
+        prefix.keyword_text = "repeat";
+        Ok(prefix)
+    }
     pub(super) fn jump_keyword(&self) -> Option<usize> {
         match self.statement {
-            Statement::Jump { keyword, .. } => Some(keyword),
+            Statement::Jump { keyword, .. } | Statement::BareReturn { keyword, .. } => {
+                Some(keyword)
+            }
             _ => None,
         }
     }
@@ -420,7 +539,11 @@ impl Prefix {
             Phase::Annotation => {
                 word(tokens, at, ":=") || word(tokens, at, "←") || word(tokens, at, "<-")
             }
-            Phase::Value => word(tokens, at, ";"),
+            Phase::ForBinder => word(tokens, at, "in"),
+            // An unbraced nested do can end at an enclosing repeat's marker.
+            // Only Statement::Repeat consumes it; an orphan reaches the term
+            // driver unchanged and is refused rather than made an identifier.
+            Phase::Value => word(tokens, at, ";") || word(tokens, at, "until"),
             Phase::Collection => word(tokens, at, "do"),
             Phase::Done => false,
         }
@@ -489,6 +612,18 @@ impl Prefix {
                 parser_kind(&["Term", "doReturn"]),
                 vec![atom(leaves, at, "return")?, null_node(vec![value])],
             ),
+            Statement::BareReturn { keyword, position } => {
+                if value != leaves.leaf(keyword)? {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::EndOfCommand,
+                    });
+                }
+                Syntax::node(
+                    parser_kind(&["Term", "doReturn"]),
+                    vec![atom(leaves, keyword, "return")?, null_node(vec![])],
+                )
+            }
             Statement::Jump {
                 keyword,
                 is_break,
@@ -541,6 +676,55 @@ impl Prefix {
                         condition,
                         do_keyword,
                         sequence,
+                    ],
+                )
+            }
+            Statement::Repeat { position, .. } => {
+                // The sequence the keyword opened is the loop's body (`doRepeat`).
+                let Syntax::Node { kind, args, .. } = &value else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                };
+                if *kind != parser_kind(&["Term", "do"])
+                    || args.len() != 2
+                    || !matches!(&args[0], Syntax::Atom { val, .. } if val == "repeat")
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: position,
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    });
+                }
+                Syntax::node(parser_kind(&["Term", "doRepeat"]), args.clone())
+            }
+            Statement::RepeatUntil {
+                keyword,
+                until,
+                position,
+            } => {
+                let invalid = || NatDefinitionParseError::OutsideSeedGrammar {
+                    at: position,
+                    expected: NatDefinitionExpectation::ScalarValue,
+                };
+                let mut body = self.collection.take().ok_or_else(invalid)?;
+                let Syntax::Node { kind, args, .. } = &mut body else {
+                    return Err(invalid());
+                };
+                if *kind != parser_kind(&["Term", "do"])
+                    || args.len() != 2
+                    || !matches!(&args[0], Syntax::Atom { val, .. } if val == "repeat")
+                {
+                    return Err(invalid());
+                }
+                let body = args.pop().expect("checked repeat sequence");
+                Syntax::node(
+                    parser_kind(&["Term", "doRepeatUntil"]),
+                    vec![
+                        atom(leaves, keyword, "repeat")?,
+                        body,
+                        atom(leaves, until, "until")?,
+                        value,
                     ],
                 )
             }
@@ -621,11 +805,14 @@ impl Prefix {
                     Some(at) => null_node(vec![leaves.leaf(at)?, leaves.leaf(at + 1)?]),
                     None => null_node(vec![]),
                 };
-                let name = leaves.leaf(name)?;
-                let name = if matches!(&name, Syntax::Atom { val, .. } if val == "_") {
-                    Syntax::node(parser_kind(&["Term", "hole"]), vec![name])
-                } else {
-                    name
+                let name = match self.pattern.take() {
+                    Some(pattern) => pattern,
+                    None => match leaves.leaf(name)? {
+                        hole @ Syntax::Atom { .. } if matches!(&hole, Syntax::Atom { val, .. } if val == "_") => {
+                            Syntax::node(parser_kind(&["Term", "hole"]), vec![hole])
+                        }
+                        name => name,
+                    },
                 };
                 let declaration = Syntax::node(
                     parser_kind(&["Term", "doForDecl"]),
@@ -660,6 +847,7 @@ impl Prefix {
             assignment,
             mutable,
             reassign,
+            recursive,
         } = self.statement
         else {
             unreachable!("binding element is dispatched only for a binding")
@@ -743,7 +931,13 @@ impl Prefix {
         // `finish_header` refuses an arrow after `have`.
         let have = matches!(&leaves.leaf(keyword)?, Syntax::Atom { val, .. } if val == "have");
         Ok(if pure {
-            let (kind, binder, binders) = if let Some(pattern) = self.pattern.take() {
+            let (kind, binder, binders) = if let Some(binders) = self.binders.take() {
+                (
+                    "letIdDecl",
+                    Syntax::node(parser_kind(&["Term", "letId"]), vec![leaves.leaf(name)?]),
+                    null_node(binders),
+                )
+            } else if let Some(pattern) = self.pattern.take() {
                 if pattern.kind() == Some(&parser_kind(&["Term", "hole"])) {
                     // Unlike doIdDecl, the pin's letId accepts `_` binders.
                     (
@@ -783,6 +977,31 @@ impl Prefix {
                     parser_kind(&["Term", "doHave"]),
                     vec![leaves.leaf(keyword)?, config, declaration],
                 )
+            } else if let Some(rec) = recursive {
+                // `doLetRec := group("let " "rec ") letRecDecls`, `letRecDecl := (docComment)?
+                // (attributes)? letDecl Termination.suffix`.
+                let declaration = Syntax::node(
+                    parser_kind(&["Term", "letRecDecl"]),
+                    vec![
+                        null_node(vec![]),
+                        null_node(vec![]),
+                        declaration,
+                        crate::empty_termination_suffix(),
+                    ],
+                );
+                Syntax::node(
+                    parser_kind(&["Term", "doLetRec"]),
+                    vec![
+                        Syntax::node(
+                            Name::from_components(["group"]),
+                            vec![leaves.leaf(keyword)?, atom(leaves, rec, "rec")?],
+                        ),
+                        Syntax::node(
+                            parser_kind(&["Term", "letRecDecls"]),
+                            vec![null_node(vec![declaration])],
+                        ),
+                    ],
+                )
             } else {
                 Syntax::node(
                     parser_kind(&["Term", "doLet"]),
@@ -790,6 +1009,8 @@ impl Prefix {
                 )
             }
         } else {
+            // `doIdDecl` takes no binders: an arrow reads the header as `doPatDecl`'s term.
+            self.binders = None;
             let action = do_element(value);
             let declaration = if let Some(pattern) = self.pattern.take() {
                 Syntax::node(
@@ -830,10 +1051,22 @@ impl Prefix {
     ) -> Result<(Self, usize), NatDefinitionParseError> {
         // `doHave` binds with `:=` only.
         if (word(tokens, at, "←") || word(tokens, at, "<-"))
-            && matches!(self.statement, Statement::Binding { keyword, reassign: false, .. }
-                if word(tokens, keyword, "have"))
+            && matches!(self.statement, Statement::Binding { keyword, reassign: false, recursive, .. }
+                if word(tokens, keyword, "have") || recursive.is_some())
         {
             return Err(refuse(view, tokens, at));
+        }
+        if self.phase == Phase::ForBinder {
+            let Statement::For { in_at, .. } = &mut self.statement else {
+                return Err(refuse(view, tokens, at));
+            };
+            if at + 1 >= end || !word(tokens, at, "in") {
+                return Err(refuse(view, tokens, at));
+            }
+            *in_at = at;
+            self.pattern = Some(expression);
+            self.phase = Phase::Collection;
+            return Ok((self, at + 1));
         }
         if self.phase == Phase::Pattern {
             if at + 1 >= end
@@ -845,12 +1078,46 @@ impl Prefix {
                 return Err(refuse(view, tokens, at));
             }
             let Statement::Binding {
-                colon, assignment, ..
+                name,
+                colon,
+                assignment,
+                mutable,
+                reassign,
+                ..
             } = &mut self.statement
             else {
                 return Err(refuse(view, tokens, at));
             };
-            self.pattern = Some(expression);
+            // `letIdDecl := atomic(letIdLhs " := ") term` comes before `letPatDecl`: a name and
+            // binders up to the `:` or `:=` (`letIdLhs := binderIdent letIdBinder* optType`) are a
+            // local function, its binders read as a declaration's are, not a pattern applying the
+            // name to a structure instance (`let f {n : Nat} (x : Nat) : T := e`).
+            let binders = (matches!(tokens[*name].kind, TokenKind::Ident(_))
+                && mutable.is_none()
+                && !*reassign
+                && !word(tokens, at, "←")
+                && !word(tokens, at, "<-"))
+            .then(|| crate::signature_binders(view, tokens, *name + 1, DefinitionGrammar::Scalar))
+            .and_then(Result::ok)
+            .filter(|(groups, after)| !groups.is_empty() && *after == at);
+            // The pattern stays: a failure branch (`doLetElse`) or an arrow (`doPatDecl`) reads
+            // the same header as a term.
+            if let Some((groups, _)) = binders {
+                self.binders = Some(crate::bounded_binder_syntax(
+                    leaves,
+                    view,
+                    tokens,
+                    groups,
+                    DefinitionGrammar::Scalar,
+                )?);
+            }
+            self.pattern = Some(crate::matching::named_binding_pattern(
+                leaves,
+                view,
+                tokens,
+                *name..at,
+                expression,
+            )?);
             if word(tokens, at, ":") {
                 *colon = Some(at);
                 self.phase = Phase::Annotation;
@@ -899,11 +1166,30 @@ impl Prefix {
         if self.phase != Phase::Value {
             return Err(refuse(view, tokens, at));
         }
+        if word(tokens, at, "until")
+            && let Statement::Repeat { keyword, position } = self.statement
+        {
+            if at + 1 >= end {
+                return Err(refuse(view, tokens, at + 1));
+            }
+            self.collection = Some(expression);
+            self.statement = Statement::RepeatUntil {
+                keyword,
+                until: at,
+                position,
+            };
+            return Ok((self, at + 1));
+        }
+        if self.term_element {
+            self.item(leaves, expression, None)?;
+            self.phase = Phase::Done;
+            return Ok((self, at));
+        }
         let semi = word(tokens, at, ";").then_some(at);
         let mut next = at + usize::from(semi.is_some());
         let terminal = matches!(
             self.statement,
-            Statement::Return(_) | Statement::Jump { .. }
+            Statement::Return(_) | Statement::BareReturn { .. } | Statement::Jump { .. }
         );
         // A binding needs a continuation; a reassignment is a complete statement.
         let binding = matches!(
@@ -914,6 +1200,15 @@ impl Prefix {
             }
         ) && !is_failure_value(&expression);
         self.item(leaves, expression, semi)?;
+        if word(tokens, at, "until") {
+            // Leave the marker for the parent repeat. It cannot cross braces
+            // or supply the missing continuation of a body-local binding.
+            if self.braces.is_some() || binding {
+                return Err(refuse(view, tokens, at));
+            }
+            self.phase = Phase::Done;
+            return Ok((self, at));
+        }
         if let Some((_, close)) = &mut self.braces {
             if next < end && word(tokens, next, "}") {
                 if binding {
@@ -988,14 +1283,52 @@ impl Prefix {
         if self.sequence_only {
             return Ok((sequence, self.keyword));
         }
+        if self.term_element {
+            return term_element(sequence, self.keyword);
+        }
         Ok((
             Syntax::node(
                 parser_kind(&["Term", "do"]),
-                vec![atom(leaves, self.keyword, "do")?, sequence],
+                vec![atom(leaves, self.keyword, self.keyword_text)?, sequence],
             ),
             self.keyword,
         ))
     }
+}
+
+/// The one element of a term-position `unless`/`for`, given the pin's term kind: `termUnless`
+/// and `termFor` have exactly `doUnless`'s and `doFor`'s arguments.
+fn term_element(
+    sequence: Syntax,
+    keyword: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let refused = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: BytePos(0),
+        expected: NatDefinitionExpectation::ScalarValue,
+    };
+    let Syntax::Node { args, .. } = &sequence else {
+        return Err(refused());
+    };
+    let [Syntax::Node { args: items, .. }] = args.as_slice() else {
+        return Err(refused());
+    };
+    let [Syntax::Node { args: item, .. }] = items.as_slice() else {
+        return Err(refused());
+    };
+    let Some(Syntax::Node { kind, args, .. }) = item.first() else {
+        return Err(refused());
+    };
+    let term = if kind == &parser_kind(&["Term", "doUnless"]) {
+        "termUnless"
+    } else if kind == &parser_kind(&["Term", "doFor"]) {
+        "termFor"
+    } else {
+        return Err(refused());
+    };
+    Ok((
+        Syntax::node(parser_kind(&["Term", term]), args.clone()),
+        keyword,
+    ))
 }
 
 /// Only body prefixes may close before the next do statement. Parentheses,
@@ -1027,7 +1360,7 @@ pub(super) fn layout(
             term_locals::Prefix::Do(p)
                 if !matches!(
                     p.phase,
-                    Phase::Pattern | Phase::Annotation | Phase::Collection
+                    Phase::Pattern | Phase::ForBinder | Phase::Annotation | Phase::Collection
                 ) =>
             {
                 if p.braces.is_some() && word(tokens, at, "}") {
@@ -1156,7 +1489,6 @@ mod for_tests {
             "def walk : Nat := do { for x xs do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs; return 7 }",
             "def walk : Nat := do { for x in xs do {}; return 7 }",
-            "def walk : Nat := do { for (x, y) in xs do { visit x }; return 7 }",
             "def walk : Nat := do { for h : : x in xs do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs, y in ys do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs do { break 1 }; return 7 }",
@@ -1164,6 +1496,14 @@ mod for_tests {
         ] {
             assert!(parse_definition(source.as_ref()).is_err(), "{source}");
         }
+        // A pattern binder is `doForDecl`'s term: the pin parses it (and fails in elaboration,
+        // 2026-10-09).
+        assert!(
+            parse_definition(
+                "def walk : Nat := do { for (x, y) in xs do { visit x }; return 7 }".as_ref()
+            )
+            .is_ok()
+        );
         // A mutable binding in a loop body is the pin's syntax; the elaborator refuses it.
         assert!(
             parse_definition(

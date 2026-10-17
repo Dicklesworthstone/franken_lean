@@ -46,9 +46,23 @@ fn source_records_generate_constructors_projections_and_real_proofs() {
 
 #[test]
 fn dependent_fields_infer_a_large_enough_record_universe() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    // The pin requires an explicit numeral type through this named projection.
+    let original = "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := Package.mk Nat 23\ntheorem value_ok : Package.value wrapped = 23 := by rfl";
+    let Err(error) = base.check_source_files(
+        &[original.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ) else {
+        panic!("accepted an unannotated dependent-field numeral");
+    };
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&n("wrapped")));
     check(
-        &engine(),
-        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := Package.mk Nat 23\ntheorem value_ok : Package.value wrapped = 23 := by rfl",
+        &base,
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef wrapped : Package := Package.mk Nat 23\ntheorem value_ok : Package.value wrapped = (23 : Nat) := by rfl",
     );
 }
 
@@ -280,7 +294,8 @@ fn source_command_report_retains_every_checked_declaration_transition() {
         .unwrap()
         .into_complete()
         .unwrap();
-    assert_eq!(result.admissions.len(), 3);
+    // The block, two projections, and the two checked recursor auxiliaries.
+    assert_eq!(result.admissions.len(), 5);
     assert!(matches!(
         result.admissions[0].declaration,
         Declaration::Inductive(_)

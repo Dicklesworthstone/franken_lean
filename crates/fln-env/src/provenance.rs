@@ -3315,7 +3315,10 @@ mod tests {
         assert!(Domain::ALL.contains(&Domain::ArtifactClosure));
         assert!(Domain::ALL.contains(&Domain::ArtifactProduct));
         assert!(Domain::ALL.contains(&Domain::ExprNode));
-        assert_eq!(Domain::ALL.len(), 20);
+        // The IR call-graph codec's two domains (fln-ir-decoder-call-graph-sjzl).
+        assert!(Domain::ALL.contains(&Domain::IrCallGraph));
+        assert!(Domain::ALL.contains(&Domain::IrPartition));
+        assert_eq!(Domain::ALL.len(), 22);
         assert_ne!(
             hash(Domain::LogicalRoot, b"same"),
             hash(Domain::ModuleProvenance, b"same")

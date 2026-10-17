@@ -1,0 +1,26 @@
+proposition_pair	accept	def f (p : Prop) (h : p) (hn : p → False) : Nat := nomatch h, hn
+reverse_proposition_pair	accept	def f (p : Prop) (h : p) (hn : p → False) : Nat := nomatch hn, h
+empty_function_pair	accept	def f (p : Prop) : p → (p → False) → Nat := nofun
+conjunction_pair	accept	def f (p : Prop) (h : p ∧ (p → False)) : Nat := nomatch h
+reverse_conjunction_pair	accept	def f (p : Prop) (h : (p → False) ∧ p) : Nat := nomatch h
+nested_pairs	accept	def f (p : Prop) (h : (p ∧ (p → False)) ∨ (False ∧ True)) : Nat := nomatch h
+constructor_pair	accept	inductive Contr (p : Prop) where | mk (h : p) (hn : p → False)\ndef f (p : Prop) (x : Contr p) : Nat := nomatch x
+negative_reflexivity	accept	def f (n : Nat) (hn : (n = n) → False) : Nat := nomatch hn
+negative_definitional_reflexivity	accept	def f (n : Nat) (hn : ((fun x => x) n = n) → False) : Nat := nomatch hn
+empty_function_reflexivity	accept	def f : (n : Nat) → ((n = n) → False) → Nat := nofun
+multiple_ignored_columns	accept	def f (p : Prop) (n : Nat) (h : p) (hn : p → False) : Nat := nomatch n, h, hn
+let_evidence	accept	def f (p : Prop) (h : p) (hn : p → False) : Nat := let alias := h; nomatch alias, hn
+dependent_pair_result	accept	def f (p : Prop) (P : p → Type) (h : p) (hn : p → False) : P h := nomatch h, hn
+function_pair_result	accept	def f (p : Prop) (h : p) (hn : p → False) : Nat → Nat := nomatch h, hn
+ambient_negation	reject	def f (p : Prop) (h : p) (hn : p → False) : Nat := nomatch h
+ambient_positive	reject	def f (p : Prop) (h : p) (hn : p → False) : Nat := nomatch hn
+ambient_pair	reject	def f (p : Prop) (h : p) (hn : p → False) (n : Nat) : Nat := nomatch n
+ambient_function_negation	reject	def f (p : Prop) (hn : p → False) : p → Nat := nofun
+inhabited_functions	reject	def f (p : Prop) (h : p) (g : p → p) : Nat := nomatch h, g
+unrelated_propositions	reject	def f (p q : Prop) (h : p) (hn : q → False) : Nat := nomatch h, hn
+nonreflexive_negative	reject	def f (hn : (true = false) → False) : Nat := nomatch hn
+invalid_trailing_input	reject	def f (p : Prop) (h : p) (hn : p → False) : Nat := nomatch h, hn, missing
+invalid_trailing_annotation	reject	def f (p : Prop) (h : p) (hn : p → False) : Nat := nomatch h, hn, (true : Nat)
+consistent_structure	reject	def f (p : Prop) (h : p ∧ (p → p)) : Nat := nomatch h
+ordinary_tactic_pair	accept	theorem f (p : Prop) (h : p) (hn : p → False) : False := by contradiction
+ordinary_tactic_ambient	accept	def f (h : False) (n : Nat) : Nat := by contradiction

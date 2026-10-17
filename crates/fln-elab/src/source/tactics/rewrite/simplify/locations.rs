@@ -17,18 +17,12 @@ impl Context {
                 type_,
             })),
             UnfoldResult::NotDefinition => {
-                let mut term = self.selected_simp_term(rule)?;
-                term.type_ = self.simp_premise_target(&term.type_, rules)?;
-                let Some(RewriteMatch {
-                    rule: term,
-                    occurrence,
-                    premises,
-                }) = self.instantiate_rewrite_rule(term, &target, rule.reverse(), true, rules)?
+                let Some((term, occurrence, reverse)) =
+                    self.simp_rule_evidence(&target, rule, rules)?
                 else {
                     return Ok(None);
                 };
-                assert!(premises.is_empty(), "simp discharges its own premises");
-                self.rewrite_hypothesis_value(local, term, &occurrence, rule.reverse())
+                self.rewrite_hypothesis_value(local, term, &occurrence, reverse)
                     .map(Some)
             }
         }

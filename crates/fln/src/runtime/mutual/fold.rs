@@ -107,6 +107,18 @@ impl Preparation<'_> {
         if args.len() < group.arity || group.shapes.len() > u16::MAX as usize {
             return Ok(None);
         }
+        self.mutual_fold_with_group(rec, &group, args)
+    }
+
+    // Discover every admitted layout before entering the larger peer/branch
+    // construction frame, including on a small bounded host stack.
+    #[inline(never)]
+    fn mutual_fold_with_group(
+        &mut self,
+        rec: &RecursorVal,
+        group: &Group,
+        args: &[Expr],
+    ) -> Result<Option<Fold>, IngressError> {
         let mut motives = Vec::new();
         for (index, shape) in group.shapes.iter().enumerate() {
             self.tick()?;

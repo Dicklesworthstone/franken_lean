@@ -1,9 +1,11 @@
 //! `fln run` and the drop-in `lean` over explicit source and `.olean` imports.
 //! `fln run` presents FlN's raw result surface; `lean` presents the entry file's
-//! command output through that door's own printer. Neither publishes an artifact.
+//! command output through that door's own printer. FlN can retain the entry's
+//! exact final executed bytecode and a sidecar binding the complete import program.
 use super::*;
 use fln::source_check::modules::execution::{
-    SourceProgramExecution, SourceProgramLimits, preflight_source_program,
+    SourceProgramExecution, SourceProgramLimits, preflight_lean_source_program,
+    preflight_source_program,
 };
 
 const SCHEMA: &str = "fln.source-program/1";
@@ -16,6 +18,15 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub(in crate::source_check) enum Presentation {
     Fln { json: bool },
     Lean,
+}
+
+/// The Lean door always uses the checked printers in its actual import world.
+/// A missing printer is a refusal, including in an explicit prelude world.
+fn evaluation_presentation(presentation: Presentation) -> fln::EvaluationPresentation {
+    match presentation {
+        Presentation::Fln { .. } => fln::EvaluationPresentation::Raw,
+        Presentation::Lean => fln::EvaluationPresentation::Lean,
+    }
 }
 
 fn failure(error: Failure, presentation: Presentation) -> MultiplexerOutput {
@@ -85,50 +96,121 @@ fn append(output: &mut String, text: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A legacy input is left to the existing runner, including its old diagnostics.
+/// Legacy FlN inputs retain their bounded runner. Every Lean source file uses
+/// ordinary module semantics, independently of whether `main` is invoked.
 /// Header parsing and admission stay on a worker sized for imported declarations.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::source_check) fn run(
     paths: &[PathBuf],
     max_bytes: usize,
     presentation: Presentation,
-    emit_artifact: bool,
+    publication: SourcePublication,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+    main_arguments: Option<Vec<String>>,
 ) -> Option<MultiplexerOutput> {
-    let sources = read_source_batch(paths, max_bytes).ok()?;
+    let ordinary_lean = matches!(presentation, Presentation::Lean);
+    let sources = match read_source_batch(paths, max_bytes) {
+        Ok(sources) => sources,
+        Err(error) if ordinary_lean => {
+            return Some(source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                SourcePresentation::Lean,
+                error.exit_code(),
+            ));
+        }
+        Err(_) => return None,
+    };
     let paths = paths.to_vec();
+    run_loaded(
+        paths,
+        sources,
+        EntryOrigin::File,
+        max_bytes,
+        presentation,
+        publication,
+        jobs,
+        posture,
+        vm_limits,
+        main_arguments,
+    )
+}
+
+pub(in crate::source_check) fn run_stdin(
+    source: Vec<u8>,
+    max_bytes: usize,
+    jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> Option<MultiplexerOutput> {
+    run_loaded(
+        vec![PathBuf::from("_stdin.lean")],
+        vec![source],
+        EntryOrigin::StandardInput,
+        max_bytes,
+        Presentation::Lean,
+        SourcePublication::None,
+        jobs,
+        ImportPosture::ReuseVerified,
+        vm_limits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loaded(
+    paths: Vec<PathBuf>,
+    mut sources: Vec<Vec<u8>>,
+    origin: EntryOrigin,
+    max_bytes: usize,
+    presentation: Presentation,
+    publication: SourcePublication,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+    main_arguments: Option<Vec<String>>,
+) -> Option<MultiplexerOutput> {
+    let ordinary_lean = matches!(presentation, Presentation::Lean);
     let worker = std::thread::Builder::new()
         .name("fln-imported-source-run".to_owned())
         .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
         .spawn(move || {
             crate::stdout_capture::optional_json(
                 matches!(presentation, Presentation::Fln { json: true }), SCHEMA, || {
-            let headers = sources
+            let headers = match sources
                 .iter()
                 .map(|source| parse_source_header(source))
                 .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            if !headers.iter().any(|header| header.prelude || !header.imports.is_empty()) {
+            {
+                Ok(headers) => headers,
+                Err(error) if ordinary_lean => {
+                    return Some(failure(Failure::input(error.to_string()), presentation));
+                }
+                Err(_) => return None,
+            };
+            if !ordinary_lean && !headers.iter().any(|header| header.prelude || header.module_system || !header.imports.is_empty()) {
                 return None;
             }
             // Explicit source batches keep their existing caller-ordered route.
             // A prelude must never fall through to that route's synthetic seed.
             if paths.len() != 1 {
-                return headers.iter().any(|header| header.prelude).then(|| {
-                    failure(Failure::input("a prelude source program requires one entry path"), presentation)
+                return headers.iter().any(|header| header.prelude || header.module_system).then(|| {
+                    failure(Failure::input("a prelude or module-system source program requires one entry path"), presentation)
                 });
             }
             // The established source-only runner resolves an unambiguous root
             // among bounded ancestors. Preserve that route before the import
             // loader (whose explicit module root is the entry's directory).
             // A transitive `prelude` still requires an empty, isolated world.
-            let local = (!headers[0].prelude)
+            let local = (!ordinary_lean && !headers[0].prelude && !headers[0].module_system)
                 .then(|| discover_source_closure(paths[0].clone(), max_bytes));
             match &local {
                 Some(Ok(discovered))
                     if discovered.sources.iter().all(|source| {
                         parse_source_header(source).is_ok_and(|header| {
-                            !header.prelude
+                            !header.prelude && !header.module_system
                                 && fln::partition_source_module(source)
                                     .is_ok_and(|module| module.imports == header.imports)
                         })
@@ -136,40 +218,31 @@ pub(in crate::source_check) fn run(
                 {
                     return None;
                 }
-                // For the `lean` door, an import that names no local source is
-                // the one reason to look for a compiled module. Every other
-                // answer the local route gives (a budget stop, an ambiguous
-                // root, a refused symlink) stays the local route's to give.
-                Some(Err(error))
-                    if matches!(presentation, Presentation::Lean)
-                        && !is_unresolved_local_import(error) =>
-                {
-                    return None;
-                }
                 _ => {}
             }
             let total = sources.iter().map(Vec::len).sum();
-            let loaded = match load(&paths, sources, total, max_bytes) {
+            let loaded = match if matches!(origin, EntryOrigin::StandardInput) {
+                load_lean_stdin(sources.remove(0), max_bytes)
+            } else if ordinary_lean {
+                load_lean(&paths, sources, total, max_bytes)
+            } else {
+                load(&paths, sources, total, max_bytes)
+            } {
                 Ok(loaded) => loaded,
                 Err(error) => return Some(failure(error, presentation)),
             };
             let Inputs::Modules { names, sources } = &loaded.inputs else {
                 return None;
             };
-            let explicit_world = !loaded.oleans.is_empty()
+            let explicit_world = ordinary_lean || !loaded.oleans.is_empty()
                 || sources.iter().any(|source| {
-                    parse_source_header(source).is_ok_and(|header| header.prelude)
+                    parse_source_header(source).is_ok_and(|header| header.prelude || header.module_system)
                 });
             if !explicit_world {
                 return None;
             }
-            if emit_artifact {
-                return Some(failure(Failure::new(
-                    "capability",
-                    "artifact publication (--emit-flbc, --emit-sidecar, --emit-olean-snapshot) is not implemented for explicit import source programs",
-                    false,
-                    CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                ), presentation));
+            if let Err(error) = preflight_publication(&publication) {
+                return Some(failure(error, presentation));
             }
             let inputs: Vec<_> = names.iter().zip(sources).map(|(name, source)| {
                 SourceModuleInput { name, source }
@@ -177,16 +250,22 @@ pub(in crate::source_check) fn run(
             let mut limits = SourceProgramLimits::new(fln::EngineExecutionLimits::for_user_program(
                 fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
             ));
+            limits.execution.vm = vm_limits;
             limits.modules.source.max_bytes = max_bytes;
-            if let Err(error) = preflight_source_program(&inputs, limits.modules) {
+            let preflight = if ordinary_lean {
+                preflight_lean_source_program(&inputs, limits.modules)
+            } else {
+                preflight_source_program(&inputs, limits.modules)
+            };
+            if let Err(error) = preflight {
                 return Some(failure(module_error(error), presentation));
             }
-            let base = match loaded.base_engine(
+            let (_, base) = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),
                 jobs,
                 posture,
             ) {
-                Ok((_, base)) => base,
+                Ok(base) => base,
                 Err(error) => return Some(failure(error, presentation)),
             };
             let empty;
@@ -197,9 +276,25 @@ pub(in crate::source_check) fn run(
                     &empty
                 }
             };
-            let completed = match receipt.execute_source_modules(
-                &inputs, &names[0], &fln::KVMap::new(), limits, None,
-            ) {
+            let evaluation_presentation = evaluation_presentation(presentation);
+            let execution = if ordinary_lean {
+                receipt.execute_lean_source_modules_with_validation(
+                    &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
+                    &mut validate_lean_module,
+                )
+                .map_err(|error| match error {
+                    fln::source_check::modules::execution::SourceProgramExecutionError::Source(error) => {
+                        failure(module_error(error), presentation)
+                    }
+                    fln::source_check::modules::execution::SourceProgramExecutionError::Validation { error, .. } => error,
+                })
+            } else {
+                receipt.execute_source_modules_with_presentation(
+                    &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
+                )
+                .map_err(|error| failure(module_error(error), presentation))
+            };
+            let completed = match execution {
                 Ok(Outcome::Complete(completed)) => completed,
                 Ok(Outcome::Inconclusive(reason)) => return Some(failure(Failure::new(
                     "inconclusive", &format!("source program did not finish: {reason:?}"), false, 3,
@@ -207,20 +302,46 @@ pub(in crate::source_check) fn run(
                 Ok(Outcome::InternalFault(fault)) => return Some(failure(Failure::new(
                     "internal-fault", &format!("source program faulted: {fault:?}"), false, 4,
                 ), presentation)),
-                Err(error) => return Some(failure(module_error(error), presentation)),
+                Err(output) => return Some(output),
+            };
+            // The pin names the file as the command line did, and standard input `<stdin>`.
+            let display = match origin {
+                EntryOrigin::StandardInput => "<stdin>".to_owned(),
+                EntryOrigin::File => paths[0].display().to_string(),
             };
             Some(match presentation {
                 Presentation::Lean => match lean_output(
                     &completed,
                     &names[0],
                     headers[0].prelude && !loaded.reaches(&Name::from_components(["Init"])),
+                    crate::WarningSink::Print {
+                        file: &display,
+                        source: &sources[0],
+                    },
                 ) {
-                    Ok(output) => output,
+                    Ok(output) => match main_arguments.as_ref() {
+                        Some(arguments) => main_output(
+                            &completed,
+                            arguments,
+                            limits.execution,
+                            output,
+                        ),
+                        None => output,
+                    },
                     Err(error) => failure(error, presentation),
                 },
                 Presentation::Fln { json } => {
-                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json) {
-                        Ok(stdout) => MultiplexerOutput::success(stdout),
+                    let prepared = match prepare_publication(&publication, &completed, &inputs, &loaded) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Some(failure(error, presentation)),
+                    };
+                    // Validate and bound the complete report before linking
+                    // either artifact. No recompile or second execution occurs.
+                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json, prepared.as_ref()) {
+                        Ok(stdout) => match prepared.as_ref().map(|prepared| prepared.publish(fln::publish_file_atomic_new)).transpose() {
+                            Ok(_) => MultiplexerOutput::success(stdout),
+                            Err(error) => failure(error, presentation),
+                        },
                         Err(error) => failure(error, presentation),
                     }
                 }
@@ -242,65 +363,361 @@ pub(in crate::source_check) fn run(
     }
 }
 
+fn preflight_publication(publication: &SourcePublication) -> Result<(), Failure> {
+    let (product, sidecar) = match publication {
+        SourcePublication::None => return Ok(()),
+        SourcePublication::OleanSnapshot { .. } => {
+            return Err(Failure::new(
+                "capability",
+                "standalone .olean snapshot publication is not implemented for explicit import source programs; imported module metadata and private artifact parts require their own export contract",
+                false,
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            ));
+        }
+        SourcePublication::Flbc { path, sidecar } => (path.as_path(), sidecar.as_ref()),
+    };
+    if sidecar.is_some_and(|sidecar| output_paths_alias(product, &sidecar.path)) {
+        return Err(Failure::new(
+            "output",
+            "the FLBC product and its sidecar must name different paths",
+            true,
+            1,
+        ));
+    }
+    for path in std::iter::once(product).chain(sidecar.map(|sidecar| sidecar.path.as_path())) {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(Failure::new(
+                    "output",
+                    &format!(
+                        "output path {} already exists; no artifact was published",
+                        path.display()
+                    ),
+                    true,
+                    1,
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let (class, authority, exit) = publication_failure_disposition(&error);
+                return Err(Failure::new(
+                    class,
+                    &format!("could not inspect output {}: {error}", path.display()),
+                    authority,
+                    exit,
+                ));
+            }
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match std::fs::metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Failure::new(
+                    "output",
+                    &format!("output parent {} is not a directory", parent.display()),
+                    true,
+                    1,
+                ));
+            }
+            Err(error) => {
+                let (class, authority, exit) = publication_failure_disposition(&error);
+                return Err(Failure::new(
+                    class,
+                    &format!(
+                        "could not inspect output parent {}: {error}",
+                        parent.display()
+                    ),
+                    authority,
+                    exit,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct PreparedSidecar<'a> {
+    path: &'a Path,
+    bytes: Vec<u8>,
+    mode: fln::Mode,
+    closure_root: fln::ContentRoot,
+    product_root: fln::ContentRoot,
+}
+
+struct PreparedPublication<'a> {
+    module: &'a Name,
+    command: usize,
+    product_path: &'a Path,
+    product: &'a [u8],
+    sidecar: Option<PreparedSidecar<'a>>,
+}
+
+fn prepare_publication<'a>(
+    publication: &'a SourcePublication,
+    program: &'a SourceProgramExecution,
+    sources: &[SourceModuleInput<'_>],
+    loaded: &Loaded,
+) -> Result<Option<PreparedPublication<'a>>, Failure> {
+    let SourcePublication::Flbc { path, sidecar } = publication else {
+        return Ok(None);
+    };
+    validate_exits(program)?;
+    for module in &program.modules {
+        if !module.commands.guards.is_empty() {
+            let judged = render_lean_source_commands(&module.commands, crate::WarningSink::Discard);
+            if judged.exit_code != 0 {
+                let (class, authority) = match judged.exit_code {
+                    3 => ("resource", false),
+                    4 => ("internal-fault", false),
+                    5 => ("capability", false),
+                    _ => ("guard-msgs", true),
+                };
+                return Err(Failure::new(
+                    class,
+                    &format!(
+                        "module `{}`: {}",
+                        module.module.to_display_string(),
+                        judged.stderr.trim_end()
+                    ),
+                    authority,
+                    judged.exit_code,
+                ));
+            }
+        }
+    }
+    let entry = program
+        .modules
+        .last()
+        .ok_or_else(|| internal("source program has no entry for FLBC publication"))?;
+    let final_execution = entry.commands.batch.executions.last().ok_or_else(|| {
+        Failure::new(
+            "execution",
+            "entry module has no executed definition or #eval command to publish as FLBC",
+            true,
+            1,
+        )
+    })?;
+    let command = entry
+        .commands
+        .execution_command_indices
+        .last()
+        .copied()
+        .ok_or_else(|| internal("entry's final execution has no source command index"))?;
+    let sidecar = if let Some(request) = sidecar {
+        let current_image;
+        let image = match request.toolchain_image.as_deref() {
+            Some(image) => image,
+            None => {
+                current_image =
+                    read_current_toolchain_image().map_err(|error| internal(&error.to_string()))?;
+                &current_image
+            }
+        };
+        let imports: Vec<_> = loaded
+            .oleans
+            .iter()
+            .map(|import| {
+                let [exported, server, private] = &import.parts;
+                fln::OleanModuleInput {
+                    name: &import.name,
+                    artifact: exported,
+                    server_artifact: (!server.is_empty()).then_some(server.as_slice()),
+                    private_artifact: (!private.is_empty()).then_some(private.as_slice()),
+                }
+            })
+            .collect();
+        let sidecar = fln::build_source_program_flbc_sidecar(
+            sources,
+            &imports,
+            &fln::KVMap::new(),
+            image,
+            program,
+        )
+        .map_err(|error| Failure::new("sidecar", &error.to_string(), false, 1))?;
+        Some(PreparedSidecar {
+            path: &request.path,
+            bytes: fln::encode_flbc_product_sidecar(&sidecar),
+            mode: sidecar.mode(),
+            closure_root: sidecar.closure_root(),
+            product_root: sidecar.product_root(),
+        })
+    } else {
+        None
+    };
+    Ok(Some(PreparedPublication {
+        module: &entry.module,
+        command,
+        product_path: path,
+        // These bytes were already canonically decoded and validated before
+        // Golem executed them. They contain the complete reachable functions
+        // and intrinsics, including compiled imported definitions.
+        product: &final_execution.flbc_artifact,
+        sidecar,
+    }))
+}
+
+impl PreparedPublication<'_> {
+    fn publish<P, E>(&self, mut publish: P) -> Result<(), Failure>
+    where
+        P: FnMut(&[u8], &Path) -> Result<(), E>,
+        E: SourcePublicationFailure,
+    {
+        // As on the import-free path, each artifact is atomically created,
+        // never overwritten. A failed product link may leave its complete
+        // sidecar; it never exposes a partial bytecode file.
+        if let Some(sidecar) = &self.sidecar {
+            publish(&sidecar.bytes, sidecar.path).map_err(|error| {
+                let (class, authority, exit) = publication_failure_disposition(&error);
+                Failure::new(class, &format!("could not complete durable FLBC sidecar publication to {}: {error}; {}; the FLBC product was not published", sidecar.path.display(), publication_state(&error)), authority, exit)
+            })?;
+        }
+        publish(self.product, self.product_path).map_err(|error| {
+            let (class, authority, exit) = publication_failure_disposition(&error);
+            let retained = self.sidecar.as_ref().map_or_else(String::new, |sidecar| format!("; the complete sidecar is retained at {}", sidecar.path.display()));
+            Failure::new(class, &format!("could not complete durable FLBC artifact publication to {}: {error}; {}{retained}", self.product_path.display(), publication_state(&error)), authority, exit)
+        })
+    }
+
+    fn report(&self, output: &mut String, json: bool) -> Result<(), Failure> {
+        if json {
+            append(
+                output,
+                &format!(
+                    ",\"emittedFlbc\":{{\"path\":{},\"bytes\":{},\"module\":{},\"command\":{}}},\"emittedSidecar\":",
+                    json_string(&self.product_path.to_string_lossy()),
+                    self.product.len(),
+                    json_string(&self.module.to_display_string()),
+                    self.command
+                ),
+            )?;
+            if let Some(sidecar) = &self.sidecar {
+                append(
+                    output,
+                    &format!(
+                        "{{\"path\":{},\"bytes\":{},\"mode\":{},\"profile\":\"standard\",\"closureRoot\":{},\"productRoot\":{}}}",
+                        json_string(&sidecar.path.to_string_lossy()),
+                        sidecar.bytes.len(),
+                        json_string(mode_name(sidecar.mode)),
+                        json_string(&root_hex(sidecar.closure_root)),
+                        json_string(&root_hex(sidecar.product_root))
+                    ),
+                )?;
+            } else {
+                append(output, "null")?;
+            }
+        } else {
+            append(
+                output,
+                &format!(
+                    "Emitted FLBC: {} bytes to {} (module `{}`, command {}).\n",
+                    self.product.len(),
+                    self.product_path.display(),
+                    self.module.to_display_string(),
+                    self.command
+                ),
+            )?;
+            if let Some(sidecar) = &self.sidecar {
+                append(
+                    output,
+                    &format!(
+                        "Emitted sidecar: {} bytes to {}.\nClosure root: {}\nProduct root: {}\n",
+                        sidecar.bytes.len(),
+                        sidecar.path.display(),
+                        root_hex(sidecar.closure_root),
+                        root_hex(sidecar.product_root)
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Definitions that produce no output still execute. A later successful `#eval`
 /// cannot hide a dependency panic or refusal; inspect the complete table first.
 fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
     for module in &program.modules {
-        let commands = &module.commands;
-        if commands.execution_command_indices.len() != commands.batch.executions.len()
-            || commands.execution_command_indices != commands.batch.source_execution_command_indices
-        {
+        validate_module_exits(&module.module, &module.commands)?;
+    }
+    Ok(())
+}
+
+fn validate_module_exits(
+    module: &Name,
+    commands: &fln::SourceCommandBatchExecution,
+) -> Result<(), Failure> {
+    if commands.execution_command_indices.len() != commands.batch.executions.len()
+        || commands.execution_command_indices != commands.batch.source_execution_command_indices
+    {
+        return Err(internal(
+            "source program execution indices do not cover every execution",
+        ));
+    }
+    let mut previous = None;
+    for (&command, execution) in commands
+        .execution_command_indices
+        .iter()
+        .zip(&commands.batch.executions)
+    {
+        if command >= commands.command_count || previous.is_some_and(|last| last >= command) {
             return Err(internal(
-                "source program execution indices do not cover every execution",
+                "source program execution indices are not increasing in range",
             ));
         }
-        let mut previous = None;
-        for (&command, execution) in commands
-            .execution_command_indices
-            .iter()
-            .zip(&commands.batch.executions)
-        {
-            if command >= commands.command_count || previous.is_some_and(|last| last >= command) {
-                return Err(internal(
-                    "source program execution indices are not increasing in range",
-                ));
+        previous = Some(command);
+        let (class, detail, usage) = match &execution.exit {
+            fln::VmExit::Returned(_) => {
+                source_evaluation::check(execution).map_err(|error| {
+                    let (class, authority, exit) = error.disposition();
+                    Failure::new(
+                        class,
+                        &format!(
+                            "module `{}`, command {command}: {error}",
+                            module.to_display_string()
+                        ),
+                        authority,
+                        exit,
+                    )
+                })?;
+                continue;
             }
-            previous = Some(command);
-            let (class, detail, usage) = match &execution.exit {
-                fln::VmExit::Returned(_) => {
-                    source_evaluation::check(execution).map_err(|error| {
-                        let (class, authority, exit) = error.disposition();
-                        Failure::new(
-                            class,
-                            &format!(
-                                "module `{}`, command {command}: {error}",
-                                module.module.to_display_string()
-                            ),
-                            authority,
-                            exit,
-                        )
-                    })?;
-                    continue;
-                }
-                fln::VmExit::Panicked { message, usage } => {
-                    ("program-panic", message.to_string(), usage)
-                }
-                fln::VmExit::Refused { refusal, usage } => {
-                    ("vm-refusal", refusal.to_string(), usage)
-                }
-            };
-            return Err(Failure::new(
-                class,
-                &format!(
-                    "module `{}`, command {command}: {detail}; execution used {} steps, {} system polls, peak stack {}",
-                    module.module.to_display_string(),
-                    usage.steps,
-                    usage.system_polls,
-                    usage.peak_stack_depth,
-                ),
-                true,
-                1,
-            ));
+            fln::VmExit::Panicked { message, usage } => {
+                ("program-panic", message.to_string(), usage)
+            }
+            fln::VmExit::Refused { refusal, usage } => ("vm-refusal", refusal.to_string(), usage),
+        };
+        return Err(Failure::new(
+            class,
+            &format!(
+                "module `{}`, command {command}: {detail}; execution used {} steps, {} system polls, peak stack {}",
+                module.to_display_string(),
+                usage.steps,
+                usage.system_polls,
+                usage.peak_stack_depth,
+            ),
+            true,
+            1,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate retained module evidence before its declarations are exported or
+/// any dependent source module starts. In particular, a failing dependency
+/// guard or VM exit cannot be followed by an entry's IO effects.
+fn validate_lean_module(
+    module: &Name,
+    commands: &fln::SourceCommandBatchExecution,
+) -> Result<(), MultiplexerOutput> {
+    validate_module_exits(module, commands).map_err(|error| failure(error, Presentation::Lean))?;
+    if !commands.guards.is_empty() {
+        let mut presented = render_lean_source_commands(commands, crate::WarningSink::Discard);
+        if presented.exit_code != 0 {
+            presented.stdout.clear();
+            return Err(presented);
         }
     }
     Ok(())
@@ -311,37 +728,80 @@ fn validate_exits(program: &SourceProgramExecution) -> Result<(), Failure> {
 /// print is not the entry's.
 /// `without_init`: the entry is a `prelude` file whose imports never reach `Init`. The pin
 /// prints an `#eval` through a `Repr` or `ToString` instance and refuses it without one, which
-/// such a world may lack (`Init.Prelude` declares neither), while this door's printer needs
-/// none. Printing there would accept what the pin refuses. A non-`prelude` file imports `Init`
-/// implicitly at the pin, so its instances exist whatever this closure holds.
+/// such a world may lack (`Init.Prelude` declares neither). Only an execution retaining
+/// checked pure/IO printer intent or validated silent IO Unit intent bypasses this guard. A non-`prelude`
+/// file imports `Init` implicitly at the pin, so its instances exist whatever this closure holds.
 fn lean_output(
     program: &SourceProgramExecution,
     entry: &Name,
     without_init: bool,
+    sink: crate::WarningSink<'_>,
 ) -> Result<MultiplexerOutput, Failure> {
     validate_exits(program)?;
-    let module = program
+    let (module, dependencies) = program
         .modules
-        .last()
-        .filter(|module| &module.module == entry)
+        .split_last()
+        .filter(|(module, _)| &module.module == entry)
         .ok_or_else(|| internal("source program did not retain its entry as the final module"))?;
+    // Guards belong to the complete source front end, whether or not main is
+    // requested. Judge each dependency's retained batch without rerunning it
+    // or publishing its output; a failed closure publishes no entry output.
+    for dependency in dependencies {
+        if dependency.commands.guards.is_empty() {
+            continue;
+        }
+        let mut presented =
+            render_lean_source_commands(&dependency.commands, crate::WarningSink::Discard);
+        if presented.exit_code != 0 {
+            presented.stdout.clear();
+            return Ok(presented);
+        }
+    }
     if without_init
-        && module
-            .commands
-            .outputs
-            .iter()
-            .any(|output| matches!(output, fln::SourceCommandOutput::Evaluation { .. }))
+        && module.commands.outputs.iter().any(|output| match output {
+            fln::SourceCommandOutput::Evaluation {
+                execution_index, ..
+            } => module
+                .commands
+                .batch
+                .executions
+                .get(*execution_index)
+                .is_none_or(|execution| !source_evaluation::has_checked_presentation(execution)),
+            _ => false,
+        })
     {
         return Err(Failure::new(
             "capability",
             "this prelude file's imports do not reach `Init`; the pin prints an #eval through \
              the Repr or ToString instance its world declares and refuses it without one, and \
-             that instance-directed printing is not implemented",
+             no checked printer or silent IO Unit presentation was selected for this evaluation",
             false,
             CAPABILITY_NOT_IMPLEMENTED_EXIT,
         ));
     }
-    Ok(render_lean_source_commands(&module.commands))
+    Ok(render_lean_source_commands(&module.commands, sink))
+}
+
+/// Invoke main only after the complete source front end, including dependency
+/// guards, has succeeded. A main failure preserves successful frontend output.
+fn main_output(
+    program: &SourceProgramExecution,
+    arguments: &[String],
+    limits: fln::EngineExecutionLimits,
+    frontend: MultiplexerOutput,
+) -> MultiplexerOutput {
+    if frontend.exit_code != 0 {
+        return frontend;
+    }
+    let Some(entry) = program.modules.last() else {
+        let mut failed = failure(
+            internal("source program did not retain its entry before main"),
+            Presentation::Lean,
+        );
+        failed.stdout = frontend.stdout;
+        return failed;
+    };
+    crate::source_main::execute(&entry.commands, arguments, limits, frontend)
 }
 
 fn render(
@@ -350,6 +810,7 @@ fn render(
     source_bytes: usize,
     base: Option<&OleanBase>,
     json: bool,
+    publication: Option<&PreparedPublication<'_>>,
 ) -> Result<String, Failure> {
     validate_exits(program)?;
     if program
@@ -427,11 +888,44 @@ fn render(
         }
         render_commands(commands, &name, json, &mut output)?;
         if json {
+            append(&mut output, "],\"traces\":[")?;
+        }
+        for (index, trace) in commands.traces.iter().enumerate() {
+            if json {
+                if index != 0 {
+                    append(&mut output, ",")?;
+                }
+                append(
+                    &mut output,
+                    &format!(
+                        "{{\"command\":{},\"byteOffset\":{},\"message\":{}}}",
+                        trace.command_index,
+                        trace.at.0,
+                        json_string(&trace.message),
+                    ),
+                )?;
+            } else {
+                append(
+                    &mut output,
+                    &format!(
+                        "Trace {name}, command {}, byte {}:\n{}\n",
+                        trace.command_index, trace.at.0, trace.message
+                    ),
+                )?;
+            }
+        }
+        if json {
             append(&mut output, "]}")?;
         }
     }
     if json {
-        append(&mut output, "]}\n")?;
+        append(&mut output, "]")?;
+    }
+    if let Some(publication) = publication {
+        publication.report(&mut output, json)?;
+    }
+    if json {
+        append(&mut output, "}\n")?;
     }
     Ok(output)
 }
@@ -532,7 +1026,7 @@ fn render_commands(
                         .parsed
                         .query_term_normalized()
                         .ok_or_else(|| internal("source program check has no query term"))?;
-                    let type_ = fln::pretty::Printer::new(commands.batch.engine.environment())
+                    let type_ = fln::pretty::Printer::in_scope(commands.batch.engine.environment(), &check.scope)
                         .expr(&check.checked_type, 0)
                         .map_err(|fln::pretty::Unsupported(what)| Failure::new(
                             "capability", &format!("module `{module}`, command {command}: cannot print checked type {what}"),
@@ -586,6 +1080,93 @@ mod tests {
     use fln::source_check::modules::execution::SourceModuleExecution;
 
     #[test]
+    fn imported_publication_reports_resource_failure_and_retained_sidecar_truthfully() {
+        let module = Name::from_components(["Main"]);
+        let prepared = PreparedPublication {
+            module: &module,
+            command: 0,
+            product_path: Path::new("program.flbc"),
+            product: b"complete product",
+            sidecar: Some(PreparedSidecar {
+                path: Path::new("program.sidecar"),
+                bytes: b"complete sidecar".to_vec(),
+                mode: fln::Mode::Sound,
+                closure_root: fln::ContentRoot::new([0; 32]),
+                product_root: fln::ContentRoot::new([0; 32]),
+            }),
+        };
+        for failed_call in 0..2 {
+            for target_created in [false, true] {
+                let mut calls = Vec::new();
+                let failed = prepared
+                    .publish(|bytes, path| {
+                        let call = calls.len();
+                        calls.push((path.to_path_buf(), bytes.to_vec()));
+                        if call != failed_call {
+                            return Ok(());
+                        }
+                        Err(fln::AtomicCreateError::<std::convert::Infallible>::Io {
+                            step: if target_created {
+                                fln::AtomicCreateStep::SyncDirectoryAfterLink
+                            } else {
+                                fln::AtomicCreateStep::WriteChunk {
+                                    offset: 0,
+                                    chunk_len: 1,
+                                    total_len: bytes.len() as u64,
+                                }
+                            },
+                            target_created,
+                            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                        })
+                    })
+                    .unwrap_err();
+                assert_eq!(
+                    (failed.class, failed.authority, failed.exit),
+                    ("resource", false, 3)
+                );
+                assert_eq!(calls.len(), failed_call + 1);
+                assert_eq!(
+                    calls[0],
+                    (
+                        PathBuf::from("program.sidecar"),
+                        b"complete sidecar".to_vec()
+                    )
+                );
+                if failed_call == 0 {
+                    assert!(failed.detail.contains("the FLBC product was not published"));
+                } else {
+                    assert_eq!(
+                        calls[1],
+                        (PathBuf::from("program.flbc"), b"complete product".to_vec())
+                    );
+                    assert!(
+                        failed
+                            .detail
+                            .contains("the complete sidecar is retained at program.sidecar")
+                    );
+                }
+                assert!(failed.detail.contains(if target_created {
+                    "the complete target already exists"
+                } else {
+                    "the target was not created"
+                }));
+                let report = failure(failed, Presentation::Fln { json: true });
+                assert!(report.stdout.is_empty());
+                assert!(report.stderr.contains("\"authority\":false"));
+            }
+        }
+    }
+
+    #[test]
+    fn lean_presentation_always_requires_its_checked_printer() {
+        use fln::EvaluationPresentation::{Lean, Raw};
+        assert_eq!(evaluation_presentation(Presentation::Lean), Lean);
+        for json in [false, true] {
+            assert_eq!(evaluation_presentation(Presentation::Fln { json }), Raw);
+        }
+    }
+
+    #[test]
     fn a_result_projection_limit_is_not_a_program_rejection_or_internal_fault() {
         let error = evaluation_error(source_evaluation::Error::Value(
             SourceValueProjectionError::Shaped(fln::ClosedShapedValueError::TooLarge { limit: 17 }),
@@ -603,6 +1184,127 @@ mod tests {
             (mismatch.class, mismatch.authority, mismatch.exit),
             ("internal-fault", false, 4)
         );
+        for (error, expected) in [
+            (
+                fln::source_format::Error::Limit {
+                    resource: "text bytes",
+                    limit: 8,
+                    observed: 9,
+                },
+                ("resource", false, 3),
+            ),
+            (
+                fln::source_format::Error::UnsupportedContract {
+                    family: "Std.Format",
+                },
+                ("capability", false, 5),
+            ),
+            (
+                fln::source_format::Error::Representation {
+                    expected: "Std.Format",
+                },
+                ("internal-fault", false, 4),
+            ),
+        ] {
+            let failed = evaluation_error(source_evaluation::Error::Format(error));
+            assert_eq!((failed.class, failed.authority, failed.exit), expected);
+            let output = failure(failed, Presentation::Lean);
+            assert!(output.stdout.is_empty());
+            assert_eq!(output.exit_code, expected.2);
+            assert!(
+                output
+                    .stderr
+                    .starts_with(&format!("lean: {}: ", expected.0))
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_guards_are_judged_before_entry_output_or_main() {
+        std::thread::Builder::new()
+            .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+            .spawn(|| {
+                let limits = fln::EngineExecutionLimits::new(fln::Budget::for_stack_bytes(
+                    SOURCE_RUN_KERNEL_STACK_BYTES,
+                ));
+                let engine = fln::Engine::with_source_seed(limits.admission())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+                for expected in [2, 999] {
+                    let dependency = engine
+                        .execute_source_commands_with_checks(
+                            format!("#eval 11\n/-- info: {expected} -/\n#guard_msgs in\n#eval 2\n")
+                                .as_bytes(),
+                            &fln::KVMap::new(),
+                            limits,
+                        )
+                        .unwrap()
+                        .into_complete()
+                        .unwrap();
+                    assert_eq!(dependency.guards.len(), 1);
+                    let judged =
+                        render_lean_source_commands(&dependency, crate::WarningSink::Discard);
+                    if expected == 2 {
+                        assert_eq!(judged.exit_code, 0, "{}", judged.stderr);
+                        assert_eq!(judged.stdout, "11\n");
+                    } else {
+                        assert_eq!(judged.exit_code, 1);
+                        assert!(judged.stderr.starts_with("lean: guard-msgs:"));
+                    }
+                    // This genuinely checked declaration deliberately has an
+                    // invalid executable signature. Its distinct selection
+                    // error proves whether the saved dependency guard allowed
+                    // the main path to proceed; no synthetic VM result is used.
+                    let commands = engine
+                        .execute_source_commands_with_checks(
+                            b"def main : Nat := 7\n#eval 42\n",
+                            &fln::KVMap::new(),
+                            limits,
+                        )
+                        .unwrap()
+                        .into_complete()
+                        .unwrap();
+                    let program = SourceProgramExecution {
+                        modules: vec![
+                            SourceModuleExecution {
+                                module: Name::from_components(["Dependency"]),
+                                commands: dependency,
+                            },
+                            SourceModuleExecution {
+                                module: Name::from_components(["Main"]),
+                                commands,
+                            },
+                        ],
+                    };
+                    let frontend = match lean_output(
+                        &program,
+                        &Name::from_components(["Main"]),
+                        false,
+                        crate::WarningSink::Unreachable,
+                    ) {
+                        Ok(frontend) => frontend,
+                        Err(error) => {
+                            panic!("retained source commands must finish: {}", error.detail)
+                        }
+                    };
+                    assert_eq!(frontend.exit_code, if expected == 2 { 0 } else { 1 });
+                    assert_eq!(frontend.stdout, if expected == 2 { "42\n" } else { "" });
+                    let result = main_output(&program, &[], limits, frontend);
+                    assert_eq!(result.exit_code, 1);
+                    assert_eq!(result.stdout, if expected == 2 { "42\n" } else { "" });
+                    if expected == 2 {
+                        assert!(result.stderr.contains("`main` function must have type"));
+                        assert!(!result.stderr.contains("guard-msgs"));
+                    } else {
+                        assert!(result.stderr.starts_with("lean: guard-msgs:"));
+                        assert!(!result.stderr.contains("`main` function must have type"));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -635,10 +1337,10 @@ mod tests {
                 }
                 let mut program = SourceProgramExecution { modules };
                 let entry = Name::from_components(["Main"]);
-                assert!(render(&program, &entry, 0, None, true).is_ok());
+                assert!(render(&program, &entry, 0, None, true, None).is_ok());
                 // The `lean` presentation prints the entry's own output only: one
                 // `42`, though the dependency evaluated the same term.
-                match lean_output(&program, &entry, false) {
+                match lean_output(&program, &entry, false, crate::WarningSink::Unreachable) {
                     Ok(presented) => assert_eq!(
                         (presented.exit_code, presented.stdout.as_str()),
                         (0, "42\n")
@@ -646,7 +1348,7 @@ mod tests {
                     Err(error) => panic!("a complete program must present: {}", error.detail),
                 }
                 // A `prelude` entry whose world lacks `Init` never prints an `#eval`.
-                match lean_output(&program, &entry, true) {
+                match lean_output(&program, &entry, true, crate::WarningSink::Unreachable) {
                     Err(error) => assert_eq!((error.class, error.exit), ("capability", 5)),
                     Ok(_) => panic!("an #eval without Init's instances must not print"),
                 }
@@ -661,12 +1363,12 @@ mod tests {
                     message: "dependency initialization failed".to_owned(),
                     usage: returned.usage,
                 };
-                match lean_output(&program, &entry, false) {
+                match lean_output(&program, &entry, false, crate::WarningSink::Unreachable) {
                     Err(error) => assert_eq!((error.class, error.exit), ("program-panic", 1)),
                     Ok(_) => panic!("the lean presentation must not hide a dependency panic"),
                 }
                 for json in [false, true] {
-                    let error = match render(&program, &entry, 0, None, json) {
+                    let error = match render(&program, &entry, 0, None, json, None) {
                         Err(error) => error,
                         Ok(_) => panic!("a successful entry must not hide a dependency panic"),
                     };

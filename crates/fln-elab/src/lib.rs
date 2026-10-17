@@ -22,17 +22,21 @@
 #![forbid(unsafe_code)]
 
 pub mod aliases;
+pub mod arithmetic;
+pub mod aux_recursors;
 pub mod constraint;
 pub mod dataflow;
 pub mod decision;
 pub mod effects;
 pub mod externs;
+pub mod implemented_by;
 pub mod inductive;
 pub mod info;
 pub mod instances;
 pub mod lctx;
 pub mod messages;
 pub mod mvar;
+pub mod noncomputable;
 pub mod perturbation;
 pub mod protected_names;
 pub mod records;
@@ -81,7 +85,6 @@ pub enum NatDefinitionElabError {
     AnonymousDeclarationName,
     InvalidGeneratedEvaluationName,
     InvalidGeneratedCheckName,
-    CannotInferCheckType,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
     InvalidScientificLiteral,
@@ -105,9 +108,6 @@ impl std::fmt::Display for NatDefinitionElabError {
                 formatter,
                 "check name must be one numeric component below the anonymous root"
             ),
-            Self::CannotInferCheckType => {
-                write!(formatter, "bounded check term has no inferable type")
-            }
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
             Self::InvalidScientificLiteral => write!(formatter, "scientific literal is invalid"),
@@ -322,106 +322,12 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
     Ok(Literal::Nat(literal_from_bignat(&value)))
 }
 
-fn decode_hex_scalar(bytes: &[u8]) -> Result<char, NatDefinitionElabError> {
-    let mut value = 0_u32;
-    for byte in bytes {
-        let digit = natural_digit(*byte).ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        value = value
-            .checked_mul(16)
-            .and_then(|value| value.checked_add(u32::try_from(digit).ok()?))
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-    }
-    // Pin `decodeQuotedChar` (`Init/Meta/Defs.lean:1096-1105`) feeds the
-    // digits to `Char.ofNat`. Invalid scalars (the UTF-16 surrogates a
-    // four-digit `\u` can name) become `'\0'`, not a decode failure
-    // (`Prelude.lean:2867-2870`). `char::from_u32` is the Rust refusal;
-    // using it here rejected `"\uD800"` while the pin accepted a NUL.
-    Ok(char::from_u32(value).unwrap_or('\0'))
-}
-
+/// `Syntax.isStrLit?`'s value ([`fln_syntax::literal::decode_string`], shared with the parser,
+/// which reads `syntax` declarations' atoms with it).
 fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
-    if spelling.starts_with('r') {
-        let bytes = spelling.as_bytes();
-        let mut opener = 1;
-        while bytes.get(opener) == Some(&b'#') {
-            opener += 1;
-        }
-        if bytes.get(opener) != Some(&b'"') {
-            return Err(NatDefinitionElabError::InvalidStringLiteral);
-        }
-        let hashes = opener - 1;
-        let suffix = 1_usize
-            .checked_add(hashes)
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        let content_start = opener + 1;
-        let content_stop = spelling
-            .len()
-            .checked_sub(suffix)
-            .filter(|stop| *stop >= content_start)
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        if bytes.get(content_stop) != Some(&b'"')
-            || bytes[content_stop + 1..].iter().any(|byte| *byte != b'#')
-        {
-            return Err(NatDefinitionElabError::InvalidStringLiteral);
-        }
-        return Ok(Literal::Str(
-            spelling[content_start..content_stop].to_owned(),
-        ));
-    }
-
-    let content = spelling
-        .strip_prefix('"')
-        .and_then(|spelling| spelling.strip_suffix('"'))
-        .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-    let mut decoded = String::new();
-    let mut chars = content.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            decoded.push(character);
-            continue;
-        }
-        let escaped = chars
-            .next()
-            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
-        match escaped {
-            '\\' => decoded.push('\\'),
-            '"' => decoded.push('"'),
-            '\'' => decoded.push('\''),
-            'r' => decoded.push('\r'),
-            'n' => decoded.push('\n'),
-            't' => decoded.push('\t'),
-            'x' => {
-                let digits = chars.by_ref().take(2).collect::<String>();
-                if digits.len() != 2 {
-                    return Err(NatDefinitionElabError::InvalidStringLiteral);
-                }
-                decoded.push(decode_hex_scalar(digits.as_bytes())?);
-            }
-            'u' => {
-                let digits = chars.by_ref().take(4).collect::<String>();
-                if digits.len() != 4 {
-                    return Err(NatDefinitionElabError::InvalidStringLiteral);
-                }
-                decoded.push(decode_hex_scalar(digits.as_bytes())?);
-            }
-            // Pin `quotedCharCoreFn` (`Basic.lean:668`): a string gap starts
-            // only on a newline after `\`. `stringGapFn` then eats pin
-            // whitespace (`Char.isWhitespace`: space, tab, CR, LF) and
-            // refuses a second newline. Unicode White_Space (NBSP, form
-            // feed, …) is content, not gap.
-            '\n' => loop {
-                match chars.clone().next() {
-                    Some('\n') => return Err(NatDefinitionElabError::InvalidStringLiteral),
-                    Some(whitespace) if fln_syntax::literal::is_whitespace(whitespace) => {
-                        chars.next();
-                    }
-                    _ => break,
-                }
-            },
-            _ => return Err(NatDefinitionElabError::InvalidStringLiteral),
-        }
-    }
-    Ok(Literal::Str(decoded))
+    fln_syntax::literal::decode_string(spelling)
+        .map(Literal::Str)
+        .ok_or(NatDefinitionElabError::InvalidStringLiteral)
 }
 
 fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {
@@ -512,6 +418,8 @@ pub fn elaborate_definition_in(
 /// Elaborate with native expected-type propagation and implicit inference.
 /// Every speculative assignment uses the caller's calibrated kernel budget.
 /// The returned declaration is still an untrusted candidate, not admission.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects_in_with_budget`] instead.
 pub fn elaborate_definition_in_with_budget(
     syntax: &Syntax,
     environment: &Environment,
@@ -522,6 +430,22 @@ pub fn elaborate_definition_in_with_budget(
     // elaboration error as a kernel rejection.
     source::definition(syntax, environment, budget)
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// Elaborate an untrusted declaration together with effects selected by the
+/// successful elaboration. Both checkers must admit the candidate before the
+/// caller installs its effects in the checked successor.
+pub fn elaborate_definition_with_effects_in_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+) -> Result<source::ElaboratedDeclaration, NatDefinitionElabError> {
+    elaborate_definition_with_effects_in_scope_with_budget(
+        syntax,
+        environment,
+        budget,
+        &source::scope::SourceScope::default(),
+    )
 }
 
 /// The pin words an unknown name `Unknown constant` when a proper prefix of it is a
@@ -603,6 +527,8 @@ pub fn elaborate_evaluation_in_scope_with_budget(
 
 /// [`elaborate_definition_in_with_budget`] with names declared and resolved in a
 /// source scope.
+/// This raw candidate API omits source effects; source publication should use
+/// [`elaborate_definition_with_effects_in_scope_with_budget`] instead.
 pub fn elaborate_definition_in_scope_with_budget(
     syntax: &Syntax,
     environment: &Environment,
@@ -610,6 +536,17 @@ pub fn elaborate_definition_in_scope_with_budget(
     scope: &source::scope::SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     source::scope::elaborate_definition(syntax, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
+}
+
+/// The metadata-bearing source declaration seam with names resolved in `scope`.
+pub fn elaborate_definition_with_effects_in_scope_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+    scope: &source::scope::SourceScope,
+) -> Result<source::ElaboratedDeclaration, NatDefinitionElabError> {
+    source::scope::elaborate_definition_with_effects(syntax, environment, budget, scope)
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
@@ -621,12 +558,9 @@ pub fn elaborate_check_in_scope_with_budget(
     budget: Budget,
     scope: &source::scope::SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::scope::elaborate_check(syntax, generated_name, environment, budget, scope) {
-        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
-            _,
-        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
-        result => result,
-    }
+    // An unknown name is the pin's "Unknown identifier `x`" here too, as for a definition.
+    source::scope::elaborate_check(syntax, generated_name, environment, budget, scope)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
 /// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a
@@ -651,12 +585,8 @@ pub fn elaborate_check_in_with_budget(
     environment: &Environment,
     budget: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    match source::query(syntax, generated_name, environment, budget, false) {
-        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
-            _,
-        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
-        result => result,
-    }
+    source::query(syntax, generated_name, environment, budget, false)
+        .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
 fn elaborate_definition_with_types(
@@ -900,6 +830,28 @@ fn elaborate_atom(
         }
         Syntax::Ident { val: name, .. } => {
             elaborate_nat_reference(name, locals, allow_string, environment)?
+        }
+        // `nat_lit n` (`rawNatLit`): the pin's `elabRawNatLit` is `mkRawNatLit n`, a raw literal of
+        // type `Nat`, with no `OfNat` instance.
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["rawNatLit"]) && args.len() == 2 =>
+        {
+            let Syntax::Node { kind, args, .. } = &args[1] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            };
+            let [Syntax::Atom { val: spelling, .. }] = args.as_slice() else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            };
+            if kind != &Name::str(Name::anonymous(), "num") {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "raw natural literal numeral",
+                });
+            }
+            Expr::lit(decode_natural(spelling)?)
         }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -1590,31 +1542,64 @@ mod tests {
     }
 
     fn publish_test_axiom(environment: &Environment, name: &str, type_: Expr) -> Environment {
-        let declaration = Declaration::Axiom(AxiomVal {
-            base: ConstantVal {
-                name: Name::from_components(name.split('.')),
-                level_params: Vec::new(),
-                type_,
-            },
-            is_unsafe: false,
-        });
+        publish_test_declaration(
+            environment,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components(name.split('.')),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            }),
+        )
+    }
+
+    fn publish_test_value(
+        environment: &Environment,
+        name: &str,
+        type_: Expr,
+        value: Expr,
+    ) -> Environment {
+        let name = Name::from_components(name.split('.'));
+        publish_test_declaration(
+            environment,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                value,
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![name],
+            }),
+        )
+    }
+
+    fn publish_test_declaration(
+        environment: &Environment,
+        declaration: Declaration,
+    ) -> Environment {
         let Outcome::Complete(admitted) = admit(environment, declaration, Budget::DEFAULT) else {
-            panic!("the bounded test axiom must reach a kernel verdict");
+            panic!("the bounded test declaration must reach a kernel verdict");
         };
         let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
         else {
-            panic!("the kernel-accepted test axiom must pass the empty council");
+            panic!("the kernel-accepted test declaration must pass the empty council");
         };
-        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
-            checked.publish(
-                DeclarationBudget::default(),
-                CollisionBudget::default(),
-                None,
-            )
-        else {
-            panic!("the checked test axiom must publish exactly once");
-        };
-        publication.environment
+        match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) => publication.environment,
+            Outcome::Complete(Published::BlockCommitted(publication)) => publication.environment,
+            other => panic!("the checked test declaration must publish exactly once: {other:?}"),
+        }
     }
 
     fn binary_intrinsic(expression: &Expr) -> (&Name, &Expr, &Expr) {
@@ -2318,9 +2303,7 @@ mod tests {
     #[test]
     fn scalar_bool_literals_resolve_to_exact_constructor_names() {
         let bool_ty = Expr::const_(Name::from_components(["Bool"]), Vec::new());
-        let env = publish_test_axiom(&nat_environment(), "Bool", Expr::sort(Level::one()));
-        let env = publish_test_axiom(&env, "Bool.false", bool_ty.clone());
-        let env = publish_test_axiom(&env, "Bool.true", bool_ty.clone());
+        let env = publish_test_declaration(&nat_environment(), seed::bool_seed_declaration());
 
         for (spelling, expected) in [
             ("true", "Bool.true"),
@@ -2370,7 +2353,12 @@ mod tests {
         assert!(matches!(body.node(), ExprNode::BVar { idx } if *idx == 0));
 
         let nat_ty = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-        let env = publish_test_axiom(&nat_environment(), "true", nat_ty.clone());
+        let env = publish_test_value(
+            &nat_environment(),
+            "true",
+            nat_ty.clone(),
+            Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+        );
         let parsed = parse_definition(b"def answer := true")
             .expect("an exact checked global named true remains source-spellable");
         let Declaration::Defn(global) = elaborate_definition_in(parsed.syntax(), &env)
@@ -2410,8 +2398,23 @@ mod tests {
             BinderInfo::Default,
         );
         let env = publish_test_axiom(&nat_environment(), "String", Expr::sort(Level::one()));
-        let env = publish_test_axiom(&env, "greet", string_ty.clone());
-        let env = publish_test_axiom(&env, "copy", copy_ty.clone());
+        let env = publish_test_value(
+            &env,
+            "greet",
+            string_ty.clone(),
+            Expr::lit(Literal::Str("hello".into())),
+        );
+        let env = publish_test_value(
+            &env,
+            "copy",
+            copy_ty.clone(),
+            Expr::lam(
+                Name::from_components(["value"]),
+                string_ty.clone(),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+        );
 
         let parsed = parse_definition(b"def message := greet")
             .expect("an un-ascribed constant reference is in the scalar grammar");
@@ -2474,18 +2477,12 @@ mod tests {
     #[test]
     fn evaluation_command_elaborates_its_expression_without_a_fake_definition() {
         let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-        let nat_add = Expr::forall_e(
-            Name::from_components(["left"]),
-            nat.clone(),
-            Expr::forall_e(
-                Name::from_components(["right"]),
-                nat.clone(),
-                nat.clone(),
-                BinderInfo::Default,
-            ),
-            BinderInfo::Default,
-        );
-        let environment = publish_test_axiom(&nat_environment(), "Nat.add", nat_add);
+        // A compiler check needs actual executable fixtures, not an axiom
+        // named Nat.add. Admit the same checked seed as the source front door.
+        let environment = seed::source_seed_declarations_iter()
+            .fold(Environment::new(), |environment, declaration| {
+                publish_test_declaration(&environment, declaration)
+            });
         let parsed = fln_parse::parse_source_command(b"#eval let x : Nat := 40; Nat.add x 2")
             .expect("the bounded evaluation command parses directly");
         let generated = Name::num(Name::anonymous(), 7);
@@ -2604,6 +2601,31 @@ mod tests {
                 expected: "Lean.Parser.Command.check"
             })
         ));
+
+        // An unknown name is the pin's `error(lean.unknownIdentifier)` through either entry
+        // point, naming it, as for a definition.
+        let unknown = fln_parse::parse_source_command(b"#check Missing")
+            .expect("the unknown-name check parses");
+        let scope = source::scope::SourceScope::default();
+        for refused in [
+            elaborate_check_in(
+                unknown.syntax(),
+                Name::num(Name::anonymous(), 12),
+                &environment,
+            ),
+            elaborate_check_in_scope_with_budget(
+                unknown.syntax(),
+                Name::num(Name::anonymous(), 13),
+                &environment,
+                Budget::DEFAULT,
+                &scope,
+            ),
+        ] {
+            assert_eq!(
+                refused.map(|_| ()).map_err(|error| error.to_string()),
+                Err("Unknown identifier `Missing`".to_owned())
+            );
+        }
     }
 
     #[test]

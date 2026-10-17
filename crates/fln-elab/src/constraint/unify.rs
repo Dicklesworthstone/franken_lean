@@ -12,6 +12,7 @@
 //! its metavariables, universes and constraint queue, atomically on success.
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
+mod application_congruence;
 mod application_head;
 mod assignment_types;
 mod assignment_universes;
@@ -73,6 +74,9 @@ pub struct UnificationBudget {
     /// Unfold local let declarations. This is independent of global delta
     /// transparency; automatic `simp` closure leaves these names closed.
     pub zeta_delta: bool,
+    /// Enable the direct comparison of proofs of the same proposition. Fixed
+    /// recursion parameters use the pin's `withoutProofIrrelevance` policy.
+    pub proof_irrelevance: bool,
     /// A separate, caller-calibrated bound for each assignment's K1 check.
     pub kernel: Budget,
 }
@@ -86,6 +90,7 @@ impl UnificationBudget {
             max_metavar_depth: 0,
             transparency: UnificationTransparency::Abbreviations,
             zeta_delta: true,
+            proof_irrelevance: true,
             kernel,
         }
     }
@@ -127,6 +132,8 @@ pub enum UnificationError {
     ExpressionScope,
     /// The reducibility journal an `Instances`/`Default` unfold consults was unreadable.
     Reducibility(crate::reducibility::ReducibilityError),
+    /// Class projection reduction could not establish the admitted class registry.
+    InstanceRegistry(crate::instances::InstanceRegistryError),
     Metavariable(MetavarError),
     Universe(UniverseInstantiationError),
     /// A native proof-conversion check stopped without a Boolean answer.
@@ -162,6 +169,7 @@ impl std::fmt::Display for UnificationError {
             Self::Metavariable(error) => write!(f, "{error}"),
             Self::Universe(error) => write!(f, "{error}"),
             Self::Reducibility(error) => write!(f, "{error}"),
+            Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::ConversionCheck { .. } => {
                 write!(f, "kernel proof-conversion check did not complete")
             }
@@ -505,7 +513,9 @@ struct Engine<'a> {
     // freed temporary cannot donate its address to an unrelated expression.
     fact_cache: HashMap<usize, (Expr, Facts)>,
     nat_literals_valid: Option<bool>,
+    projection_registry: crate::instances::RegistryCache,
     pending: pending::PendingState<'a>,
+    congruence_depth: u8,
 }
 
 impl Engine<'_> {
@@ -975,11 +985,16 @@ impl Engine<'_> {
                 return Ok(());
             }
         }
-        if self.proof_irrelevance(&left, &right, locals, pending)? {
+        if self.budget.proof_irrelevance
+            && self.proof_irrelevance(&left, &right, locals, pending)?
+        {
             return Ok(());
         }
         if let Some((left, right)) = self.nat_offset_equation(&left, &right, locals)? {
             pending.push_front((left, right, locals.clone()));
+            return Ok(());
+        }
+        if self.try_definition_congruence(&left, &right, locals)? {
             return Ok(());
         }
         if let Some((left, right)) = self.lazy_delta(&left, &right)? {
@@ -1011,6 +1026,12 @@ impl Engine<'_> {
                     // Decomposing it now would guess that the eventual function
                     // is injective. Other rungs, including function eta, remain
                     // available above and below this rigid-congruence case.
+                    return Err(UnificationError::Deferred(reason));
+                }
+                if self.preserve_pending_application(&left, &right, locals)? {
+                    // Retain the named projection at its receiver boundary.
+                    // Its owner's checked dictionary can reduce the original
+                    // application, but cannot repair discarded head equations.
                     return Err(UnificationError::Deferred(reason));
                 }
                 pending.push_front((b.clone(), d.clone(), locals.clone()));
@@ -1594,7 +1615,9 @@ impl ElabTxn {
             kernel_checks: 0,
             fact_cache: HashMap::new(),
             nat_literals_valid: None,
+            projection_registry: crate::instances::RegistryCache::default(),
             pending: pending::PendingState::new(pending, remaining),
+            congruence_depth: 0,
         };
         let result = engine.solve(equations, typings, delayed);
         // Synthesis spends the same heartbeats as the batch that asked for it,

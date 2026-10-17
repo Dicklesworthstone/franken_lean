@@ -1,0 +1,813 @@
+fln.pin-syntax/1
+HEADER
+0 N n ["Lean","Parser","Module","header"] 3
+1 N n ["null"] 0
+1 N n ["null"] 0
+1 N n ["null"] 0
+COMMAND 0
+0 N n ["Lean","Parser","Command","set_option"] 4
+1 A o 0 0 0 10 10 11 "set_option"
+1 I o 11 11 11 20 20 21 11 20 "doc.verso" ["doc","verso"] []
+1 N n ["null"] 0
+1 A o 21 21 21 25 25 27 "true"
+COMMAND 1
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 27 27 27 30 30 31 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["null"] 3
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 31 31 31 31 31 31 "para{"
+7 N n ["null"] 7
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 31 31 31 49 49 49 "\"A first line with \""
+8 N n ["Lean","Doc","Syntax","code"] 3
+9 A o 49 49 49 50 50 50 "`"
+9 N n ["str"] 1
+10 A o 50 50 50 54 54 54 "\"code\""
+9 A o 54 54 54 55 55 55 "`"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 55 55 55 60 60 60 "\" and \""
+8 N n ["Lean","Doc","Syntax","role"] 7
+9 A o 60 60 60 61 61 61 "{"
+9 I o 61 61 61 65 65 65 61 65 "name" ["name"] []
+9 N n ["null"] 0
+9 A o 65 65 65 66 66 66 "}"
+9 A n "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","code"] 3
+11 A o 66 66 66 67 67 67 "`"
+11 N n ["str"] 1
+12 A o 67 67 67 70 70 70 "\"Nat\""
+11 A o 70 70 70 71 71 71 "`"
+9 A n "]"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 71 71 71 72 72 72 "\".\""
+8 N n ["Lean","Doc","Syntax","linebreak"] 2
+9 A o 72 72 72 72 72 72 "line!"
+9 N n ["str"] 1
+10 A o 72 72 72 73 73 73 "\"\\n\""
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 73 73 73 93 93 93 "\"A continuation line.\""
+7 A o 93 93 93 93 93 93 "}"
+6 N n ["Lean","Doc","Syntax","ul"] 3
+7 A o 95 95 95 95 95 95 "ul{"
+7 N n ["null"] 2
+8 N n ["Lean","Doc","Syntax","li"] 2
+9 A o 95 95 95 96 96 96 "*"
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","para"] 3
+11 A o 97 97 97 97 97 97 "para{"
+11 N n ["null"] 3
+12 N n ["Lean","Doc","Syntax","text"] 1
+13 N n ["str"] 1
+14 A o 97 97 97 111 111 111 "\"A bullet with \""
+12 N n ["Lean","Doc","Syntax","role"] 7
+13 A o 111 111 111 112 112 112 "{"
+13 I o 112 112 112 116 116 116 112 116 "name" ["name"] []
+13 N n ["null"] 0
+13 A o 116 116 116 117 117 117 "}"
+13 A n "["
+13 N n ["null"] 1
+14 N n ["Lean","Doc","Syntax","code"] 3
+15 A o 117 117 117 118 118 118 "`"
+15 N n ["str"] 1
+16 A o 118 118 118 126 126 126 "\"Nat.succ\""
+15 A o 126 126 126 127 127 127 "`"
+13 A n "]"
+12 N n ["Lean","Doc","Syntax","text"] 1
+13 N n ["str"] 1
+14 A o 127 127 127 128 128 128 "\".\""
+11 A o 128 128 128 128 128 128 "}"
+8 N n ["Lean","Doc","Syntax","li"] 2
+9 A o 129 129 129 130 130 130 "*"
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","para"] 3
+11 A o 131 131 131 131 131 131 "para{"
+11 N n ["null"] 3
+12 N n ["Lean","Doc","Syntax","text"] 1
+13 N n ["str"] 1
+14 A o 131 131 131 145 145 145 "\"Another bullet\""
+12 N n ["Lean","Doc","Syntax","linebreak"] 2
+13 A o 145 145 145 145 145 145 "line!"
+13 N n ["str"] 1
+14 A o 145 145 145 146 146 146 "\"\\n\""
+12 N n ["Lean","Doc","Syntax","text"] 1
+13 N n ["str"] 1
+14 A o 146 146 146 163 163 163 "\"  continued here.\""
+11 A o 163 163 163 163 163 163 "}"
+7 A o 165 165 165 165 165 165 "}"
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 165 165 165 165 165 165 "para{"
+7 N n ["null"] 8
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 165 165 165 190 190 190 "\"A closing paragraph with \""
+8 N n ["Lean","Doc","Syntax","bold"] 3
+9 A o 190 190 190 191 191 191 "*"
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","text"] 1
+11 N n ["str"] 1
+12 A o 191 191 191 195 195 195 "\"bold\""
+9 A o 195 195 195 196 196 196 "*"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 196 196 196 198 198 198 "\", \""
+8 N n ["Lean","Doc","Syntax","emph"] 3
+9 A o 198 198 198 199 199 199 "_"
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","text"] 1
+11 N n ["str"] 1
+12 A o 199 199 199 203 203 203 "\"emph\""
+9 A o 203 203 203 204 204 204 "_"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 204 204 204 209 209 209 "\" and \""
+8 N n ["Lean","Doc","Syntax","bold"] 3
+9 A o 209 209 209 211 211 211 "**"
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","text"] 1
+11 N n ["str"] 1
+12 A o 211 211 211 217 217 217 "\"strong\""
+9 A o 217 217 217 219 219 219 "**"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 219 219 219 220 220 220 "\".\""
+8 N n ["Lean","Doc","Syntax","linebreak"] 2
+9 A o 220 220 220 220 220 220 "line!"
+9 N n ["str"] 1
+10 A o 220 220 220 221 221 221 "\"\\n\""
+7 A o 221 221 221 221 221 221 "}"
+5 A o 221 221 221 223 223 224 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 224 224 224 227 227 228 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 228 228 228 230 230 231 228 230 "a1" ["a1"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 231 231 231 232 232 233 ":"
+5 I o 233 233 233 236 236 237 233 236 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 237 237 237 239 239 240 ":="
+3 N n ["num"] 1
+4 A o 240 240 240 241 241 243 "1"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 2
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 243 243 243 246 246 247 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["Lean","Doc","Syntax","parseFailure"] 1
+6 A o 247 247 247 299 299 299 "Emphasis inside a double-asterisk bold: **_both_**. "
+5 A o 299 299 299 301 301 302 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 302 302 302 305 305 306 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 306 306 306 309 309 310 306 309 "a1'" ["a1'"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 310 310 310 311 311 312 ":"
+5 I o 312 312 312 315 315 316 312 315 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 316 316 316 318 318 319 ":="
+3 N n ["num"] 1
+4 A o 319 319 319 320 320 322 "1"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 3
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 322 322 322 325 325 326 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["null"] 1
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 326 326 326 326 326 326 "para{"
+7 N n ["null"] 3
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 326 326 326 354 354 354 "\"Escapes { and * here, and \""
+8 N n ["Lean","Doc","Syntax","code"] 3
+9 A o 354 354 354 356 356 356 "``"
+9 N n ["str"] 1
+10 A o 356 357 357 358 358 359 "\"`\""
+9 A o 359 359 359 361 361 361 "``"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 361 361 361 368 368 368 "\" code. \""
+7 A o 368 368 368 368 368 368 "}"
+5 A o 368 368 368 370 370 371 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 371 371 371 374 374 375 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 375 375 375 377 377 378 375 377 "a2" ["a2"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 378 378 378 379 379 380 ":"
+5 I o 380 380 380 383 383 384 380 383 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 384 384 384 386 386 387 ":="
+3 N n ["num"] 1
+4 A o 387 387 387 388 388 390 "2"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 4
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 390 390 390 393 393 394 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["null"] 1
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 394 394 394 394 394 394 "para{"
+7 N n ["null"] 8
+8 N n ["Lean","Doc","Syntax","role"] 7
+9 A o 394 394 394 395 395 395 "{"
+9 I o 395 395 395 399 399 399 395 399 "name" ["name"] []
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","named"] 5
+11 A o 400 400 400 401 401 401 "("
+11 I o 401 401 401 405 405 405 401 405 "full" ["full"] []
+11 A o 406 406 406 408 408 408 ":="
+11 N n ["Lean","Doc","Syntax","arg_ident"] 1
+12 I o 409 409 409 417 417 417 409 417 "Nat.succ" ["Nat","succ"] []
+11 A o 417 417 417 418 418 418 ")"
+9 A o 418 418 418 419 419 419 "}"
+9 A n "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","code"] 3
+11 A o 419 419 419 420 420 420 "`"
+11 N n ["str"] 1
+12 A o 420 420 420 424 424 424 "\"succ\""
+11 A o 424 424 424 425 425 425 "`"
+9 A n "]"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 425 425 425 427 427 427 "\", \""
+8 N n ["Lean","Doc","Syntax","role"] 7
+9 A o 427 427 427 428 428 428 "{"
+9 I o 428 428 428 432 432 432 428 432 "lean" ["lean"] []
+9 N n ["null"] 0
+9 A o 432 432 432 433 433 433 "}"
+9 A n "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","code"] 3
+11 A o 433 433 433 434 434 434 "`"
+11 N n ["str"] 1
+12 A o 434 434 434 439 439 439 "\"1 + 1\""
+11 A o 439 439 439 440 440 440 "`"
+9 A n "]"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 440 440 440 442 442 442 "\", \""
+8 N n ["Lean","Doc","Syntax","role"] 7
+9 A o 442 442 442 443 443 443 "{"
+9 I o 443 443 443 448 448 448 443 448 "given" ["given"] []
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","flag_off"] 2
+11 A o 449 449 449 450 450 450 "-"
+11 I o 450 450 450 454 454 454 450 454 "show" ["show"] []
+9 A o 454 454 454 455 455 455 "}"
+9 A n "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","code"] 3
+11 A o 455 455 455 456 456 456 "`"
+11 N n ["str"] 1
+12 A o 456 456 456 463 463 463 "\"n : Nat\""
+11 A o 463 463 463 464 464 464 "`"
+9 A n "]"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 464 464 464 469 469 469 "\" and \""
+8 N n ["Lean","Doc","Syntax","role"] 7
+9 A o 469 469 469 470 470 470 "{"
+9 I o 470 470 470 473 473 473 470 473 "lit" ["lit"] []
+9 N n ["null"] 0
+9 A o 473 473 473 474 474 474 "}"
+9 A o 474 474 474 475 475 475 "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","text"] 1
+11 N n ["str"] 1
+12 A o 475 475 475 479 479 479 "\"text\""
+9 A o 479 479 479 480 480 480 "]"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 480 480 480 482 482 482 "\". \""
+7 A o 482 482 482 482 482 482 "}"
+5 A o 482 482 482 484 484 485 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 485 485 485 488 488 489 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 489 489 489 491 491 492 489 491 "a3" ["a3"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 492 492 492 493 493 494 ":"
+5 I o 494 494 494 497 497 498 494 497 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 498 498 498 500 500 501 ":="
+3 N n ["num"] 1
+4 A o 501 501 501 502 502 504 "3"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 5
+0 N n ["Lean","Parser","Command","moduleDoc"] 2
+1 A o 504 504 504 507 507 508 "/-!"
+1 N n ["Lean","Parser","Command","versoCommentBody"] 2
+2 N n ["null"] 2
+3 N n ["Lean","Doc","Syntax","header"] 6
+4 A o 508 508 508 509 509 509 "header("
+4 N n ["num"] 1
+5 A n "0"
+4 A n ")"
+4 A n "{"
+4 N n ["null"] 1
+5 N n ["Lean","Doc","Syntax","text"] 1
+6 N n ["str"] 1
+7 A o 510 510 510 518 518 518 "\"A Header\""
+4 A o 518 518 518 518 518 518 "}"
+3 N n ["Lean","Doc","Syntax","para"] 3
+4 A o 520 520 520 520 520 520 "para{"
+4 N n ["null"] 2
+5 N n ["Lean","Doc","Syntax","text"] 1
+6 N n ["str"] 1
+7 A o 520 520 520 534 534 534 "\"Text under it.\""
+5 N n ["Lean","Doc","Syntax","linebreak"] 2
+6 A o 534 534 534 534 534 534 "line!"
+6 N n ["str"] 1
+7 A o 534 534 534 535 535 535 "\"\\n\""
+4 A o 535 535 535 535 535 535 "}"
+2 A o 535 535 535 537 537 539 "-/"
+COMMAND 6
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 539 539 539 542 542 543 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["null"] 6
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 543 543 543 543 543 543 "para{"
+7 N n ["null"] 1
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 543 543 543 554 554 554 "\"Code block:\""
+7 A o 554 554 554 554 554 554 "}"
+6 N n ["Lean","Doc","Syntax","codeblock"] 5
+7 A o 555 555 555 558 558 558 "```"
+7 N n ["null"] 2
+8 I o 558 558 558 562 562 562 558 562 "lean" ["lean"] []
+8 N n ["null"] 0
+7 A o 562 562 562 563 563 563 "\n"
+7 N n ["str"] 1
+8 A o 563 563 563 574 574 574 "\"def x := 1\\n\""
+7 A o 574 574 574 577 577 577 "```"
+6 N n ["Lean","Doc","Syntax","ol"] 6
+7 A o 579 579 579 579 579 579 "ol("
+7 N n ["num"] 1
+8 A o 579 579 579 580 580 580 "1"
+7 A o 579 579 579 579 579 579 ")"
+7 A o 579 579 579 579 579 579 "{"
+7 N n ["null"] 2
+8 N n ["Lean","Doc","Syntax","li"] 2
+9 A o 579 579 579 581 581 581 "1."
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","para"] 3
+11 A o 582 582 582 582 582 582 "para{"
+11 N n ["null"] 1
+12 N n ["Lean","Doc","Syntax","text"] 1
+13 N n ["str"] 1
+14 A o 582 582 582 587 587 587 "\"First\""
+11 A o 587 587 587 587 587 587 "}"
+8 N n ["Lean","Doc","Syntax","li"] 2
+9 A o 588 588 588 590 590 590 "2."
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","para"] 3
+11 A o 591 591 591 591 591 591 "para{"
+11 N n ["null"] 1
+12 N n ["Lean","Doc","Syntax","text"] 1
+13 N n ["str"] 1
+14 A o 591 591 591 597 597 597 "\"Second\""
+11 A o 597 597 597 597 597 597 "}"
+7 A o 599 599 599 599 599 599 "}"
+6 N n ["Lean","Doc","Syntax","blockquote"] 2
+7 A o 599 599 599 600 600 600 ">"
+7 N n ["null"] 1
+8 N n ["Lean","Doc","Syntax","para"] 3
+9 A o 601 601 601 601 601 601 "para{"
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","text"] 1
+11 N n ["str"] 1
+12 A o 601 601 601 607 607 607 "\"Quoted\""
+9 A o 607 607 607 607 607 607 "}"
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 609 609 609 609 609 609 "para{"
+7 N n ["null"] 9
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 609 609 609 611 611 611 "\"A \""
+8 N n ["Lean","Doc","Syntax","link"] 4
+9 A o 611 611 611 612 612 612 "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","text"] 1
+11 N n ["str"] 1
+12 A o 612 612 612 616 616 616 "\"link\""
+9 A o 616 616 616 617 617 617 "]"
+9 N n ["Lean","Doc","Syntax","url"] 3
+10 A o 617 617 617 618 618 618 "("
+10 N n ["str"] 1
+11 A o 618 618 618 639 639 639 "\"https://lean-lang.org\""
+10 A o 639 639 639 640 640 640 ")"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 640 640 640 645 645 645 "\", an \""
+8 N n ["Lean","Doc","Syntax","image"] 4
+9 A o 645 645 645 647 647 647 "!["
+9 N n ["str"] 1
+10 A o 647 647 647 652 652 652 "\"image\""
+9 A o 652 652 652 653 653 653 "]"
+9 N n ["Lean","Doc","Syntax","url"] 3
+10 A o 653 653 653 654 654 654 "("
+10 N n ["str"] 1
+11 A o 654 654 654 661 661 661 "\"pic.png\""
+10 A o 661 661 661 662 662 662 ")"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 662 662 662 664 664 664 "\", \""
+8 N n ["Lean","Doc","Syntax","inline_math"] 2
+9 A o 664 664 664 665 665 665 "$"
+9 N n ["Lean","Doc","Syntax","code"] 3
+10 A o 665 665 665 666 666 666 "`"
+10 N n ["str"] 1
+11 A o 666 666 666 667 667 667 "\"x\""
+10 A o 667 667 667 668 668 668 "`"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 668 668 668 673 673 673 "\" and \""
+8 N n ["Lean","Doc","Syntax","display_math"] 2
+9 A o 673 673 673 675 675 675 "$$"
+9 N n ["Lean","Doc","Syntax","code"] 3
+10 A o 675 675 675 676 676 676 "`"
+10 N n ["str"] 1
+11 A o 676 676 676 677 677 677 "\"y\""
+10 A o 677 677 677 678 678 678 "`"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 678 678 678 679 679 679 "\".\""
+7 A o 679 679 679 679 679 679 "}"
+6 N n ["Lean","Doc","Syntax","command"] 4
+7 A o 681 681 681 682 682 682 "{"
+7 I o 682 682 682 693 693 693 682 693 "tactic_docs" ["tactic_docs"] []
+7 N n ["null"] 0
+7 A o 693 693 693 694 694 694 "}"
+5 A o 695 695 695 697 697 698 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 698 698 698 701 701 702 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 702 702 702 704 704 705 702 704 "a4" ["a4"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 705 705 705 706 706 707 ":"
+5 I o 707 707 707 710 710 711 707 710 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 711 711 711 713 713 714 ":="
+3 N n ["num"] 1
+4 A o 714 714 714 715 715 717 "4"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 7
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","structure"] 6
+2 N n ["Lean","Parser","Command","structureTk"] 1
+3 A o 717 717 717 726 726 727 "structure"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 727 727 727 728 728 729 727 728 "S" ["S"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 3
+3 A o 729 729 729 734 734 737 "where"
+3 N n ["null"] 0
+3 N n ["Lean","Parser","Command","structFields"] 1
+4 N n ["null"] 1
+5 N n ["Lean","Parser","Command","structSimpleBinder"] 4
+6 N n ["Lean","Parser","Command","declModifiers"] 7
+7 N n ["null"] 1
+8 N n ["Lean","Parser","Command","docComment"] 2
+9 A o 737 737 737 740 740 743 "/--"
+9 N n ["Lean","Parser","Command","versoCommentBody"] 2
+10 N n ["null"] 1
+11 N n ["Lean","Doc","Syntax","para"] 3
+12 A o 743 743 743 743 743 743 "para{"
+12 N n ["null"] 5
+13 N n ["Lean","Doc","Syntax","text"] 1
+14 N n ["str"] 1
+15 A o 743 743 743 755 755 755 "\"Indented two\""
+13 N n ["Lean","Doc","Syntax","linebreak"] 2
+14 A o 755 755 755 755 755 755 "line!"
+14 N n ["str"] 1
+15 A o 755 755 755 756 756 756 "\"\\n\""
+13 N n ["Lean","Doc","Syntax","text"] 1
+14 N n ["str"] 1
+15 A o 756 756 756 764 764 764 "\"  lines.\""
+13 N n ["Lean","Doc","Syntax","linebreak"] 2
+14 A o 764 764 764 764 764 764 "line!"
+14 N n ["str"] 1
+15 A o 764 764 764 765 765 765 "\"\\n\""
+13 N n ["Lean","Doc","Syntax","text"] 1
+14 N n ["str"] 1
+15 A o 765 765 765 767 767 767 "\"  \""
+12 A o 767 767 767 767 767 767 "}"
+10 A o 767 767 767 769 769 772 "-/"
+7 N n ["null"] 0
+7 N n ["null"] 0
+7 N n ["null"] 0
+7 N n ["null"] 0
+7 N n ["null"] 0
+7 N n ["null"] 0
+6 I o 772 772 772 773 773 774 772 773 "y" ["y"] []
+6 N n ["Lean","Parser","Command","optDeclSig"] 2
+7 N n ["null"] 0
+7 N n ["null"] 1
+8 N n ["Lean","Parser","Term","typeSpec"] 2
+9 A o 774 774 774 775 775 776 ":"
+9 I o 776 776 776 779 779 781 776 779 "Nat" ["Nat"] []
+6 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeriving"] 1
+3 N n ["null"] 0
+COMMAND 8
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 781 781 781 784 784 785 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["Lean","Doc","Syntax","parseFailure"] 1
+6 A o 785 785 785 803 803 803 "An unclosed [link "
+5 A o 803 803 803 805 805 806 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 806 806 806 809 809 810 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 810 810 810 812 812 813 810 812 "a5" ["a5"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 813 813 813 814 814 815 ":"
+5 I o 815 815 815 818 818 819 815 818 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 819 819 819 821 821 822 ":="
+3 N n ["num"] 1
+4 A o 822 822 822 823 823 825 "5"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 9
+0 N n ["Lean","Parser","Command","section"] 3
+1 N n ["Lean","Parser","Command","sectionHeader"] 4
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 A o 825 825 825 832 832 833 "section"
+1 N n ["null"] 0
+COMMAND 10
+0 N n ["Lean","Parser","Command","set_option"] 4
+1 A o 833 833 833 843 843 844 "set_option"
+1 I o 844 844 844 853 853 854 844 853 "doc.verso" ["doc","verso"] []
+1 N n ["null"] 0
+1 A o 854 854 854 859 859 861 "false"
+COMMAND 11
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 861 861 861 864 864 865 "/--"
+4 A o 865 865 865 892 892 893 "Plain {name}`Nat` again. -/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 893 893 893 896 896 897 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 897 897 897 899 899 900 897 899 "a6" ["a6"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 900 900 900 901 901 902 ":"
+5 I o 902 902 902 905 905 906 902 905 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 906 906 906 908 908 909 ":="
+3 N n ["num"] 1
+4 A o 909 909 909 910 910 912 "6"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 12
+0 N n ["Lean","Parser","Command","in"] 3
+1 N n ["Lean","Parser","Command","set_option"] 4
+2 A o 912 912 912 922 922 923 "set_option"
+2 I o 923 923 923 932 932 933 923 932 "doc.verso" ["doc","verso"] []
+2 N n ["null"] 0
+2 A o 933 933 933 937 937 938 "true"
+1 A o 938 938 938 940 940 941 "in"
+1 N n ["Lean","Parser","Command","declaration"] 2
+2 N n ["Lean","Parser","Command","declModifiers"] 7
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Command","docComment"] 2
+5 A o 941 941 941 944 944 945 "/--"
+5 A o 945 945 945 999 999 1000 "Still plain after `set_option … in`, {name}`Nat`. -/"
+3 N n ["null"] 0
+3 N n ["null"] 0
+3 N n ["null"] 0
+3 N n ["null"] 0
+3 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","definition"] 5
+3 A o 1000 1000 1000 1003 1003 1004 "def"
+3 N n ["Lean","Parser","Command","declId"] 2
+4 I o 1004 1004 1004 1006 1006 1007 1004 1006 "a7" ["a7"] []
+4 N n ["null"] 0
+3 N n ["Lean","Parser","Command","optDeclSig"] 2
+4 N n ["null"] 0
+4 N n ["null"] 1
+5 N n ["Lean","Parser","Term","typeSpec"] 2
+6 A o 1007 1007 1007 1008 1008 1009 ":"
+6 I o 1009 1009 1009 1012 1012 1013 1009 1012 "Nat" ["Nat"] []
+3 N n ["Lean","Parser","Command","declValSimple"] 4
+4 A o 1013 1013 1013 1015 1015 1016 ":="
+4 N n ["num"] 1
+5 A o 1016 1016 1016 1017 1017 1018 "7"
+4 N n ["Lean","Parser","Termination","suffix"] 2
+5 N n ["null"] 0
+5 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+COMMAND 13
+0 N n ["Lean","Parser","Command","end"] 2
+1 A o 1018 1018 1018 1021 1021 1023 "end"
+1 N n ["null"] 0
+COMMAND 14
+0 N n ["Lean","Parser","Command","declaration"] 2
+1 N n ["Lean","Parser","Command","declModifiers"] 7
+2 N n ["null"] 1
+3 N n ["Lean","Parser","Command","docComment"] 2
+4 A o 1023 1023 1023 1026 1026 1027 "/--"
+4 N n ["Lean","Parser","Command","versoCommentBody"] 2
+5 N n ["null"] 1
+6 N n ["Lean","Doc","Syntax","para"] 3
+7 A o 1027 1027 1027 1027 1027 1027 "para{"
+7 N n ["null"] 3
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 1027 1027 1027 1046 1046 1046 "\"After the section, \""
+8 N n ["Lean","Doc","Syntax","role"] 7
+9 A o 1046 1046 1046 1047 1047 1047 "{"
+9 I o 1047 1047 1047 1051 1051 1051 1047 1051 "name" ["name"] []
+9 N n ["null"] 0
+9 A o 1051 1051 1051 1052 1052 1052 "}"
+9 A n "["
+9 N n ["null"] 1
+10 N n ["Lean","Doc","Syntax","code"] 3
+11 A o 1052 1052 1052 1053 1053 1053 "`"
+11 N n ["str"] 1
+12 A o 1053 1053 1053 1056 1056 1056 "\"Nat\""
+11 A o 1056 1056 1056 1057 1057 1057 "`"
+9 A n "]"
+8 N n ["Lean","Doc","Syntax","text"] 1
+9 N n ["str"] 1
+10 A o 1057 1057 1057 1059 1059 1059 "\". \""
+7 A o 1059 1059 1059 1059 1059 1059 "}"
+5 A o 1059 1059 1059 1061 1061 1062 "-/"
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+2 N n ["null"] 0
+1 N n ["Lean","Parser","Command","definition"] 5
+2 A o 1062 1062 1062 1065 1065 1066 "def"
+2 N n ["Lean","Parser","Command","declId"] 2
+3 I o 1066 1066 1066 1068 1068 1069 1066 1068 "a8" ["a8"] []
+3 N n ["null"] 0
+2 N n ["Lean","Parser","Command","optDeclSig"] 2
+3 N n ["null"] 0
+3 N n ["null"] 1
+4 N n ["Lean","Parser","Term","typeSpec"] 2
+5 A o 1069 1069 1069 1070 1070 1071 ":"
+5 I o 1071 1071 1071 1074 1074 1075 1071 1074 "Nat" ["Nat"] []
+2 N n ["Lean","Parser","Command","declValSimple"] 4
+3 A o 1075 1075 1075 1077 1077 1078 ":="
+3 N n ["num"] 1
+4 A o 1078 1078 1078 1079 1079 1080 "8"
+3 N n ["Lean","Parser","Termination","suffix"] 2
+4 N n ["null"] 0
+4 N n ["null"] 0
+3 N n ["null"] 0
+2 N n ["null"] 0
+COMMAND 15
+0 N n ["Lean","Parser","Command","eoi"] 1
+1 A o 1080 1080 1080 1080 1080 1080 ""
+MESSAGE warning 4 18 "Code element could be more specific.\n\nHint: Insert a role to document it:\n  • {̲g̲i̲v̲e̲n̲}̲`code`\n  • Use the `lit` role:\n    {̲l̲i̲t̲}̲`code`\n    to mark the code as literal text and disable suggestions"
+MESSAGE error 15 51 "invalid 'many' parser combinator application, parser did not consume anything"
+MESSAGE error 15 52 "'_'"
+MESSAGE error 21 85 "Expected code"
+MESSAGE error 43 1 "Unknown document command `tactic_docs`"
+MESSAGE error 54 22 "expected ']'"
+END 16 6

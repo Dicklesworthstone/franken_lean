@@ -387,12 +387,18 @@ impl Checker<'_> {
         Ok(())
     }
 
-    fn call(&mut self, name: &Name, args: &[IrArg], partial: bool) -> Result<(), IrValidationError> {
+    fn call(
+        &mut self,
+        name: &Name,
+        args: &[IrArg],
+        partial: bool,
+    ) -> Result<(), IrValidationError> {
         self.charge()?;
         let Some(signature) = self.signatures.get(name).copied() else {
             return Err(self.fail(IrValidationErrorKind::UnknownCallee { name: name.clone() }));
         };
-        if (partial && args.len() >= signature.arity) || (!partial && args.len() != signature.arity) {
+        if (partial && args.len() >= signature.arity) || (!partial && args.len() != signature.arity)
+        {
             return Err(self.fail(IrValidationErrorKind::Arity {
                 target: IrCallTarget::Declaration(name.clone()),
                 provided: args.len(),
@@ -565,9 +571,9 @@ impl Checker<'_> {
                             IrTerminal::Jmp { j, args } => {
                                 self.charge()?;
                                 let Some(&arity) = self.joins.get(j) else {
-                                    return Err(self.fail(IrValidationErrorKind::UnknownJoinPoint {
-                                        index: *j,
-                                    }));
+                                    return Err(self.fail(
+                                        IrValidationErrorKind::UnknownJoinPoint { index: *j },
+                                    ));
                                 };
                                 if args.len() != arity {
                                     return Err(self.fail(IrValidationErrorKind::Arity {

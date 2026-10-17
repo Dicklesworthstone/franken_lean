@@ -9,8 +9,9 @@
 //! The unary math rows (`sqrt` through the transcendentals) and the binary
 //! `pow`/`atan2` rows execute on `fln-libm`, the owned deterministic numerics
 //! plane (§6.8, D21): bit-identical across hosts by construction, never the
-//! platform libm the pin's extern symbols name. `frExp` (pair result) and
-//! `scaleB` (Int exponent) remain unsupported.
+//! platform libm the pin's extern symbols name. `scaleB` preserves the pin's
+//! scalar-Int versus mpz branches and rounds finite binary scaling once.
+//! `frExp` (pair result) remains unsupported.
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, type_mismatch};
 
@@ -144,6 +145,7 @@ enum Operation {
     Pow,
     // The pin declares `Float.atan2 (y x : Float)`: the first argument is y.
     Atan2,
+    ScaleB,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +199,25 @@ macro_rules! evaluate {
             });
         }
         let value = $argument(&$args[0], 0)?;
+        if operation == Operation::ScaleB {
+            let exponent = &$args[1];
+            // The C++ runtime branches on the Int representation, not its
+            // mathematical magnitude. Large negative exponents return +0
+            // even for a negative zero, infinity or NaN input. Keep this
+            // observable rule instead of saturating every exponent to i32.
+            let negative = super::with_int_view(exponent, "Float.scaleB", 1, |int| int.negative)?;
+            let scaled = if exponent.is_scalar() {
+                let exponent = exponent.unbox() as u32 as i32;
+                <$type>::from_bits(
+                    scale_binary_bits(value.to_bits() as u64, exponent, $this.width) as _,
+                )
+            } else if value == 0.0 || negative {
+                0.0
+            } else {
+                value * <$type>::INFINITY
+            };
+            return Ok($result(scaled));
+        }
         Ok(match operation {
             Operation::Add => $result(value + $argument(&$args[1], 1)?),
             Operation::Sub => $result(value - $argument(&$args[1], 1)?),
@@ -239,7 +260,7 @@ macro_rules! evaluate {
                 Integer::I32 => super::int32_result(value as i32),
                 Integer::I64 | Integer::ISize => wide_result(value as i64 as u64),
             },
-            Operation::OfBits | Operation::FromInteger(_) => {
+            Operation::OfBits | Operation::FromInteger(_) | Operation::ScaleB => {
                 return Err(VmRefusal::UnsupportedIntrinsic {
                     row: $row.to_string(),
                 }
@@ -288,6 +309,7 @@ impl Intrinsic {
             "toFloat" if width == Width::Binary32 => Operation::ConvertWidth,
             "pow" => Operation::Pow,
             "atan2" => Operation::Atan2,
+            "scaleB" => Operation::ScaleB,
             _ => match UnaryMath::from_method(method) {
                 Some(op) => Operation::Unary(op),
                 None => Operation::ToInteger(Integer::from_name(method.strip_prefix("to")?)?),
@@ -312,6 +334,7 @@ impl Intrinsic {
                 | Operation::Lt
                 | Operation::Pow
                 | Operation::Atan2
+                | Operation::ScaleB
         ) {
             2
         } else {
@@ -384,6 +407,53 @@ impl Intrinsic {
                 value.try_ctor_scalar_u32(0).is_some()
             }
     }
+}
+
+/// Scale an IEEE input by an exact power of two with one ties-to-even
+/// rounding. Splitting a negative exponent across host multiplications can
+/// round twice after the first multiplication enters the subnormal range.
+/// This integer path also handles subnormal inputs, signed zeros and the
+/// complete i32 exponent range without an exponent-sized loop.
+fn scale_binary_bits(bits: u64, exponent: i32, width: Width) -> u64 {
+    let (fraction_bits, exponent_bits, canonical_nan) = match width {
+        Width::Binary64 => (52, 11, QUIET_NAN64_BITS),
+        Width::Binary32 => (23, 8, u64::from(QUIET_NAN32_BITS)),
+    };
+    let sign = bits & (1_u64 << (fraction_bits + exponent_bits));
+    let fraction_mask = (1_u64 << fraction_bits) - 1;
+    let exponent_mask = (1_u64 << exponent_bits) - 1;
+    let fraction = bits & fraction_mask;
+    let encoded_exponent = (bits >> fraction_bits) & exponent_mask;
+    if encoded_exponent == exponent_mask {
+        return if fraction == 0 { bits } else { canonical_nan };
+    }
+    if encoded_exponent == 0 && fraction == 0 {
+        return bits;
+    }
+    let (significand, encoded_exponent) = if encoded_exponent == 0 {
+        let shift = fraction.leading_zeros() - (63 - fraction_bits);
+        (fraction << shift, 1 - i64::from(shift))
+    } else {
+        ((1_u64 << fraction_bits) | fraction, encoded_exponent as i64)
+    };
+    let scaled_exponent = encoded_exponent + i64::from(exponent);
+    if scaled_exponent >= exponent_mask as i64 {
+        return sign | (exponent_mask << fraction_bits);
+    }
+    if scaled_exponent > 0 {
+        return sign | ((scaled_exponent as u64) << fraction_bits) | (significand & fraction_mask);
+    }
+    let shift = 1 - scaled_exponent;
+    if shift > i64::from(fraction_bits + 1) {
+        return sign;
+    }
+    let shift = shift as u32;
+    let quotient = significand >> shift;
+    let remainder = significand & ((1_u64 << shift) - 1);
+    let halfway = 1_u64 << (shift - 1);
+    let rounded =
+        quotient + u64::from(remainder > halfway || (remainder == halfway && quotient & 1 != 0));
+    sign | rounded
 }
 
 fn scalar_box(value: &Obj) -> bool {

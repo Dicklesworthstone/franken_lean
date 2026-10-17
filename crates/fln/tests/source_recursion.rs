@@ -498,11 +498,33 @@ fn different_tree_children_receive_independent_changing_accumulators() {
     );
 }
 
+/// A structural definition unfolds as the pin unfolds it, through its original body
+/// (`_sunfold`): `Tower 1` is `Tower 0 → Tower 0`, so `idTower`'s domain is `Tower 0`, where a
+/// bare numeral has no `OfNat` instance (instance resolution does not unfold `Tower`). The
+/// compiled recursor's `Nat.rec … 0` would reduce to `Nat` even there. The pin refuses each bare
+/// numeral ("failed to synthesize OfNat (Tower 0) 9", 4:26; 12 at 4:35) and accepts the typed
+/// ones (2026-10-10).
 #[test]
 fn recursive_type_computations_supply_source_lambda_domains() {
-    check(
-        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef idTower : Tower 1 := fun n => n\ndef higher : Tower 2 := fun f => f\ntheorem type_ok : idTower 9 = 9 := by rfl\ntheorem higher_ok : higher idTower 12 = 12 := by rfl",
-    );
+    let tower = "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef idTower : Tower 1 := fun n => n\ndef higher : Tower 2 := fun f => f\n";
+    check(&format!(
+        "{tower}theorem type_ok : idTower (9 : Nat) = (9 : Nat) := by rfl\ntheorem higher_ok : higher idTower (12 : Nat) = (12 : Nat) := by rfl"
+    ));
+    let base = engine();
+    for bare in [
+        "theorem type_ok : idTower 9 = 9 := by rfl",
+        "theorem higher_ok : higher idTower 12 = 12 := by rfl",
+    ] {
+        let source = format!("{tower}{bare}");
+        let Err(error) = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        ) else {
+            panic!("accepted a numeral at `Tower 0`: {bare}");
+        };
+        assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    }
 }
 
 #[test]

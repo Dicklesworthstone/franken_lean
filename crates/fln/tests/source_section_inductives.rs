@@ -239,8 +239,18 @@ end
 end
 def forest : Forest Nat 7 := Forest.cons 7 (Tree.node 7 (Forest.nil 7)) (Forest.nil 7)"#,
     );
+    // Every constructor takes and returns its index, so the pin promotes it: read at the
+    // pin with `getConstInfo`, both families have `numParams=2`, binders `A` and the
+    // arrow's `a._@._internal._hyg.0`, both default.
+    let arrow = Name::num(Name::from_components(["a", "_@", "_internal", "_hyg"]), 0);
     for name in ["Tree", "Forest"] {
-        assert_eq!(params(&e, name), vec![(n("A"), BinderInfo::Default)]);
+        assert_eq!(
+            params(&e, name),
+            vec![
+                (n("A"), BinderInfo::Default),
+                (arrow.clone(), BinderInfo::Default)
+            ]
+        );
     }
 }
 

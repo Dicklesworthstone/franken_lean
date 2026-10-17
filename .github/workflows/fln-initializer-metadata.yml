@@ -1,0 +1,76 @@
+name: Native initializer metadata
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-olean/**'
+      - 'crates/fln/src/source_check/modules/**'
+      - 'scripts/extract/gen_initializer_contract.py'
+      - '.github/workflows/fln-initializer-metadata.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fln-initializer-metadata-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the pinned compiler
+        id: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+          git rev-parse HEAD
+      - name: Verify extracted contracts and native codec
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/extract/gen_source_extension_contract.py --check
+          python3 -I scripts/extract/gen_initializer_contract.py --check
+          cargo test --locked -p fln-olean --no-fail-fast
+          cargo clippy --locked -p fln-olean --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+          rustfmt --edition 2024 --check crates/fln-olean/src/initializers.rs crates/fln-olean/tests/source_initializers.rs
+      # Development inputs are retained even on a failed gate, with the gate's
+      # outcome. This does not turn a failing verification into success.
+      - name: Export exact inputs for offline native integration tests
+        if: >-
+          always() && steps.compiler.outcome == 'success' &&
+          startsWith(github.event.head_commit.message, 'feat(olean): decode initializer attribute journals')
+        shell: bash
+        env:
+          VERIFICATION_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/initializer-offline
+          git archive --format=tar.gz HEAD > target/initializer-offline/source.tar.gz
+          toolchain="$(rustc --print sysroot)"
+          tar -C "$toolchain" -czf target/initializer-offline/compiler.tar.gz bin lib
+          git rev-parse HEAD > target/initializer-offline/source-commit.txt
+          git rev-parse 'HEAD^{tree}' > target/initializer-offline/source-tree.txt
+          rustc -Vv > target/initializer-offline/compiler.txt
+          printf '%s\n' "$VERIFICATION_STATUS" > target/initializer-offline/verification-status.txt
+          sha256sum target/initializer-offline/source.tar.gz target/initializer-offline/compiler.tar.gz > target/initializer-offline/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: >-
+          always() && steps.compiler.outcome == 'success' &&
+          startsWith(github.event.head_commit.message, 'feat(olean): decode initializer attribute journals')
+        with:
+          name: initializer-offline-${{ github.sha }}
+          path: target/initializer-offline
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error

@@ -340,7 +340,8 @@ fn push_field_index(text: &SourceText, stop: BytePos, events: &mut Vec<Event>) -
     };
     let projectable = match &before.kind {
         TokenKind::Ident(_) | TokenKind::Literal(LiteralKind::Nat) => true,
-        TokenKind::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]" | "}" | "⟩" | "⦄"),
+        // `(·.1.foo)`: the cdot stands for the function's argument, projected.
+        TokenKind::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]" | "}" | "⟩" | "⦄" | "·"),
         TokenKind::Literal(_) => false,
     };
     if !projectable || before.extent.end() != dot.extent.start() {
@@ -865,7 +866,7 @@ mod tests {
     /// lexes; a `.` with space before it, a leading zero, or a decimal numeral are unchanged.
     #[test]
     fn a_digit_after_a_touching_projection_dot_is_a_field_index() {
-        let table = TokenTable::from_tokens([".", "(", ")", ":="]);
+        let table = TokenTable::from_tokens([".", "(", ")", ":=", "·"]);
         let tokens = |raw: &str| {
             let run = lex_run(&text_of(raw), &table);
             let accepted = run.accepted();
@@ -887,6 +888,11 @@ mod tests {
         );
         assert_eq!(tokens("(p).2.impl"), (true, "( p ) . 2 . impl".to_owned()));
         assert_eq!(tokens("m.12.e"), (true, "m . 12 . e".to_owned()));
+        // The cdot's argument, projected (`Init/Data/Iterators/Consumers/Monadic/Collect.lean`).
+        assert_eq!(
+            tokens("(·.1.steps)"),
+            (true, "( · . 1 . steps )".to_owned())
+        );
         assert_eq!(tokens("x := 0.5"), (true, "x := 0.5".to_owned()));
         assert!(
             !tokens("h .1.isEmpty").0,

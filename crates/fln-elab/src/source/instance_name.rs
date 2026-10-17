@@ -135,7 +135,10 @@ impl Context {
             namespace = namespace.parent();
         }
         let base = format!("inst{}", render.aux(&binders, &body));
-        // `mkUnusedBaseName`.
+        // `mkUnusedBaseName`: the pin's Macro.hasDecl adapter checks both the
+        // public name and the current module's private name (Elab/Util.lean).
+        // Anonymous and derived instances bypass enter_declaration, so this
+        // path must also apply the file's private-by-default visibility.
         let namespace = self.source_scope.namespace.clone();
         let candidate = |suffix: Option<usize>| {
             let text = match suffix {
@@ -144,11 +147,25 @@ impl Context {
             };
             Name::str(namespace.clone(), text)
         };
-        let mut name = candidate(None);
+        let mut user_name = candidate(None);
+        let mut name = self.source_scope.visible_name(&user_name);
         let mut next = 1;
-        while self.txn.env.contains(&name) {
+        while self.txn.env.contains(&user_name)
+            || self
+                .txn
+                .env
+                .contains(&self.source_scope.private_name(&user_name))
+            // A public header resolves in the exported environment. Generated
+            // names still avoid the current module's private declarations, as
+            // Macro.hasDecl does, without using them for source resolution.
+            || self.private_proof_body.as_ref().is_some_and(|(environment, _)| {
+                environment.contains(&user_name)
+                    || environment.contains(&self.source_scope.private_name(&user_name))
+            })
+        {
             self.tick()?;
-            name = candidate(Some(next));
+            user_name = candidate(Some(next));
+            name = self.source_scope.visible_name(&user_name);
             next += 1;
         }
         Ok(name)

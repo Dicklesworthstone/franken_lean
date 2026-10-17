@@ -10,6 +10,12 @@
 //! This is not a general normalizer. Native and String reduction, recursors,
 //! typing, declaration admission, and consensus remain outside this module.
 
+mod memo;
+#[cfg(test)]
+mod shared_tests;
+
+use std::sync::Arc;
+
 use crate::numeric::{
     self, NatBudget, NatComparison, NatFault, NatOperation, NatOutcome, NatProgress, NatRefusal,
     NatStop, NatValue,
@@ -334,7 +340,7 @@ impl Halt {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ArenaSource {
     Candidate,
     Generated(usize),
@@ -349,7 +355,7 @@ impl ArenaSource {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Cursor {
     source: ArenaSource,
     root: ExprId,
@@ -365,7 +371,7 @@ struct EvalFrame {
     cursor: Cursor,
     operation: NatReductionOperation,
     operands: [Option<ExprId>; 2],
-    values: [Option<NatValue>; 2],
+    values: [Option<Arc<NatValue>>; 2],
     next_operand: u8,
     top_level: bool,
 }
@@ -376,7 +382,7 @@ enum EvalState {
         core_normalized: bool,
     },
     ForceDelta(Cursor),
-    Natural(NatValue),
+    Natural(Arc<NatValue>),
     NonNatural,
 }
 
@@ -1454,6 +1460,21 @@ fn operand_identity(index: u8) -> NatReductionOperand {
     }
 }
 
+/// A bare monomorphic constant has the same meaning in every arena of this
+/// query. Applied functions and universe arguments require their full cursor;
+/// a name-only key would discard those semantic inputs.
+fn operand_name<'a>(
+    cursor: Cursor,
+    candidate: &'a WireExpr,
+    generated: &'a [WireExpr],
+) -> Result<Option<&'a WireName>, Halt> {
+    let term = source_term(cursor.source, candidate, generated)?;
+    Ok(match term.node(cursor.root) {
+        Some(ExprNode::Constant { name, levels }) if levels.is_empty() => Some(name),
+        _ => None,
+    })
+}
+
 fn reduce_inner(
     query: NatReductionQuery<'_>,
     budget: NatReductionBudget,
@@ -1542,6 +1563,7 @@ fn reduce_inner(
     };
     let mut generated = Vec::new();
     let mut context_validated = false;
+    let mut memo = memo::NaturalMemo::default();
 
     loop {
         state = match state {
@@ -1550,10 +1572,18 @@ fn reduce_inner(
                 core_normalized,
             } => {
                 if context_validated
+                    && let Some(value) = memo.recall_operand(
+                        cursor,
+                        operand_name(cursor, candidate, &generated)?,
+                        &mut control,
+                    )?
+                {
+                    EvalState::Natural(value)
+                } else if context_validated
                     && let Some(value) =
                         direct_natural(cursor, candidate, &generated, &mut control)?
                 {
-                    EvalState::Natural(value)
+                    EvalState::Natural(Arc::new(value))
                 } else {
                     let nested = {
                         let term = source_term(cursor.source, candidate, &generated)?;
@@ -1589,7 +1619,7 @@ fn reduce_inner(
                     } else if let Some(value) =
                         direct_natural(cursor, candidate, &generated, &mut control)?
                     {
-                        EvalState::Natural(value)
+                        EvalState::Natural(Arc::new(value))
                     } else {
                         EvalState::ForceDelta(cursor)
                     }
@@ -1621,6 +1651,17 @@ fn reduce_inner(
                         .ok_or(Halt::Fault(NatReductionFault::ValueStack {
                             operation: parsed.operation,
                         }))?;
+                // Remember the demand, not only a newly materialized arithmetic
+                // root. Beta/zeta/delta and metadata normalization may move that
+                // root into a different arena, while repeated operands still
+                // refer to their original immutable source cursor.
+                let operand = current_operand(frame)?;
+                memo.remember_operand(
+                    operand,
+                    operand_name(operand, candidate, &generated)?,
+                    &value,
+                    &mut control,
+                )?;
                 frame.values[usize::from(frame.next_operand)] = Some(value);
                 if frame.next_operand + 1 < frame.operation.arity() {
                     frame.next_operand += 1;
@@ -1667,7 +1708,7 @@ fn reduce_inner(
                                 progress: control.progress,
                             });
                         }
-                        Executed::Natural(value) => EvalState::Natural(value),
+                        Executed::Natural(value) => EvalState::Natural(Arc::new(value)),
                         Executed::Boolean(_) => EvalState::NonNatural,
                     }
                 }

@@ -1,10 +1,21 @@
-//! Present explicitly evaluated IO payloads without executing deferred values.
+//! Present checked evaluation payloads without executing deferred values.
 use super::*;
 
 #[derive(Debug)]
 pub(super) enum Error {
     Value(SourceValueProjectionError),
+    Format(fln::source_format::Error),
     Io(fln::IoEvaluationProjectionError),
+    OutputLimit {
+        limit: usize,
+        observed: usize,
+    },
+    OutputAllocation,
+    InvalidIoPresentation,
+    /// `#guard e` evaluated to `false` (the pin: "Expression … did not evaluate to `true`").
+    GuardFalse,
+    /// `#guard e`'s checked `Bool` did not come back as the scalar 0 or 1.
+    InvalidGuardResult,
     InvalidUnit,
     InvalidException,
     Raised {
@@ -19,7 +30,18 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Value(error) => error.fmt(f),
+            Self::Format(error) => error.fmt(f),
             Self::Io(error) => error.fmt(f),
+            Self::OutputLimit { limit, observed } => write!(
+                f,
+                "formatted source output limit {limit} exceeded by {observed} bytes"
+            ),
+            Self::OutputAllocation => f.write_str("could not allocate formatted source output"),
+            Self::InvalidIoPresentation => {
+                f.write_str("selected IO presentation did not retain a checked IO result")
+            }
+            Self::GuardFalse => f.write_str("#guard: the expression did not evaluate to `true`"),
+            Self::InvalidGuardResult => f.write_str("#guard result is not the Bool scalar 0 or 1"),
             Self::InvalidUnit => f.write_str("IO unit result has an invalid representation"),
             Self::InvalidException => {
                 f.write_str("IO exception disagrees with its admitted constructor layout")
@@ -40,7 +62,10 @@ impl fmt::Display for Error {
 impl Error {
     pub(super) fn disposition(&self) -> (&'static str, bool, u8) {
         match self {
+            Self::Format(error) => error.disposition(),
+            Self::OutputLimit { .. } | Self::OutputAllocation => ("resource", false, 3),
             Self::Raised { .. } => ("io-exception", true, 1),
+            Self::GuardFalse => ("execution", true, 1),
             Self::Value(SourceValueProjectionError::Shaped(
                 fln::ClosedShapedValueError::TooLarge { .. },
             )) => ("resource", false, 3),
@@ -218,7 +243,7 @@ fn exception_message(
     }
 }
 
-fn raised(
+pub(super) fn raised(
     execution: &fln::DefinitionExecution,
     runtime_type: &fln::Expr,
     exit: fln::VmExit,
@@ -246,6 +271,159 @@ pub(super) fn check(execution: &fln::DefinitionExecution) -> Result<(), Error> {
             Err(raised(execution, &runtime_type, exit))
         }
         _ => Ok(()),
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum PresentedEvaluation {
+    Text(String),
+    IoUnit,
+}
+
+/// Only the source adapter's retained intent authorizes Lean presentation.
+/// The runtime type or constructor of an ordinary result supplies no marker.
+pub(super) fn has_checked_presentation(execution: &fln::DefinitionExecution) -> bool {
+    matches!(
+        execution.evaluation_presentation(),
+        Some(
+            fln::EvaluationResultPresentation::Format { .. }
+                | fln::EvaluationResultPresentation::IoFormat { .. }
+                | fln::EvaluationResultPresentation::IoUnit
+                | fln::EvaluationResultPresentation::Guard
+        )
+    )
+}
+
+/// Project the result of the already-run action. Neither reading its outcome
+/// nor rendering its Format executes the action or calls its printer again.
+fn io_formatted(
+    execution: &fln::DefinitionExecution,
+    width: Option<usize>,
+) -> Result<PresentedEvaluation, Error> {
+    match execution.io_evaluation_outcome().map_err(Error::Io)? {
+        Some(fln::IoEvaluationOutcome::Returned { runtime_type, exit }) => match width {
+            Some(width) => fln::source_format::render_vm(
+                execution.engine.environment(),
+                &runtime_type,
+                &exit,
+                width,
+                fln::source_format::Limits::default(),
+            )
+            .map(PresentedEvaluation::Text)
+            .map_err(Error::Format),
+            None => {
+                unit_payload(execution.engine.environment(), &runtime_type, &exit)?;
+                Ok(PresentedEvaluation::IoUnit)
+            }
+        },
+        Some(fln::IoEvaluationOutcome::Raised { runtime_type, exit }) => {
+            Err(raised(execution, &runtime_type, exit))
+        }
+        None => Err(Error::InvalidIoPresentation),
+    }
+}
+
+/// A selected Lean printer returns an admitted Format, either directly or in
+/// a checked IO result. The private execution marker selects the projection;
+/// any refusal remains a refusal and never retries the scalar presentation.
+pub(super) fn formatted(
+    execution: &fln::DefinitionExecution,
+) -> Result<Option<PresentedEvaluation>, Error> {
+    match execution.evaluation_presentation() {
+        None => Ok(None),
+        Some(fln::EvaluationResultPresentation::Format { width }) => {
+            fln::source_format::render(execution, width, fln::source_format::Limits::default())
+                .map(PresentedEvaluation::Text)
+                .map(Some)
+                .map_err(Error::Format)
+        }
+        Some(fln::EvaluationResultPresentation::IoFormat { width }) => {
+            io_formatted(execution, Some(width)).map(Some)
+        }
+        Some(fln::EvaluationResultPresentation::IoUnit) => io_formatted(execution, None).map(Some),
+        Some(fln::EvaluationResultPresentation::Guard) => {
+            match fln::closed_vm_value(&execution.exit) {
+                Ok(Some(fln::ClosedVmValue::Scalar(1))) => Ok(Some(PresentedEvaluation::IoUnit)),
+                Ok(Some(fln::ClosedVmValue::Scalar(0))) => Err(Error::GuardFalse),
+                Ok(_) => Err(Error::InvalidGuardResult),
+                Err(error) => Err(Error::Value(SourceValueProjectionError::Runtime(error))),
+            }
+        }
+    }
+}
+
+/// One cumulative bound for marked printer output, including text retained
+/// by guards. The document renderer's own limit resets for each evaluation.
+pub(super) struct FormattedOutputBudget {
+    bytes: usize,
+    limit: usize,
+}
+
+impl FormattedOutputBudget {
+    pub(super) fn new(limit: usize) -> Self {
+        Self { bytes: 0, limit }
+    }
+
+    /// Reserve the destination before mutating its text or message table.
+    /// The caller discards the entire pending presentation on any failure.
+    pub(super) fn append(
+        &mut self,
+        text: &str,
+        stdout: &mut String,
+        guarded: Option<&mut Vec<String>>,
+    ) -> Result<(), Error> {
+        // SerialMessage.toString and GuardMsgs.messageToString retain the
+        // printer's line endings, adding a newline only when one is absent.
+        let needs_newline = !text.ends_with('\n');
+        let prefix = if guarded.is_none() {
+            ""
+        } else if text.starts_with('\n') {
+            "info:"
+        } else {
+            "info: "
+        };
+        let required = text
+            .len()
+            .checked_add(prefix.len())
+            .and_then(|bytes| bytes.checked_add(usize::from(needs_newline)));
+        let observed = required.and_then(|bytes| self.bytes.checked_add(bytes));
+        let Some((required, observed)) = required.zip(observed) else {
+            return Err(Error::OutputLimit {
+                limit: self.limit,
+                observed: usize::MAX,
+            });
+        };
+        if observed > self.limit {
+            return Err(Error::OutputLimit {
+                limit: self.limit,
+                observed,
+            });
+        }
+        if let Some(messages) = guarded {
+            messages
+                .try_reserve(1)
+                .map_err(|_| Error::OutputAllocation)?;
+            let mut message = String::new();
+            message
+                .try_reserve(required)
+                .map_err(|_| Error::OutputAllocation)?;
+            message.push_str(prefix);
+            message.push_str(text);
+            if needs_newline {
+                message.push('\n');
+            }
+            messages.push(message);
+        } else {
+            stdout
+                .try_reserve(required)
+                .map_err(|_| Error::OutputAllocation)?;
+            stdout.push_str(text);
+            if needs_newline {
+                stdout.push('\n');
+            }
+        }
+        self.bytes = observed;
+        Ok(())
     }
 }
 
@@ -296,6 +474,136 @@ mod tests {
         execute(
             "def Unit := PUnit.{1}\ndef Unit.unit : Unit := PUnit.unit.{1}\ndef ordinaryUnit : Unit := ()",
         )
+    }
+
+    #[test]
+    fn raw_evaluations_never_select_a_format_printer() {
+        for (source, expected) in [
+            ("#eval 42", "42\n"),
+            ("#eval true", "true\n"),
+            ("#eval \"raw λ\"", "\"raw λ\"\n"),
+        ] {
+            let execution = execute(source);
+            assert!(execution.evaluation_format_width().is_none());
+            assert!(!has_checked_presentation(&execution));
+            assert!(formatted(&execution).unwrap().is_none());
+            let value = value(&execution).unwrap().unwrap();
+            assert_eq!(lean_evaluation_line(0, &value).unwrap(), expected);
+        }
+
+        // A familiar type name is ordinary source data. It cannot acquire
+        // the private marker that authorizes instance-directed presentation.
+        let named_format = execute(
+            "inductive Std.Format where\n  | text (value : String)\n#eval Std.Format.text \"ordinary data\"",
+        );
+        assert!(named_format.evaluation_format_width().is_none());
+        assert!(!has_checked_presentation(&named_format));
+        assert!(formatted(&named_format).unwrap().is_none());
+    }
+
+    #[test]
+    fn ordinary_unit_and_scalar_values_do_not_supply_an_io_presentation() {
+        for execution in [unit_execution(), execute("#eval 42")] {
+            assert!(!has_checked_presentation(&execution));
+            assert!(formatted(&execution).unwrap().is_none());
+            for width in [None, Some(120)] {
+                let error = io_formatted(&execution, width).unwrap_err();
+                assert!(matches!(error, Error::InvalidIoPresentation));
+                let refusal = error.failure(7, SourcePresentation::Lean);
+                assert_eq!(refusal.exit_code, 4);
+                assert!(refusal.stdout.is_empty());
+                assert!(refusal.stderr.starts_with("lean: internal-fault: "));
+            }
+        }
+    }
+
+    #[test]
+    fn formatted_output_charges_plain_and_guarded_utf8_before_publication() {
+        let mut budget = FormattedOutputBudget::new(13);
+        let mut stdout = String::new();
+        let mut messages = Vec::new();
+        budget.append("λ", &mut stdout, None).unwrap();
+        budget
+            .append("\"x\"", &mut stdout, Some(&mut messages))
+            .unwrap();
+        assert_eq!(stdout, "λ\n");
+        assert_eq!(messages, ["info: \"x\"\n"]);
+
+        // These two messages exactly consume thirteen UTF-8 bytes, including
+        // line endings and guard severity. A later message cannot reset it.
+        let error = budget.append("z", &mut stdout, None).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::OutputLimit {
+                limit: 13,
+                observed: 15,
+            }
+        ));
+        assert_eq!(stdout, "λ\n", "the refused append changes no text");
+        assert_eq!(messages, ["info: \"x\"\n"]);
+        let refusal = error.failure(7, SourcePresentation::Lean);
+        assert_eq!(refusal.exit_code, 3);
+        assert!(
+            refusal.stdout.is_empty(),
+            "pending prior text is not published"
+        );
+        assert!(refusal.stderr.starts_with("lean: resource: "));
+        assert!(refusal.stderr.contains("evaluation command 7"));
+
+        let mut newline = FormattedOutputBudget::new(9);
+        let mut messages = Vec::new();
+        newline
+            .append("\nλ\n", &mut String::new(), Some(&mut messages))
+            .unwrap();
+        assert_eq!(messages, [guard_message("info", "\nλ\n")]);
+        assert!(matches!(
+            newline.append("", &mut String::new(), Some(&mut messages)),
+            Err(Error::OutputLimit { .. })
+        ));
+        assert_eq!(
+            messages.len(),
+            1,
+            "guard storage is also bounded atomically"
+        );
+    }
+
+    #[test]
+    fn formatted_output_preserves_existing_line_endings_and_meters_only_insertions() {
+        for (text, plain, guarded) in [
+            ("", "\n", "info: \n"),
+            ("x", "x\n", "info: x\n"),
+            ("x\n", "x\n", "info: x\n"),
+            ("x\n\n", "x\n\n", "info: x\n\n"),
+            ("\nλ\n\n", "\nλ\n\n", "info:\nλ\n\n"),
+        ] {
+            let mut budget = FormattedOutputBudget::new(plain.len());
+            let mut stdout = String::new();
+            budget.append(text, &mut stdout, None).unwrap();
+            assert_eq!(stdout, plain, "plain text {text:?}");
+            assert_eq!(budget.bytes, plain.len());
+            assert!(matches!(
+                budget.append("", &mut stdout, None),
+                Err(Error::OutputLimit { .. })
+            ));
+            assert_eq!(stdout, plain, "refusal preserves plain text {text:?}");
+
+            let mut budget = FormattedOutputBudget::new(guarded.len());
+            let mut messages = Vec::new();
+            budget
+                .append(text, &mut String::new(), Some(&mut messages))
+                .unwrap();
+            assert_eq!(messages, [guarded], "guarded text {text:?}");
+            assert_eq!(budget.bytes, guarded.len());
+            assert!(matches!(
+                budget.append("", &mut String::new(), Some(&mut messages)),
+                Err(Error::OutputLimit { .. })
+            ));
+            assert_eq!(
+                messages,
+                [guarded],
+                "refusal preserves guarded text {text:?}"
+            );
+        }
     }
 
     #[test]

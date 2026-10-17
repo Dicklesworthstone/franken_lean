@@ -703,154 +703,125 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// precede intrinsic signatures, and collection families precede their checked
 /// operation bodies. This is not a complete Prelude ingestion path.
 pub fn source_seed_declarations() -> [Declaration; 100] {
-    let [
-        punit,
-        pprod,
-        cases_on,
-        below,
-        brec_on_go,
-        brec_on,
-        add_match,
-        add_functional,
-    ] = nat_recursion::nat_add_support_seed_declarations();
-    let [false_elim, ne] = logic_support::logical_support_seed_declarations();
-    let [
-        and,
-        and_left,
-        and_right,
-        or,
-        or_elim,
-        iff,
-        iff_mp,
-        iff_mpr,
-        and_instance,
-        or_instance,
-        implies_instance,
-        iff_instance,
-    ] = logic::logical_seed_declarations();
-    let [bool_eq, nat_eq, bool_instance, nat_instance] = equality_decision_seed_declarations();
-    let [equality_type, generic_eq] = generic_equality_decision_seed_declarations();
-    let [
-        option,
-        option_get_d,
-        option_map,
-        option_bind,
-        option_is_some,
-        option_is_none,
-    ] = collections::option_seed_declarations();
-    let [
-        list,
-        list_length,
-        list_append,
-        list_map,
-        list_foldr,
-        list_foldl,
-        list_reverse,
-        list_head,
-        list_tail,
-    ] = collections::list_seed_declarations();
-    [
-        nat_inductive_seed_declaration(),
-        string_seed_declaration(),
-        bool_seed_declaration(),
-        punit,
-        pprod,
-        cases_on,
-        below,
-        brec_on_go,
-        brec_on,
-        add_match,
-        add_functional,
-        nat_add_seed_declaration(),
-        nat_sub_seed_declaration(),
-        nat_mul_seed_declaration(),
-        nat_div_seed_declaration(),
-        nat_gcd_seed_declaration(),
-        nat_land_seed_declaration(),
-        nat_log2_seed_declaration(),
-        nat_lor_seed_declaration(),
-        nat_mod_seed_declaration(),
-        nat_pow_seed_declaration(),
-        nat_pred_seed_declaration(),
-        nat_shift_left_seed_declaration(),
-        nat_shift_right_seed_declaration(),
-        nat_xor_seed_declaration(),
-        string_append_seed_declaration(),
-        string_length_seed_declaration(),
-        string_utf8_byte_size_seed_declaration(),
-        nat_beq_seed_declaration(),
-        nat_ble_seed_declaration(),
-        nat_dec_le_seed_declaration(),
-        nat_dec_lt_seed_declaration(),
-        string_dec_eq_seed_declaration(),
-        eq_seed_declaration(),
-        rfl_seed_declaration(),
-        inhabited::inhabited_seed_declaration(),
-        inhabited::default_seed_declaration(true),
-        inhabited::default_seed_declaration(false),
-        inhabited::scalar_inhabited_seed_declaration("Nat"),
-        inhabited::scalar_inhabited_seed_declaration("String"),
-        inhabited::scalar_inhabited_seed_declaration("Bool"),
-        inhabited::infer_instance_seed_declaration(),
-        heq_seed_declaration(),
-        heterogeneous::type_eq_seed_declaration(),
-        heterogeneous::heq_of_eq_seed_declaration(),
-        heterogeneous::eq_of_heq_seed_declaration(),
-        heterogeneous::symmetry_seed_declaration(),
-        heterogeneous::transitivity_seed_declaration(),
-        decidable::false_declaration(),
-        decidable::true_declaration(),
-        decidable::not_declaration(),
-        false_elim,
-        ne,
-        decidable::decidable_declaration(),
-        decidable::conditional_declaration(false),
-        decidable::conditional_declaration(true),
-        decidable::decide_declaration(),
-        decidable::true_instance(),
-        decidable::false_instance(),
-        decidable::not_instance(),
-        decidable::of_decide_eq_true_declaration(),
-        out_param_seed_declaration(),
-        semi_out_param_seed_declaration(),
-        bool_eq,
-        nat_eq,
-        bool_instance,
-        nat_instance,
-        equality_type,
-        generic_eq,
-        and,
-        and_left,
-        and_right,
-        or,
-        or_elim,
-        iff,
-        iff_mp,
-        iff_mpr,
-        and_instance,
-        or_instance,
-        implies_instance,
-        iff_instance,
-        quotient_seed_declaration(),
-        quotient_sound_seed_declaration(),
-        propext_seed_declaration(),
-        option,
-        option_get_d,
-        option_map,
-        option_bind,
-        option_is_some,
-        option_is_none,
-        list,
-        list_length,
-        list_append,
-        list_map,
-        list_foldr,
-        list_foldl,
-        list_reverse,
-        list_head,
-        list_tail,
-        decidable_option::option_equality_decision_seed_declaration(),
-    ]
+    let mut declarations = source_seed_declarations_iter();
+    std::array::from_fn(|_| {
+        declarations
+            .next()
+            .expect("the fixed source seed has 100 declarations")
+    })
+}
+
+/// Construct the same canonical source sequence one bounded batch at a time.
+///
+/// Runtime contract checks run inside nested type/proof preparation. Returning
+/// the entire `[Declaration; 100]` there materializes tens of kilobytes of stack
+/// even when most declarations are discarded. Factories below are function
+/// pointers, not eager declaration values; only the next small related group
+/// is constructed. The array-returning compatibility API remains available to
+/// callers that deliberately need the whole sequence.
+pub fn source_seed_declarations_iter() -> impl Iterator<Item = Declaration> {
+    // A single declaration needs no allocation just to iterate it. Related
+    // groups contain at most twelve declarations and move into a heap iterator.
+    // Keep their order identical to the canonical source admission order.
+    const BUILDERS: &[fn() -> SourceSeedBatch] = &[
+        || SourceSeedBatch::One(Some(nat_inductive_seed_declaration())),
+        || SourceSeedBatch::One(Some(string_seed_declaration())),
+        || SourceSeedBatch::One(Some(bool_seed_declaration())),
+        || {
+            SourceSeedBatch::Many(
+                Vec::from(nat_recursion::nat_add_support_seed_declarations()).into_iter(),
+            )
+        },
+        || SourceSeedBatch::One(Some(nat_add_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_sub_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_mul_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_div_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_gcd_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_land_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_log2_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_lor_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_mod_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_pow_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_pred_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_shift_left_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_shift_right_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_xor_seed_declaration())),
+        || SourceSeedBatch::One(Some(string_append_seed_declaration())),
+        || SourceSeedBatch::One(Some(string_length_seed_declaration())),
+        || SourceSeedBatch::One(Some(string_utf8_byte_size_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_beq_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_ble_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_dec_le_seed_declaration())),
+        || SourceSeedBatch::One(Some(nat_dec_lt_seed_declaration())),
+        || SourceSeedBatch::One(Some(string_dec_eq_seed_declaration())),
+        || SourceSeedBatch::One(Some(eq_seed_declaration())),
+        || SourceSeedBatch::One(Some(rfl_seed_declaration())),
+        || SourceSeedBatch::One(Some(inhabited::inhabited_seed_declaration())),
+        || SourceSeedBatch::One(Some(inhabited::default_seed_declaration(true))),
+        || SourceSeedBatch::One(Some(inhabited::default_seed_declaration(false))),
+        || SourceSeedBatch::One(Some(inhabited::scalar_inhabited_seed_declaration("Nat"))),
+        || SourceSeedBatch::One(Some(inhabited::scalar_inhabited_seed_declaration("String"))),
+        || SourceSeedBatch::One(Some(inhabited::scalar_inhabited_seed_declaration("Bool"))),
+        || SourceSeedBatch::One(Some(inhabited::infer_instance_seed_declaration())),
+        || SourceSeedBatch::One(Some(heq_seed_declaration())),
+        || SourceSeedBatch::One(Some(heterogeneous::type_eq_seed_declaration())),
+        || SourceSeedBatch::One(Some(heterogeneous::heq_of_eq_seed_declaration())),
+        || SourceSeedBatch::One(Some(heterogeneous::eq_of_heq_seed_declaration())),
+        || SourceSeedBatch::One(Some(heterogeneous::symmetry_seed_declaration())),
+        || SourceSeedBatch::One(Some(heterogeneous::transitivity_seed_declaration())),
+        || SourceSeedBatch::One(Some(decidable::false_declaration())),
+        || SourceSeedBatch::One(Some(decidable::true_declaration())),
+        || SourceSeedBatch::One(Some(decidable::not_declaration())),
+        || {
+            SourceSeedBatch::Many(
+                Vec::from(logic_support::logical_support_seed_declarations()).into_iter(),
+            )
+        },
+        || SourceSeedBatch::One(Some(decidable::decidable_declaration())),
+        || SourceSeedBatch::One(Some(decidable::conditional_declaration(false))),
+        || SourceSeedBatch::One(Some(decidable::conditional_declaration(true))),
+        || SourceSeedBatch::One(Some(decidable::decide_declaration())),
+        || SourceSeedBatch::One(Some(decidable::true_instance())),
+        || SourceSeedBatch::One(Some(decidable::false_instance())),
+        || SourceSeedBatch::One(Some(decidable::not_instance())),
+        || SourceSeedBatch::One(Some(decidable::of_decide_eq_true_declaration())),
+        || SourceSeedBatch::One(Some(out_param_seed_declaration())),
+        || SourceSeedBatch::One(Some(semi_out_param_seed_declaration())),
+        || SourceSeedBatch::Many(Vec::from(equality_decision_seed_declarations()).into_iter()),
+        || {
+            SourceSeedBatch::Many(
+                Vec::from(generic_equality_decision_seed_declarations()).into_iter(),
+            )
+        },
+        || SourceSeedBatch::Many(Vec::from(logic::logical_seed_declarations()).into_iter()),
+        || SourceSeedBatch::One(Some(quotient_seed_declaration())),
+        || SourceSeedBatch::One(Some(quotient_sound_seed_declaration())),
+        || SourceSeedBatch::One(Some(propext_seed_declaration())),
+        || SourceSeedBatch::Many(Vec::from(collections::option_seed_declarations()).into_iter()),
+        || SourceSeedBatch::Many(Vec::from(collections::list_seed_declarations()).into_iter()),
+        || {
+            SourceSeedBatch::One(Some(
+                decidable_option::option_equality_decision_seed_declaration(),
+            ))
+        },
+    ];
+    BUILDERS.iter().flat_map(|build| build())
+}
+
+enum SourceSeedBatch {
+    One(Option<Declaration>),
+    Many(std::vec::IntoIter<Declaration>),
+}
+
+impl Iterator for SourceSeedBatch {
+    type Item = Declaration;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(declaration) => declaration.take(),
+            Self::Many(declarations) => declarations.next(),
+        }
+    }
 }
 
 /// Build the seed's minimal environment.
@@ -970,6 +941,37 @@ mod tests {
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"
         );
+    }
+
+    #[test]
+    fn seed_stream_and_early_drop_fit_a_small_stack_without_changing_declarations() {
+        // Build the compatibility array on the ordinary test stack, then move
+        // only a Vec handle into the bounded thread. No full-seed value may be
+        // returned on that thread, including during iterator destruction.
+        let expected = Vec::from(source_seed_declarations());
+        std::thread::Builder::new()
+            .name("bounded-source-seed".into())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                assert_eq!(expected.len(), 100);
+                // Include every boundary inside a multi-declaration batch and
+                // the exhausted iterator, not just a completed traversal.
+                for prefix in 0..=expected.len() {
+                    let mut declarations = source_seed_declarations_iter();
+                    assert!(std::mem::size_of_val(&declarations) < 2048);
+                    for original in expected.iter().take(prefix) {
+                        assert_eq!(declarations.next().as_ref(), Some(original));
+                    }
+                    if prefix == expected.len() {
+                        assert!(declarations.next().is_none());
+                        assert!(declarations.next().is_none());
+                    }
+                    drop(declarations);
+                }
+            })
+            .expect("bounded source-seed thread")
+            .join()
+            .expect("canonical seed streaming must not overflow");
     }
 
     #[test]

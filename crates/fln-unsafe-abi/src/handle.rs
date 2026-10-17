@@ -28,6 +28,14 @@ use crate::tagged;
 pub mod fs;
 pub mod stdout_capture;
 
+/// Flush native writes to the process stdout before a host publishes through
+/// its own stdout buffer. Thread-local stream overrides and other files are
+/// untouched. An error retains any bytes the OS already accepted; no action is
+/// repeated and no logical IO result or declaration authority is produced.
+pub fn flush_native_stdout() -> std::io::Result<()> {
+    crate::stdio::flush_native_stdout()
+}
+
 /// Boxed-convention function types for the callable-closure constructors: every
 /// parameter and the result are `lean_object*`, per the pin's `m_fun` contract
 /// (`lean.h:211-217`; apply arms `apply.cpp:101-460`).
@@ -511,23 +519,41 @@ impl Obj {
             && byte_off.checked_add(width).is_some_and(|end| end <= extent)
     }
 
-    /// Fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    /// Borrow a string view `(size, capacity, length, bytes-with-NUL)`.
     ///
     /// Returns `None` when the handle is not a string or the header is
     /// inconsistent (`m_size == 0`, `m_size` past `m_capacity`, missing
-    /// NUL). Product paths that accept untrusted objects must use this;
-    /// [`string_view`] still asserts. Inflating both `m_size` and
-    /// `m_capacity` past the minted allocation remains outside this check
-    /// (same residual as [`try_mpz_view`]): the test plants `m_size` only,
-    /// so Drop still frees with the real `m_capacity`.
-    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+    /// NUL). The returned bytes alias the immutable ABI buffer and remain
+    /// valid only while this handle is borrowed. There is no allocation,
+    /// copy, UTF-8 scan, or ownership transfer: callers can check their byte
+    /// allowance before validating the text or creating an owned copy.
+    /// `length` is the recorded character count, not a verified count.
+    ///
+    /// Inflating both `m_size` and `m_capacity` past the minted allocation
+    /// remains outside this check (same residual as [`Self::try_mpz_view`]):
+    /// the test plants `m_size` only, so Drop still frees with the real
+    /// `m_capacity`.
+    ///
+    /// The byte slice cannot outlive its owning handle:
+    ///
+    /// ```compile_fail
+    /// use fln_unsafe_abi::handle::Obj;
+    /// let bytes = {
+    ///     let value = Obj::mk_string("borrowed");
+    ///     value.try_borrow_string_view().unwrap().3
+    /// };
+    /// assert_eq!(bytes, b"borrowed\0");
+    /// ```
+    pub fn try_borrow_string_view(&self) -> Option<(usize, usize, usize, &[u8])> {
         if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_STRING) {
             return None;
         }
         // SAFETY: tag is TAG_STRING, so the object is a LeanStringObject.
         // `m_size <= m_capacity` is the inline-buffer law: the minted
-        // data area is `m_capacity` bytes. Copying `m_size` after that
-        // check cannot run past the header's own capacity claim.
+        // data area is `m_capacity` bytes. Reading `m_size` after that
+        // check cannot run past the header's own capacity claim. The live
+        // owning &self keeps the immutable allocation alive for the slice's
+        // complete lifetime; no raw pointer or unconstrained borrow escapes.
         unsafe {
             let s = self.0.cast::<crate::layout::LeanStringObject>();
             let size = (&raw const (*s).m_size).read();
@@ -537,12 +563,23 @@ impl Obj {
                 return None;
             }
             let data = (&raw const (*s).m_data).cast::<u8>();
-            let copy = core::slice::from_raw_parts(data, size).to_vec();
-            if copy[size - 1] != 0 {
+            let bytes = core::slice::from_raw_parts(data, size);
+            if bytes[size - 1] != 0 {
                 return None;
             }
-            Some((size, cap, len, copy))
+            Some((size, cap, len, bytes))
         }
+    }
+
+    /// Copy a fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    ///
+    /// Uses [`Self::try_borrow_string_view`]'s category, header, and terminator
+    /// checks before allocating the copy. Resource-bounded callers should use
+    /// that borrowed view to check their allowance before copying; this
+    /// convenience observer retains its original owned-byte behavior.
+    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+        self.try_borrow_string_view()
+            .map(|(size, cap, len, bytes)| (size, cap, len, bytes.to_vec()))
     }
 
     /// String salient facts `(size, capacity, length, bytes-with-NUL)`.
@@ -631,7 +668,7 @@ impl Obj {
         }
     }
 
-    /// Fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    /// Borrow an sarray view `(elem_size, size, capacity, live-bytes)`.
     ///
     /// Returns `None` when the handle is not a scalar array, `m_other`
     /// (element size) is 0, `m_size` is past `m_capacity`, or
@@ -641,25 +678,47 @@ impl Obj {
     /// `m_size` and `m_capacity` past the minted allocation remains
     /// outside this check (same residual as [`try_array_view`]): the
     /// test plants `m_size` only, so Drop still frees with the real
-    /// `m_capacity`.
-    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+    /// `m_capacity`. The immutable slice borrows this owning handle; there is
+    /// no allocation or reference transfer, and no spare capacity is exposed.
+    /// Callers can check a byte allowance before scanning or copying data.
+    ///
+    /// ```compile_fail
+    /// use fln_unsafe_abi::handle::Obj;
+    /// let bytes = {
+    ///     let value = Obj::mk_sarray(1, b"borrowed");
+    ///     value.try_borrow_sarray_view().unwrap().3
+    /// };
+    /// assert_eq!(bytes, b"borrowed");
+    /// ```
+    pub fn try_borrow_sarray_view(&self) -> Option<(u8, usize, usize, &[u8])> {
         if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_SCALAR_ARRAY) {
             return None;
         }
         // SAFETY: tag is TAG_SCALAR_ARRAY, so the object is a
         // LeanSarrayObject. `m_size <= m_capacity` is the inline-buffer
         // law: the minted data area is `m_capacity * elem_size` bytes.
-        // Copying `m_size * elem_size` after that check and the overflow
-        // check cannot run past the header's own capacity claim.
+        // Reading `m_size * elem_size` after that check and the overflow
+        // check cannot run past the header's own capacity claim. The owning
+        // &self keeps that immutable allocation live for the returned borrow.
         unsafe {
             let (elem, size, cap, data) = object::sarray_fields(self.0);
             if elem == 0 || size > cap {
                 return None;
             }
             let nbytes = size.checked_mul(usize::from(elem))?;
-            let copy = core::slice::from_raw_parts(data, nbytes).to_vec();
-            Some((elem, size, cap, copy))
+            let bytes = core::slice::from_raw_parts(data, nbytes);
+            Some((elem, size, cap, bytes))
         }
+    }
+
+    /// Copy a fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    ///
+    /// Uses [`Self::try_borrow_sarray_view`]'s category and layout checks.
+    /// Bounded consumers should use that borrowed view before allocating;
+    /// this convenience observer retains its original owned-copy behavior.
+    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+        self.try_borrow_sarray_view()
+            .map(|(elem, size, cap, bytes)| (elem, size, cap, bytes.to_vec()))
     }
 
     #[cfg(test)]
@@ -1198,7 +1257,7 @@ impl Obj {
 }
 
 fn canonical_stdio_string(value: &Obj) -> bool {
-    let Some((size, _, length, bytes)) = value.try_string_view() else {
+    let Some((size, _, length, bytes)) = value.try_borrow_string_view() else {
         return false;
     };
     std::str::from_utf8(&bytes[..size - 1]).is_ok_and(|text| text.chars().count() == length)
@@ -1335,3 +1394,6 @@ mod stdio_tests;
 
 #[cfg(test)]
 mod stdio_input_tests;
+
+#[cfg(test)]
+mod sarray_view_tests;

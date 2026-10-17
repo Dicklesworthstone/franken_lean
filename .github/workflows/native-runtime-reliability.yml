@@ -1,0 +1,55 @@
+name: Native runtime reliability
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-elab/src/seed.rs'
+      - 'crates/fln-elab/src/seed/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/tests/runtime_*.rs'
+      - 'crates/fln/tests/source_*decisions.rs'
+      - 'crates/fln-cli/tests/source_equality_decisions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/native-runtime-reliability.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-runtime-reliability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '1'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'true'
+      CARGO_PROFILE_DEV_DEBUG: '2'
+      CARGO_PROFILE_TEST_DEBUG: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
+      - name: Canonical seed streaming and small-stack runtime preparation
+        run: |
+          cargo test --locked -p fln-elab seed_stream_and_early_drop_fit_a_small_stack_without_changing_declarations
+          cargo test --locked -p fln --lib nested_lexical_contexts_prepare_mutual_groups_on_a_small_host_stack
+          cargo test --locked -p fln --lib runtime::decisions::tests
+      - name: Runtime contracts and installed equality execution
+        run: |
+          cargo test --locked -p fln --test runtime_conditionals --test runtime_logic_decisions --test runtime_nat_decisions --test source_equality_decisions --test source_generic_decisions --test source_option_decisions --no-fail-fast
+          cargo test --locked -p fln-cli --test source_equality_decisions
+      - name: Lint all runtime consumers and compile the workspace
+        run: |
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

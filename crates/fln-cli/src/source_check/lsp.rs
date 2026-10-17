@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 mod completion;
 mod dependencies;
+mod interactive;
 mod navigation;
 mod render;
 use fln::source_check::inspect::{ObservationKind, SourceObservation};
@@ -104,7 +105,11 @@ impl Checker {
         // Header parsing uses the complete lexical source view. Keep its exact
         // error offset instead of flattening a syntax error into an I/O failure.
         match fln::source_check::modules::parse_source_header(text.as_bytes()) {
-            Ok(header) if header.imports.is_empty() => self.dependencies.no_imports(uri),
+            Ok(header)
+                if header.imports.is_empty() && (!header.module_system || header.prelude) =>
+            {
+                self.dependencies.no_imports(uri)
+            }
             Ok(_) => {}
             Err(error) => {
                 return project(
@@ -230,6 +235,7 @@ fn failure(
 #[derive(Default)]
 struct Sessions {
     seed: Option<SourceModuleSession>,
+    unseeded: Option<SourceModuleSession>,
     world: Option<World>,
 }
 
@@ -270,6 +276,20 @@ fn select<'a>(
     sources: &Sources,
 ) -> Result<(&'a mut SourceModuleSession, Option<WorldUse>), Unavailable> {
     if sources.olean_roots.is_empty() {
+        if sources.sources.iter().any(|source| {
+            fln::source_check::modules::parse_source_header(source)
+                .is_ok_and(|header| header.module_system)
+        }) {
+            let session = sessions.unseeded.get_or_insert_with(|| {
+                SourceModuleSession::new(
+                    fln::Engine::builder().build_empty(),
+                    fln::KVMap::new(),
+                    check_limits(),
+                    SourceModuleCacheLimits::default(),
+                )
+            });
+            return Ok((session, None));
+        }
         ensure_session(&mut sessions.seed).map_err(Unavailable::Snapshot)?;
         return Ok((
             sessions.seed.as_mut().expect("initialized seed session"),
@@ -488,7 +508,8 @@ fn inspect_sources(
         .map(|(name, source)| fln::SourceModuleInput { name, source })
         .collect();
     let wanted = match kind {
-        QueryKind::Goals => ObservationKind::Goals,
+        QueryKind::Goals | QueryKind::InteractiveGoals => ObservationKind::Goals,
+        QueryKind::TermGoal | QueryKind::InteractiveTermGoal => ObservationKind::TermGoal,
         QueryKind::Hover => ObservationKind::Term,
         QueryKind::Definition => {
             return navigation::definition(session, sources, &inputs, offset);
@@ -511,9 +532,20 @@ fn inspect_sources(
     };
     Ok(match inspected.observation {
         None => None,
-        Some(SourceObservation::Goals { goals, .. }) => {
+        Some(SourceObservation::Goals { range, goals })
+            if matches!(
+                kind,
+                QueryKind::InteractiveGoals | QueryKind::InteractiveTermGoal
+            ) =>
+        {
+            Some(interactive::observe(goals, range, kind)?)
+        }
+        Some(SourceObservation::Goals { range, goals }) => {
             if goals.len() > 256 {
                 return Err("too many goals for one editor response".to_owned());
+            }
+            if kind == QueryKind::TermGoal && goals.len() != 1 {
+                return Err("term inspection did not return exactly one goal".to_owned());
             }
             let mut displayed = Vec::new();
             let mut total = 0usize;
@@ -540,7 +572,12 @@ fn inspect_sources(
                     .ok_or("goal display exceeded its byte limit")?;
                 displayed.push(text);
             }
-            Some(Answer::Goals { goals: displayed })
+            if kind == QueryKind::TermGoal {
+                let goal = displayed.pop().ok_or("term goal display is missing")?;
+                Some(Answer::TermGoal { goal, range })
+            } else {
+                Some(Answer::Goals { goals: displayed })
+            }
         }
         Some(SourceObservation::Term {
             range,

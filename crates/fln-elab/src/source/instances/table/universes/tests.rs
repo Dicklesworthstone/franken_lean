@@ -116,6 +116,8 @@ fn make_path(frame: &Frame) -> [Frame; 1] {
         cursor: 0,
         chosen: None,
         children: vec![],
+        size: 0,
+        parent_size: 0,
         resumable: false,
         replay_first: false,
         returned: false,
@@ -158,7 +160,7 @@ fn output_universe_replay_assigns_each_queries_own_type_and_level_holes() {
         let value = dictionary(Level::one(), c("Nat"));
         assert_eq!(
             table.lookup(&mut ctx, &frame, &path).unwrap(),
-            Some(Answer::Solved(value.clone()))
+            Some(Answer::Solved(value.clone(), 1))
         );
         assert_eq!(ctx.instantiate(&alpha).unwrap(), c("Nat"));
         assert_eq!(

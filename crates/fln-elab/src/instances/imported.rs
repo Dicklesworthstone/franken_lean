@@ -35,7 +35,7 @@ pub(super) struct Metadata {
     pub instances: BTreeMap<Name, InstanceParameters>,
 }
 
-fn name() -> Name {
+pub(super) fn name() -> Name {
     Name::from_components(["FrankenLean", "importedInstances", "v2"])
 }
 fn descriptor() -> ExtensionDescriptor {
@@ -427,7 +427,8 @@ pub fn register_instance(
 pub struct ImportActivation {
     env: Environment,
     registry: Option<(InstanceRegistry, super::Positions)>,
-    defaults: Option<Vec<Name>>,
+    defaults: Option<usize>,
+    structures: Option<crate::records::imported::Activation>,
 }
 
 /// The ordinary registry as [`InstanceRegistry::read`] would find it in `env`,
@@ -454,6 +455,7 @@ impl ImportActivation {
             env,
             registry: None,
             defaults: None,
+            structures: None,
         }
     }
 
@@ -549,20 +551,12 @@ impl ImportActivation {
     ) -> Result<Self, InstanceRegistryError> {
         let existing = match &mut self.defaults {
             Some(existing) => existing,
-            None => self.defaults.insert(
-                super::defaults::read(&self.env)?
-                    .into_iter()
-                    .map(|row| row.candidate.declaration)
-                    .collect(),
-            ),
+            None => self
+                .defaults
+                .insert(super::defaults::read(&self.env)?.len()),
         };
-        if existing.len() >= MAX_ROWS {
+        if *existing >= MAX_ROWS {
             return Err(InstanceRegistryError::Limit);
-        }
-        if existing.contains(declaration) {
-            return Err(InstanceRegistryError::DuplicateInstance(
-                declaration.clone(),
-            ));
         }
         let class = validate_instance(&self.env, declaration)?;
         let (registry, _) = kept(&mut self.registry, &self.env)?;
@@ -570,7 +564,7 @@ impl ImportActivation {
             return Err(InstanceRegistryError::UnknownClass(class));
         }
         self.env = super::defaults::append(&self.env, declaration, priority)?;
-        existing.push(declaration.clone());
+        *existing += 1;
         Ok(self)
     }
 
@@ -594,6 +588,26 @@ impl ImportActivation {
         declarations: &[Name],
     ) -> Result<Self, crate::protected_names::ProtectedError> {
         self.env = crate::protected_names::register_module(&self.env, declarations)?;
+        Ok(self)
+    }
+
+    /// Retain one checked module's internal auxiliary-recursor tags. This
+    /// journal does not affect the kept class or instance state.
+    pub fn register_aux_recursors(
+        mut self,
+        declarations: &[Name],
+    ) -> Result<Self, crate::aux_recursors::AuxRecursorError> {
+        self.env = crate::aux_recursors::register_module(&self.env, declarations)?;
+        Ok(self)
+    }
+
+    /// Record a checked owning module's noncomputable tag. This changes no
+    /// instance candidate or cached typeclass metadata.
+    pub fn register_noncomputable(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::noncomputable::NoncomputableError> {
+        self.env = crate::noncomputable::register(&self.env, declaration)?;
         Ok(self)
     }
 
@@ -621,6 +635,37 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain a compatible imported executable replacement. Logical constants
+    /// and the kept class/instance registries remain unchanged.
+    pub fn register_implemented_by(
+        mut self,
+        declaration: &Name,
+        implementation: &Name,
+    ) -> Result<Self, crate::implemented_by::ImplementedByError> {
+        self.env = crate::implemented_by::register(&self.env, declaration, implementation)?;
+        Ok(self)
+    }
+
+    /// Retain this module's original structure identities after checked
+    /// constructor/projection validation. These journals do not affect the kept
+    /// class or instance state, and no declarations are added by registration.
+    pub fn register_structures(
+        mut self,
+        rows: &[crate::records::imported::StructureEntry],
+    ) -> Result<Self, crate::records::RecordError> {
+        if rows.is_empty() {
+            return Ok(self);
+        }
+        let state = match self.structures.take() {
+            Some(state) => state,
+            None => crate::records::imported::Activation::read(&self.env)?,
+        };
+        let (state, env) = state.register(&self.env, rows)?;
+        self.structures = Some(state);
+        self.env = env;
+        Ok(self)
+    }
+
     /// The activated environment, once each journal touched has been read back
     /// whole and found to agree.
     pub fn finish(self) -> Result<Environment, InstanceRegistryError> {
@@ -629,6 +674,15 @@ impl ImportActivation {
         }
         if self.defaults.is_some() {
             super::defaults::read(&self.env)?;
+        }
+        if self.structures.is_some() {
+            crate::records::imported::ImportedStructures::read(&self.env).map_err(|error| {
+                if error == crate::records::RecordError::ResourceLimit {
+                    InstanceRegistryError::Limit
+                } else {
+                    InstanceRegistryError::Malformed
+                }
+            })?;
         }
         Ok(self.env)
     }

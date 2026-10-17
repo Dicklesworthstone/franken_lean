@@ -3,6 +3,8 @@
 //! default never manufactures a declaration or changes ordinary search order.
 use super::*;
 
+mod export;
+
 const DEFAULT_MAGIC: &[u8] = b"FLNDEFI\x01";
 fn name() -> Name {
     Name::from_components(["FrankenLean", "sourceDefaultInstances", "v1"])
@@ -14,6 +16,14 @@ fn descriptor() -> ExtensionDescriptor {
         checkpoint: CheckpointSemantics::FullJournal,
         provenance: PayloadProvenance::Understood,
     }
+}
+
+pub fn journal_name() -> Name {
+    name()
+}
+
+pub fn supports(candidate: &ExtensionDescriptor) -> bool {
+    *candidate == descriptor()
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultInstance {
@@ -32,7 +42,6 @@ pub fn read(env: &Environment) -> Result<Vec<DefaultInstance>, InstanceRegistryE
         return Err(InstanceRegistryError::Limit);
     }
     let registry = InstanceRegistry::read(env)?;
-    let mut seen = BTreeSet::new();
     let mut result = Vec::new();
     for (order, entry) in extension.entries().enumerate() {
         if entry.payload.len() > MAX_ENTRY_BYTES {
@@ -48,7 +57,7 @@ pub fn read(env: &Environment) -> Result<Vec<DefaultInstance>, InstanceRegistryE
                 .try_into()
                 .map_err(|_| InstanceRegistryError::Malformed)?,
         );
-        if !bytes.is_empty() || !seen.insert(declaration.clone()) {
+        if !bytes.is_empty() {
             return Err(InstanceRegistryError::Malformed);
         }
         let class = validate_instance(env, &declaration)?;
@@ -84,19 +93,30 @@ pub fn register(
     if existing.len() >= MAX_ROWS {
         return Err(InstanceRegistryError::Limit);
     }
-    if existing
-        .iter()
-        .any(|row| &row.candidate.declaration == declaration)
-    {
-        return Err(InstanceRegistryError::DuplicateInstance(
-            declaration.clone(),
-        ));
-    }
     let class = validate_instance(env, declaration)?;
     if !InstanceRegistry::read(env)?.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));
     }
     append(env, declaration, priority)
+}
+
+/// The exact module-owned default journal suffix, in chronological order.
+/// Ownership belongs to each registration, including registrations of imported
+/// candidates. Repeated declarations remain distinct entries, as in the pin's
+/// `addDefaultInstanceEntry` (Lean/Meta/Instances.lean).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Registrations {
+    pub entries: Vec<DefaultInstance>,
+    pub work: usize,
+    pub bytes_examined: usize,
+}
+
+pub fn registrations(
+    base: &Environment,
+    result: &Environment,
+    max_work: usize,
+) -> Result<Registrations, InstanceRegistryError> {
+    export::registrations(base, result, max_work)
 }
 
 /// Append the journal row for an already validated default candidate.

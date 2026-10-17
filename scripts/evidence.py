@@ -19442,8 +19442,12 @@ def artifact_role(rel: str) -> str:
 
 # The one location that may hold a retained test input whose artifact kind the
 # bundle publisher forbids.  It is deliberately not under the repository and not
-# under any artifact root: nothing published ever walks it.
-RETAINED_FIXTURE_ROOT = Path("/data/tmp")
+# under any artifact root: nothing published ever walks it.  On the development
+# host that is /data/tmp.  A CI runner has no /data, and hard-coding it made the
+# self-test, and with it stage 1 of every ci.yml run, die on mkdir
+# (bead fln-ci-fixture-root-dev-host-path-8gdb); there /tmp serves, which is
+# likewise outside the repository and every artifact root.
+RETAINED_FIXTURE_ROOT = Path("/data/tmp") if Path("/data/tmp").is_dir() else Path("/tmp")
 
 
 def forbidden_artifact_kind(mode: int) -> str | None:

@@ -543,7 +543,7 @@ impl Context {
     }
 
     /// Congruence under a nondependent function, retaining the supplied evidence.
-    fn selector_congruence(
+    pub(super) fn selector_congruence(
         &mut self,
         equality: &Typed,
         codomain: &Expr,
@@ -889,6 +889,47 @@ impl Context {
 }
 
 impl Context {
+    /// Deriving reuses the same checked selector/transport proof as injection.
+    /// The caller supplies an actual constructor equality and a bounded field
+    /// index; a missing or dependent selector is never replaced with an axiom.
+    pub(in crate::source) fn constructor_injection_evidence(
+        &mut self,
+        evidence: &Typed,
+        index: usize,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let type_ = self.whnf(&evidence.type_)?;
+        let Some((_, alpha, lhs, rhs)) = equality_target(&type_) else {
+            return Ok(None);
+        };
+        let Some(family) = self.reasoning_family(&alpha, true)? else {
+            return Ok(None);
+        };
+        let Some(left) = self.equality_constructor(&lhs, &family)? else {
+            return Ok(None);
+        };
+        let Some(right) = self.equality_constructor(&rhs, &family)? else {
+            return Ok(None);
+        };
+        if left.name != right.name || index >= left.fields.len() || index >= right.fields.len() {
+            return Ok(None);
+        }
+        self.constructor_field_equality(evidence, &family, &left, &right, index)
+    }
+
+    /// A constructor clash is ordinary equality elimination into False.
+    pub(in crate::source) fn constructor_clash_evidence(
+        &mut self,
+        evidence: &Typed,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let false_ = Expr::const_(Name::from_components(["False"]), Vec::new());
+        Ok(self
+            .refute_index_evidence(evidence, &false_)?
+            .map(|value| Typed {
+                value,
+                type_: false_,
+            }))
+    }
+
     /// Only the generated index equation is considered here, not arbitrary
     /// assumptions in the user's context. Missing branches require explicit
     /// constructor/literal inconsistency in their retained equation premises.
@@ -930,7 +971,7 @@ impl Context {
         self.constructor_clash(&evidence, &family, &right.name, target)
     }
 
-    fn empty_evidence(
+    pub(super) fn empty_evidence(
         &mut self,
         evidence: &Typed,
         target: &Expr,
@@ -1022,6 +1063,20 @@ impl Context {
                 type_: local.type_.clone(),
             })
             .collect();
+        self.contradict_evidence_goal(goal, original)
+    }
+
+    /// Contradiction from an explicit set of checked evidence. Empty matches
+    /// pass only their discriminants and exposed constructor fields: the pin's
+    /// matcher closure does not capture unrelated ambient hypotheses.
+    pub(super) fn contradict_evidence_goal(
+        &mut self,
+        goal: ProofGoal,
+        original: Vec<Typed>,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
         // The pin's `contradictionCore` (vendored Lean/Meta/Tactic/Contradiction.lean) refutes
         // an `Eq` or `HEq` hypothesis by its HEAD constructors only; it never injects into
         // fields. A nested clash it reaches only through `decide` (`Config.useDecide`,

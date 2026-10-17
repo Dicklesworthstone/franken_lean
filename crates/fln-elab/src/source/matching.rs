@@ -9,7 +9,9 @@ use super::*;
 use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
+mod conditional_order;
 mod mutual;
+mod nomatch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
@@ -70,6 +72,8 @@ pub(super) struct MatchParts<'a> {
     pub(super) equation: Option<&'a Syntax>,
     alternatives: &'a [Syntax],
     pub(super) generated: bool,
+    /// A `match` as written in the source, not one a sugar or the compiler produced.
+    written: bool,
     conditional: Option<ConditionalParts<'a>>,
 }
 #[derive(Clone, Copy)]
@@ -116,6 +120,7 @@ pub(super) struct MatchBuild<'a> {
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
+    conditional_order: Option<conditional_order::ConditionalOrder>,
 }
 pub(super) struct BranchBinders {
     // Old indices whose direct field patterns lack an index-equation witness.
@@ -137,7 +142,11 @@ pub(super) enum MatchStep<'a> {
 
 pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
     if let Syntax::Ident { val, .. } = syntax {
-        if val.is_anonymous() || !val.parent().is_anonymous() {
+        // Quotation-generated pattern binders are atomic before macro scopes
+        // are attached. Retain the scoped identity for local lookup; erasing
+        // it here would capture caller variables in the branch body.
+        let unscoped = val.erase_macro_scopes();
+        if unscoped.is_anonymous() || !unscoped.parent().is_anonymous() {
             return Err(error(MatchError::InvalidPattern));
         }
         return Ok(Some(val.clone()));
@@ -251,7 +260,9 @@ impl Context {
                 let Syntax::Ident { val, .. } = &name[0] else {
                     return Err(error(MatchError::InvalidPattern));
                 };
-                if val.is_anonymous() || !val.parent().is_anonymous() {
+                if val.erase_macro_scopes().is_anonymous()
+                    || !val.erase_macro_scopes().parent().is_anonymous()
+                {
                     return Err(error(MatchError::InvalidPattern));
                 }
                 (Some(val), &parts[3..])
@@ -266,6 +277,7 @@ impl Context {
                 equation: None,
                 alternatives: &[],
                 generated: true,
+                written: false,
                 conditional: Some(ConditionalParts {
                     binding,
                     yes: &rest[2],
@@ -286,7 +298,8 @@ impl Context {
             let binding = match expect_null_args(&parts[1], "conditional evidence")? {
                 [] => None,
                 [Syntax::Ident { val, .. }, colon]
-                    if !val.is_anonymous() && val.parent().is_anonymous() =>
+                    if !val.erase_macro_scopes().is_anonymous()
+                        && val.erase_macro_scopes().parent().is_anonymous() =>
                 {
                     expect_atom(colon, ":", "conditional evidence separator")?;
                     Some(val)
@@ -298,6 +311,7 @@ impl Context {
                 equation: None,
                 alternatives: &[],
                 generated: true,
+                written: false,
                 conditional: Some(ConditionalParts {
                     binding,
                     yes: &parts[4],
@@ -355,6 +369,8 @@ impl Context {
             equation,
             alternatives,
             generated,
+            written: matches!(&parts[0], Syntax::Atom { info, .. }
+                if matches!(info, fln_syntax::source::SourceInfo::Original { .. })),
             conditional: None,
         })
     }
@@ -418,13 +434,31 @@ impl Context {
         mut major: Typed,
         expected: Option<Expr>,
     ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
-        if let Some(conditional) = parts.conditional {
-            let type_ = self.whnf(&major.type_)?;
-            if type_ == Expr::const_(Name::from_components(["Bool"]), vec![]) {
-                if conditional.binding.is_some() {
-                    return Err(error(MatchError::ExpectedCondition));
-                }
-            } else if type_ == Expr::sort(Level::zero()) {
+        if let Some(binding) = parts.conditional.as_ref().map(|c| c.binding.is_some()) {
+            let mut type_ = self.whnf(&major.type_)?;
+            let boolean = Expr::const_(Name::from_components(["Bool"]), vec![]);
+            // A conditional never refines its condition, as the pin's `ite`/`dite` never do: the
+            // case split below is on a copy of the condition (`start_refined_match`), so a branch
+            // that needs `b` replaced (`if b then Or.inl rfl else Or.inr rfl` against
+            // `b = true ∨ b = false`) is refused, as at the pin. `if h : b` is the pin's
+            // `dite (b = true)`, its evidence `h : b = true`: the decided proposition below.
+            if type_ == boolean && binding {
+                major = Typed {
+                    value: [
+                        boolean.clone(),
+                        major.value,
+                        Expr::const_(Name::from_components(["Bool", "true"]), vec![]),
+                    ]
+                    .into_iter()
+                    .fold(
+                        Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                        Expr::app,
+                    ),
+                    type_: Expr::sort(Level::zero()),
+                };
+                type_ = Expr::sort(Level::zero());
+            }
+            if type_ == Expr::sort(Level::zero()) {
                 // Keep the condition in the checked dictionary's type and both
                 // branches in the ordinary Decidable recursor. No source branch
                 // is selected by evaluating a proposition or a host Boolean.
@@ -452,15 +486,33 @@ impl Context {
                     type_,
                 };
                 self.resolve_instances(false)?;
-            } else {
+            } else if type_ != boolean {
                 return Err(error(MatchError::ExpectedCondition));
             }
+        }
+        // A match as written is refused where the pin refuses its patterns' types; the lowering
+        // below would solve index equations the pin leaves alone (`pattern_typing`).
+        if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
+            self.check_pattern_typing(
+                &[(major.value.clone(), major.type_.clone())],
+                parts.alternatives,
+            )?;
         }
         // Keep the existing direct/index-polymorphic path, including recursive
         // call lowering. Only the precise index-shape refusal selects the
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
-        if parts.equation.is_some() || parts.generated && !recursive {
+        let well_founded = self.well_founded_continuation().is_some();
+        if well_founded && parts.equation.is_some() {
+            // That backend substitutes the whole local dependency cone. A
+            // well-founded call must preserve original captured arguments;
+            // named-equation support needs the same dedicated treatment.
+            return Err(error(MatchError::UnrefinedIndices));
+        }
+        if well_founded && parts.generated && parts.conditional.is_none() {
+            major = self.well_founded_match_input(major)?;
+        }
+        if parts.equation.is_some() || parts.generated && !recursive && !well_founded {
             // Earlier columns may occur in later discriminant types. The
             // shared elimination engine generalizes that entire dependency
             // cone; treating each split as an independent case loses it.
@@ -473,7 +525,7 @@ impl Context {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
                 MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
-            ))) => {
+            ))) if !well_founded => {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = saved;
                 self.txn.budget.heartbeats_consumed = spent;
@@ -594,6 +646,7 @@ impl Context {
                     // Replaced by the checked body before completion.
                     recursor: major,
                     branches: std::collections::VecDeque::new(),
+                    conditional_order: None,
                 });
             }
         }
@@ -633,7 +686,10 @@ impl Context {
         let mut generalized = Vec::new();
         if recursive {
             self.recursive_indices(name, &parameters, &indices)?;
-        } else if !indices.is_empty() {
+        } else if !indices.is_empty() || self.well_founded_continuation().is_some() {
+            // Well-founded matches specialize the private continuation and
+            // dependent hypotheses too. Genuine source lets remain captured,
+            // retaining their original values in recursive call arguments.
             let mut dependencies: HashSet<_> =
                 indices.iter().map(|index| index.id.clone()).collect();
             // Parameters stay fixed. Index domains, however, form a telescope:
@@ -772,6 +828,12 @@ impl Context {
                 syntax,
             });
         }
+        let conditional_order = self.order_well_founded_conditional(
+            parts.conditional.is_some(),
+            name,
+            &recursor,
+            &mut branches,
+        )?;
         Ok(MatchBuild {
             direct: None,
             recursive,
@@ -787,6 +849,7 @@ impl Context {
             levels: levels.clone(),
             recursor,
             branches,
+            conditional_order,
         })
     }
 
@@ -1191,13 +1254,18 @@ impl Context {
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-        let type_ = self.whnf(&state.recursor.type_)?;
-        let ExprNode::ForallE {
-            binder_type: minor_type,
-            ..
-        } = type_.node()
-        else {
-            return Err(error(MatchError::UnsupportedFamily));
+        let minor_type = if let Some(order) = &mut state.conditional_order {
+            self.next_ordered_conditional_domain(order)?
+        } else {
+            let type_ = self.whnf(&state.recursor.type_)?;
+            let ExprNode::ForallE {
+                binder_type: minor_type,
+                ..
+            } = type_.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            minor_type.clone()
         };
         let mut target = minor_type.clone();
         let mut locals = Vec::new();
@@ -1377,7 +1445,12 @@ impl Context {
         // otherwise a captured let would lose its actual free-variable scope.
         // In particular, obsolete dictionaries must not stay searchable merely
         // because their replacement was given the same name.
-        if !state.generalized.is_empty() {
+        // Well-founded calls may retain old identities through cached proof
+        // transports. Those ambient locals remain privately available, while
+        // ordinary source proof and instance search see the specialized ones.
+        if !state.generalized.is_empty()
+            && !self.hide_well_founded_match_locals(&state.generalized)?
+        {
             let candidates: HashSet<_> = state
                 .generalized
                 .iter()
@@ -1506,13 +1579,13 @@ impl Context {
             };
             return Ok(());
         }
-        state.recursor = self.match_apply(
-            state.recursor.clone(),
-            Typed {
-                value,
-                type_: binders.type_,
-            },
-        )?;
+        let value = Typed {
+            value,
+            type_: binders.type_,
+        };
+        if !self.accept_ordered_conditional_minor(state, value.clone())? {
+            state.recursor = self.match_apply(state.recursor.clone(), value)?;
+        }
         Ok(())
     }
 }

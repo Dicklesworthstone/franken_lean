@@ -9,12 +9,14 @@ pub(super) mod audit;
 mod parameters;
 mod reconcile;
 mod table;
+mod tabled;
 
 #[cfg(test)]
 mod index_tests;
 
 const MAX_SEARCH_DEPTH: usize = 128;
 const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
+const DEFAULT_MAX_RESULT_SIZE: u64 = 128;
 /// The pin's `maxSynthPendingDepth` default (vendored Meta/Basic.lean). As in
 /// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
 pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
@@ -134,10 +136,12 @@ enum Candidate {
     Local(FVarId),
     Global(Name),
 }
+#[derive(Clone)]
 struct Expansion {
     value: Expr,
     subgoals: Vec<MVarId>,
 }
+#[derive(Clone)]
 struct Frame {
     goal: MVarId,
     target: Expr,
@@ -151,6 +155,10 @@ struct Frame {
     // Successful prerequisites remain resumable until the enclosing candidate
     // completes. Arena indices keep this history flat, not recursively cloned.
     children: Vec<usize>,
+    // Number of prerequisite instances consumed by this candidate. Restoring
+    // a historical child also restores the enclosing candidate's prior size.
+    size: u64,
+    parent_size: u64,
     resumable: bool,
     // A table hit returns the first answer but retains a lazy continuation.
     // On backtracking rebuild its choices, skip that answer once, then resume
@@ -165,6 +173,13 @@ pub(super) fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabE
 }
 
 impl Context {
+    fn instance_max_result_size(&self) -> u64 {
+        self.txn.options.get_nat(
+            &Name::from_components(["synthInstance", "maxSize"]),
+            DEFAULT_MAX_RESULT_SIZE,
+        )
+    }
+
     /// The current environment's instance registry, read once per change of
     /// what it reads ([`crate::instances::RegistryCache`]).
     pub(super) fn instance_registry(
@@ -200,6 +215,15 @@ impl Context {
         result.map_err(registry_error)
     }
 }
+
+/// The distinct default priorities, highest first (`getDefaultInstancesPriorities`).
+fn default_priorities(defaults: &[crate::instances::defaults::DefaultInstance]) -> Vec<u32> {
+    let mut priorities: Vec<u32> = defaults.iter().map(|row| row.candidate.priority).collect();
+    priorities.sort_unstable_by(|a, b| b.cmp(a));
+    priorities.dedup();
+    priorities
+}
+
 pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
     // A completed closed-conversion refusal can start another coercion or
     // instance trial. Exhaustion, cancellation and faults remain terminal.
@@ -236,6 +260,59 @@ pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
 }
 
 impl Context {
+    /// The universe holes of `exprs`, instantiated. A shared subterm is walked once, and a subterm
+    /// without a universe hole is skipped whole.
+    fn level_holes(
+        &mut self,
+        exprs: &[Expr],
+    ) -> Result<std::collections::HashSet<LMVarId>, NatDefinitionElabError> {
+        let mut holes = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            pending.push(self.instantiate(expr)?);
+        }
+        while let Some(expr) = pending.pop() {
+            self.tick()?;
+            if !expr.has_level_mvar() || !seen.insert(expr.allocation_identity()) {
+                continue;
+            }
+            let mut levels: Vec<Level> = Vec::new();
+            match expr.node() {
+                ExprNode::Sort { level } => levels.push(level.clone()),
+                ExprNode::Const { levels: args, .. } => levels.extend(args.iter().cloned()),
+                ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type.clone(), body.clone()]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_.clone(), value.clone(), body.clone()]),
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    pending.push(expr.clone());
+                }
+                _ => {}
+            }
+            while let Some(level) = levels.pop() {
+                match level.view() {
+                    fln_core::level::LevelView::MVar(id) => {
+                        holes.insert(id.clone());
+                    }
+                    fln_core::level::LevelView::Succ(inner) => levels.push(inner.clone()),
+                    fln_core::level::LevelView::Max(a, b)
+                    | fln_core::level::LevelView::IMax(a, b) => {
+                        levels.extend([a.clone(), b.clone()]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(holes)
+    }
+
     fn instance_type(&mut self, type_: &Expr) -> Result<Expr, NatDefinitionElabError> {
         // Class discovery unfolds abbreviations, but neither ordinary
         // definitions nor local type aliases. Candidate matching can still
@@ -266,9 +343,10 @@ impl Context {
         &mut self,
         domain: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         let mut trial = self.clone();
         let mut target = domain.clone();
         let result = (|| {
@@ -315,13 +393,15 @@ impl Context {
             .instance_goals
             .iter()
             .all(|id| self.txn.mvars.is_assigned(id))
+            && self.postponed_coercions.is_empty()
         {
             return Ok(());
         }
         self.flush(false)?;
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         loop {
             let before = self.txn.mvars.assignments().len();
             for id in self.instance_goals.clone() {
@@ -365,7 +445,16 @@ impl Context {
             // blocked OfNat/HAdd goals must not exhaust the command budget
             // before the final default-instance phase becomes eligible.
             if self.txn.mvars.assignments().len() == before {
+                // As the pin's synthesis loop: resume postponed coercions at
+                // the fixed point, and only then try a default instance.
+                if self.resume_postponed_coercions()? {
+                    self.flush(false)?;
+                    continue;
+                }
                 if final_pass && self.resolve_default_instance(&registry)? {
+                    // As after an ordinary answer: the default's assignments may decide
+                    // suspended equations (`?β × ?γ =?= Nat × Nat`) that block other goals.
+                    self.flush(false)?;
                     continue;
                 }
                 break;
@@ -374,6 +463,11 @@ impl Context {
             // projections. Resume every retained equation after that progress;
             // skipping a redundant pass is not permission to drop obligations.
             self.flush(false)?;
+        }
+        if final_pass {
+            // What is still open is refused as it was found, before any
+            // instance goal it left unsolved is reported instead.
+            self.finish_postponed_coercions()?;
         }
         if final_pass
             && self
@@ -391,9 +485,10 @@ impl Context {
     /// after ordinary synthesis, while postponing unrelated instance goals.
     pub(super) fn resolve_instances_with_defaults(&mut self) -> Result<(), NatDefinitionElabError> {
         self.resolve_instances(false)?;
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         while self.resolve_default_instance(&registry)? {
             self.resolve_instances(false)?;
         }
@@ -405,9 +500,10 @@ impl Context {
     /// pending numeral, so defaulting all goals before resuming is too early.
     /// The caller first reaches ordinary synthesis's fixed point.
     pub(super) fn resolve_next_default_instance(&mut self) -> Result<bool, NatDefinitionElabError> {
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         self.resolve_default_instance(&registry)
     }
 
@@ -419,53 +515,176 @@ impl Context {
         registry: &InstanceRegistry,
     ) -> Result<bool, NatDefinitionElabError> {
         let defaults = crate::instances::defaults::read(&self.txn.env).map_err(registry_error)?;
-        let mut priorities = std::collections::BTreeSet::new();
-        for row in &defaults {
-            priorities.insert(row.candidate.priority);
-        }
-        for priority in priorities.into_iter().rev() {
+        for priority in default_priorities(&defaults) {
             for id in self.instance_goals.clone() {
                 self.tick()?;
                 if self.txn.mvars.is_assigned(&id) {
                     continue;
                 }
-                let decl = self
-                    .txn
-                    .mvars
-                    .get_decl(&id)
-                    .cloned()
-                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                let mut probe = self.clone();
-                probe.txn.lctx = decl.lctx;
-                let target = probe.instance_type(&decl.type_);
-                self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
-                let Some(class) = result_head(&target?) else {
+                let Some(class) = self.goal_class(&id)? else {
                     continue;
                 };
-                for row in &defaults {
+                if self.default_at_priority(&id, &class, priority, registry, &defaults, 0)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The class a pending instance goal asks for, if its type has a class head.
+    fn goal_class(&mut self, id: &MVarId) -> Result<Option<Name>, NatDefinitionElabError> {
+        let decl = self
+            .txn
+            .mvars
+            .get_decl(id)
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        let mut probe = self.clone();
+        probe.txn.lctx = decl.lctx;
+        let target = probe.instance_type(&decl.type_);
+        self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
+        Ok(result_head(&target?))
+    }
+
+    /// `synthesizeUsingDefaultPrio` (vendored Lean/Elab/SyntheticMVars.lean): the defaults of
+    /// `priority` for this goal's class, in list order. The pin prepends each default
+    /// registration and tries that list from its head (Meta/Instances.lean); `defaults::read`
+    /// already orders rows by descending priority, then newest registration first, so the
+    /// order is kept here: `Pow`'s `Pow α α` is tried before the older `instPowNat`.
+    fn default_at_priority(
+        &mut self,
+        id: &MVarId,
+        class: &Name,
+        priority: u32,
+        registry: &InstanceRegistry,
+        defaults: &[crate::instances::defaults::DefaultInstance],
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        for row in defaults {
+            self.tick()?;
+            if row.candidate.priority != priority || &row.class != class {
+                continue;
+            }
+            if self.apply_default(id, &row.candidate.declaration, registry, defaults, depth)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `synthesizeUsingDefaultInstance`, under `commitWhen`: apply the default to fresh holes,
+    /// then `synthesizePending` its instance arguments. A default whose arguments do not all
+    /// resolve now is rolled back and the next one is tried: `Pow α α` applies to `Pow Nat ?β`,
+    /// but `HomogeneousPow Nat` has no instance, so `2 ^ 10` takes `instPowNat`.
+    fn apply_default(
+        &mut self,
+        id: &MVarId,
+        declaration: &Name,
+        registry: &InstanceRegistry,
+        defaults: &[crate::instances::defaults::DefaultInstance],
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let known: std::collections::HashSet<MVarId> =
+            self.instance_goals.iter().cloned().collect();
+        let mut trial = self.clone();
+        let saved = trial.txn.lctx.clone();
+        let suspended = std::mem::take(&mut trial.equations);
+        let result = trial.search_instance_mode(id.clone(), registry, Some(declaration));
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        if result? != SearchResult::Solved {
+            return Ok(false);
+        }
+        trial.txn.lctx = saved;
+        trial.equations.extend(suspended);
+        let pending = trial
+            .instance_goals
+            .iter()
+            .filter(|goal| !known.contains(*goal) && !trial.txn.mvars.is_assigned(goal))
+            .cloned()
+            .collect();
+        let settled = trial.synthesize_pending_arguments(pending, registry, defaults, depth);
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(error) if nonmatch(&error) => false,
+            Err(error) => return Err(error),
+        };
+        if settled {
+            *self = trial;
+        }
+        Ok(settled)
+    }
+
+    /// `synthesizePending`: ordinary synthesis to a fixed point, then one default for the first
+    /// goal that takes one (`synthesizeSomeUsingDefault?`), until no goal is left. False when a
+    /// goal takes neither. The nesting bound is this engine's own; past it the default is not
+    /// applied, so a deeper chain is refused, never accepted.
+    fn synthesize_pending_arguments(
+        &mut self,
+        mut pending: Vec<MVarId>,
+        registry: &InstanceRegistry,
+        defaults: &[crate::instances::defaults::DefaultInstance],
+        depth: usize,
+    ) -> Result<bool, NatDefinitionElabError> {
+        const MAX_DEFAULT_NESTING: usize = 16;
+        loop {
+            loop {
+                let count = pending.len();
+                let mut blocked = Vec::new();
+                for goal in pending {
                     self.tick()?;
-                    if row.candidate.priority != priority || row.class != class {
+                    if self.txn.mvars.is_assigned(&goal) {
                         continue;
                     }
                     let mut trial = self.clone();
                     let saved = trial.txn.lctx.clone();
                     let suspended = std::mem::take(&mut trial.equations);
-                    let result = trial.search_instance_mode(
-                        id.clone(),
-                        registry,
-                        Some(&row.candidate.declaration),
-                    );
+                    let result = trial.search_instance(goal.clone(), registry);
                     self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                     if result? == SearchResult::Solved {
                         trial.txn.lctx = saved;
                         trial.equations.extend(suspended);
                         *self = trial;
-                        return Ok(true);
+                    } else {
+                        blocked.push(goal);
+                    }
+                }
+                pending = blocked;
+                if pending.is_empty() || pending.len() == count {
+                    break;
+                }
+            }
+            if pending.is_empty() {
+                return Ok(true);
+            }
+            if depth >= MAX_DEFAULT_NESTING {
+                return Ok(false);
+            }
+            let mut taken = None;
+            'goals: for (index, goal) in pending.iter().enumerate() {
+                let Some(class) = self.goal_class(goal)? else {
+                    continue;
+                };
+                for priority in default_priorities(defaults) {
+                    if self.default_at_priority(
+                        goal,
+                        &class,
+                        priority,
+                        registry,
+                        defaults,
+                        depth + 1,
+                    )? {
+                        taken = Some(index);
+                        break 'goals;
                     }
                 }
             }
+            let Some(index) = taken else {
+                return Ok(false);
+            };
+            pending.remove(index);
         }
-        Ok(false)
     }
 
     /// Build a speculative frame. Unknown ordinary inputs block this goal;
@@ -593,6 +812,8 @@ impl Context {
             cursor: 0,
             chosen: None,
             children: Vec::new(),
+            size: 0,
+            parent_size: 0,
         }))
     }
 
@@ -634,10 +855,16 @@ impl Context {
             };
             let body = body.clone();
             let arg = if *binder_info == BinderInfo::InstImplicit {
-                let arg = self.instance_hole(binder_type.clone())?;
+                // These are search-internal binders, not source-owned goals.
+                // The pin's getSubgoals creates ordinary assignable variables
+                // for every binder, including dictionaries. Keeping them
+                // opaque forces output preprocessing in prerequisites, losing
+                // repeated-variable constraints before candidate selection.
+                let arg = self.hole(binder_type.clone())?;
                 let ExprNode::MVar { id } = arg.node() else {
                     unreachable!("fresh instance hole")
                 };
+                self.instance_goals.push(id.clone());
                 subgoals.push(id.clone());
                 positions.push(position);
                 arg
@@ -720,10 +947,12 @@ impl Context {
             };
             if let Some(child) = frame.children.pop() {
                 let child = history[child].take().expect("live instance choice");
+                frame.size = child.parent_size;
                 frames.push(child);
                 continue;
             }
             frame.chosen = None;
+            frame.size = 0;
             let spent = self.txn.budget.heartbeats_consumed;
             *self = frame.base.clone();
             self.txn.budget.heartbeats_consumed = spent;
@@ -781,13 +1010,49 @@ impl Context {
         registry: &InstanceRegistry,
         default: Option<&Name>,
     ) -> Result<SearchResult, NatDefinitionElabError> {
-        let ambient = self
+        if default.is_none() {
+            let base = self.clone();
+            if let Some(result) = self.search_instances_tabled(root.clone(), registry)? {
+                return Ok(result);
+            }
+            // Open answers and scope fragments not represented by the shared
+            // table keep the bounded search below. No speculative assignment
+            // or uncharged work survives a change of search strategy.
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = base;
+            self.txn.budget.heartbeats_consumed = spent;
+        }
+        self.search_instance_depth_first(root, registry, default)
+    }
+
+    fn search_instance_depth_first(
+        &mut self,
+        root: MVarId,
+        registry: &InstanceRegistry,
+        default: Option<&Name>,
+    ) -> Result<SearchResult, NatDefinitionElabError> {
+        let decl = self
             .txn
             .mvars
             .get_decl(&root)
             .ok_or_else(|| failure(SourceInferenceError::Scope))?
-            .lctx
             .clone();
+        let ambient = decl.lctx;
+        // The pin searches under `withNewMCtxDepth (allowLevelAssignments := true)`
+        // (vendored Lean/Meta/SynthInstance.lean, `synthInstance?`): a universe hole of the goal or
+        // of its local context may stay open in an answer, as `inst : Inhabited.{?u} α` answers
+        // `Inhabited.{?u} α` for `{α} [Inhabited α]`, and is generalized with the declaration. Only a
+        // hole the search itself opened and left unconstrained (an instance's unsolved universe)
+        // leaves an answer open. The scope is read again at each answer, as unification may have
+        // solved a goal hole by an instance's universe.
+        let mut scope = vec![decl.type_];
+        scope.extend(
+            ambient
+                .decls()
+                .iter()
+                .filter(|local| local.type_.has_level_mvar())
+                .map(|local| local.type_.clone()),
+        );
         let Some(first) = self.instance_frame(root, registry, &ambient, default, true)? else {
             return Ok(SearchResult::Stuck);
         };
@@ -823,6 +1088,7 @@ impl Context {
                     // blocked preparation, but retain every charged heartbeat.
                 }
                 if let Some(mut child) = ready {
+                    child.parent_size = frames[index].size;
                     let mut cycle = false;
                     for ancestor in &frames {
                         if table::same_goal(self, ancestor, &child)? {
@@ -838,8 +1104,10 @@ impl Context {
                         return Err(failure(SourceInferenceError::ResourceLimit));
                     }
                     match table.lookup(self, &child, &frames)? {
-                        Some(table::Answer::Solved(value)) => {
+                        Some(table::Answer::Solved(value, size)) => {
                             self.assign_instance_answer(&child, value)?;
+                            frames[index].size = frames[index].size.saturating_add(size);
+                            child.size = size.saturating_sub(1);
                             if child.resumable {
                                 child.replay_first = true;
                                 child.returned = true;
@@ -858,21 +1126,38 @@ impl Context {
                     continue;
                 }
                 if remaining {
+                    // `synthesizeUsingDefaultInstance` (vendored Lean/Elab/SyntheticMVars.lean)
+                    // assigns the goal to the default instance applied to fresh holes. Its
+                    // blocked prerequisites are already instance goals here; `apply_default`
+                    // then runs `synthesizePending` on them and rolls the default back unless
+                    // each one resolves, by an instance or by another default.
+                    if index == 0 && frames[0].default_application {
+                        let value = self.instantiate(&expansion.value)?;
+                        self.assign_instance_answer(&frames[0], value)?;
+                        return Ok(SearchResult::Solved);
+                    }
+                    self.retry_instance_choice(&mut frames, &mut history)?;
+                    continue;
+                }
+                if frames[index].size >= self.instance_max_result_size() {
                     self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
                 let mut value = self.instantiate(&expansion.value)?;
                 let actual = self.instantiate(&frames[index].target)?;
                 if value.has_expr_mvar()
-                    || value.has_level_mvar()
                     || actual.has_expr_mvar()
-                    || actual.has_level_mvar()
+                    || ((value.has_level_mvar() || actual.has_level_mvar())
+                        && !self
+                            .level_holes(&[value.clone(), actual.clone()])?
+                            .is_subset(&self.level_holes(&scope)?))
                 {
                     self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
-                // Selection never sees existing output values. Reconcile only
-                // after a complete candidate, in this goal's own local scope.
+                // Only the outer selection hides existing output values;
+                // prerequisites preserve their original output constraints.
+                // Reconcile a complete answer in this goal's own local scope.
                 // A mismatch ends this goal; trying a lower-priority instance
                 // here would silently turn outParam into semiOutParam.
                 self.txn.lctx = frames[index].base.txn.lctx.clone();
@@ -933,6 +1218,9 @@ impl Context {
                 }
                 frames[index].returned = true;
                 let complete = frames.pop().expect("completed instance frame");
+                if let Some(parent) = frames.last_mut() {
+                    parent.size = parent.size.saturating_add(complete.size.saturating_add(1));
+                }
                 if complete.resumable
                     && let Some(parent) = frames.last_mut()
                 {

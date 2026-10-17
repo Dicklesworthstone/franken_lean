@@ -24,6 +24,10 @@ pub(super) enum EliminationSyntax<'a> {
     Tactic(&'a [Syntax]),
     Match(matching::MatchParts<'a>),
     RecursiveMatch(matching::MatchParts<'a>),
+    /// Retain each live branch as another empty-matrix obligation.
+    EmptyMatrix(HashMap<Name, Vec<Name>>),
+    /// Recursive tactic patterns retain the ordinary cases removal semantics.
+    RCases(HashMap<Name, Vec<Name>>),
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -36,6 +40,7 @@ struct EliminationContext<'a> {
     equations: Option<&'a index_equations::IndexEquations>,
     recursive_source: bool,
     source_match: bool,
+    empty_fields: Option<&'a [Name]>,
 }
 
 /// The pinned `elimTarget` production retains an optional equation binder and
@@ -281,8 +286,9 @@ impl Context {
             equations,
             recursive_source,
             source_match,
+            empty_fields,
         } = context;
-        let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
+        let names = alternative.map_or(empty_fields.unwrap_or(&[]), |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
         let exact_fields = alternative.is_some_and(|alt| alt.exact_fields);
         let mut ctor = Expr::const_(constructor.base.name.clone(), levels.to_vec());
@@ -486,6 +492,16 @@ impl Context {
             work: Vec::new(),
             controls: Vec::new(),
         };
+        let refined = if parts.equation.is_none()
+            && (recursive
+                || parts.generated
+                    && !parts.is_conditional()
+                    && matches!(major.value.node(), ExprNode::FVar { .. }))
+        {
+            self.refined_discriminant(&parts, &major, &proof.target, recursive)?
+        } else {
+            None
+        };
         let local = if let Some(equation) = parts.equation {
             // Generalize with an actual Eq obligation. Each minor receives
             // `original = constructor ...`; the parent supplies Eq.refl for
@@ -507,39 +523,9 @@ impl Context {
                 .find(&id)
                 .cloned()
                 .ok_or_else(|| error(TacticError::EliminationLocal))?
-        } else if recursive
-            || parts.generated && matches!(major.value.node(), ExprNode::FVar { .. })
-        {
+        } else if let Some(local) = refined {
             if recursive {
                 self.recursive_match(&major.value);
-            }
-            let ExprNode::FVar { id } = major.value.node() else {
-                return Err(error(TacticError::EliminationLocal));
-            };
-            let mut local = self
-                .txn
-                .lctx
-                .find(id)
-                .cloned()
-                .ok_or_else(|| error(TacticError::EliminationLocal))?;
-            if parts.generated && !recursive {
-                // Matrix columns are checked single-evaluation lets. Follow
-                // exact aliases, not arbitrary reduction, so abstraction also
-                // refines later inputs whose types mention the original local.
-                let mut visited = HashSet::new();
-                while let Some(value) = &local.value {
-                    self.tick()?;
-                    let ExprNode::FVar { id } = value.node() else {
-                        break;
-                    };
-                    if !visited.insert(local.id.clone()) {
-                        return Err(error(TacticError::EliminationLocal));
-                    }
-                    let Some(original) = self.txn.lctx.find(id) else {
-                        break;
-                    };
-                    local = original.clone();
-                }
             }
             local
         } else {
@@ -569,6 +555,79 @@ impl Context {
             None,
         )?;
         Ok(proof)
+    }
+
+    /// The local a match on a free variable refines, or `None` when the pin would not refine it.
+    ///
+    /// The pin's match elaborator (vendored Lean/Elab/Match.lean, `generalize`, and
+    /// `mkMotive`) keeps the discriminant in scope. It refines it only where the motive
+    /// mentions it, abstracting it in the expected type, or where a later local depends on it
+    /// (`getFVarsToGeneralize … (ignoreLetDecls := true)`, which skips `let`s and
+    /// instance-implicit locals). When nothing does, every branch sees the outer context
+    /// unchanged. Refining anyway would replace the local in each branch's context, so a hole
+    /// made outside the match (`Id ?α`'s `?α`) could not be solved from inside a branch. A
+    /// recursive match always refines: its recursive calls are lowered on that local.
+    fn refined_discriminant(
+        &mut self,
+        parts: &matching::MatchParts<'_>,
+        major: &Typed,
+        target: &Expr,
+        recursive: bool,
+    ) -> Result<Option<LocalDecl>, NatDefinitionElabError> {
+        let ExprNode::FVar { id } = major.value.node() else {
+            return Err(error(TacticError::EliminationLocal));
+        };
+        let mut local = self
+            .txn
+            .lctx
+            .find(id)
+            .cloned()
+            .ok_or_else(|| error(TacticError::EliminationLocal))?;
+        if parts.generated && !recursive {
+            // Matrix columns are checked single-evaluation lets. Follow
+            // exact aliases, not arbitrary reduction, so abstraction also
+            // refines later inputs whose types mention the original local.
+            let mut visited = HashSet::new();
+            while let Some(value) = &local.value {
+                self.tick()?;
+                let ExprNode::FVar { id } = value.node() else {
+                    break;
+                };
+                if !visited.insert(local.id.clone()) {
+                    return Err(error(TacticError::EliminationLocal));
+                }
+                let Some(original) = self.txn.lctx.find(id) else {
+                    break;
+                };
+                local = original.clone();
+            }
+        }
+        if recursive {
+            return Ok(Some(local));
+        }
+        // The locals that depend on the discriminant, through non-`let` locals only.
+        let mut dependents = HashSet::from([local.id.clone()]);
+        let mut generalized = false;
+        let decls = self.txn.lctx.decls().to_vec();
+        for decl in decls.iter().skip_while(|decl| decl.id != local.id).skip(1) {
+            self.tick()?;
+            if decl.value.is_some() || decl.binder_info == BinderInfo::InstImplicit {
+                continue;
+            }
+            if self
+                .elimination_reads(&decl.type_)?
+                .iter()
+                .any(|id| dependents.contains(id))
+            {
+                dependents.insert(decl.id.clone());
+                generalized = true;
+            }
+        }
+        let motive = self
+            .elimination_reads(target)?
+            .iter()
+            .any(|id| dependents.contains(id));
+        Ok((generalized || motive).then_some(local))
     }
 
     /// Whether `target` certainly lives outside `Prop`: its sort is a successor level.
@@ -605,6 +664,9 @@ impl Context {
             }
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
                 (Name::anonymous(), &[][..], true, &[][..])
+            }
+            EliminationSyntax::EmptyMatrix(_) | EliminationSyntax::RCases(_) => {
+                (Name::anonymous(), &[][..], false, &[][..])
             }
         };
         self.resolve_instances(false)?;
@@ -744,8 +806,10 @@ impl Context {
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         if equations.is_none() {
-            if matches!(input, EliminationSyntax::Match(_))
-                && self.match_has_field_indices(&family)?
+            if matches!(
+                input,
+                EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix(_)
+            ) && self.match_has_field_indices(&family)?
             {
                 return self.eliminate_constrained_indices(
                     proof,
@@ -1129,7 +1193,17 @@ impl Context {
                     induction,
                     equations,
                     recursive_source,
-                    source_match: !matches!(input, EliminationSyntax::Tactic(_)),
+                    source_match: !matches!(
+                        input,
+                        EliminationSyntax::Tactic(_) | EliminationSyntax::RCases(_)
+                    ),
+                    empty_fields: match input {
+                        EliminationSyntax::EmptyMatrix(fields)
+                        | EliminationSyntax::RCases(fields) => {
+                            fields.get(&rule.ctor).map(Vec::as_slice)
+                        }
+                        _ => None,
+                    },
                 },
                 alternative,
                 &mut hypotheses,

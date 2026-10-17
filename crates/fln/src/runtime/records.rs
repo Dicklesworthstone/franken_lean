@@ -858,20 +858,15 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let ExprNode::Lam {
-            binder_type,
-            body: motive,
-            ..
-        } = args[0].node()
-        else {
-            return Ok(None);
-        };
-        // A result may depend on the major's erased Type fields while still
-        // having a uniform representation. Resolve those verified projections
-        // in the motive's own local context, just as definition signatures and
-        // constructor minors use the boxed hidden carrier. Dependence on an
-        // ordinary value remains unresolved and is refused by layout discovery.
-        let motive = self.erase_hidden_types(motive, std::slice::from_ref(binder_type))?;
+        // A result may mention the major in proof domains or erased Type-field
+        // projections while still having a uniform representation. Erase the
+        // whole motive in its original telescope so both kinds of dependency
+        // retain their checked local context. Only then remove the major binder,
+        // after verifying that no runtime representation still depends on it.
+        let motive = self.erase_type_argument(&args[0], &[])?;
+        let motive = self
+            .indexed_motive(&motive, &[], &family)?
+            .ok_or_else(|| unsupported("dependent record recursor result"))?;
         let result = self
             .value_type(&motive)?
             .ok_or_else(|| unsupported("dependent record recursor result"))?;
@@ -1077,7 +1072,7 @@ mod closure_fields_tests {
             fields.push(prep.constructors.last().unwrap().fields[0]);
         }
         assert_ne!(fields[0], fields[1]);
-        prep.finalize_callables(&mut []).unwrap();
+        prep.finalize_callables(&mut [], &mut []).unwrap();
         assert_eq!(prep.constructors[0].fields[0], fields[1]);
         assert_eq!(prep.constructors[1].fields[0], fields[0]);
     }
@@ -1166,8 +1161,8 @@ mod closure_fields_tests {
             Some(ValueType::Constructor)
         );
         assert_eq!(
-            stopped.finalize_callables(&mut []).unwrap(),
-            clean.finalize_callables(&mut []).unwrap()
+            stopped.finalize_callables(&mut [], &mut []).unwrap(),
+            clean.finalize_callables(&mut [], &mut []).unwrap()
         );
         assert_eq!(stopped.constructors, clean.constructors);
     }

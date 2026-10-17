@@ -22,7 +22,7 @@ const MAX_ENTRIES: usize = MAX_CANDIDATE_ATTEMPTS;
 const MAX_KEY_UNITS: usize = 65_536;
 
 #[derive(Clone)]
-struct Key {
+pub(super) struct Key {
     expected: Expr,
     output_types: Vec<Expr>,
     syntax_units: usize,
@@ -44,7 +44,7 @@ impl PartialEq for Key {
 impl Eq for Key {}
 
 impl Key {
-    fn units(&self) -> usize {
+    pub(super) fn units(&self) -> usize {
         1 + self.syntax_units
             + self.output_types.len()
             + self.locals.len()
@@ -53,6 +53,10 @@ impl Key {
                 .iter()
                 .map(|(_, types)| 1 + types.len())
                 .sum::<usize>()
+    }
+
+    pub(super) fn bucket(&self) -> &Expr {
+        &self.expected
     }
 }
 
@@ -134,7 +138,7 @@ pub(super) fn same_goal(
     Ok(left.expected == right.expected && left.types == right.types)
 }
 
-fn replay_outputs(
+pub(super) fn replay_outputs(
     context: &mut Context,
     frame: &Frame,
     type_: &Expr,
@@ -167,6 +171,47 @@ fn replay_outputs(
         Err(error) if nonmatch(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// A generator/consumer table shares a goal independently of the path that
+/// first requested it. Cycles become waiters, so this key needs no DFS cycle
+/// path. The outer query is keyed by its preprocessed outputs; prerequisites
+/// retain the original typed output pattern, including known output values.
+pub(super) fn shared_key(
+    context: &mut Context,
+    frame: &Frame,
+    outer: bool,
+) -> Result<Option<Key>, NatDefinitionElabError> {
+    context.tick()?;
+    if !frame.binders.is_empty()
+        || !frame.base.equations.is_empty()
+        || frame.base.txn.lctx.len() >= MAX_KEY_UNITS
+        || !replayable_target(context, frame)?
+        || !ground_locals(context, &frame.base.txn.lctx)?
+    {
+        return Ok(None);
+    }
+    let prepared;
+    let pattern = if outer {
+        prepared = Frame {
+            expected: frame.target.clone(),
+            ..frame.clone()
+        };
+        &prepared
+    } else {
+        frame
+    };
+    let Some(canonical) = outputs::canonical_with_ancestors(context, pattern, &[])? else {
+        return Ok(None);
+    };
+    let key = Key {
+        expected: canonical.expected,
+        output_types: canonical.types,
+        syntax_units: canonical.units,
+        locals: frame.base.txn.lctx.clone(),
+        ancestors: Vec::new(),
+    };
+    Ok((key.units() <= MAX_KEY_UNITS).then_some(key))
 }
 
 fn key(
@@ -229,7 +274,7 @@ fn key(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Answer {
-    Solved(Expr),
+    Solved(Expr, u64),
     Exhausted,
 }
 
@@ -265,7 +310,7 @@ impl GroundTable {
                 context.tick()?;
                 if stored == &key {
                     let usable = match &value.answer {
-                        Answer::Solved(_) => replay_outputs(context, frame, &value.type_)?,
+                        Answer::Solved(..) => replay_outputs(context, frame, &value.type_)?,
                         // Only complete, answer-free enumeration creates this
                         // entry. It is valid for the exact typed open query too.
                         Answer::Exhausted => true,
@@ -295,7 +340,7 @@ impl GroundTable {
             context,
             frame,
             ancestors,
-            Answer::Solved(value.clone()),
+            Answer::Solved(value.clone(), frame.size.saturating_add(1)),
             type_,
         )
     }
@@ -381,6 +426,8 @@ mod tests {
             cursor: 0,
             chosen: None,
             children: vec![],
+            size: 0,
+            parent_size: 0,
             resumable: false,
             replay_first: false,
             returned: false,
@@ -399,7 +446,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             table.lookup(&mut context, &target, &path).unwrap(),
-            Some(Answer::Solved(value))
+            Some(Answer::Solved(value, 1))
         );
         for other in [vec![], vec![frame("Root")], vec![frame("Root"), frame("B")]] {
             assert!(

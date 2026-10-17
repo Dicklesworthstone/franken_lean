@@ -103,8 +103,7 @@ impl Preparation<'_> {
         };
         let index = usize::from(dependent);
         if !self.conditional_contracts[index] {
-            let Some(Declaration::Defn(expected)) = fln_elab::seed::source_seed_declarations()
-                .into_iter()
+            let Some(Declaration::Defn(expected)) = fln_elab::seed::source_seed_declarations_iter()
                 .find(|declaration| {
                     matches!(declaration, Declaration::Defn(definition)
                         if definition.base.name == *callee)

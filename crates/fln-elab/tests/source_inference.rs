@@ -133,7 +133,15 @@ fn expected_result_infers_an_implicit_with_no_explicit_value_argument() {
             is_unsafe: false,
         }),
     );
-    let result = accepted("def picked : Nat := choose", &env);
+    // The axiom isolates expected-type inference, not executable choice.
+    // Preserve that inference test while checking its compilation boundary.
+    assert!(matches!(
+        check_definition_source(b"def picked : Nat := choose", &env, budget()),
+        Err(DefinitionFrontendError::Elaborate(NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::NoncomputableDependency(name)
+        ))) if name == n("choose")
+    ));
+    let result = accepted("noncomputable def picked : Nat := choose", &env);
     assert_eq!(
         result.value,
         Expr::app(Expr::const_(n("choose"), vec![]), nat())

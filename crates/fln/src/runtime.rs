@@ -3,20 +3,26 @@
 //! This never changes the declaration sent to either checker. Special forms
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
+mod array_fold;
+mod array_iteration;
 mod callables;
 mod conditionals;
 mod data_recursion;
 mod decisions;
+mod diagnostics;
 mod empty;
 mod evaluation;
 mod floats;
 mod fs;
 mod global;
+mod implemented_by;
 mod indexed;
 mod io;
 mod io_result;
 mod mutual;
 mod nat;
+mod native_intrinsics;
+mod noncomputable;
 mod partial;
 mod projections;
 mod proofs;
@@ -24,12 +30,18 @@ mod records;
 mod specialize;
 mod st;
 mod stdout;
+mod string_bootstrap;
+mod string_bytes;
+mod string_from_list;
 mod string_push;
 mod transport;
 mod variants;
+mod well_founded;
 
 use super::*;
-use fln_comp::ingress::{BoolCaseBinding, CallableBindings, ConstructorCaseBinding};
+use fln_comp::ingress::{
+    BoolCaseBinding, CallableBindings, ConstructorCaseBinding, NatCaseBinding,
+};
 use std::collections::HashSet;
 
 pub(super) struct Preparation<'a> {
@@ -38,8 +50,17 @@ pub(super) struct Preparation<'a> {
     visited: usize,
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
+    implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
+    noncomputable: Option<BTreeSet<Name>>,
+    /// Opaques whose values may run; see `Engine::executable_opaques`. None
+    /// unless the caller names its engine's set.
+    executable_opaques: Option<&'a BTreeSet<Name>>,
+    /// Globals with initialized runtime values; their stored bodies cannot run.
+    runtime_initializers: Option<&'a BTreeSet<Name>>,
+    native_intrinsics: native_intrinsics::Store,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
+    nat_cases: Vec<NatCaseBinding>,
     variant_cases: Vec<ConstructorCaseBinding>,
     empty_cases: Vec<fln_comp::ingress::EmptyCaseBinding>,
     false_family_checked: bool,
@@ -49,19 +70,32 @@ pub(super) struct Preparation<'a> {
     bool_recursor_checked: bool,
     io_world_checked: bool,
     equality_family_checked: bool,
+    well_founded_fix_checked: bool,
+    quotient_family_checked: bool,
     conditional_contracts: [bool; 2],
     next_branch: usize,
     next_local: u64,
     next_nat: u64,
     nat_family_checked: bool,
+    nat_primitives: [Option<IntrinsicBinding>; 2],
     value_types: ExecutableValueTypes,
+    proposition_queries: proofs::query::Store,
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
+    partial_stages: global::PartialStages,
     specializations: specialize::Store,
+    text_decisions: decisions::Store,
+    array_fold: array_fold::Store,
+    array_iteration: array_iteration::Store,
+    diagnostics: diagnostics::Store,
     st: st::Store,
     io: io::Store,
     fs: fs::Store,
+    floats: floats::Store,
     stdout: stdout::Store,
+    string_bootstrap: string_bootstrap::Store,
+    string_bytes: string_bytes::Store,
     string_push: string_push::Store,
+    string_from_list: string_from_list::Store,
     data_shapes: std::collections::HashMap<Expr, records::Shape>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
@@ -82,6 +116,10 @@ enum Task {
         signatures: Vec<(Vec<ValueType>, ValueType)>,
     },
     Visit(Expr),
+    VisitFixedLambdas {
+        value: Expr,
+        remaining: usize,
+    },
     Callee(Expr),
     Apply(usize),
     Lam {
@@ -100,6 +138,7 @@ enum Task {
     },
     Case {
         name: Name,
+        parameter: ValueType,
         result: ValueType,
     },
 }
@@ -111,8 +150,14 @@ impl<'a> Preparation<'a> {
             limits,
             visited: 0,
             externs: None,
+            implementations: None,
+            noncomputable: None,
+            executable_opaques: None,
+            runtime_initializers: None,
+            native_intrinsics: native_intrinsics::Store::default(),
             lambdas: Vec::new(),
             cases: Vec::new(),
+            nat_cases: Vec::new(),
             variant_cases: Vec::new(),
             empty_cases: Vec::new(),
             false_family_checked: false,
@@ -122,29 +167,54 @@ impl<'a> Preparation<'a> {
             bool_recursor_checked: false,
             io_world_checked: false,
             equality_family_checked: false,
+            well_founded_fix_checked: false,
+            quotient_family_checked: false,
             conditional_contracts: [false; 2],
             next_branch: 0,
             next_local: 0,
             next_nat: 0,
             nat_family_checked: false,
+            nat_primitives: [None, None],
             value_types: ExecutableValueTypes::bounded_source(environment),
+            proposition_queries: proofs::query::Store::default(),
             interfaces: Vec::new(),
+            partial_stages: global::PartialStages::default(),
             specializations: specialize::Store::default(),
+            text_decisions: decisions::Store::default(),
+            array_fold: array_fold::Store::default(),
+            array_iteration: array_iteration::Store::default(),
+            diagnostics: diagnostics::Store::default(),
             st: st::Store::default(),
             io: io::Store::default(),
             fs: fs::Store::default(),
+            floats: floats::Store::default(),
             stdout: stdout::Store::default(),
+            string_bootstrap: string_bootstrap::Store::default(),
+            string_bytes: string_bytes::Store::default(),
             string_push: string_push::Store::default(),
+            string_from_list: string_from_list::Store::default(),
             data_shapes: std::collections::HashMap::new(),
             constructors: Vec::new(),
         }
+    }
+
+    /// Permit the named opaques' values to run, as the pin's compiler does for
+    /// an opaque with no extern or init attribute.
+    pub(super) fn with_executable_opaques(mut self, names: &'a BTreeSet<Name>) -> Self {
+        self.executable_opaques = Some(names);
+        self
+    }
+
+    pub(super) fn with_runtime_initializers(mut self, names: &'a BTreeSet<Name>) -> Self {
+        self.runtime_initializers = Some(names);
+        self
     }
 
     fn tick(&mut self) -> Result<(), IngressError> {
         charge_catalog_node(&mut self.visited, self.limits)
     }
 
-    fn thunk(&mut self, body: &Expr) -> Result<Expr, IngressError> {
+    fn thunk(&mut self, body: &Expr, parameter: ValueType) -> Result<Expr, IngressError> {
         let observed = self.next_branch.saturating_add(1);
         if observed > self.limits.max_lambda_bindings {
             return Err(IngressError::ResourceLimit {
@@ -163,7 +233,14 @@ impl<'a> Preparation<'a> {
         // deterministic site identities keep those annotations separate.
         Ok(Expr::lam(
             Name::num(name("_fln_runtime_branch"), id),
-            Expr::const_(name("Bool"), vec![]),
+            Expr::const_(
+                name(match parameter {
+                    ValueType::Bool => "Bool",
+                    ValueType::Nat => "Nat",
+                    _ => return Err(unsupported("scalar branch parameter")),
+                }),
+                vec![],
+            ),
             lifted,
             BinderInfo::Default,
         ))
@@ -190,7 +267,11 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
-    fn branch_name(&mut self, result: ValueType) -> Result<Name, IngressError> {
+    fn branch_name(
+        &mut self,
+        result: ValueType,
+        parameter: ValueType,
+    ) -> Result<Name, IngressError> {
         let index = match result {
             ValueType::Nat => 0,
             ValueType::String => 1,
@@ -203,11 +284,24 @@ impl<'a> Preparation<'a> {
             ValueType::Closure(id) => 4 + u64::from(id.get()),
             _ => return Err(unsupported("conditional result representation")),
         };
-        let name = Name::num(Name::from_components(["_fln_runtime_bool_case"]), index);
+        let prefix = match parameter {
+            ValueType::Bool => "_fln_runtime_bool_case",
+            ValueType::Nat => "_fln_runtime_nat_case",
+            _ => return Err(unsupported("scalar branch parameter")),
+        };
+        let name = Name::num(Name::from_components([prefix]), index);
         if self.environment.contains(&name) {
             return Err(unsupported("runtime case name collision"));
         }
-        if !self.cases.iter().any(|case| case.name == name) {
+        if parameter == ValueType::Nat {
+            if !self.nat_cases.iter().any(|case| case.name == name) {
+                reserve(&mut self.nat_cases, self.limits.fir.max_functions)?;
+                self.nat_cases.push(NatCaseBinding {
+                    name: name.clone(),
+                    result,
+                });
+            }
+        } else if !self.cases.iter().any(|case| case.name == name) {
             reserve(&mut self.cases, self.limits.fir.max_functions)?;
             self.cases.push(BoolCaseBinding {
                 name: name.clone(),
@@ -217,7 +311,12 @@ impl<'a> Preparation<'a> {
         Ok(name)
     }
 
-    fn register_branch(&mut self, lambda: &Expr, result: ValueType) -> Result<(), IngressError> {
+    fn register_branch(
+        &mut self,
+        lambda: &Expr,
+        parameter: ValueType,
+        result: ValueType,
+    ) -> Result<(), IngressError> {
         if self.lambda_keys.contains(lambda) {
             return Ok(());
         }
@@ -231,7 +330,7 @@ impl<'a> Preparation<'a> {
         self.lambda_keys.insert(lambda.clone());
         self.lambdas.push(LambdaBinding {
             lambda: lambda.clone(),
-            parameters: vec![ValueType::Bool],
+            parameters: vec![parameter],
             parameter_ownership: borrowed_runtime_parameters(1)?,
             result,
             result_ownership: result_ownership(result),
@@ -288,6 +387,15 @@ impl<'a> Preparation<'a> {
     }
 
     fn local_lambda(&mut self, value: &Expr, type_: &Expr) -> Result<Expr, IngressError> {
+        if !matches!(value.node(), ExprNode::Lam { .. }) {
+            return Ok(value.clone());
+        }
+        // Late unfolding can leave a value-only gap after this initializer's
+        // children have already registered. Keep the exact closed child as an
+        // executable call target; never revisit or beta-inline the forwarding
+        // wrapper and invalidate its metadata.
+        let forwarded = self.forward_closed_administrative_tail(value)?;
+        let value = forwarded.as_ref().unwrap_or(value);
         let ExprNode::Lam {
             binder_type,
             body,
@@ -402,8 +510,40 @@ impl<'a> Preparation<'a> {
             reserve(&mut values, self.limits.max_nodes.saturating_add(1))?;
             match task {
                 Task::Visit(expr) => {
+                    if !matches!(expr.node(), ExprNode::App { .. }) {
+                        self.check_initialized_head(&expr)?;
+                    }
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        self.check_initialized_head(&head)?;
+                        if let Some((case, result)) = self.nat_case(&head)? {
+                            if args.len() != 3 {
+                                return Err(unsupported("Nat case arity"));
+                            }
+                            tasks.push(Task::Case {
+                                name: case,
+                                parameter: ValueType::Nat,
+                                result,
+                            });
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&args[2], ValueType::Nat)?,
+                                remaining: 1,
+                            });
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&args[1], ValueType::Nat)?,
+                                remaining: 1,
+                            });
+                            tasks.push(Task::Visit(args[0].clone()));
+                            continue;
+                        }
+                        if let Some(replacement) = self.implemented_by_call(&head, &args)? {
+                            tasks.push(Task::Visit(replacement));
+                            continue;
+                        }
+                        if let Some(value) = self.diagnostic_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(decision) = self.nat_equality_decision(&head, &args)? {
                             tasks.push(Task::Visit(decision));
                             continue;
@@ -420,11 +560,27 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(value) = self.imported_float_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(action) = self.stdout_call(&head, &args)? {
                             tasks.push(Task::Visit(action));
                             continue;
                         }
+                        if let Some(value) = self.string_from_list_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(value) = self.string_push_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
+                        if let Some(value) = self.string_bootstrap_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
+                        if let Some(value) = self.string_bytes_call(&head, &args)? {
                             tasks.push(Task::Visit(value));
                             continue;
                         }
@@ -483,7 +639,7 @@ impl<'a> Preparation<'a> {
                             let result = self
                                 .value_type(&motive)?
                                 .ok_or_else(|| unsupported("dependent Boolean motive"))?;
-                            let case = self.branch_name(result)?;
+                            let case = self.branch_name(result, ValueType::Bool)?;
                             let yes = self.typed_callable_result(
                                 args[2].clone(),
                                 motive.clone(),
@@ -494,9 +650,19 @@ impl<'a> Preparation<'a> {
                                 motive.clone(),
                                 result,
                             )?;
-                            tasks.push(Task::Case { name: case, result });
-                            tasks.push(Task::Visit(self.thunk(&yes)?));
-                            tasks.push(Task::Visit(self.thunk(&no)?));
+                            tasks.push(Task::Case {
+                                name: case,
+                                parameter: ValueType::Bool,
+                                result,
+                            });
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&yes, ValueType::Bool)?,
+                                remaining: 1,
+                            });
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: self.thunk(&no, ValueType::Bool)?,
+                                remaining: 1,
+                            });
                             tasks.push(Task::Visit(args[3].clone()));
                             continue;
                         }
@@ -521,22 +687,19 @@ impl<'a> Preparation<'a> {
                             })?;
                             tasks.push(Task::Apply(args.len() - 3));
                             tasks.extend(args[3..].iter().rev().cloned().map(Task::Visit));
+                            let fixed = recursion.parameters.len().saturating_add(1);
                             tasks.push(Task::RecursiveLambda {
                                 parameters: recursion.parameters,
                                 result: recursion.result,
                             });
-                            tasks.push(Task::Visit(recursion.lambda));
+                            tasks.push(Task::VisitFixedLambdas {
+                                value: recursion.lambda,
+                                remaining: fixed,
+                            });
                             continue;
                         }
-                        if matches!(head.node(), ExprNode::Const { name: n, levels }
-                            if n == &name("Nat.succ") && levels.is_empty())
-                            && args.len() == 1
-                        {
-                            self.check_nat_family()?;
-                            tasks.push(Task::Visit(Expr::app(
-                                Expr::app(Expr::const_(name("Nat.add"), vec![]), args[0].clone()),
-                                nat::literal(1),
-                            )));
+                        if let Some(successor) = self.nat_successor_call(&head, &args)? {
+                            tasks.push(Task::Visit(successor));
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()
@@ -605,6 +768,11 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(eliminated));
                             continue;
                         }
+                        let args = if matches!(head.node(), ExprNode::Const { .. }) {
+                            self.eta_expand_callbacks(&head, args)?
+                        } else {
+                            args
+                        };
                         let required = args.len().saturating_add(2);
                         if tasks.len().saturating_add(required) > limit {
                             return Err(IngressError::ResourceLimit {
@@ -628,6 +796,10 @@ impl<'a> Preparation<'a> {
                         });
                         continue;
                     }
+                    if let Some(replacement) = self.implemented_by_call(&expr, &[])? {
+                        tasks.push(Task::Visit(replacement));
+                        continue;
+                    }
                     match expr.node() {
                         ExprNode::Const { name: n, levels }
                             if n == &name("Nat.zero") && levels.is_empty() =>
@@ -641,12 +813,26 @@ impl<'a> Preparation<'a> {
                             body,
                             binder_info,
                         } => {
+                            // Ordinary callback syntax can become literal only
+                            // after a projection or application is exposed.
+                            // Contract its inert gap before descendants acquire
+                            // closure/recursion identities. Synthetic fixed
+                            // prefixes take VisitFixedLambdas instead.
+                            let body = if matches!(
+                                body.node(),
+                                ExprNode::LetE { .. } | ExprNode::MData { .. }
+                            ) {
+                                self.administrative_callable_gap(body)?
+                                    .unwrap_or_else(|| body.clone())
+                            } else {
+                                body.clone()
+                            };
                             tasks.push(Task::Lam {
                                 name: binder_name.clone(),
                                 type_: self.normalize_type(binder_type)?,
                                 info: *binder_info,
                             });
-                            tasks.push(Task::Visit(body.clone()));
+                            tasks.push(Task::Visit(body));
                         }
                         ExprNode::LetE {
                             decl_name: name,
@@ -655,6 +841,15 @@ impl<'a> Preparation<'a> {
                             body,
                             non_dep: nondep,
                         } => {
+                            if self.type_parameter(type_)? {
+                                // Inlining and recursor specialization can expose
+                                // a motive binding after proof erasure has run.
+                                // Its checked Sort-valued telescope is static:
+                                // substitute it before runtime closure discovery,
+                                // preserving outer captures and dependent types.
+                                tasks.push(Task::Visit(self.substitution(body, value)?));
+                                continue;
+                            }
                             if let Some(exposed) =
                                 self.expose_callable_binding(type_, value, body)?
                             {
@@ -667,7 +862,13 @@ impl<'a> Preparation<'a> {
                                 nondep: *nondep,
                             });
                             tasks.push(Task::Visit(body.clone()));
-                            tasks.push(Task::Visit(self.annotate_callable_tail(value, type_)?));
+                            // This checked local annotation owns its lambda's
+                            // actual prefix arity. Normalize value-only gaps
+                            // before any nested closure metadata is created.
+                            // Synthetic case/recursor lambdas instead keep the
+                            // fixed stage boundary supplied by their scheduler.
+                            let value = self.administrative_callable_value(value)?;
+                            tasks.push(Task::Visit(self.annotate_callable_tail(&value, type_)?));
                         }
                         ExprNode::MData { expr, .. } => tasks.push(Task::Visit(expr.clone())),
                         ExprNode::Proj {
@@ -698,6 +899,10 @@ impl<'a> Preparation<'a> {
                                 values.push(expr.clone());
                                 continue;
                             }
+                            if let Some(successor) = self.nat_successor_call(&expr, &[])? {
+                                tasks.push(Task::Visit(successor));
+                                continue;
+                            }
                             if let Some(action) = self.io_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
                                 continue;
@@ -706,11 +911,27 @@ impl<'a> Preparation<'a> {
                                 tasks.push(Task::Visit(action));
                                 continue;
                             }
+                            if let Some(value) = self.imported_float_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
                             if let Some(action) = self.stdout_call(&expr, &[])? {
                                 tasks.push(Task::Visit(action));
                                 continue;
                             }
+                            if let Some(value) = self.string_from_list_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
                             if let Some(value) = self.string_push_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
+                            if let Some(value) = self.string_bootstrap_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
+                            if let Some(value) = self.string_bytes_call(&expr, &[])? {
                                 tasks.push(Task::Visit(value));
                                 continue;
                             }
@@ -741,6 +962,37 @@ impl<'a> Preparation<'a> {
                         }
                         _ => values.push(expr.clone()),
                     }
+                }
+                Task::VisitFixedLambdas { value, remaining } => {
+                    // The scheduler, rather than source spelling, owns this
+                    // exact branch/recursive prefix. Keep its return anchor
+                    // and normalize only ordinary callbacks inside its body.
+                    self.producer_depth(remaining)?;
+                    let ExprNode::Lam {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } = value.node()
+                    else {
+                        return Err(unsupported("fixed runtime lambda prefix"));
+                    };
+                    if remaining == 0 {
+                        return Err(unsupported("empty fixed runtime lambda prefix"));
+                    }
+                    tasks.push(Task::Lam {
+                        name: binder_name.clone(),
+                        type_: self.normalize_type(binder_type)?,
+                        info: *binder_info,
+                    });
+                    tasks.push(if remaining == 1 {
+                        Task::Visit(body.clone())
+                    } else {
+                        Task::VisitFixedLambdas {
+                            value: body.clone(),
+                            remaining: remaining - 1,
+                        }
+                    });
                 }
                 Task::Callee(expr) => {
                     if let ExprNode::Const { name, .. } = expr.node() {
@@ -836,12 +1088,16 @@ impl<'a> Preparation<'a> {
                     let value = pop(&mut values)?;
                     values.push(Expr::proj(name, index, value));
                 }
-                Task::Case { name, result } => {
+                Task::Case {
+                    name,
+                    parameter,
+                    result,
+                } => {
                     let yes = pop(&mut values)?;
                     let no = pop(&mut values)?;
                     let condition = pop(&mut values)?;
-                    self.register_branch(&no, result)?;
-                    self.register_branch(&yes, result)?;
+                    self.register_branch(&no, parameter, result)?;
+                    self.register_branch(&yes, parameter, result)?;
                     values.push(
                         [condition, no, yes]
                             .into_iter()
@@ -945,7 +1201,15 @@ impl<'a> Preparation<'a> {
             result: case.result,
             branches: case.branches.len(),
         });
-        tasks.extend(case.branches.into_iter().rev().map(Task::Visit));
+        tasks.extend(
+            case.branches
+                .into_iter()
+                .rev()
+                .map(|value| Task::VisitFixedLambdas {
+                    value,
+                    remaining: 1,
+                }),
+        );
         tasks.push(Task::Visit(case.major));
         Ok(())
     }
@@ -989,6 +1253,7 @@ impl<'a> Preparation<'a> {
             functions,
             lambdas: &self.lambdas,
             bool_cases: &self.cases,
+            nat_cases: &self.nat_cases,
             constructor_cases: &self.variant_cases,
             empty_cases: &self.empty_cases,
         }
@@ -1094,6 +1359,12 @@ fn type_constructor_kind(mut type_: &Expr) -> bool {
 
 #[cfg(test)]
 mod templates;
+
+#[cfg(test)]
+mod late_types_tests;
+
+#[cfg(test)]
+mod annotation_tests;
 
 #[cfg(test)]
 mod tests {

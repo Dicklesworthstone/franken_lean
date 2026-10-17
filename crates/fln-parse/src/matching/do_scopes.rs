@@ -20,6 +20,10 @@ struct Sequence {
 pub(super) struct DoScopes {
     sequences: Vec<Sequence>,
     ended: HashSet<usize>,
+    /// A braced repeat can consume an `until` immediately after its `}`.
+    /// Remember that owner for one token so the marker cannot close an outer
+    /// unbraced repeat and its still-active conditional branch instead.
+    closed_repeat: Option<(usize, usize)>,
 }
 
 impl DoScopes {
@@ -96,6 +100,7 @@ impl DoScopes {
         matches: &[MatchPlan],
         failure: bool,
     ) {
+        let closed_repeat = self.closed_repeat.take();
         let else_target = is_symbol(tokens, at, "else")
             .then(|| {
                 conditionals
@@ -119,6 +124,26 @@ impl DoScopes {
                     .map(|p| p.start)
             })
             .flatten();
+        // A postcondition terminates the nearest repeat's body, including its
+        // unbraced if/match/try branches. Keep the enclosing do sequence alive
+        // for statements after the condition. Brackets protect nested terms.
+        let until_target = term_locals::word(tokens, at, "until")
+            .then(|| {
+                closed_repeat
+                    .filter(|(_, body_depth)| *body_depth == depth)
+                    .map(|(introducer, _)| introducer)
+                    .or_else(|| {
+                        self.sequences
+                            .iter()
+                            .rev()
+                            .find(|s| {
+                                s.depth == depth
+                                    && term_locals::word(tokens, s.introducer, "repeat")
+                            })
+                            .map(|s| s.introducer)
+                    })
+            })
+            .flatten();
         while self.sequences.last().is_some_and(|s| {
             at >= s.first
                 && !s.braced
@@ -129,7 +154,8 @@ impl DoScopes {
                     || (later_line(view, tokens, at, s.first)
                         && column(view, tokens, at) < s.baseline)
                     || else_target.is_some_and(|target| target < s.introducer)
-                    || match_target.is_some_and(|target| target < s.introducer))
+                    || match_target.is_some_and(|target| target < s.introducer)
+                    || until_target.is_some_and(|target| target <= s.introducer))
         }) {
             self.pop();
         }
@@ -205,6 +231,8 @@ impl DoScopes {
             && s.depth == depth
         {
             if s.braced && is_symbol(tokens, at, "}") {
+                self.closed_repeat = term_locals::word(tokens, s.introducer, "repeat")
+                    .then(|| (s.introducer, s.depth - 1));
                 self.pop();
             } else if statement_separator {
                 s.ready = true;

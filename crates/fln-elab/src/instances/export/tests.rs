@@ -158,6 +158,74 @@ fn generic_paths_and_authoritative_imported_out_parameters_determine_the_schedul
     );
 }
 
+/// The pin's `checkOutParam` (`Lean/Class.lean`), run by `addClass` on every new class.
+#[test]
+fn a_regular_parameter_may_not_depend_on_an_out_parameter() {
+    let out = |domain| app("outParam", domain);
+    let base = axiom(
+        &Environment::new(),
+        "Inhabited",
+        pi("a", ty(), ty(), BinderInfo::Default),
+    );
+    // F (β : outParam Type) (b : β) : Type is refused, and registers nothing.
+    let refused = axiom(
+        &base,
+        "F",
+        pi(
+            "β",
+            out(ty()),
+            pi("b", b(0), ty(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+    );
+    assert_eq!(
+        register_class(&refused, &n("F")),
+        Err(InstanceRegistryError::OutParamDependency {
+            class: n("F"),
+            parameter: 2,
+        })
+    );
+    assert!(!InstanceRegistry::read(&refused).unwrap().is_class(&n("F")));
+    // G (β : outParam Type) (b : outParam β), D (β : outParam Type) [Inhabited β] (the
+    // instance-implicit exception, pin issue #1852), and E (x : outParam Type) (α : Type), whose
+    // α does not mention x, are classes.
+    for (name, type_) in [
+        (
+            "G",
+            pi(
+                "β",
+                out(ty()),
+                pi("b", out(b(0)), ty(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+        (
+            "D",
+            pi(
+                "β",
+                out(ty()),
+                pi("i", app("Inhabited", b(0)), ty(), BinderInfo::InstImplicit),
+                BinderInfo::Default,
+            ),
+        ),
+        (
+            "E",
+            pi(
+                "x",
+                out(ty()),
+                pi("α", ty(), ty(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+    ] {
+        let env = class(&base, name, type_);
+        assert!(
+            InstanceRegistry::read(&env).unwrap().is_class(&n(name)),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn implicit_class_detection_uses_the_original_function_telescope() {
     let env = class(&Environment::new(), "C", ty());
@@ -186,6 +254,101 @@ fn implicit_class_detection_uses_the_original_function_telescope() {
             discr_tree::Key::Const(n("h"), 0),
         ]
     );
+}
+
+#[test]
+fn elaborated_numerals_and_successors_have_literal_keys_with_exact_budgeting() {
+    use fln_core::expr::{Literal, NatLit};
+    let env = axiom(&Environment::new(), "Nat", ty());
+    let env = axiom(&env, "Nat.zero", c("Nat"));
+    let env = axiom(
+        &env,
+        "Nat.succ",
+        pi("n", c("Nat"), c("Nat"), BinderInfo::Default),
+    );
+    let env = class(&env, "At", pi("n", c("Nat"), ty(), BinderInfo::Default));
+    let env = class(
+        &env,
+        "OfNat",
+        pi(
+            "A",
+            ty(),
+            pi("n", c("Nat"), ty(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+    );
+    let name = n("OfNat.ofNat");
+    let env = env
+        .add_decl(ConstantInfo::Defn(fln_env::constants::DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: vec![],
+                type_: pi(
+                    "A",
+                    ty(),
+                    pi(
+                        "n",
+                        c("Nat"),
+                        pi(
+                            "d",
+                            Expr::app(app("OfNat", b(1)), b(0)),
+                            b(2),
+                            BinderInfo::InstImplicit,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            },
+            value: c("Nat.zero"),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name],
+        }))
+        .unwrap();
+    let literal = |n| Expr::lit(Literal::Nat(NatLit::from_u64(n)));
+    let dictionary = Expr::app(app("OfNat", c("Nat")), literal(7));
+    let env = axiom(&env, "dictionary", dictionary);
+    let numeral = Expr::app(
+        Expr::app(app("OfNat.ofNat", c("Nat")), literal(7)),
+        c("dictionary"),
+    );
+    for (name, term, expected) in [
+        ("zero", c("Nat.zero"), NatLit::from_u64(0)),
+        ("literal", literal(7), NatLit::from_u64(7)),
+        ("elaborated", numeral.clone(), NatLit::from_u64(7)),
+        ("successor", app("Nat.succ", numeral), NatLit::from_u64(8)),
+        (
+            "wide",
+            app("Nat.succ", literal(u64::MAX)),
+            NatLit::from_limbs_le(vec![0, 1]),
+        ),
+    ] {
+        let env = register(&env, name, app("At", term));
+        let registry = InstanceRegistry::read(&env).unwrap();
+        let mut remaining = 100_000;
+        let index = derive_index(&env, &registry, &n(name), &mut remaining)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            index.keys,
+            [
+                discr_tree::Key::Const(n("At"), 1),
+                discr_tree::Key::Lit(Literal::Nat(expected))
+            ]
+        );
+        let work = 100_000 - remaining;
+        let mut exact = work;
+        assert_eq!(
+            derive_index(&env, &registry, &n(name), &mut exact).unwrap(),
+            Some(index)
+        );
+        assert_eq!(exact, 0);
+        assert_eq!(
+            derive_index(&env, &registry, &n(name), &mut (work - 1)),
+            Err(InstanceRegistryError::Limit)
+        );
+    }
 }
 
 #[test]

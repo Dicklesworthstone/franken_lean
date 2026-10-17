@@ -24,6 +24,12 @@ impl Context {
         }
         let proposition = self.instantiate(&goal.target)?;
         self.require_resolved(std::slice::from_ref(&proposition))?;
+        // The pin's `preprocessPropToDecide` (Lean/Elab/Tactic/Decide.lean): let-bound locals are
+        // unfolded, and a goal that still mentions a local is refused, even where a local
+        // dictionary would decide it.
+        if self.zeta_locals(&proposition)?.has_fvar() {
+            return Err(error(TacticError::DecideFreeVariables));
+        }
         let dictionary = self.decision_dictionary(&proposition)?;
         let computation = apps(
             self.decide_constant(),
@@ -46,6 +52,28 @@ impl Context {
         self.close_proof_goal(goal, value)
     }
 
+    /// `expr` with every let-bound local of the current context replaced by its value (the pin's
+    /// `zetaReduce`). One pass from the newest local suffices: a value mentions only older ones.
+    fn zeta_locals(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        let mut current = expr.clone();
+        for local in self.txn.lctx.decls().to_vec().into_iter().rev() {
+            self.tick()?;
+            let Some(value) = &local.value else {
+                continue;
+            };
+            let abstracted = current
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            if abstracted.has_loose_bvar(0) {
+                let value = self.instantiate(value)?;
+                current = abstracted
+                    .subst_loose(0, std::slice::from_ref(&value))
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+            }
+        }
+        Ok(current)
+    }
+
     /// The Boolean decision the tactic evaluates. The pin builds it with `mkDecide`,
     /// whose head is `Decidable.decide` (vendored Lean/Meta/AppBuilder.lean:589-590); a
     /// plain `decide` exists there only as an `export` alias, which is no
@@ -53,7 +81,7 @@ impl Context {
     /// names the same function `decide`, so the seed spelling is used only where
     /// the pin's constant is absent; it goes when the seed is retired
     /// (franken_lean-z8j.1.8).
-    pub(super) fn decide_constant(&self) -> Expr {
+    pub(in crate::source) fn decide_constant(&self) -> Expr {
         let pinned = Name::from_components(["Decidable", "decide"]);
         if self.txn.env.contains(&pinned) {
             Expr::const_(pinned, vec![])
@@ -215,7 +243,7 @@ impl Context {
         }
     }
 
-    pub(super) fn decision_dictionary(
+    pub(in crate::source) fn decision_dictionary(
         &mut self,
         proposition: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
@@ -269,7 +297,20 @@ impl Context {
             return Err(error(TacticError::ExpectedProposition));
         }
         let proposition = self.instantiate(&proposition.value)?;
-        let dictionary = self.decision_dictionary(&proposition)?;
+        // The pin's by_cases macro opens Classical while elaborating the
+        // dependent conditional (Init/ByCases.lean). Activate its *registered*
+        // scoped instances rather than manufacturing a propDecidable call:
+        // ordinary priorities, local dictionaries and erasures still matter.
+        // The scope ends before either branch, including after a failed search.
+        self.tick()?;
+        let mut scopes = self.source_scope.instance_scopes.clone();
+        scopes
+            .activate(&self.txn.env, &Name::from_components(["Classical"]))
+            .map_err(instances::registry_error)?;
+        let saved = std::mem::replace(&mut self.source_scope.instance_scopes, scopes);
+        let dictionary = self.decision_dictionary(&proposition);
+        self.source_scope.instance_scopes = saved;
+        let dictionary = dictionary?;
         let target_type = self
             .known_type(&goal.target)?
             .ok_or_else(|| error(TacticError::ExpectedGoal))?;

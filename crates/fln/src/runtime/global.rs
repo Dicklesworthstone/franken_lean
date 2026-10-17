@@ -3,6 +3,9 @@
 //! spine is not eta-expanded across its strict, closure-producing body.
 mod applications;
 mod callbacks;
+mod partial;
+
+pub(super) use partial::Store as PartialStages;
 
 use super::*;
 
@@ -18,7 +21,7 @@ fn variable(index: usize) -> Result<Expr, IngressError> {
 }
 
 impl Preparation<'_> {
-    fn producer_depth(&mut self, depth: usize) -> Result<u32, IngressError> {
+    pub(in crate::runtime) fn producer_depth(&mut self, depth: usize) -> Result<u32, IngressError> {
         self.tick()?;
         if depth > self.limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
@@ -56,7 +59,16 @@ impl Preparation<'_> {
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(replacement) = self.implemented_by_call(head, args)? {
+            return Ok(Some(replacement));
+        }
+        if let Some(staged) = self.partial_stage_call(head, args)? {
+            return Ok(Some(staged));
+        }
         if let Some(specialized) = self.specialize_staged_callback(head, args)? {
+            return Ok(Some(specialized));
+        }
+        if let Some(specialized) = self.specialize_computed_callback(head, args)? {
             return Ok(Some(specialized));
         }
         let ExprNode::Const { name, levels } = head.node() else {

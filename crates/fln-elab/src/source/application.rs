@@ -19,6 +19,7 @@ pub(super) enum ApplicationValue<'a> {
 
 pub(super) struct NamedApplication<'a> {
     function: Typed,
+    initial: bool,
     positional: VecDeque<ApplicationValue<'a>>,
     named: Vec<Named<'a>>,
     explicit: bool,
@@ -31,6 +32,18 @@ pub(super) struct NamedApplication<'a> {
 impl NamedApplication<'_> {
     pub(super) fn function_type(&self) -> &Expr {
         &self.function.type_
+    }
+
+    pub(super) fn initial(&self) -> bool {
+        self.initial
+    }
+
+    pub(super) fn start(&mut self) {
+        self.initial = false;
+    }
+
+    pub(super) fn has_arguments(&self) -> bool {
+        !self.positional.is_empty() || !self.named.is_empty()
     }
 }
 
@@ -93,6 +106,7 @@ impl Context {
         }
         Ok(NamedApplication {
             function,
+            initial: true,
             positional,
             named,
             explicit,
@@ -107,7 +121,13 @@ impl Context {
         &mut self,
         state: &mut NamedApplication<'a>,
     ) -> Result<Option<Argument<'a>>, NatDefinitionElabError> {
-        while !state.positional.is_empty() || !state.named.is_empty() {
+        loop {
+            let has_arguments = !state.positional.is_empty() || !state.named.is_empty();
+            if !has_arguments
+                && (state.explicit || !self.has_optional_parameter(&state.function.type_)?)
+            {
+                break;
+            }
             self.tick()?;
             state.function = match self.coerce_function(state.function.clone()) {
                 Err(NatDefinitionElabError::Inference(SourceInferenceError::ExpectedFunction))
@@ -138,8 +158,12 @@ impl Context {
             };
             let name = binder_name.clone();
             let domain = binder_type.clone();
+            let argument_domain = self.projection_domain(domain.clone())?;
             let codomain = body.clone();
             let style = *binder_info;
+            if !has_arguments && style == BinderInfo::StrictImplicit {
+                break;
+            }
             let mut selected = None;
             for (index, argument) in state.named.iter().enumerate() {
                 self.tick()?;
@@ -152,9 +176,9 @@ impl Context {
                 Some(state.named.remove(index).value)
             } else if !state.explicit && style != BinderInfo::Default {
                 let argument = if style == BinderInfo::InstImplicit {
-                    self.instance_hole(domain)?
+                    self.instance_hole(argument_domain)?
                 } else {
-                    self.hole(domain)?
+                    self.hole(argument_domain)?
                 };
                 self.append_named_value(state, &codomain, argument)?;
                 continue;
@@ -173,36 +197,41 @@ impl Context {
                 return Ok(Some(Argument {
                     value,
                     infer_exception_action: self
-                        .do_exception_infer_action(&state.function, &domain)?,
-                    domain,
+                        .do_exception_infer_action(&state.function, &argument_domain)?,
+                    domain: argument_domain,
                     codomain,
                 }));
             }
             // There is a later named parameter, but no positional argument for
             // this explicit parameter. A dependent named type must determine it,
             // rather than being checked under an arbitrary eta-bound variable.
-            let argument = if self
-                .named_argument_depends_on_current(&state.function.type_, &state.named)?
+            let argument = if !state.explicit
+                && let Some(value) = optional::default_value(&domain)
             {
-                self.hole(domain)?
+                value.clone()
+            } else if self.named_argument_depends_on_current(&state.function.type_, &state.named)? {
+                self.hole(argument_domain)?
             } else {
                 let id = FVarId(self.fresh_name()?);
                 let hidden = self.fresh_name()?;
-                self.txn
-                    .lctx
-                    .add_param(id.clone(), hidden, domain.clone(), BinderInfo::Default);
+                self.txn.lctx.add_param(
+                    id.clone(),
+                    hidden,
+                    argument_domain.clone(),
+                    BinderInfo::Default,
+                );
                 if let Some(expected) = state.result_expected.take() {
                     let expected = self.whnf(&expected)?;
                     if let ExprNode::ForallE {
                         binder_type, body, ..
                     } = expected.node()
                     {
-                        self.constrain_type(&domain, binder_type)?;
+                        self.constrain_type(&argument_domain, binder_type)?;
                         state.result_expected =
                             Some(self.substitute(body, &Expr::fvar(id.clone()))?);
                     }
                 }
-                state.eta.push((name, id.clone(), domain));
+                state.eta.push((name, id.clone(), argument_domain));
                 Expr::fvar(id)
             };
             self.append_named_value(state, &codomain, argument)?;
@@ -238,7 +267,7 @@ impl Context {
             let mut term = if state.explicit {
                 self.finish_explicit_term(state.function, state.result_expected.as_ref())?
             } else {
-                self.finish_application(state.function, state.result_expected.as_ref())?
+                self.finish_application_implicits(state.function, state.result_expected.as_ref())?
             };
             term.value = self.instantiate(&term.value)?;
             term.type_ = self.instantiate(&term.type_)?;
@@ -393,7 +422,11 @@ impl Context {
                 else {
                     return Ok(false);
                 };
-                let depends = first || self.mentions_named_dependencies(binder_type, &dependent)?;
+                // The pin's `findNamedArgDependsOn?` ignores annotation
+                // payloads: a default mentioning this parameter is not a
+                // dependency of the later named argument's actual type.
+                let domain = self.projection_domain(binder_type.clone())?;
+                let depends = first || self.mentions_named_dependencies(&domain, &dependent)?;
                 if !first && pending.remove(binder_name) && depends {
                     return Ok(true);
                 }

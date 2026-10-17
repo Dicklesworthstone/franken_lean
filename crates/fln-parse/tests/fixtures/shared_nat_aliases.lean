@@ -1,0 +1,35 @@
+-- Sharing through named definitions must survive checker delta reduction.
+def chain0 : Nat := 1
+def chain1 : Nat := Nat.add chain0 chain0
+def chain2 : Nat := Nat.add chain1 chain1
+def chain3 : Nat := Nat.add chain2 chain2
+def chain4 : Nat := Nat.add chain3 chain3
+def chain5 : Nat := Nat.add chain4 chain4
+def chain6 : Nat := Nat.add chain5 chain5
+def chain7 : Nat := Nat.add chain6 chain6
+def chain8 : Nat := Nat.add chain7 chain7
+def chain9 : Nat := Nat.add chain8 chain8
+def chain10 : Nat := Nat.add chain9 chain9
+def chain11 : Nat := Nat.add chain10 chain10
+def chain12 : Nat := Nat.add chain11 chain11
+def chain13 : Nat := Nat.add chain12 chain12
+def chain14 : Nat := Nat.add chain13 chain13
+def chain15 : Nat := Nat.add chain14 chain14
+def chain16 : Nat := Nat.add chain15 chain15
+def chain17 : Nat := Nat.add chain16 chain16
+def chain18 : Nat := Nat.add chain17 chain17
+def chain19 : Nat := Nat.add chain18 chain18
+def chain20 : Nat := Nat.add chain19 chain19
+def chain21 : Nat := Nat.add chain20 chain20
+def chain22 : Nat := Nat.add chain21 chain21
+def chain23 : Nat := Nat.add chain22 chain22
+def chain24 : Nat := Nat.add chain23 chain23
+def chain25 : Nat := Nat.add chain24 chain24
+def chain26 : Nat := Nat.add chain25 chain25
+def chain27 : Nat := Nat.add chain26 chain26
+def chain28 : Nat := Nat.add chain27 chain27
+def chain29 : Nat := Nat.add chain28 chain28
+def chain30 : Nat := Nat.add chain29 chain29
+def chain31 : Nat := Nat.add chain30 chain30
+def chain32 : Nat := Nat.add chain31 chain31
+theorem aliasComputes : chain32 = 4294967296 := by rfl

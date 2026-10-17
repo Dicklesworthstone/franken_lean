@@ -61,8 +61,23 @@ fn fallible_constructor_scalar_reads_check_width_and_offset() {
     )));
 }
 
-pub(crate) fn lock() -> MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// The serialization every shadow-observing test holds. Dropping it first releases this
+/// thread's current stdio streams, then the mutex: libtest runs each test on its own thread,
+/// and the thread-exit release of those slots would otherwise run after the lock is gone,
+/// inside whichever test holds the shadow next, as a `ForeignPointer` that is not its traffic.
+/// Measured: with that release outside the lock, 2 to 4 shadow tests failed in every parallel
+/// run of this crate, and none with `--test-threads=1`, where every test shares the main thread.
+pub(crate) struct TestLock(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+impl Drop for TestLock {
+    fn drop(&mut self) {
+        // Runs before the field's MutexGuard drops, so still inside the critical section.
+        crate::stdio::settle_current_streams();
+    }
+}
+
+pub(crate) fn lock() -> TestLock {
+    TestLock(TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 // ================================================================ layout law
@@ -665,6 +680,69 @@ fn try_mpz_view_refuses_hostile_headers() {
 }
 
 #[test]
+fn borrowed_string_view_aliases_owned_storage_without_copying() {
+    let _g = lock();
+    shadow::enable();
+    {
+        for text in ["", "héllo∀", "a\0💧\0z"] {
+            let value = Obj::mk_string(text);
+            let alias = value.clone_ref();
+            let rc_before = value.header().rc;
+            let (size, cap, len, first) = value
+                .try_borrow_string_view()
+                .expect("a minted string has a borrowed view");
+            let (_, _, _, second) = value.try_borrow_string_view().unwrap();
+            let (_, _, _, aliased) = alias.try_borrow_string_view().unwrap();
+            assert_eq!(
+                (size, cap, len),
+                (text.len() + 1, text.len() + 1, text.chars().count())
+            );
+            assert_eq!(&first[..size - 1], text.as_bytes());
+            assert_eq!(first[size - 1], 0);
+            assert_eq!(first.as_ptr(), second.as_ptr());
+            assert_eq!(first.as_ptr(), aliased.as_ptr());
+            assert_eq!(
+                first.as_ptr() as usize,
+                value.identity_token() + offset_of!(LeanStringObject, m_data),
+                "the view borrows the actual inline buffer, not an observer cache"
+            );
+            assert_eq!(
+                value.header().rc,
+                rc_before,
+                "a byte borrow adds no owned reference"
+            );
+
+            let (_, _, _, mut copy) = value.try_string_view().unwrap();
+            assert_eq!(copy, first);
+            assert_ne!(
+                copy.as_ptr(),
+                first.as_ptr(),
+                "the old API still owns its copy"
+            );
+            copy[size - 1] = b'x';
+            assert_eq!(
+                first[size - 1],
+                0,
+                "mutating the copy leaves the borrow intact"
+            );
+
+            drop(alias);
+            assert_eq!(
+                &first[..size - 1],
+                text.as_bytes(),
+                "the owning handle retains the buffer"
+            );
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
 fn try_string_view_refuses_hostile_headers() {
     let _g = lock();
     let well = Obj::mk_string("hi");
@@ -674,21 +752,28 @@ fn try_string_view_refuses_hostile_headers() {
     assert_eq!((size, cap, len), (3, 3, 2));
     assert_eq!(&bytes[..size - 1], b"hi");
     assert_eq!(bytes[size - 1], 0);
+    assert_eq!(
+        well.try_borrow_string_view(),
+        Some((size, cap, len, bytes.as_slice()))
+    );
 
     assert!(
         Obj::mk_nat(3).try_string_view().is_none(),
         "a scalar is not a string"
     );
+    assert!(Obj::mk_nat(3).try_borrow_string_view().is_none());
     assert!(
         Obj::mk_mpz(&[7], false).try_string_view().is_none(),
         "an mpz is not a string"
     );
+    assert!(Obj::mk_mpz(&[7], false).try_borrow_string_view().is_none());
 
     well.plant_string_size(0);
     assert!(
         well.try_string_view().is_none(),
         "a zero m_size is not a view"
     );
+    assert!(well.try_borrow_string_view().is_none());
     well.restore_string_size(3);
 
     well.plant_string_size(4);
@@ -696,6 +781,7 @@ fn try_string_view_refuses_hostile_headers() {
         well.try_string_view().is_none(),
         "m_size past m_capacity is not a view"
     );
+    assert!(well.try_borrow_string_view().is_none());
     well.restore_string_size(3);
 
     well.plant_string_terminator(b'x');
@@ -703,7 +789,9 @@ fn try_string_view_refuses_hostile_headers() {
         well.try_string_view().is_none(),
         "a missing NUL terminator is not a view"
     );
+    assert!(well.try_borrow_string_view().is_none());
     well.plant_string_terminator(0);
+    assert_eq!(well.try_borrow_string_view(), Some((3, 3, 2, &b"hi\0"[..])));
 }
 
 #[test]

@@ -823,7 +823,15 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
                    and lakefile. Measured at 49b53289 by the checked-in ordinary-Lean probe \
                    (crates/fln-cli/tests/ordinary_lean_probe.rs): the drop-in `lean` accepts 3 \
                    of the 27 programs the pinned Reference accepts. The comment now says the \
-                   drop-in is the 1.0 target and points at Live today.",
+                   drop-in is the 1.0 target and points at Live today. RE-READ 2026-10-13: \
+                   since a5c5293c (2026-10-11) headerless files run over the pin's real Init, \
+                   and Live today reports the 2026-10-07 bounded-seed probe (15 of 29, all \
+                   identical) as historical, saying in the same sentence that it does not \
+                   measure the new import route. No checked-in measurement of that route is \
+                   cited in the README; the pin's own suite is scored on bead \
+                   fln-upstream-suite-scoreboard-n04o (comment 3629: 160 of 2,961 tests/elab \
+                   files byte-identical at main 8304bd2e). The drop-in claim stays a 1.0 \
+                   target, so the state is unchanged.",
         enforcement: Enforcement::Enforced,
     },
     ClaimRow {
@@ -1172,7 +1180,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 27] = [
         "README-DROP-IN-TODAY",
         Citation::OccursExactly {
             path: "README.md",
-            needle: "accepts 15 of the 29 probe programs the pinned Reference accepts",
+            needle: "that historical result is not a measurement of the new import route",
             count: 1,
         },
     ),

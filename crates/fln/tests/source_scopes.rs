@@ -109,10 +109,112 @@ fn section_variables_generalize_runtime_definitions_and_restore_after_end() {
 fn scoped_instance_activation_changes_runtime_values_and_ends_with_the_section() {
     let completed = executed(
         &engine(),
-        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef fallbackSelection : Selection := Selection.mk 1\nattribute [instance] fallbackSelection\nnamespace Alternative\ndef dictionary : Selection := Selection.mk 7\nattribute [scoped instance] dictionary\nend Alternative\n#eval (selected : Nat)\nsection\nopen scoped Alternative\n#eval (selected : Nat)\nend\n#eval (selected : Nat)",
+        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef fallbackSelection : Selection := Selection.mk 1\nattribute [instance] fallbackSelection\nnamespace Alternative\ndef dictionary : Selection := Selection.mk 7\nattribute [scoped instance] dictionary\nend Alternative\n#eval selected\nsection\nopen scoped Alternative\n#eval (selected)\nend\n#eval selected",
     );
     assert_eq!(evaluated(&completed), [1, 7, 1]);
     assert_eq!(completed.batch.source_evaluation_indices.len(), 3);
+}
+
+#[test]
+fn bare_evaluations_synthesize_consecutive_instances_and_refuse_missing_dictionaries() {
+    let missing = checked(
+        &engine(),
+        "class FirstChoice where\n  value : Nat\nclass SecondChoice where\n  value : Nat\ndef combined [FirstChoice] [SecondChoice] : Nat := FirstChoice.value + SecondChoice.value\ndef firstDictionary : FirstChoice := FirstChoice.mk 17\nattribute [instance] firstDictionary\ndef secondDictionary : SecondChoice := SecondChoice.mk 25",
+    );
+    let parsed = fln_parse::parse_source_command(b"#eval combined").unwrap();
+    assert!(matches!(
+        fln_elab::elaborate_evaluation_in_with_budget(
+            parsed.syntax(),
+            Name::num(Name::anonymous(), 0),
+            missing.environment(),
+            limits().kernel,
+        ),
+        Err(fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::InstanceSynthesisRequired
+        ))
+    ));
+    let registered = checked(&missing, "attribute [instance] secondDictionary");
+    assert_eq!(
+        evaluated(&executed(&registered, "#eval combined\n#eval (combined)")),
+        [42, 42]
+    );
+}
+
+#[test]
+fn instance_query_insertion_preserves_explicit_and_polymorphic_function_values() {
+    let base = checked(
+        &engine(),
+        "class Selection where\n  value : Nat\ndef selected [Selection] : Nat := Selection.value\ndef dictionary : Selection := Selection.mk 7\nattribute [instance] dictionary\ndef explicitFunction (x : Nat) : Nat := x\ndef polymorphic {A : Type} (x : A) : A := x\ndef strict ⦃A : Type⦄ (x : A) : A := x\ndef ordinaryImplicit {A : Type} : Nat := 0\ndef remaining [Selection] {A : Type} (x : A) : Nat := Selection.value",
+    );
+    let candidate = |source: &str| {
+        let parsed = fln_parse::parse_source_command(source.as_bytes()).unwrap();
+        let name = Name::num(Name::anonymous(), 0);
+        let declaration = if parsed.kind() == fln_parse::SourceCommandKind::Check {
+            fln_elab::elaborate_check_in_with_budget(
+                parsed.syntax(),
+                name,
+                base.environment(),
+                limits().kernel,
+            )
+        } else {
+            fln_elab::elaborate_evaluation_in_with_budget(
+                parsed.syntax(),
+                name,
+                base.environment(),
+                limits().kernel,
+            )
+        }
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert!(matches!(
+            fln_kernel::check(base.environment(), &declaration, limits().kernel),
+            fln::Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+        ));
+        let fln::Declaration::Defn(definition) = declaration else {
+            panic!("query must produce a definition candidate");
+        };
+        definition
+    };
+    for (source, name) in [
+        ("#eval @selected", "selected"),
+        ("#eval (@selected)", "selected"),
+        ("#check selected", "selected"),
+        ("#eval explicitFunction", "explicitFunction"),
+        ("#eval polymorphic", "polymorphic"),
+        ("#eval strict", "strict"),
+        ("#eval ordinaryImplicit", "ordinaryImplicit"),
+        ("#check @polymorphic", "polymorphic"),
+    ] {
+        assert_eq!(
+            candidate(source).base.type_,
+            base.environment()
+                .find(&n(name))
+                .unwrap()
+                .constant_val()
+                .type_,
+            "{source} must retain the checked function type"
+        );
+    }
+    let remaining = candidate("#eval remaining");
+    assert!(matches!(
+        remaining.base.type_.node(),
+        fln::ExprNode::ForallE {
+            binder_info: fln::BinderInfo::Implicit,
+            ..
+        }
+    ));
+    assert_eq!(
+        remaining.value,
+        fln::Expr::app(
+            fln::Expr::const_(n("remaining"), vec![]),
+            fln::Expr::const_(n("dictionary"), vec![]),
+        )
+    );
+    let computed = candidate("#eval let paid : Nat := 40 + 2; fun (x : Nat) => x");
+    assert!(matches!(
+        computed.value.node(),
+        fln::ExprNode::LetE { body, .. }
+            if matches!(body.node(), fln::ExprNode::Lam { .. })
+    ));
 }
 
 #[test]
@@ -547,10 +649,11 @@ fn open_in_reaches_exactly_its_one_command() {
 }
 
 /// Declaration modifiers parse to the pin's trees
-/// (`crates/fln-parse/tests/reference_command_trees.rs`), but `private` and
-/// `noncomputable` are not implemented: each is refused by the elaborator as syntax it
-/// does not support, a typed, non-authoritative refusal, never admitted with the modifier
-/// dropped. The pin accepts both files. `protected` is elaborated (bead `fln-eq4k`),
+/// (`crates/fln-parse/tests/reference_command_trees.rs`), but `private` is not implemented:
+/// it is refused by the elaborator as syntax it does not support, a typed, non-authoritative
+/// refusal, never admitted with the modifier dropped. The pin accepts that file.
+/// `noncomputable` is elaborated (the `noncomputable` journal): `noncomputable def b` is
+/// admitted, as the pin admits it. `protected` is elaborated (bead `fln-eq4k`),
 /// admitted and tagged, never admitted with the tag dropped. A nameless instance is
 /// elaborated too, and the pin accepts it. Its name follows `mkInstanceName`
 /// (`instance_name.rs`) except for one stated deviation. The base name
@@ -608,19 +711,27 @@ fn parsed_modifiers_are_refused_until_elaborated_and_nameless_instances_are_admi
         added.len() == 1 && added[0].starts_with("instInhabitedNat_"),
         "exactly one new instance, named off the taken base: {added:?}"
     );
-    for source in ["private def a : Nat := 1", "noncomputable def b : Nat := 2"] {
-        let error = engine()
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits()),
-            )
-            .expect_err(source);
-        let (class, authority, _) = error.disposition();
-        assert_eq!((class, authority), ("input", false), "{source}: {error}");
-        assert!(
-            error.to_string().contains("elaboration refused source"),
-            "{source}: {error}"
-        );
-    }
+    engine()
+        .check_source_files(
+            &[b"noncomputable def b : Nat := 2"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = "private def a : Nat := 1";
+    let error = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(source);
+    let (class, authority, _) = error.disposition();
+    assert_eq!((class, authority), ("input", false), "{source}: {error}");
+    assert!(
+        error.to_string().contains("elaboration refused source"),
+        "{source}: {error}"
+    );
 }

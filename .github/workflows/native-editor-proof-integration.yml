@@ -5,6 +5,9 @@ on:
     paths:
       - '.github/workflows/native-editor-proof-integration.yml'
       - 'crates/fln-server/**'
+      - 'crates/fln-elab/src/source/subst*'
+      - 'crates/fln-elab/src/source/subst/**'
+      - 'crates/fln/tests/source_subst*'
       - 'crates/fln-olean/**'
       - 'crates/fln-cli/src/lib.rs'
       - 'crates/fln-cli/src/bin/**'
@@ -57,6 +60,8 @@ jobs:
           rustc -Vv
           cargo test --locked -p fln-olean --lib extension_write::
           cargo test --locked -p fln-olean --lib rebuild::
+          cargo test --locked -p fln-elab --lib source::subst::
+          cargo test --locked -p fln --test source_subst --test source_subst_operand --test source_subst_data --no-fail-fast
           cargo test --locked -p fln-server
           cargo test --locked -p fln-cli --lib source_check::lsp::dependencies
           cargo test --locked -p fln-cli --test lsp_proof_modules --test lsp_stdio_e2e --test source_module_check --no-fail-fast
@@ -70,3 +75,35 @@ jobs:
           path: ${{ runner.temp }}/native-editor-validation.log
           retention-days: 7
           if-no-files-found: error
+
+  substitution-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the pinned Reference for differential tests only
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+      - name: Compare the same accepted and refused substitution sources
+        shell: python
+        run: |
+          import json, os, pathlib, re, subprocess
+          source = '\n'.join(pathlib.Path('crates/fln/tests/' + name).read_text() for name in ('source_subst_operand.rs', 'source_subst_data.rs'))
+          cases = re.findall(r'"((?:theorem (?:t|bad) |def t |universe )[^"\\]*(?:\\.[^"\\]*)*)"', source)
+          assert len(cases) >= 18, 'shared source fixture inventory unexpectedly shrank'
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'substitution.lean'
+          for index, quoted in enumerate(cases):
+              text = json.loads('"' + quoted + '"')
+              fixture.write_text(text + '\n')
+              result = subprocess.run([str(lean), str(fixture)], capture_output=True, text=True, timeout=60)
+              print(index, text, result.returncode, result.stdout, result.stderr, flush=True)
+              expected = not text.startswith('theorem bad ')
+              assert (result.returncode == 0) == expected, f'Reference verdict differs for fixture {index}'

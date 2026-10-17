@@ -30,6 +30,11 @@
 //! `coercions::rigid_type_mismatch`, bead fln-azxg) or a completed `NotDefEq`
 //! conversion refusal reaches that evidence sooner. Both rule an interpretation
 //! out only when the coercion classes are the pin's.
+//! A distinct terminal function-application refusal is also shared: after a
+//! known telescope runs out, no active global, scoped or possible local CoeFun
+//! provider exists in the imported class registry. Unknown inputs alone are
+//! insufficient evidence; any provider vetoes this empty-search proof. An initially
+//! unknown callee remains postponed/undetermined, as does generic ExpectedFunction.
 //!
 //! Every other non-success leaves the interpretation undetermined, and the identifier
 //! is refused rather than resolved by guessing:
@@ -65,7 +70,7 @@ impl Context {
         let mut undetermined: Option<Name> = None;
         for candidate in candidates {
             self.tick()?;
-            let syntax = interpretation_syntax(head, arguments, candidate)?;
+            let syntax = interpretation_syntax(head, arguments, candidate, &self.source_scope)?;
             let mut trial = Box::new(self.clone());
             trial.overload_depth += 1;
             let outcome = trial.interpretation(&syntax, expected);
@@ -119,6 +124,14 @@ impl Context {
         let term = match self.term_prepared(syntax, expected.cloned()) {
             Ok(term) => term,
             Err(error) => {
+                if matches!(
+                    &error,
+                    NatDefinitionElabError::Inference(SourceInferenceError::FunctionCoercionAbsent)
+                ) {
+                    return Ok(Some(Err(
+                        "function type is unavailable after argument inference".to_owned(),
+                    )));
+                }
                 let mismatch = matches!(
                     &error,
                     NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. })
@@ -192,11 +205,13 @@ impl Context {
     }
 }
 
-/// `head` written `_root_.<candidate>`, applied to `arguments` when present.
+/// An exact candidate, applied to `arguments` when present. Public names use
+/// `_root_`; a current-module private core identity is already exact.
 fn interpretation_syntax(
     head: &Syntax,
     arguments: Option<&[Syntax]>,
     candidate: &Name,
+    scope: &scope::SourceScope,
 ) -> Result<Syntax, NatDefinitionElabError> {
     let Syntax::Ident { info, raw_val, .. } = head else {
         return Err(failure(SourceInferenceError::Scope));
@@ -204,7 +219,11 @@ fn interpretation_syntax(
     let head = Syntax::Ident {
         info: *info,
         raw_val: *raw_val,
-        val: Name::from_components(["_root_"]).append_core(candidate),
+        val: if scope.user_name(candidate) != *candidate {
+            candidate.clone()
+        } else {
+            Name::from_components(["_root_"]).append_core(candidate)
+        },
         preresolved: Vec::new(),
     };
     Ok(match arguments {

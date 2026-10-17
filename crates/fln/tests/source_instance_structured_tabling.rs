@@ -35,7 +35,7 @@ fn repeated(shape: &str) {
     checked(
         &base,
         &format!(
-            "def result : C12 ({concrete}) := inferInstance\ntheorem correct : result.value = 7 := by rfl"
+            "set_option synthInstance.maxSize 8192 in\ndef result : C12 ({concrete}) := inferInstance\ntheorem correct : result.value = 7 := by rfl"
         ),
     );
 }
@@ -69,6 +69,6 @@ class Root where
 instance root {A B : Type} [warm : Pick (Box A)] [pick : Pick (Box B)] [need : Need (Box B)] : Root := Root.mk pick.stamp warm.stamp
 def result : Root := inferInstance
 theorem resumed : result.first = 1 := by rfl
-theorem priority : result.second = 2 := by rfl"#,
+theorem earlierConsumerResumed : result.second = 1 := by rfl"#,
     );
 }

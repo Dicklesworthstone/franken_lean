@@ -14,8 +14,10 @@ mod context;
 mod lambdas;
 mod matrix;
 mod obligation;
+mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
+pub(super) use well_founded::State as WellFounded;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -32,6 +34,14 @@ pub enum RecursionError {
     },
     ChangedIndex,
     PartialApplication,
+    WellFoundedMeasureRequired,
+    WellFoundedRelationUnsupported,
+    WellFoundedMeasureDependsOnVaryingParameter,
+    WellFoundedMeasureOrderUnsupported,
+    WellFoundedArgumentRequired,
+    FixedArgumentConversionUnsupported,
+    WellFoundedMeasureSearchFailed,
+    RecursionInDecreasingProof,
     StructuralMeasureNotParameter,
     StructuralParameterNotInductive,
     TerminationBinderCount {
@@ -62,7 +72,31 @@ impl std::fmt::Display for RecursionError {
             Self::GeneralizeParameter { .. } => "recursive parameter requires generalization",
             Self::ChangedIndex => "recursive call indices do not match its structural child's type",
             Self::PartialApplication => {
-                "recursive function escapes without its structural argument"
+                "recursive function escapes without its decreasing argument"
+            }
+            Self::WellFoundedMeasureRequired => {
+                "well-founded measure inference found no supported Nat-valued parameter; provide an explicit termination_by measure"
+            }
+            Self::WellFoundedRelationUnsupported => {
+                "Nat-valued termination measures require the active WellFoundedRelation Nat instance to use Nat.lt"
+            }
+            Self::WellFoundedMeasureDependsOnVaryingParameter => {
+                "the termination measure's type and well-founded relation must not depend on the function's varying parameters"
+            }
+            Self::WellFoundedMeasureOrderUnsupported => {
+                "well-founded inference cannot skip earlier SizeOf or lexicographic measures; provide an explicit Nat-valued termination_by measure"
+            }
+            Self::WellFoundedArgumentRequired => {
+                "well-founded recursion requires at least one varying argument"
+            }
+            Self::FixedArgumentConversionUnsupported => {
+                "well-founded fixed-argument analysis does not yet support this proof-dependent conversion"
+            }
+            Self::WellFoundedMeasureSearchFailed => {
+                "could not find a Nat parameter decreasing on every recursive call; provide termination_by or decreasing_by"
+            }
+            Self::RecursionInDecreasingProof => {
+                "a decreasing_by proof cannot call the recursive function"
             }
             Self::StructuralMeasureNotParameter => {
                 "the termination measure of a structurally recursive function must be one of its parameters"
@@ -84,6 +118,56 @@ fn error(reason: RecursionError) -> NatDefinitionElabError {
 pub(super) struct StructuralHint<'a> {
     aliases: Vec<Option<Name>>,
     measure: &'a Syntax,
+}
+
+pub(super) enum TerminationHint<'a> {
+    Structural(StructuralHint<'a>),
+    /// Only safe definitions enter the structural-then-well-founded fallback.
+    Automatic,
+    WellFounded {
+        hint: well_founded::Hint<'a>,
+        allowed: bool,
+    },
+}
+
+pub(super) fn termination_hint(
+    syntax: &Syntax,
+    well_founded_allowed: bool,
+) -> Result<Option<TerminationHint<'_>>, NatDefinitionElabError> {
+    if let Some(hint) = well_founded::hint(syntax)? {
+        return Ok(Some(TerminationHint::WellFounded {
+            hint,
+            allowed: well_founded_allowed,
+        }));
+    }
+    Ok(match structural_hint(syntax)? {
+        Some(hint) => Some(TerminationHint::Structural(hint)),
+        None if well_founded_allowed => Some(TerminationHint::Automatic),
+        None => None,
+    })
+}
+
+/// The binder of a structural definition's original-body obligation (`recursion/obligation.rs`):
+/// `_fln_structural.<h>`, where `h` counts the parameters bound directly above it (the header
+/// and the written leading lambdas). The obligation is the body the pin's `_sunfold` companion
+/// holds, recursive calls still naming the definition, and source reduction unfolds through it
+/// as the pin does (`reduce.rs`, `smart_unfolding`). Source text cannot spell a numeric name
+/// component, so no written `let` carries this name.
+pub(super) fn structural_obligation_name(parameters: usize) -> Name {
+    Name::num(
+        Name::from_components(["_fln_structural"]),
+        parameters as u64,
+    )
+}
+
+/// The `h` of [`structural_obligation_name`], or `None` for any other binder name.
+pub(super) fn structural_obligation_parameters(name: &Name) -> Option<usize> {
+    let fln_core::name::LeafView::Num(parameters) = name.leaf_view() else {
+        return None;
+    };
+    (!name.component_overflowed() && name.parent() == Name::from_components(["_fln_structural"]))
+        .then(|| usize::try_from(parameters).ok())
+        .flatten()
 }
 
 /// Read the supported structural clause, never silently discard a well-founded
@@ -480,11 +564,28 @@ impl Context {
         parameters: &[LocalDecl],
         syntax: &Syntax,
         expected: Option<Expr>,
-        hint: Option<&StructuralHint<'_>>,
+        hint: Option<&TerminationHint<'_>>,
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
         self.defining = Some(name.clone());
         let snapshot = self.clone();
+        if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.group.is_none())
+        {
+            // Partial self references must be in scope before tactics select
+            // alternatives. An initial unknown-self trial can otherwise choose
+            // a different successful branch and silently change the program.
+            // Mutual groups already register all peer headers before bodies.
+            let result = self.partial_definition_body(name, parameters, syntax, expected);
+            if result.is_err() {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = snapshot;
+                self.txn.budget.heartbeats_consumed = spent;
+            }
+            return result;
+        }
         match self.term(syntax, expected.clone()) {
             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
                 found,
@@ -523,15 +624,97 @@ impl Context {
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
         self.txn.budget.heartbeats_consumed = spent;
+        if self.partial.is_some() {
+            let result = self.partial_definition_body(name, parameters, syntax, expected);
+            if result.is_err() {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = snapshot;
+                self.txn.budget.heartbeats_consumed = spent;
+            }
+            return result;
+        }
         let mut parameters = parameters.to_vec();
         let result = (|| {
             let (body, expected, lambdas) =
                 self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
-            let selected = hint
-                .map(|hint| self.structural_hint_parameter(hint, &parameters, header_parameters))
-                .transpose()?;
-            let body =
-                self.structural_definition_body(name, &parameters, body, expected, selected)?;
+            let body = match hint {
+                Some(TerminationHint::WellFounded {
+                    hint,
+                    allowed: true,
+                }) => self.well_founded_body(
+                    name,
+                    &parameters,
+                    body,
+                    expected,
+                    hint,
+                    header_parameters,
+                )?,
+                Some(TerminationHint::WellFounded { allowed: false, .. }) => {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "well-founded recursion in a safe def declaration",
+                    });
+                }
+                Some(TerminationHint::Automatic) => {
+                    // The pin tries structural recursion first when neither
+                    // hint was supplied. A rollback retains all consumed work;
+                    // unrelated body errors and resource stops do not select
+                    // the well-founded fallback.
+                    let structural = self.clone();
+                    match self.structural_definition_body(
+                        name,
+                        &parameters,
+                        body,
+                        expected.clone(),
+                        None,
+                    ) {
+                        Ok(value) => value,
+                        Err(
+                            problem @ NatDefinitionElabError::Inference(
+                                SourceInferenceError::Recursion(
+                                    RecursionError::NotDecreasing
+                                    | RecursionError::ChangedParameter
+                                    | RecursionError::ChangedIndex
+                                    | RecursionError::RootMatchRequired
+                                    | RecursionError::ExplicitParameterRequired
+                                    | RecursionError::PartialApplication,
+                                ),
+                            ),
+                        ) => {
+                            let spent = self.txn.budget.heartbeats_consumed;
+                            *self = structural;
+                            self.txn.budget.heartbeats_consumed = spent;
+                            // An environment without the imported fixpoint
+                            // cannot attempt this lowering. Keep the original
+                            // structural diagnostic in bounded source seeds.
+                            if !self.txn.env.contains(&Name::from_components([
+                                "WellFounded",
+                                "Nat",
+                                "fix",
+                            ])) {
+                                return Err(problem);
+                            }
+                            self.well_founded_body(
+                                name,
+                                &parameters,
+                                body,
+                                expected,
+                                &well_founded::Hint::automatic(),
+                                header_parameters,
+                            )?
+                        }
+                        Err(problem) => return Err(problem),
+                    }
+                }
+                _ => {
+                    let selected = match hint {
+                        Some(TerminationHint::Structural(hint)) => Some(
+                            self.structural_hint_parameter(hint, &parameters, header_parameters)?,
+                        ),
+                        _ => None,
+                    };
+                    self.structural_definition_body(name, &parameters, body, expected, selected)?
+                }
+            };
             self.close_recursive_lambdas(&lambdas, body)
         })();
         if result.is_err() {
@@ -586,7 +769,7 @@ impl Context {
                                 self.original_recursive_body_obligation(syntax, expected.clone())?;
                             let mut value = self.term(syntax, expected.clone())?;
                             value.value = Expr::let_e(
-                                Name::anonymous(),
+                                structural_obligation_name(parameters.len()),
                                 obligation.type_,
                                 obligation.value,
                                 value.value,
@@ -614,7 +797,7 @@ impl Context {
                                 false,
                             );
                             value.value = Expr::let_e(
-                                Name::anonymous(),
+                                structural_obligation_name(parameters.len()),
                                 build.obligation.type_,
                                 build.obligation.value,
                                 value.value,

@@ -199,3 +199,316 @@ fn recognition_is_metered_and_a_failed_attempt_does_not_change_the_model() {
     assert!(nat_add_matches(engine.environment(), &mut 0, IngressLimits::default()).unwrap());
     assert_eq!(root, engine.logical_root(&KVMap::new()));
 }
+
+// Recursor regeneration inherits the family's parameter labels but supplies
+// its own motive and minor labels. Rename only the inherited alpha parameter
+// so this fixture still passes ordinary admission in both checking engines.
+fn transport_labels(expr: &Expr) -> Expr {
+    let label = |original: &Name| {
+        if original == &name("α") {
+            name("hygienic.alpha")
+        } else {
+            original.clone()
+        }
+    };
+    match expr.node() {
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            label(binder_name),
+            transport_labels(binder_type),
+            transport_labels(body),
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            label(binder_name),
+            transport_labels(binder_type),
+            transport_labels(body),
+            *binder_info,
+        ),
+        ExprNode::App { f, a } => Expr::app(transport_labels(f), transport_labels(a)),
+        _ => expr.clone(),
+    }
+}
+
+fn hygienic_transport_engine() -> Engine {
+    let mut engine = Engine::from_environment(Environment::new());
+    let options = KVMap::new();
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    for mut declaration in [
+        fln_elab::seed::nat_inductive_seed_declaration(),
+        fln_elab::seed::eq_seed_declaration(),
+        fln_elab::seed::quotient_seed_declaration(),
+    ] {
+        match &mut declaration {
+            Declaration::Inductive(block) if block.types[0].base.name == name("Eq") => {
+                for value in &mut block.types {
+                    value.base.type_ = transport_labels(&value.base.type_);
+                }
+                for value in &mut block.ctors {
+                    value.base.type_ = transport_labels(&value.base.type_);
+                }
+                for value in &mut block.recursors {
+                    value.base.type_ = transport_labels(&value.base.type_);
+                    for rule in &mut value.rules {
+                        rule.rhs = transport_labels(&rule.rhs);
+                    }
+                }
+            }
+            Declaration::Quotient(values) => {
+                for value in values {
+                    value.base.type_ = transport_labels(&value.base.type_);
+                }
+            }
+            _ => {}
+        }
+        engine = engine
+            .admit_declaration(declaration, &options, limits)
+            .expect("hygienic transport model passes both checking engines")
+            .into_complete()
+            .expect("transport model admission completes")
+            .engine;
+    }
+    engine
+}
+
+fn transport_application(label: &str, levels: Vec<Level>, arguments: &[Expr]) -> Expr {
+    arguments
+        .iter()
+        .cloned()
+        .fold(Expr::const_(name(label), levels), Expr::app)
+}
+
+fn execute_transport(engine: &Engine, value: Expr) -> usize {
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let entry = name("transportAnswer");
+    let execution = engine
+        .execute_definition(
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: entry.clone(),
+                    level_params: vec![],
+                    type_: Expr::const_(name("Nat"), vec![]),
+                },
+                value,
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![entry],
+            }),
+            &options,
+            EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .expect("checked transport compiles and executes")
+        .into_complete()
+        .expect("transport execution completes");
+    assert_eq!(root, engine.logical_root(&options));
+    let Some(ClosedVmValue::Scalar(value)) = closed_vm_value(&execution.exit).unwrap() else {
+        panic!("transport must preserve its scalar payload");
+    };
+    value
+}
+
+#[test]
+fn hygienic_equality_family_executes_checked_transport() {
+    let engine = hygienic_transport_engine();
+    assert!(
+        equality_family_matches(engine.environment(), &mut 0, IngressLimits::default()).unwrap()
+    );
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let value = Expr::lit(Literal::Nat(NatLit::from_u64(42)));
+    let equation = transport_application(
+        "Eq",
+        vec![Level::one()],
+        &[nat.clone(), value.clone(), Expr::bvar(0).unwrap()],
+    );
+    let motive = Expr::lam(
+        name("endpoint"),
+        nat.clone(),
+        Expr::lam(name("proof"), equation, nat.clone(), BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    let proof = transport_application("Eq.refl", vec![Level::one()], &[nat.clone(), value.clone()]);
+    let transport = transport_application(
+        "Eq.rec",
+        vec![Level::one(), Level::one()],
+        &[nat, value.clone(), motive, value.clone(), value, proof],
+    );
+    assert_eq!(execute_transport(&engine, transport), 42);
+}
+
+#[test]
+fn hygienic_quotient_family_executes_checked_representatives() {
+    let engine = hygienic_transport_engine();
+    assert!(
+        quotient_family_matches(engine.environment(), &mut 0, IngressLimits::default()).unwrap()
+    );
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let relation = transport_application("Eq", vec![Level::one()], std::slice::from_ref(&nat));
+    let function = Expr::lam(
+        name("value"),
+        nat.clone(),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let equation = transport_application(
+        "Eq",
+        vec![Level::one()],
+        &[nat.clone(), Expr::bvar(1).unwrap(), Expr::bvar(0).unwrap()],
+    );
+    let respects = Expr::lam(
+        name("left"),
+        nat.clone(),
+        Expr::lam(
+            name("right"),
+            nat.clone(),
+            Expr::lam(
+                name("proof"),
+                equation,
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let representative = transport_application(
+        "Quot.mk",
+        vec![Level::one()],
+        &[
+            nat.clone(),
+            relation.clone(),
+            Expr::lit(Literal::Nat(NatLit::from_u64(42))),
+        ],
+    );
+    let lifted = transport_application(
+        "Quot.lift",
+        vec![Level::one(), Level::one()],
+        &[
+            nat.clone(),
+            relation,
+            nat,
+            function,
+            respects,
+            representative,
+        ],
+    );
+    assert_eq!(execute_transport(&engine, lifted), 42);
+}
+
+#[test]
+fn metadata_is_transparent_when_comparing_transport_models() {
+    let Declaration::Inductive(block) = fln_elab::seed::eq_seed_declaration() else {
+        unreachable!()
+    };
+    let recursor = block.recursors[0].clone();
+    let mut annotated = recursor.clone();
+    annotated.base.type_ = renamed(&annotated.base.type_);
+    for rule in &mut annotated.rules {
+        rule.rhs = renamed(&rule.rhs);
+    }
+    assert!(
+        Comparison {
+            visited: &mut 0,
+            limits: IngressLimits::default(),
+        }
+        .info(&ConstantInfo::Rec(annotated), &ConstantInfo::Rec(recursor))
+        .unwrap()
+    );
+    let Declaration::Quotient(values) = fln_elab::seed::quotient_seed_declaration() else {
+        unreachable!()
+    };
+    for expected in values {
+        let mut annotated = expected.clone();
+        annotated.base.type_ = renamed(&annotated.base.type_);
+        assert!(
+            Comparison {
+                visited: &mut 0,
+                limits: IngressLimits::default(),
+            }
+            .info(
+                &ConstantInfo::Quot(annotated),
+                &ConstantInfo::Quot(expected)
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn quotient_recognition_preserves_kinds_universes_and_binder_structure() {
+    let Declaration::Quotient(values) = fln_elab::seed::quotient_seed_declaration() else {
+        unreachable!()
+    };
+    let model = values[2].clone();
+    let expected = ConstantInfo::Quot(model.clone());
+    let mut mutants = Vec::new();
+    let mut changed = model.clone();
+    changed.kind = fln_env::constants::QuotKind::Ind;
+    mutants.push(changed);
+    let mut changed = model.clone();
+    changed.base.level_params.swap(0, 1);
+    mutants.push(changed);
+    let mut changed = model.clone();
+    changed.base.type_ = Expr::sort(Level::zero());
+    mutants.push(changed);
+    let mut changed = model;
+    let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        ..
+    } = changed.base.type_.node()
+    else {
+        unreachable!()
+    };
+    changed.base.type_ = Expr::forall_e(
+        binder_name.clone(),
+        binder_type.clone(),
+        body.clone(),
+        BinderInfo::Default,
+    );
+    mutants.push(changed);
+    for changed in mutants {
+        assert!(
+            !Comparison {
+                visited: &mut 0,
+                limits: IngressLimits::default(),
+            }
+            .info(&ConstantInfo::Quot(changed), &expected)
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn transport_model_budget_stops_are_not_negative_matches() {
+    let engine = hygienic_transport_engine();
+    let root = engine.logical_root(&KVMap::new());
+    for matches in [equality_family_matches, quotient_family_matches] {
+        assert!(matches!(
+            matches(
+                engine.environment(),
+                &mut 0,
+                IngressLimits {
+                    max_nodes: 1,
+                    ..IngressLimits::default()
+                },
+            ),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            })
+        ));
+        assert!(matches(engine.environment(), &mut 0, IngressLimits::default()).unwrap());
+    }
+    assert_eq!(root, engine.logical_root(&KVMap::new()));
+}

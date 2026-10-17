@@ -3,13 +3,15 @@
 //! grants proof authority: the final declaration still needs kernel admission.
 use super::instances::{nonmatch, registry_error};
 use super::*;
-use crate::instances::InstanceRegistry;
 use fln_env::constants::ConstantInfo;
 
 mod expand;
 mod function;
 mod monad;
+mod postponed;
 mod result_hint;
+
+pub(super) use postponed::PostponedCoercion;
 
 /// A native probe can be blocked before a closed kernel query is possible.
 /// Keep that distinct from a completed query's concrete conversion refusal.
@@ -240,7 +242,7 @@ impl Context {
                 UnificationError::Reducibility(error),
             )))
         })?;
-        match fln_kernel::check_def_eq_with_unfolding(
+        let outcome = fln_kernel::check_def_eq_with_unfolding(
             &self.txn.env,
             &params.into_iter().collect::<Vec<_>>(),
             &left,
@@ -250,7 +252,22 @@ impl Context {
                 opaque_definitions: reducibility.opaque_definitions(),
                 unfold_theorems: false,
             },
-        ) {
+        );
+        // A step-limited query reports actual work even without a verdict.
+        // Retain that work before returning the original typed nonanswer;
+        // restoring the enclosing proof choice must not refund kernel steps.
+        if let Outcome::Inconclusive(problem) = &outcome
+            && let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } =
+                &problem.cause
+            && matches!(usage.reason, fln_core::diag::ResourceReason::ExecutionSteps)
+        {
+            self.txn.budget.heartbeats_consumed = self
+                .txn
+                .budget
+                .heartbeats_consumed
+                .saturating_add(usage.observed);
+        }
+        match outcome {
             Outcome::Complete(verdict) => {
                 let consumed = match &verdict {
                     Verdict::Accepted { consumption } | Verdict::Rejected { consumption, .. } => {
@@ -329,9 +346,10 @@ impl Context {
         &mut self,
         target: Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let registry =
-            InstanceRegistry::read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
-                .map_err(registry_error)?;
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
         let saved = self.txn.lctx.clone();
         let suspended = std::mem::take(&mut self.equations);
         let hole = self.instance_hole(target)?;
@@ -474,6 +492,74 @@ impl Context {
         }
     }
 
+    /// The pin's application loop distinguishes an unavailable *initial*
+    /// function type (`elabAppArgs.tryPostponeIfMVar`) from a telescope that
+    /// runs out during argument processing. The latter first synthesizes
+    /// pending instances, then calls `coerceToFunction?` and fails if it cannot
+    /// produce a function (`App.synthesizePendingAndNormalizeFunType`).
+    ///
+    /// Unknown inputs alone are NOT failure evidence: a generic CoeFun provider
+    /// can match without assigning them. Only an empty provider population is
+    /// decisive here. Read active scoped registrations too; a possible local
+    /// instance or an unknown local type vetoes the proof. A seed class, a rigid
+    /// carrier and every nonempty/unsupported coercion search give no evidence.
+    /// Pending arguments (including a caller's queue), eliminators or equations
+    /// also veto it: the pin synthesizes those before trying CoeFun, and they
+    /// may still reveal a function without any coercion.
+    /// Call only after ordinary synthesis/coercion failed, and never for the
+    /// initial application postponement.
+    pub(in crate::source) fn function_coercion_is_absent(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.pending_source_arguments
+            || !self.postponed_eliminators.is_empty()
+            || !self.postponed_coercions.is_empty()
+            || !self.equations.is_empty()
+            || self.application_type_unavailable(type_)?.is_none()
+        {
+            return Ok(false);
+        }
+        let class = Name::from_components(["CoeFun"]);
+        let registry = self
+            .registry_cache
+            .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
+            .map_err(registry_error)?;
+        if !self.txn.env.contains(&class)
+            || registry.imported_class_parameters(&class).is_none()
+            || !registry.candidates(&class).is_empty()
+        {
+            return Ok(false);
+        }
+        for local in self.txn.lctx.decls().to_vec() {
+            self.tick()?;
+            if local.binder_info == BinderInfo::InstImplicit {
+                return Ok(false);
+            }
+            let type_ = self.whnf_with_transparency(
+                &local.type_,
+                UnificationTransparency::Abbreviations,
+                false,
+            )?;
+            if type_.has_expr_mvar() || type_.has_level_mvar() {
+                return Ok(false);
+            }
+            // Ordinary function parameters are not local instances. Every
+            // other local must have a known head outside the CoeFun class.
+            if matches!(
+                type_.node(),
+                ExprNode::ForallE { .. } | ExprNode::Sort { .. }
+            ) {
+                continue;
+            }
+            match operators::spine(&type_).0.node() {
+                ExprNode::Const { name, .. } if name != &class => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     pub(in crate::source) fn coerce_expected(
         &mut self,
         term: Typed,
@@ -565,6 +651,11 @@ impl Context {
         if let Some(candidate) = result? {
             *self = trial;
             return Ok(candidate);
+        }
+        // No path yet. While the value is open, the pin postpones a coercion
+        // (`mkCoe`'s `.undef`); instance synthesis resumes it.
+        if let Some(postponed) = self.postpone_coercion(&term, expected)? {
+            return Ok(postponed);
         }
         // No path. A rigid mismatch is the pin's elaboration-time `Type mismatch`; any
         // other closed mismatch still reaches K1, while an unification/resource

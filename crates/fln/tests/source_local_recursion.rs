@@ -23,6 +23,134 @@ fn checked(base: &Engine, source: &str) -> Engine {
     .engine
 }
 
+/// The pin elaborates the rest of a definition with its `let rec` as a local without a value
+/// (`elabLetRec`, Lean/Elab/LetRec.lean:140-147): `rfl : bar = 5` inside `foo` is a type mismatch
+/// there (3:22). Once `foo` is complete the value is visible, so `foo = 6` by `rfl` holds for the
+/// `where` form, which is the same `let rec` (2026-10-11).
+#[test]
+fn a_let_rec_is_opaque_inside_its_definition_and_transparent_after_it() {
+    let base = engine();
+    let inside = "def foo : Nat :=\n  let rec bar : Nat := 5\n  have h : bar = 5 := rfl\n  bar\n";
+    let Err(error) = base.check_source_files(
+        &[inside.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ) else {
+        panic!("unfolded a let rec inside its own definition");
+    };
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    checked(
+        &base,
+        "def foo : Nat := bar + 1\nwhere bar : Nat := 5\ntheorem t : foo = 6 := rfl\n",
+    );
+}
+
+/// `let rec` opacity survives the term's lexical scope, including occurrences
+/// in parameter and result types. The pinned elaborator retains a
+/// synthetic-opaque metavariable until the enclosing declaration is complete.
+#[test]
+fn local_recursive_types_do_not_unfold_while_the_enclosing_declaration_elaborates() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad (x : (let rec ty (n : Nat) : Type := match n with | .zero => Nat | .succ k => ty k; ty 2)) : Nat := x",
+        "def bad (x : Nat) : (let rec ty (n : Nat) : Type := match n with | .zero => Nat | .succ k => ty k; ty 2) := x",
+        "def bad (x : (let rec ty : Type := Nat; ty)) : Nat := x",
+        "def bad : Nat := let x : (let rec ty : Type := Nat; ty) := (7 : Nat); 0",
+        "def bad : Nat := let m : Nat := (let rec n : Nat := 5; n); have h : m = 5 := rfl; m",
+        "axiom bad : (let rec ty : Type := Nat; ty)",
+        "inductive Bad where | mk (x : (let rec ty : Type := Nat; ty))",
+    ] {
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("a local recursive type cannot reveal its value during elaboration");
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}\n{error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+    checked(
+        &base,
+        "def constant (x : (let rec ty : Type := Nat; ty)) : Nat := 0\ntheorem computed : constant (7 : Nat) = 0 := by rfl",
+    );
+}
+
+#[test]
+fn deferred_local_recursion_closes_lexical_captures_before_admission() {
+    checked(
+        &engine(),
+        "def result (n : Nat) : Nat := let base : Nat := n + 1; let rec get : Nat := base; get\ntheorem computed : result 6 = 7 := by rfl\ndef typeOf (A : Type) : Type := let rec ty : Type := A; ty\ndef value : typeOf Nat := (7 : Nat)\ntheorem valueComputed : value = (7 : Nat) := by rfl",
+    );
+}
+
+#[test]
+fn deferred_local_recursion_captures_instances_selected_by_its_continuation() {
+    execute(
+        "class Choice (A : Type) where chosen : A\ndef choose {A : Type} [Choice A] : A := Choice.chosen\ndef captureLate [Choice Nat] : Nat := let rec get (flag : Bool) : _ := choose; get false\n#eval @captureLate ⟨7⟩",
+        "7",
+    );
+}
+
+#[test]
+fn public_header_freezing_keeps_local_functions_opaque_in_proof_bodies() {
+    use fln::SourceModuleInput;
+    use fln::source_check::modules::{SourceModuleCheckError, SourceModuleCheckLimits};
+
+    let base = engine();
+    let name = Name::from_components(["Main"]);
+    let check = |source: &str| {
+        base.check_source_modules(
+            &[SourceModuleInput {
+                name: &name,
+                source: source.as_bytes(),
+            }],
+            &name,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+    };
+    let accepted = check(
+        "module\nprelude\npublic theorem exampleOpaque (x : (let rec ty : Type := Nat; ty)) : (1 : Nat) = 1 := rfl",
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    assert!(
+        accepted
+            .checked
+            .engine
+            .environment()
+            .contains(&Name::from_components(["exampleOpaque"]))
+    );
+    let before = base.logical_root(&KVMap::new());
+    let source = "module\nprelude\npublic theorem bad (x : (let rec ty : Type := Nat; ty)) : (1 : Nat) = 1 := by exact (let n : Nat := x; rfl)";
+    let error = check(source)
+        .expect_err("freezing a public header cannot disclose let-rec values to its body");
+    let SourceModuleCheckError::Source { error, .. } = error else {
+        panic!("expected a source elaboration error: {error:?}");
+    };
+    assert_eq!(
+        error.disposition(),
+        ("elaboration", false, 1),
+        "{source}\n{error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn suspended_recursion_hypotheses_remain_hidden_from_local_proof_search() {
+    execute(
+        "inductive Branch where | base | left (child : Branch) | right (child : Branch)\ndef value (fallback : Nat) (x : Branch) : Nat := match x with | .base => 0 | .left child => value fallback child | .right child => let rec h (flag : Bool) : Nat := (by assumption); h false\n#eval value 7 (Branch.right Branch.base)",
+        "7",
+    );
+}
+
 #[test]
 fn local_recursors_capture_outer_values_and_compute_without_global_helpers() {
     let base = engine();

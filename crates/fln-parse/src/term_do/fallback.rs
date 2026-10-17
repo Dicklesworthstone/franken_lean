@@ -24,14 +24,16 @@ impl Prefix {
             assignment,
             mutable,
             reassign,
+            recursive,
         } = self.statement
         else {
             return Err(invalid());
         };
-        // A mutable or reassigning refutable binding is not read, and `doHave` has no failure
-        // branch.
+        // A mutable or reassigning refutable binding is not read, and `doHave` and `let rec` have
+        // no failure branch.
         if mutable.is_some()
             || reassign
+            || recursive.is_some()
             || matches!(&leaves.leaf(keyword)?, Syntax::Atom { val, .. } if val == "have")
         {
             return Err(invalid());

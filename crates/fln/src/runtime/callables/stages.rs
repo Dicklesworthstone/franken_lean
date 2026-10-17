@@ -4,9 +4,13 @@
 use super::*;
 
 mod captures;
+mod lookup;
 
 impl Preparation<'_> {
-    fn stage_interface(&mut self, signature: ClosureSignature) -> Result<ValueType, IngressError> {
+    pub(in crate::runtime) fn stage_interface(
+        &mut self,
+        signature: ClosureSignature,
+    ) -> Result<ValueType, IngressError> {
         for index in 0..self.interfaces.len() {
             self.tick()?;
             if self.interfaces[index] == signature {
@@ -163,7 +167,11 @@ impl Preparation<'_> {
     /// Only return-stage grouping may differ. Parameter representations are
     /// still exact. In particular, this is not a representation-changing cast
     /// and does not relax fixed callable arguments or constructor fields.
-    fn same_stage_telescope(&mut self, a: ValueType, b: ValueType) -> Result<bool, IngressError> {
+    pub(in crate::runtime) fn same_stage_telescope(
+        &mut self,
+        a: ValueType,
+        b: ValueType,
+    ) -> Result<bool, IngressError> {
         fn expand(
             preparation: &mut Preparation<'_>,
             mut ty: ValueType,

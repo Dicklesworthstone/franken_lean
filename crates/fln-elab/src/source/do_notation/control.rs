@@ -7,11 +7,14 @@ pub(super) struct LoopTargets {
     // Returning loops retain the outer checked join's result type. A return
     // inside a handler may have no normal path from which to infer this type.
     pub(super) return_type: Option<Syntax>,
+    // Only names of the current mutable values, in the checked carrier order.
+    // Return packets read these at the exit site, after all prior assignments.
+    pub(super) return_state: Vec<Syntax>,
 }
 impl LoopTargets {
     /// `expand_for_loop` supplies exactly `pure (ForInStep.yield accumulator)`.
     /// Validate that private handoff before deriving the other exit. The
-    /// accumulator is one fresh identifier, not an action to clone or rerun.
+    /// accumulator is names, not an action to clone or rerun.
     pub(super) fn new(normal: &Syntax) -> Result<Self, NatDefinitionElabError> {
         let pure = expect_node(
             normal,
@@ -28,14 +31,15 @@ impl LoopTargets {
         let [accumulator] = expect_null_args(&app[1], "loop accumulator")? else {
             return Err(invalid());
         };
-        if !matches!(accumulator, Syntax::Ident {val,..}
-            if !val.is_anonymous() && val.parent().is_anonymous())
-        {
+        // One fresh name, or the tuple of a loop's `mut` variables (`mutation::state_tuple`),
+        // whose exits then yield the values the variables have where the exit is.
+        if !super::mutation::is_state_tuple(accumulator) {
             return Err(invalid());
         }
         Ok(Self {
             accumulator: accumulator.clone(),
             return_type: None,
+            return_state: Vec::new(),
         })
     }
     fn value(&self, stop: bool) -> Syntax {
@@ -124,6 +128,7 @@ mod tests {
         LoopTargets {
             accumulator: ident(Name::num(Name::anonymous(), 99)),
             return_type: None,
+            return_state: Vec::new(),
         }
         .exit(false)
     }

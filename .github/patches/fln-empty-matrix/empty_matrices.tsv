@@ -1,0 +1,29 @@
+# id	verdict	source (literal \n separates commands)
+false_first	accept	def f (h : False) (n : Nat) : Nat := nomatch h, n
+false_last	accept	def f (n : Nat) (h : False) : Nat := nomatch n, h
+abstract_column	accept	def f (A : Type) (a : A) (h : False) : A := nomatch a, h
+computed_column	accept	def f (g : Nat -> False) (n : Nat) : Nat := nomatch n, (g n)
+boolean_column	accept	def f (b : Bool) (h : False) : Nat := nomatch b, h
+indexed_column	accept	def f (n : Nat) (h : Nat.succ n = 0) : Nat := nomatch n, h
+correlated_columns	accept	def f (b : Bool) (h : b = true) (k : b = false) : Nat := nomatch b, h, k
+dependent_result	accept	def f (P : False -> Type) (h : False) : P h := nomatch h, true
+alias_columns	accept	def f (h : False) : Nat := let k : False := h; nomatch k, true
+empty_function	accept	def f : False -> Nat := nofun
+empty_function_later	accept	def f : Nat -> False -> Nat := nofun
+empty_function_dependent	accept	def f (P : False -> Type) : (h : False) -> P h := nofun
+empty_function_polymorphic	accept	def f (A : Type) : False -> A := nofun
+empty_function_implicit	accept	def f : {A : Type} -> False -> A := nofun
+empty_function_indices	accept	def f : (n : Nat) -> Nat.succ n = 0 -> Nat := nofun
+empty_function_correlated	accept	def f : (b : Bool) -> b = true -> b = false -> Nat := nofun
+user_empty_family	accept	inductive Void where\ndef f : Void -> Nat := nofun
+higher_order_empty_function	accept	def use (g : False -> Nat) : False -> Nat := g\ndef f : False -> Nat := use nofun
+inhabited_columns	reject	def f (n : Nat) (b : Bool) : Nat := nomatch n, b
+inhabited_function	reject	def f : Nat -> Nat := nofun
+inhabited_function_bool	reject	def f : Bool -> Nat := nofun
+non_function	reject	def f : Nat := nofun
+ambient_false_not_a_column	reject	def f (h : False) (n : Nat) : Nat := nomatch n
+ambient_false_not_a_binder	reject	def f (h : False) : Nat -> Nat := nofun
+unknown_later_column	reject	def f (h : False) : Nat := nomatch h, missing
+bad_later_annotation	reject	def f (h : False) : Nat := nomatch h, (true : Nat)
+consistent_indices	reject	def f : (n : Nat) -> n = n -> Nat := nofun
+consistent_columns	reject	def f (b : Bool) (h : b = true) (k : b = true) : Nat := nomatch b, h, k

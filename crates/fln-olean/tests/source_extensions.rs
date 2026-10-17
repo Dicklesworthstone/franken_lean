@@ -132,6 +132,62 @@ fn real_prelude_decodes_class_outputs_instance_order_and_defaults() {
     );
 }
 
+/// The pinned Reference reports 317 auxRecExt entries for Init.Prelude. Unlike
+/// the general isAuxRecursor query, the journal itself does not include Eq.ndrec:
+/// that declaration is one of the pin's three explicit legacy exceptions.
+#[test]
+fn real_auxiliary_tags_roundtrip_in_the_pins_binary_search_order() {
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget};
+    let decoded = read(blocks()).unwrap();
+    assert!(!decoded.uninterpreted.contains(&n("Lean.auxRecExt")));
+    assert_eq!(decoded.aux_recursors.len(), 317);
+    for name in ["Nat.recOn", "Nat.casesOn", "Nat.brecOn", "Nat.below"] {
+        assert!(decoded.aux_recursors.contains(&n(name)), "{name}");
+    }
+    for name in ["Nat.add", "Eq.ndrec"] {
+        assert!(!decoded.aux_recursors.contains(&n(name)), "{name}");
+    }
+    assert!(
+        decoded
+            .aux_recursors
+            .windows(2)
+            .all(|pair| pair[0].quick_lt(&pair[1]))
+    );
+    let mut supplied = decoded.aux_recursors.clone();
+    supplied.reverse();
+    for version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = encode_module_with_source_metadata(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &SourceMetadata {
+                aux_recursors: supplied.clone(),
+                ..SourceMetadata::default()
+            },
+            OleanWriteHeader {
+                version: *version,
+                flags: 1,
+                lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln_olean::format::PIN_COMMIT,
+                base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let view = OleanView::parse(&encoded.bytes).unwrap();
+        let actual = view
+            .extension_payloads(WalkBudget::default(), 4 << 20)
+            .unwrap();
+        let actual = read(&actual).unwrap();
+        assert_eq!(actual.aux_recursors, decoded.aux_recursors);
+        assert!(actual.uninterpreted.is_empty());
+    }
+}
+
 /// The Prelude's `reducibilityCore` entries (bead fln-gkhu), against what the
 /// pinned `lean` reports through `getReducibilityStatus` for the same names:
 /// instOfNatNat, Nat.add, instAddNat, instLTNat and Nat.decLt are
@@ -274,6 +330,35 @@ fn protected_entries_are_names_and_a_repeat_refuses() {
         prefixed[0].entries.push(compact(&forged, 0).unwrap());
         assert!(read(&prefixed).is_err(), "a non-Name payload is refused");
     }
+}
+
+#[test]
+fn auxiliary_entries_reject_duplicate_anonymous_and_non_name_payloads() {
+    let tagged = entry("Lean.auxRecExt");
+    let single = one("Lean.auxRecExt", &tagged);
+    assert_eq!(read(&single).unwrap().aux_recursors.len(), 1);
+    let mut repeated = single.clone();
+    repeated[0].entries.push(single[0].entries[0].clone());
+    assert!(matches!(read(&repeated), Err(DecodeError::Shape { .. })));
+    for forged in [
+        inject_name(&Name::anonymous()),
+        Obj::mk_string("Nat.casesOn"),
+        Obj::mk_nat(7),
+    ] {
+        let mut prefixed = single.clone();
+        prefixed[0].entries.push(compact(&forged, 0).unwrap());
+        assert!(read(&prefixed).is_err());
+    }
+    assert!(matches!(
+        decode(
+            &single,
+            DecodeLimits {
+                max_entries: 0,
+                ..DecodeLimits::default()
+            }
+        ),
+        Err(DecodeError::Limit { .. })
+    ));
 }
 
 #[test]

@@ -155,7 +155,8 @@ fn lean_configuration_is_not_invented_from_directory_name() {
         assert_eq!(out.status.code(), Some(1), "{out:?}");
         assert!(out.stdout.is_empty());
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("unavailable"),
+            String::from_utf8_lossy(&out.stderr)
+                .contains("requires the ordinary `import Lake` header only"),
             "{out:?}"
         );
         assert!(!dir.join(".lake").exists());

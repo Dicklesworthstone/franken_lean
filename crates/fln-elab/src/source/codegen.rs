@@ -2,7 +2,8 @@
 //! directly (bead `franken_lean-z8j.1.6.6`): "code generator does not support recursor
 //! `T.rec` yet, consider using 'match ... with' and/or structural recursion".
 //!
-//! The pin compiles every `def`, `instance` and `example` (not a theorem). Lowering
+//! The pin compiles `def`, `instance` and `example` unless marked `noncomputable`,
+//! and never a theorem. Lowering
 //! (vendored `src/Lean/Compiler/LCNF/ToLCNF.lean:817`, `visitApp`) first rewrites a
 //! constant through its `@[csimp]` replacement, then handles `Eq.rec`, `HEq.rec`,
 //! `And.rec`/`Iff.rec`, `False.rec`/`Empty.rec`, `casesOn`, constructors, `noConfusion`
@@ -11,17 +12,22 @@
 //! `Prop` or in a sort is never compiled.
 //!
 //! FrankenLean has no pre-definition: `match`, `cases` and structural recursion are all
-//! lowered to `T.rec` here, where the pin uses `casesOn` and `brecOn`, which it compiles.
+//! lowered to `T.rec` here, where the pin compiles its pre-definition lowering.
+//! Directly naming a generated `recOn`, `brecOn`, or `brecOn.go` is different:
+//! those definitions have no compiled LCNF signature in the pin.
 //! So only the recursors the source itself names are checked: a recursor constant the
 //! source resolves (`T.rec`, `@T.rec`, `T.rec (motive := …)`) and the one an `induction`
 //! tactic applies. Each relevant application of such a recursor in the elaborated value
 //! is refused. Not established, and stated: a definition that names `T.rec` only in a
 //! proof but also matches on `T` in data is refused here and accepted by the pin; a
-//! data-valued recursor application nested inside a proof or type argument, or in code
-//! the pin's simplifier deletes, is refused here and erased there.
+//! recursor application in code the pin's simplifier deletes can still be refused here.
+//! Nested proof and type subtrees are classified before their bodies are visited, as
+//! ToLCNF.visit/visitAppArg do; data computations inside those erased subtrees never
+//! require an executable recursor.
 //!
 //! Executing such recursors is FrankenLean's `frontier` lane: an engine in that mode
-//! sets [`SourceScope::frontier_recursors`] and this check is skipped. Its artifacts
+//! sets [`SourceScope::frontier_recursors`] and the recursor restriction is skipped.
+//! Noncomputable dependencies remain non-executable in every mode. Its artifacts
 //! carry the frontier mode, which default consumers refuse (D-18).
 //!
 //! The csimp set is derived, never remembered: `csimp_recursors.tsv` is generated from
@@ -32,13 +38,18 @@ use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::{BTreeSet, HashSet};
 
+mod dependencies;
+mod types;
+
 const CSIMP_TABLE: &str = include_str!("../seed/csimp_recursors.tsv");
 const CSIMP_SCHEMA: &str = "schema fln-seed-csimp-recursors/1";
 
-/// Recursors the pin's `visitApp` lowers itself (ToLCNF.lean:824-831). Its `Eq.recOn`
-/// and `Eq.ndrec` cases are definitions here, never recursor constants.
-const SPECIAL_RECURSORS: [[&str; 2]; 6] = [
+/// Recursors the pin's `visitApp` lowers itself (ToLCNF.lean:824-831).
+/// Eq.recOn is a tagged definition. Other generated recOn wrappers have no
+/// compiled signature, even when their underlying recursor has a csimp rule.
+const SPECIAL_RECURSORS: [[&str; 2]; 7] = [
     ["Eq", "rec"],
+    ["Eq", "recOn"],
     ["HEq", "rec"],
     ["And", "rec"],
     ["Iff", "rec"],
@@ -104,7 +115,85 @@ fn type_former_motive(motive: &Expr) -> bool {
     }
 }
 
+/// Return the explicit tag and underlying checked recursor for a generated
+/// wrapper. The helper carries its parent's tag, not one of its own. Spelling
+/// alone is never sufficient: the caller must validate that tag in the journal.
+fn auxiliary_origin(name: &Name) -> Option<(Name, Name)> {
+    let helper = matches!(name.leaf_view(), LeafView::Str("go"));
+    let tagged = if helper { name.parent() } else { name.clone() };
+    let suffix = match tagged.leaf_view() {
+        LeafView::Str("recOn") if !helper => "",
+        LeafView::Str("brecOn") => "",
+        LeafView::Str(s) => {
+            let suffix = s.strip_prefix("brecOn_")?;
+            let index = suffix.parse::<u32>().ok()?;
+            if index == 0 || suffix != index.to_string() {
+                return None;
+            }
+            return Some((
+                tagged.clone(),
+                Name::str(tagged.parent(), format!("rec_{index}")),
+            ));
+        }
+        _ => return None,
+    };
+    Some((
+        tagged.clone(),
+        Name::str(tagged.parent(), format!("rec{suffix}")),
+    ))
+}
+
 impl Context {
+    /// Deferred compilation effects must validate the admitted successor's
+    /// metadata even when the original body already had a known compiler error.
+    pub(super) fn validate_codegen_metadata(&mut self) -> Result<(), NatDefinitionElabError> {
+        dependencies::Dependencies::read(self).map(|_| ())
+    }
+
+    /// `noncomputable section` suppresses only a known declaration compiler
+    /// refusal. Parsing, typing, resource stops, malformed metadata and faults
+    /// are not compiler failures and must never be converted to this effect.
+    /// Evaluation calls `check_compiled_recursors` directly, so the section
+    /// cannot turn a failed `#eval` into an admitted but unexecuted query.
+    /// Partial batches carry this effect to their exact admitted companions.
+    pub(super) fn check_definition_codegen(
+        &mut self,
+        term: &Typed,
+    ) -> Result<bool, NatDefinitionElabError> {
+        match self.check_compiled_recursors(term) {
+            Ok(()) => Ok(false),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::UnsupportedRecursor(_)
+                | SourceInferenceError::AuxiliaryNotCompiled(_)
+                | SourceInferenceError::NoncomputableDependency(_),
+            )) if self.source_scope.noncomputable_section => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Track both ordinary constants and constants with explicit universe arguments.
+    /// Elaboration's own eliminations construct their recursor constants directly.
+    pub(super) fn note_resolved_recursor(
+        &mut self,
+        name: &Name,
+        info: &ConstantInfo,
+    ) -> Result<(), NatDefinitionElabError> {
+        let generated = if matches!(info, ConstantInfo::Defn(_)) {
+            if let Some((tagged, recursor)) = auxiliary_origin(name) {
+                self.is_auxiliary_recursor(&tagged)?
+                    && matches!(self.txn.env.find(&recursor), Some(ConstantInfo::Rec(_)))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if matches!(info, ConstantInfo::Rec(_)) || generated {
+            self.note_source_recursor(name);
+        }
+        Ok(())
+    }
+
     /// Record a recursor the source names, for [`Self::check_compiled_recursors`].
     pub(super) fn note_source_recursor(&mut self, name: &Name) {
         if !self.source_recursors.contains(name) {
@@ -117,25 +206,89 @@ impl Context {
     /// position the pin does not erase.
     pub(super) fn check_compiled_recursors(
         &mut self,
-        value: &Expr,
+        term: &Typed,
     ) -> Result<(), NatDefinitionElabError> {
-        if self.source_scope.frontier_recursors {
-            return Ok(());
-        }
         let named: Vec<Name> = self
             .source_recursors
             .iter()
-            .filter(|name| !compiles(name))
+            .filter(|name| !self.source_scope.frontier_recursors && !compiles(name))
             .cloned()
             .collect();
-        if named.is_empty() {
+        let dependencies = dependencies::Dependencies::read(self)?;
+        // Untagged axioms can still lack executable code. An empty registry
+        // must not bypass the typed walk of a computational declaration.
+        // Proof declarations and type formers have no runtime body. This is
+        // also necessary for brecOn.go: its PProd result is data even with a
+        // Prop-valued motive, but a projection used solely as a proof erases.
+        if self.codegen_type_former(&term.type_)? {
             return Ok(());
         }
+        if let Some(sort) = self.known_type(&term.type_)? {
+            let sort = self.whnf(&sort)?;
+            if matches!(sort.node(), ExprNode::Sort { level } if level.is_zero()) {
+                return Ok(());
+            }
+        }
+        let saved = self.txn.lctx.clone();
+        let result = self.check_compiled_value(&term.value, &named, &dependencies);
+        // A refusal may unwind past pending Restore tasks. Temporary binders
+        // are analysis only and must never escape, including on budget stops.
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// ToLCNF.visit/visitAppArg erase proofs and type formers before inspecting
+    /// their executable subexpressions. Unknown types are not evidence of
+    /// erasure: retain the conservative recursor walk in that case.
+    fn codegen_erased(&mut self, value: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let Some(type_) = self.known_type(value)? else {
+            return Ok(false);
+        };
+        if self.codegen_type_former(&type_)? {
+            return Ok(true);
+        }
+        let Some(sort) = self.known_type(&type_)? else {
+            return Ok(false);
+        };
+        let sort = self.whnf(&sort)?;
+        Ok(matches!(sort.node(), ExprNode::Sort { level } if level.is_zero()))
+    }
+
+    fn check_compiled_value(
+        &mut self,
+        value: &Expr,
+        named: &[Name],
+        dependencies: &dependencies::Dependencies,
+    ) -> Result<(), NatDefinitionElabError> {
+        enum Work {
+            Visit(Expr),
+            OpenLet(Name, Expr, Expr, Expr),
+            Restore(LocalContext),
+        }
+        // Every binder is opened with a fresh local identity. Exact expression
+        // keys therefore cannot confuse one de Bruijn node used in two scopes,
+        // and retaining expressions prevents allocation-address reuse.
         let mut seen = HashSet::new();
-        let mut work = vec![value.clone()];
-        while let Some(expr) = work.pop() {
+        let mut work = vec![Work::Visit(value.clone())];
+        while let Some(task) = work.pop() {
             self.tick()?;
-            if !seen.insert(expr.allocation_identity()) {
+            let expr = match task {
+                Work::Restore(saved) => {
+                    self.txn.lctx = saved;
+                    continue;
+                }
+                Work::OpenLet(name, type_, value, body) => {
+                    let saved = self.txn.lctx.clone();
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_let(id.clone(), name, type_, value);
+                    let body = self.substitute(&body, &Expr::fvar(id))?;
+                    work.push(Work::Restore(saved));
+                    work.push(Work::Visit(body));
+                    continue;
+                }
+                Work::Visit(expr) => expr,
+            };
+            if !seen.insert(expr.clone()) || self.codegen_erased(&expr)? {
                 continue;
             }
             match expr.node() {
@@ -143,29 +296,67 @@ impl Context {
                     let mut args = Vec::new();
                     let mut head = &expr;
                     while let ExprNode::App { f, a } = head.node() {
+                        self.tick()?;
                         args.push(a.clone());
                         head = f;
                     }
                     args.reverse();
                     if let ExprNode::Const { name, levels } = head.node() {
-                        if named.contains(name) && self.compiled_application(name, levels, &args) {
+                        dependencies.check(name)?;
+                        if named.contains(name) && self.compiled_application(name, levels, &args)? {
+                            if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
+                                return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
+                                    name.clone(),
+                                )));
+                            }
                             return Err(failure(SourceInferenceError::UnsupportedRecursor(
                                 name.clone(),
                             )));
                         }
                     } else {
-                        work.push(head.clone());
+                        work.push(Work::Visit(head.clone()));
                     }
-                    work.extend(args);
+                    work.extend(args.into_iter().map(Work::Visit));
                 }
-                // Binder and let types are types: erased.
-                ExprNode::Lam { body, .. } => work.push(body.clone()),
-                ExprNode::LetE { value, body, .. } => {
-                    work.push(value.clone());
-                    work.push(body.clone());
+                // Domains are erased; bodies are opened rather than walking
+                // loose bvars without the telescope that gives them meaning.
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => {
+                    let saved = self.txn.lctx.clone();
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_param(
+                        id.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    );
+                    let body = self.substitute(body, &Expr::fvar(id))?;
+                    work.push(Work::Restore(saved));
+                    work.push(Work::Visit(body));
+                }
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    ..
+                } => {
+                    // The value is checked outside its own binding, then the
+                    // body sees the checked let for dependent type inference.
+                    work.push(Work::OpenLet(
+                        decl_name.clone(),
+                        type_.clone(),
+                        value.clone(),
+                        body.clone(),
+                    ));
+                    work.push(Work::Visit(value.clone()));
                 }
                 ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
-                    work.push(expr.clone());
+                    work.push(Work::Visit(expr.clone()));
                 }
                 _ => {}
             }
@@ -175,28 +366,97 @@ impl Context {
 
     /// Whether an application of the recursor `name` at `levels` to `args` produces data
     /// the pin compiles: neither a proof nor a type.
-    fn compiled_application(&self, name: &Name, levels: &[Level], args: &[Expr]) -> bool {
-        let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(name) else {
-            return false;
+    fn compiled_application(
+        &mut self,
+        name: &Name,
+        levels: &[Level],
+        args: &[Expr],
+    ) -> Result<bool, NatDefinitionElabError> {
+        let recursor = match self.txn.env.find(name) {
+            Some(ConstantInfo::Rec(recursor)) => recursor,
+            // Only explicitly tagged wrappers (or their checked go helper)
+            // enter source_recursors. Their motive parameter positions agree
+            // with the original recursor even though its minors are replaced.
+            Some(ConstantInfo::Defn(_)) => {
+                // go returns PProd, including for a Prop-valued motive. Its
+                // complete proof/type uses were erased above; a remaining data
+                // application always requires the missing compiled signature.
+                if matches!(name.leaf_view(), LeafView::Str("go")) {
+                    return Ok(true);
+                }
+                let Some((_, recursor_name)) = auxiliary_origin(name) else {
+                    return Ok(true);
+                };
+                let Some(ConstantInfo::Rec(recursor)) = self.txn.env.find(&recursor_name) else {
+                    return Ok(true);
+                };
+                recursor
+            }
+            _ => return Ok(false),
         };
-        let family = name.parent();
+        let family = recursor.base.name.parent();
         let Some(ConstantInfo::Induct(inductive)) = self.txn.env.find(&family) else {
-            return true;
+            return Ok(true);
         };
         // Without a universe of its own the recursor eliminates only into `Prop`.
         if recursor.base.level_params.len() <= inductive.base.level_params.len()
             || levels.first().is_some_and(Level::is_zero)
         {
-            return false;
+            return Ok(false);
         }
-        let index = recursor
-            .all
-            .iter()
-            .position(|member| *member == family)
-            .unwrap_or(0);
-        match args.get(recursor.num_params as usize + index) {
+        let type_ = recursor.base.type_.clone();
+        let params = recursor.num_params as usize;
+        let motives = recursor.num_motives as usize;
+        let Some(index) = self.result_motive_argument(&type_, params, motives)? else {
+            return Ok(true);
+        };
+        Ok(match args.get(index) {
             Some(motive) => !type_former_motive(motive),
             None => true,
+        })
+    }
+
+    /// The actual result motive can belong to a nested container rather than
+    /// the recursor's owning inductive. Read its bound-variable position from
+    /// the checked telescope instead of inferring it from the owner's name.
+    fn result_motive_argument(
+        &mut self,
+        type_: &Expr,
+        params: usize,
+        motives: usize,
+    ) -> Result<Option<usize>, NatDefinitionElabError> {
+        let mut body = type_;
+        let mut binders = 0usize;
+        loop {
+            self.tick()?;
+            match body.node() {
+                ExprNode::ForallE { body: next, .. } => {
+                    let Some(next_count) = binders.checked_add(1) else {
+                        return Ok(None);
+                    };
+                    binders = next_count;
+                    body = next;
+                }
+                ExprNode::MData { expr, .. } => body = expr,
+                _ => break,
+            }
+        }
+        loop {
+            self.tick()?;
+            match body.node() {
+                ExprNode::App { f, .. } => body = f,
+                ExprNode::MData { expr, .. } => body = expr,
+                ExprNode::BVar { idx } => {
+                    let Some(index) = binders.checked_sub(*idx as usize + 1) else {
+                        return Ok(None);
+                    };
+                    return Ok(index
+                        .checked_sub(params)
+                        .filter(|motive| *motive < motives)
+                        .map(|_| index));
+                }
+                _ => return Ok(None),
+            }
         }
     }
 }
@@ -229,6 +489,57 @@ mod tests {
             "rows out of byte order"
         );
         assert_eq!(parse_csimp(&format!("{CSIMP_SCHEMA}\nNat.rec")), None);
+    }
+
+    #[test]
+    fn codegen_locals_are_restored_at_every_heartbeat_stop() {
+        let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let name = Name::from_components(["x"]);
+        let term = Typed {
+            type_: Expr::forall_e(name.clone(), nat.clone(), nat.clone(), BinderInfo::Default),
+            value: Expr::lam(
+                name.clone(),
+                nat.clone(),
+                Expr::let_e(
+                    name.clone(),
+                    nat.clone(),
+                    Expr::bvar(0).unwrap(),
+                    Expr::bvar(0).unwrap(),
+                    false,
+                ),
+                BinderInfo::Default,
+            ),
+        };
+        let context = || {
+            let mut context = Context::new(&env, Budget::DEFAULT);
+            context
+                .source_recursors
+                .push(Name::from_components(["T", "rec"]));
+            context.txn.lctx.add_param(
+                FVarId(Name::from_components(["existing"])),
+                name.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            );
+            context
+        };
+        let mut complete = context();
+        let saved = complete.txn.lctx.clone();
+        complete.check_compiled_recursors(&term).unwrap();
+        assert_eq!(complete.txn.lctx, saved);
+        let steps = complete.txn.budget.heartbeats_consumed;
+        assert!(steps > 1, "the check must actually visit binders");
+        for allowed in 1..steps {
+            let mut limited = context();
+            limited.txn.budget.max_heartbeats = allowed;
+            assert!(
+                limited.check_compiled_recursors(&term).is_err(),
+                "bound {allowed}"
+            );
+            assert_eq!(limited.txn.lctx, saved, "locals escaped at bound {allowed}");
+            assert_eq!(limited.txn.env, env);
+        }
     }
 
     #[test]

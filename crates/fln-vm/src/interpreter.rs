@@ -60,8 +60,14 @@ use std::fmt;
 
 mod array_construction;
 mod arrays;
+mod diagnostics;
 mod floats;
+mod string_fold;
+mod strings;
 mod tail_calls;
+
+#[cfg(test)]
+mod string_from_bytes_tests;
 
 /// Caller-supplied execution limits. `max_steps` is a FrankenLean-owned FLBC
 /// instruction allowance, not the Reference's allocation-linked heartbeat
@@ -559,7 +565,10 @@ struct IntrinsicPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
+    PanicCore,
+    DbgTrace,
     Float(floats::Intrinsic),
+    StringInternal(strings::Intrinsic),
     BaseIoAsTask,
     BaseIoBindTask,
     BaseIoMapTask,
@@ -808,6 +817,7 @@ enum IntrinsicImplementation {
     ISizeToInt,
     ISizeToWidth,
     StringAppend,
+    StringOfByteArray,
     StringAtEnd,
     StringCompare,
     StringDecEq,
@@ -819,6 +829,7 @@ enum IntrinsicImplementation {
     StringDrop,
     StringDropRight,
     StringExtract,
+    StringInternalFoldl,
     StringInternalIsEmpty,
     StringInternalIsPrefixOf,
     StringNext,
@@ -858,6 +869,8 @@ enum IntrinsicImplementation {
     FileHandlePutStr,
     FileHandleGetLine,
     FileHandleRead,
+    FileHandleWrite,
+    FilePathReadDir,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -885,6 +898,8 @@ enum IntrinsicImplementation {
 impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         match row {
+            "extern:panicCore" => Self::PanicCore,
+            "extern:dbgTrace" => Self::DbgTrace,
             "extern:BaseIO.asTask" => Self::BaseIoAsTask,
             "extern:BaseIO.bindTask" => Self::BaseIoBindTask,
             "extern:BaseIO.mapTask" => Self::BaseIoMapTask,
@@ -1162,6 +1177,7 @@ impl IntrinsicImplementation {
             "extern:String.Internal.atEnd" => Self::StringAtEnd,
             "extern:String.Internal.length" => Self::StringLength,
             "extern:String.append" => Self::StringAppend,
+            "extern:String.ofByteArray" => Self::StringOfByteArray,
             "extern:String.atEnd" | "extern:String.Pos.Raw.atEnd" => Self::StringAtEnd,
             "extern:String.compare" => Self::StringCompare,
             "extern:String.decEq" => Self::StringDecEq,
@@ -1175,6 +1191,7 @@ impl IntrinsicImplementation {
             "extern:String.Internal.extract"
             | "extern:String.extract"
             | "extern:String.Pos.Raw.extract" => Self::StringExtract,
+            "extern:String.Internal.foldl" => Self::StringInternalFoldl,
             "extern:String.Internal.isEmpty" => Self::StringInternalIsEmpty,
             "extern:String.Internal.isPrefixOf" => Self::StringInternalIsPrefixOf,
             "extern:String.Internal.next" | "extern:String.next" | "extern:String.Pos.Raw.next" => {
@@ -1218,6 +1235,8 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.putStr" => Self::FileHandlePutStr,
             "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
             "extern:IO.FS.Handle.read" => Self::FileHandleRead,
+            "extern:IO.FS.Handle.write" => Self::FileHandleWrite,
+            "extern:System.FilePath.readDir" => Self::FilePathReadDir,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -1243,6 +1262,7 @@ impl IntrinsicImplementation {
                     array_construction::Intrinsic::for_row(row).map(Self::ArrayConstruction)
                 })
                 .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))
+                .or_else(|| strings::Intrinsic::for_row(row).map(Self::StringInternal))
                 .unwrap_or(Self::Unsupported),
         }
     }
@@ -1755,6 +1775,23 @@ impl fmt::Display for StepLocation {
     }
 }
 
+/// Keep checkpoint context borrowed until a stop actually needs its text.
+#[derive(Clone, Copy)]
+struct CheckSystemLocation<'a> {
+    step: StepLocation,
+    module_name: &'a str,
+}
+
+impl fmt::Display for CheckSystemLocation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} Lean.Core.checkSystem module {}",
+            self.step, self.module_name
+        )
+    }
+}
+
 struct Frame {
     function: FunctionId,
     pc: usize,
@@ -1779,9 +1816,14 @@ enum ReturnTo {
         thunk: Obj,
         result_ownership: ResultOwnership,
     },
-    CompleteManagerlessTask {
+    CompleteStringFold {
         destination: Register,
-        completion: ManagerlessTaskCompletion,
+        state: string_fold::State,
+        result_ownership: ResultOwnership,
+    },
+    CompleteIntrinsicApplication {
+        destination: Register,
+        completion: IntrinsicCompletion,
         row: &'static str,
         result_ownership: ResultOwnership,
     },
@@ -1812,17 +1854,19 @@ struct InspectedClosure {
     captures: Vec<Obj>,
 }
 
-enum ManagerlessTaskCompletion {
+enum IntrinsicCompletion {
     WrapPure,
     RequireFinishedTask,
+    RawResult,
 }
 
-struct ManagerlessTaskApplication {
+struct IntrinsicApplication {
     row: &'static str,
     closure: Obj,
     arguments: Vec<Obj>,
     argument_ownership: Vec<ArgumentOwnership>,
-    completion: ManagerlessTaskCompletion,
+    completion: IntrinsicCompletion,
+    trace: Option<String>,
 }
 
 struct IntrinsicResult {
@@ -1834,6 +1878,8 @@ enum IntrinsicFailure {
     Refused(VmRefusal),
     NatMagnitudeLimit { allowed: u64, observed: u64 },
     FileReadResource(FileReadError),
+    StringResource(strings::ResourceError),
+    StringFromBytesResource(strings::ResourceError),
 }
 
 impl From<VmRefusal> for IntrinsicFailure {
@@ -2093,7 +2139,7 @@ fn run(
                 ),
             ))
         })?;
-        let instruction = function.code.get(frame.pc).cloned().ok_or_else(|| {
+        let instruction = function.code.get(frame.pc).ok_or_else(|| {
             Stop::InternalFault(InternalFault::new(
                 "FLBC-VALIDATED-PC",
                 format!(
@@ -2103,8 +2149,12 @@ fn run(
                 ),
             ))
         })?;
+        let pending_return;
         let instruction = match frame.pending_tail_return {
-            Some(src) => Instruction::Return { src },
+            Some(src) => {
+                pending_return = Instruction::Return { src };
+                &pending_return
+            }
             None => instruction,
         };
         let cache_site = CacheSite {
@@ -2117,7 +2167,7 @@ fn run(
         };
 
         let dynamic_check_system_module =
-            if let Instruction::CheckSystemValue { module_name } = &instruction {
+            if let Instruction::CheckSystemValue { module_name } = instruction {
                 Some(string_value(
                     register(frame, *module_name)?,
                     "Lean.Core.checkSystem",
@@ -2126,27 +2176,32 @@ fn run(
             } else {
                 None
             };
-        let check_system_location = match (&instruction, &dynamic_check_system_module) {
-            (Instruction::CheckSystem { module_name }, _) => Some(format!(
-                "{location} Lean.Core.checkSystem module {module_name}"
-            )),
-            (Instruction::CheckSystemValue { .. }, Some(Ok(module_name))) => Some(format!(
-                "{location} Lean.Core.checkSystem module {module_name}"
-            )),
+        let check_system_location = match (instruction, &dynamic_check_system_module) {
+            (Instruction::CheckSystem { module_name }, _)
+            | (Instruction::CheckSystemValue { .. }, Some(Ok(module_name))) => {
+                Some(CheckSystemLocation {
+                    step: location,
+                    module_name,
+                })
+            }
             _ => None,
         };
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             let poll_location = check_system_location
-                .clone()
+                .map(|context| context.to_string())
                 .unwrap_or_else(|| location.to_string());
             return Err(Stop::Inconclusive(
                 Inconclusive::cancelled(&poll_location).with_progress(&poll_location),
             ));
         }
-        if let Some(check_location) = check_system_location.as_deref()
+        if let Some(check_location) = check_system_location
             && let Some((consumed, limit)) = heartbeat_context.exhaustion()
         {
-            return Err(heartbeat_exhausted(consumed, limit, check_location));
+            return Err(heartbeat_exhausted(
+                consumed,
+                limit,
+                &check_location.to_string(),
+            ));
         }
         let observed_steps = steps.checked_add(1).ok_or_else(|| {
             Stop::InternalFault(InternalFault::new(
@@ -2165,8 +2220,11 @@ fn run(
 
         // Share all argument/closure checks with ordinary calls. Only the
         // final dispatch differs; no tail form may bypass a checked contract.
-        let (instruction, tail) = tail_calls::ordinary_call(instruction);
-        match instruction {
+        let tail = matches!(
+            instruction,
+            Instruction::TailCall { .. } | Instruction::TailApply { .. }
+        );
+        match *instruction {
             Instruction::Nat { dst, value } => {
                 let value = usize::try_from(value).map_err(|_| {
                     Stop::InternalFault(InternalFault::new(
@@ -2177,7 +2235,7 @@ fn run(
                 set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_nat(value))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
-            Instruction::NatBig { dst, limbs_le } => {
+            Instruction::NatBig { dst, ref limbs_le } => {
                 let observed = u64::try_from(limbs_le.len())
                     .unwrap_or(u64::MAX)
                     .saturating_mul(8);
@@ -2196,12 +2254,12 @@ fn run(
                 set_register(
                     current_frame_mut(&mut stack)?,
                     dst,
-                    Obj::mk_mpz(&limbs_le, false),
+                    Obj::mk_mpz(limbs_le, false),
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
-            Instruction::String { dst, value } => {
-                set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_string(&value))?;
+            Instruction::String { dst, ref value } => {
+                set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_string(value))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::Copy { dst, src } => {
@@ -2223,14 +2281,14 @@ fn run(
             Instruction::Ctor {
                 dst,
                 tag,
-                fields,
-                scalar_bytes,
+                ref fields,
+                ref scalar_bytes,
             } => {
                 let values = clone_registers(current_frame(&stack)?, fields.iter().copied())?;
                 set_register(
                     current_frame_mut(&mut stack)?,
                     dst,
-                    Obj::mk_ctor(tag, values, &scalar_bytes),
+                    Obj::mk_ctor(tag, values, scalar_bytes),
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
@@ -2315,43 +2373,41 @@ fn run(
                 set_register(current_frame_mut(&mut stack)?, dst, projected)?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
-            Instruction::Array { dst, items } => {
+            Instruction::Array { dst, ref items } => {
                 let values = clone_registers(current_frame(&stack)?, items.iter().copied())?;
                 set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_array(values))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::Intrinsic {
                 dst,
-                row,
-                args,
-                argument_ownership,
+                ref row,
+                ref args,
+                ref argument_ownership,
                 result_ownership,
             } => {
                 let cached_plan = inline_caches.as_deref_mut().and_then(|caches| {
-                    caches.intrinsic_hit(cache_site, &row, &argument_ownership, result_ownership)
+                    caches.intrinsic_hit(cache_site, row, argument_ownership, result_ownership)
                 });
                 let plan = match cached_plan {
                     Some(plan) => plan,
                     None => {
-                        let plan = match resolve_intrinsic_plan(
-                            &row,
-                            &argument_ownership,
-                            result_ownership,
-                        ) {
-                            Ok(plan) => plan,
-                            Err(refusal) => {
-                                return Ok(VmExit::Refused {
-                                    refusal,
-                                    usage: usage(steps, peak_stack_depth),
-                                });
-                            }
-                        };
+                        let plan =
+                            match resolve_intrinsic_plan(row, argument_ownership, result_ownership)
+                            {
+                                Ok(plan) => plan,
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            };
                         if let Some(caches) = inline_caches.as_deref_mut() {
                             caches.record_intrinsic(
                                 IntrinsicCacheKey::new(
                                     cache_site,
                                     plan.row,
-                                    &argument_ownership,
+                                    argument_ownership,
                                     result_ownership,
                                 ),
                                 plan,
@@ -2362,8 +2418,8 @@ fn run(
                 };
                 let values = transfer_intrinsic_arguments(
                     current_frame_mut(&mut stack)?,
-                    &args,
-                    &argument_ownership,
+                    args,
+                    argument_ownership,
                 )?;
                 if plan.implementation == IntrinsicImplementation::ThunkGet {
                     let thunk = match delayed_thunk_operand(values) {
@@ -2462,17 +2518,69 @@ fn run(
                             }
                         }
                     }
-                } else if plan.implementation.is_managerless_task() {
-                    let application =
-                        match managerless_task_application(plan.implementation, plan.row, values) {
-                            Ok(application) => application,
-                            Err(refusal) => {
-                                return Ok(VmExit::Refused {
-                                    refusal,
-                                    usage: usage(steps, peak_stack_depth),
-                                });
-                            }
-                        };
+                } else if plan.implementation == IntrinsicImplementation::StringInternalFoldl {
+                    match string_fold::start(program, values) {
+                        Ok(string_fold::Step::Complete(value)) => {
+                            let value = match finish_intrinsic_result(
+                                plan.row,
+                                result_ownership,
+                                IntrinsicResult::owned(value),
+                            ) {
+                                Ok(value) => value,
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            };
+                            set_register(current_frame_mut(&mut stack)?, dst, value)?;
+                            advance(current_frame_mut(&mut stack)?)?;
+                        }
+                        Ok(string_fold::Step::Call {
+                            function,
+                            args,
+                            state,
+                        }) => {
+                            advance(current_frame_mut(&mut stack)?)?;
+                            let next_depth = push_call(
+                                program,
+                                &mut stack,
+                                function,
+                                args,
+                                ReturnTo::CompleteStringFold {
+                                    destination: dst,
+                                    state,
+                                    result_ownership,
+                                },
+                                limits.max_stack_depth,
+                                location,
+                            )?;
+                            peak_stack_depth = peak_stack_depth.max(next_depth);
+                        }
+                        Err(refusal) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                    }
+                } else if plan.implementation.is_managerless_task()
+                    || plan.implementation == IntrinsicImplementation::DbgTrace
+                {
+                    let application = match closure_intrinsic_application(
+                        plan.implementation,
+                        plan.row,
+                        values,
+                    ) {
+                        Ok(application) => application,
+                        Err(refusal) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                    };
                     match prepare_internal_apply_many(
                         program,
                         &application.closure,
@@ -2480,9 +2588,13 @@ fn run(
                         application.argument_ownership,
                     ) {
                         Ok(PreparedApply::Partial { function, captures }) => {
+                            if let Some(message) = &application.trace {
+                                fln_rt::diagnostics::trace_message(message.as_bytes());
+                            }
                             let value = make_golem_closure(program, function, captures)?;
                             let value =
-                                match complete_managerless_task(application.completion, value) {
+                                match complete_intrinsic_application(application.completion, value)
+                                {
                                     Ok(value) => value,
                                     Err(refusal) => {
                                         return Ok(VmExit::Refused {
@@ -2494,7 +2606,7 @@ fn run(
                             let value = match finish_intrinsic_result(
                                 application.row,
                                 result_ownership,
-                                IntrinsicResult::owned(value),
+                                value,
                             ) {
                                 Ok(value) => value,
                                 Err(refusal) => {
@@ -2515,9 +2627,12 @@ fn run(
                         }) => {
                             if !remainder.is_empty() {
                                 return Err(Stop::InternalFault(InternalFault::new(
-                                    "FLBC-TASK-APPLY",
-                                    "managerless task arguments over-applied a validated closure",
+                                    "FLBC-INTRINSIC-APPLY",
+                                    "intrinsic arguments over-applied a validated closure",
                                 )));
+                            }
+                            if let Some(message) = &application.trace {
+                                fln_rt::diagnostics::trace_message(message.as_bytes());
                             }
                             advance(current_frame_mut(&mut stack)?)?;
                             let next_depth = push_call(
@@ -2525,7 +2640,7 @@ fn run(
                                 &mut stack,
                                 function,
                                 args,
-                                ReturnTo::CompleteManagerlessTask {
+                                ReturnTo::CompleteIntrinsicApplication {
                                     destination: dst,
                                     completion: application.completion,
                                     row: application.row,
@@ -2580,23 +2695,41 @@ fn run(
                         Err(IntrinsicFailure::FileReadResource(error)) => {
                             return Err(file_read_exhausted(error, &location.to_string()));
                         }
+                        Err(IntrinsicFailure::StringResource(error)) => {
+                            return Err(strings::resource_exhausted(error, &location.to_string()));
+                        }
+                        Err(IntrinsicFailure::StringFromBytesResource(error)) => {
+                            return Err(string_from_bytes_exhausted(error, &location.to_string()));
+                        }
                     }
                 }
             }
             Instruction::Call {
-                dst,
                 function,
-                args,
-                argument_ownership,
+                ref args,
+                ref argument_ownership,
+                result_ownership,
+                ..
+            }
+            | Instruction::TailCall {
+                function,
+                ref args,
+                ref argument_ownership,
                 result_ownership,
             } => {
+                let dst = if let Instruction::Call { dst, .. } = *instruction {
+                    dst
+                } else {
+                    // Never read or written: an exact tail call has no destination.
+                    Register::new(0)
+                };
                 let callee = program.function(function).ok_or_else(|| {
                     Stop::InternalFault(InternalFault::new(
                         "FLBC-VALIDATED-TARGET",
                         format!("validated call target {} disappeared", function.get()),
                     ))
                 })?;
-                if callee.parameter_ownership != argument_ownership {
+                if callee.parameter_ownership.as_slice() != argument_ownership.as_slice() {
                     return Err(Stop::InternalFault(InternalFault::new(
                         "FLBC-CALL-OWNERSHIP",
                         format!(
@@ -2617,8 +2750,8 @@ fn run(
                 }
                 let values = transfer_call_arguments(
                     current_frame_mut(&mut stack)?,
-                    &args,
-                    &argument_ownership,
+                    args,
+                    argument_ownership,
                 )?;
                 if tail {
                     tail_calls::replace_frame(program, &mut stack, function, values)?;
@@ -2639,8 +2772,8 @@ fn run(
             Instruction::Closure {
                 dst,
                 function,
-                captures,
-                capture_ownership,
+                ref captures,
+                ref capture_ownership,
             } => {
                 let callee = program.function(function).ok_or_else(|| {
                     Stop::InternalFault(InternalFault::new(
@@ -2654,7 +2787,7 @@ fn run(
                         "validated closure capture count exceeds the target parameter contract",
                     )));
                 };
-                if expected != capture_ownership {
+                if expected != capture_ownership.as_slice() {
                     return Err(Stop::InternalFault(InternalFault::new(
                         "FLBC-CLOSURE-OWNERSHIP",
                         format!(
@@ -2671,20 +2804,33 @@ fn run(
                 }
                 let captures = transfer_closure_captures(
                     current_frame_mut(&mut stack)?,
-                    &captures,
-                    &capture_ownership,
+                    captures,
+                    capture_ownership,
                 )?;
                 let closure = make_golem_closure(program, function, captures)?;
                 set_register(current_frame_mut(&mut stack)?, dst, closure)?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::Apply {
-                dst,
                 closure,
-                args,
-                argument_ownership,
+                ref args,
+                ref argument_ownership,
+                result_ownership,
+                ..
+            }
+            | Instruction::TailApply {
+                closure,
+                ref args,
+                ref argument_ownership,
                 result_ownership,
             } => {
+                let dst = if let Instruction::Apply { dst, .. } = *instruction {
+                    dst
+                } else {
+                    // Non-exact applications reuse the already validated closure
+                    // slot after all original operands have been transferred.
+                    closure
+                };
                 let closure = clone_register(current_frame(&stack)?, closure)?;
                 // Native callbacks never enter the Golem function-id cache.
                 // The public source Stream contains Golem wrappers; only a
@@ -2693,7 +2839,7 @@ fn run(
                 if reading || closure.is_stdio_put_str_closure() {
                     if let Err(refusal) = validate_stdio_apply(
                         args.len(),
-                        &argument_ownership,
+                        argument_ownership,
                         result_ownership,
                         reading,
                     ) {
@@ -2704,8 +2850,8 @@ fn run(
                     }
                     let args = transfer_apply_arguments(
                         current_frame_mut(&mut stack)?,
-                        &args,
-                        &argument_ownership,
+                        args,
+                        argument_ownership,
                     )?;
                     let value = match execute_stdio_apply(&closure, &args, reading) {
                         Ok(value) => value,
@@ -2726,7 +2872,7 @@ fn run(
                     program,
                     &closure,
                     args.len(),
-                    &argument_ownership,
+                    argument_ownership,
                     result_ownership,
                     cache_site,
                     inline_caches.as_deref_mut(),
@@ -2741,8 +2887,8 @@ fn run(
                 };
                 let args = transfer_apply_arguments(
                     current_frame_mut(&mut stack)?,
-                    &args,
-                    &argument_ownership,
+                    args,
+                    argument_ownership,
                 )?;
                 match finish_apply(plan, args, Some(argument_ownership)) {
                     PreparedApply::Partial { function, captures } => {
@@ -2792,12 +2938,6 @@ fn run(
                         peak_stack_depth = peak_stack_depth.max(next_depth);
                     }
                 }
-            }
-            Instruction::TailCall { .. } | Instruction::TailApply { .. } => {
-                return Err(Stop::InternalFault(InternalFault::new(
-                    "FLBC-TAIL-DISPATCH",
-                    "tail instruction was not normalized for checked dispatch",
-                )));
             }
             Instruction::Jump { target } => {
                 current_frame_mut(&mut stack)?.pc =
@@ -3008,13 +3148,66 @@ fn run(
                                 cache_thunk_value(&thunk, &value)?;
                                 set_register(current_frame_mut(&mut stack)?, destination, value)?;
                             }
-                            ReturnTo::CompleteManagerlessTask {
+                            ReturnTo::CompleteStringFold {
+                                destination,
+                                state,
+                                result_ownership,
+                            } => match string_fold::resume(program, state, value) {
+                                Ok(string_fold::Step::Complete(value)) => {
+                                    let value = match finish_intrinsic_result(
+                                        string_fold::ROW,
+                                        result_ownership,
+                                        IntrinsicResult::owned(value),
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(refusal) => {
+                                            return Ok(VmExit::Refused {
+                                                refusal,
+                                                usage: usage(steps, peak_stack_depth),
+                                            });
+                                        }
+                                    };
+                                    set_register(
+                                        current_frame_mut(&mut stack)?,
+                                        destination,
+                                        value,
+                                    )?;
+                                }
+                                Ok(string_fold::Step::Call {
+                                    function,
+                                    args,
+                                    state,
+                                }) => {
+                                    let next_depth = push_call(
+                                        program,
+                                        &mut stack,
+                                        function,
+                                        args,
+                                        ReturnTo::CompleteStringFold {
+                                            destination,
+                                            state,
+                                            result_ownership,
+                                        },
+                                        limits.max_stack_depth,
+                                        location,
+                                    )?;
+                                    peak_stack_depth = peak_stack_depth.max(next_depth);
+                                }
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            },
+                            ReturnTo::CompleteIntrinsicApplication {
                                 destination,
                                 completion,
                                 row,
                                 result_ownership,
                             } => {
-                                let value = match complete_managerless_task(completion, value) {
+                                let value = match complete_intrinsic_application(completion, value)
+                                {
                                     Ok(value) => value,
                                     Err(refusal) => {
                                         return Ok(VmExit::Refused {
@@ -3023,19 +3216,16 @@ fn run(
                                         });
                                     }
                                 };
-                                let value = match finish_intrinsic_result(
-                                    row,
-                                    result_ownership,
-                                    IntrinsicResult::owned(value),
-                                ) {
-                                    Ok(value) => value,
-                                    Err(refusal) => {
-                                        return Ok(VmExit::Refused {
-                                            refusal,
-                                            usage: usage(steps, peak_stack_depth),
-                                        });
-                                    }
-                                };
+                                let value =
+                                    match finish_intrinsic_result(row, result_ownership, value) {
+                                        Ok(value) => value,
+                                        Err(refusal) => {
+                                            return Ok(VmExit::Refused {
+                                                refusal,
+                                                usage: usage(steps, peak_stack_depth),
+                                            });
+                                        }
+                                    };
                                 set_register(current_frame_mut(&mut stack)?, destination, value)?;
                             }
                         }
@@ -3253,7 +3443,7 @@ fn prepare_internal_apply_many(
         Some(&argument_ownership),
         None,
     )?;
-    Ok(finish_apply(plan, arguments, Some(argument_ownership)))
+    Ok(finish_apply(plan, arguments, Some(&argument_ownership)))
 }
 
 fn prepare_owned_apply(
@@ -3270,7 +3460,7 @@ fn prepare_owned_apply(
         Some(&argument_ownership),
         Some(result_ownership),
     )?;
-    Ok(finish_apply(plan, args, Some(argument_ownership)))
+    Ok(finish_apply(plan, args, Some(&argument_ownership)))
 }
 
 fn plan_apply(
@@ -3454,7 +3644,7 @@ fn validate_inspected_apply(
 fn finish_apply(
     plan: ApplyPlan,
     args: Vec<Obj>,
-    argument_ownership: Option<Vec<ArgumentOwnership>>,
+    argument_ownership: Option<&[ArgumentOwnership]>,
 ) -> PreparedApply {
     let ApplyPlan {
         function,
@@ -3469,7 +3659,7 @@ fn finish_apply(
     let mut args = args.into_iter();
     captures.extend(args.by_ref().take(required));
     let remainder_ownership = argument_ownership
-        .map(|ownership| ownership.into_iter().skip(required).collect())
+        .map(|ownership| ownership.iter().copied().skip(required).collect())
         .unwrap_or_default();
     PreparedApply::Call {
         function,
@@ -3735,8 +3925,8 @@ fn resolve_intrinsic_plan(
             reason: error.message().to_string(),
         }
     })?;
-    let expected_arguments = ownership
-        .argument_ownership(declared_arguments.len())
+    let expected_arguments = diagnostics::argument_ownership(generated, declared_arguments.len())
+        .unwrap_or_else(|| ownership.argument_ownership(declared_arguments.len()))
         .map_err(|error| VmRefusal::IntrinsicOwnershipContract {
             row: row.to_string(),
             reason: error.message().to_string(),
@@ -3804,6 +3994,11 @@ fn finish_intrinsic_result(
         });
     }
     let value = result.into_object();
+    // Only a scalar result has a representation to check; classifying the
+    // row by its text is skipped for every other ownership.
+    if expected != ResultOwnership::Scalar {
+        return Ok(value);
+    }
     let scalar_kind_matches = if let Some(intrinsic) = floats::Intrinsic::for_row(row) {
         intrinsic.result_kind_matches(&value)
     } else if floats::boxed_integer_result(row) {
@@ -3811,7 +4006,7 @@ fn finish_intrinsic_result(
     } else {
         value.is_scalar()
     };
-    if expected == ResultOwnership::Scalar && !scalar_kind_matches {
+    if !scalar_kind_matches {
         return Err(VmRefusal::IntrinsicResultKind {
             row: row.to_string(),
             expected: if floats::Intrinsic::for_row(row).is_some()
@@ -3922,6 +4117,48 @@ fn transfer_arguments(
     fault_code: &'static str,
     boundary: &'static str,
 ) -> Result<Vec<Obj>, Stop> {
+    let consumes = |index: usize| ownership.get(index).is_some_and(|d| d.consumes());
+    // Order is observable only when a register consumed by one operand is
+    // read borrowed by a later one: the retained copy must be taken first.
+    let consumed_then_borrowed = registers.iter().enumerate().any(|(later, register_id)| {
+        later < ownership.len()
+            && !consumes(later)
+            && registers[..later]
+                .iter()
+                .enumerate()
+                .any(|(earlier, other)| other == register_id && consumes(earlier))
+    });
+    if !consumed_then_borrowed {
+        // Report a missing register exactly as the two-phase path does:
+        // every borrowed operand first, then every consumed one.
+        for pass_consumes in [false, true] {
+            for (register_id, disposition) in
+                registers.iter().copied().zip(ownership.iter().copied())
+            {
+                if disposition.consumes() == pass_consumes {
+                    register(frame, register_id)?;
+                }
+            }
+        }
+        let mut values = Vec::new();
+        values.try_reserve_exact(registers.len()).map_err(|_| {
+            Stop::InternalFault(InternalFault::new(
+                fault_code,
+                format!(
+                    "could not reserve {} transferred {boundary} arguments",
+                    registers.len()
+                ),
+            ))
+        })?;
+        for (register_id, disposition) in registers.iter().copied().zip(ownership.iter().copied()) {
+            values.push(if disposition.consumes() {
+                take_register(frame, register_id)?
+            } else {
+                clone_register(frame, register_id)?
+            });
+        }
+        return Ok(values);
+    }
     let mut borrowed = Vec::new();
     borrowed.try_reserve_exact(registers.len()).map_err(|_| {
         Stop::InternalFault(InternalFault::new(
@@ -4013,7 +4250,82 @@ fn set_register(frame: &mut Frame, register: Register, value: Obj) -> Result<(),
     Ok(())
 }
 
+/// The scalar branch of the pin's `Nat` primitives: `lean_nat_add` and its
+/// siblings (`lean.h:1423` onwards) test `lean_is_scalar` on every operand
+/// before reaching GMP.
+///
+/// Answers only when every operand is a tagged scalar and the bignum arm
+/// below would pass each magnitude check and return a tagged scalar too, so
+/// it changes how fast a row answers, never what it answers or refuses.
+/// `None` leaves the call to that arm, which also owns every arity and
+/// operand-type refusal.
+fn scalar_nat_result(
+    implementation: IntrinsicImplementation,
+    args: &[Obj],
+) -> Option<IntrinsicResult> {
+    // An operand below this has at most `usize::BITS - 2` significant bits,
+    // so the bignum arm's bound for a sum is at most `usize::BITS - 1` bits:
+    // zero magnitude bytes (`nat_magnitude_bytes`) and a tagged scalar.
+    const SUM_OPERAND_LIMIT: usize = 1 << (usize::BITS - 2);
+    let bits = |value: usize| usize::BITS - value.leading_zeros();
+    let truth = |holds: bool| Some(IntrinsicResult::scalar(Obj::mk_nat(usize::from(holds))));
+    match (implementation, args) {
+        (IntrinsicImplementation::NatPred, [value]) if value.is_scalar() => Some(
+            IntrinsicResult::owned(Obj::mk_nat(value.unbox().saturating_sub(1))),
+        ),
+        (_, [left, right]) if left.is_scalar() && right.is_scalar() => {
+            let (left, right) = (left.unbox(), right.unbox());
+            let value = match implementation {
+                IntrinsicImplementation::NatAdd
+                    if left < SUM_OPERAND_LIMIT && right < SUM_OPERAND_LIMIT =>
+                {
+                    left + right
+                }
+                // A scalar minuend has at most `usize::BITS - 1` bits, the
+                // bignum arm's whole check here.
+                IntrinsicImplementation::NatSub => left.saturating_sub(right),
+                // The bignum arm's bound for a product is the sum of the bit
+                // lengths; below `usize::BITS` it is a tagged scalar.
+                IntrinsicImplementation::NatMul
+                    if left == 0 || right == 0 || bits(left) + bits(right) < usize::BITS =>
+                {
+                    left * right
+                }
+                // Lean's laws: `x / 0 = 0` and `x % 0 = x`.
+                IntrinsicImplementation::NatDiv | IntrinsicImplementation::NatDivExact => {
+                    left.checked_div(right).unwrap_or(0)
+                }
+                IntrinsicImplementation::NatMod | IntrinsicImplementation::NatModCore => {
+                    left.checked_rem(right).unwrap_or(left)
+                }
+                IntrinsicImplementation::NatBeq | IntrinsicImplementation::NatDecEq => {
+                    return truth(left == right);
+                }
+                IntrinsicImplementation::NatBle | IntrinsicImplementation::NatDecLe => {
+                    return truth(left <= right);
+                }
+                IntrinsicImplementation::NatDecLt => return truth(left < right),
+                _ => return None,
+            };
+            Some(IntrinsicResult::owned(Obj::mk_nat(value)))
+        }
+        _ => None,
+    }
+}
+
 fn invoke_intrinsic(
+    implementation: IntrinsicImplementation,
+    row: &str,
+    args: &[Obj],
+    max_nat_magnitude_bytes: u64,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    if let Some(result) = scalar_nat_result(implementation, args) {
+        return Ok(result);
+    }
+    dispatch_intrinsic(implementation, row, args, max_nat_magnitude_bytes)
+}
+
+fn dispatch_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
     args: &[Obj],
@@ -4025,9 +4337,11 @@ fn invoke_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
+        IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::StringInternal(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
             let sum = with_nat_views(
@@ -5871,6 +6185,14 @@ fn invoke_intrinsic(
             lhs.push_str(&string_value(&args[1], "String.append", 1)?);
             Ok(IntrinsicResult::owned(Obj::mk_string(&lhs)))
         }
+        IntrinsicImplementation::StringOfByteArray => {
+            // The census retains the constructor's UTF-8 proof as its second
+            // logical argument. That proof is erased before this one-argument
+            // native ABI call. The generated borrowed/owned ownership rule
+            // remains in force; a fresh String preserves every input alias.
+            expect_arity(row, args, 1)?;
+            string_from_byte_array(&args[0], MAX_STRING_FROM_BYTES)
+        }
         IntrinsicImplementation::StringAtEnd => {
             expect_arity(row, args, 2)?;
             let byte_len = string_bytes(&args[0], "String.atEnd", 0)?.len();
@@ -6395,6 +6717,19 @@ fn invoke_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(file_read_failure)
         }
+        IntrinsicImplementation::FileHandleWrite => {
+            expect_arity(row, args, 2)?;
+            args[0]
+                .try_file_write(&args[1], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FilePathReadDir => {
+            expect_arity(row, args, 1)?;
+            Obj::try_file_read_dir(&args[0], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::IoGetTaskState => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
@@ -6525,6 +6860,8 @@ fn invoke_intrinsic(
         | IntrinsicImplementation::TaskSpawn
         | IntrinsicImplementation::TaskMap
         | IntrinsicImplementation::TaskBind
+        | IntrinsicImplementation::StringInternalFoldl
+        | IntrinsicImplementation::DbgTrace
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }
@@ -6557,12 +6894,13 @@ fn cache_thunk_value(thunk: &Obj, value: &Obj) -> Result<(), Stop> {
     )))
 }
 
-fn managerless_task_application(
+fn closure_intrinsic_application(
     implementation: IntrinsicImplementation,
     row: &'static str,
     args: Vec<Obj>,
-) -> Result<ManagerlessTaskApplication, VmRefusal> {
+) -> Result<IntrinsicApplication, VmRefusal> {
     match implementation {
+        IntrinsicImplementation::DbgTrace => diagnostics::trace(row, args),
         IntrinsicImplementation::BaseIoAsTask | IntrinsicImplementation::TaskSpawn => {
             let [closure, priority] = exact_owned_args(row, args)?;
             let operation = if implementation == IntrinsicImplementation::BaseIoAsTask {
@@ -6576,12 +6914,13 @@ fn managerless_task_application(
             // mismatch would treat 2^64 as ill-typed rather than a valid
             // (and here unused) priority.
             with_nat_view(&priority, operation, 1, |_| ())?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![Obj::mk_nat(0)],
                 argument_ownership: vec![ArgumentOwnership::Scalar],
-                completion: ManagerlessTaskCompletion::WrapPure,
+                completion: IntrinsicCompletion::WrapPure,
+                trace: None,
             })
         }
         IntrinsicImplementation::BaseIoMapTask => {
@@ -6593,12 +6932,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
                 argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
-                completion: ManagerlessTaskCompletion::WrapPure,
+                completion: IntrinsicCompletion::WrapPure,
+                trace: None,
             })
         }
         IntrinsicImplementation::BaseIoBindTask => {
@@ -6616,12 +6956,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
                 argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
-                completion: ManagerlessTaskCompletion::RequireFinishedTask,
+                completion: IntrinsicCompletion::RequireFinishedTask,
+                trace: None,
             })
         }
         IntrinsicImplementation::TaskMap => {
@@ -6633,12 +6974,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
                 argument_ownership: vec![ArgumentOwnership::Owned],
-                completion: ManagerlessTaskCompletion::WrapPure,
+                completion: IntrinsicCompletion::WrapPure,
+                trace: None,
             })
         }
         IntrinsicImplementation::TaskBind => {
@@ -6650,12 +6992,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
                 argument_ownership: vec![ArgumentOwnership::Owned],
-                completion: ManagerlessTaskCompletion::RequireFinishedTask,
+                completion: IntrinsicCompletion::RequireFinishedTask,
+                trace: None,
             })
         }
         IntrinsicImplementation::NatAdd
@@ -6675,6 +7018,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatShiftRight
         | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
+        | IntrinsicImplementation::StringOfByteArray
         | IntrinsicImplementation::StringAtEnd
         | IntrinsicImplementation::StringCompare
         | IntrinsicImplementation::StringDecEq
@@ -6931,6 +7275,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ByteArrayUset
         | IntrinsicImplementation::ByteArrayValidateUtf8
         | IntrinsicImplementation::StringNext
+        | IntrinsicImplementation::StringInternalFoldl
         | IntrinsicImplementation::StringPrev
         | IntrinsicImplementation::StringPush
         | IntrinsicImplementation::StringTrim
@@ -6953,6 +7298,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::FileHandlePutStr
         | IntrinsicImplementation::FileHandleGetLine
         | IntrinsicImplementation::FileHandleRead
+        | IntrinsicImplementation::FileHandleWrite
+        | IntrinsicImplementation::FilePathReadDir
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny
@@ -6972,6 +7319,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayConstruction(_)
         | IntrinsicImplementation::ArrayExtra(_)
         | IntrinsicImplementation::Float(_)
+        | IntrinsicImplementation::StringInternal(_)
+        | IntrinsicImplementation::PanicCore
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }),
@@ -7005,13 +7354,14 @@ fn expect_golem_task_closure(
     Ok(())
 }
 
-fn complete_managerless_task(
-    completion: ManagerlessTaskCompletion,
+fn complete_intrinsic_application(
+    completion: IntrinsicCompletion,
     value: Obj,
-) -> Result<Obj, VmRefusal> {
+) -> Result<IntrinsicResult, VmRefusal> {
     match completion {
-        ManagerlessTaskCompletion::WrapPure => Ok(Obj::mk_task_pure(value)),
-        ManagerlessTaskCompletion::RequireFinishedTask => {
+        IntrinsicCompletion::RawResult => Ok(IntrinsicResult::raw_object(value)),
+        IntrinsicCompletion::WrapPure => Ok(IntrinsicResult::owned(Obj::mk_task_pure(value))),
+        IntrinsicCompletion::RequireFinishedTask => {
             expect_value_kind(
                 &value,
                 "Task.bind result",
@@ -7022,7 +7372,7 @@ fn complete_managerless_task(
             if value.finished_task_value().is_none() {
                 return Err(VmRefusal::UnsupportedTaskState);
             }
-            Ok(value)
+            Ok(IntrinsicResult::owned(value))
         }
     }
 }
@@ -7346,14 +7696,22 @@ fn int_obj(negative: bool, magnitude: &BigNat) -> Obj {
     if magnitude.is_zero() {
         return Obj::mk_int(0);
     }
-    if let Some(word) = magnitude.to_u64()
-        && let Ok(small) = i32::try_from(word)
-    {
-        return Obj::mk_int(if negative {
-            -i64::from(small)
+    if let Some(word) = magnitude.to_u64() {
+        // The negative endpoint has one more magnitude than the positive
+        // endpoint. Testing the unsigned magnitude with i32::try_from would
+        // incorrectly make -2^31 an mpz, observable in Float.scaleB's branch.
+        let scalar_limit = if negative {
+            i64::from(i32::MIN).unsigned_abs()
         } else {
-            i64::from(small)
-        });
+            i32::MAX as u64
+        };
+        if word <= scalar_limit {
+            return Obj::mk_int(if negative {
+                -(word as i64)
+            } else {
+                word as i64
+            });
+        }
     }
     Obj::mk_mpz(magnitude.limbs_le(), negative)
 }
@@ -7470,6 +7828,61 @@ fn extract_utf8(bytes: &[u8], begin: Option<usize>, end: Option<usize>) -> Optio
 
 fn mk_byte_array(bytes: &[u8]) -> Obj {
     Obj::mk_sarray(1, bytes)
+}
+
+// A Golem conversion-output ceiling, independent of Lean heartbeats. Check
+// it on the borrowed native payload before scanning UTF-8 or copying bytes.
+const MAX_STRING_FROM_BYTES: usize = 16 * 1024 * 1024;
+
+fn string_from_byte_array(
+    value: &Obj,
+    max_bytes: usize,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    if value_kind(value) != ValueKind::ScalarArray {
+        return Err(type_mismatch("String.ofByteArray", 0, "ByteArray", value).into());
+    }
+    let Some((1, _, _, bytes)) = value.try_borrow_sarray_view() else {
+        return Err(VmRefusal::InvalidByteArrayObject.into());
+    };
+    if bytes.len() > max_bytes {
+        return Err(IntrinsicFailure::StringFromBytesResource(
+            strings::ResourceError::OutputLimit {
+                allowed: max_bytes as u64,
+                observed: bytes.len() as u64,
+            },
+        ));
+    }
+    // Trusted source ingress checks the logical validity proof. A malformed
+    // direct FLBC caller still cannot mint a lossy or noncanonical String.
+    let text = std::str::from_utf8(bytes).map_err(|_| VmRefusal::InvalidStringObject)?;
+    let mut output = String::new();
+    output.try_reserve_exact(text.len()).map_err(|_| {
+        IntrinsicFailure::StringFromBytesResource(strings::ResourceError::Allocation {
+            requested: text.len(),
+        })
+    })?;
+    output.push_str(text);
+    Ok(IntrinsicResult::owned(Obj::mk_string(&output)))
+}
+
+fn string_from_bytes_exhausted(error: strings::ResourceError, location: &str) -> Stop {
+    match error {
+        strings::ResourceError::OutputLimit { allowed, observed } => Stop::Inconclusive(
+            Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::Memory {
+                    limit_bytes: allowed,
+                },
+                allowed,
+                observed,
+            })
+            .with_progress(format!("String.ofByteArray output at {location}")),
+        ),
+        strings::ResourceError::Allocation { requested } => {
+            Stop::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                "host buffer allocation for String.ofByteArray: requested {requested} bytes at {location}"
+            )))
+        }
+    }
 }
 
 /// The bytes of a Marrow `ByteArray`: a scalar array whose element size is
@@ -7749,6 +8162,172 @@ pub fn value_kind(value: &Obj) -> ValueKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scalar `Nat` branch answers exactly as the bignum arm it bypasses,
+    /// at every operand boundary and magnitude ceiling, and steps aside
+    /// wherever the bignum arm could refuse or box.
+    #[test]
+    fn the_scalar_nat_branch_agrees_with_the_bignum_arm() -> Result<(), String> {
+        // `LEAN_MAX_SMALL_NAT` is `SIZE_MAX >> 1` (`lean.h:1380`).
+        let max = usize::MAX >> 1;
+        let quarter = 1usize << (usize::BITS - 2);
+        let operands = [
+            0,
+            1,
+            2,
+            3,
+            255,
+            1 << 31,
+            (1 << 32) + 7,
+            quarter - 1,
+            quarter,
+            quarter + 1,
+            max / 2,
+            max - 1,
+            max,
+        ];
+        let rows = [
+            (IntrinsicImplementation::NatAdd, "extern:Nat.add"),
+            (IntrinsicImplementation::NatSub, "extern:Nat.sub"),
+            (IntrinsicImplementation::NatMul, "extern:Nat.mul"),
+            (IntrinsicImplementation::NatDiv, "extern:Nat.div"),
+            (IntrinsicImplementation::NatDivExact, "extern:Nat.divExact"),
+            (IntrinsicImplementation::NatMod, "extern:Nat.mod"),
+            (IntrinsicImplementation::NatModCore, "extern:Nat.modCore"),
+            (IntrinsicImplementation::NatBeq, "extern:Nat.beq"),
+            (IntrinsicImplementation::NatBle, "extern:Nat.ble"),
+            (IntrinsicImplementation::NatDecEq, "extern:Nat.decEq"),
+            (IntrinsicImplementation::NatDecLe, "extern:Nat.decLe"),
+            (IntrinsicImplementation::NatDecLt, "extern:Nat.decLt"),
+        ];
+        let ceilings = [0, 7, 8, 16, u64::MAX];
+        let (mut answered, mut declined) = (0usize, 0usize);
+        let mut agree = |implementation, row: &str, values: &[usize]| -> Result<(), String> {
+            let args: Vec<Obj> = values.iter().map(|&value| Obj::mk_nat(value)).collect();
+            let Some(fast) = scalar_nat_result(implementation, &args) else {
+                declined += 1;
+                return Ok(());
+            };
+            answered += 1;
+            for ceiling in ceilings {
+                let slow =
+                    dispatch_intrinsic(implementation, row, &args, ceiling).map_err(|_| {
+                        format!("{row} {values:?} at {ceiling}: the bignum arm refused")
+                    })?;
+                assert_eq!(slow.ownership(), fast.ownership(), "{row} {values:?}");
+                let slow = slow.into_object();
+                assert!(
+                    slow.is_scalar() && fast.value.is_scalar(),
+                    "{row} {values:?}"
+                );
+                assert_eq!(
+                    slow.unbox(),
+                    fast.value.unbox(),
+                    "{row} {values:?} at {ceiling}"
+                );
+            }
+            Ok(())
+        };
+        for (implementation, row) in rows {
+            for left in operands {
+                for right in operands {
+                    agree(implementation, row, &[left, right])?;
+                }
+            }
+        }
+        for value in operands {
+            agree(
+                IntrinsicImplementation::NatPred,
+                "extern:Nat.pred",
+                &[value],
+            )?;
+        }
+        // The branch fires for every predicate pair and steps aside where a
+        // sum or product could leave the scalar range.
+        assert!(
+            answered > rows.len() * operands.len(),
+            "answered {answered}"
+        );
+        assert!(declined > 0, "declined {declined}");
+        assert!(
+            scalar_nat_result(
+                IntrinsicImplementation::NatAdd,
+                &[Obj::mk_nat(quarter), Obj::mk_nat(0)]
+            )
+            .is_none()
+        );
+        assert!(
+            scalar_nat_result(
+                IntrinsicImplementation::NatMul,
+                &[Obj::mk_nat(1 << 32), Obj::mk_nat(1 << 31)]
+            )
+            .is_none()
+        );
+        // A boxed operand and a wrong arity both stay with the bignum arm,
+        // which owns their answers and refusals.
+        let boxed = Obj::mk_mpz(&[0, 1], false);
+        assert!(
+            scalar_nat_result(IntrinsicImplementation::NatAdd, &[boxed, Obj::mk_nat(1)]).is_none()
+        );
+        assert!(scalar_nat_result(IntrinsicImplementation::NatAdd, &[Obj::mk_nat(1)]).is_none());
+        assert!(
+            scalar_nat_result(
+                IntrinsicImplementation::NatPred,
+                &[Obj::mk_nat(1), Obj::mk_nat(1)]
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    /// One register read borrowed and consumed in either order transfers the
+    /// same handles; a register consumed twice is the validator's fault, named
+    /// as the moved register.
+    #[test]
+    fn argument_transfer_is_order_independent_for_aliased_registers() -> Result<(), String> {
+        use ArgumentOwnership::{Borrowed, Owned};
+        let frame_with = |value: Obj| Frame {
+            function: FunctionId::new(0),
+            pc: 0,
+            registers: vec![Some(value), Some(Obj::mk_nat(9))],
+            return_to: None,
+            pending_tail_return: None,
+        };
+        let r0 = Register::new(0);
+        let r1 = Register::new(1);
+        for ownership in [[Owned, Borrowed], [Borrowed, Owned]] {
+            let string = Obj::mk_string("aliased");
+            let mut frame = frame_with(string.clone_ref());
+            let values = transfer_arguments(&mut frame, &[r0, r0], &ownership, "T", "test")
+                .map_err(|_| format!("{ownership:?}: an aliased transfer was refused"))?;
+            assert_eq!(values.len(), 2);
+            for value in &values {
+                assert_eq!(
+                    string_value(value, "test", 0).ok().as_deref(),
+                    Some("aliased")
+                );
+            }
+            assert!(frame.registers[0].is_none(), "{ownership:?} consumed r0");
+            assert!(frame.registers[1].is_some());
+        }
+        let mut frame = frame_with(Obj::mk_nat(1));
+        let mixed = transfer_arguments(
+            &mut frame,
+            &[r1, r0, r1],
+            &[Borrowed, Owned, Owned],
+            "T",
+            "t",
+        );
+        let mixed = mixed.map_err(|_| "a borrowed read before a move was refused".to_string())?;
+        assert_eq!(mixed.iter().map(Obj::unbox).collect::<Vec<_>>(), [9, 1, 9]);
+        let mut frame = frame_with(Obj::mk_nat(1));
+        let twice = transfer_arguments(&mut frame, &[r0, r0], &[Owned, Owned], "T", "t");
+        assert!(matches!(
+            twice,
+            Err(Stop::InternalFault(ref fault)) if fault.detail.text().contains("moved missing register 0")
+        ));
+        Ok(())
+    }
 
     #[test]
     fn intrinsic_result_adapter_refuses_class_and_scalar_kind_drift() {
@@ -8349,6 +8928,18 @@ mod tests {
         let underflow = invoke("extern:Int.sub", &[i(i64::from(i32::MIN)), i(1)]);
         let (negative, _, _) = int_words(underflow);
         assert!(negative);
+        for minimum in [
+            invoke("extern:Int.sub", &[i(-2_147_483_647), i(1)]),
+            invoke("extern:Int.add", &[i(i64::from(i32::MIN)), i(0)]),
+            invoke("extern:Int.neg", &[Obj::mk_mpz(&[2_147_483_648], false)]),
+        ] {
+            let minimum = minimum.expect("minimum i32 answers");
+            assert!(
+                minimum.is_scalar(),
+                "the pin includes -2^31 in its scalar Int range"
+            );
+            assert_eq!(minimum.unbox() as u32 as i32, i32::MIN);
+        }
     }
 
     #[test]
@@ -8427,6 +9018,12 @@ mod tests {
         // negSucc n = -(n + 1): Basic.lean:61.
         assert_eq!(int_i64(invoke("extern:Int.negSucc", &[n(0)])), -1);
         assert_eq!(int_i64(invoke("extern:Int.negSucc", &[n(5)])), -6);
+        let minimum = invoke("extern:Int.negSucc", &[n(2_147_483_647)]).unwrap();
+        assert!(
+            minimum.is_scalar(),
+            "negSucc reaches the scalar Int lower endpoint"
+        );
+        assert_eq!(minimum.unbox() as u32 as i32, i32::MIN);
         assert_eq!(int_i64(invoke("extern:Int.ofNat", &[n(5)])), 5);
         assert_eq!(int_i64(invoke("extern:Int.natAbs", &[i(-9)])), 9);
         assert_eq!(owned_usize(invoke("extern:Int.natAbs", &[i(5)])), 5);

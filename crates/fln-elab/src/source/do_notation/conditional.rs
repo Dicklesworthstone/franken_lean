@@ -19,6 +19,7 @@ fn skip() -> Syntax {
 }
 
 pub(super) enum Header {
+    Nested,
     Proposition(Vec<Syntax>),
     Binding(Box<super::fallback::Header>),
     Match(Box<super::matching::MatchHeader>),
@@ -35,6 +36,12 @@ impl Context {
         header: Header,
         mut bodies: Vec<Syntax>,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if let Header::Nested = header {
+            if bodies.len() != 1 {
+                return Err(invalid());
+            }
+            return bodies.pop().ok_or_else(invalid);
+        }
         if let Header::Match(header) = header {
             return self.finish_do_match(*header, bodies);
         }
@@ -49,6 +56,7 @@ impl Context {
         let no = bodies.pop().expect("else branch");
         let yes = bodies.pop().expect("then branch");
         match header {
+            Header::Nested => unreachable!("handled nested block"),
             Header::Match(_) => unreachable!("handled match header"),
             Header::Exception(_) => unreachable!("handled exception header"),
             Header::Binding(header) => self.finish_do_fallback(*header, yes, no),
@@ -76,6 +84,8 @@ pub(super) struct Branches {
 pub(super) fn is_compound(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", "doIf"]))
         || syntax.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+        || syntax.kind() == Some(&parser_kind(&["Term", "doNested"]))
+        || nested::sequence(syntax).is_some()
         || fallback::is_binding(syntax)
 }
 
@@ -83,6 +93,19 @@ pub(super) fn split(
     context: &mut Context,
     syntax: Syntax,
 ) -> Result<Branches, NatDefinitionElabError> {
+    if syntax.kind() == Some(&parser_kind(&["Term", "doNested"])) {
+        let mut parts = node(syntax, "doNested", 2)?;
+        let body = parts.pop().expect("nested sequence");
+        expect_atom(&parts[0], "do", "nested block keyword")?;
+        // A bare block shares the surrounding loop target. Route its one arm
+        // through the same signal worklist as conditional/exception arms, so
+        // break and continue cross cleanup without running the outer suffix.
+        // The join's continuation stays outside the block's local binders.
+        return Ok(Branches {
+            header: Header::Nested,
+            arms: vec![Some(body)],
+        });
+    }
     if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoTry"])) {
         return context.split_loop_exception(syntax);
     }
@@ -128,7 +151,10 @@ pub(super) fn split(
             [] => {}
             [binder, colon] => {
                 expect_atom(colon, ":", "condition binder colon")?;
-                if !matches!(binder, Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous())
+                // Macro-generated binders are atomic before hygiene scopes
+                // are attached. Validate that shape without erasing the name
+                // which the branch body must use for capture-free lookup.
+                if !matches!(binder, Syntax::Ident { val, .. } if !val.erase_macro_scopes().is_anonymous() && val.erase_macro_scopes().parent().is_anonymous())
                     && !matches!(binder, Syntax::Atom { val, .. } if val == "_")
                 {
                     return Err(invalid());
@@ -149,6 +175,7 @@ struct Block<'a> {
     result: Option<Syntax>,
     scope: SequenceScope<'a>,
     terminal: bool,
+    completion: Option<Syntax>,
 }
 impl<'a> Block<'a> {
     fn new(sequence: Syntax, scope: SequenceScope<'a>) -> Result<Self, NatDefinitionElabError> {
@@ -161,6 +188,7 @@ impl<'a> Block<'a> {
             result: scope.targets.map(|targets| targets.signal(None)),
             scope,
             terminal: true,
+            completion: None,
         })
     }
 }
@@ -188,8 +216,9 @@ impl Context {
         scope: SequenceScope<'_>,
     ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task<'a> {
-            Conditional(Syntax, Option<Syntax>, SequenceScope<'a>),
+            Conditional(Syntax, Option<Syntax>, SequenceScope<'a>, Option<Syntax>),
             Finish(Header, usize, Option<Syntax>, SequenceScope<'a>),
+            FinishNested(Option<(Syntax, Syntax)>),
             Block(Block<'a>),
             Resume(Block<'a>),
             Value(Syntax),
@@ -197,17 +226,51 @@ impl Context {
         if scope.targets.is_some() && suffix.is_none() {
             return Err(invalid());
         }
-        let mut tasks = vec![Task::Conditional(syntax, suffix, scope)];
+        let mut tasks = vec![Task::Conditional(syntax, suffix, scope, None)];
         let mut values = Vec::new();
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
                 Task::Value(value) => values.push(value),
-                Task::Conditional(syntax, suffix, scope) => {
+                Task::FinishNested(join) => self.finish_returning_nested(join, &mut values)?,
+                Task::Conditional(syntax, suffix, scope, completion) => {
+                    if syntax.kind() == Some(&parser_kind(&["Term", "doLetArrow"]))
+                        && nested::sequence(&syntax).is_some()
+                    {
+                        // The normal value calls a typed continuation in the
+                        // binder's original lexical scope. Loop exits bypass
+                        // it and retain this region's exact signal depth.
+                        let nested = self.prepare_nested_do(syntax, suffix, completion, scope)?;
+                        let mut inner = Block::new(
+                            nested.sequence,
+                            SequenceScope {
+                                require_unit: false,
+                                ..scope
+                            },
+                        )?;
+                        inner.result = None;
+                        inner.completion = nested.completion;
+                        tasks.push(Task::FinishNested(nested.join));
+                        tasks.push(Task::Block(inner));
+                        continue;
+                    }
+                    if completion.is_some()
+                        && syntax.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
+                    {
+                        // As in the returning worklist, a terminal exception
+                        // region with a value completion needs a distinct
+                        // normal payload. Never run the continuation inside
+                        // that handler/finalizer just to make its type fit.
+                        return Err(invalid());
+                    }
                     let branches = split(self, syntax)?;
                     let branch_scope = SequenceScope {
                         targets: scope.targets,
-                        signal: scope.targets.is_some(),
+                        signal: if completion.is_some() {
+                            scope.signal
+                        } else {
+                            scope.targets.is_some()
+                        },
                         require_unit: scope.require_unit || suffix.is_some(),
                         allow_return: scope.allow_return
                             && (scope.targets.is_some() || suffix.is_none()),
@@ -216,10 +279,20 @@ impl Context {
                     for arm in branches.arms.into_iter().rev() {
                         self.tick()?;
                         tasks.push(match arm {
-                            Some(sequence) => Task::Block(Block::new(sequence, branch_scope)?),
-                            None => Task::Value(match scope.targets {
-                                Some(targets) => targets.signal(None),
-                                None => skip(),
+                            Some(sequence) => {
+                                let mut block = Block::new(sequence, branch_scope)?;
+                                if completion.is_some() {
+                                    block.result = None;
+                                    block.completion = completion.clone();
+                                }
+                                Task::Block(block)
+                            }
+                            None => Task::Value(match &completion {
+                                Some(completion) => nested::complete(skip(), completion.clone()),
+                                None => match scope.targets {
+                                    Some(targets) => targets.signal(None),
+                                    None => skip(),
+                                },
                             }),
                         });
                     }
@@ -245,15 +318,27 @@ impl Context {
                             block.result.take()
                         };
                         let scope = block.scope;
+                        let completion = if suffix.is_none() {
+                            block.completion.clone()
+                        } else {
+                            None
+                        };
                         tasks.push(Task::Resume(block));
-                        tasks.push(Task::Conditional(element, suffix, scope));
+                        tasks.push(Task::Conditional(element, suffix, scope, completion));
                     } else {
-                        block.result = Some(self.prepend_do_element(
-                            element,
-                            block.result,
-                            block.scope,
-                            terminal,
-                        )?);
+                        let completes = terminal
+                            && block.result.is_none()
+                            && element.kind() == Some(&parser_kind(&["Term", "doExpr"]));
+                        let value =
+                            self.prepend_do_element(element, block.result, block.scope, terminal)?;
+                        block.result = Some(if completes {
+                            match &block.completion {
+                                Some(completion) => nested::complete(value, completion.clone()),
+                                None => value,
+                            }
+                        } else {
+                            value
+                        });
                         tasks.push(Task::Block(block));
                     }
                 }
@@ -428,6 +513,91 @@ mod tests {
             ) >= 3
         );
     }
+
+    #[test]
+    fn nested_blocks_share_signals_but_cannot_discard_malformed_source() {
+        let targets = control::LoopTargets::new(&normal()).unwrap();
+        for stop in [false, true] {
+            let input = term("doNested", vec![atom("do"), sequence(jump(stop))]);
+            let result = context()
+                .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                .unwrap();
+            let join = expect_node(
+                &result,
+                &parser_kind(&["Term", "nativeDoBind"]),
+                2,
+                "nested join",
+            )
+            .unwrap();
+            assert_eq!(join[0], targets.signal(Some(stop)));
+            assert_eq!(count(&result, &Name::from_components(["suffix"])), 1);
+        }
+        for invalid in [
+            term("doNested", vec![]),
+            term("doNested", vec![atom("wrong"), sequence(action("body"))]),
+            term("doNested", vec![atom("do"), block(vec![], false)]),
+            term(
+                "doNested",
+                vec![atom("do"), sequence(action("body")), named("discarded")],
+            ),
+        ] {
+            assert!(
+                context()
+                    .expand_do_conditional(invalid, Some(named("suffix")), Some(&targets))
+                    .is_err()
+            );
+        }
+        assert!(
+            context()
+                .finish_do_condition(Header::Nested, vec![])
+                .is_err()
+        );
+        assert!(
+            context()
+                .finish_do_condition(Header::Nested, vec![named("one"), named("two")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deep_nested_loop_blocks_use_the_metered_heap_worklist() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut input = jump(false);
+                for _ in 0..1024 {
+                    input = term("doNested", vec![atom("do"), sequence(input)]);
+                }
+                let targets = control::LoopTargets::new(&normal()).unwrap();
+                let mut stopped = context();
+                stopped.txn.budget.max_heartbeats = 10;
+                assert!(matches!(
+                    stopped.expand_do_conditional(
+                        input.clone(),
+                        Some(named("suffix")),
+                        Some(&targets)
+                    ),
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::ResourceLimit
+                    ))
+                ));
+                let output = context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .unwrap();
+                let join = expect_node(
+                    &output,
+                    &parser_kind(&["Term", "nativeDoBind"]),
+                    2,
+                    "only the outermost block needs a join",
+                )
+                .unwrap();
+                assert_eq!(join[0], targets.signal(Some(false)));
+                assert_eq!(count(&output, &Name::from_components(["suffix"])), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
     #[test]
     fn ordinary_terminal_conditionals_keep_their_result_without_loop_signals() {
         let result = context()
@@ -579,6 +749,78 @@ mod tests {
                     ),
                 ],
             )
+        }
+    }
+
+    fn bound_sequence(body: Syntax) -> Syntax {
+        term(
+            "doLetArrow",
+            vec![
+                atom("let"),
+                null(vec![]),
+                term("letConfig", vec![null(vec![])]),
+                term(
+                    "doIdDecl",
+                    vec![
+                        named("value"),
+                        null(vec![]),
+                        atom("←"),
+                        term("doNested", vec![atom("do"), body]),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn nested_value_blocks_are_metered_and_use_heap_continuations() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut body = sequence(action("leaf"));
+                for _ in 0..256 {
+                    body = block(vec![bound_sequence(body), action("next")], false);
+                }
+                let input = bound_sequence(body);
+                let targets = control::LoopTargets::new(&normal()).unwrap();
+                let mut stopped = context();
+                stopped.txn.budget.max_heartbeats = 10;
+                assert!(matches!(
+                    stopped.expand_do_conditional(
+                        input.clone(),
+                        Some(named("suffix")),
+                        Some(&targets)
+                    ),
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::ResourceLimit
+                    ))
+                ));
+                let output = context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .unwrap();
+                assert_eq!(count(&output, &Name::from_components(["leaf"])), 1);
+                assert_eq!(count(&output, &Name::from_components(["next"])), 256);
+                assert_eq!(count(&output, &Name::from_components(["suffix"])), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_nested_binding_headers_cannot_discard_source_fields() {
+        let targets = control::LoopTargets::new(&normal()).unwrap();
+        for slot in 0..4 {
+            let mut input = bound_sequence(sequence(action("body")));
+            let Syntax::Node { args, .. } = &mut input else {
+                unreachable!()
+            };
+            args[slot] = Syntax::Missing;
+            assert!(
+                context()
+                    .expand_do_conditional(input, Some(named("suffix")), Some(&targets))
+                    .is_err()
+            );
         }
     }
 

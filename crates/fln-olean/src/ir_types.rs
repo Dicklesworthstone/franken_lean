@@ -9,17 +9,19 @@
 //! soundness or ownership proof. As in that checker, full applications do not
 //! compare argument/result types, numeric literals have no result-type rule,
 //! and returns and mutation/RC instructions retain structural checks only.
-//! Constructor layout bounds, linear aggregate use and runtime-tag/RC balance
+//! Constructor metadata also obeys the pin's IR checker bounds, using the
+//! generated ABI limits and the codec's LP64 scalar-word layout. Those bounds
+//! are inclusive, unlike the runtime allocator's stricter assertions; this is
+//! not an allocation permit. Linear aggregate use and runtime-tag/RC balance
 //! are separate obligations. Successful checking grants no execution authority.
 
 use crate::ir::{
-    IrAlt, IrBody, IrDecl, IrExpr, IrIndex, IrLit, IrModule, IrParam, IrStmt, IrTerminal,
-    IrType,
+    IrAlt, IrBody, IrCtorInfo, IrDecl, IrExpr, IrIndex, IrLit, IrModule, IrParam, IrStmt,
+    IrTerminal, IrType,
 };
-use crate::ir_validate::{
-    IrValidationError, IrValidationLimits, IrValidationSummary, validate_ir,
-};
+use crate::ir_validate::{IrValidationError, IrValidationLimits, IrValidationSummary, validate_ir};
 use fln_core::name::Name;
+use fln_rt::abi::{MAX_CTOR_FIELDS, MAX_CTOR_SCALARS_SIZE, TAG_MAX_CTOR_TAG};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,14 @@ pub enum IrTypeValidationError {
         binding: IrIndex,
         index: u64,
         fields: usize,
+    },
+    ConstructorLayout {
+        declaration: Name,
+        binding: IrIndex,
+        constructor: Name,
+        field: &'static str,
+        observed: u128,
+        allowed: u128,
     },
     /// Defensive: the preceding structural pass normally prevents this.
     UnknownVariable {
@@ -89,8 +99,8 @@ pub fn validate_ir_types(
     census_externs: &BTreeMap<Name, usize>,
     limits: IrValidationLimits,
 ) -> Result<IrTypeValidationSummary> {
-    let structural = validate_ir(modules, census_externs, limits)
-        .map_err(IrTypeValidationError::Structural)?;
+    let structural =
+        validate_ir(modules, census_externs, limits).map_err(IrTypeValidationError::Structural)?;
     check_after_structure(modules, structural, limits)
 }
 
@@ -148,13 +158,21 @@ impl Meter {
     }
 
     fn charge(&mut self) -> Result<()> {
-        self.summary.work = self.summary.work.checked_add(1)
+        self.summary.work = self
+            .summary
+            .work
+            .checked_add(1)
             .filter(|work| *work <= self.limits.max_work)
             .ok_or_else(|| self.limit("work"))?;
         Ok(())
     }
 
-    fn rule(&self, operation: &'static str, expected: &'static str, ty: &IrType) -> IrTypeValidationError {
+    fn rule(
+        &self,
+        operation: &'static str,
+        expected: &'static str,
+        ty: &IrType,
+    ) -> IrTypeValidationError {
         IrTypeValidationError::Rule {
             declaration: self.name(),
             binding: self.binding,
@@ -164,17 +182,82 @@ impl Meter {
         }
     }
 
-    fn require(&mut self, operation: &'static str, expected: &'static str, ty: &IrType, valid: bool) -> Result<()> {
+    fn require(
+        &mut self,
+        operation: &'static str,
+        expected: &'static str,
+        ty: &IrType,
+        valid: bool,
+    ) -> Result<()> {
         self.charge()?;
-        if valid { Ok(()) } else { Err(self.rule(operation, expected, ty)) }
+        if valid {
+            Ok(())
+        } else {
+            Err(self.rule(operation, expected, ty))
+        }
     }
 
     fn object(&mut self, operation: &'static str, ty: &IrType) -> Result<()> {
-        self.require(operation, "object, tagged, tobject or void", ty, is_object(ty))
+        self.require(
+            operation,
+            "object, tagged, tobject or void",
+            ty,
+            is_object(ty),
+        )
     }
 
     fn scalar(&mut self, operation: &'static str, ty: &IrType) -> Result<()> {
         self.require(operation, "scalar", ty, is_scalar(ty))
+    }
+
+    fn constructor_bound(
+        &mut self,
+        info: &IrCtorInfo,
+        field: &'static str,
+        observed: u128,
+        allowed: u128,
+    ) -> Result<()> {
+        self.charge()?;
+        if observed > allowed {
+            return Err(IrTypeValidationError::ConstructorLayout {
+                declaration: self.name(),
+                binding: self.binding,
+                constructor: info.name.clone(),
+                field,
+                observed,
+                allowed,
+            });
+        }
+        Ok(())
+    }
+
+    /// `IR/Checker.lean::checkExpr`, ctor arm; `Basic.lean::CtorInfo.isRef`.
+    /// A fieldless constructor is a scalar tag and has no reference-tag cap.
+    /// The pin checks metadata, not argument count or allocator eligibility.
+    fn constructor_layout(&mut self, info: &IrCtorInfo) -> Result<bool> {
+        let is_reference = info.size != 0 || info.usize != 0 || info.ssize != 0;
+        if is_reference {
+            self.constructor_bound(info, "tag", info.cidx.into(), TAG_MAX_CTOR_TAG.into())?;
+        }
+        self.constructor_bound(
+            info,
+            "object fields",
+            info.size.into(),
+            MAX_CTOR_FIELDS as u128,
+        )?;
+        // The region codec reads LP64 size_t words, even on another host. Do
+        // not use size_of::<usize> here: this validates the artifact's layout.
+        // u128 preserves the pin's Nat arithmetic for all decoded u64 fields,
+        // including metadata whose multiplication or sum would overflow u64.
+        let scalar_bytes =
+            u128::from(info.ssize) + u128::from(info.usize) * std::mem::size_of::<u64>() as u128;
+        self.constructor_bound(
+            info,
+            "scalar bytes",
+            scalar_bytes,
+            MAX_CTOR_SCALARS_SIZE as u128,
+        )?;
+        Ok(is_reference)
     }
 
     /// No recursive clone/equality/formatting of aggregate types, even for
@@ -190,7 +273,9 @@ impl Meter {
             if let IrType::Struct { types, .. } | IrType::Union { types, .. } = ty {
                 for child in types.iter().rev() {
                     self.charge()?;
-                    let child_depth = depth.checked_add(1).ok_or_else(|| self.limit("type depth"))?;
+                    let child_depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| self.limit("type depth"))?;
                     pending.push((child, child_depth));
                 }
             }
@@ -198,19 +283,36 @@ impl Meter {
         Ok(())
     }
 
-    fn same_type(&mut self, operation: &'static str, expected: &IrType, actual: &IrType) -> Result<()> {
+    fn same_type(
+        &mut self,
+        operation: &'static str,
+        expected: &IrType,
+        actual: &IrType,
+    ) -> Result<()> {
         let mut pending = vec![(expected, actual)];
         while let Some((left, right)) = pending.pop() {
             self.charge()?;
             self.summary.type_nodes += 1;
             let members = match (left, right) {
                 (
-                    IrType::Struct { lean_type: a, types: xs },
-                    IrType::Struct { lean_type: b, types: ys },
+                    IrType::Struct {
+                        lean_type: a,
+                        types: xs,
+                    },
+                    IrType::Struct {
+                        lean_type: b,
+                        types: ys,
+                    },
                 ) if a == b => Some((xs, ys)),
                 (
-                    IrType::Union { lean_type: a, types: xs },
-                    IrType::Union { lean_type: b, types: ys },
+                    IrType::Union {
+                        lean_type: a,
+                        types: xs,
+                    },
+                    IrType::Union {
+                        lean_type: b,
+                        types: ys,
+                    },
                 ) if a == b => Some((xs, ys)),
                 (IrType::Struct { .. } | IrType::Union { .. }, _)
                 | (_, IrType::Struct { .. } | IrType::Union { .. }) => {
@@ -235,26 +337,48 @@ impl Meter {
 
 fn category(ty: &IrType) -> &'static str {
     match ty {
-        IrType::Float => "float", IrType::Float32 => "float32",
-        IrType::UInt8 => "uint8", IrType::UInt16 => "uint16",
-        IrType::UInt32 => "uint32", IrType::UInt64 => "uint64",
-        IrType::USize => "usize", IrType::Object => "object",
-        IrType::TObject => "tobject", IrType::Tagged => "tagged",
-        IrType::Void => "void", IrType::Erased => "erased",
-        IrType::Struct { .. } => "struct", IrType::Union { .. } => "union",
+        IrType::Float => "float",
+        IrType::Float32 => "float32",
+        IrType::UInt8 => "uint8",
+        IrType::UInt16 => "uint16",
+        IrType::UInt32 => "uint32",
+        IrType::UInt64 => "uint64",
+        IrType::USize => "usize",
+        IrType::Object => "object",
+        IrType::TObject => "tobject",
+        IrType::Tagged => "tagged",
+        IrType::Void => "void",
+        IrType::Erased => "erased",
+        IrType::Struct { .. } => "struct",
+        IrType::Union { .. } => "union",
     }
 }
 
 fn is_object(ty: &IrType) -> bool {
-    matches!(ty, IrType::Object | IrType::TObject | IrType::Tagged | IrType::Void)
+    matches!(
+        ty,
+        IrType::Object | IrType::TObject | IrType::Tagged | IrType::Void
+    )
 }
 
 fn is_scalar(ty: &IrType) -> bool {
-    matches!(ty, IrType::Float | IrType::Float32 | IrType::UInt8 | IrType::UInt16
-        | IrType::UInt32 | IrType::UInt64 | IrType::USize)
+    matches!(
+        ty,
+        IrType::Float
+            | IrType::Float32
+            | IrType::UInt8
+            | IrType::UInt16
+            | IrType::UInt32
+            | IrType::UInt64
+            | IrType::USize
+    )
 }
 
-fn add_params<'a>(params: &'a [IrParam], locals: &mut BTreeMap<IrIndex, &'a IrType>, meter: &mut Meter) -> Result<()> {
+fn add_params<'a>(
+    params: &'a [IrParam],
+    locals: &mut BTreeMap<IrIndex, &'a IrType>,
+    meter: &mut Meter,
+) -> Result<()> {
     for param in params {
         meter.charge()?;
         meter.visit_type(&param.ty)?;
@@ -265,13 +389,20 @@ fn add_params<'a>(params: &'a [IrParam], locals: &mut BTreeMap<IrIndex, &'a IrTy
 
 fn check_declaration(declaration: &IrDecl, meter: &mut Meter) -> Result<()> {
     let (params, result, body) = match declaration {
-        IrDecl::Function { params, result, body, .. } => (params, result, Some(body)),
+        IrDecl::Function {
+            params,
+            result,
+            body,
+            ..
+        } => (params, result, Some(body)),
         IrDecl::Extern { params, result, .. } => (params, result, None),
     };
     let mut locals = BTreeMap::new();
     meter.visit_type(result)?;
     add_params(params, &mut locals, meter)?;
-    let Some(body) = body else { return Ok(()); };
+    let Some(body) = body else {
+        return Ok(());
+    };
     let mut pending: Vec<&IrBody> = vec![body];
     let mut expressions = Vec::new();
     // Structural validation already proved scopes and declaration-wide index
@@ -284,7 +415,9 @@ fn check_declaration(declaration: &IrDecl, meter: &mut Meter) -> Result<()> {
             match stmt {
                 IrStmt::VDecl { x, ty, expr } => {
                     meter.visit_type(ty)?;
-                    if let IrExpr::Box { ty, .. } = expr { meter.visit_type(ty)?; }
+                    if let IrExpr::Box { ty, .. } = expr {
+                        meter.visit_type(ty)?;
+                    }
                     locals.insert(*x, ty);
                     expressions.push((*x, ty, expr));
                 }
@@ -314,12 +447,18 @@ fn check_declaration(declaration: &IrDecl, meter: &mut Meter) -> Result<()> {
     Ok(())
 }
 
-fn check_expr(result: &IrType, expr: &IrExpr, locals: &BTreeMap<IrIndex, &IrType>, meter: &mut Meter) -> Result<()> {
+fn check_expr(
+    result: &IrType,
+    expr: &IrExpr,
+    locals: &BTreeMap<IrIndex, &IrType>,
+    meter: &mut Meter,
+) -> Result<()> {
     // Returning a borrow from locals does not borrow the mutable meter.
     let get = |index: IrIndex| locals.get(&index).copied();
     let source = |index: IrIndex, meter: &Meter| {
         get(index).ok_or_else(|| IrTypeValidationError::UnknownVariable {
-            declaration: meter.name(), index,
+            declaration: meter.name(),
+            index,
         })
     };
     match expr {
@@ -329,7 +468,7 @@ fn check_expr(result: &IrType, expr: &IrExpr, locals: &BTreeMap<IrIndex, &IrType
             meter.object("ap result", result)
         }
         IrExpr::Ctor { info, .. } => {
-            if info.size != 0 || info.usize != 0 || info.ssize != 0 {
+            if meter.constructor_layout(info)? {
                 meter.object("reference constructor result", result)?;
             }
             Ok(())
@@ -352,17 +491,31 @@ fn check_expr(result: &IrType, expr: &IrExpr, locals: &BTreeMap<IrIndex, &IrType
             IrType::Object | IrType::TObject => meter.object("proj result", result),
             IrType::Tagged => Ok(()),
             IrType::Struct { types, .. } | IrType::Union { types, .. } => {
-                let field = usize::try_from(*i).ok().and_then(|i| types.get(i))
+                let field = usize::try_from(*i)
+                    .ok()
+                    .and_then(|i| types.get(i))
                     .ok_or_else(|| IrTypeValidationError::Projection {
-                        declaration: meter.name(), binding: meter.binding, index: *i, fields: types.len(),
+                        declaration: meter.name(),
+                        binding: meter.binding,
+                        index: *i,
+                        fields: types.len(),
                     })?;
                 meter.same_type("proj aggregate field", field, result)
             }
-            ty => Err(meter.rule("proj source", "object, tobject, tagged, struct or union", ty)),
+            ty => Err(meter.rule(
+                "proj source",
+                "object, tobject, tagged, struct or union",
+                ty,
+            )),
         },
         IrExpr::UProj { x, .. } => {
             meter.object("uproj source", source(*x, meter)?)?;
-            meter.require("uproj result", "usize", result, matches!(result, IrType::USize))
+            meter.require(
+                "uproj result",
+                "usize",
+                result,
+                matches!(result, IrType::USize),
+            )
         }
         IrExpr::SProj { x, .. } => {
             meter.object("sproj source", source(*x, meter)?)?;
@@ -370,7 +523,12 @@ fn check_expr(result: &IrType, expr: &IrExpr, locals: &BTreeMap<IrIndex, &IrType
         }
         IrExpr::IsShared { x } => {
             meter.object("isShared source", source(*x, meter)?)?;
-            meter.require("isShared result", "uint8", result, matches!(result, IrType::UInt8))
+            meter.require(
+                "isShared result",
+                "uint8",
+                result,
+                matches!(result, IrType::UInt8),
+            )
         }
         IrExpr::Lit(IrLit::Str(_)) => meter.object("string literal result", result),
         IrExpr::Fap { .. } | IrExpr::Lit(IrLit::Num(_)) => Ok(()),

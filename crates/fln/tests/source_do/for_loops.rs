@@ -186,3 +186,9 @@ mod match_sequences;
 
 #[path = "for_loops/loop_returns.rs"]
 mod loop_returns;
+
+#[path = "for_loops/mutation.rs"]
+mod mutation;
+
+#[path = "for_loops/mutable_returns.rs"]
+mod mutable_returns;

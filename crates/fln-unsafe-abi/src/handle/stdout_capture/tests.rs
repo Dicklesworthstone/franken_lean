@@ -92,6 +92,43 @@ fn capture_limits_refuse_whole_write_and_retain_accepted_prefix() {
 }
 
 #[test]
+fn capture_oversized_aliased_text_can_retry_without_consuming_its_bytes() {
+    let _lock = crate::tests::lock();
+    let callback = callback();
+    let text = "λ🙂\0".repeat(64 * 1024);
+    let value = Obj::mk_string(&text);
+    let alias = value.clone_ref();
+    let original_references = value.header().rc;
+    // Each pair of Unicode characters occupies six unchanged UTF-8 bytes;
+    // the NUL contributes six escaped bytes to the existing capture policy.
+    let escaped_bytes = 12 * 64 * 1024;
+    let scope = StdoutCapture::begin(32).unwrap();
+    write(&callback, "prefix").unwrap();
+    let expected = StdoutCaptureError::Limit {
+        limit: 32,
+        requested: escaped_bytes + 6,
+    };
+    assert!(matches!(
+        callback.try_stdio_put_str(&value, &Obj::mk_nat(0)),
+        Err(StdioPutStrError::Capture(error)) if error == expected
+    ));
+    assert_eq!(value.header().rc, original_references);
+    let captured = scope.finish();
+    assert_eq!(captured.bytes, b"prefix");
+    assert_eq!(captured.error, Some(expected));
+
+    let retry = StdoutCapture::begin(escaped_bytes).unwrap();
+    let result = callback.try_stdio_put_str(&alias, &Obj::mk_nat(0)).unwrap();
+    assert_eq!(result.try_ctor_child(0).unwrap().unbox(), 1);
+    let captured = retry.finish();
+    assert_eq!(captured.error, None);
+    assert_eq!(captured.bytes, text.as_bytes());
+    assert_eq!(value.header().rc, original_references);
+    let (size, _, _, bytes) = value.try_borrow_string_view().unwrap();
+    assert_eq!(&bytes[..size - 1], text.as_bytes());
+}
+
+#[test]
 fn capture_never_accepts_invalid_callback_string_or_world() {
     let _lock = crate::tests::lock();
     let scope = StdoutCapture::begin(100).unwrap();

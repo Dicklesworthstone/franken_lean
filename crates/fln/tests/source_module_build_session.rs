@@ -61,7 +61,7 @@ fn products(build: &SourceModuleBuild) -> Vec<(Name, Vec<u8>)> {
 const GRAPH: [(&str, &str); 4] = [
     (
         "Main",
-        "prelude\nimport Left Right\ntheorem use (P : Prop) (h : P) : P := left P (right P h)",
+        "prelude\nimport Left\nimport Right\ntheorem use (P : Prop) (h : P) : P := left P (right P h)",
     ),
     (
         "Left",
@@ -125,7 +125,7 @@ fn edits_invalidate_the_dependency_cone_and_preserve_cold_artifact_identity() {
     for (index, source, expected) in [
         (
             0,
-            "prelude\nimport Left Right\ntheorem changed (P : Prop) (h : P) : P := left P (right P h)",
+            "prelude\nimport Left\nimport Right\ntheorem changed (P : Prop) (h : P) : P := left P (right P h)",
             (3, 1),
         ),
         (
@@ -169,7 +169,7 @@ fn failed_source_and_late_writer_failure_do_not_replace_the_successful_cache() {
     let mut changed = GRAPH;
     changed[3].1 =
         "prelude\ndef base (P : Prop) (h : P) : P := h\ndef added (A : Type) (a : A) : A := a";
-    changed[0].1 = "prelude\nimport Left Right\ntheorem bad (P : Prop) : P := by rfl";
+    changed[0].1 = "prelude\nimport Left\nimport Right\ntheorem bad (P : Prop) : P := by rfl";
     assert!(compile(&mut session, &changed, OleanWriteBudget::default(), None).is_err());
     assert_eq!(build(&mut session, &GRAPH).reused_modules, 4);
     changed[0] = GRAPH[0];
@@ -370,7 +370,7 @@ fn warm_modules_still_consume_the_aggregate_command_budget() {
     );
     build(&mut session, &GRAPH);
     let mut files = GRAPH;
-    files[0].1 = "prelude\nimport Left Right\ndef one (P : Prop) (h : P) : P := left P h\ndef two (P : Prop) (h : P) : P := right P h";
+    files[0].1 = "prelude\nimport Left\nimport Right\ndef one (P : Prop) (h : P) : P := left P h\ndef two (P : Prop) (h : P) : P := right P h";
     assert!(compile(&mut session, &files, OleanWriteBudget::default(), None).is_err());
     assert_eq!(build(&mut session, &GRAPH).reused_modules, 4);
 }

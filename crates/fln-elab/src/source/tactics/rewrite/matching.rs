@@ -87,6 +87,72 @@ impl Context {
         }
     }
 
+    fn rewrite_types_have_distinct_heads(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let (Some(actual), Some(expected)) = (
+            self.rigid_rewrite_type_head(left)?,
+            self.rigid_rewrite_type_head(right)?,
+        ) else {
+            return Ok(false);
+        };
+        Ok(actual != expected)
+    }
+
+    /// Inspect the type skeleton after EXACTLY the supplied arguments. A bare
+    /// constant or partial application can still be function-valued; stripping
+    /// its entire telescope would falsely discard rewrites of that function.
+    /// Only the stable outer constructors recognized by rigid_rewrite_type_head
+    /// are used. A dependent result headed by a bound variable, alias or redex
+    /// stays unknown: this filter neither substitutes arguments nor unfolds.
+    fn rigid_rewrite_constant_result(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
+        let mut head = expression;
+        let mut arguments = 0_u64;
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, .. } => {
+                    arguments = arguments
+                        .checked_add(1)
+                        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                    head = f;
+                }
+                ExprNode::MData { expr, .. } => head = expr,
+                _ => break,
+            }
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(info) = self.txn.env.find(name) else {
+            return Ok(None);
+        };
+        let base = info.constant_val();
+        if levels.len() != base.level_params.len() {
+            return Ok(None);
+        }
+        let mut result = base.type_.clone();
+        while arguments != 0 {
+            self.tick()?;
+            match result.node() {
+                ExprNode::ForallE { body, .. } => {
+                    result = body.clone();
+                    arguments -= 1;
+                }
+                ExprNode::MData { expr, .. } => result = expr.clone(),
+                // Overapplication and reducible/unknown telescope tails must
+                // go to ordinary type reconstruction, never guessed arity.
+                _ => return Ok(None),
+            }
+        }
+        self.rigid_rewrite_type_head(&result)
+    }
+
     pub(super) fn rewrite_trial(&self) -> Self {
         self.clone()
     }
@@ -126,15 +192,48 @@ impl Context {
         }
     }
 
-    /// Match both the term and its type. `constrain` contributes universe
-    /// equations and concrete closed conversion refusals. Explicit equations
-    /// retain the same obligations through the transactional selection batch.
+    /// Queue a selection equation and its universe-typing obligations without
+    /// first running ordinary source inference. `constrain` flushes immediately
+    /// and may retry at Default transparency before a selection marker exists.
+    /// That can unfold an irrelevant rule or change which occurrence it matches.
+    fn queue_rewrite_selection(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.tick()?;
+        let left = self.instantiate(left)?;
+        let right = self.instantiate(right)?;
+        if let (Some(a), Some(b)) = (self.known_type(&left)?, self.known_type(&right)?)
+            && (a.has_level_mvar() || b.has_level_mvar())
+        {
+            self.equations.push(SourceEquation::selection(a, b));
+        }
+        self.equations.push(SourceEquation::selection(left, right));
+        Ok(())
+    }
+
+    /// Match the term and its type in ONE selection-policy transaction. Even
+    /// ground equations must be established before a rule can be selected.
     fn match_rewrite_occurrence(
         &mut self,
         pattern: &Expr,
         alpha: &Expr,
         occurrence: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        // Sorts, dependent function types and saturated admitted inductives
+        // are rigid as terms too. Distinct heads cannot become equal through
+        // conversion; avoid inferring and solving that impossible occurrence.
+        if self.rewrite_types_have_distinct_heads(pattern, occurrence)? {
+            return Ok(false);
+        }
+        if let (Some(actual), Some(expected)) = (
+            self.rigid_rewrite_constant_result(occurrence)?,
+            self.rigid_rewrite_type_head(alpha)?,
+        ) && actual != expected
+        {
+            return Ok(false);
+        }
         let Some(type_) = self.known_type(occurrence)? else {
             return Ok(false);
         };
@@ -142,21 +241,11 @@ impl Context {
         // partially applied functions, not values of the rule's carrier type.
         // Do not unify their large proof terms after their types already have
         // irreconcilable rigid heads. This accepts nothing and assigns no hole.
-        if let (Some(actual), Some(expected)) = (
-            self.rigid_rewrite_type_head(&type_)?,
-            self.rigid_rewrite_type_head(alpha)?,
-        ) && actual != expected
-        {
+        if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
         }
-        self.constrain(&type_, alpha)?;
-        self.constrain(occurrence, pattern)?;
-        self.equations
-            .push(SourceEquation::selection(type_, alpha.clone()));
-        self.equations.push(SourceEquation::selection(
-            occurrence.clone(),
-            pattern.clone(),
-        ));
+        self.queue_rewrite_selection(&type_, alpha)?;
+        self.queue_rewrite_selection(occurrence, pattern)?;
         self.flush(true)?;
         Ok(true)
     }
@@ -226,116 +315,202 @@ impl Context {
     /// Bound-variable occurrences needing a newly opened binder are not guessed.
     pub(in crate::source) fn instantiate_rewrite_rule(
         &mut self,
-        mut rule: Typed,
+        rule: Typed,
         target: &Expr,
         reverse: bool,
         inside_out: bool,
         selected_rules: &[SimpRule<'_>],
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            inside_out,
+            selected_rules,
+            false,
+        )
+    }
+
+    pub(in crate::source) fn instantiate_dsimp_rule(
+        &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(rule, target, reverse, true, &[], true)
+    }
+
+    fn instantiate_rewrite_rule_with_scope(
+        &mut self,
+        mut rule: Typed,
+        target: &Expr,
+        reverse: bool,
+        inside_out: bool,
+        selected_rules: &[SimpRule<'_>],
+        root_only: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
-        let mut implicit_holes = Vec::new();
-        // Rule elaboration has already inserted implicit arguments. They are
-        // obligations too, even when equality transport later erases the rule.
-        rule.value = template.instantiate(&rule.value)?;
-        let mut pending = vec![&rule.value];
-        let mut visited = HashSet::new();
-        while let Some(term) = pending.pop() {
-            template.tick()?;
-            if !visited.insert(term.allocation_identity()) {
-                continue;
+        // Preparing a rule is speculative too. Charge its private context on
+        // EVERY exit, including interruption while opening its telescope.
+        let prepared = (|| {
+            let mut implicit_holes = Vec::new();
+            // Rule elaboration has already inserted implicit arguments. They are
+            // obligations too, even when equality transport later erases the rule.
+            rule.value = template.instantiate(&rule.value)?;
+            let mut pending = vec![&rule.value];
+            let mut visited = HashSet::new();
+            while let Some(term) = pending.pop() {
+                template.tick()?;
+                if !visited.insert(term.allocation_identity()) {
+                    continue;
+                }
+                if let ExprNode::MVar { id } = term.node()
+                    && !implicit_holes.contains(id)
+                {
+                    implicit_holes.push(id.clone());
+                }
+                pending.extend(children(term).into_iter().rev().flatten());
             }
-            if let ExprNode::MVar { id } = term.node()
-                && !implicit_holes.contains(id)
-            {
-                implicit_holes.push(id.clone());
+            let mut holes = Vec::new();
+            loop {
+                template.tick()?;
+                // The pin prepares simp theorems at reducible transparency without
+                // unfolding local lets. Preserve the final proposition's head too:
+                // unfolding Nat.lt here would hide it from the occurrence matcher.
+                rule.type_ = if inside_out {
+                    template.whnf_with_transparency(
+                        &rule.type_,
+                        UnificationTransparency::Abbreviations,
+                        false,
+                    )?
+                } else {
+                    template.whnf(&rule.type_)?
+                };
+                // A refutation is a rewrite of its proposition to False, not an
+                // implication whose antecedent simp must first prove. Stop before
+                // consuming that final proof binder; outer parameters still infer
+                // normally from the selected occurrence.
+                if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
+                    break;
+                }
+                let ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } = rule.type_.node()
+                else {
+                    break;
+                };
+                let domain = binder_type.clone();
+                let body = body.clone();
+                let argument = if *binder_info == BinderInfo::InstImplicit {
+                    template.instance_hole(domain)?
+                } else {
+                    template.hole(domain)?
+                };
+                if let ExprNode::MVar { id } = argument.node() {
+                    holes.push(id.clone());
+                }
+                rule.type_ = template.substitute(&body, &argument)?;
+                rule.value = Expr::app(rule.value, argument);
             }
-            pending.extend(children(term).into_iter().rev().flatten());
-        }
-        let mut holes = Vec::new();
-        loop {
-            template.tick()?;
-            rule.type_ = template.whnf(&rule.type_)?;
-            // A refutation is a rewrite of its proposition to False, not an
-            // implication whose antecedent simp must first prove. Stop before
-            // consuming that final proof binder; outer parameters still infer
-            // normally from the selected occurrence.
-            if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
-                break;
-            }
-            let ExprNode::ForallE {
-                binder_type,
-                body,
-                binder_info,
-                ..
-            } = rule.type_.node()
-            else {
-                break;
+            // Rewrite's newly applied parameters precede the unresolved implicit
+            // arguments inserted while elaborating the selected rule expression.
+            holes.extend(implicit_holes);
+            // A known class input must select its dictionary before matching a
+            // pattern containing that dictionary. Synthetic-opaque instance holes
+            // cannot be assigned by occurrence unification. Inputs learned from
+            // the occurrence still get the second synthesis pass below.
+            let resolution = template.resolve_instances(false);
+            self.charge_rewrite_trial(&template);
+            resolution?;
+            let compiled = (|| {
+                let rule = template.equivalence_rewrite_rule(rule)?;
+                if inside_out {
+                    let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
+                    template.equivalence_rewrite_rule(rule)
+                } else {
+                    Ok(rule)
+                }
+            })();
+            self.charge_rewrite_trial(&template);
+            let rule = compiled?;
+            let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
+                // An explicitly selected proposition proof can discharge another
+                // rule's premise without itself being an equality rewrite.
+                if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
+                    let universe = template.whnf(&universe)?;
+                    if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                        self.charge_rewrite_trial(&template);
+                        return Ok(None);
+                    }
+                }
+                return Err(error(TacticError::ExpectedEquality));
             };
-            let domain = binder_type.clone();
-            let body = body.clone();
-            let argument = if *binder_info == BinderInfo::InstImplicit {
-                template.instance_hole(domain)?
-            } else {
-                template.hole(domain)?
-            };
-            if let ExprNode::MVar { id } = argument.node() {
-                holes.push(id.clone());
-            }
-            rule.type_ = template.substitute(&body, &argument)?;
-            rule.value = Expr::app(rule.value, argument);
-        }
-        // Rewrite's newly applied parameters precede the unresolved implicit
-        // arguments inserted while elaborating the selected rule expression.
-        holes.extend(implicit_holes);
-        // A known class input must select its dictionary before matching a
-        // pattern containing that dictionary. Synthetic-opaque instance holes
-        // cannot be assigned by occurrence unification. Inputs learned from
-        // the occurrence still get the second synthesis pass below.
-        let resolution = template.resolve_instances(false);
-        self.charge_rewrite_trial(&template);
-        resolution?;
-        let compiled = (|| {
-            let rule = template.equivalence_rewrite_rule(rule)?;
-            if inside_out {
-                let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
-                template.equivalence_rewrite_rule(rule)
-            } else {
-                Ok(rule)
-            }
-        })();
-        self.charge_rewrite_trial(&template);
-        let rule = compiled?;
-        let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
-            // An explicitly selected proposition proof can discharge another
-            // rule's premise without itself being an equality rewrite.
-            if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
-                let universe = template.whnf(&universe)?;
-                if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
-                    self.charge_rewrite_trial(&template);
+            let pattern = if reverse { rhs } else { lhs };
+            if root_only {
+                // Dsimp's rule lookup is head-directed. A conversion-based
+                // occurrence match must not unfold a named pattern into an
+                // unrelated node (e.g. `wrap ?n` into every Nat literal). That
+                // both expands the rule's domain and cycles with literal
+                // refolding. Parameter-headed patterns still use the solver.
+                let mut pattern_head = &pattern;
+                let mut target_head = target;
+                loop {
+                    template.tick()?;
+                    match pattern_head.node() {
+                        ExprNode::App { f, .. } => pattern_head = f,
+                        ExprNode::MData { expr, .. } => pattern_head = expr,
+                        _ => break,
+                    }
+                }
+                loop {
+                    template.tick()?;
+                    match target_head.node() {
+                        ExprNode::App { f, .. } => target_head = f,
+                        ExprNode::MData { expr, .. } => target_head = expr,
+                        _ => break,
+                    }
+                }
+                let mismatch = match pattern_head.node() {
+                    ExprNode::Const { name, .. } => !matches!(
+                        target_head.node(), ExprNode::Const { name: actual, .. } if actual == name
+                    ),
+                    ExprNode::FVar { id } => !matches!(
+                        target_head.node(), ExprNode::FVar { id: actual } if actual == id
+                    ),
+                    _ => false,
+                };
+                if mismatch {
                     return Ok(None);
                 }
             }
-            return Err(error(TacticError::ExpectedEquality));
-        };
-        let pattern = if reverse { rhs } else { lhs };
-        self.charge_rewrite_trial(&template);
-        if !inside_out {
-            let pattern = template.instantiate(&pattern)?;
+
             self.charge_rewrite_trial(&template);
-            let mut head = &pattern;
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::App { f, .. } => head = f,
-                    ExprNode::MData { expr, .. } => head = expr,
-                    ExprNode::MVar { .. } => {
-                        return Err(error(TacticError::RewriteMetavariablePattern));
+            if !inside_out {
+                let pattern = template.instantiate(&pattern)?;
+                self.charge_rewrite_trial(&template);
+                let mut head = &pattern;
+                loop {
+                    template.tick()?;
+                    match head.node() {
+                        ExprNode::App { f, .. } => head = f,
+                        ExprNode::MData { expr, .. } => head = expr,
+                        ExprNode::MVar { .. } => {
+                            return Err(error(TacticError::RewriteMetavariablePattern));
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
             }
-        }
+            Ok(Some((rule, alpha, pattern, holes)))
+        })();
+        self.charge_rewrite_trial(&template);
+        let Some((rule, alpha, pattern, holes)) = prepared? else {
+            return Ok(None);
+        };
         let mut pending = vec![(target, false)];
         let mut visited = HashSet::new();
         while let Some((term, exit)) = pending.pop() {
@@ -344,7 +519,7 @@ impl Context {
                 if !visited.insert(term.allocation_identity()) {
                     continue;
                 }
-                if inside_out {
+                if inside_out && !root_only {
                     pending.push((term, true));
                     pending.extend(
                         children(term)
@@ -355,13 +530,15 @@ impl Context {
                     );
                     continue;
                 }
-                pending.extend(
-                    children(term)
-                        .into_iter()
-                        .rev()
-                        .flatten()
-                        .map(|child| (child, false)),
-                );
+                if !root_only {
+                    pending.extend(
+                        children(term)
+                            .into_iter()
+                            .rev()
+                            .flatten()
+                            .map(|child| (child, false)),
+                    );
+                }
             }
             if term.has_loose_bvars() {
                 continue;
@@ -490,6 +667,83 @@ mod outcome_tests {
             env = publication.environment;
         }
         Context::new(&env, budget)
+    }
+
+    #[test]
+    fn selection_does_not_retry_an_irrelevant_definition_at_inference_transparency() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        let source = format!(
+            "def costly (n : Nat) : Nat := {}n{}",
+            "Nat.succ (".repeat(128),
+            ")".repeat(128)
+        );
+        let declaration =
+            crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                .unwrap()
+                .declaration;
+        let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+            panic!("definition admission did not complete");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("definition was rejected");
+        };
+        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+            checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+        else {
+            panic!("definition publication did not complete");
+        };
+        ctx.txn.env = publication.environment;
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let costly = Expr::const_(Name::from_components(["costly"]), vec![]);
+        let hole = ctx.hole(nat.clone()).unwrap();
+        let pattern = Expr::app(costly.clone(), hole.clone());
+        let before = ctx.txn.clone();
+        let mut trial = ctx.rewrite_trial();
+        trial.txn.budget.max_heartbeats = trial.txn.budget.heartbeats_consumed + 512;
+        let problem = trial
+            .match_rewrite_occurrence(&pattern, &nat, &zero)
+            .unwrap_err();
+        assert!(Context::rewrite_nonmatch(&problem), "{problem:?}");
+        ctx.charge_rewrite_trial(&trial);
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+
+        let mut same_head = ctx.rewrite_trial();
+        assert!(
+            same_head
+                .match_rewrite_occurrence(&pattern, &nat, &Expr::app(costly, zero.clone()),)
+                .unwrap()
+        );
+        assert_eq!(same_head.instantiate(&hole).unwrap(), zero);
+
+        // Ordinary source conversion still unfolds safe definitions; selection
+        // alone must avoid the expensive second attempt on an irrelevant rule.
+        let mut expanded = zero.clone();
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            expanded = Expr::app(succ.clone(), expanded);
+        }
+        ctx.constrain(&pattern, &expanded).unwrap();
+        // Delta/Nat reduction returns a literal, unlike the same-head match
+        // above. The independent control below pins this pre-existing result.
+        assert_eq!(
+            ctx.instantiate(&hole).unwrap(),
+            Expr::lit(fln_core::expr::Literal::Nat(
+                fln_core::expr::NatLit::from_u64(0)
+            ))
+        );
     }
 
     #[test]
@@ -623,5 +877,192 @@ mod outcome_tests {
             assert!(!crate::source::instances::nonmatch(&problem));
             assert!(!Context::rewrite_nonmatch(&problem));
         }
+    }
+
+    #[test]
+    fn failed_occurrence_does_not_commit_its_carrier_assignment() {
+        let mut ctx = context();
+        let carrier = ctx.hole(Expr::sort(Level::one())).unwrap();
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let one = Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            zero.clone(),
+        );
+        let before = ctx.txn.clone();
+        let problem = ctx
+            .match_rewrite_occurrence(&zero, &carrier, &one)
+            .unwrap_err();
+        assert!(Context::rewrite_nonmatch(&problem), "{problem:?}");
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+        assert!(ctx.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+        // A fresh trial from the original context must still match a real occurrence.
+        let mut recovery = Context::new(&before.env, ctx.kernel);
+        let carrier = recovery.hole(Expr::sort(Level::one())).unwrap();
+        assert!(
+            recovery
+                .match_rewrite_occurrence(&zero, &carrier, &zero)
+                .unwrap()
+        );
+        assert_eq!(
+            recovery.instantiate(&carrier).unwrap(),
+            Expr::const_(Name::from_components(["Nat"]), vec![])
+        );
+    }
+
+    #[test]
+    fn selection_retains_polymorphic_carrier_and_value_obligations() {
+        let mut ctx = context();
+        let level = ctx.level().unwrap();
+        let carrier = ctx.hole(Expr::sort(level)).unwrap();
+        let pattern = ctx.hole(carrier.clone()).unwrap();
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        assert!(
+            ctx.match_rewrite_occurrence(&pattern, &carrier, &zero)
+                .unwrap()
+        );
+        assert_eq!(
+            ctx.instantiate(&carrier).unwrap(),
+            Expr::const_(Name::from_components(["Nat"]), vec![])
+        );
+        assert_eq!(ctx.instantiate(&pattern).unwrap(), zero);
+        assert!(ctx.equations.is_empty());
+    }
+
+    #[test]
+    fn ordinary_delta_inference_returns_canonical_nat_zero() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        let source = format!(
+            "def costly (n : Nat) : Nat := {}n{}",
+            "Nat.succ (".repeat(128),
+            ")".repeat(128)
+        );
+        let declaration =
+            crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                .unwrap()
+                .declaration;
+        let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+            panic!("definition admission did not complete");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("definition was rejected");
+        };
+        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+            checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+        else {
+            panic!("definition publication did not complete");
+        };
+        ctx.txn.env = publication.environment;
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let costly = Expr::const_(Name::from_components(["costly"]), vec![]);
+        let hole = ctx.hole(nat.clone()).unwrap();
+        let pattern = Expr::app(costly.clone(), hole.clone());
+
+        let mut expanded = zero;
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            expanded = Expr::app(succ.clone(), expanded);
+        }
+        ctx.constrain(&pattern, &expanded).unwrap();
+        assert_eq!(
+            ctx.instantiate(&hole).unwrap(),
+            Expr::lit(fln_core::expr::Literal::Nat(
+                fln_core::expr::NatLit::from_u64(0)
+            ))
+        );
+    }
+
+    #[test]
+    fn constant_result_discrimination_preserves_partial_function_types() {
+        let mut ctx = context();
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&succ).unwrap(),
+            Some(RigidTypeHead::Forall)
+        );
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&Expr::app(succ.clone(), zero.clone()))
+                .unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Nat"])))
+        );
+        let wrapped = Expr::mdata(KVMap::new(), succ.clone());
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&wrapped).unwrap(),
+            Some(RigidTypeHead::Forall)
+        );
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&Expr::app(wrapped, zero.clone()))
+                .unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Nat"])))
+        );
+        for unknown in [
+            Expr::app(Expr::app(succ, zero.clone()), zero),
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![Level::one()]),
+            Expr::const_(Name::from_components(["absent"]), vec![]),
+        ] {
+            assert_eq!(ctx.rigid_rewrite_constant_result(&unknown).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn constant_result_discrimination_leaves_dependent_results_unknown() {
+        let mut ctx = context();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let constructor = Expr::const_(Name::from_components(["Eq", "refl"]), vec![Level::one()]);
+        // The unsupplied value binder remains a function type, not Eq.
+        let partial = Expr::app(constructor, nat.clone());
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&partial).unwrap(),
+            Some(RigidTypeHead::Forall)
+        );
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&Expr::app(partial, zero))
+                .unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Eq"])))
+        );
+        // The result of this fully applied recursor is headed by its motive,
+        // not the recursor's name or the function type of a partial application.
+        let recursor = Expr::const_(Name::from_components(["Nat", "rec"]), vec![Level::one()]);
+        let mut applied = recursor;
+        for _ in 0..4 {
+            applied = Expr::app(applied, nat.clone());
+        }
+        assert_eq!(ctx.rigid_rewrite_constant_result(&applied).unwrap(), None);
+    }
+
+    #[test]
+    fn constant_result_spine_walk_is_metered_without_semantic_mutation() {
+        let mut ctx = context();
+        let before = ctx.txn.clone();
+        let mut term = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            term = Expr::mdata(KVMap::new(), term);
+        }
+        ctx.txn.budget.max_heartbeats = ctx.txn.budget.heartbeats_consumed + 32;
+        let problem = ctx.rigid_rewrite_constant_result(&term).unwrap_err();
+        assert!(matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+        ));
+        assert!(!Context::rewrite_nonmatch(&problem));
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.env, before.env);
+        assert_eq!(ctx.txn.lctx, before.lctx);
+        assert!(ctx.equations.is_empty());
     }
 }

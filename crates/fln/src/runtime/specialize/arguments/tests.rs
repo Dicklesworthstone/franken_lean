@@ -601,3 +601,213 @@ fn late_static_arguments_use_a_bounded_heap_telescope() {
 
 #[cfg(test)]
 mod stages;
+
+#[test]
+fn predicate_arguments_share_closed_metadata_but_retain_decision_callbacks() {
+    let environment = Environment::new();
+    let predicate_domain = telescope(
+        &[(ty("Nat"), BinderInfo::Default)],
+        Expr::sort(Level::zero()),
+        false,
+    );
+    let canonical = telescope(
+        &[(ty("Nat"), BinderInfo::Default)],
+        erased_proposition(),
+        true,
+    );
+    let decision_domain = telescope(
+        &[(ty("Nat"), BinderInfo::Default)],
+        Expr::app(ty("Decidable"), Expr::app(b(1), b(0))),
+        false,
+    );
+    let binders = [
+        (ty("Nat"), BinderInfo::Default),
+        (predicate_domain, BinderInfo::Implicit),
+        (decision_domain, BinderInfo::Default),
+        (ty("Nat"), BinderInfo::Default),
+    ];
+    let captured_predicate = Expr::lam(
+        name("k"),
+        ty("Nat"),
+        application(
+            Expr::const_(name("Eq"), vec![Level::one()]),
+            [ty("Nat"), b(0), b(1)],
+        ),
+        BinderInfo::Default,
+    );
+    let retained = [
+        (ty("Nat"), BinderInfo::Default),
+        (
+            telescope(
+                &[(ty("Nat"), BinderInfo::Default)],
+                Expr::app(ty("Decidable"), erased_proposition()),
+                false,
+            ),
+            BinderInfo::Default,
+        ),
+        (ty("Nat"), BinderInfo::Default),
+    ];
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    // The open variable represents a predicate forwarded by another helper.
+    for predicate in [captured_predicate, b(4), canonical.clone()] {
+        let result = preparation
+            .specialize_arguments(
+                telescope(&binders, ty("Nat"), false),
+                telescope(&binders, b(0), true),
+                &[b(0), predicate, b(1), nat::literal(42)],
+            )
+            .unwrap();
+        assert_eq!(result.static_arguments, vec![(1, canonical.clone())]);
+        assert_eq!(result.runtime_arguments, vec![b(0), b(1), nat::literal(42)]);
+        assert_eq!(
+            preparation.normalize_type(&result.type_).unwrap(),
+            telescope(&retained, ty("Nat"), false),
+        );
+        assert!(!result.value.has_loose_bvars());
+    }
+    assert!(preparation.lambdas.is_empty());
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn erased_predicate_telescopes_keep_dependent_domains_and_still_type_as_prop() {
+    let binders = [
+        (Expr::sort(Level::one()), BinderInfo::Implicit),
+        (b(0), BinderInfo::Default),
+    ];
+    let domain = telescope(&binders, Expr::sort(Level::zero()), false);
+    let engine = Engine::from_environment(Environment::new());
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let canonical = preparation
+        .erased_proposition_argument(&domain)
+        .unwrap()
+        .expect("a closed dependent telescope ends in Prop");
+    assert_eq!(canonical, telescope(&binders, erased_proposition(), true));
+    assert!(closed(&canonical));
+    assert_eq!(
+        preparation
+            .erased_proposition_argument(&Expr::sort(Level::zero()))
+            .unwrap(),
+        Some(erased_proposition()),
+    );
+    let declaration_name = name("erasedDependentPredicate");
+    engine
+        .admit_declaration(
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: declaration_name.clone(),
+                    level_params: vec![],
+                    type_: domain,
+                },
+                value: canonical,
+                safety: DefinitionSafety::Safe,
+                hints: ReducibilityHints::Abbrev,
+                all: vec![declaration_name],
+            }),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(fln_kernel::verdict::Budget::for_stack_bytes(
+                2 * 1024 * 1024,
+            )),
+        )
+        .unwrap()
+        .into_complete()
+        .expect("both checking engines confirm the original dependent Prop type");
+}
+
+#[test]
+fn predicate_metadata_requires_closed_domains_and_an_exact_prop_result() {
+    let environment = Environment::new();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    for domain in [
+        Expr::sort(Level::one()),
+        Expr::sort(Level::param(name("u"))),
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::sort(Level::one()),
+            false,
+        ),
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::sort(Level::param(name("u"))),
+            false,
+        ),
+        telescope(
+            &[(ty("Nat"), BinderInfo::Default)],
+            Expr::app(ty("Decidable"), erased_proposition()),
+            false,
+        ),
+        // The argument's data domain refers to an outer A : Type.
+        telescope(
+            &[(b(0), BinderInfo::Default)],
+            Expr::sort(Level::zero()),
+            false,
+        ),
+        telescope(
+            &[(Expr::sort(Level::param(name("u"))), BinderInfo::Default)],
+            Expr::sort(Level::zero()),
+            false,
+        ),
+        b(0),
+    ] {
+        assert!(
+            preparation
+                .erased_proposition_argument(&domain)
+                .unwrap()
+                .is_none(),
+            "must retain this parameter: {domain:?}",
+        );
+    }
+    assert!(preparation.lambdas.is_empty());
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn predicate_telescope_erasure_is_heap_backed_and_propagates_resource_stops() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let environment = Environment::new();
+            let mut domain = Expr::sort(Level::zero());
+            for _ in 0..300 {
+                domain = Expr::forall_e(Name::anonymous(), ty("Nat"), domain, BinderInfo::Default);
+            }
+            let mut preparation = Preparation::new(&environment, IngressLimits::default());
+            let mut value = preparation
+                .erased_proposition_argument(&domain)
+                .unwrap()
+                .unwrap();
+            let mut count = 0;
+            while let ExprNode::Lam { body, .. } = value.node() {
+                count += 1;
+                value = body.clone();
+            }
+            assert_eq!(count, 300);
+            assert_eq!(value, erased_proposition());
+            for (limits, expected) in [
+                (
+                    IngressLimits {
+                        max_context_depth: 8,
+                        ..IngressLimits::default()
+                    },
+                    IngressResource::ProgramTables,
+                ),
+                (
+                    IngressLimits {
+                        max_nodes: 1,
+                        ..IngressLimits::default()
+                    },
+                    IngressResource::Nodes,
+                ),
+            ] {
+                let Err(IngressError::ResourceLimit { resource, .. }) =
+                    Preparation::new(&environment, limits).erased_proposition_argument(&domain)
+                else {
+                    panic!("predicate metadata must retain its resource refusal")
+                };
+                assert_eq!(resource, expected);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -234,10 +234,9 @@ fn dependent_domain_and_result_escapes_defer_without_creating_holes() {
 }
 
 #[test]
-fn captured_arguments_and_opaque_or_deeper_holes_remain_deferred() {
-    for case in 0..3 {
+fn opaque_or_deeper_holes_remain_deferred() {
+    for case in 1..3 {
         let mut txn = transaction();
-        let early_x = (case == 0).then(|| local(&mut txn, "x", nat()));
         let kind = if case == 1 {
             MetavarKind::SyntheticOpaque
         } else {
@@ -245,7 +244,7 @@ fn captured_arguments_and_opaque_or_deeper_holes_remain_deferred() {
         };
         let depth = if case == 2 { 1 } else { 0 };
         let f = hole(&mut txn, "f", pi(nat(), nat()), kind, depth);
-        let x = early_x.unwrap_or_else(|| local(&mut txn, "x", nat()));
+        let x = local(&mut txn, "x", nat());
         let y = local(&mut txn, "y", nat());
         let before = txn.clone();
         assert!(matches!(

@@ -9,6 +9,9 @@ pub(in crate::source) enum Mode {
     First,
     Try,
     Repeat,
+    /// `fail_if_success t` (`evalFailIfSuccess`, Lean/Elab/Tactic/BuiltinTactic.lean:273-277):
+    /// succeeds, with the state unchanged, exactly when `t` fails.
+    FailIfSuccess,
 }
 pub(in crate::source) struct Spec<'a> {
     pub mode: Mode,
@@ -64,7 +67,10 @@ impl<'a> Checkpoint<'a> {
             .rposition(|work| {
                 matches!(
                     work,
-                    Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_)
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
                 )
             })
             .map_or(0, |position| position + 1);
@@ -82,7 +88,14 @@ impl<'a> Checkpoint<'a> {
         self.next < self.spec.branches.len()
     }
     pub fn optional(&self) -> bool {
-        matches!(self.spec.mode, Mode::Try | Mode::Repeat)
+        matches!(
+            self.spec.mode,
+            Mode::Try | Mode::Repeat | Mode::FailIfSuccess
+        )
+    }
+    /// Whether the body succeeding is this attempt's failure (`fail_if_success`).
+    pub fn inverted(&self) -> bool {
+        self.spec.mode == Mode::FailIfSuccess
     }
     pub fn finish(&self, context: &mut Context, proof: &mut ProofState<'a>) {
         context.attempt_depth = self.context.attempt_depth;
@@ -106,17 +119,44 @@ impl<'a> Checkpoint<'a> {
 pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
     match problem {
         NatDefinitionElabError::Inference(SourceInferenceError::Tactic(reason)) => {
-            !matches!(reason, TacticError::MalformedScript)
+            !matches!(
+                reason,
+                TacticError::MalformedScript
+                    | TacticError::UnsupportedTactic(_)
+                    | TacticError::ArithmeticUnsupported
+                    | TacticError::ArithmeticInvalidCertificate
+            )
+        }
+        // With a known expected type, these are ordinary elaboration errors.
+        // An unknown-type suspension is routed to its owning argument before
+        // reaching tactic backtracking; on replay, `first` can try the next
+        // branch if the now-known constructor or namespace makes this one fail.
+        NatDefinitionElabError::Inference(SourceInferenceError::AnonymousCtor(reason)) => {
+            !matches!(
+                reason,
+                anonymous_ctor::AnonymousCtorError::NestedFieldsUnsupported { .. }
+            )
+        }
+        NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(reason)) => {
+            !matches!(
+                reason,
+                dotted_ident::DottedIdentError::OverloadUnsupported { .. }
+            )
         }
         NatDefinitionElabError::Inference(
             SourceInferenceError::UnknownConstant(_)
             | SourceInferenceError::ExpectedFunction
+            | SourceInferenceError::FunctionCoercionAbsent
             | SourceInferenceError::ExpectedType
             | SourceInferenceError::Match(_)
             | SourceInferenceError::Recursion(_)
             | SourceInferenceError::InstanceSynthesisRequired
             | SourceInferenceError::UnresolvedHoles { .. }
             | SourceInferenceError::UnresolvedUniverses
+            // The known row's wrong literal type is an ordinary `throwError`
+            // in Lean.Elab.SetOption. Missing policy rows and unsupported
+            // effects do not establish a pin failure, so remain uncaught.
+            | SourceInferenceError::Option(scope::options::OptionRefusal::WrongType { .. })
             // The pin's `throwTypeMismatchError` is an ordinary elaboration error: `first`
             // catches it and tries its next alternative.
             | SourceInferenceError::TypeMismatch { .. },
@@ -183,6 +223,9 @@ impl Context {
             Mode::Try
         } else if kind == &parser_kind(&["Tactic", "tacticRepeat_"]) {
             Mode::Repeat
+        } else if kind == &parser_kind(&["Tactic", "failIfSuccess"]) {
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "failIfSuccess"])?;
+            Mode::FailIfSuccess
         } else {
             return Ok(None);
         };
@@ -195,6 +238,7 @@ impl Context {
                 Mode::First => "first",
                 Mode::Try => "try",
                 Mode::Repeat => "repeat",
+                Mode::FailIfSuccess => "fail_if_success",
             },
             "alternative keyword",
         )?;
@@ -233,7 +277,7 @@ impl Context {
         for position in (0..proof.work.len()).rev() {
             self.tick()?;
             match proof.work[position] {
-                Work::EndScript(..) | Work::EndControl(_) => return Ok(None),
+                Work::EndScript(..) | Work::EndControl(_) | Work::EndOptions(_) => return Ok(None),
                 Work::EndAttempt(index) => {
                     proof.work.remove(position);
                     proof.work.push(Work::Goal(goal.clone()));

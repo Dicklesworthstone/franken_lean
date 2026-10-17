@@ -386,14 +386,28 @@ fn ascribed_patterns_are_never_misread() {
     );
 }
 
-/// `nofun` and `nomatch h` parse as the pin's `Term.nofun` and `Term.nomatch`; the elaborator
-/// does not read them, so it refuses files the pin accepts.
+/// `nofun` and `nomatch h` elaborate as the pin's empty matches: admitted over an empty type or an
+/// impossible equation, through every binder `nofun` opens.
 #[test]
-fn empty_matches_are_refused_not_misread() {
-    let (engine, limits) = engine();
+fn empty_matches_are_admitted_over_uninhabited_types() {
     for source in [
         "def nf : False → Nat := nofun\n",
         "def nm (h : False) : Nat := nomatch h\n",
+        "def ne : Nat.succ 0 = 0 → Nat := nofun\n",
+        "def n2 : (n : Nat) → Nat.succ n = 0 → Nat := nofun\n",
+    ] {
+        check(source);
+    }
+}
+
+/// An empty match over an inhabited type is the pin's "Missing cases" error, never a function.
+#[test]
+fn empty_matches_over_inhabited_types_are_refused() {
+    let (engine, limits) = engine();
+    for source in [
+        "def bad : Nat → Nat := nofun\n",
+        "def bad : Bool → Nat := nofun\n",
+        "def bad (n : Nat) : Nat := nomatch n\n",
     ] {
         assert!(
             !matches!(
@@ -458,29 +472,28 @@ fn deriving_commands_are_refused_not_ignored() {
     );
 }
 
-/// `l@p` parses as the pin's `Term.namedPattern`, also as a constructor argument
-/// (`.inner l@(.inner ..) r@.leaf`); the pattern compiler does not bind the name, so the checker
-/// refuses the file, which the pin accepts.
+/// Value aliases are supported; an ellipsis inside an aliased field is still
+/// outside the matrix compiler's supported constructor fragment.
 #[test]
-fn named_patterns_are_refused_not_dropped() {
+fn named_values_are_bound_but_constructor_field_ellipsis_stays_unsupported() {
+    check(
+        "def np : List Nat → Nat\n  | l@(x :: _) => x\n  | [] => 0\n\
+        theorem head : np [7, 8] = 7 := by rfl",
+    );
     let (engine, limits) = engine();
-    for source in [
-        "def np : List Nat → Nat\n  | l@(x :: _) => x\n  | [] => 0\n",
-        "inductive T where\n  | leaf\n  | inner (l : T) (r : T)\n\
-         def np : T → T\n  | .inner l@(.inner ..) r@.leaf => .inner r l\n  | t => t\n",
-    ] {
-        assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
+    let source = "inductive T where\n  | leaf\n  | inner (l : T) (r : T)\n\
+         def np : T → T\n  | .inner l@(.inner ..) r@.leaf => .inner r l\n  | t => t\n";
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
             ),
-            "{source}"
-        );
-    }
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
 }
 
 /// `f <*> x` parses as the pin's `«term_<*>_»` (`Seq.seq f fun _ => x`); the checker does not
@@ -698,8 +711,10 @@ fn a_bracket_after_a_tight_operator_is_a_list_not_a_binder() {
 }
 
 /// A binder default in a dependent arrow or a `∀` (`(h : i = i := by rfl) → Nat`) parses as the
-/// pin's `binderTactic`/`binderDefault`; the binder's type is then `optParam`/`autoParam`, which the
-/// checker does not build, so it refuses each file, all of which the pin accepts.
+/// pin's `binderTactic`/`binderDefault`; the binder's type needs `optParam`/`autoParam`, neither
+/// supplied by this test's seed. Defaults must not be dropped to admit these files. The value
+/// default is exercised positively with an actual `optParam` in `source_optional_parameters`;
+/// tactic defaults additionally need the separate quoted-syntax machinery.
 #[test]
 fn binder_defaults_in_arrows_and_foralls_are_refused_not_dropped() {
     let (engine, limits) = engine();
@@ -749,30 +764,29 @@ fn mutable_do_variables_are_refused_not_dropped() {
 }
 
 /// Alternatives sharing a right-hand side (`| 0 | 1 => 0`) parse as the pin's `matchAlt` with two
-/// pattern groups. The checker reads one group per alternative, so it refuses the file, which the
-/// pin accepts; it never keeps the first group alone, which would let `sa1 1 = 1` through.
+/// pattern groups, which the pin's `expandMatchAlt` splits into one alternative per group. Every
+/// group reaches the shared right-hand side, so `sa1 1 = 1` stays refused: the first group alone
+/// would have let it through.
 #[test]
-fn shared_match_alternatives_are_refused_not_truncated() {
-    let (engine, limits) = engine();
+fn shared_match_alternatives_cover_every_group() {
     let sa1 = "def sa1 : Nat → Nat\n  | 0 | 1 => 0\n  | _ => 1\n";
-    for source in [
-        format!("{sa1}theorem sa1_one : sa1 1 = 0 := rfl\n"),
-        format!("{sa1}theorem sa1_wrong : sa1 1 = 1 := rfl\n"),
-        "def sa2 (o : Option Nat) : Nat :=\n  match o with | none | some 0 => 0 | some _ => 1\n"
-            .to_owned(),
-    ] {
-        assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
+    check(&format!(
+        "{sa1}theorem sa1_zero : sa1 0 = 0 := rfl\ntheorem sa1_one : sa1 1 = 0 := rfl\n\
+         theorem sa1_two : sa1 2 = 1 := rfl\n"
+    ));
+    let (engine, limits) = engine();
+    let source = format!("{sa1}theorem sa1_wrong : sa1 1 = 1 := rfl\n");
+    assert!(
+        !matches!(
+            engine.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
             ),
-            "{source}"
-        );
-    }
+            Ok(fln::Outcome::Complete(_))
+        ),
+        "{source}"
+    );
 }
 
 /// `h : P := by tac` is the pin's `binderTactic` (an `autoParam` field): an omitted field is filled
@@ -782,7 +796,8 @@ fn shared_match_alternatives_are_refused_not_truncated() {
 fn tactic_fields_are_filled_by_their_tactic() {
     check("structure BT3 where\n  x : Nat\n  h : x = x := by rfl\ndef b3 : BT3 := { x := 1 }\n");
     let (engine, limits) = engine();
-    let source = "structure BT4 where\n  x : Nat\n  h : x = x + 1 := by rfl\ndef b4 : BT4 := { x := 1 }\n";
+    let source =
+        "structure BT4 where\n  x : Nat\n  h : x = x + 1 := by rfl\ndef b4 : BT4 := { x := 1 }\n";
     assert!(
         !matches!(
             engine.check_source_files(
@@ -827,7 +842,9 @@ fn local_equations_are_refused_not_misread() {
 fn equivalence_is_has_equiv() {
     let class = "class HasEquiv (α : Type) where\n  Equiv : α → α → Prop\n\
                  instance trivialEquiv : HasEquiv Nat := { Equiv := fun _ _ => True }\n";
-    check(&format!("{class}theorem eq1 : (2 : Nat) ≈ 3 := True.intro\n"));
+    check(&format!(
+        "{class}theorem eq1 : (2 : Nat) ≈ 3 := True.intro\n"
+    ));
     let (engine, limits) = engine();
     let source = format!("{class}theorem eq2 : (2 : Nat) ≈ 2 := rfl\n");
     assert!(
@@ -979,7 +996,10 @@ fn where_termination_hints_are_refused_not_dropped() {
             Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
             Ok(_) => {}
             Err(error) => {
-                assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}");
+                assert!(
+                    format!("{error:?}").contains("Elaborate"),
+                    "{source}\n{error:?}"
+                );
             }
         }
     }
@@ -1017,10 +1037,17 @@ fn matches_is_the_boolean_match() {
 fn the_coercion_arrow_is_refused_after_parsing() {
     let (engine, limits) = engine();
     let source = "def up (n : Nat) : Nat := ↑n\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1052,10 +1079,17 @@ fn definition_deriving_is_refused_after_parsing() {
     check("def Plain := Nat\n");
     let (engine, limits) = engine();
     let source = "def Derived := Nat\nderiving Inhabited\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1066,10 +1100,17 @@ fn inductive_modifiers_are_refused_after_parsing() {
     check("/-- doc -/\ninductive Documented where\n  | a\n");
     let (engine, limits) = engine();
     let source = "private inductive Hidden where\n  | a\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1078,11 +1119,19 @@ fn inductive_modifiers_are_refused_after_parsing() {
 #[test]
 fn tactic_pattern_bindings_are_refused_after_parsing() {
     let (engine, limits) = engine();
-    let source = "theorem tp (p q : Prop) (h : And p q) : p := by\n  have ⟨hp, hq⟩ := h\n  exact hp\n";
-    match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits)) {
+    let source =
+        "theorem tp (p q : Prop) (h : And p q) : p := by\n  have ⟨hp, hq⟩ := h\n  exact hp\n";
+    match engine.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    ) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 
@@ -1115,26 +1164,25 @@ fn constructor_docs_lead_their_constructors() {
 }
 
 /// A structure's or class's modifiers (`private`, `@[ext]`, `public`) build the pin's
-/// `declModifiers`; the checker models neither private names, nor the attribute, nor the module
-/// system's visibility, so it refuses each file, all of which the pin accepts.
+/// `declModifiers`. The checker models neither private names nor the attribute, so it refuses
+/// those two files, which the pin accepts. `public` it reads as the module system's visibility
+/// (1877539f), and admits the class with its constructor and field, as the pin does.
 #[test]
 fn structure_modifiers_are_refused_not_dropped() {
-    let (engine, limits) = engine();
     for source in [
         "private structure SM1 where\n  x : Nat\n",
         "@[ext] structure SM2 where\n  x : Nat\n",
-        "public class SM5 (α : Type) where\n  op : α → α\n",
     ] {
+        assert!(refused(source), "{source}");
+    }
+    let checked = checked_environment("public class SM5 (α : Type) where\n  op : α → α\n");
+    for name in ["SM5", "SM5.mk", "SM5.op"] {
         assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
-            ),
-            "{source}"
+            checked
+                .engine
+                .environment()
+                .contains(&Name::from_components(name.split('.'))),
+            "{name}"
         );
     }
 }
@@ -1399,36 +1447,43 @@ fn grind_patterns_are_refused_not_ignored() {
 
 /// A `section` with a header parses as the pin's `Command.section` with its `sectionHeader`, and
 /// `export` as `Command.export`; the scope layer refuses an attribute command or an `open … in` it
-/// does not model. The pin accepts each of these files; the checker models neither the module
-/// system's `public`, nor `noncomputable` scopes, nor export aliases, nor the `inline` attribute,
-/// nor `open` of selected names, nor syntax and notation declarations, nor conv mode, so it
-/// refuses them rather than reading a plain scope or dropping what it does not read.
+/// does not model. The pin accepts each of these files. A `public` section, with or without
+/// `@[expose]`, the checker reads as the module system's visibility (1877539f) and admits its
+/// theorem, as the pin does. An `export` registers the pin's aliases, so a file ending in one is
+/// admitted. It models neither `noncomputable` scopes, nor the `inline` attribute command, nor
+/// conv mode, so it refuses those rather than
+/// reading a plain scope or dropping what it does not read. A syntax or notation
+/// declaration it does read (bead `franken_lean-z8j.1.10`, stage 4): the pin accepts both files
+/// below (exit 0, 2026-10-09).
 #[test]
 fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
     check("section\ntheorem plain : True := True.intro\nend\n");
-    let (engine, limits) = engine();
+    check("syntax \"plain_tactic\" : tactic\ntheorem plain : True := True.intro\n");
+    check("infixl:65 \" +++ \" => Nat.add\ntheorem plain : True := True.intro\n");
     for source in [
         "public section\ntheorem plain : True := True.intro\nend\n",
-        "noncomputable section\ntheorem plain : True := True.intro\nend\n",
         "@[expose] public section\ntheorem plain : True := True.intro\nend\n",
         "theorem plain : True := True.intro\nexport Nat (succ)\n",
-        "def d : Nat := 1\nattribute [inline] d\n",
         "open Nat (succ) in\ntheorem plain : True := True.intro\n",
-        "syntax \"plain_tactic\" : tactic\ntheorem plain : True := True.intro\n",
-        "infixl:65 \" +++ \" => Nat.add\ntheorem plain : True := True.intro\n",
-        "theorem plain (a : Nat) : a = a := by\n  conv => lhs\n",
     ] {
+        let checked = checked_environment(source);
         assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
+            matches!(
+                checked
+                    .engine
+                    .environment()
+                    .find(&Name::from_components(["plain"])),
+                Some(ConstantInfo::Thm(_))
             ),
             "{source}"
         );
+    }
+    for source in [
+        "noncomputable section\ntheorem plain : True := True.intro\nend\n",
+        "def d : Nat := 1\nattribute [inline] d\n",
+        "theorem plain (a : Nat) : a = a := by\n  conv => lhs\n",
+    ] {
+        assert!(refused(source), "{source}");
     }
 }
 
@@ -1694,4 +1749,161 @@ fn a_proof_nested_in_a_tactic_term_closes_only_what_it_proves() {
             "{source}"
         );
     }
+}
+
+fn checked_environment(source: &str) -> fln::SourceFileCheck {
+    let (engine, limits) = engine();
+    engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
+        .into_complete()
+        .unwrap()
+}
+
+fn refused(source: &str) -> bool {
+    let (engine, limits) = engine();
+    !matches!(
+        engine.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        ),
+        Ok(fln::Outcome::Complete(_))
+    )
+}
+
+fn constant(text: &str) -> fln::Expr {
+    fln::Expr::const_(Name::from_components(text.split('.')), vec![])
+}
+
+/// `axiom` is admitted as the pin admits it (vendored `Lean/Elab/Declaration.lean`,
+/// `elabAxiom`): an `AxiomVal` whose type is the elaborated header, through both checkers. A
+/// theorem may then use what it asserts. It is admitted, never skipped: the same theorem
+/// without the axiom, or citing a name never declared, is refused, as the pin refuses it.
+#[test]
+fn a_files_own_axiom_is_admitted_as_the_pin_admits_it() {
+    let checked =
+        checked_environment("axiom unproven : False\ntheorem bad : 0 = 1 := False.elim unproven\n");
+    assert_eq!((checked.commands, checked.theorems), (2, 1));
+    let environment = checked.engine.environment();
+    let Some(ConstantInfo::Axiom(axiom)) = environment.find(&Name::from_components(["unproven"]))
+    else {
+        panic!("`unproven` is an axiom");
+    };
+    assert_eq!(axiom.base.type_, constant("False"));
+    assert!(axiom.base.level_params.is_empty() && !axiom.is_unsafe);
+    assert!(matches!(
+        environment.find(&Name::from_components(["bad"])),
+        Some(ConstantInfo::Thm(_))
+    ));
+    for source in [
+        "theorem bad : 0 = 1 := False.elim unproven\n",
+        "axiom unproven : False\ntheorem bad : 0 = 1 := False.elim neverDeclared\n",
+    ] {
+        assert!(refused(source), "{source}");
+    }
+}
+
+/// An axiom's binders and the section variables it uses become its type's `∀`s, and a
+/// universe it names becomes its level parameter; the pin's
+/// `big : ∀ (n : Nat), n + 0 = n`, `@pick : {α : Type} → α → (α → Prop) → α`.
+#[test]
+fn an_axioms_parameters_and_section_variables_are_its_binders() {
+    let checked = checked_environment(
+        "axiom pick {α : Type} (a : α) (p : α → Prop) : α\n\
+         section\nvariable (n : Nat)\naxiom big : n + 0 = n\nend\n\
+         axiom twoParams.{u} {α : Sort u} (a b : α) : a = b\n",
+    );
+    let environment = checked.engine.environment();
+    let axiom = |text: &str| match environment.find(&Name::from_components([text])) {
+        Some(ConstantInfo::Axiom(axiom)) => axiom.clone(),
+        other => panic!("`{text}` is an axiom, found {other:?}"),
+    };
+    let telescope = |mut type_: fln::Expr| {
+        let mut binders = Vec::new();
+        while let fln::ExprNode::ForallE {
+            binder_info, body, ..
+        } = type_.node()
+        {
+            binders.push(*binder_info);
+            type_ = body.clone();
+        }
+        binders
+    };
+    use fln::BinderInfo::{Default, Implicit};
+    assert_eq!(
+        telescope(axiom("pick").base.type_),
+        [Implicit, Default, Default]
+    );
+    assert_eq!(telescope(axiom("big").base.type_), [Default]);
+    let two = axiom("twoParams");
+    assert_eq!(two.base.level_params, [Name::from_components(["u"])]);
+    assert_eq!(telescope(two.base.type_), [Implicit, Default, Default]);
+}
+
+/// `opaque` is an `OpaqueVal` (vendored `Lean/Elab/Declaration.lean`, `elabOpaque`): its value
+/// is checked against its type, but never unfolds, so `secret = 5` is not provable by `rfl`
+/// (the pin: "Not a definitional equality"). Without a value it is `default` from the type's
+/// `Inhabited` instance; a type with neither `Inhabited` nor `Nonempty` is refused, as the pin
+/// refuses it.
+#[test]
+fn an_opaque_constant_is_checked_and_never_unfolds() {
+    let checked = checked_environment("opaque secret : Nat := 5\nopaque bare : Nat\n");
+    assert_eq!(checked.commands, 2);
+    let environment = checked.engine.environment();
+    for text in ["secret", "bare"] {
+        let Some(ConstantInfo::Opaque(opaque)) = environment.find(&Name::from_components([text]))
+        else {
+            panic!("`{text}` is opaque");
+        };
+        assert_eq!(opaque.base.type_, constant("Nat"), "{text}");
+        assert!(!opaque.is_unsafe, "{text}");
+        assert_eq!(opaque.all, [Name::from_components([text])], "{text}");
+    }
+    for source in [
+        "opaque secret : Nat := 5\ntheorem t : secret = 5 := rfl\n",
+        "structure P where\n  x : Nat\nopaque p : P\n",
+        "opaque wrong : Nat := True\n",
+    ] {
+        assert!(refused(source), "{source}");
+    }
+}
+
+/// The pin's compiler runs an opaque's value when no companion, extern or init
+/// attribute selects another implementation (`Compiler/LCNF/ToDecl.lean`, `toDecl`).
+/// On the pinned v4.32.0 these evaluations print 5, 0 (`default`), 6 and 7 (measured
+/// 2026-10-11, `scratchpad/r13/op7.lean`). The logic still never sees the value: the
+/// test above keeps `secret = 5 := rfl` refused.
+#[test]
+fn a_source_opaque_executes_its_value_as_the_pin_compiles_it() {
+    let (engine, limits) = engine();
+    let program = "opaque s : Nat := 5\nopaque t : Nat\ndef u : Nat := s + 1\nstructure P where\n  x : Nat\ninstance : Inhabited P := ⟨⟨7⟩⟩\nopaque p : P\n#eval s\n#eval t\n#eval u\n#eval p.x\n";
+    let batch = engine
+        .execute_source_definitions(
+            &[program.as_bytes()],
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits.kernel),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"))
+        .into_complete()
+        .unwrap();
+    let values: Vec<_> = batch
+        .executions
+        .iter()
+        .map(|execution| {
+            let fln::VmExit::Returned(value) = &execution.exit else {
+                panic!("returned value: {:?}", execution.exit)
+            };
+            fln_vm::interpreter::nat_decimal(&value.value)
+        })
+        .collect();
+    // The batch also runs the closed definition `u` where it is declared.
+    assert_eq!(
+        values.iter().map(Option::as_deref).collect::<Vec<_>>(),
+        [Some("6"), Some("5"), Some("0"), Some("6"), Some("7")]
+    );
 }

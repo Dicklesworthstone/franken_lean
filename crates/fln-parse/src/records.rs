@@ -78,12 +78,6 @@ pub(super) fn deriving_clause(
     }
     Ok(null_node(suffix))
 }
-pub(super) fn modifiers() -> Syntax {
-    Syntax::node(
-        parser_kind(&["Command", "declModifiers"]),
-        (0..7).map(|_| null_node(Vec::new())).collect(),
-    )
-}
 
 /// A `declModifiers` node holding only the doc comment at token `doc`, if any.
 fn modifiers_with_doc(
@@ -100,6 +94,27 @@ fn modifiers_with_doc(
         parser_kind(&["Command", "declModifiers"]),
         parts,
     ))
+}
+
+/// A `declModifiers` node with the doc comment at token `doc` and the `private` or `protected` at
+/// its token: `docComment? attributes? visibility? protected? …`, where `private` is a visibility
+/// and `protected` a slot of its own.
+pub(super) fn modifiers_with(
+    view: &SourceView,
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    doc: Option<usize>,
+    visibility: Option<(&str, usize)>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut modifiers = modifiers_with_doc(view, leaves, tokens, doc)?;
+    if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut modifiers) {
+        let slot = if word == "protected" { 3 } else { 2 };
+        args[slot] = null_node(vec![Syntax::node(
+            parser_kind(&["Command", word]),
+            vec![leaves.leaf(at)?],
+        )]);
+    }
+    Ok(modifiers)
 }
 
 /// Whether token `at` is a declaration doc comment (`/--`), which leads a field as it leads a
@@ -148,6 +163,12 @@ fn field(
         .find(|word| symbol(tokens, range.start, word))
         .map(|word| (word, range.start));
     let range = range.start + usize::from(visibility.is_some())..range.end;
+    if ["(", "{", "["]
+        .into_iter()
+        .any(|open| symbol(tokens, range.start, open))
+    {
+        return bracketed_field(leaves, view, tokens, range, doc, visibility);
+    }
     if !matches!(
         tokens.get(range.start).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
@@ -160,12 +181,18 @@ fn field(
         range.start + 1,
         DefinitionGrammar::Scalar,
     )?;
-    if !symbol(tokens, colon, ":") || colon >= range.end {
+    // `optDeclSig`'s type is optional: `x := v` overrides an inherited field's default.
+    let typed = symbol(tokens, colon, ":");
+    if colon >= range.end || !typed && !symbol(tokens, colon, ":=") {
         return Err(refuse(view, tokens, colon));
     }
     let parameters =
         bounded_binder_syntax(leaves, view, tokens, groups, DefinitionGrammar::Scalar)?;
-    let type_limit = type_end(&tokens[..range.end], colon, ":=");
+    let type_limit = if typed {
+        type_end(&tokens[..range.end], colon, ":=")
+    } else {
+        colon
+    };
     let default = if type_limit < range.end {
         let bounded_tokens = &tokens[..range.end];
         let (bindings, body_start) = bounded_let_bindings(view, bounded_tokens, type_limit + 1)?;
@@ -194,16 +221,7 @@ fn field(
     } else {
         null_node(Vec::new())
     };
-    let mut field_modifiers = modifiers_with_doc(view, leaves, tokens, doc)?;
-    // `declModifiers := docComment? attributes? visibility? protected? …`: `private` is a
-    // visibility, `protected` a slot of its own.
-    if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut field_modifiers) {
-        let slot = if word == "protected" { 3 } else { 2 };
-        args[slot] = null_node(vec![Syntax::node(
-            parser_kind(&["Command", word]),
-            vec![leaves.leaf(at)?],
-        )]);
-    }
+    let field_modifiers = modifiers_with(view, leaves, tokens, doc, visibility)?;
     Ok(Syntax::node(
         parser_kind(&["Command", "structSimpleBinder"]),
         vec![
@@ -221,11 +239,112 @@ fn field(
     ))
 }
 
+/// A field written as a binder (`Lean/Parser/Command.lean`): `structExplicitBinder`
+/// (`"(" ident+ optDeclSig (binderDefault)? ")"`), `structImplicitBinder` (`"{" ident+ declSig "}"`)
+/// and `structInstBinder` (`"[" ident+ declSig "]"`), each its names, `:` and a type. Out of line,
+/// as every field form is built.
+#[inline(never)]
+fn bracketed_field(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    doc: Option<usize>,
+    visibility: Option<(&str, usize)>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let open = range.start;
+    let (kind, closing) = if symbol(tokens, open, "(") {
+        ("structExplicitBinder", ")")
+    } else if symbol(tokens, open, "{") {
+        ("structImplicitBinder", "}")
+    } else {
+        ("structInstBinder", "]")
+    };
+    let close = range.end - 1;
+    if close <= open + 2 || !symbol(tokens, close, closing) {
+        return Err(refuse(view, tokens, close));
+    }
+    let mut colon = open + 1;
+    while colon < close && matches!(&tokens[colon].kind, TokenKind::Ident(_)) {
+        colon += 1;
+    }
+    if colon == open + 1 || !symbol(tokens, colon, ":") {
+        return Err(refuse(view, tokens, colon));
+    }
+    let names = (open + 1..colon)
+        .map(|at| leaves.leaf(at))
+        .collect::<Result<Vec<_>, _>>()?;
+    // An explicit field's default (`(n : Nat := 0)`): the type ends at its top-level `:=`.
+    let type_end = if kind == "structExplicitBinder" {
+        type_end(&tokens[..close], colon, ":=")
+    } else {
+        close
+    };
+    if type_end <= colon + 1 {
+        return Err(refuse(view, tokens, colon + 1));
+    }
+    let type_spec = Syntax::node(
+        parser_kind(&["Term", "typeSpec"]),
+        vec![
+            leaves.leaf(colon)?,
+            bounded_type(
+                leaves,
+                view,
+                tokens,
+                colon + 1..type_end,
+                DefinitionGrammar::Scalar,
+            )?,
+        ],
+    );
+    let mut modifiers = modifiers_with_doc(view, leaves, tokens, doc)?;
+    if let (Some((word, at)), Syntax::Node { args, .. }) = (visibility, &mut modifiers) {
+        let slot = if word == "protected" { 3 } else { 2 };
+        args[slot] = null_node(vec![Syntax::node(
+            parser_kind(&["Command", word]),
+            vec![leaves.leaf(at)?],
+        )]);
+    }
+    let mut parts = vec![modifiers, leaves.leaf(open)?, null_node(names)];
+    if kind == "structExplicitBinder" {
+        let default = if type_end < close {
+            if type_end + 1 >= close {
+                return Err(refuse(view, tokens, type_end));
+            }
+            null_node(vec![Syntax::node(
+                parser_kind(&["Term", "binderDefault"]),
+                vec![
+                    leaves.leaf(type_end)?,
+                    bounded_term(
+                        leaves,
+                        view,
+                        tokens,
+                        type_end + 1..close,
+                        DefinitionGrammar::Scalar,
+                    )?,
+                ],
+            )])
+        } else {
+            null_node(Vec::new())
+        };
+        parts.push(Syntax::node(
+            parser_kind(&["Command", "optDeclSig"]),
+            vec![null_node(Vec::new()), null_node(vec![type_spec])],
+        ));
+        parts.push(default);
+    } else {
+        parts.push(Syntax::node(
+            parser_kind(&["Command", "declSig"]),
+            vec![null_node(Vec::new()), type_spec],
+        ));
+    }
+    parts.push(leaves.leaf(close)?);
+    Ok(Syntax::node(parser_kind(&["Command", kind]), parts))
+}
+
 fn fields(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
-    keyword: usize,
     start: usize,
 ) -> Result<Vec<Syntax>, NatDefinitionParseError> {
     if start == tokens.len() {
@@ -239,12 +358,18 @@ fn fields(
             .expect("token's line exists")
             .0
     };
+    // `structFields` is `manyIndent`: the first field may sit at any column, even 0 (the pin
+    // accepts `structure A where` then `x : Nat` at the line start), and each later field at
+    // a line start sits at the first one's column.
     let base = column(start);
-    if source.line_of(tokens[start].extent.start()) > source.line_of(tokens[keyword].extent.start())
-        && base <= column(keyword)
-    {
-        return Err(refuse(view, tokens, start));
-    }
+    // A field's own bracket (`(x : Nat)`), after its doc comment and visibility: the field ends
+    // where that bracket closes, so `(x : Nat) (y : Nat)` on one line is two fields. The next
+    // one passes `checkColGe` at any column from the first field's on: a line starting further
+    // left is refused below, as the pin ends the command there and fails on the rest.
+    let opening = |first: usize| {
+        let at = first + usize::from(doc_at(tokens, first));
+        at + usize::from(symbol(tokens, at, "private") || symbol(tokens, at, "protected"))
+    };
     let mut output = Vec::new();
     let mut first = start;
     let mut stack = Vec::new();
@@ -272,6 +397,17 @@ fn fields(
                     if stack.pop() != Some(crate::canonical_bracket(s.as_str())) =>
                 {
                     return Err(refuse(view, tokens, index));
+                }
+                ")" | "}" | "]"
+                    if stack.is_empty()
+                        && ["(", "{", "["]
+                            .into_iter()
+                            .any(|open| symbol(tokens, opening(first), open))
+                        && index + 1 < tokens.len()
+                        && column(index + 1) >= base =>
+                {
+                    output.push(field(leaves, view, tokens, first..index + 1)?);
+                    first = index + 1;
                 }
                 "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
                 _ => {}
@@ -380,13 +516,16 @@ pub(super) fn parse(
     let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
     let end_body = deriving_start(&tokens, cursor);
     let body_tokens = &tokens[..end_body];
+    // The body opens with `where` or, in the pin's older spelling, `:=` (`" := " <|> " where "`).
     let end_result = if symbol(&tokens, cursor, ":") {
-        type_end(body_tokens, cursor, "where").min(type_end(body_tokens, cursor, "extends"))
+        type_end(body_tokens, cursor, "where")
+            .min(type_end(body_tokens, cursor, ":="))
+            .min(type_end(body_tokens, cursor, "extends"))
     } else {
         cursor
     };
     let end_header = if symbol(&tokens, end_result, "extends") {
-        type_end(body_tokens, end_result, "where")
+        type_end(body_tokens, end_result, "where").min(type_end(body_tokens, end_result, ":="))
     } else {
         end_result
     };
@@ -399,7 +538,7 @@ pub(super) fn parse(
     let body = if end_header == end_body {
         null_node(Vec::new())
     } else {
-        if !symbol(&tokens, end_header, "where") {
+        if !symbol(&tokens, end_header, "where") && !symbol(&tokens, end_header, ":=") {
             return Err(refuse(&view, &tokens, end_header));
         }
         // `structCtor := declModifiers ident " :: "`: the constructor's own name, after its doc
@@ -437,8 +576,7 @@ pub(super) fn parse(
             null_node(Vec::new())
         };
         let first_field = if named_ctor { name + 2 } else { end_header + 1 };
-        // Fields are indented past the command's start, its modifiers included.
-        let fields = fields(&leaves, &view, body_tokens, 0, first_field)?;
+        let fields = fields(&leaves, &view, body_tokens, first_field)?;
         null_node(vec![
             leaves.leaf(end_header)?,
             ctor,
@@ -514,8 +652,9 @@ mod tests {
     fn unsupported_record_forms_and_bad_indentation_do_not_disappear() {
         for text in [
             "structure A extends where x : Nat",
-            "structure A where\nx : Nat",
             "structure A where\n  x : Nat\n y : Nat",
+            "structure A := (x : Nat)\n  (y : Nat)",
+            "structure A := (x : Nat) :=",
             "structure A where\n  x : Nat :=",
             "structure A where\n  x : Nat\nderiving",
             "structure A where\n  x Nat",
@@ -533,6 +672,13 @@ mod tests {
             "structure Empty : Type where",
             // A named constructor and no fields (`structCtor`), which the elaborator refuses.
             "structure A where\n  mk ::",
+            // `structFields` is `manyIndent`: the first field may start a line at column 0.
+            "structure A where\nx : Nat",
+            "structure A where\nx : Nat\ny : Nat",
+            // The older `:=` body, and bracketed fields sharing a line.
+            "structure A :=\n(x : Nat)",
+            "structure A := (x : Nat) (y z : Bool := true)",
+            "class A (α : Type) := (op : α → α)",
         ] {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
         }

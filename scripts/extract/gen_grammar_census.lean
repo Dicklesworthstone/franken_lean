@@ -22,8 +22,10 @@ Modes:
     `builtinSyntaxNodeKindSetRef`, `builtinParserCategoriesRef`), the module-header parser's
     tokens and kinds, the named special kinds (constants of type `SyntaxNodeKind`), and, for
     every Init/Std module, its imports, its parser-extension entries (tokens, kinds, parsers,
-    categories), the syntax declarations it compiles (ParserDescr constants, with precedence
-    and the tokens their compiled parser collects), and its `macro` attribute entries. For
+    categories), the parser aliases `syntax` resolves names to (rows `parser-alias`), the syntax
+    declarations it compiles (ParserDescr constants, with precedence,
+    the tokens their compiled parser collects, and the evaluated `ParserDescr` itself, rows
+    `syntax-descr`), and its `macro` attribute entries. For
     every other module only the kind and category entries are recorded, because Init/Std parse
     trees contain nodes Lean.* parsers build (the Verso docstring grammar).
     Totality is checked HERE, against the oracle's own runtime state, and a failure exits 3
@@ -67,6 +69,33 @@ def checkToken (tk : String) : IO String := do
 def joinTokens (tks : List String) : IO String := do
   let tks ← tks.toArray.mapM checkToken
   return " ".intercalate (dedupSorted tks).toList
+
+/-- A JSON string: names and strings in a `syntax-descr` row are printed this way, so a space,
+a parenthesis or a quote inside one cannot be mistaken for the row's own structure. -/
+def quoteJson (s : String) : String := (Json.str s).compress
+
+/-- The evaluated `ParserDescr` of a syntax declaration as one s-expression: each constructor
+(`Init/Prelude.lean`, `inductive ParserDescr`) is a parenthesized bareword followed by its
+fields in declaration order; names and strings are JSON strings, numbers decimal, booleans
+`true`/`false`. This is what the pin's `compileParserDescr` interprets, so a consumer that
+interprets it builds the parser `syntax` declared, not a transcription of it. -/
+partial def descrRepr : ParserDescr → String
+  | .const n => s!"(const {quoteJson (render n)})"
+  | .unary n p => s!"(unary {quoteJson (render n)} {descrRepr p})"
+  | .binary n p q => s!"(binary {quoteJson (render n)} {descrRepr p} {descrRepr q})"
+  | .node k prec p => s!"(node {quoteJson (render k)} {prec} {descrRepr p})"
+  | .trailingNode k prec lhsPrec p =>
+    s!"(trailingNode {quoteJson (render k)} {prec} {lhsPrec} {descrRepr p})"
+  | .symbol v => s!"(symbol {quoteJson v})"
+  | .nonReservedSymbol v includeIdent => s!"(nonReservedSymbol {quoteJson v} {includeIdent})"
+  | .cat c rbp => s!"(cat {quoteJson (render c)} {rbp})"
+  | .parser d => s!"(parser {quoteJson (render d)})"
+  | .nodeWithAntiquot n k p => s!"(nodeWithAntiquot {quoteJson n} {quoteJson (render k)} {descrRepr p})"
+  | .sepBy p sep psep trailing =>
+    s!"(sepBy {descrRepr p} {quoteJson sep} {descrRepr psep} {trailing})"
+  | .sepBy1 p sep psep trailing =>
+    s!"(sepBy1 {descrRepr p} {quoteJson sep} {descrRepr psep} {trailing})"
+  | .unicodeSymbol v ascii preserve => s!"(unicodeSymbol {quoteJson v} {quoteJson ascii} {preserve})"
 
 /-! ## Decoding `toExpr` encodings found in `_regBuiltin` values -/
 
@@ -296,6 +325,25 @@ unsafe def grammar : IO UInt32 := do
       return 3
     categoryRows := categoryRows.push
       s!"category\t{render cat}\t{render c.declName}\t{behaviorRepr c.behavior}\tparsers={runtime.size}"
+  -- parser aliases (`register_parser_alias`): what `syntax` resolves `ident`, `optional(…)` and
+  -- `sepBy(…)` to, and the stack sizes `toParserDescr` groups arguments by (`ensureUnaryOutput`)
+  let aliasInfos ← Lean.Parser.parserAliases2infoRef.get
+  let aliasKinds ← Lean.Parser.parserAlias2kindRef.get
+  let mut aliasRows : Array String := #[]
+  for (name, value) in (← Lean.Parser.parserAliasesRef.get).toList do
+    let arity := match value with
+      | .const _ => "const"
+      | .unary _ => "unary"
+      | .binary _ => "binary"
+    let info := aliasInfos.getD name {}
+    let stack := match info.stackSz? with
+      | some n => toString n
+      | none => "-"
+    let kind := match aliasKinds.find? name with
+      | some k => render k
+      | none => "-"
+    aliasRows := aliasRows.push
+      s!"parser-alias\t{render name}\t{arity}\tdecl={render info.declName}\tstack={stack}\tauto-group={info.autoGroupArgs}\tkind={kind}"
   for (cat, _) in byCategory.toList do
     unless categories.contains cat do
       IO.eprintln s!"census refusal: _regBuiltin registers parsers in unknown category {cat}"
@@ -353,6 +401,7 @@ unsafe def grammar : IO UInt32 := do
   let mut moduleTokenRows : Array String := #[]
   let mut moduleKindRows : Array String := #[]
   let mut syntaxRows : Array String := #[]
+  let mut descrRows : Array String := #[]
   let mut keyedModuleRows : Array String := #[]
   let mut categoryDeclRows : Array String := #[]
   let mut moduleCount := 0
@@ -428,6 +477,8 @@ unsafe def grammar : IO UInt32 := do
         s!"syntax-decl\t{render m}\t{render decl}\t{cat}\t{position}\tprio={prio}\t" ++
         s!"prec={renderOpt prec.prec}\tlhs-prec={renderOpt prec.lhsPrec}\t{scope}\t" ++
         s!"tokens={← joinTokens (p.info.collectTokens [])}"
+      let descr ← IO.ofExcept <| env.evalConst ParserDescr opts decl
+      descrRows := descrRows.push s!"syntax-descr\t{render m}\t{render decl}\t{descrRepr descr}"
     for (decl, _) in parserEntries.toList do
       unless (descrByModule.getD m #[]).contains decl do
         -- a `[term_parser]`-style attribute on a hand-written `Parser`, not a ParserDescr
@@ -469,8 +520,10 @@ unsafe def grammar : IO UInt32 := do
     s!"count\theader-node-kinds\t{headerKinds.size}",
     s!"count\tsyntax-node-kind-constants\t{kindConstantRows.size}",
     s!"count\tcategories\t{categoryRows.size}",
+    s!"count\tparser-aliases\t{aliasRows.size}",
     s!"count\tinit-std-modules\t{moduleCount}",
     s!"count\tinit-std-syntax-decls\t{syntaxRows.size}",
+    s!"count\tinit-std-syntax-descrs\t{descrRows.size}",
     s!"count\tinit-std-token-entries\t{tokenEntryCount}",
     s!"count\tinit-std-kind-entries\t{kindEntryCount}",
     s!"count\tinit-std-module-macros\t{keyedModuleRows.size}"]
@@ -478,6 +531,7 @@ unsafe def grammar : IO UInt32 := do
   lines := lines ++ sortStrings closureRows
   lines := lines ++ sortStrings familyRows
   lines := lines ++ sortStrings categoryRows
+  lines := lines ++ sortStrings aliasRows
   lines := lines ++ sortStrings parserRows
   for tk in builtinTokens do
     lines := lines.push s!"builtin-token\t{← checkToken tk}\tintroducers={introducers.getD tk 0}"
@@ -492,6 +546,7 @@ unsafe def grammar : IO UInt32 := do
   lines := lines ++ sortStrings moduleKindRows
   lines := lines ++ sortStrings categoryDeclRows
   lines := lines ++ sortStrings syntaxRows
+  lines := lines ++ sortStrings descrRows
   lines := lines ++ sortStrings keyedModuleRows
   for l in lines do IO.println l
   return 0

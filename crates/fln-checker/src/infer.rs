@@ -26,7 +26,7 @@ use crate::instantiate::{
 use crate::term::{
     TermBudget, TermFacts, TermFault, TermInput, TermLimit, TermOutcome, TermStop,
     abstract_free_telescope_with, copy_compact_subterm_with, copy_subterm_with, inspect_nodes_with,
-    inspect_with, substitute_bound_subterms_with, substitute_free_with,
+    inspect_with, open_bound_telescope_with, substitute_bound_subterms_with, substitute_free_with,
 };
 use crate::whnf::{
     FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal,
@@ -2456,7 +2456,7 @@ impl<'a> InferenceEngine<'a> {
         phase: InferencePhase,
     ) -> Result<WireExpr, LeafHalt> {
         let source = inference_arena(self.input, &self.generated, reference.source)?;
-        let mut result = map_materialization(
+        let result = map_materialization(
             copy_compact_subterm_with(
                 source,
                 reference.root,
@@ -2493,26 +2493,44 @@ impl<'a> InferenceEngine<'a> {
             }));
         }
 
+        if needed == 0 {
+            return Ok(result);
+        }
+
+        // These locals were materialized from exactly their local_name when
+        // installed. Borrow that exact Free identity from each local arena,
+        // avoiding a full arena copy for every binder in the active suffix.
         let first = binders.len() - needed;
-        for binder in binders[first..].iter().rev() {
+        let mut names = Vec::new();
+        for binder in &binders[first..] {
+            self.control
+                .poll(self.cancelled, phase, reference.root.index())
+                .map_err(LeafHalt::stop)?;
             let replacement =
                 inference_arena(self.input, &self.generated, binder.local_reference.source)?;
-            let root = result.root();
-            result = map_materialization(
-                substitute_bound_subterms_with(
-                    &result,
-                    root,
-                    0,
-                    replacement,
-                    binder.local_reference.root,
-                    self.control.budget.materialization,
-                    self.cancelled,
-                ),
-                phase,
-                self.control.progress,
-            )?;
+            let Some(ExprNode::Free { name }) = replacement.node(binder.local_reference.root)
+            else {
+                return Err(LeafHalt::Fault(InferenceFault::Materialization {
+                    phase,
+                    fault: TermFault::MissingExpression {
+                        input: TermInput::Replacement,
+                        index: binder.local_reference.root.index(),
+                    },
+                }));
+            };
+            debug_assert_eq!(name, &binder.local_name);
+            names.push(name);
         }
-        Ok(result)
+        map_materialization(
+            open_bound_telescope_with(
+                &result,
+                &names,
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            phase,
+            self.control.progress,
+        )
     }
 
     fn install_telescope_binder(

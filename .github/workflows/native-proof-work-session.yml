@@ -1,0 +1,107 @@
+name: Native indexed unfolding validation
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-proof-work-session.yml']
+permissions:
+  contents: read
+jobs:
+  indexed-unfolding:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply the exact locally tested patch
+        shell: python
+        run: |
+          import base64, gzip, hashlib, os, pathlib, re, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'indexed-unfolding'
+          root.mkdir()
+          stored = subprocess.check_output(['git','show','539b6ce58a3d1acbbda882664ec1ecea3b2b8847:.github/workflows/native-proof-work-session.yml'], text=True)
+          encoded = re.search(r"encoded = '''([A-Za-z0-9+/=]+)'''", stored).group(1)
+          (root/'transmitted.txt').write_text(encoded)
+          assert encoded.count('GndZ97g78q78fD0') == 1
+          encoded = encoded.replace('GndZ97g78q78fD0', 'GndZ97g78qfD0')
+          (root/'recovered.txt').write_text(encoded)
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '54df26766936c221a0181a5a2c0a9e489990eb0204ac695be3bc856fc7f8e6c9'
+          (root / 'patch.diff').write_bytes(patch)
+          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          subprocess.run(['git', 'apply', '--check', str(root / 'patch.diff')], check=True)
+          subprocess.run(['git', 'apply', str(root / 'patch.diff')], check=True)
+      - name: Install pinned compilers and oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          curl --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' --fail --location --retry 3 -o "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_SMART_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Check transport gates, existing recursion, imported collections and real commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee "$RUNNER_TEMP/indexed-unfolding/validation.log") 2>&1
+          rustc -Vv
+          cargo test --locked -p fln-elab --lib source::reduce::
+          cargo test --locked -p fln --test source_indexed_smart_unfolding --test source_dependent_index_recursion --test source_recursion --test source_imported_collections --test source_numeral_carriers --no-fail-fast
+          cargo test --locked -p fln-cli --test source_indexed_smart_unfolding --test source_constrained_simplification --no-fail-fast
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --lib -- -D warnings
+          cargo check --locked --workspace --all-targets
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/selected_k_tests.rs crates/fln/tests/source_indexed_smart_unfolding.rs crates/fln-cli/tests/source_indexed_smart_unfolding.rs
+          git diff --check
+      - name: Export tested Git objects without moving main
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'indexed-unfolding'
+          expected = {
+              'crates/fln-cli/tests/source_indexed_smart_unfolding.rs': 'ff64aeab62feb23eb385d1ac68e822af63f13290',
+              'crates/fln-elab/src/source/reduce.rs': '6fc7503a0be91c19eb324faaa33c2c5b67889033',
+              'crates/fln-elab/src/source/reduce/selected_k_tests.rs': '7b35c18105c767a6c461f80dbd6526af804296e6',
+              'crates/fln/tests/source_indexed_smart_unfolding.rs': 'd8221d5fdcfaf0b1c2001c1f7d92efb581eb3d24',
+              'docs/NATIVE_INDUCTION.md': 'b2a0ff4b501fa66c1f99aae0d3554671a79be2c4',
+              'examples/native_indexed_smart_unfolding.lean': '34891c13a499dc6a9a19f51928d989531c72898d',
+          }
+          def post(endpoint, value):
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint, data=json.dumps(value).encode(), headers={'Accept':'application/vnd.github+json','Content-Type':'application/json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          entries = []
+          for path, sha in expected.items():
+              content = pathlib.Path(path).read_bytes()
+              assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha, path
+              assert post('blobs', {'content':content.decode(), 'encoding':'utf-8'})['sha'] == sha
+              entries.append({'path':path, 'mode':'100644', 'type':'blob', 'sha':sha})
+          subprocess.run(['git', 'add', '--', *expected], check=True)
+          actual = subprocess.check_output(['git','diff','--cached','--name-only'], text=True).splitlines()
+          assert sorted(actual) == sorted(expected)
+          base_tree = subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip()
+          tree = post('trees', {'base_tree':base_tree, 'tree':entries})['sha']
+          assert tree == subprocess.check_output(['git','write-tree'], text=True).strip()
+          record = {'parent':(root/'base.txt').read_text().strip(),'tree':tree,'files':entries,'reference':'8c9756b28d64dab099da31a4c09229a9e6a2ef35','ref_changed':False}
+          (root/'tested-tree.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record), flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: indexed-unfolding-${{ github.sha }}
+          path: ${{ runner.temp }}/indexed-unfolding
+          retention-days: 7
+          if-no-files-found: warn

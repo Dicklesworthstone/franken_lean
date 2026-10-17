@@ -1,0 +1,18 @@
+{
+  "schema": "fln-readable-source-v1",
+  "files": {
+    "crates/fln-elab/src/source/partial.rs": {
+      "before": "000593dd131aaf5eaf2c16f82382a783ef6bec26",
+      "after": "8d7f29ecc0b5deb81f07fc2026bf9f5724dbc33a"
+    },
+    "crates/fln-elab/src/source/recursion.rs": {
+      "before": "4996b84ea600232071122b6fa6449cf72e464248",
+      "after": "931d6b2954af6299797d06cc6307f1e986f91880"
+    },
+    "crates/fln/tests/source_partial_inference.rs": {
+      "before": null,
+      "after": "1376663994602eec452813383eafc9df4d98dbd4"
+    }
+  },
+  "patches": ["d4edc47f9456d2d418568d3f916dc776a4920841"]
+}

@@ -39,6 +39,17 @@ fn binder_name(syntax: &Syntax) -> Result<Name, NatDefinitionElabError> {
         Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous() => {
             Ok(val.clone())
         }
+        // A binder a notation's template introduces carries the expansion's macro scopes: atomic
+        // once they are erased, and kept scoped, so only the template's own references (which
+        // carry the same scopes) name it.
+        Syntax::Ident { val, .. }
+            if val.has_macro_scopes() && {
+                let erased = val.erase_macro_scopes();
+                !erased.is_anonymous() && erased.parent().is_anonymous()
+            } =>
+        {
+            Ok(val.clone())
+        }
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "hole"]) => {
             let [hole] = args.as_slice() else {
                 return Err(invalid());
@@ -542,9 +553,24 @@ fn exists_kind() -> Name {
     Name::str(Name::anonymous(), "term∃_,_")
 }
 
-/// Whether a node is an `∃` the expansion pass must rewrite.
+/// `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`): the same macro over `Sigma` and
+/// `PSigma`, `expandExplicitBinders ``Sigma` and `expandExplicitBinders ``PSigma`. Each node kind with
+/// its keyword and the head its expansion applies, resolved where the notation is defined.
+fn binder_notation(kind: &Name) -> Option<(&'static str, Name)> {
+    if kind == &exists_kind() {
+        Some(("∃", Name::from_components(["Exists"])))
+    } else if kind == &Name::str(Name::anonymous(), "termΣ_,_") {
+        Some(("Σ", Name::from_components(["_root_", "Sigma"])))
+    } else if kind == &Name::str(Name::anonymous(), "termΣ'_,_") {
+        Some(("Σ'", Name::from_components(["_root_", "PSigma"])))
+    } else {
+        None
+    }
+}
+
+/// Whether a node is an `∃`, `Σ` or `Σ'` the expansion pass must rewrite.
 pub(super) fn is_exists(syntax: &Syntax) -> bool {
-    syntax.kind() == Some(&exists_kind())
+    syntax.kind().and_then(binder_notation).is_some()
 }
 
 /// A node's parts, taken out of it (`Syntax` drops iteratively, so it cannot be
@@ -586,10 +612,21 @@ impl Context {
         syntax: Syntax,
         pattern: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        if syntax.kind() != Some(&exists_kind()) {
+        let Some((word, head)) = syntax.kind().and_then(binder_notation) else {
             return Ok(syntax);
-        }
+        };
         if pattern {
+            return Err(invalid());
+        }
+        // `Σ` and `Σ'` exist where their declaring module (`Init.NotationExtra`) is imported, as
+        // its `ParserDescr` constant witnesses: without it the pin's parser has no such token
+        // (`prelude` + `import Init.Core` says "expected token").
+        if word != "∃"
+            && !self
+                .txn
+                .env
+                .contains(syntax.kind().expect("a binder notation node"))
+        {
             return Err(invalid());
         }
         let Ok((_, parts)) = node_parts(syntax) else {
@@ -598,7 +635,7 @@ impl Context {
         let Ok([keyword, binders, separator, body]) = <[Syntax; 4]>::try_from(parts) else {
             return Err(invalid());
         };
-        expect_atom(&keyword, "∃", "existential keyword")?;
+        expect_atom(&keyword, word, "existential keyword")?;
         expect_atom(&separator, ",", "existential separator")?;
         let lean = |name: &str| Name::from_components(["Lean", name]);
         let binder_ident = |syntax: Syntax| -> Result<Syntax, NatDefinitionElabError> {
@@ -698,7 +735,7 @@ impl Context {
                     Syntax::Ident {
                         info: SourceInfo::None,
                         raw_val: fln_syntax::source::ByteSpan::default(),
-                        val: Name::from_components(["Exists"]),
+                        val: head.clone(),
                         preresolved: Vec::new(),
                     },
                     Syntax::node(Name::from_components(["null"]), vec![lambda]),

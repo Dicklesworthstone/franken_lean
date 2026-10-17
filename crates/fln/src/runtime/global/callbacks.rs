@@ -3,6 +3,8 @@
 //! Every other supplied operand keeps one strict binding in source order.
 use super::*;
 
+mod computed;
+
 impl Preparation<'_> {
     /// Typed identity lets can hide a literal consumer or callback after
     /// dictionary projection. Expose only lambda construction, its aliases,
@@ -273,11 +275,47 @@ impl Preparation<'_> {
         self.typed_callable_result(value, type_, result)
     }
 
+    /// Substituting an inert function argument can forward it to a runtime
+    /// consumer whose type is no longer available to expression preparation.
+    /// Preserve the checked outer type at such value occurrences, including
+    /// ordinary flat callbacks. Direct callee uses still expose their literal
+    /// syntax, while staged callbacks retain their existing return annotations.
+    pub(in crate::runtime) fn retain_substituted_callable_type(
+        &mut self,
+        value: Expr,
+        type_: &Expr,
+        body: &Expr,
+    ) -> Result<Expr, IngressError> {
+        if !self.type_parameter(type_)? {
+            let type_ = self.normalize_type(type_)?;
+            if let Some(result @ ValueType::Closure(_)) = self.value_type(&type_)?
+                && !self.only_callee_uses(body)?
+            {
+                return self.typed_callable_result(value, type_, result);
+            }
+        }
+        self.retain_staged_callable_type(value, type_)
+    }
+
     fn only_callee_uses(&mut self, body: &Expr) -> Result<bool, IngressError> {
         let mut pending = vec![(body.clone(), 0usize, false)];
         let mut used = false;
         while let Some((expr, depth, callee)) = pending.pop() {
             self.tick()?;
+            // The cached range includes every loose variable, including those
+            // in types. If this slot is absent, the subtree cannot change the
+            // answer. Still retain the original binder-depth refusals: only an
+            // unsaturated structural height can prove every skipped descent
+            // fits the checked context and the producer's u32 depth bound.
+            let height = expr.approx_depth();
+            if usize::try_from(expr.loose_bvar_range()).is_ok_and(|range| range <= depth)
+                && height < u8::MAX
+                && depth.checked_add(usize::from(height)).is_some_and(|end| {
+                    end <= self.limits.max_context_depth && u32::try_from(end).is_ok()
+                })
+            {
+                continue;
+            }
             match expr.node() {
                 ExprNode::BVar { idx } if usize::try_from(*idx).ok() == Some(depth) => {
                     if !callee {
@@ -490,7 +528,7 @@ impl Preparation<'_> {
             let offset = self.producer_depth(bindings.len())?;
             let argument = self.lift(argument, offset)?;
             if let Some(lambda) = self.inert_callable(&argument)? {
-                let lambda = self.retain_staged_callable_type(lambda, domain)?;
+                let lambda = self.retain_substituted_callable_type(lambda, domain, body)?;
                 // Captures already name runtime values, not initializer code.
                 // The charged capture-avoiding substitution adjusts both the
                 // removed parameter and all retained strict argument slots.
@@ -535,3 +573,9 @@ impl Preparation<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod uses_tests;
+
+#[cfg(test)]
+mod computed_tests;

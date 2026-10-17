@@ -1,0 +1,238 @@
+diff --git a/crates/fln-elab/src/source.rs b/crates/fln-elab/src/source.rs
+index 369d950c76115907c4489a569f656a734c589abb..52724471e6dda2c76e53b2a6b9903efb5ba1d688 100644
+--- a/crates/fln-elab/src/source.rs
++++ b/crates/fln-elab/src/source.rs
+@@ -41,6 +41,7 @@ mod numeric;
+ mod operators;
+ mod optional;
+ mod overload;
++mod partial;
+ mod pattern_typing;
+ mod patterns;
+ mod record;
+@@ -556,6 +557,11 @@ struct Context {
+     // Set only after a top-level well-founded lowering succeeds. The source
+     // declaration result carries this status to post-admission metadata.
+     well_founded_definition: bool,
++    // The untrusted body of a source partial definition, elaborated under a
++    // private self parameter. Its executable companion is published only with
++    // the separately checked opaque inhabitant.
++    partial_definition: Option<partial::State>,
++    executable_companions: Vec<Declaration>,
+     // A local recursive helper suspends its parent's structural compiler.
+     // Complete parent calls still lower against that parent's hypotheses
+     // before the helper closes over them as an opaque value.
+@@ -636,6 +642,8 @@ impl Context {
+             recursion: None,
+             well_founded: None,
+             well_founded_definition: false,
++            partial_definition: None,
++            executable_companions: Vec::new(),
+             enclosing_recursions: Vec::new(),
+             postponed_eliminators: Vec::new(),
+             postponed_coercions: Vec::new(),
+@@ -956,6 +964,11 @@ impl Context {
+                 });
+             }
+             let name = &resolved;
++            if let Some(partial) = &self.partial_definition
++                && &partial.name == name
++            {
++                return Ok(partial.reference.clone());
++            }
+             if let Some(recursion) = &self.recursion
+                 && &recursion.name == name
+             {
+@@ -4585,11 +4598,28 @@ pub(super) fn definition(
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct ElaboratedDeclaration {
+     pub declaration: Declaration,
++    /// Required executable declarations, in admission order after the logical
++    /// declaration. Never publish or execute the logical half on its own.
++    pub executable_companions: Vec<Declaration>,
+     /// The definition actually used well-founded lowering. A source spelling or
+     /// a body mentioning `WellFounded.Nat.fix` does not set this effect.
+     pub irreducible: bool,
+ }
+ 
++impl ElaboratedDeclaration {
++    /// Legacy single-declaration callers cannot retain the complete checked
++    /// partial-definition pair. Refuse instead of losing its executable body.
++    pub fn into_single(self) -> Result<Declaration, NatDefinitionElabError> {
++        if self.executable_companions.is_empty() {
++            Ok(self.declaration)
++        } else {
++            Err(NatDefinitionElabError::UnexpectedSyntax {
++                expected: "atomic admission of a partial definition and its executable companion",
++            })
++        }
++    }
++}
++
+ fn definition_scoped(
+     syntax: &Syntax,
+     environment: &Environment,
+@@ -4597,7 +4627,7 @@ fn definition_scoped(
+     scope: &SourceScope,
+ ) -> Result<Declaration, NatDefinitionElabError> {
+     definition_scoped_with_effects(syntax, environment, kernel, scope)
+-        .map(|elaborated| elaborated.declaration)
++        .and_then(ElaboratedDeclaration::into_single)
+ }
+ 
+ fn definition_scoped_with_effects(
+@@ -4611,6 +4641,7 @@ fn definition_scoped_with_effects(
+     let declaration = definition_in_context(syntax, &mut context)?;
+     Ok(ElaboratedDeclaration {
+         declaration,
++        executable_companions: context.executable_companions,
+         irreducible: context.well_founded_definition,
+     })
+ }
+@@ -4747,6 +4778,7 @@ fn definition_in_context_named(
+     scope::simp::registration(syntax)?;
+     let mut is_protected = false;
+     let mut is_noncomputable = false;
++    let mut is_partial = false;
+     for (index, modifier) in modifiers.iter().enumerate() {
+         match index {
+             0 => doc_comment_slot(modifier)?,
+@@ -4757,10 +4789,21 @@ fn definition_in_context_named(
+             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
+             // Validated, with the declaration kind, by `noncomputable_registration` below.
+             NONCOMPUTABLE_SLOT => is_noncomputable = noncomputable_slot(modifier)?,
++            6 => is_partial = partial::modifier(modifier)?,
+             _ => expect_empty_null(modifier, "empty declaration modifier")?,
+         }
+     }
+     noncomputable_registration(syntax)?;
++    if is_partial && declaration[1].kind() != Some(&parser_kind(&["Command", "definition"])) {
++        return Err(NatDefinitionElabError::UnexpectedSyntax {
++            expected: "partial recursion in a def declaration",
++        });
++    }
++    if is_partial && noncomputable_slot(&modifiers[NONCOMPUTABLE_SLOT])? {
++        return Err(NatDefinitionElabError::UnexpectedSyntax {
++            expected: "a computable partial def (noncomputable partial lowering is not yet supported)",
++        });
++    }
+     if is_protected && generated_name.is_some() {
+         return Err(NatDefinitionElabError::UnexpectedSyntax {
+             expected: "a named protected declaration",
+@@ -5059,10 +5102,15 @@ fn definition_in_context_named(
+             expect_atom(&parts[0], ":=", "definition assignment")?;
+             (&parts[1], &parts[2], &parts[3])
+         };
+-    let termination = recursion::termination_hint(
+-        termination,
+-        !is_theorem && !is_instance && !is_abbrev && !is_opaque,
+-    )?;
++    let termination = if is_partial {
++        partial::check_termination(termination)?;
++        Some(recursion::TerminationHint::Partial)
++    } else {
++        recursion::termination_hint(
++            termination,
++            !is_theorem && !is_instance && !is_abbrev && !is_opaque,
++        )?
++    };
+     // `where` declarations scope over the body as `let rec` declarations, the pin's
+     // `expandWhereDecls`; each is its own group here, so a later one may call an
+     // earlier one.
+@@ -5114,6 +5162,7 @@ fn definition_in_context_named(
+     } else {
+         let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
+         roots.extend([term.type_.clone(), term.value.clone()]);
++        partial::extend_roots(context, &mut roots);
+         context.section_parameters(&roots, false)?
+     };
+     let instance_type = context
+@@ -5121,13 +5170,16 @@ fn definition_in_context_named(
+         .clone()
+         .map(|header| header.close(context, name, &section_parameters))
+         .transpose()?;
++    let partial_sections = section_parameters.clone();
+     parameters.splice(0..0, section_parameters);
+     let mut universe_roots: Vec<_> = parameters
+         .iter()
+         .map(|parameter| parameter.type_.clone())
+         .collect();
+     universe_roots.extend([term.type_.clone(), term.value.clone()]);
++    partial::extend_roots(context, &mut universe_roots);
+     context.generalize_declaration_universes(&universe_roots)?;
++    let mut executable = partial::executable_body(context, &partial_sections, &universe_roots)?;
+     let mut term = context.finish(term)?;
+     // Preserve the source's actual lambda stages. Eta-expanding a computed
+     // function moves its strict initializer under a new binder and delays it
+@@ -5150,6 +5202,18 @@ fn definition_in_context_named(
+             .type_
+             .abstract_fvar(&id, 0)
+             .map_err(|_| failure(SourceInferenceError::Scope))?;
++        if let Some(executable) = &mut executable {
++            context.tick()?;
++            executable.value = Expr::lam(
++                name.clone(),
++                domain.clone(),
++                executable
++                    .value
++                    .abstract_fvar(&id, 0)
++                    .map_err(|_| failure(SourceInferenceError::Scope))?,
++                style,
++            );
++        }
+         term.value = Expr::lam(name.clone(), domain.clone(), term.value, style);
+         term.type_ = Expr::forall_e(name, domain, term.type_, style);
+     }
+@@ -5168,13 +5232,25 @@ fn definition_in_context_named(
+         context.check_compiled_recursors(&term)?;
+     }
+     let type_ = instance_type.unwrap_or(term.type_);
+-    let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
++    if let Some(executable) = &executable {
++        context.check_compiled_recursors(&Typed {
++            value: executable.value.clone(),
++            type_: type_.clone(),
++        })?;
++    }
++    let mut roots = vec![type_.clone(), term.value.clone()];
++    if let Some(executable) = &executable {
++        roots.push(executable.value.clone());
++    }
++    let level_params = context.declaration_levels(&roots)?;
+     let mut base = ConstantVal {
+         name: name.clone(),
+         level_params,
+         type_,
+     };
+-    if is_theorem || proof_instance {
++    if let Some(executable) = executable {
++        partial::complete(context, base, term.value, executable.value)
++    } else if is_theorem || proof_instance {
+         if let Some(signature) = &context.public_theorem_signature {
+             if base.name != signature.name || base.level_params != signature.level_params {
+                 return Err(NatDefinitionElabError::UnexpectedSyntax {
+@@ -5511,6 +5587,24 @@ pub fn instance_registration_is_local(syntax: &Syntax) -> Result<bool, NatDefini
+ const PROTECTED_SLOT: usize = 3;
+ pub(super) const NONCOMPUTABLE_SLOT: usize = 4;
+ 
++/// Whether this canonical declaration requests partial recursion. This is a
++/// routing hint only; elaboration determines whether a companion is required.
++pub fn is_partial_definition(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
++    let declaration = expect_node(
++        syntax,
++        &parser_kind(&["Command", "declaration"]),
++        2,
++        "declaration",
++    )?;
++    let modifiers = expect_node(
++        &declaration[0],
++        &parser_kind(&["Command", "declModifiers"]),
++        7,
++        "declaration modifiers",
++    )?;
++    partial::modifier(&modifiers[6])
++}
++
+ /// `declModifiers`' doc comment slot: empty, or the pin's `docComment` node. A docstring adds
+ /// no declaration and no meaning the kernel sees; the reference-manual links the pin validates
+ /// were checked when the command was partitioned.

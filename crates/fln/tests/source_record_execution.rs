@@ -25,6 +25,43 @@ fn value(result: &DefinitionBatchExecution, expected: &str) {
 const POINT: &str = "structure Point where\n  x : Nat\n  y : Nat\n";
 
 #[test]
+fn nullary_proof_definitions_are_checked_without_becoming_runtime_entries() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let proof = Name::from_components(["ordinaryProof"]);
+    let completed = base
+        .execute_source_commands_with_checks(
+            b"def ordinaryProof : True := True.intro\ndef answer := 42\n#eval answer",
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    value(&completed.batch, "42");
+    assert_eq!(completed.execution_command_indices, [1, 2]);
+    assert_eq!(completed.batch.source_admissions.len(), 1);
+    let receipt = &completed.batch.source_admissions[0];
+    assert_eq!(receipt.command_index, 0);
+    assert!(matches!(receipt.admission.admissions.as_slice(),
+        [checked] if matches!(&checked.declaration,
+            fln::Declaration::Defn(definition) if definition.base.name == proof)));
+    assert!(matches!(
+        completed.batch.engine.environment().find(&proof),
+        Some(fln::ConstantInfo::Defn(_))
+    ));
+    let failed = base.execute_source_commands_with_checks(
+        b"def answer := 42\ndef ordinaryProof : 0 = 1 := by rfl\n#eval answer",
+        &options,
+        limits(),
+    );
+    assert!(!matches!(failed, Ok(Outcome::Complete(_))));
+    assert_eq!(base.logical_root(&options), root);
+    assert!(!base.environment().contains(&proof));
+}
+
+#[test]
 fn anonymous_examples_are_silent_checked_commands_between_executions() {
     let base = engine();
     let options = KVMap::new();
@@ -330,7 +367,7 @@ fn unimported_sibling_types_constructors_projections_defaults_and_proofs_are_ref
         let modules = [
             SourceModuleInput {
                 name: &entry,
-                source: b"import A B\n#eval 42",
+                source: b"import A\nimport B\n#eval 42",
             },
             SourceModuleInput {
                 name: &b,

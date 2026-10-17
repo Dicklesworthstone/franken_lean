@@ -3,7 +3,9 @@
 //! Source exports retain declarations and metadata; evaluation candidates and
 //! scratch queries never become another module's declarations.
 use super::*;
-use crate::{EngineExecutionLimits, SourceCommandBatchExecution};
+use crate::{EngineExecutionLimits, EvaluationPresentation, SourceCommandBatchExecution};
+
+mod preflight;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceProgramLimits {
@@ -33,6 +35,29 @@ pub struct SourceModuleExecution {
 #[derive(Debug)]
 pub struct SourceProgramExecution {
     pub modules: Vec<SourceModuleExecution>,
+}
+
+/// A source failure or a caller's refusal of a completed module. Validation
+/// errors retain the caller's type and stop before any later module executes.
+#[derive(Debug)]
+pub enum SourceProgramExecutionError<E> {
+    Source(SourceModuleCheckError),
+    Validation { module: Name, error: E },
+}
+
+impl<E> From<SourceModuleCheckError> for SourceProgramExecutionError<E> {
+    fn from(error: SourceModuleCheckError) -> Self {
+        Self::Source(error)
+    }
+}
+
+impl SourceProgramExecutionError<std::convert::Infallible> {
+    fn into_source_error(self) -> SourceModuleCheckError {
+        match self {
+            Self::Source(error) => error,
+            Self::Validation { error, .. } => match error {},
+        }
+    }
 }
 
 fn source_error(module: &Name, error: EngineExecutionError) -> SourceModuleCheckError {
@@ -102,66 +127,16 @@ pub fn preflight_source_program(
     modules: &[SourceModuleInput<'_>],
     limits: SourceModuleCheckLimits,
 ) -> Result<(), SourceModuleCheckError> {
-    if modules.len() > limits.max_modules {
-        return Err(SourceModuleCheckError::Limit {
-            resource: "modules",
-            limit: limits.max_modules,
-        });
-    }
-    let mut bytes = 0usize;
-    let mut count = 0usize;
-    for module in modules {
-        bytes = bytes
-            .checked_add(module.source.len())
-            .filter(|n| *n <= limits.source.max_bytes)
-            .ok_or(SourceModuleCheckError::Limit {
-                resource: "source bytes",
-                limit: limits.source.max_bytes,
-            })?;
-        let header =
-            parse_source_header(module.source).map_err(|error| SourceModuleCheckError::Header {
-                module: module.name.clone(),
-                error,
-            })?;
-        for (index, (mut at, mut bytes)) in commands(module.name, module.source, &header)?
-            .into_iter()
-            .enumerate()
-        {
-            count = count
-                .checked_add(1)
-                .filter(|n| *n <= limits.source.max_commands)
-                .ok_or(SourceModuleCheckError::Limit {
-                    resource: "source commands",
-                    limit: limits.source.max_commands,
-                })?;
-            loop {
-                match fln_parse::command_scope::parse(bytes)
-                    .map_err(|error| parse_error(module.name, index, at, error))?
-                {
-                    Some(
-                        fln_parse::command_scope::ScopeCommand::OpenIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::SetOptionIn { body, .. }
-                        | fln_parse::command_scope::ScopeCommand::GuardMsgs { body, .. },
-                    ) => {
-                        at.0 += body;
-                        bytes = &bytes[body..];
-                    }
-                    Some(_) => break,
-                    None => {
-                        if fln_parse::command_scope::mutual::parse(bytes)
-                            .map_err(|error| parse_error(module.name, index, at, error))?
-                            .is_none()
-                        {
-                            fln_parse::parse_source_command(bytes)
-                                .map_err(|error| parse_error(module.name, index, at, error))?;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    preflight::check(modules, limits, false)
+}
+
+/// Preflight ordinary Lean modules with their implicit `Init` import edges.
+/// Source bytes and diagnostic positions remain the caller's original input.
+pub fn preflight_lean_source_program(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+) -> Result<(), SourceModuleCheckError> {
+    preflight::check(modules, limits, true)
 }
 
 fn declarations(
@@ -187,6 +162,13 @@ fn declarations(
                 .entry(command)
                 .or_default()
                 .push(execution.declaration.clone());
+            for helper in &execution.local_functions {
+                meter.work(1)?;
+                ordered
+                    .entry(command)
+                    .or_default()
+                    .push(helper.declaration.clone());
+            }
         }
     }
     for admission in &completed.batch.source_admissions {
@@ -242,6 +224,29 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        self.execute_source_modules_with_presentation(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            EvaluationPresentation::Raw,
+        )
+    }
+
+    /// Execute the same explicit import graph with an opt-in presentation for
+    /// pure `#eval` values. Lean presentation uses only actual imported Repr or
+    /// ToString instances; each checked printer result is marked on its private
+    /// execution evidence. Imported worlds, source exports and IO stay exact.
+    pub fn execute_source_modules_with_presentation(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
         self.execute_source_modules_with_implicit_init(
             modules,
             entry,
@@ -249,7 +254,10 @@ impl imported::SourceOleanImport {
             limits,
             cancellation,
             false,
+            presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
         )
+        .map_err(SourceProgramExecutionError::into_source_error)
     }
 
     /// Compile and run ordinary Lean source modules, including the implicit
@@ -269,6 +277,28 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        self.execute_lean_source_modules_with_presentation(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            EvaluationPresentation::Raw,
+        )
+    }
+
+    /// Execute the ordinary implicit-Init graph with checked source printing.
+    /// The graph, source positions and admission rules are identical to
+    /// [`Self::execute_lean_source_modules`].
+    pub fn execute_lean_source_modules_with_presentation(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
         self.execute_source_modules_with_implicit_init(
             modules,
             entry,
@@ -276,10 +306,42 @@ impl imported::SourceOleanImport {
             limits,
             cancellation,
             true,
+            presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+        )
+        .map_err(SourceProgramExecutionError::into_source_error)
+    }
+
+    /// Execute ordinary Lean modules, validating each completed command stream
+    /// before exporting its declarations or executing another module. The
+    /// validator sees the module's retained command evidence, including guards
+    /// and checked printer results. A refusal returns its exact error and no
+    /// partial program; the remaining source modules do not execute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_validation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
+        self.execute_source_modules_with_implicit_init(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            true,
+            presentation,
+            validate,
         )
     }
 
-    fn execute_source_modules_with_implicit_init(
+    #[allow(clippy::too_many_arguments)]
+    fn execute_source_modules_with_implicit_init<E>(
         &self,
         modules: &[SourceModuleInput<'_>],
         entry: &Name,
@@ -287,13 +349,15 @@ impl imported::SourceOleanImport {
         limits: SourceProgramLimits,
         cancellation: Option<&dyn CancellationProbe>,
         implicit_init: bool,
-    ) -> Result<Outcome<SourceProgramExecution>, SourceModuleCheckError> {
+        presentation: EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                 "source-program/before-plan",
             )));
         }
-        preflight_source_program(modules, limits.modules)?;
+        preflight::check(modules, limits.modules, implicit_init)?;
         let mut meter = Meter {
             work: 0,
             bytes: 0,
@@ -347,12 +411,57 @@ impl imported::SourceOleanImport {
                 };
             }
             let module = modules[index];
-            let body = commands(module.name, module.source, &plan.headers[index])?;
+            // Empty forwarding modules still import a grammar world. Enforce
+            // its phase boundary before bypassing the command stream.
+            let grammar = grammar::SourceGrammar::for_engine(
+                &engine,
+                Some(module.name),
+                plan.headers[index].module_system,
+            )
+            .map_err(|error| source_error(module.name, error))?;
+            let public_imports = if plan.headers[index].module_system {
+                match visibility::imports(
+                    &self.contexts.complete,
+                    Some(&self.contexts),
+                    index,
+                    &plan,
+                    modules,
+                    |dependency| &exports[&dependency],
+                    options,
+                    &mut meter,
+                    cancellation,
+                )? {
+                    Outcome::Complete((engine, _)) => Some(engine),
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            } else {
+                None
+            };
+            let mut public = public_imports.map(|engine| {
+                visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
+            });
+            let body =
+                grammar.enter(|| commands(module.name, module.source, &plan.headers[index]))?;
             let completed = if body.is_empty() {
-                engine.empty_source_command_execution(options)
+                let mut completed = engine.empty_source_command_execution(options);
+                completed.scope.private_module = plan.headers[index]
+                    .module_system
+                    .then(|| module.name.clone());
+                completed
             } else {
                 match engine
-                    .execute_source_command_stream(body, options, limits.execution, true, &[])
+                    .execute_source_command_stream(
+                        body,
+                        options,
+                        limits.execution,
+                        true,
+                        &[],
+                        plan.headers[index].module_system.then_some(module.name),
+                        Some(module.name),
+                        public.as_mut(),
+                        presentation,
+                    )
                     .map_err(|error| source_error(module.name, error))?
                 {
                     Outcome::Complete(completed) => completed,
@@ -365,17 +474,29 @@ impl imported::SourceOleanImport {
                     "source-program/after-module",
                 )));
             }
+            validate(module.name, &completed).map_err(|error| {
+                SourceProgramExecutionError::Validation {
+                    module: module.name.clone(),
+                    error,
+                }
+            })?;
+            let public_export = public.map(visibility::PublicWorld::finish).transpose()?;
             if index != plan.entry {
-                let declarations = declarations(&completed, &mut meter)?;
                 exports.insert(
                     index,
-                    replay::Export::capture(
-                        module.name,
-                        engine.environment(),
-                        completed.batch.engine.environment(),
-                        declarations,
-                        &mut meter,
-                    )?,
+                    match public_export {
+                        Some(export) => export,
+                        None => {
+                            let declarations = declarations(&completed, &mut meter)?;
+                            replay::Export::capture(
+                                module.name,
+                                engine.environment(),
+                                completed.batch.engine.environment(),
+                                declarations,
+                                &mut meter,
+                            )?
+                        }
+                    },
                 );
             }
             completed_modules.push(SourceModuleExecution {

@@ -33,6 +33,10 @@ struct Binding {
     name: Option<usize>,
     /// `letPatDecl`'s pattern (`have ⟨k, hk⟩ := h`, `let (a, b) := p`), in place of a name.
     pattern: Option<Range<usize>>,
+    /// `letIdBinder`s after the name (`have h (x : T) {y} : P := v`).
+    parameters: Vec<crate::ExplicitBinderTokens>,
+    /// `let rec`'s `rec` (`Tactic.letrec`).
+    recursive: Option<usize>,
     annotation: Option<(usize, Range<usize>)>,
     assign: usize,
     value: Range<usize>,
@@ -106,12 +110,17 @@ enum Task {
     FinishChain(usize),
     Group(Range<usize>),
     FinishGroup(usize, usize),
+    /// `{ tacs }`: its braces, and whether it is the whole `tacticSeq`.
+    FinishBraces(usize, usize, bool),
     Open(usize, usize, usize),
     FinishOpen(usize, usize),
     Control(Control),
     FinishControl(Control),
     Sequence(Range<usize>, Option<usize>),
     Plain(Range<usize>),
+    /// An alternative's right-hand side that is a hole (`matchRhs := hole <|> syntheticHole <|>
+    /// tacticSeq`): `_`, `?_`, `?x`.
+    Hole(Range<usize>),
     Eliminate(Elimination),
     /// The separators after each item, and whether the sequence keeps a trailing one.
     FinishSequence(Vec<Option<usize>>, bool),
@@ -210,6 +219,21 @@ fn block_end(
     }
     end
 }
+/// Whether the declaration in `range` is defined by equations: a `|` at depth 0 before any `:=`.
+fn by_equations(tokens: &[LexedToken], range: Range<usize>) -> bool {
+    let mut depth = 0;
+    for at in range {
+        if depth == 0 && symbol(tokens, at, ":=") {
+            return false;
+        }
+        if depth == 0 && symbol(tokens, at, "|") {
+            return true;
+        }
+        delimiter_depth(&tokens[at], &mut depth);
+    }
+    false
+}
+
 fn control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'static str)> {
     // `cdotTk := unicode("· ", ". ")`: the ASCII dot is the same focus.
     if symbol(tokens, at, "·") {
@@ -228,6 +252,31 @@ fn control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'sta
         Some(("repeat", "tacticRepeat_"))
     } else if word(tokens, at, "repeat'") {
         Some(("repeat'", "repeat'"))
+    } else if let Some(&(text, kind)) = [
+        // `syntax (name := k) "w " tacticSeq : tactic` (`Init/Tactics.lean`), as the census lists
+        // them: the sequence takes every `;`-separated tactic after it.
+        ("any_goals", "anyGoals"),
+        // `syntax (name := classical) "classical" ppDedent(tacticSeq) : tactic`.
+        ("classical", "classical"),
+        // `macro "decreasing_with " ts:tacticSeq : tactic` (`Init/WFTactics.lean`), whose kind is
+        // in the root namespace.
+        ("decreasing_with", "_root_.tacticDecreasing_with_"),
+        ("fail_if_success", "failIfSuccess"),
+        ("repeat1'", "repeat1'"),
+        ("show_term", "showTerm"),
+        ("unhygienic", "tacticUnhygienic_"),
+        ("with_reducible", "withReducible"),
+        ("with_reducible_and_instances", "withReducibleAndInstances"),
+        ("with_unfolding_all", "withUnfoldingAll"),
+        ("with_unfolding_none", "withUnfoldingNone"),
+    ]
+    .iter()
+    .find(|(text, _)| word(tokens, at, text))
+    {
+        Some((text, kind))
+    } else if word(tokens, at, "set_option") && word(tokens, at + 3, "in") {
+        // `"set_option " ident optionValue " in " tacticSeq` (`Lean.Parser.Tactic.set_option`).
+        Some(("set_option", "set_option"))
     } else if word(tokens, at, "next") {
         Some(("next", "tacticNext_=>_"))
     } else if word(tokens, at, "case") {
@@ -356,7 +405,13 @@ fn plan_control(
     // (`Init/Tactics.lean`): the names, then the body after `=>`. `case` is
     // `"case " sepBy1(caseArg, " | ") " => " tacticSeq`, each `caseArg` a tag and its names.
     let case = keyword == "case" || keyword == "case'";
-    let (names, arrow) = if keyword == "next" || case {
+    // `"set_option " ident optionValue " in " tacticSeq`: the name and the value, then `in`.
+    let (names, arrow) = if keyword == "set_option" {
+        if !word(tokens, start + 3, "in") {
+            return Err(refusal(view, tokens, start + 3));
+        }
+        (start + 1..start + 3, Some(start + 3))
+    } else if keyword == "next" || case {
         let mut at = start + 1;
         while at < limit
             && (matches!(&tokens[at].kind, TokenKind::Ident(_))
@@ -430,6 +485,22 @@ fn plan_elimination(
     limit: usize,
     baseline: usize,
 ) -> Result<Elimination, NatDefinitionParseError> {
+    // `"intro" matchAlts` (`introMatch`): match alternatives straight after the keyword.
+    if word(tokens, start, "intro") && symbol(tokens, start + 1, "|") {
+        let result = Elimination {
+            start,
+            matching: true,
+            target: start + 1..start + 1,
+            equation: None,
+            using: None,
+            generalizing: None,
+            with: None,
+            pre_tactic: None,
+            alternatives: Vec::new(),
+            end: start + 1,
+        };
+        return plan_alternatives(view, tokens, result, start + 1, limit, true);
+    }
     let mut target = start + 1;
     let matching = word(tokens, start, "match");
     // `fun_induction f x` and `fun_cases f x` (`Init/Tactics.lean`): one term, the
@@ -555,22 +626,48 @@ fn plan_elimination(
         result.pre_tactic = Some(at + 1..pipe);
         pipe
     };
+    plan_alternatives(view, tokens, result, first, limit, matching)
+}
+
+/// The alternatives from the first `|` at `first`: their pipes, left-hand sides and bodies, up to
+/// where a line returns left of the pipes (`with`'s alternatives, and `introMatch`'s).
+fn plan_alternatives(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut result: Elimination,
+    first: usize,
+    limit: usize,
+    matching: bool,
+) -> Result<Elimination, NatDefinitionParseError> {
     let pipe_column = column(view, tokens, first);
     let mut pipes = Vec::new();
     let mut depth = 0;
     let mut in_body = false;
     let mut nested_pipes = false;
     let mut end = limit;
+    // `=> tacticSeq` whose sequence starts on its own line at or left of the pipes: `sepByIndent`
+    // positions it at its first token, so it runs while lines stay at that column or right of it
+    // (`with | step it ihy ihs =>⏎  rw …`, the rest of the proof).
+    let mut floor: Option<usize> = None;
     for at in first..limit {
         let fresh_line = newline(view, tokens, at);
-        if depth == 0
-            && at > first
-            && fresh_line
-            && column(view, tokens, at) <= pipe_column
-            && !(column(view, tokens, at) == pipe_column && symbol(tokens, at, "|"))
-        {
-            end = at;
-            break;
+        let arrow_before =
+            at > first && (symbol(tokens, at - 1, "=>") || symbol(tokens, at - 1, "↦"));
+        if depth == 0 && at > first && fresh_line {
+            let at_column = column(view, tokens, at);
+            if let Some(floor) = floor {
+                if at_column < floor {
+                    end = at;
+                    break;
+                }
+            } else if in_body && arrow_before && at_column <= pipe_column {
+                floor = Some(at_column);
+            } else if at_column <= pipe_column
+                && !(at_column == pipe_column && symbol(tokens, at, "|"))
+            {
+                end = at;
+                break;
+            }
         }
         if depth == 0
             && symbol(tokens, at, "|")
@@ -611,11 +708,18 @@ fn plan_elimination(
                 }
                 delimiter_depth(&tokens[at], &mut depth);
             }
+            // `matchAlt := "| " sepBy1(term,+, " | ") " => " rhs`: patterns with no `=>` before
+            // the next `|` share the next alternative's body (`| 0 | 1 => rfl`).
+            if arrow.is_none() && stop > pipe + 1 && index + 1 < pipes.len() {
+                lhs.push((pipe, stop));
+                continue;
+            }
             let Some(arrow) = arrow.filter(|&arrow| arrow > pipe + 1 && arrow + 1 < stop) else {
                 return Err(refusal(view, tokens, pipe + 1));
             };
+            lhs.push((pipe, arrow));
             result.alternatives.push(Alternative {
-                lhs: vec![(pipe, arrow)],
+                lhs: std::mem::take(&mut lhs),
                 arrow: Some(arrow),
                 body: arrow + 1..stop,
             });
@@ -658,6 +762,7 @@ fn plan_elimination(
     result.end = end;
     Ok(result)
 }
+
 fn plan_binding(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -669,8 +774,22 @@ fn plan_binding(
     let inline = word(tokens, start, "letI") || word(tokens, start, "haveI");
     let opaque = replace || word(tokens, start, "have") || word(tokens, start, "haveI");
     let preliminary_end = plain_end(view, tokens, start, limit, baseline);
-    let mut cursor = start + 1;
-    let name = if cursor < preliminary_end && matches!(&tokens[cursor].kind, TokenKind::Ident(_)) {
+    // `let rec` is `Tactic.letrec` (`"let " &" rec " letRecDecls`): one named declaration here.
+    let recursive =
+        (word(tokens, start, "let") && word(tokens, start + 1, "rec")).then_some(start + 1);
+    let mut cursor = start + 1 + usize::from(recursive.is_some());
+    if recursive.is_some()
+        && !matches!(
+            tokens.get(cursor).map(|t| &t.kind),
+            Some(TokenKind::Ident(_))
+        )
+    {
+        return Err(refusal(view, tokens, cursor));
+    }
+    // `binderIdent`: a name or the hole `_`.
+    let name = if cursor < preliminary_end
+        && (matches!(&tokens[cursor].kind, TokenKind::Ident(_)) || symbol(tokens, cursor, "_"))
+    {
         let at = cursor;
         cursor += 1;
         Some(at)
@@ -678,9 +797,16 @@ fn plan_binding(
         None
     };
     // `letPatDecl := term optType " := " term`: a bracketed pattern in place of the name, an
-    // anonymous constructor or a tuple. A parenthesis without a comma is the anonymous `have`'s
-    // binder (`have (x : T) : P := v` is `letIdDecl`'s), which is not read here.
-    let pattern = if name.is_none() && !replace && !inline {
+    // anonymous constructor, a tuple or `{..}`. A parenthesis without a comma is the anonymous
+    // `have`'s binder (`have (x : T) : P := v` is `letIdDecl`'s).
+    let ellipsis = symbol(tokens, cursor, "{")
+        && symbol(tokens, cursor + 1, "..")
+        && symbol(tokens, cursor + 2, "}");
+    let pattern = if name.is_none() && !replace && !inline && ellipsis {
+        let open = cursor;
+        cursor += 3;
+        Some(open..cursor)
+    } else if name.is_none() && !replace && !inline {
         let open = cursor;
         let mut depth = 0;
         let mut close = None;
@@ -696,9 +822,7 @@ fn plan_binding(
             }
         }
         match close {
-            Some(close)
-                if symbol(tokens, open, "⟨") || (symbol(tokens, open, "(") && comma) =>
-            {
+            Some(close) if symbol(tokens, open, "⟨") || (symbol(tokens, open, "(") && comma) => {
                 cursor = close + 1;
                 Some(open..close + 1)
             }
@@ -707,10 +831,17 @@ fn plan_binding(
     } else {
         None
     };
-    // An anonymous `letI : C := v` names its instance as `have` does (`hygieneInfo`).
-    if !opaque && !inline && name.is_none() && pattern.is_none() {
-        return Err(refusal(view, tokens, cursor));
-    }
+    // An anonymous local (`let : C := v`, `letI : C := v`) names itself as `have` does
+    // (`letIdLhs`'s `hygieneInfo`); the pin parses `let := 7` too.
+    // `many (ppSpace letIdBinder)`: names, holes and bracketed binders.
+    let parameters = if pattern.is_none() {
+        let (parameters, after) =
+            crate::signature_binders(view, tokens, cursor, DefinitionGrammar::Scalar)?;
+        cursor = after;
+        parameters
+    } else {
+        Vec::new()
+    };
     let colon = if symbol(tokens, cursor, ":") {
         let at = cursor;
         cursor += 1;
@@ -764,6 +895,8 @@ fn plan_binding(
         start,
         name,
         pattern,
+        parameters,
+        recursive,
         annotation: colon.map(|at| (at, type_start..assign)),
         assign,
         value,
@@ -804,9 +937,13 @@ fn finish_binding(
         (false, false, false) => "let",
     };
     let keyword_atom = atom(leaves, plan.start, keyword)?;
-    // An anonymous `have` names its `letId` with the hygiene identifier (`hygieneInfo`).
+    // An anonymous `have` names its `letId` with the hygiene identifier (`hygieneInfo`); `_` is
+    // a symbol, so its leaf is an atom: the hole `Term.hole`.
     let name = match plan.name {
-        Some(at) => leaves.leaf(at)?,
+        Some(at) => match leaves.leaf(at)? {
+            hole @ Syntax::Atom { .. } => Syntax::node(parser_kind(&["Term", "hole"]), vec![hole]),
+            name => name,
+        },
         None => crate::hygiene_info_following(&keyword_atom),
     };
     let annotation = match plan.annotation {
@@ -843,7 +980,13 @@ fn finish_binding(
             parser_kind(&["Term", "letIdDecl"]),
             vec![
                 Syntax::node(parser_kind(&["Term", "letId"]), vec![name]),
-                null_node(Vec::new()),
+                null_node(crate::bounded_binder_syntax(
+                    leaves,
+                    view,
+                    tokens,
+                    plan.parameters,
+                    DefinitionGrammar::Scalar,
+                )?),
                 annotation,
                 leaves.leaf(plan.assign)?,
                 value,
@@ -851,6 +994,29 @@ fn finish_binding(
         ),
     };
     let declaration = Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]);
+    // `letRecDecl := (docComment)? (attributes)? letDecl Termination.suffix`.
+    if let Some(rec) = plan.recursive {
+        let recursive = Syntax::node(
+            parser_kind(&["Term", "letRecDecl"]),
+            vec![
+                null_node(Vec::new()),
+                null_node(Vec::new()),
+                declaration,
+                crate::empty_termination_suffix(),
+            ],
+        );
+        return Ok(Syntax::node(
+            parser_kind(&["Tactic", "letrec"]),
+            vec![
+                keyword_atom,
+                atom(leaves, rec, "rec")?,
+                Syntax::node(
+                    parser_kind(&["Term", "letRecDecls"]),
+                    vec![null_node(vec![recursive])],
+                ),
+            ],
+        ));
+    }
     // `syntax "replace" haveDecl : tactic`: no configuration slot.
     if plan.replace {
         return Ok(Syntax::node(
@@ -891,7 +1057,22 @@ fn finish_control(
     body: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let keyword = atom(leaves, plan.start, plan.keyword)?;
-    Ok(if plan.kind == "cdot" {
+    Ok(if plan.kind == "set_option" {
+        let in_at = plan.arrow.expect("set_option's in");
+        let value = crate::command_scope::trees::option_value(leaves, tokens, plan.start + 2)?
+            .ok_or_else(|| refusal(view, tokens, plan.start + 2))?;
+        Syntax::node(
+            parser_kind(&["Tactic", "set_option"]),
+            vec![
+                keyword,
+                leaves.leaf(plan.start + 1)?,
+                null_node(Vec::new()),
+                value,
+                atom(leaves, in_at, "in")?,
+                body,
+            ],
+        )
+    } else if plan.kind == "cdot" {
         // `syntax cdotTk := unicode("· ", ". ")` and `syntax (name := cdot) cdotTk
         // tacticSeqIndentGt : tactic`, in namespace `Lean` (`Init/NotationExtra.lean`).
         Syntax::node(
@@ -928,7 +1109,11 @@ fn finish_control(
             vec![keyword, null_node(names), leaves.leaf(arrow)?, body],
         )
     } else {
-        Syntax::node(parser_kind(&["Tactic", plan.kind]), vec![keyword, body])
+        let kind = match plan.kind.strip_prefix("_root_.") {
+            Some(root) => Name::from_components([root]),
+            None => parser_kind(&["Tactic", plan.kind]),
+        };
+        Syntax::node(kind, vec![keyword, body])
     })
 }
 
@@ -970,8 +1155,31 @@ fn plan_if(
     let (Some(then_at), Some(else_at)) = (then_at, else_at) else {
         return Err(refusal(view, tokens, start));
     };
-    // The `else` branch is a tactic sequence: it takes the `;`s after it.
-    let end = block_end(view, tokens, else_at, limit, baseline);
+    // The `else` branch is a tactic sequence: it takes the `;`s after it. One that starts on its
+    // own line at or left of the enclosing column is positioned at its first token (`sepByIndent`)
+    // and runs while lines stay at that column or right of it (`… else⏎  rfl`, the rest).
+    let first = else_at + 1;
+    let end =
+        if first < limit && newline(view, tokens, first) && column(view, tokens, first) <= baseline
+        {
+            let floor = column(view, tokens, first);
+            let mut depth = 0;
+            let mut end = limit;
+            for at in first..limit {
+                if depth == 0
+                    && at > first
+                    && newline(view, tokens, at)
+                    && column(view, tokens, at) < floor
+                {
+                    end = at;
+                    break;
+                }
+                delimiter_depth(&tokens[at], &mut depth);
+            }
+            end
+        } else {
+            block_end(view, tokens, else_at, limit, baseline)
+        };
     if then_at == condition_start || else_at == then_at + 1 || end == else_at + 1 {
         return Err(refusal(view, tokens, then_at));
     }
@@ -1073,11 +1281,20 @@ fn finish_match(
     plan: Elimination,
     children: Vec<Syntax>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let with = plan
-        .with
-        .ok_or_else(|| refusal(view, tokens, plan.target.end))?;
+    let intro = word(tokens, plan.start, "intro");
+    let with = match plan.with {
+        Some(with) => Some(with),
+        None if intro => None,
+        None => return Err(refusal(view, tokens, plan.target.end)),
+    };
     let mut discriminants = Vec::new();
-    for (range, comma) in comma_items(tokens, plan.target.clone()) {
+    // `introMatch` has no discriminants.
+    let targets = if intro {
+        Vec::new()
+    } else {
+        comma_items(tokens, plan.target.clone())
+    };
+    for (range, comma) in targets {
         if range.is_empty() {
             return Err(refusal(view, tokens, range.start));
         }
@@ -1105,27 +1322,48 @@ fn finish_match(
     }
     let mut alternatives = Vec::new();
     for (alt, body) in plan.alternatives.into_iter().zip(children) {
-        let (pipe, arrow) = alt.lhs[0];
-        let mut patterns = Vec::new();
-        for (range, comma) in comma_items(tokens, pipe + 1..arrow) {
-            if range.is_empty() {
-                return Err(refusal(view, tokens, range.start));
+        // One pattern group per `|`, the later groups after their own `|` (`| 0 | 1 => …`).
+        let mut groups = Vec::new();
+        for (index, &(pipe, end)) in alt.lhs.iter().enumerate() {
+            if index > 0 {
+                groups.push(leaves.leaf(pipe)?);
             }
-            patterns.push(binding_term(leaves, view, tokens, range)?);
-            if let Some(comma) = comma {
-                patterns.push(leaves.leaf(comma)?);
+            let mut patterns = Vec::new();
+            for (range, comma) in comma_items(tokens, pipe + 1..end) {
+                if range.is_empty() {
+                    return Err(refusal(view, tokens, range.start));
+                }
+                patterns.push(binding_term(leaves, view, tokens, range)?);
+                if let Some(comma) = comma {
+                    patterns.push(leaves.leaf(comma)?);
+                }
             }
+            groups.push(null_node(patterns));
         }
+        let (Some(&(pipe, _)), Some(arrow)) = (alt.lhs.first(), alt.arrow) else {
+            return Err(refusal(view, tokens, plan.start));
+        };
         alternatives.push(Syntax::node(
             parser_kind(&["Term", "matchAlt"]),
             vec![
                 leaves.leaf(pipe)?,
-                null_node(vec![null_node(patterns)]),
+                null_node(groups),
                 leaves.leaf(arrow)?,
                 body,
             ],
         ));
     }
+    let alternatives = Syntax::node(
+        parser_kind(&["Term", "matchAlts"]),
+        vec![null_node(alternatives)],
+    );
+    let Some(with) = with else {
+        // `"intro" matchAlts` (`introMatch`).
+        return Ok(Syntax::node(
+            parser_kind(&["Tactic", "introMatch"]),
+            vec![atom(leaves, plan.start, "intro")?, alternatives],
+        ));
+    };
     Ok(Syntax::node(
         parser_kind(&["Tactic", "match"]),
         vec![
@@ -1134,10 +1372,7 @@ fn finish_match(
             null_node(Vec::new()),
             null_node(discriminants),
             atom(leaves, with, "with")?,
-            Syntax::node(
-                parser_kind(&["Term", "matchAlts"]),
-                vec![null_node(alternatives)],
-            ),
+            alternatives,
         ],
     ))
 }
@@ -1331,6 +1566,10 @@ fn single_tactic(syntax: Syntax) -> Syntax {
     let Some(indented) = unwrap(&syntax, "tacticSeq") else {
         return syntax;
     };
+    if matches!(&indented, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "tacticSeqBracketed"]))
+    {
+        return indented;
+    }
     let Some(items) = unwrap(&indented, "tacticSeq1Indented") else {
         return syntax;
     };
@@ -1349,10 +1588,14 @@ fn chain_at(tokens: &[LexedToken], range: Range<usize>) -> Option<usize> {
     let mut last = None;
     // `rcases … with pat` has a pattern after `with`, not alternatives holding tactics.
     let pattern_with = word(tokens, range.start, "rcases");
-    // `conv … => convSeq`: a `<;>` after the `=>` is the conv sequence's (`conv_<;>_`).
-    let conv = word(tokens, range.start, "conv");
+    // `conv … => convSeq`, and the census's `as_aux_lemma => tacticSeq` (`conv' =>`, `try? =>`):
+    // a `<;>` after the `=>` is the sequence's (`conv_<;>_`).
+    let arrow_sequence = ["conv", "conv'", "as_aux_lemma", "try?"]
+        .iter()
+        .any(|head| word(tokens, range.start, head));
+    let range_start = range.start;
     for at in range {
-        if depth == 0 && conv && symbol(tokens, at, "=>") {
+        if depth == 0 && arrow_sequence && symbol(tokens, at, "=>") {
             return last;
         }
         if depth == 0 {
@@ -1362,10 +1605,12 @@ fn chain_at(tokens: &[LexedToken], range: Range<usize>) -> Option<usize> {
                 }
                 last = Some(at);
             }
-            // A `by` owns the `<;>`s after it (`suffices h : t by … split <;> simp`).
+            // A `by` owns the `<;>`s after it (`suffices h : t by … split <;> simp`), as a
+            // tactic `if`'s branches own theirs (`if h : c then … split <;> simp_all`).
             if symbol(tokens, at, ":=")
                 || symbol(tokens, at, "by")
                 || (symbol(tokens, at, "with") && !pattern_with)
+                || (symbol(tokens, at, "then") && symbol(tokens, range_start, "if"))
             {
                 return last;
             }
@@ -1427,9 +1672,16 @@ fn split(
                 }),
                 end,
             )
-        } else if symbol(tokens, cursor, "(") {
+        } else if symbol(tokens, cursor, "(") || symbol(tokens, cursor, "{") {
+            // `(tacs)` (`Tactic.paren`) and `{ tacs }` (`tacticSeqBracketed`, a tactic as
+            // `nestedTactic`).
+            let close = if symbol(tokens, cursor, "(") {
+                ")"
+            } else {
+                "}"
+            };
             let end = plain_end(view, tokens, cursor, range.end, baseline);
-            if end <= cursor + 2 || !symbol(tokens, end - 1, ")") {
+            if end <= cursor + 2 || !symbol(tokens, end - 1, close) {
                 return Err(refusal(view, tokens, cursor));
             }
             let mut depth = 0;
@@ -1455,6 +1707,17 @@ fn split(
             )?;
             let end = plan.end;
             (Plan::Calc(plan, exact), end)
+        } else if symbol(tokens, cursor, "let")
+            && word(tokens, cursor + 1, "rec")
+            && by_equations(
+                tokens,
+                cursor + 2..block_end(view, tokens, cursor, range.end, baseline),
+            )
+        {
+            // `let rec f : T | p => e …` (`letEqnsDecl`): one plain tactic, to the line back at
+            // `baseline`.
+            let end = block_end(view, tokens, cursor, range.end, baseline);
+            (Plan::Plain(cursor..end), end)
         } else if word(tokens, cursor, "have")
             || word(tokens, cursor, "replace")
             || word(tokens, cursor, "letI")
@@ -1469,6 +1732,7 @@ fn split(
             let end = plan.end;
             (Plan::If(plan), end)
         } else if word(tokens, cursor, "cases")
+            || word(tokens, cursor, "intro") && symbol(tokens, cursor + 1, "|")
             || word(tokens, cursor, "induction")
             || word(tokens, cursor, "match")
             || word(tokens, cursor, "fun_induction")
@@ -1574,12 +1838,37 @@ fn run(
     while let Some(task) = tasks.pop() {
         match task {
             // A plain tactic parses its terms from this loop's own small frame; every other task
-            // is one `step`, whose temporaries are not live while a tactic's terms are parsed.
+            // is one `step`, whose temporaries are not live while a tactic's terms are parsed. An
+            // elimination's target and eliminator are terms too, parsed from a frame of their own.
             Task::Plain(range) => values.push(tactic(leaves, view, tokens, range)?),
+            Task::FinishElimination(plan) => {
+                finish_elimination_task(leaves, view, tokens, plan, &mut values)?
+            }
             task => step(leaves, view, tokens, task, &mut tasks, &mut values)?,
         }
     }
     Ok(values.pop().expect("root tactic sequence"))
+}
+
+/// An elimination's node from its finished bodies: `run` calls it directly, so `step`'s frame is not
+/// live while the target and eliminator terms parse.
+#[inline(never)]
+fn finish_elimination_task(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: Elimination,
+    values: &mut Vec<Syntax>,
+) -> Result<(), NatDefinitionParseError> {
+    let bodies = plan
+        .alternatives
+        .iter()
+        .filter(|alt| alt.arrow.is_some())
+        .count()
+        + usize::from(plan.pre_tactic.is_some());
+    let children = values.split_off(values.len() - bodies);
+    values.push(finish_elimination(leaves, view, tokens, plan, children)?);
+    Ok(())
 }
 
 /// One task of [`run`]'s work loop: it pushes the tasks it needs or the value it makes.
@@ -1594,15 +1883,54 @@ fn step(
 ) -> Result<(), NatDefinitionParseError> {
     match task {
         Task::Sequence(range, baseline) => {
-            // `sepByIndent tactic "; " (allowTrailingSep := true)`: a termination hint on a later
-            // line at the items' column passes the separator's `checkColEq`, pushing an empty
-            // separator that no item follows.
+            // `tacticSeq := tacticSeqBracketed <|> tacticSeq1Indented`: a sequence that is one
+            // `{ … }` is the bracketed form itself.
+            if range.len() > 2
+                && symbol(tokens, range.start, "{")
+                && symbol(tokens, range.end - 1, "}")
+                && super::rcases::closing(tokens, range.start) == Some(range.end - 1)
+            {
+                tasks.push(Task::FinishBraces(range.start, range.end - 1, true));
+                tasks.push(Task::Sequence(range.start + 1..range.end - 1, None));
+                return Ok(());
+            }
+            // Inside a quotation, a whole sequence that is one antiquotation (`first | $t | rfl`)
+            // is `tacticSeq`'s own.
+            if let Some((antiquotation, next)) = crate::quotations::antiquotation(
+                leaves,
+                view,
+                tokens,
+                range.start,
+                range.end,
+                crate::quotations::Position::TacticSeq,
+            )? && next == range.end
+            {
+                values.push(antiquotation);
+                return Ok(());
+            }
+            // `sepByIndent tactic "; " (allowTrailingSep := true)`: a termination hint, `where`,
+            // the `)`/`}` closing a parenthesized or bracketed sequence, or the `,`/`]`/`⟩` that
+            // ends the term a `by` block sits in (`⟨by tacs⏎  , by tac⟩`), on a later line at the
+            // items' column, passes the separator's `checkColEq`, pushing an empty separator that
+            // no item follows. (A chain's operand is no `sepByIndent`: a `<;>` there is not.)
             let trailing = range.end < tokens.len()
                 && range.start < range.end
-                && (symbol(tokens, range.end, "termination_by")
-                    || symbol(tokens, range.end, "decreasing_by"))
+                && [
+                    "termination_by",
+                    "decreasing_by",
+                    "where",
+                    ")",
+                    "}",
+                    ",",
+                    "]",
+                    "⟩",
+                ]
+                .iter()
+                .any(|next| symbol(tokens, range.end, next))
                 && view.normalized().line_of(tokens[range.end].extent.start())
-                    > view.normalized().line_of(tokens[range.end - 1].extent.end())
+                    > view
+                        .normalized()
+                        .line_of(tokens[range.end - 1].extent.end())
                 && column(view, tokens, range.end) == column(view, tokens, range.start);
             let (plans, separators) = split(view, tokens, range, baseline)?;
             tasks.push(Task::FinishSequence(separators, trailing));
@@ -1643,7 +1971,11 @@ fn step(
             tasks.push(Task::Sequence(in_at + 1..end, None));
         }
         Task::Group(range) => {
-            tasks.push(Task::FinishGroup(range.start, range.end - 1));
+            tasks.push(if symbol(tokens, range.start, "{") {
+                Task::FinishBraces(range.start, range.end - 1, false)
+            } else {
+                Task::FinishGroup(range.start, range.end - 1)
+            });
             tasks.push(Task::Sequence(range.start + 1..range.end - 1, None));
         }
         Task::Control(plan) => {
@@ -1684,12 +2016,13 @@ fn step(
                 .collect();
             let pre_tactic = plan.pre_tactic.clone();
             tasks.push(Task::FinishElimination(plan));
-            tasks.extend(
-                bodies
-                    .into_iter()
-                    .rev()
-                    .map(|range| Task::Sequence(range, None)),
-            );
+            tasks.extend(bodies.into_iter().rev().map(|range| {
+                if hole_body(tokens, &range) {
+                    Task::Hole(range)
+                } else {
+                    Task::Sequence(range, None)
+                }
+            }));
             // `with tac`'s tactic is read first, so its value precedes the bodies'.
             if let Some(range) = pre_tactic {
                 tasks.push(Task::Sequence(range, None));
@@ -1706,22 +2039,16 @@ fn step(
             let yes = values.pop().expect("then branch sequence");
             values.push(finish_if(leaves, view, tokens, plan, yes, no)?);
         }
-        Task::FinishElimination(plan) => {
-            let bodies = plan
-                .alternatives
-                .iter()
-                .filter(|alt| alt.arrow.is_some())
-                .count()
-                + usize::from(plan.pre_tactic.is_some());
-            let children = values.split_off(values.len() - bodies);
-            values.push(finish_elimination(leaves, view, tokens, plan, children)?);
-        }
-        task @ (Task::FinishChoice(_)
+        // `run` finishes eliminations itself (`finish_elimination_task`).
+        task @ (Task::FinishElimination(_)
+        | Task::FinishChoice(_)
         | Task::FinishChain(_)
         | Task::FinishOpen(..)
         | Task::FinishGroup(..)
+        | Task::FinishBraces(..)
         | Task::CalcTactic(_)
         | Task::By(_)
+        | Task::Hole(_)
         | Task::FinishSequence(..)) => finish_syntax(leaves, view, tokens, task, values)?,
         task @ (Task::StartCalcTactic(..)
         | Task::Calc(_)
@@ -1783,6 +2110,32 @@ fn finish_syntax(
                 ],
             ));
         }
+        Task::FinishBraces(open, close, whole) => {
+            // `tacticSeqBracketed := "{" sepByIndent tactic "; " "}"`: the rows the inner
+            // `tacticSeq1Indented` holds, between the braces.
+            let body = values.pop().expect("bracketed tactic sequence");
+            let rows = match &body {
+                Syntax::Node { args, .. } => match args.as_slice() {
+                    [Syntax::Node { kind, args, .. }]
+                        if kind == &parser_kind(&["Tactic", "tacticSeq1Indented"]) =>
+                    {
+                        args.first().cloned()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+            .ok_or_else(|| refusal(view, tokens, open))?;
+            let bracketed = Syntax::node(
+                parser_kind(&["Tactic", "tacticSeqBracketed"]),
+                vec![leaves.leaf(open)?, rows, leaves.leaf(close)?],
+            );
+            values.push(if whole {
+                Syntax::node(parser_kind(&["Tactic", "tacticSeq"]), vec![bracketed])
+            } else {
+                bracketed
+            });
+        }
         Task::FinishGroup(open, close) => {
             let body = values.pop().expect("parenthesized tactic sequence");
             values.push(Syntax::node(
@@ -1800,10 +2153,9 @@ fn finish_syntax(
             } else {
                 // `Lean.calcTactic`: the term's keyword and steps, as a tactic.
                 match &term {
-                    Syntax::Node { args, .. } => Syntax::node(
-                        Name::from_components(["Lean", "calcTactic"]),
-                        args.clone(),
-                    ),
+                    Syntax::Node { args, .. } => {
+                        Syntax::node(Name::from_components(["Lean", "calcTactic"]), args.clone())
+                    }
                     _ => term,
                 }
             });
@@ -1819,8 +2171,7 @@ fn finish_syntax(
             let count = separators.len();
             let children = values.split_off(values.len() - count);
             let mut rows = Vec::new();
-            for (index, (child, separator)) in children.into_iter().zip(separators).enumerate()
-            {
+            for (index, (child, separator)) in children.into_iter().zip(separators).enumerate() {
                 rows.push(child);
                 if let Some(separator) = separator {
                     rows.push(leaves.leaf(separator)?);
@@ -1837,10 +2188,26 @@ fn finish_syntax(
                 )],
             ));
         }
+        Task::Hole(range) => values.push(binding_term(leaves, view, tokens, range)?),
         // `step` routes only the tasks above here.
         _ => return Err(refusal(view, tokens, tokens.len().saturating_sub(1))),
     }
     Ok(())
+}
+
+/// Whether an alternative's body is a hole rather than a tactic sequence: `_`, or `?` touching
+/// `_` or a name.
+fn hole_body(tokens: &[LexedToken], range: &Range<usize>) -> bool {
+    match range.len() {
+        1 => symbol(tokens, range.start, "_"),
+        2 => {
+            symbol(tokens, range.start, "?")
+                && tokens[range.start].extent.end() == tokens[range.start + 1].extent.start()
+                && (symbol(tokens, range.start + 1, "_")
+                    || matches!(tokens[range.start + 1].kind, TokenKind::Ident(_)))
+        }
+        _ => false,
+    }
 }
 
 /// [`step`]'s calculation tasks, in a frame of their own.
@@ -1914,7 +2281,6 @@ fn calc_step(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

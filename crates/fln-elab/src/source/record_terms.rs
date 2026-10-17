@@ -8,6 +8,8 @@ use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
 
+mod imported;
+
 #[cfg(test)]
 mod expected_tests;
 #[cfg(test)]
@@ -65,6 +67,7 @@ pub(super) struct RecordParts<'a> {
 pub(super) struct RecordBuild<'a> {
     // Parent subobjects use heap continuations, never recursive elaboration.
     frames: Vec<RecordFrame<'a>>,
+    imported: Option<imported::ImportedRecord<'a>>,
 }
 struct RecordFrame<'a> {
     parents: HashMap<Name, Vec<Name>>,
@@ -79,17 +82,23 @@ struct RecordFrame<'a> {
     defaults: Vec<Option<Name>>,
     levels: Vec<Level>,
 }
+pub(super) enum RecordTarget {
+    Constructor(Expr),
+    Imported(usize),
+}
+
 pub(super) enum RecordStep<'a> {
     Field {
         syntax: &'a Syntax,
         domain: Expr,
-        codomain: Expr,
+        target: RecordTarget,
     },
     Copy {
         value: Typed,
-        codomain: Expr,
+        target: RecordTarget,
     },
     Complete(Typed),
+    Continue,
 }
 
 pub(super) enum FieldResolution {
@@ -359,18 +368,23 @@ impl Context {
                 binder_info,
                 ..
             } = receiver.type_.node()
-                && (*binder_info == BinderInfo::Implicit
-                    || *binder_info == BinderInfo::InstImplicit
-                    || has_arguments && *binder_info == BinderInfo::StrictImplicit)
             {
-                let argument = if *binder_info == BinderInfo::InstImplicit {
-                    self.instance_hole(binder_type.clone())?
+                let argument = if *binder_info == BinderInfo::Implicit
+                    || has_arguments && *binder_info == BinderInfo::StrictImplicit
+                {
+                    Some(self.hole(binder_type.clone())?)
+                } else if *binder_info == BinderInfo::InstImplicit {
+                    Some(self.instance_hole(binder_type.clone())?)
                 } else {
-                    self.hole(binder_type.clone())?
+                    // The pin's receiver `consumeImplicits` also applies
+                    // leading `optParam` defaults before namespace lookup.
+                    optional::default_value(binder_type).cloned()
                 };
-                receiver.type_ = self.substitute(body, &argument)?;
-                receiver.value = Expr::app(receiver.value, argument);
-                continue;
+                if let Some(argument) = argument {
+                    receiver.type_ = self.substitute(body, &argument)?;
+                    receiver.value = Expr::app(receiver.value, argument);
+                    continue;
+                }
             }
             let mut head = &receiver.type_;
             let mut arguments = Vec::new();
@@ -451,11 +465,26 @@ impl Context {
                     base,
                 });
             }
+            if let Some(recursion) = &self.well_founded
+                && recursion.name == method
+            {
+                if recursion.proving {
+                    return Err(failure(SourceInferenceError::Recursion(
+                        recursion::RecursionError::RecursionInDecreasingProof,
+                    )));
+                }
+                return Ok(FieldResolution::Method {
+                    function: recursion.reference.clone(),
+                    receiver,
+                    base,
+                });
+            }
             // Before the recursion context exists, a reference to the declaration being
             // defined is reported as the unknown constant it still is, exactly as a direct
             // `T.size l` is: `definition_body` retries such a failure with the structural
             // recursion context, where the branch above resolves it.
             if self.recursion.is_none()
+                && self.well_founded.is_none()
                 && self.defining.as_ref() == Some(&method)
                 && !self.txn.env.contains(&method)
             {
@@ -809,8 +838,16 @@ impl Context {
         expected: Option<Expr>,
         sources: Vec<Typed>,
     ) -> Result<RecordBuild<'a>, NatDefinitionElabError> {
+        let frame = self.start_record_frame(parts, expected, sources)?;
+        if let Some(layout) = self.imported_record_layout(&frame)? {
+            return Ok(RecordBuild {
+                frames: Vec::new(),
+                imported: Some(self.start_imported_record(frame, layout)?),
+            });
+        }
         Ok(RecordBuild {
-            frames: vec![self.start_record_frame(parts, expected, sources)?],
+            frames: vec![frame],
+            imported: None,
         })
     }
 
@@ -992,6 +1029,9 @@ impl Context {
         &mut self,
         state: &mut RecordBuild<'a>,
     ) -> Result<RecordStep<'a>, NatDefinitionElabError> {
+        if let Some(imported) = &mut state.imported {
+            return self.next_imported_record_field(imported);
+        }
         loop {
             self.tick()?;
             let frame = state
@@ -1027,7 +1067,11 @@ impl Context {
                         let Some(codomain) = finished.return_codomain else {
                             return Ok(RecordStep::Complete(term));
                         };
-                        self.accept_record_field(state, &codomain, term)?;
+                        self.accept_record_field(
+                            state,
+                            &RecordTarget::Constructor(codomain),
+                            term,
+                        )?;
                         continue;
                     }
                     // Copy a whole available parent before considering defaults:
@@ -1080,7 +1124,10 @@ impl Context {
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                 if let Some(value) = attempt? {
                     *self = trial;
-                    return Ok(RecordStep::Copy { value, codomain });
+                    return Ok(RecordStep::Copy {
+                        value,
+                        target: RecordTarget::Constructor(codomain),
+                    });
                 }
             }
             let frame = state.frames.last_mut().expect("active record frame");
@@ -1165,7 +1212,7 @@ impl Context {
                         let value = self.finish_term(value, Some(binder_type))?;
                         return Ok(RecordStep::Copy {
                             value,
-                            codomain: body.clone(),
+                            target: RecordTarget::Constructor(body.clone()),
                         });
                     }
                     Err(NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
@@ -1185,7 +1232,16 @@ impl Context {
                     return Err(failure(SourceInferenceError::Scope));
                 };
                 let mut value = Typed {
-                    value: Expr::const_(helper.clone(), state.levels.clone()),
+                    // The pin's instantiateStructDefaultValueFn? instantiates
+                    // the registered helper's checked body, rather than leaving
+                    // an application of its semireducible name. Later fields
+                    // must see the actual chosen value at their expected type,
+                    // without changing ordinary instance-search transparency.
+                    value: self.instantiate_params(
+                        &definition.value,
+                        &definition.base.level_params,
+                        &state.levels,
+                    )?,
                     type_: self.instantiate_params(
                         &definition.base.type_,
                         &definition.base.level_params,
@@ -1208,12 +1264,15 @@ impl Context {
                         return Err(failure(SourceInferenceError::Scope));
                     };
                     value.type_ = self.substitute(body, &argument)?;
-                    value.value = Expr::app(value.value, argument);
+                    let ExprNode::Lam { body, .. } = value.value.node() else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    value.value = self.substitute(body, &argument)?;
                 }
                 let value = self.finish_term(value, Some(binder_type))?;
                 return Ok(RecordStep::Copy {
                     value,
-                    codomain: body.clone(),
+                    target: RecordTarget::Constructor(body.clone()),
                 });
             }
             return Err(error(RecordTermError::MissingField(binder_name.clone())));
@@ -1221,17 +1280,26 @@ impl Context {
         Ok(RecordStep::Field {
             syntax,
             domain: binder_type.clone(),
-            codomain: body.clone(),
+            target: RecordTarget::Constructor(body.clone()),
         })
     }
 
     pub(super) fn accept_record_field(
         &mut self,
         state: &mut RecordBuild<'_>,
-        codomain: &Expr,
+        target: &RecordTarget,
         value: Typed,
     ) -> Result<(), NatDefinitionElabError> {
         self.tick()?;
+        if let Some(imported) = &mut state.imported {
+            let RecordTarget::Imported(index) = target else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            return self.accept_imported_record_field(imported, *index, value);
+        }
+        let RecordTarget::Constructor(codomain) = target else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
         let state = state
             .frames
             .last_mut()

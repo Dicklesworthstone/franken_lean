@@ -1,0 +1,98 @@
+name: Checked source object transfer
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-text-patterns-transfer.yml']
+permissions:
+  contents: read
+jobs:
+  transfer:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: a751969ca531afbb820d000083a46f9834a7c9da
+          persist-credentials: false
+      - name: Transfer exact tested files without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-transfer'
+          root.mkdir()
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          def request(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(api + path, data=body, headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '1f04b8dcc113541f604f5af0f4de4c435295bf16'
+          parts = [
+              'c381183495afeb155f5b3687bb41b620a234e7c7',
+              'ff0ed09408753f6efc73110347753ff0b1f909d4',
+              'ad45e5146387bd6f90e4013f0d54d8f7f467a45f',
+              'fee63d3b481fc1af3e286d6d1205973b9287a98f',
+              'daffca5d366ccb4d36855f6a396863d7625af3b6',
+              '09c32974c19687b8adb8ece8dc910894e749317a',
+          ]
+          chunks = []
+          for source in parts:
+              obj = request('/git/blobs/' + source)
+              assert obj['encoding'] == 'base64' and obj['size'] <= 1200
+              chunk = base64.b64decode(obj['content'])
+              assert blob(chunk) == source
+              chunks.append(chunk)
+          compressed = b''.join(chunks)
+          assert blob(compressed) == 'a916646ca38406eba9eebbc0581438770bb720cd'
+          assert hashlib.sha256(compressed).hexdigest() == '81b5c2b511c75109af237e856a01c22d9079fd25ed40e2f64075ddf3a631f7c1'
+          manifest = json.loads(gzip.decompress(compressed))
+          expected = {
+              'crates/fln/src/source_check/grammar/quotation_scope.rs': {'before': '895a38b7f5f02f54bdce7838a7c92df42f840a96', 'after': '3db0619e0f4b6eb5d2a312a637751714c60a21c9'},
+              'crates/fln/src/source_check/grammar/quotation_scope/do_notation.rs': {'before': 'cf813f3f22176a6309c155e2e4b821b3de7e50d3', 'after': '8d74d674b343a993fa842efd5933d5179bf34eca'},
+              'crates/fln/src/source_check/grammar/quotation_scope/matches.rs': {'before': '6e28f6652e000ea90d7b6753b08b3d74e6a5c5a8', 'after': 'bce25154ef82da36bbbaa4892a1cf4785cc8e836'},
+              'crates/fln/tests/source_quotation_do.rs': {'before': '0daa4d979aa4cc50c389afc80eb53464604791b4', 'after': '414b7cfe50f375c5808e077298d2c5b774394519'},
+          }
+          assert manifest['files'] == expected
+          patch = manifest['patch'].encode()
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(expected) and len(paths) == len(set(paths))
+          assert '\ndeleted file mode ' not in patch.decode()
+          for path, identities in expected.items():
+              file = pathlib.Path(path)
+              assert not file.is_symlink() and not any(parent.is_symlink() for parent in file.parents)
+              assert blob(file.read_bytes()) == identities['before'], path
+          patch_file = root / 'source.patch'
+          patch_file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', str(patch_file)], check=True)
+          subprocess.run(['git', 'apply', str(patch_file)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, identities in expected.items():
+              assert blob(pathlib.Path(path).read_bytes()) == identities['after'], path
+          for path, identities in expected.items():
+              data = pathlib.Path(path).read_bytes()
+              data.decode('utf-8')
+              result = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert result['sha'] == identities['after'], path
+              print(result['sha'], path)
+          # No commit or ref operation occurs here. The connected GitHub
+          # client compares current main before its guarded publication.
+          (root / 'manifest.json').write_text(json.dumps(expected, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: source-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/source-transfer
+          retention-days: 7
+          if-no-files-found: error

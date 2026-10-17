@@ -88,6 +88,43 @@ fn parts<'a>(
     Ok(())
 }
 
+/// Whether `declaration` mentions `sorryAx` anywhere, the pin's `Declaration.hasSorry`
+/// (`Lean/Util/Sorry.lean`), which decides its "declaration uses `sorry`" warning
+/// (`warnIfUsesSorry`, `Lean/AddDecl.lean`).
+///
+/// Unbudgeted, as the pin's is: the walk visits each distinct node of a declaration the
+/// kernel already admitted once. It must not spend the command's ingress budget, or a
+/// small one would stop here rather than at the preparation it bounds.
+pub(super) fn uses_sorry(declaration: &Declaration) -> Result<bool, EngineExecutionError> {
+    let limit = usize::MAX;
+    let sorry = Name::from_components(["sorryAx"]);
+    let mut found = false;
+    let mut spent = 0;
+    parts(declaration, &mut |part| {
+        if let Part::Expression(expr) = part
+            && !found
+        {
+            let mut references = BTreeSet::new();
+            collect_constant_references(expr, &mut references, &mut spent, limit).map_err(
+                |error| match error {
+                    ConstantReferenceCollectionError::PresentationLimit { observed, limit } => {
+                        EngineExecutionError::SourceDependencyPresentationLimit { observed, limit }
+                    }
+                    ConstantReferenceCollectionError::AllocationFailure { requested } => {
+                        EngineExecutionError::AllocationFailure {
+                            resource: "sorry detection worklist",
+                            requested,
+                        }
+                    }
+                },
+            )?;
+            found = references.contains(&sorry);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn published(
     subjects: &SourceModuleVisibilitySubjects<'_>,
     visit: &mut impl FnMut(&Declaration, usize) -> Result<(), EngineExecutionError>,

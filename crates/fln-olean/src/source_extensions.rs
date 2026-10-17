@@ -1,5 +1,5 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! protected-declaration and extern-attribute journals.
+//! protected-declaration, auxiliary-recursor, structure, extern, implemented_by and initialization journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -16,13 +16,26 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION, INSTANCE_EXTENSION,
-    PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, SIMP_EXTENSION,
+    ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, CLASS_EXTENSION, DEFAULT_EXTENSION, EXTERN_EXTENSION,
+    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION, PROTECTED_EXTENSION,
+    REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
+mod structures;
+pub use structures::{StructureEntry, StructureField, StructureParent};
+
+/// The private extension name contains a numeric component. Parsing its display
+/// spelling as a dot-separated string would produce a different Lean Name.
+pub fn structure_extension_name() -> Name {
+    let module = Name::from_components(format::STRUCTURE_EXTENSION_MODULE.split('.'));
+    let prefix = Name::from_components([format::STRUCTURE_PRIVATE_HEADER]).append_core(&module);
+    Name::num(prefix, format::STRUCTURE_EXTENSION_PRIVATE_INDEX).append_core(
+        &Name::from_components(format::STRUCTURE_EXTENSION_DECLARATION.split('.')),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassEntry {
@@ -79,6 +92,14 @@ pub struct AliasEntry {
     pub declaration: Name,
 }
 
+/// The pin's `implementedByAttr`: an explicit executable replacement. Both
+/// names still need checked ownership/type validation before source activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplementedByEntry {
+    pub declaration: Name,
+    pub implementation: Name,
+}
+
 /// The pin's `ReducibilityStatus` (vendored `src/Lean/ReducibilityAttrs.lean`):
 /// which transparency modes may unfold a definition. `ImplicitReducible`
 /// unfolds at `instances` transparency and above; instances carry it.
@@ -107,11 +128,24 @@ pub struct SourceExtensions {
     /// `protected` declarations (the pin's `protectedExt`): each entry names one
     /// declaration its own module tagged. A name tagged twice is refused.
     pub protected: Vec<Name>,
+    /// Generated auxiliary recursors (the pin's `auxRecExt`), recorded only by
+    /// their owning module. A suffix alone never supplies this metadata.
+    pub aux_recursors: Vec<Name>,
+    /// Noncomputable tags, interpreted only after checking their owning module.
+    pub noncomputable: Vec<Name>,
+    /// Structure fields and extends-clause metadata, still awaiting checked
+    /// constructor/projection validation by the source importer.
+    pub structures: Vec<StructureEntry>,
     /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
     pub reducibility: Vec<ReducibilityEntry>,
     /// Explicit extern bindings. Consumers must validate their declarations and
     /// selected backend/symbol before granting executable authority.
     pub externs: Vec<ExternAttribute>,
+    /// Executable replacements, separate from the declarations' logical bodies.
+    pub implemented_by: Vec<ImplementedByEntry>,
+    /// Ordered initialization journals. A named initializer replaces a stored
+    /// body at runtime; an anonymous parameter denotes a standalone IO action.
+    pub initializers: crate::initializers::InitJournals,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -120,7 +154,7 @@ pub struct SourceExtensions {
 pub struct DecodeLimits {
     pub max_bytes: usize,
     pub max_objects: u64,
-    /// Cumulative journal rows plus nested extern list cells.
+    /// Cumulative journal rows, extern list cells, and structure array cells.
     pub max_entries: usize,
     pub max_indices: usize,
     /// Cumulative instance `DiscrTree` keys across the batch.
@@ -408,6 +442,12 @@ pub fn decode(
         name(format::PROTECTED_EXTENSION),
         name(format::REDUCIBILITY_EXTENSION),
         name(format::EXTERN_EXTENSION),
+        name(format::IMPLEMENTED_BY_EXTENSION),
+        name(format::AUX_RECURSOR_EXTENSION),
+        name(crate::initializers::REGULAR_INIT_EXTENSION),
+        name(crate::initializers::BUILTIN_INIT_EXTENSION),
+        structure_extension_name(),
+        name(format::NONCOMPUTABLE_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -420,6 +460,9 @@ pub fn decode(
     };
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();
+    let mut aux_recursors = BTreeSet::new();
+    let mut noncomputable = BTreeSet::new();
+    let mut structures = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
             return Err(shape("duplicate extension block"));
@@ -461,7 +504,51 @@ pub fn decode(
                 7 => out
                     .externs
                     .push(reader.extern_attribute(&obj, &mut entries_left)?),
-                _ => unreachable!("eight selected extension families"),
+                8 => {
+                    // ParametricAttribute Name exports Name × Name, the same
+                    // extracted Prod shape as aliases, in declaration/target order.
+                    let pair = reader.alias(&obj)?;
+                    out.implemented_by.push(ImplementedByEntry {
+                        declaration: pair.alias,
+                        implementation: pair.declaration,
+                    });
+                }
+                9 => {
+                    let declaration = reader.name(&obj)?;
+                    if !aux_recursors.insert(declaration.clone()) {
+                        return Err(shape("auxiliary recursor tagged twice"));
+                    }
+                    out.aux_recursors.push(declaration);
+                }
+                10 => out
+                    .initializers
+                    .regular
+                    .push(crate::initializers::project_entry(
+                        &mut reader.conversion,
+                        &obj,
+                    )?),
+                11 => out
+                    .initializers
+                    .builtin
+                    .push(crate::initializers::project_entry(
+                        &mut reader.conversion,
+                        &obj,
+                    )?),
+                12 => {
+                    let row = reader.structure(&obj, &mut entries_left)?;
+                    if !structures.insert(row.name.clone()) {
+                        return Err(shape("structure metadata registered twice"));
+                    }
+                    out.structures.push(row);
+                }
+                13 => {
+                    let declaration = reader.name(&obj)?;
+                    if declaration.is_anonymous() || !noncomputable.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated noncomputable declaration"));
+                    }
+                    out.noncomputable.push(declaration);
+                }
+                _ => unreachable!("fourteen selected extension families"),
             }
         }
     }

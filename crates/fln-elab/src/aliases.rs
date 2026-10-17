@@ -153,6 +153,13 @@ impl AliasTable {
         self.targets.get(alias).map_or(&[], Vec::as_slice)
     }
 
+    /// Every alias with the declarations it names, in alias order.
+    pub fn entries(&self) -> impl Iterator<Item = (&Name, &[Name])> {
+        self.targets
+            .iter()
+            .map(|(alias, targets)| (alias, targets.as_slice()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }

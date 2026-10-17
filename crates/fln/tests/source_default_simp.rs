@@ -36,6 +36,40 @@ const WRAP: &str = "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
     theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n";
 
 #[test]
+fn simp_preserves_terminal_predicates_while_opening_rule_binders() {
+    let base = engine();
+    // The pin accepts the selected fact at its declared predicate and refuses
+    // to unfold that predicate just to select the fact at a different goal.
+    for opacity in ["", "attribute [irreducible] Named\n"] {
+        let declarations = format!(
+            "def Named (p : Prop) : Prop := p\n\
+             theorem namedFact (p : Prop) (h : p) : Named p := h\n{opacity}"
+        );
+        let scoped = checked(&base, &[&declarations]).engine;
+        let root = scoped.logical_root(&KVMap::new());
+        checked(
+            &scoped,
+            &["theorem selected (p : Prop) (h : p) : Named p := by simp only [namedFact p h]"],
+        );
+        let refusal = scoped
+            .check_source_files(
+                &[b"theorem unrelatedHead (p : Prop) (h : p) : p := by simp only [namedFact p h]"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("simp only must preserve the selected fact's predicate");
+        assert!(
+            !matches!(
+                refusal.disposition().0,
+                "resource" | "inconclusive" | "internal-fault"
+            ),
+            "predicate selection is a semantic refusal: {refusal:?}"
+        );
+        assert_eq!(scoped.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
 fn inline_simp_attributes_are_registered_only_after_checked_admission() {
     let base = engine();
     let result = checked(
@@ -574,28 +608,25 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
     );
 }
 
-/// The parser keeps every attribute the pin parses in the declaration's tree; the elaborator
-/// implements one global `simp` and refuses the rest, so no attribute is dropped and none is
+/// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
+/// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
+/// change no checked meaning, and refuses the rest. So no attribute is dropped and none is
 /// admitted without its meaning.
 #[test]
 fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     let base = engine();
     for source in [
-        "@[inline] def x : Nat := 0",
+        "@[macro_inline] def x : Nat := 0",
         "@[simp, inline] theorem t : (0 : Nat) = 0 := by rfl",
         "@[local simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
         "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
         "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
-        "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
         "@[extern \"lean_x\"] def x : Nat := 0",
         "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp] example : (0 : Nat) = 0 := by rfl",
-        // An instance's attributes likewise, inert or not; the instance alone is admitted below.
-        "@[inline] instance : OfNat Bool 7 := ⟨false⟩",
-        "@[default_instance] instance : OfNat Bool 7 := ⟨false⟩",
     ] {
         assert!(
             fln_parse::parse_definition(source.as_bytes()).is_ok(),
@@ -604,6 +635,23 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         refused(&base, source);
     }
     checked(&base, &["instance : OfNat Bool 7 := ⟨false⟩"]);
+    // A default instance is now admitted through checked registration, including
+    // when the same declaration also installs an ordinary instance.
+    checked(
+        &base,
+        &[
+            "@[default_instance] instance : OfNat Bool 7 := ⟨false⟩",
+            "theorem defaultNumeral : (7 : Bool) = false := by rfl",
+        ],
+    );
+    // The code generator hints are admitted, on a definition and on an instance.
+    for source in [
+        "@[inline] def x : Nat := 0",
+        "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
+        "@[inline] instance : OfNat Bool 7 := ⟨false⟩",
+    ] {
+        checked(&base, &[source]);
+    }
 }
 
 /// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000
@@ -631,5 +679,53 @@ fn named_simp_priorities_register_their_values() {
             .find(|rule| rule.declaration == Name::from_components(["again"]))
             .unwrap_or_else(|| panic!("{priority}: {rules:?}"));
         assert_eq!(rule.priority, value, "{priority}");
+    }
+}
+
+#[test]
+fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
+    let mut source = String::from(
+        "def wrap (n : Nat) : Nat := n
+         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl
+",
+    );
+    for index in 0..34 {
+        source.push_str(&format!(
+            "@[simp] def unrelated_def_{index} (n : Nat) : Nat := n
+"
+        ));
+    }
+    for index in 0..4000 {
+        source.push_str(&format!(
+            "@[simp] theorem unrelated_{index} : True := True.intro
+"
+        ));
+    }
+    source.push_str(
+        "theorem use_default (n : Nat) : wrap n = n := by simp
+",
+    );
+    let result = checked(&engine(), &[&source]);
+    assert_eq!(result.theorems, 4002);
+    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);
+    for source in [
+        "attribute [-simp] unwrap
+theorem missing_rule (n : Nat) : wrap n = n := by simp",
+        "theorem false_goal : (0 : Nat) = 1 := by simp",
+    ] {
+        let error = result
+            .engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        let diagnostic = format!("{error}");
+        assert!(
+            diagnostic.contains("simp only made no progress")
+                || diagnostic.contains("unsolved goals"),
+            "{diagnostic}"
+        );
     }
 }

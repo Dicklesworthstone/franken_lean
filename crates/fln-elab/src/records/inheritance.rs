@@ -250,45 +250,91 @@ pub fn register_parents(
     if rows.is_empty() {
         return Ok(env.clone());
     }
-    let mut registry = RecordParents::read(env)?;
-    let count: usize = registry.rows.values().map(Vec::len).sum();
-    if count.saturating_add(rows.len()) > MAX_ROWS {
-        return Err(RecordError::ResourceLimit);
-    }
-    let mut remaining = RecordBudget::default().max_nodes;
-    let mut bytes_left = MAX_BYTES;
-    if let Some(extension) = env.extension(&extension_name()) {
-        for entry in extension.entries() {
-            bytes_left = bytes_left
-                .checked_sub(entry.payload.len())
-                .ok_or(RecordError::ResourceLimit)?;
-        }
-    }
-    let mut payloads = Vec::new();
-    for row in rows {
-        validate(env, row, &mut remaining)?;
-        registry.insert(row.clone())?;
-        let mut payload = MAGIC.to_vec();
-        write_name(&row.record, &mut payload).map_err(codec_error)?;
-        payload.extend(row.field.to_le_bytes());
-        write_name(&row.parent, &mut payload).map_err(codec_error)?;
-        bytes_left = bytes_left
-            .checked_sub(payload.len())
+    Registration::read(env)?
+        .append(env, rows)
+        .map(|(_, env)| env)
+}
+
+/// Kept only by the private imported-structure activation. The environment's
+/// constants and this journal cannot change through any other activation method.
+/// Every new row follows the public registration checks; the completed import
+/// reads the entire journal again before publishing its successor.
+#[derive(Debug)]
+pub(super) struct Registration {
+    registry: RecordParents,
+    rows_left: usize,
+    bytes_left: usize,
+}
+
+impl Registration {
+    pub(super) fn read(env: &Environment) -> Result<Self, RecordError> {
+        let registry = RecordParents::read(env)?;
+        let count: usize = registry.rows.values().map(Vec::len).sum();
+        let rows_left = MAX_ROWS
+            .checked_sub(count)
             .ok_or(RecordError::ResourceLimit)?;
-        payloads.push(payload);
+        let mut bytes_left = MAX_BYTES;
+        if let Some(extension) = env.extension(&extension_name()) {
+            for entry in extension.entries() {
+                bytes_left = bytes_left
+                    .checked_sub(entry.payload.len())
+                    .ok_or(RecordError::ResourceLimit)?;
+            }
+        }
+        Ok(Self {
+            registry,
+            rows_left,
+            bytes_left,
+        })
     }
-    let mut out = if env.extension(&extension_name()).is_none() {
-        env.register_extension(descriptor())
-            .map_err(|_| RecordError::InvalidTelescope)?
-    } else {
-        env.clone()
-    };
-    for payload in payloads {
-        out = out
-            .push_extension_entry(&extension_name(), payload)
-            .map_err(|_| RecordError::InvalidTelescope)?;
+
+    pub(super) fn parents(&self, record: &Name) -> &[RecordParent] {
+        self.registry.parents(record)
     }
-    Ok(out)
+
+    pub(super) fn append(
+        mut self,
+        env: &Environment,
+        rows: &[RecordParent],
+    ) -> Result<(Self, Environment), RecordError> {
+        if rows.is_empty() {
+            return Ok((self, env.clone()));
+        }
+        self.rows_left = self
+            .rows_left
+            .checked_sub(rows.len())
+            .ok_or(RecordError::ResourceLimit)?;
+        let mut remaining = RecordBudget::default().max_nodes;
+        let mut payloads = Vec::new();
+        payloads
+            .try_reserve_exact(rows.len())
+            .map_err(|_| RecordError::ResourceLimit)?;
+        for row in rows {
+            validate(env, row, &mut remaining)?;
+            self.registry.insert(row.clone())?;
+            let mut payload = MAGIC.to_vec();
+            write_name(&row.record, &mut payload).map_err(codec_error)?;
+            payload.extend(row.field.to_le_bytes());
+            write_name(&row.parent, &mut payload).map_err(codec_error)?;
+            self.bytes_left = self
+                .bytes_left
+                .checked_sub(payload.len())
+                .ok_or(RecordError::ResourceLimit)?;
+            payloads.push(payload);
+        }
+        let mut out = if env.extension(&extension_name()).is_none() {
+            env.register_extension(descriptor())
+                .map_err(|_| RecordError::InvalidTelescope)?
+        } else {
+            env.clone()
+        };
+        for payload in payloads {
+            out = out
+                .push_extension_entry(&extension_name(), payload)
+                .map_err(|_| RecordError::InvalidTelescope)?;
+        }
+        Ok((self, out))
+    }
 }
 
 #[cfg(test)]

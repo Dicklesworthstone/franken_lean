@@ -3,6 +3,9 @@
 
 use super::*;
 
+mod implemented_by;
+mod write;
+
 fn raw_bytes_environment() -> Option<Environment> {
     let mut environment = raw_pin_environment()?;
     let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB").unwrap());

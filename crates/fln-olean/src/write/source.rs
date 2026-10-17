@@ -5,9 +5,12 @@
 //! arrays and records share the module's object and byte budgets.
 use super::*;
 use crate::source_extension_format as layout;
-use crate::source_extensions::{ClassEntry, InstanceEntry, InstanceKey, ReducibilityEntry};
+use crate::source_extensions::{
+    ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
+};
 use std::collections::HashSet;
 
+mod defaults;
 mod instances;
 mod namespaces;
 mod reducibility;
@@ -17,11 +20,19 @@ pub struct SourceMetadata {
     pub classes: Vec<ClassEntry>,
     /// Chronological global/scoped entries, retaining repeated priority updates.
     pub instances: Vec<InstanceEntry>,
+    /// Chronological module-owned defaults, preserving repeated registrations
+    /// and rows for candidates whose declarations belong to imported modules.
+    pub defaults: Vec<DefaultEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
     /// entries, one `Name` each. They are written sorted by `Name.quickLt`, the
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
     /// reading this module answers `isProtected` correctly.
     pub protected: Vec<Name>,
+    /// This module's own internally generated auxiliary recursors, written as
+    /// the pin's `auxRecExt` tag array in `Name.quickLt` order.
+    pub aux_recursors: Vec<Name>,
+    /// Module-owned `Lean.noncomputableExt` tags, sorted by `Name.quickLt`.
+    pub noncomputable: Vec<Name>,
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
@@ -90,11 +101,32 @@ impl Encoder {
         if !metadata.instances.is_empty() {
             blocks.push(self.instance_block(&metadata.instances)?);
         }
+        if !metadata.defaults.is_empty() {
+            blocks.push(self.default_block(&metadata.defaults)?);
+        }
         if !metadata.protected.is_empty() {
-            blocks.push(self.protected_block(&metadata.protected)?);
+            blocks.push(self.tagged_names_block(
+                layout::PROTECTED_EXTENSION,
+                &metadata.protected,
+                "anonymous or duplicate protected declaration",
+            )?);
+        }
+        if !metadata.aux_recursors.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::AUX_RECURSOR_EXTENSION,
+                &metadata.aux_recursors,
+                "anonymous or duplicate auxiliary recursor",
+            )?);
         }
         if !metadata.reducibility.is_empty() {
             blocks.push(self.reducibility_block(&metadata.reducibility)?);
+        }
+        if !metadata.noncomputable.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::NONCOMPUTABLE_EXTENSION,
+                &metadata.noncomputable,
+                "anonymous or duplicate noncomputable declaration",
+            )?);
         }
         Ok(blocks)
     }
@@ -125,29 +157,30 @@ impl Encoder {
         self.ctor(0, vec![name, entries], &[])
     }
 
-    /// `protectedExt`'s entries: each a `Name`, in `Name.quickLt` order, as
-    /// `mkTagDeclarationExtension`'s `toArrayFn` writes them.
-    fn protected_block(&mut self, protected: &[Name]) -> WResult<Obj> {
-        self.source_array_bound(protected.len())?;
-        let mut sorted: Vec<&Name> = protected.iter().collect();
+    /// `TagDeclarationExtension` entries: each a `Name`, in `Name.quickLt`
+    /// order, as `mkTagDeclarationExtension`'s `toArrayFn` writes them.
+    fn tagged_names_block(
+        &mut self,
+        extension: &str,
+        tagged: &[Name],
+        invalid: &'static str,
+    ) -> WResult<Obj> {
+        self.source_array_bound(tagged.len())?;
+        let mut sorted: Vec<&Name> = tagged.iter().collect();
         sorted.sort_by(|left, right| left.quick_cmp(right));
         if sorted.iter().any(|name| name.is_anonymous())
             || sorted
                 .windows(2)
                 .any(|pair| pair[0].quick_cmp(pair[1]) == std::cmp::Ordering::Equal)
         {
-            return Err(WriteError::Contract {
-                what: "anonymous or duplicate protected declaration",
-            });
+            return Err(WriteError::Contract { what: invalid });
         }
         let mut entries = Vec::with_capacity(sorted.len());
         for name in sorted {
             entries.push(self.name(name)?);
         }
         let entries = self.array(entries)?;
-        let name = self.name(&Name::from_components(
-            layout::PROTECTED_EXTENSION.split('.'),
-        ))?;
+        let name = self.name(&Name::from_components(extension.split('.')))?;
         self.ctor(0, vec![name, entries], &[])
     }
 }
@@ -252,6 +285,133 @@ mod tests {
             original.report.runtime_objects,
             typed.report.runtime_objects
         );
+    }
+    #[test]
+    fn noncomputable_tags_roundtrip_without_namespace_or_other_metadata() {
+        let names = vec![
+            Name::from_components(["simple"]),
+            Name::from_components(["A", "f"]),
+            Name::from_components(["A.f"]),
+            Name::str(
+                Name::num(Name::from_components(["_private", "Lib"]), 0),
+                "value",
+            ),
+        ];
+        let metadata = SourceMetadata {
+            noncomputable: names.clone(),
+            ..SourceMetadata::default()
+        };
+        let encoded = encode_module_with_source_metadata(
+            input(),
+            &metadata,
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let blocks = crate::region::OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+            .unwrap();
+        assert_eq!(blocks.len(), 1, "no namespace was inferred from tag names");
+        assert_eq!(
+            blocks[0].name,
+            Name::from_components(layout::NONCOMPUTABLE_EXTENSION.split('.'))
+        );
+        let mut sorted = names;
+        sorted.sort_by(Name::quick_cmp);
+        let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+        assert_eq!(decoded.noncomputable, sorted);
+        assert!(decoded.uninterpreted.is_empty());
+        assert!(decoded.aux_recursors.is_empty() && decoded.protected.is_empty());
+        let mut repeated = blocks.clone();
+        let duplicate = repeated[0].entries[0].clone();
+        repeated[0].entries.push(duplicate);
+        assert!(source_extensions::decode(&repeated, DecodeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn noncomputable_metadata_spends_shared_writer_and_decoder_budgets() {
+        let metadata = SourceMetadata {
+            noncomputable: vec![Name::from_components(["x"])],
+            ..SourceMetadata::default()
+        };
+        let encoded = encode_module_with_source_metadata(
+            input(),
+            &metadata,
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let exact = WriteBudget {
+            max_bytes: encoded.report.file_bytes,
+            max_objects: encoded.report.runtime_objects,
+        };
+        assert_eq!(
+            encode_module_with_source_metadata(input(), &metadata, header(), exact)
+                .unwrap()
+                .bytes,
+            encoded.bytes
+        );
+        for budget in [
+            WriteBudget {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            WriteBudget {
+                max_objects: exact.max_objects - 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                encode_module_with_source_metadata(input(), &metadata, header(), budget),
+                Err(WriteError::Budget { .. })
+            ));
+        }
+        let blocks = crate::region::OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+            .unwrap();
+        for limits in [
+            DecodeLimits {
+                max_entries: 0,
+                ..DecodeLimits::default()
+            },
+            DecodeLimits {
+                max_bytes: 0,
+                ..DecodeLimits::default()
+            },
+            DecodeLimits {
+                max_objects: 0,
+                ..DecodeLimits::default()
+            },
+        ] {
+            assert!(source_extensions::decode(&blocks, limits).is_err());
+        }
+        assert_eq!(
+            source_extensions::decode(&blocks, DecodeLimits::default())
+                .unwrap()
+                .noncomputable,
+            metadata.noncomputable
+        );
+    }
+
+    #[test]
+    fn noncomputable_writer_refuses_anonymous_and_repeated_tags() {
+        let name = Name::from_components(["x"]);
+        for names in [vec![Name::anonymous()], vec![name.clone(), name]] {
+            assert!(matches!(
+                encode_module_with_source_metadata(
+                    input(),
+                    &SourceMetadata {
+                        noncomputable: names,
+                        ..SourceMetadata::default()
+                    },
+                    header(),
+                    WriteBudget::default()
+                ),
+                Err(WriteError::Contract { .. })
+            ));
+        }
     }
     #[test]
     fn class_records_roundtrip_under_exact_shared_writer_limits() {

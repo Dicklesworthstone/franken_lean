@@ -33,6 +33,9 @@ use std::fmt;
 use fln_core::expr::{Expr, ExprNode, Literal};
 use fln_core::name::Name;
 
+pub mod omega;
+pub use omega::{LinearConstraint, OmegaOutcome};
+
 // ---------------------------------------------------------------------------
 // §12.1 — simp driver
 // ---------------------------------------------------------------------------
@@ -411,26 +414,6 @@ pub enum NormNumOutcome {
     /// Expression is not a supported numeric form.
     Unsupported,
     /// Budget exhausted.
-    Inconclusive,
-}
-
-/// A linear constraint for `omega`: `coeffs[0]*x0 + coeffs[1]*x1 + ... ≤ bound`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinearConstraint {
-    /// Coefficients, indexed by variable ordinal.
-    pub coeffs: Vec<i64>,
-    /// Upper bound of the constraint.
-    pub bound: i64,
-}
-
-/// Outcome of the `omega` decision procedure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OmegaOutcome {
-    /// The system is unsatisfiable; proof certificate attached.
-    Unsat { certificate: Vec<u8> },
-    /// The system is satisfiable; a witness is attached.
-    Sat { witness: Vec<i64> },
-    /// Budget or scope exceeded.
     Inconclusive,
 }
 

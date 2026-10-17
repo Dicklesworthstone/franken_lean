@@ -3,6 +3,8 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod binders;
+mod dsimp;
 mod locations;
 mod simpa;
 mod unfold;
@@ -33,6 +35,36 @@ impl SimpRule<'_> {
 }
 
 impl Context {
+    /// Expand explicitly selected definitions for the `unfold` tactic.
+    /// Resolution, safety and local-shadowing semantics are shared with explicit
+    /// simp unfolding; callers decide which proof-state locations are replaced.
+    pub(in crate::source) fn unfold_tactic_expression(
+        &mut self,
+        names: &[Syntax],
+        target: &Expr,
+    ) -> Result<(Expr, bool), NatDefinitionElabError> {
+        let mut current = target.clone();
+        let mut changed = false;
+        for syntax in names {
+            self.tick()?;
+            match self.unfold_simp_term(syntax, false, &current)? {
+                UnfoldResult::NotDefinition => {
+                    let name = match syntax {
+                        Syntax::Ident { val, .. } => val.clone(),
+                        _ => return Err(error(TacticError::MalformedScript)),
+                    };
+                    return Err(error(TacticError::UnfoldFailed(name)));
+                }
+                UnfoldResult::Unchanged => {}
+                UnfoldResult::Changed(next) => {
+                    current = next;
+                    changed = true;
+                }
+            }
+        }
+        Ok((current, changed))
+    }
+
     /// Recognize a refutation only when the antecedent is known to be a
     /// proposition. An unknown sort is not permission to guess Prop.
     pub(super) fn simp_negated_proposition(
@@ -40,6 +72,14 @@ impl Context {
         type_: &Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         self.tick()?;
+        // `¬ p` itself: simp prepares its facts at reducible transparency, which keeps `Not`
+        // folded, and the pin's `preprocess` reads it as `p = False` (`Expr.not?`).
+        if let ExprNode::App { f, a } = type_.node()
+            && matches!(f.node(), ExprNode::Const { name, levels }
+                if name == &Name::from_components(["Not"]) && levels.is_empty())
+        {
+            return Ok(Some(a.clone()));
+        }
         let ExprNode::ForallE {
             binder_type, body, ..
         } = type_.node()
@@ -203,7 +243,9 @@ impl Context {
     fn selected_simp_term(&mut self, rule: &SimpRule<'_>) -> Result<Typed, NatDefinitionElabError> {
         match rule {
             SimpRule::Explicit(rule) => self.simp_rule_term(rule.syntax),
-            SimpRule::Global(rule) => self.constant(&rule.declaration),
+            SimpRule::Global(rule) => {
+                self.constant(rule.proof.as_ref().unwrap_or(&rule.declaration))
+            }
             SimpRule::Local(id) => {
                 self.tick()?;
                 let local = self
@@ -289,9 +331,16 @@ impl Context {
             _ => return Err(error(TacticError::MalformedScript)),
         };
         let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");
+        let dsimp = matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp");
         expect_atom(
             keyword,
-            if simpa { "simpa" } else { "simp" },
+            if simpa {
+                "simpa"
+            } else if dsimp {
+                "dsimp"
+            } else {
+                "simp"
+            },
             "simplification keyword",
         )?;
         expect_default_config(config, "default simplification configuration")?;
@@ -311,11 +360,19 @@ impl Context {
         // Even `simp []` reads the default set; `simp only` never reads it. A
         // malformed registry therefore cannot silently become an empty success.
         let mut defaults = if use_default {
-            scope::simp::read(&self.txn.env)
-                .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?
-                .into_iter()
-                .map(SimpRule::Global)
-                .collect()
+            let mut rules = scope::simp::read(&self.txn.env)
+                .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?;
+            // The enclosing scope's `attribute [local simp]` rules, after the registered ones; a
+            // rule already registered is not read twice.
+            for local in &self.source_scope.local_simp {
+                if !rules
+                    .iter()
+                    .any(|rule| rule.declaration == local.declaration)
+                {
+                    rules.push(local.clone());
+                }
+            }
+            rules.into_iter().map(SimpRule::Global).collect()
         } else {
             Vec::new()
         };
@@ -348,6 +405,10 @@ impl Context {
             }
             if matches!(row, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "simpStar"]))
             {
+                if dsimp {
+                    // The pin's dsimp argument category does not admit `[*]`.
+                    return Err(error(TacticError::MalformedScript));
+                }
                 let parts = expect_node(
                     row,
                     &parser_kind(&["Tactic", "simpStar"]),
@@ -609,33 +670,13 @@ impl Context {
                 Ok(Some((next_goal, child)))
             }
             UnfoldResult::NotDefinition => {
-                // Re-elaboration gives each polymorphic use fresh universes.
-                let mut term = self.selected_simp_term(rule)?;
-                // Selected definitions normalize the lemma's type as well as
-                // the goal. Keep its actual proof term: conversion is checked
-                // by the final kernel, never replaced by an equality axiom.
-                term.type_ = self.simp_premise_target(&term.type_, premise_rules)?;
-                let Some(RewriteMatch {
-                    rule: term,
-                    occurrence,
-                    premises,
-                }) = self.instantiate_rewrite_rule(
-                    term,
-                    &target,
-                    rule.reverse(),
-                    true,
-                    premise_rules,
-                )?
+                let Some((term, occurrence, reverse)) =
+                    self.simp_rule_evidence(&target, rule, premise_rules)?
                 else {
                     return Ok(None);
                 };
-                assert!(premises.is_empty(), "simp discharges its own premises");
-                Ok(Some(self.rewrite_transport(
-                    goal,
-                    term,
-                    &occurrence,
-                    rule.reverse(),
-                )?))
+                self.rewrite_transport(goal, term, &occurrence, reverse)
+                    .map(Some)
             }
         }
     }
@@ -659,6 +700,8 @@ impl Context {
                 self.constant(&Name::from_components(["True", "intro"]))?
                     .value,
             )
+        } else if matches!(target.node(), ExprNode::ForallE { .. }) {
+            self.simp_quantified_reflexivity(goal, target)?
         } else {
             self.automatic_reflexivity_candidate(goal, false)?
         };

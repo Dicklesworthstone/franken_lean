@@ -170,13 +170,12 @@ mod tests {
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
-        let source =
-            "theorem t (a b c : Nat) (h : a = b) (k : b = c) : a = c := by\n  calc a = b := h\n  b = c := k\n";
+        let source = "theorem t (a b c : Nat) (h : a = b) (k : b = c) : a = c := by\n  calc a = b := h\n  b = c := k\n";
         assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
     }
 
     fn tokens(view: &SourceView) -> Vec<LexedToken> {
-        let run = lex_run(view.normalized(), source_module_token_table());
+        let run = lex_source(view.normalized());
         assert!(run.diagnostics().is_empty());
         run.events
             .into_iter()

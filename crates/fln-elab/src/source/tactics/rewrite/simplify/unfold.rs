@@ -5,7 +5,8 @@
 use super::*;
 use fln_env::constants::{ConstantInfo, DefinitionVal};
 
-enum Selection {
+#[derive(Clone)]
+pub(super) enum Selection {
     Global(DefinitionVal),
     Local(FVarId, Expr),
 }
@@ -22,21 +23,33 @@ impl Context {
         rule: &SimpRule<'_>,
         target: &Expr,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
+        match self.simp_unfold_selection_for_rule(rule)? {
+            Some(selection) => self.unfold_simp_selection(target, &selection),
+            None => Ok(UnfoldResult::NotDefinition),
+        }
+    }
+
+    pub(super) fn simp_unfold_selection_for_rule(
+        &mut self,
+        rule: &SimpRule<'_>,
+    ) -> Result<Option<Selection>, NatDefinitionElabError> {
         match rule {
-            SimpRule::Explicit(rule) => self.unfold_simp_term(rule.syntax, rule.reverse, target),
-            // Wildcard evidence is a proof, never an unfolding request. This
-            // also keeps a local `have`'s checked let value in its proof term.
-            SimpRule::Local(_) => Ok(UnfoldResult::NotDefinition),
+            SimpRule::Explicit(rule) => {
+                self.simp_unfold_selection_for_term(rule.syntax, rule.reverse)
+            }
+            SimpRule::Local(_) => Ok(None),
             SimpRule::Global(rule) => {
                 self.tick()?;
+                if rule.proof.is_some() {
+                    return Ok(None);
+                }
                 match self.txn.env.find(&rule.declaration) {
                     Some(ConstantInfo::Defn(definition))
                         if definition.safety == DefinitionSafety::Safe && !rule.reverse =>
                     {
-                        let selection = Selection::Global(definition.clone());
-                        self.unfold_simp_selection(target, &selection)
+                        Ok(Some(Selection::Global(definition.clone())))
                     }
-                    Some(_) => Ok(UnfoldResult::NotDefinition),
+                    Some(_) => Ok(None),
                     None => Err(failure(SourceInferenceError::UnknownConstant(
                         rule.declaration.clone(),
                     ))),
@@ -55,15 +68,26 @@ impl Context {
         reverse: bool,
         target: &Expr,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
+        match self.simp_unfold_selection_for_term(syntax, reverse)? {
+            Some(selection) => self.unfold_simp_selection(target, &selection),
+            None => Ok(UnfoldResult::NotDefinition),
+        }
+    }
+
+    fn simp_unfold_selection_for_term(
+        &mut self,
+        syntax: &Syntax,
+        reverse: bool,
+    ) -> Result<Option<Selection>, NatDefinitionElabError> {
         self.tick()?;
         let Syntax::Ident { val: name, .. } = syntax else {
-            return Ok(UnfoldResult::NotDefinition);
+            return Ok(None);
         };
         // The public IH remains a conditional parameter via a checked alias.
         // It was never an unfolding request. Avoid reconstructing its entire
         // dependent type just to rediscover that fact at every simp occurrence.
         if self.specialized_induction_rule(syntax)?.is_some() {
-            return Ok(UnfoldResult::NotDefinition);
+            return Ok(None);
         }
         let resolved = if self.txn.lctx.find_by_user_name(name).is_some() {
             name.clone()
@@ -90,11 +114,11 @@ impl Context {
                 && !sort.has_level_mvar()
                 && self.proof_types_match(&sort, &Expr::sort(Level::zero()))?
             {
-                return Ok(UnfoldResult::NotDefinition);
+                return Ok(None);
             }
             match &local.value {
                 Some(value) => Selection::Local(local.id.clone(), value.clone()),
-                None => return Ok(UnfoldResult::NotDefinition),
+                None => return Ok(None),
             }
         } else {
             match self.txn.env.find(name) {
@@ -103,13 +127,13 @@ impl Context {
                 {
                     Selection::Global(definition.clone())
                 }
-                _ => return Ok(UnfoldResult::NotDefinition),
+                _ => return Ok(None),
             }
         };
         if reverse {
             return Err(error(TacticError::MalformedScript));
         }
-        self.unfold_simp_selection(target, &selection)
+        Ok(Some(selection))
     }
 
     fn unfold_simp_selection(
@@ -193,20 +217,17 @@ impl Context {
                     idx,
                     expr,
                 } => Expr::proj(struct_name.clone(), *idx, child(expr)),
-                ExprNode::Const { name, levels } => match selection {
-                    Selection::Global(definition) if name == &definition.base.name => self
-                        .instantiate_params(
-                            &definition.value,
-                            &definition.base.level_params,
-                            levels,
-                        )?,
-                    _ => term.clone(),
-                },
                 ExprNode::FVar { id } => match selection {
                     Selection::Local(selected, value) if selected == id => value.clone(),
                     _ => term.clone(),
                 },
                 _ => term.clone(),
+            };
+            let rebuilt = match selection {
+                Selection::Global(definition) => {
+                    self.unfold_selected_definition(&rebuilt, definition)?
+                }
+                Selection::Local(..) => rebuilt,
             };
             let normalized = self.simp_beta_zeta(&rebuilt)?;
             done.insert(key, normalized);

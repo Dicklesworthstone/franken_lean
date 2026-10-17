@@ -274,7 +274,10 @@ impl Context {
 
     /// `inferProjType` consumes only outer type annotations, not the field's
     /// own definitions or annotations nested inside a function type.
-    fn projection_domain(&mut self, mut domain: Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(super) fn projection_domain(
+        &mut self,
+        mut domain: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         use fln_core::name::LeafView;
 
         loop {
@@ -343,16 +346,37 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
-        let mut pending = vec![(actual.clone(), expected.clone(), self.txn.lctx.clone())];
-        while let Some((left, right, scope)) = pending.pop() {
+        enum Task {
+            Visit(Expr, Expr, LocalContext),
+            Emit(Expr, Expr),
+        }
+        let mut pending = vec![Task::Visit(
+            actual.clone(),
+            expected.clone(),
+            self.txn.lctx.clone(),
+        )];
+        while let Some(task) = pending.pop() {
             self.tick()?;
+            let (left, right, scope) = match task {
+                Task::Visit(left, right, scope) => (left, right, scope),
+                Task::Emit(left, right) => {
+                    self.equations.push(SourceEquation::inference(left, right));
+                    continue;
+                }
+            };
             self.txn.lctx = scope;
             let left = self.instantiate(&left)?;
             let right = self.instantiate(&right)?;
             if let (Some(a), Some(b)) = (self.known_type(&left)?, self.known_type(&right)?)
                 && (a.has_level_mvar() || b.has_level_mvar())
             {
-                self.equations.push(SourceEquation::inference(a, b));
+                // A Pi's sort forgets which universe belongs to which binder.
+                // Comparing it first can assign w := max u v for an identity
+                // constructor, leaving u = max u v and v = max u v blocked.
+                // Its domain and codomain instead force u = v = w directly.
+                // Emit their constraints before the aggregate sort equality;
+                // keep that equality and the original typing obligation too.
+                pending.push(Task::Emit(a, b));
             }
             if let (
                 ExprNode::ForallE {
@@ -376,8 +400,8 @@ impl Context {
                 self.txn
                     .lctx
                     .add_param(id, binder_name.clone(), a.clone(), *binder_info);
-                pending.push((ab, bb, self.txn.lctx.clone()));
-                pending.push((a.clone(), b.clone(), outer));
+                pending.push(Task::Visit(ab, bb, self.txn.lctx.clone()));
+                pending.push(Task::Visit(a.clone(), b.clone(), outer));
             }
         }
         Ok(())

@@ -43,7 +43,9 @@ fn do_else_if_clauses_are_the_nested_conditionals() {
                else if n = 1 then\n    return 2\n  else\n    return 3\n";
     checked(
         &base,
-        &format!("{de1}theorem de1_one : de1 1 = 2 := by rfl\ntheorem de1_two : de1 7 = 3 := by rfl\n"),
+        &format!(
+            "{de1}theorem de1_one : de1 1 = 2 := by rfl\ntheorem de1_two : de1 7 = 3 := by rfl\n"
+        ),
     );
     let source = format!("{de1}theorem de1_wrong : de1 1 = 3 := by rfl\n");
     assert!(
@@ -57,7 +59,8 @@ fn do_else_if_clauses_are_the_nested_conditionals() {
 /// `let x ← if …` and `let x ← match …` bind a do element (`leftArrow doElemParser`), which the
 /// pin compiles as the nested sequence `let x ← do if …`: the branches are do sequences in the
 /// surrounding control scope, so a `return` in a branch returns from the function (`ae5 true` is
-/// `5`, never `15`). A nested action `(← if …)` is still refused; `bif` is a term and binds.
+/// `5`, never `15`). A nested action `(← if …)` is lifted before its element (`expandNestedActions`):
+/// `ae3` binds the branch's value; `bif` is a term and binds.
 #[test]
 fn if_and_match_after_an_arrow_bind_do_elements() {
     let base = engine();
@@ -68,14 +71,17 @@ fn if_and_match_after_an_arrow_bind_do_elements() {
          def ae2 (o : Option Nat) : Id Nat := do\n  let x ← match o with\n    | Option.some _ => (3 : Id Nat)\n    | Option.none => (0 : Id Nat)\n  return x\n\
          theorem ae2_s : ae2 (Option.some 7) = 3 := by rfl\ntheorem ae2_n : ae2 Option.none = 0 := by rfl\n\
          def ae5 (c : Bool) : Id Nat := do\n  let x ← if c then return 5 else (1 : Id Nat)\n  return x + 10\n\
-         theorem ae5_t : ae5 true = 5 := by rfl\ntheorem ae5_f : ae5 false = 11 := by rfl\n",
+         theorem ae5_t : ae5 true = 5 := by rfl\ntheorem ae5_f : ae5 false = 11 := by rfl\n\
+         def ae3 (c : Bool) : Id Nat := do\n  let x := (← if c then (1 : Id Nat) else (2 : Id Nat))\n  return x\n\
+         theorem ae3_t : ae3 true = 1 := by rfl\ntheorem ae3_f : ae3 false = 2 := by rfl\n",
     );
     for source in [
         "def ae1 (c : Bool) : Id Nat := do\n  let x ← if c then (1 : Id Nat) else (2 : Id Nat)\n  return x\n\
          theorem ae1_wrong : ae1 true = 2 := by rfl\n",
         "def ae5 (c : Bool) : Id Nat := do\n  let x ← if c then return 5 else (1 : Id Nat)\n  return x + 10\n\
          theorem ae5_wrong : ae5 true = 15 := by rfl\n",
-        "def ae3 (c : Bool) : Id Nat := do\n  let x := (← if c then (1 : Id Nat) else (2 : Id Nat))\n  return x\n",
+        "def ae3 (c : Bool) : Id Nat := do\n  let x := (← if c then (1 : Id Nat) else (2 : Id Nat))\n  return x\n\
+         theorem ae3_wrong : ae3 true = 2 := by rfl\n",
     ] {
         assert!(
             !matches!(
@@ -120,18 +126,26 @@ fn pattern_reassignment_is_refused_after_parsing() {
     match engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits()) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
-/// A `while` loop parses as the pin's `doWhile`; the elaborator does not lower it (the pin's macro
-/// is `repeat if c then s else break`), so it refuses the definition after parsing.
+/// A `while` loop parses as the pin's `doWhile` and is the pin's `for _ in Loop.mk do …`
+/// (`repeat if c then s else break`). The seed world has no `Lean.Loop` (`Init/While.lean`), so it
+/// is refused after parsing; fln-cli `source_while_loops` checks loops where `Init.While` is
+/// imported.
 #[test]
 fn while_loops_are_refused_after_parsing() {
     let source = "def wl (n : Nat) : Id Nat := do\n  let mut i := 0\n  while i < n do\n    i := i + 1\n  return i\n";
     match engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits()) {
         Ok(fln::Outcome::Complete(_)) => panic!("{source}"),
         Ok(_) => {}
-        Err(error) => assert!(format!("{error:?}").contains("Elaborate"), "{source}\n{error:?}"),
+        Err(error) => assert!(
+            format!("{error:?}").contains("Elaborate"),
+            "{source}\n{error:?}"
+        ),
     }
 }
 #[test]

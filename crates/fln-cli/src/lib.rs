@@ -9,10 +9,20 @@
 
 #![forbid(unsafe_code)]
 
+mod goal_traces;
+#[cfg(test)]
+mod guard_filter_tests;
+mod guard_messages;
+#[cfg(test)]
+mod guard_spec_tests;
 mod lake_build;
+mod output;
 mod source_check;
 mod source_evaluation;
+mod source_main;
 mod stdout_capture;
+
+pub use output::write_output;
 
 /// Install the binary's once-only panic router before starting workers. JSON
 /// execution workers render caught panics themselves; other threads retain
@@ -21,6 +31,7 @@ pub fn install_json_execution_panic_hook() {
     stdout_capture::install_panic_hook();
 }
 
+use fln::source_check::modules::reuse::ImportPosture;
 use fln_core::diag::{
     DIAGNOSTIC_PROJECTION_SCHEMA, DIAGNOSTIC_SOUND_BEHAVIOR_NOTE_NAME, DiagnosticChannel,
     DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, DiagnosticPathPolicy, ExitClass,
@@ -196,12 +207,19 @@ const USAGE: &str = concat!(
     "    modules at once (default: available cores, at most 8); the result does\n",
     "    not depend on N, and --jobs 1 checks them one by one. `lake build`\n",
     "    takes the same --jobs for the imports it admits.\n",
-    "  fln run [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
+    "  fln run [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--fln-max-steps N] [--fln-max-frames N] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
     "    Explicit external imports use the same bounded loader and import posture\n",
     "    as check-source. Each source module runs in its own import context;\n",
     "    fln.source-program/1 reports raw results per module. These programs\n",
-    "    currently refuse --emit-*; `prelude` starts without an ambient seed.\n",
-    "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
+    "    can publish the entry's final self-contained --emit-flbc and an\n",
+    "    --emit-sidecar binding all sources and imported artifact parts.\n",
+    "    Imported .olean snapshots remain unsupported; `prelude` starts\n",
+    "    without an ambient seed.\n",
+    "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
+    "    Execution limits count VM instructions and simultaneous frames per\n",
+    "    evaluation (per artifact for flbc run), including imported source code.\n",
+    "    Defaults: no instruction ceiling, 4,000,000 frames. Zero permits no\n",
+    "    instructions/frames. Exhaustion exits 3; elaboration limits are separate.\n",
     "  fln olean inspect [--json] [--constants] [--max-bytes BYTES] PATH\n",
     "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
     "  fln diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
@@ -286,8 +304,15 @@ const USAGE: &str = concat!(
     "and exits 0 only when every module is accepted. --progress also streams\n",
     "JSON lines to stderr: \"started\" as a module goes to the council, and\n",
     "\"decided\" with its row once every earlier row exists. --jobs N checks up to\n",
-    "N modules at once; each module is checked against its own import closure, so\n",
-    "the rows do not depend on N, only their wall time does. With --continue,\n",
+    "N modules at once, each against its own import closure. A host-memory\n",
+    "refusal during concurrent checking is retried once with no other module\n",
+    "check in flight, under the same limits; its row records both attempts.\n",
+    "The initial decoder also retries concurrent memory refusals once, after\n",
+    "joining its workers, and finishes unstarted decodes serially. Its rows\n",
+    "record separate decodeAttempts; a decoded artifact still needs council\n",
+    "acceptance. Successfully decoded siblings remain in memory.\n",
+    "Other resource stops are not retried. --progress reports \"retrying\"\n",
+    "before that isolated attempt. With --continue,\n",
     "further ROOT directories join the module set, so a library checks together\n",
     "with the libraries it imports (a toolchain's lib/lean, a package's build);\n",
     "a module found under two roots is refused, and --max-bytes bounds the set.\n",
@@ -343,9 +368,10 @@ const USAGE: &str = concat!(
 
 const LEAN_USAGE: &str = concat!(
     "Usage:\n",
-    "  lean [--max-bytes BYTES] PATH\n",
-    "  lean --stdin [--max-bytes BYTES]\n",
+    "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
+    "  lean --stdin [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N]\n",
     "  lean --src-deps [--max-bytes BYTES] PATH\n",
+    "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] --run PATH [ARG...]\n",
     "  lean --help\n",
     "  lean -v | --version\n",
     "  lean -V | --short-version\n",
@@ -365,22 +391,43 @@ const LEAN_USAGE: &str = concat!(
     "and #eval commands. Each is inferred and admitted through\n",
     "K1 plus the independent checker in a discarded scratch successor, then\n",
     "printed as `term : type` without compilation, VM execution, or publication.\n",
-    "A query sees the checked source seed and every preceding command successor.\n",
+    "A query sees its admitted import world and every preceding command successor.\n",
     "Check and #eval output is buffered in source order until the whole source\n",
     "succeeds; a later failure leaves stdout empty. A local-import entry gets the\n",
     "same ordered command stream after its transitive dependency closure completes.\n",
-    "An empty source file or empty --stdin stream succeeds silently.\n",
+    "An empty source file or empty --stdin stream succeeds silently after imports.\n",
     "Dependency definitions, #eval, and scratch-only #check run silently.\n",
     "Every dependency query is checked against that module's transitive imports.\n",
     "An import-only entry succeeds silently after its checked dependency closure.\n",
     "The bounded renderer does not pretty-print dependent or other unsupported types.\n",
-    "For `import A.B`,\n",
-    "the first direct import must identify exactly one ancestor source root;\n",
-    "the complete local A/B.lean closure is then loaded under the same aggregate\n",
-    "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
-    "--stdin reads one bounded import-free source from standard input.\n",
+    "Each source module imports Init unless that module declares prelude.\n",
+    "For `import A.B`, the complete local A/B.lean closure is resolved from\n",
+    "the entry's directory under aggregate input limits. Compiled imports\n",
+    "resolve from LEAN_PATH, else the pinned toolchain. Missing imports and\n",
+    "source symlinks are refused. A missing Init never substitutes a source seed.\n",
+    "--stdin reads one bounded source module with the same import semantics,\n",
+    "rooted at the current directory. The stream is the virtual _stdin module;\n",
+    "its input bytes never come from or replace a file on disk.\n",
+    "-j N / --threads=N sets parallel import-admission workers. Admission is\n",
+    "serial by default to limit peak memory; zero also\n",
+    "selects serial admission. Counts are unsigned 32-bit decimals. Work that\n",
+    "is not admission (re-proving a reused admission record, reading each\n",
+    "module's extension data) uses up to the available parallelism (at most 8\n",
+    "threads), or N when that is larger.\n",
+    "--fln-max-steps and --fln-max-frames set nonnegative per-evaluation VM\n",
+    "ceilings, including imported source code. Defaults are no instruction\n",
+    "ceiling and 4,000,000 frames; zero permits no instructions/frames. These\n",
+    "FrankenLean extensions stop with exit 3 and do not change elaboration fuel.\n",
     "--src-deps prints validated direct local source imports in source order\n",
     "without elaborating or executing the file.\n",
+    "--run (or -r) checks the source and runs main once in its admitted import\n",
+    "world, including implicit Init for files without prelude. Main accepts\n",
+    "IO Unit, IO PUnit, IO UInt32, or one List String argument followed by one\n",
+    "of those results. Unit and PUnit return status zero; UInt32 supplies the\n",
+    "process status. Options stop at --run: PATH is next, and all remaining\n",
+    "tokens are script arguments. --max-bytes separately bounds their UTF-8\n",
+    "bytes plus one byte per argument. Main text stdout follows frontend\n",
+    "messages in a bounded 16 MiB output; accepted output survives exceptions.\n",
     "-q and --quiet are accepted on source operations; this bounded personality\n",
     "currently has no verbose success messages for them to suppress. --githash\n",
     "prints the exact pinned Reference commit, and --features reports [] because\n",
@@ -460,6 +507,7 @@ enum MultiplexerCommand {
         paths: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
+        vm_limits: fln::VmExecutionLimits,
         jobs: Option<std::num::NonZeroUsize>,
         import_posture: fln::source_check::modules::reuse::ImportPosture,
         emit_flbc: Option<PathBuf>,
@@ -471,6 +519,7 @@ enum MultiplexerCommand {
         max_bytes: usize,
         json: bool,
         sidecar: Option<PathBuf>,
+        vm_limits: fln::VmExecutionLimits,
     },
     OleanInspect {
         path: PathBuf,
@@ -551,9 +600,28 @@ enum LeanCommand {
     PrintPrefix,
     PrintLibdir,
     Server,
-    Stdin { max_bytes: usize },
-    SourceDependencies { path: PathBuf, max_bytes: usize },
-    Source { path: PathBuf, max_bytes: usize },
+    Stdin {
+        max_bytes: usize,
+        import_jobs: std::num::NonZeroUsize,
+        vm_limits: fln::VmExecutionLimits,
+    },
+    SourceDependencies {
+        path: PathBuf,
+        max_bytes: usize,
+    },
+    Source {
+        path: PathBuf,
+        max_bytes: usize,
+        import_jobs: std::num::NonZeroUsize,
+        vm_limits: fln::VmExecutionLimits,
+    },
+    Run {
+        path: PathBuf,
+        arguments: Result<Vec<String>, source_main::ArgumentsError>,
+        max_bytes: usize,
+        import_jobs: std::num::NonZeroUsize,
+        vm_limits: fln::VmExecutionLimits,
+    },
 }
 
 #[derive(Debug)]
@@ -758,13 +826,80 @@ fn parse_path_options(
     Ok(Some((paths, max_bytes, json)))
 }
 
+/// Explicit execution ceilings belong to Golem, not to elaboration heartbeats.
+/// The `--fln-` prefix keeps these extensions distinct from the pinned Lean CLI.
+struct VmLimitOptions {
+    limits: fln::VmExecutionLimits,
+    steps_seen: bool,
+    frames_seen: bool,
+}
+
+impl Default for VmLimitOptions {
+    fn default() -> Self {
+        Self {
+            limits: fln::VmExecutionLimits::user_program(),
+            steps_seen: false,
+            frames_seen: false,
+        }
+    }
+}
+
+impl VmLimitOptions {
+    fn supplied(&self) -> bool {
+        self.steps_seen || self.frames_seen
+    }
+
+    /// Consume one recognized option and its value. Call only before `--` and
+    /// only for an option token, never for another option's path argument.
+    fn take(
+        &mut self,
+        argument: &OsString,
+        arguments: &mut impl Iterator<Item = OsString>,
+    ) -> Result<bool, UsageError> {
+        let Some(text) = argument.to_str() else {
+            return Ok(false);
+        };
+        let (name, attached) = text
+            .split_once('=')
+            .map_or((text, None), |(name, value)| (name, Some(value)));
+        let (seen, destination) = match name {
+            "--fln-max-steps" => (&mut self.steps_seen, &mut self.limits.max_steps),
+            "--fln-max-frames" => (&mut self.frames_seen, &mut self.limits.max_stack_depth),
+            _ => return Ok(false),
+        };
+        if *seen {
+            return Err(UsageError(format!("{name} may be supplied at most once")));
+        }
+        let value = match attached {
+            Some(value) => OsString::from(value),
+            None => arguments.next().ok_or_else(|| {
+                UsageError(format!("{name} requires a following nonnegative integer"))
+            })?,
+        };
+        let parsed = value
+            .to_str()
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                UsageError(format!(
+                    "{name} requires an ASCII nonnegative integer no greater than {}",
+                    u64::MAX
+                ))
+            })?;
+        *destination = parsed;
+        *seen = true;
+        Ok(true)
+    }
+}
+
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let (arguments, jobs) = take_jobs_option(arguments)?;
-    let (arguments, import_posture) = source_check::take_import_posture_option(arguments)?;
+    let mut jobs = None;
+    let mut import_posture = None;
     let mut filtered = Vec::new();
     let mut emit_flbc = None;
     let mut emit_sidecar = None;
     let mut emit_olean_snapshot = None;
+    let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -775,6 +910,60 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         }
         if options && (argument == "--help" || argument == "-h") {
             return Ok(MultiplexerCommand::Help);
+        }
+        if options && argument == "--max-bytes" {
+            filtered.push(argument);
+            filtered.push(arguments.next().ok_or_else(|| {
+                UsageError("--max-bytes requires a following byte count".to_owned())
+            })?);
+            continue;
+        }
+        if options && vm_options.take(&argument, &mut arguments)? {
+            continue;
+        }
+        let job_count =
+            if options && argument == "--jobs" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--jobs requires a following thread count".to_owned())
+                })?)
+            } else if options {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--jobs="))
+                    .map(OsString::from)
+            } else {
+                None
+            };
+        if let Some(value) = job_count {
+            if jobs.is_some() {
+                return Err(UsageError("--jobs may be supplied at most once".to_owned()));
+            }
+            jobs = Some(parse_jobs_count(&value)?);
+            continue;
+        }
+        let posture = if options && argument == "--import-posture" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--import-posture requires `recheck` or `reuse-verified`".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--import-posture="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(value) = posture {
+            if import_posture.is_some() {
+                return Err(UsageError(
+                    "--import-posture may be supplied at most once".to_owned(),
+                ));
+            }
+            let text = value
+                .to_str()
+                .ok_or_else(|| UsageError("--import-posture is not UTF-8".to_owned()))?;
+            import_posture = Some(ImportPosture::parse(text).map_err(UsageError)?);
+            continue;
         }
         let sidecar = if options && argument == "--emit-sidecar" {
             Some(arguments.next().ok_or_else(|| {
@@ -900,8 +1089,9 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         paths,
         max_bytes,
         json,
+        vm_limits: vm_options.limits,
         jobs,
-        import_posture,
+        import_posture: import_posture.unwrap_or(ImportPosture::ReuseVerified),
         emit_flbc,
         emit_sidecar,
         emit_olean_snapshot,
@@ -1175,12 +1365,23 @@ fn parse_identity(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageE
 fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let mut filtered = Vec::new();
     let mut sidecar = None;
+    let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         if options && argument == "--" {
             options = false;
             filtered.push(argument);
+            continue;
+        }
+        if options && argument == "--max-bytes" {
+            filtered.push(argument);
+            filtered.push(arguments.next().ok_or_else(|| {
+                UsageError("--max-bytes requires a following byte count".to_owned())
+            })?);
+            continue;
+        }
+        if options && vm_options.take(&argument, &mut arguments)? {
             continue;
         }
         let selected = if options && argument == "--sidecar" {
@@ -1226,6 +1427,7 @@ fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageE
         max_bytes,
         json,
         sidecar,
+        vm_limits: vm_options.limits,
     })
 }
 
@@ -1801,12 +2003,77 @@ fn parse_lean_command(
     let mut max_bytes_seen = false;
     let mut stdin_source = false;
     let mut source_dependencies = false;
+    // Every ordinary Lean input imports Init. Keep the default admission
+    // footprint to one council worker; -j/--threads opts into parallelism.
+    let mut import_jobs = std::num::NonZeroUsize::MIN;
+    let mut vm_options = VmLimitOptions::default();
     let mut options = true;
     let mut arguments = std::iter::once(first).chain(arguments);
     while let Some(argument) = arguments.next() {
         if options && argument == "--" {
             options = false;
             continue;
+        }
+        if options && (argument == "--run" || argument == "-r") {
+            if stdin_source || source_dependencies || path.is_some() {
+                return Err(UsageError(
+                    "--run requires its own source path and cannot be combined with --stdin or --src-deps"
+                        .to_owned(),
+                ));
+            }
+            // The pin stops option processing at --run, before consuming the
+            // file name. Every later token belongs to the script unchanged.
+            let path = arguments
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| UsageError("--run requires a source path".to_owned()))?;
+            return Ok(LeanCommand::Run {
+                path: PathBuf::from(path),
+                arguments: source_main::arguments(arguments, max_bytes),
+                max_bytes,
+                import_jobs,
+                vm_limits: vm_options.limits,
+            });
+        }
+        if options && vm_options.take(&argument, &mut arguments)? {
+            continue;
+        }
+        if options {
+            let threads = if argument == "-j" || argument == "--threads" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--threads requires a following thread count".to_owned())
+                })?)
+            } else {
+                argument.to_str().and_then(|argument| {
+                    argument
+                        .strip_prefix("--threads=")
+                        .or_else(|| {
+                            argument
+                                .strip_prefix("-j")
+                                .filter(|value| !value.is_empty())
+                        })
+                        .map(OsString::from)
+                })
+            };
+            if let Some(value) = threads {
+                // ShellOptions.process accepts decimal UInt32 counts; zero
+                // disables the pool, which is serial admission here.
+                let count = value
+                    .to_str()
+                    .filter(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        UsageError("--threads requires an unsigned 32-bit decimal count".to_owned())
+                    })?;
+                let count = usize::try_from(count).map_err(|_| {
+                    UsageError("thread count exceeds this platform's capacity".to_owned())
+                })?;
+                import_jobs =
+                    std::num::NonZeroUsize::new(count).unwrap_or(std::num::NonZeroUsize::MIN);
+                continue;
+            }
         }
         if options && argument == "--max-bytes" {
             if max_bytes_seen {
@@ -1905,13 +2172,27 @@ fn parse_lean_command(
                 "--stdin does not accept a source path".to_owned(),
             ));
         }
-        return Ok(LeanCommand::Stdin { max_bytes });
+        return Ok(LeanCommand::Stdin {
+            max_bytes,
+            import_jobs,
+            vm_limits: vm_options.limits,
+        });
     }
     let path = path.ok_or_else(|| UsageError("lean requires PATH or --stdin".to_owned()))?;
     if source_dependencies {
+        if vm_options.supplied() {
+            return Err(UsageError(
+                "execution limits cannot be combined with --src-deps".to_owned(),
+            ));
+        }
         Ok(LeanCommand::SourceDependencies { path, max_bytes })
     } else {
-        Ok(LeanCommand::Source { path, max_bytes })
+        Ok(LeanCommand::Source {
+            path,
+            max_bytes,
+            import_jobs,
+            vm_limits: vm_options.limits,
+        })
     }
 }
 
@@ -2409,9 +2690,10 @@ fn execute_flbc_bytes_with_sidecar(
     max_bytes: usize,
     sidecar: Option<&fln::FlbcProductSidecarV1>,
     json: bool,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     stdout_capture::json(json, FLBC_RUN_SCHEMA, || {
-        execute_flbc_bytes_with_sidecar_uncaptured(bytes, max_bytes, sidecar, json)
+        execute_flbc_bytes_with_sidecar_uncaptured(bytes, max_bytes, sidecar, json, vm_limits)
     })
 }
 
@@ -2420,12 +2702,13 @@ fn execute_flbc_bytes_with_sidecar_uncaptured(
     max_bytes: usize,
     sidecar: Option<&fln::FlbcProductSidecarV1>,
     json: bool,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let mut limits = fln::FlbcExecutionLimits::default();
     limits.codec.max_artifact_bytes = max_bytes;
     // A replayed artifact is the same user program `fln run` executed, so it
     // gets the same VM budget; otherwise a run could emit what replay refuses.
-    limits.vm = fln::VmExecutionLimits::user_program();
+    limits.vm = vm_limits;
     let outcome = match fln::execute_flbc_artifact(bytes, &fln::KVMap::new(), limits) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -2478,7 +2761,13 @@ fn execute_flbc_bytes_with_sidecar_uncaptured(
 
 #[cfg(test)]
 fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
-    execute_flbc_bytes_with_sidecar(bytes, max_bytes, None, json)
+    execute_flbc_bytes_with_sidecar(
+        bytes,
+        max_bytes,
+        None,
+        json,
+        fln::VmExecutionLimits::user_program(),
+    )
 }
 
 fn read_current_toolchain_image() -> Result<Vec<u8>, BoundedReadFailure> {
@@ -2501,6 +2790,7 @@ fn run_flbc(
     max_bytes: usize,
     sidecar_path: Option<&Path>,
     json: bool,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let bytes = match read_bounded(path, max_bytes, "FLBC artifact") {
         Ok(bytes) => bytes,
@@ -2550,7 +2840,13 @@ fn run_flbc(
     } else {
         None
     };
-    execute_flbc_bytes_with_sidecar(&bytes, max_bytes, verified_sidecar.as_ref(), json)
+    execute_flbc_bytes_with_sidecar(
+        &bytes,
+        max_bytes,
+        verified_sidecar.as_ref(),
+        json,
+        vm_limits,
+    )
 }
 
 fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean, constants: bool) -> String {
@@ -9191,6 +9487,28 @@ fn check_olean_module_frontier(
                             "{{\"schema\":\"fln.check-olean-frontier-progress/2\",\"event\":\"started\",\"position\":{position},\"total\":{total},\"module\":{}}}\n",
                             json_string(&module.to_display_string()),
                         ),
+                        fln::OleanFrontierEvent::Retrying {
+                            position,
+                            total,
+                            module,
+                            previous,
+                        } => {
+                            let detail = BoundedText::new(format!("{:?}", previous.first_refusal));
+                            format!(
+                                concat!(
+                                    "{{\"schema\":\"fln.check-olean-frontier-progress/2\",",
+                                    "\"event\":\"retrying\",\"position\":{position},\"total\":{total},",
+                                    "\"module\":{},\"attempt\":2,\"isolated\":true,",
+                                    "\"firstElapsedMs\":{},\"firstRefusal\":{},\"detailTruncated\":{}}}\n"
+                                ),
+                                json_string(&module.to_display_string()),
+                                previous.first_elapsed.as_millis(),
+                                json_string(detail.text()),
+                                detail.truncated(),
+                                position = position,
+                                total = total,
+                            )
+                        },
                         // In completion order, so a crash keeps every row that
                         // exists; `decided` repeats it in frontier order.
                         fln::OleanFrontierEvent::Settled {
@@ -9270,11 +9588,21 @@ struct FrontierRowFields {
     elapsed_ms: u128,
     detail: BoundedText,
     blocked_by: String,
+    memory_retry: Option<(u128, BoundedText)>,
+    decode_memory_retry: Option<FrontierDecodeRetryFields>,
+}
+
+struct FrontierDecodeRetryFields {
+    first_elapsed_ms: u128,
+    first_error: BoundedText,
+    retry_elapsed_ms: u128,
+    retry_class: Option<&'static str>,
+    retry_error: BoundedText,
 }
 
 impl FrontierRowFields {
     fn json_members(&self) -> String {
-        format!(
+        let mut members = format!(
             concat!(
                 "\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":{},",
                 "\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{}"
@@ -9290,7 +9618,48 @@ impl FrontierRowFields {
             } else {
                 json_string(&self.blocked_by)
             },
-        )
+        );
+        if let Some((first_elapsed_ms, first_refusal)) = &self.memory_retry {
+            members.push_str(&format!(
+                concat!(
+                    ",\"attempts\":[{{\"attempt\":1,\"isolated\":false,",
+                    "\"verdict\":\"inconclusive\",\"elapsedMs\":{},\"detail\":{},",
+                    "\"detailTruncated\":{}}},{{\"attempt\":2,\"isolated\":true,",
+                    "\"verdict\":{},\"elapsedMs\":{}}}]"
+                ),
+                first_elapsed_ms,
+                json_string(first_refusal.text()),
+                first_refusal.truncated(),
+                json_string(self.verdict),
+                self.elapsed_ms.saturating_sub(*first_elapsed_ms),
+            ));
+        }
+        if let Some(retry) = &self.decode_memory_retry {
+            members.push_str(&format!(
+                concat!(
+                    ",\"decodeAttempts\":[{{\"attempt\":1,\"isolated\":false,",
+                    "\"result\":\"error\",\"class\":\"resource\",\"elapsedMs\":{},",
+                    "\"detail\":{},\"detailTruncated\":{}}},",
+                    "{{\"attempt\":2,\"isolated\":true,\"result\":{},\"class\":{},",
+                    "\"elapsedMs\":{},\"detail\":{},\"detailTruncated\":{}}}]"
+                ),
+                retry.first_elapsed_ms,
+                json_string(retry.first_error.text()),
+                retry.first_error.truncated(),
+                json_string(if retry.retry_class.is_some() {
+                    "error"
+                } else {
+                    "decoded"
+                }),
+                retry
+                    .retry_class
+                    .map_or_else(|| "null".to_owned(), json_string),
+                retry.retry_elapsed_ms,
+                json_string(retry.retry_error.text()),
+                retry.retry_error.truncated(),
+            ));
+        }
+        members
     }
 }
 
@@ -9317,6 +9686,28 @@ fn frontier_row_fields(row: &fln::OleanFrontierRow) -> FrontierRowFields {
         elapsed_ms: row.elapsed.as_millis(),
         detail: BoundedText::new(detail),
         blocked_by,
+        memory_retry: row.memory_retry.as_ref().map(|retry| {
+            (
+                retry.first_elapsed.as_millis(),
+                BoundedText::new(format!("{:?}", retry.first_refusal)),
+            )
+        }),
+        decode_memory_retry: row.decode_memory_retry.as_ref().map(|retry| {
+            let (retry_class, retry_error) = match &retry.retry_result {
+                Ok(()) => (None, String::new()),
+                Err(error) => (
+                    Some(check_olean_error_disposition(error).0),
+                    error.to_string(),
+                ),
+            };
+            FrontierDecodeRetryFields {
+                first_elapsed_ms: retry.first_elapsed.as_millis(),
+                first_error: BoundedText::new(retry.first_error.to_string()),
+                retry_elapsed_ms: retry.retry_elapsed.as_millis(),
+                retry_class,
+                retry_error: BoundedText::new(retry_error),
+            }
+        }),
     }
 }
 
@@ -9355,6 +9746,30 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
             }
             other => format!("  {other:<13} {module}: {}", detail.text()),
         });
+        if let Some((first_elapsed_ms, first_refusal)) = &fields.memory_retry {
+            lines.push(format!(
+                "    isolated retry after host-memory refusal in {first_elapsed_ms} ms: {}",
+                first_refusal.text(),
+            ));
+        }
+        if let Some(retry) = &fields.decode_memory_retry {
+            lines.push(format!(
+                "    isolated decode retry after host-memory refusal in {} ms: {}",
+                retry.first_elapsed_ms,
+                retry.first_error.text(),
+            ));
+            lines.push(match retry.retry_class {
+                None => format!(
+                    "    retry decoded in {} ms; council verdict: {verdict}",
+                    retry.retry_elapsed_ms
+                ),
+                Some(class) => format!(
+                    "    decode retry {class} in {} ms: {}",
+                    retry.retry_elapsed_ms,
+                    retry.retry_error.text()
+                ),
+            });
+        }
     }
     let total = frontier.rows.len();
     let exit_code = if faulted > 0 {
@@ -11282,8 +11697,10 @@ fn lean_evaluation_line(
 
 fn render_lean_source_check_line(
     checked: &fln::SourceCheck,
-    environment: &fln::Environment,
+    engine: &fln::Engine,
+    printer: &mut fln::pretty::Printer<'_>,
 ) -> Result<String, MultiplexerOutput> {
+    let environment = engine.environment();
     let Some(term) = checked.parsed.query_term_normalized() else {
         return Err(source_failure(
             "internal-fault",
@@ -11303,6 +11720,40 @@ fn render_lean_source_check_line(
             4,
         ));
     }
+    let kind = checked
+        .parsed
+        .syntax()
+        .kind()
+        .map(fln::Name::to_display_string);
+    // `#synth C` prints the instance it found and nothing else (`logInfo val`).
+    if kind.as_deref() == Some("Lean.Parser.Command.synth") {
+        let fln::Declaration::Defn(definition) = &checked.declaration else {
+            return Err(source_failure(
+                "internal-fault",
+                "a #synth query did not produce a definition candidate",
+                false,
+                SourcePresentation::Lean,
+                4,
+            ));
+        };
+        return match printer.expr(&definition.value, 0) {
+            Ok(line) => Ok(format!("{line}\n")),
+            Err(fln::pretty::Unsupported(what)) => Err(source_failure(
+                "capability",
+                &format!("#synth cannot print {what} the way the pin does"),
+                false,
+                SourcePresentation::Lean,
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            )),
+        };
+    }
+    if let Some(form) = kind
+        .as_deref()
+        .and_then(|kind| kind.strip_prefix("Lean.Parser.Command."))
+        .filter(|form| matches!(*form, "print" | "printSig" | "printAxioms" | "printEqns"))
+    {
+        return render_lean_print(form, checked, engine, printer);
+    }
     // `#check c` for a constant prints its signature (`delabConstWithSignature`);
     // any other term prints as `term : type`.
     let constant = match &checked.declaration {
@@ -11316,21 +11767,16 @@ fn render_lean_source_check_line(
         }
         _ => None,
     };
-    let mut printer = fln::pretty::Printer::new(environment);
     let rendered = match &constant {
         Some((name, type_)) => printer.signature(name, type_),
         // The pin prints the elaborated term, not its source spelling.
+        // The pin lays out the whole `e : type` line at its width, so the two are composed
+        // before rendering.
         None => match &checked.declaration {
             fln::Declaration::Defn(definition) => {
-                printer.expr(&definition.value, 0).and_then(|value| {
-                    printer
-                        .expr(&checked.checked_type, 0)
-                        .map(|type_| format!("{value} : {type_}"))
-                })
+                printer.typed(&definition.value, &checked.checked_type)
             }
-            _ => printer
-                .expr(&checked.checked_type, 0)
-                .map(|type_| format!("{term} : {type_}")),
+            _ => printer.typed_text(term, &checked.checked_type),
         },
     };
     match rendered {
@@ -11342,6 +11788,73 @@ fn render_lean_source_check_line(
             SourcePresentation::Lean,
             CAPABILITY_NOT_IMPLEMENTED_EXIT,
         )),
+    }
+}
+
+/// `#print` (vendored `Lean/Elab/Print.lean`). `#print "text"` prints the text. `#print c` and
+/// `#print sig c` print a constant this source declared; an imported one is refused, because
+/// the `defeq`, `backward_defeq` and `meta` tags its header may carry are not decoded from its
+/// `.olean`. `#print axioms c` prints the axioms `c` reaches. `#print equations` is refused.
+fn render_lean_print(
+    form: &str,
+    checked: &fln::SourceCheck,
+    engine: &fln::Engine,
+    printer: &mut fln::pretty::Printer<'_>,
+) -> Result<String, MultiplexerOutput> {
+    let refuse = |what: &str| {
+        Err(source_failure(
+            "capability",
+            &format!("#print cannot print {what} the way the pin does"),
+            false,
+            SourcePresentation::Lean,
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        ))
+    };
+    let fln::Declaration::Defn(definition) = &checked.declaration else {
+        return Err(source_failure(
+            "internal-fault",
+            "a #print query did not produce a definition candidate",
+            false,
+            SourcePresentation::Lean,
+            4,
+        ));
+    };
+    if form == "printEqns" {
+        return refuse("equation theorems");
+    }
+    if let fln::ExprNode::Lit {
+        literal: fln::Literal::Str(text),
+    } = definition.value.node()
+    {
+        // `logInfoAt tk s.getString`; a message ends with a newline.
+        return if form == "print" {
+            Ok(if text.ends_with('\n') {
+                text.clone()
+            } else {
+                format!("{text}\n")
+            })
+        } else {
+            refuse("a string")
+        };
+    }
+    let fln::ExprNode::Const { name, .. } = definition.value.node() else {
+        return refuse("a term that is not a constant");
+    };
+    let printed = if form == "printAxioms" {
+        printer.print_axioms(name)
+    } else {
+        let local = match engine.imported_environment() {
+            Some(imported) => !imported.contains(name),
+            None => engine.imported_modules().is_empty(),
+        };
+        if !local {
+            return refuse("an imported constant, whose `defeq` and `meta` tags are not decoded,");
+        }
+        printer.print_constant(name, form == "printSig")
+    };
+    match printed {
+        Ok(text) => Ok(format!("{text}\n")),
+        Err(fln::pretty::Unsupported(what)) => refuse(what),
     }
 }
 
@@ -11429,7 +11942,7 @@ fn render_lean_source_module_commands(
             }
         }
     }
-    render_lean_source_commands(&completed.entry)
+    render_lean_source_commands(&completed.entry, WarningSink::Unreachable)
 }
 
 /// One message as the pin's `GuardMsgs.messageToString` renders it without positions: the
@@ -11446,7 +11959,78 @@ fn guard_message(severity: &str, text: &str) -> String {
     message
 }
 
-fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> MultiplexerOutput {
+fn io_guard_refusal(command_index: usize) -> MultiplexerOutput {
+    source_failure(
+        "capability",
+        &format!(
+            "evaluation command {command_index}: `#guard_msgs` over an IO \
+             action is not implemented; its output is written while it runs"
+        ),
+        false,
+        SourcePresentation::Lean,
+        CAPABILITY_NOT_IMPLEMENTED_EXIT,
+    )
+}
+
+/// Where a rendering sends a command's warning that no `#guard_msgs` collects. A guarded
+/// command's warning is always judged with its other messages.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WarningSink<'a> {
+    /// The entry file's: printed as the pin prints it, `FILE:LINE:COL: warning: MESSAGE`, with
+    /// `file` as the command line named it (`<stdin>` for standard input).
+    Print { file: &'a str, source: &'a [u8] },
+    /// An imported module's, or a rendering that only judges guards: the pin compiled the
+    /// module on its own and prints nothing of it here.
+    Discard,
+    /// A world without `Lean.Name` and `sorryAx`, where no warning can arise; one that does is
+    /// an internal fault, never dropped.
+    Unreachable,
+}
+
+/// Send one warning to its guard's messages or to `sink`.
+fn emit_lean_warning(
+    warning: &fln::SourceWarning,
+    sink: WarningSink<'_>,
+    guarded: &mut guard_messages::Guards<'_>,
+    stdout: &mut String,
+) -> Result<(), MultiplexerOutput> {
+    if let Some(guard) = guarded.get_mut(&warning.command_index)
+        && guard.warning(&warning.message)
+    {
+        return Ok(());
+    }
+    match sink {
+        WarningSink::Print { file, source } => {
+            let Some(position) = source_position_at(source, warning.at.0) else {
+                return Err(source_failure(
+                    "internal-fault",
+                    "a source warning's offset is not a character position of its file",
+                    false,
+                    SourcePresentation::Lean,
+                    4,
+                ));
+            };
+            stdout.push_str(&format!(
+                "{file}:{}:{}: warning: {}\n",
+                position.line, position.column, warning.message
+            ));
+            Ok(())
+        }
+        WarningSink::Discard => Ok(()),
+        WarningSink::Unreachable => Err(source_failure(
+            "internal-fault",
+            "a source warning arose where no warning can",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )),
+    }
+}
+
+fn render_lean_source_commands(
+    completed: &fln::SourceCommandBatchExecution,
+    sink: WarningSink<'_>,
+) -> MultiplexerOutput {
     if completed.execution_command_indices.len() != completed.batch.executions.len() {
         return source_failure(
             "internal-fault",
@@ -11483,23 +12067,64 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
     }
 
     let mut stdout = String::new();
+    let mut formatted_output = source_evaluation::FormattedOutputBudget::new(16 * 1024 * 1024);
     let mut previous_output_command = None;
     let mut evaluation_output_position = 0_usize;
     let mut check_output_position = 0_usize;
     // `#guard_msgs` (bead `fln-guard-msgs-lls1`): a guarded command's messages are collected
     // as the pin's `messageToString` renders them and judged below, never printed.
     // Each guard's messages, and whether a `#check` rendering is among them.
-    let mut guarded: std::collections::BTreeMap<usize, (Vec<String>, bool)> = completed
-        .guards
-        .iter()
-        .map(|guard| (guard.command_index, (Vec::new(), false)))
-        .collect();
+    let mut guarded = guard_messages::Guards::new();
+    for guard in &completed.guards {
+        if guard.command_index >= completed.command_count
+            || guarded.contains_key(&guard.command_index)
+        {
+            return source_failure(
+                "internal-fault",
+                "duplicate or out-of-range message guard",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        }
+        // Defensive checks for callers retaining or constructing public batches.
+        if guard.spec.positions
+            || guard
+                .spec
+                .action(fln_parse::command_scope::guard_spec::Severity::Error)
+                == fln_parse::command_scope::guard_spec::Action::Drop
+        {
+            return source_failure(
+                "capability",
+                "message positions and dropping error messages are not implemented",
+                false,
+                SourcePresentation::Lean,
+                CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            );
+        }
+        guarded.insert(
+            guard.command_index,
+            guard_messages::Buffer::new(&guard.spec),
+        );
+    }
+    let messages = match goal_traces::ordered(completed) {
+        Ok(messages) => messages,
+        Err(failure) => return failure,
+    };
+    let mut messages = messages.iter().peekable();
     for output in &completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
             | fln::SourceCommandOutput::Check { command_index, .. }
             | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
+        while let Some(message) = messages.next_if(|message| message.command() <= command_index) {
+            if let Err(failure) =
+                message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output)
+            {
+                return failure;
+            }
+        }
         if command_index >= completed.command_count
             || previous_output_command.is_some_and(|previous| previous >= command_index)
         {
@@ -11546,6 +12171,41 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     );
                 }
                 evaluation_output_position += 1;
+                // The source adapter refuses guarded IO before execution.
+                // Keep this defensive boundary for externally retained batches:
+                // an IO result's Format does not capture its stdout effects.
+                if guarded.contains_key(&command_index)
+                    && matches!(
+                        execution.evaluation_presentation(),
+                        Some(
+                            fln::EvaluationResultPresentation::IoFormat { .. }
+                                | fln::EvaluationResultPresentation::IoUnit
+                        )
+                    )
+                {
+                    return io_guard_refusal(command_index);
+                }
+                let formatted = match source_evaluation::formatted(execution) {
+                    Ok(formatted) => formatted,
+                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
+                };
+                match formatted {
+                    Some(source_evaluation::PresentedEvaluation::Text(text)) => {
+                        // Repr/ToString already constructed the pure or IO result
+                        // Format. Apply the same bounded exact-text presentation.
+                        let mut discarded = Vec::new();
+                        let messages = match guarded.get_mut(&command_index) {
+                            Some(guard) => guard.evaluation_target(&mut discarded),
+                            None => None,
+                        };
+                        if let Err(error) = formatted_output.append(&text, &mut stdout, messages) {
+                            return error.failure(command_index, SourcePresentation::Lean);
+                        }
+                        continue;
+                    }
+                    Some(source_evaluation::PresentedEvaluation::IoUnit) => continue,
+                    None => {}
+                }
                 let value = match source_evaluation::value(execution) {
                     Ok(Some(value)) => value,
                     Ok(None) => {
@@ -11561,24 +12221,13 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     }
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
-                if let Some((messages, _)) = guarded.get_mut(&command_index) {
+                if let Some(guard) = guarded.get_mut(&command_index) {
                     // An IO action's output was written while it ran, not returned here.
                     if matches!(value, SourceFinalValue::IoUnit) {
-                        return source_failure(
-                            "capability",
-                            &format!(
-                                "evaluation command {command_index}: `#guard_msgs` over an IO \
-                                 action is not implemented; its output is written while it runs"
-                            ),
-                            false,
-                            SourcePresentation::Lean,
-                            CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                        );
+                        return io_guard_refusal(command_index);
                     }
                     match lean_evaluation_line(command_index, &value) {
-                        Ok(line) => {
-                            messages.push(guard_message("info", line.trim_end_matches('\n')))
-                        }
+                        Ok(line) => guard.info(&line, false, &mut stdout),
                         Err(refused) => return refused,
                     }
                     continue;
@@ -11623,29 +12272,46 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 }
                 let line = match render_lean_source_check_line(
                     check,
-                    completed.batch.engine.environment(),
+                    &completed.batch.engine,
+                    // The scope at the `#check`, not at the end of the file: its namespace and
+                    // `open`s decide how a constant is named.
+                    &mut fln::pretty::Printer::in_scope(
+                        completed.batch.engine.environment(),
+                        &check.scope,
+                    ),
                 ) {
                     Ok(line) => line,
                     Err(error) => return error,
                 };
                 // A guarded `#check` contributes the line this door prints for it.
-                if let Some((messages, from_check)) = guarded.get_mut(&command_index) {
-                    messages.push(guard_message("info", line.trim_end_matches('\n')));
-                    *from_check = true;
+                if let Some(guard) = guarded.get_mut(&command_index) {
+                    guard.info(&line, true, &mut stdout);
                     continue;
                 }
                 stdout.push_str(&line);
             }
         }
     }
-    // The pin's `elabGuardMsgs`, default spec: the checked messages joined by `---\n` and
-    // ASCII-trimmed, compared with the expected text after `WhitespaceMode.normalized`
-    // (line breaks become spaces). A pass prints nothing; a failure is the pin's error.
+    for message in messages {
+        if let Err(failure) = message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output) {
+            return failure;
+        }
+    }
+    // The pin sorts individual messages before joining and trimming, then applies the
+    // selected whitespace and substring policy. No policy changes execution authority.
     for guard in &completed.guards {
-        let (messages, from_check) = guarded.remove(&guard.command_index).unwrap_or_default();
-        let joined = messages.join("---\n");
-        let produced = joined.trim_ascii();
-        if guard.expected.replace('\n', " ") != produced.replace('\n', " ") {
+        let Some(messages) = guarded.remove(&guard.command_index) else {
+            return source_failure(
+                "internal-fault",
+                "message guard lost its collector",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        };
+        let from_check = messages.from_check;
+        let produced = guard.spec.combine(messages.checked);
+        if !guard.spec.matches(&guard.expected, &produced) {
             // This door's `#check` line is the pin's on the shapes measured, but its pretty
             // printer is not proven equal to the pin's in general: a mismatch there may be
             // this rendering, so it is a non-answer, never a rejection.
@@ -11653,8 +12319,8 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                 return source_failure(
                     "capability",
                     &format!(
-                        "command {}: `#guard_msgs` over `#check` produced a message that differs \
-                         from the docstring, and this door's `#check` rendering is not proven to be \
+                        "command {}: `#guard_msgs` over `#check` or a raw goal trace produced a message that differs \
+                         from the docstring, and this door's goal/`#check` rendering is not proven to be \
                          the pin's:\n\n{produced}",
                         guard.command_index
                     ),
@@ -11864,6 +12530,7 @@ fn execute_source_bytes_with_publisher_and_presentation<P, E>(
     module_plan: Option<SourceModulePlan>,
     publication: SourcePublication,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
     publish: P,
 ) -> MultiplexerOutput
 where
@@ -11871,7 +12538,14 @@ where
     E: SourcePublicationFailure,
 {
     stdout_capture::json(presentation.json(), SOURCE_RUN_SCHEMA, || {
-        execute_source_bytes_uncaptured(sources, module_plan, publication, presentation, publish)
+        execute_source_bytes_uncaptured(
+            sources,
+            module_plan,
+            publication,
+            presentation,
+            vm_limits,
+            publish,
+        )
     })
 }
 
@@ -11880,6 +12554,7 @@ fn execute_source_bytes_uncaptured<P, E>(
     module_plan: Option<SourceModulePlan>,
     publication: SourcePublication,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
     mut publish: P,
 ) -> MultiplexerOutput
 where
@@ -11969,7 +12644,8 @@ where
     };
     let options = fln::KVMap::new();
     // A user's program, not a probe: no instruction ceiling, real recursion depth.
-    let limits = fln::EngineExecutionLimits::for_user_program(kernel_budget);
+    let mut limits = fln::EngineExecutionLimits::for_user_program(kernel_budget);
+    limits.vm = vm_limits;
     if matches!(presentation, SourcePresentation::Lean)
         && module_plan.is_none()
         && source_refs.len() == 1
@@ -11990,7 +12666,9 @@ where
             }
         };
         return match completed {
-            fln::Outcome::Complete(completed) => render_lean_source_commands(&completed),
+            fln::Outcome::Complete(completed) => {
+                render_lean_source_commands(&completed, WarningSink::Unreachable)
+            }
             fln::Outcome::Inconclusive(inconclusive) => source_failure(
                 "inconclusive",
                 &format!("{inconclusive:?}"),
@@ -12563,6 +13241,7 @@ where
         module_plan,
         publication,
         SourcePresentation::Fln { json },
+        fln::VmExecutionLimits::user_program(),
         publish,
     )
 }
@@ -13264,6 +13943,7 @@ fn run_loaded_sources_with_presentation(
     emit_sidecar: Option<PathBuf>,
     emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     let publication = match (emit_flbc, emit_sidecar, emit_olean_snapshot) {
         (Some(path), sidecar, None) => SourcePublication::Flbc {
@@ -13301,6 +13981,7 @@ fn run_loaded_sources_with_presentation(
                 module_plan,
                 publication,
                 presentation,
+                vm_limits,
                 fln::publish_file_atomic_new,
             )
         }) {
@@ -13334,6 +14015,7 @@ fn run_sources_with_presentation(
     emit_sidecar: Option<PathBuf>,
     emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     if let [entry] = paths {
         let discovered = match discover_source_closure(entry.clone(), max_bytes) {
@@ -13382,6 +14064,7 @@ fn run_sources_with_presentation(
             emit_sidecar,
             emit_olean_snapshot,
             presentation,
+            vm_limits,
         );
     }
     let sources = match read_source_batch(paths, max_bytes) {
@@ -13403,48 +14086,25 @@ fn run_sources_with_presentation(
         emit_sidecar,
         emit_olean_snapshot,
         presentation,
+        vm_limits,
     )
 }
 
-/// Whether local source discovery stopped because an import names no local
-/// source file. The three places that say so all begin their detail this way.
-fn is_unresolved_local_import(error: &BoundedReadFailure) -> bool {
-    matches!(
-        error,
-        BoundedReadFailure::Input { detail, .. } if detail.contains("cannot resolve import `")
-    )
+fn run_lean_source(
+    path: PathBuf,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    source_check::run_imported_lean(&path, max_bytes, import_jobs, vm_limits)
 }
 
-fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
-    // A file that imports compiled modules runs in their admitted world, the
-    // way `fln run` runs it. Only a headerless file, or one whose imports are
-    // all local sources, is left to the local route below.
-    if let Some(output) = source_check::run_imported_lean(&path, max_bytes) {
-        return output;
-    }
-    let discovered = match discover_source_closure(path, max_bytes) {
-        Ok(discovered) => discovered,
-        Err(error) => {
-            return source_failure(
-                error.class(),
-                &error.to_string(),
-                false,
-                SourcePresentation::Lean,
-                error.exit_code(),
-            );
-        }
-    };
-    run_loaded_sources_with_presentation(
-        &discovered.paths,
-        discovered.sources,
-        None,
-        None,
-        None,
-        SourcePresentation::Lean,
-    )
-}
-
-fn run_lean_stdin(input: &mut dyn Read, max_bytes: usize) -> MultiplexerOutput {
+fn run_lean_stdin(
+    input: &mut dyn Read,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
     let source = match read_bounded_from(input, max_bytes, "standard input source") {
         Ok(source) => source,
         Err(error) => {
@@ -13457,26 +14117,7 @@ fn run_lean_stdin(input: &mut dyn Read, max_bytes: usize) -> MultiplexerOutput {
             );
         }
     };
-    if let Ok(module) = fln::partition_source_module(&source)
-        && !module.imports.is_empty()
-    {
-        return source_failure(
-            "input",
-            "bounded --stdin execution does not resolve imports; provide a local source path instead",
-            false,
-            SourcePresentation::Lean,
-            1,
-        );
-    }
-    let paths = [PathBuf::from("stdin.lean")];
-    run_loaded_sources_with_presentation(
-        &paths,
-        vec![source],
-        None,
-        None,
-        None,
-        SourcePresentation::Lean,
-    )
+    source_check::run_imported_lean_stdin(source, max_bytes, import_jobs, vm_limits)
 }
 
 fn run_sources(
@@ -13486,6 +14127,7 @@ fn run_sources(
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
     emit_olean_snapshot: Option<PathBuf>,
+    vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
     run_sources_with_presentation(
         paths,
@@ -13494,6 +14136,7 @@ fn run_sources(
         emit_sidecar,
         emit_olean_snapshot,
         SourcePresentation::Fln { json },
+        vm_limits,
     )
 }
 
@@ -13598,6 +14241,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             paths,
             max_bytes,
             json,
+            vm_limits,
             jobs,
             import_posture,
             emit_flbc,
@@ -13607,9 +14251,29 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             &paths,
             max_bytes,
             json,
-            emit_flbc.is_some() || emit_sidecar.is_some() || emit_olean_snapshot.is_some(),
+            match (&emit_flbc, &emit_sidecar, &emit_olean_snapshot) {
+                (Some(path), sidecar, None) => SourcePublication::Flbc {
+                    path: path.clone(),
+                    sidecar: sidecar.as_ref().map(|path| SourceSidecarPublication {
+                        path: path.clone(),
+                        toolchain_image: None,
+                    }),
+                },
+                (None, None, Some(path)) => SourcePublication::OleanSnapshot { path: path.clone() },
+                (None, None, None) => SourcePublication::None,
+                _ => {
+                    return source_failure(
+                        "internal-fault",
+                        "mutually exclusive source publication options reached execution together",
+                        false,
+                        SourcePresentation::Fln { json },
+                        4,
+                    );
+                }
+            },
             jobs.unwrap_or_else(default_import_jobs),
             import_posture,
+            vm_limits,
         )
         .unwrap_or_else(|| {
             run_sources(
@@ -13619,6 +14283,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
                 emit_flbc,
                 emit_sidecar,
                 emit_olean_snapshot,
+                vm_limits,
             )
         }),
         Ok(MultiplexerCommand::FlbcRun {
@@ -13626,7 +14291,8 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
             sidecar,
-        }) => run_flbc(&path, max_bytes, sidecar.as_deref(), json),
+            vm_limits,
+        }) => run_flbc(&path, max_bytes, sidecar.as_deref(), json, vm_limits),
         Ok(MultiplexerCommand::OleanInspect {
             path,
             max_bytes,
@@ -13823,8 +14489,12 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::PrintPrefix) => lean_installation_path_output(|paths| paths.prefix),
         Ok(LeanCommand::PrintLibdir) => lean_installation_path_output(|paths| paths.libdir),
         Ok(LeanCommand::Server) => serve_lsp(),
-        Ok(LeanCommand::Stdin { max_bytes }) => match input {
-            Some(input) => run_lean_stdin(input, max_bytes),
+        Ok(LeanCommand::Stdin {
+            max_bytes,
+            import_jobs,
+            vm_limits,
+        }) => match input {
+            Some(input) => run_lean_stdin(input, max_bytes, import_jobs, vm_limits),
             None => MultiplexerOutput::failure(
                 format!(
                     "lean: --stdin requires an explicit input handle; use run_lean_with_input\n\n{LEAN_USAGE}"
@@ -13835,7 +14505,19 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::SourceDependencies { path, max_bytes }) => {
             run_lean_source_dependencies(&path, max_bytes)
         }
-        Ok(LeanCommand::Source { path, max_bytes }) => run_lean_source(path, max_bytes),
+        Ok(LeanCommand::Source {
+            path,
+            max_bytes,
+            import_jobs,
+            vm_limits,
+        }) => run_lean_source(path, max_bytes, import_jobs, vm_limits),
+        Ok(LeanCommand::Run {
+            path,
+            arguments,
+            max_bytes,
+            import_jobs,
+            vm_limits,
+        }) => source_main::run(path, arguments, max_bytes, import_jobs, vm_limits),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
 }
@@ -14086,13 +14768,15 @@ const LAKE_USAGE: &str = concat!(
     "\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean builds checked +Module:olean facets from declared TOML libraries.\n",
+    "\nFrankenLean builds checked +Module:olean facets from declared libraries.\n",
+    "TOML and native Lean package/lean_lib configurations are supported; Lean\n",
+    "srcDir/buildDir terms are checked against real Init and evaluated by Golem.\n",
     "Default library, executable and other facets remain unavailable.\n",
     "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
     "a record of this binary's earlier admission of the identical .olean bytes\n",
     "is rebuilt and re-proved by logical root; --import-posture recheck admits\n",
     "them again. No built output is ever reused from disk.\n",
-    "`check-build` only checks default-target presence in TOML configuration.\n",
+    "`check-build` loads the configuration and checks default-target presence.\n",
 );
 
 const LAKE_HELP_BUILD: &str = concat!(
@@ -14106,7 +14790,10 @@ const LAKE_HELP_BUILD: &str = concat!(
     "  [@[<package>]/][<target>|[+]<module>][:<facet>]\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean supports +Module:olean for modules owned by a TOML lean_lib.\n",
+    "\nFrankenLean supports +Module:olean for modules owned by a declared lean_lib.\n",
+    "A native lakefile.lean may define checked helpers, package srcDir/buildDir\n",
+    "and lean_lib srcDir, with @[default_target] and each library's default root.\n",
+    "Other Lake commands, fields and custom roots are explicitly unavailable.\n",
     "Local source imports are built first; external imports (including implicit\n",
     "Init) are read from LEAN_PATH or the pinned toolchain and admitted by K1\n",
     "and the independent checker, or under the default --import-posture\n",
@@ -14557,7 +15244,33 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
             // The pinned Lake command tests only default-target presence. It is
             // neither a dry build nor a source/type/target validity check.
-            match fln_lake::LakeConfig::discover(&target_dir) {
+            let mut configuration_imports = None;
+            let discovered = match fln_lake::LakeConfig::discover(&target_dir) {
+                Err(fln_lake::LakeDiscoveryError::LeanConfigUnsupported(_)) => {
+                    if let Some(option) = ignored_options.first() {
+                        return lake_operation_failure(
+                            "fln.lake-check-build/1",
+                            &format!("configuration option `{option}` is unavailable"),
+                            true,
+                            is_json,
+                        );
+                    }
+                    match lake_build::lean_configuration_for_presence(
+                        target_dir,
+                        is_json,
+                        jobs.unwrap_or_else(default_import_jobs),
+                        import_posture,
+                    ) {
+                        Ok((config, report)) => {
+                            configuration_imports = Some(report);
+                            Ok(config)
+                        }
+                        Err(output) => return output,
+                    }
+                }
+                other => other,
+            };
+            match discovered {
                 Ok(config) => {
                     if config.default_targets.is_empty() {
                         return lake_operation_failure(
@@ -14574,8 +15287,17 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                             .map(|s| json_string(s))
                             .collect::<Vec<_>>()
                             .join(",");
+                        let configuration_imports = configuration_imports
+                            .as_ref()
+                            .map(|report| {
+                                format!(
+                                    ",\"configuration_imports\":[{{{}}}]",
+                                    source_check::posture_json(report)
+                                )
+                            })
+                            .unwrap_or_default();
                         MultiplexerOutput::success(format!(
-                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"check\":\"default-target-presence\",\"package\":{},\"targets\":[{targets_json}]}}\n",
+                            "{{\"schema\":\"fln.lake-check-build/1\",\"status\":\"success\",\"check\":\"default-target-presence\",\"package\":{},\"targets\":[{targets_json}]{configuration_imports}}}\n",
                             json_string(&config.name)
                         ))
                     } else {
@@ -15779,6 +16501,170 @@ mod tests {
     }
 
     #[test]
+    fn check_olean_frontier_reports_both_memory_attempts_without_counting_twice() {
+        let row = |verdict| fln::OleanFrontierRow {
+            name: fln::Name::from_components(["RetryFixture"]),
+            verdict,
+            elapsed: std::time::Duration::from_millis(30),
+            memory_retry: Some(fln::OleanFrontierMemoryRetry {
+                first_refusal: fln::Inconclusive::dependency_unavailable("host memory: fixture"),
+                first_elapsed: std::time::Duration::from_millis(10),
+            }),
+            decode_memory_retry: None,
+        };
+        for (verdict, expected_exit, expected_count) in [
+            (
+                fln::OleanModuleVerdict::Accepted { declarations: 2 },
+                0,
+                "\"accepted\":1",
+            ),
+            (
+                fln::OleanModuleVerdict::Inconclusive(fln::Inconclusive::dependency_unavailable(
+                    "host memory: again",
+                )),
+                3,
+                "\"inconclusive\":1",
+            ),
+        ] {
+            let frontier = fln::OleanFrontier {
+                engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
+                rows: vec![row(verdict)],
+            };
+            let output = super::render_check_olean_frontier(&frontier, true);
+            assert_eq!(output.exit_code, expected_exit);
+            assert!(output.stdout.contains("\"modules\":1"));
+            assert!(output.stdout.contains(expected_count));
+            assert!(
+                output
+                    .stdout
+                    .contains("\"attempts\":[{\"attempt\":1,\"isolated\":false")
+            );
+            assert!(output.stdout.contains("\"attempt\":2,\"isolated\":true"));
+            assert!(output.stdout.contains("\"elapsedMs\":10"));
+            assert!(output.stdout.contains("\"elapsedMs\":20"));
+            let human = super::render_check_olean_frontier(&frontier, false);
+            assert_eq!(human.exit_code, expected_exit);
+            assert!(
+                human
+                    .stdout
+                    .contains("isolated retry after host-memory refusal in 10 ms")
+            );
+        }
+        let mut ordinary = row(fln::OleanModuleVerdict::Accepted { declarations: 2 });
+        ordinary.memory_retry = None;
+        assert!(
+            !super::frontier_row_fields(&ordinary)
+                .json_members()
+                .contains("attempts")
+        );
+    }
+
+    #[test]
+    fn check_olean_frontier_reports_decode_retries_without_promoting_decoding_to_acceptance() {
+        use fln::{OleanCheckError, OleanModuleVerdict};
+        let name = fln::Name::from_components(["DecodeRetryFixture"]);
+        for (retry_result, verdict, exit_code, result_text, count_text) in [
+            (
+                Ok(()),
+                OleanModuleVerdict::Accepted { declarations: 2 },
+                0,
+                "decoded",
+                "\"accepted\":1",
+            ),
+            (
+                Ok(()),
+                OleanModuleVerdict::Failed(OleanCheckError::MissingConstants {
+                    declaration: name.clone(),
+                    names: vec![fln::Name::from_components(["Missing"])],
+                }),
+                1,
+                "decoded",
+                "\"failed\":1",
+            ),
+            (
+                Ok(()),
+                OleanModuleVerdict::Blocked {
+                    by: fln::Name::from_components(["Parent"]),
+                },
+                1,
+                "decoded",
+                "\"blocked\":1",
+            ),
+            (
+                Err(OleanCheckError::HostMemory { requested: 8192 }),
+                OleanModuleVerdict::Inconclusive(fln::Inconclusive::dependency_unavailable(
+                    "host memory: again",
+                )),
+                3,
+                "error",
+                "\"inconclusive\":1",
+            ),
+            (
+                Err(OleanCheckError::InternalInvariant {
+                    detail: "decoder invariant fixture",
+                }),
+                OleanModuleVerdict::InternalFault(fln::InternalFault::new(
+                    "decode",
+                    "decoder invariant fixture",
+                )),
+                4,
+                "error",
+                "\"internalFault\":1",
+            ),
+        ] {
+            let frontier = fln::OleanFrontier {
+                engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
+                rows: vec![fln::OleanFrontierRow {
+                    name: name.clone(),
+                    verdict,
+                    elapsed: std::time::Duration::from_millis(7),
+                    memory_retry: None,
+                    decode_memory_retry: Some(fln::OleanDecodeMemoryRetry {
+                        first_error: OleanCheckError::HostMemory { requested: 4096 },
+                        first_elapsed: std::time::Duration::from_millis(10),
+                        retry_elapsed: std::time::Duration::from_millis(20),
+                        retry_result,
+                    }),
+                }],
+            };
+            let output = super::render_check_olean_frontier(&frontier, true);
+            assert_eq!(output.exit_code, exit_code);
+            assert!(output.stdout.contains("\"modules\":1"));
+            assert!(output.stdout.contains(count_text));
+            assert!(
+                output.stdout.contains("\"elapsedMs\":7"),
+                "checking time excludes initial decoding"
+            );
+            assert!(output.stdout.contains("\"decodeAttempts\":[{\"attempt\":1,\"isolated\":false,\"result\":\"error\",\"class\":\"resource\",\"elapsedMs\":10"));
+            assert!(output.stdout.contains(&format!(
+                "\"attempt\":2,\"isolated\":true,\"result\":\"{result_text}\""
+            )));
+            assert!(output.stdout.contains("\"elapsedMs\":20"));
+            assert!(
+                !output.stdout.contains("\"attempts\":"),
+                "no council retry was performed"
+            );
+            if exit_code != 0 {
+                assert!(output.stdout.contains("\"accepted\":0"));
+            }
+            let human = super::render_check_olean_frontier(&frontier, false);
+            assert_eq!(human.exit_code, exit_code);
+            assert!(
+                human
+                    .stdout
+                    .contains("isolated decode retry after host-memory refusal in 10 ms")
+            );
+            if result_text == "decoded" {
+                assert!(
+                    human
+                        .stdout
+                        .contains("retry decoded in 20 ms; council verdict:")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn check_olean_cli_reaches_reconstructed_non_safe_mutual_units() {
         let artifact = mutual_checkable_olean_fixture();
         let robot = check_olean_bytes(artifact.clone(), artifact.len(), true);
@@ -16082,14 +16968,61 @@ mod tests {
     }
 
     #[test]
+    fn lean_thread_options_reach_sources_and_stop_before_script_arguments() {
+        for (flags, expected) in [
+            (vec![], 1),
+            (vec!["-j", "0"], 1),
+            (vec!["-j3"], 3),
+            (vec!["--threads", "2"], 2),
+            (vec!["--threads=4"], 4),
+            (vec!["-j8", "--threads=2"], 2),
+        ] {
+            for stdin in [false, true] {
+                let mut args = flags.iter().map(OsString::from).collect::<Vec<_>>();
+                args.push(if stdin { "--stdin" } else { "Main.lean" }.into());
+                let parsed = super::parse_lean_command(args).unwrap();
+                let jobs = match parsed {
+                    super::LeanCommand::Source { import_jobs, .. }
+                    | super::LeanCommand::Stdin { import_jobs, .. } => import_jobs,
+                    other => panic!("wrong source mode: {other:?}"),
+                };
+                assert_eq!(jobs.get(), expected);
+            }
+        }
+        let super::LeanCommand::Run {
+            import_jobs,
+            arguments,
+            ..
+        } = super::parse_lean_command(
+            ["-j2", "--run", "Main.lean", "--threads=8"].map(OsString::from),
+        )
+        .unwrap()
+        else {
+            panic!("script mode");
+        };
+        assert_eq!(import_jobs.get(), 2);
+        assert_eq!(arguments.unwrap(), ["--threads=8"]);
+        for flags in [
+            vec!["--threads"],
+            vec!["-j"],
+            vec!["--threads="],
+            vec!["--threads=-1", "Main.lean"],
+            vec!["--threads=+1", "Main.lean"],
+            vec!["--threads=4294967296", "Main.lean"],
+            vec!["-junk", "Main.lean"],
+        ] {
+            assert!(super::parse_lean_command(flags.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
     fn lean_personality_help_version_and_usage_are_explicitly_bounded() {
         let help = run_lean(std::iter::empty());
         assert_eq!(help.exit_code, 0);
         assert!(help.stderr.is_empty());
-        assert!(
-            help.stdout
-                .starts_with("Usage:\n  lean [--max-bytes BYTES] PATH")
-        );
+        assert!(help.stdout.starts_with(
+            "Usage:\n  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] PATH"
+        ));
         assert!(help.stdout.contains("bounded native `lean` personality"));
         assert!(
             help.stdout
@@ -16097,7 +17030,10 @@ mod tests {
         );
         assert!(help.stdout.contains("complete local A/B.lean closure"));
         assert!(help.stdout.contains("lean --stdin"));
-        assert!(help.stdout.contains("bounded import-free source"));
+        assert!(
+            help.stdout
+                .contains("bounded source module with the same import semantics")
+        );
         assert!(
             help.stdout
                 .contains("Import-free #check commands may appear anywhere")
@@ -16176,17 +17112,18 @@ mod tests {
                 .stderr
                 .contains("requires an explicit input handle")
         );
-        let mut input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
+        let source = b"prelude\ninductive Local where\n  | value\n#check Local\n";
+        let mut input = std::io::Cursor::new(source.as_slice());
         let piped = run_lean_with_input([OsString::from("--stdin")], &mut input);
         assert_eq!(piped.exit_code, 0);
-        assert_eq!(piped.stdout, "42\n");
+        assert_eq!(piped.stdout, "Local : Type\n");
         assert!(piped.stderr.is_empty());
-        let mut check_input = std::io::Cursor::new(b"#check Nat\n".as_slice());
+        let mut check_input = std::io::Cursor::new(source.as_slice());
         let checked = run_lean_with_input([OsString::from("--stdin")], &mut check_input);
         assert_eq!(checked.exit_code, 0, "{}", checked.stderr);
-        assert_eq!(checked.stdout, "Nat : Type\n");
+        assert_eq!(checked.stdout, "Local : Type\n");
         assert!(checked.stderr.is_empty());
-        let mut quiet_input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
+        let mut quiet_input = std::io::Cursor::new(source.as_slice());
         let quiet_piped = run_lean_with_input(
             [
                 OsString::from("-q"),
@@ -16196,7 +17133,7 @@ mod tests {
             &mut quiet_input,
         );
         assert_eq!(quiet_piped.exit_code, 0);
-        assert_eq!(quiet_piped.stdout, "42\n");
+        assert_eq!(quiet_piped.stdout, "Local : Type\n");
         assert!(quiet_piped.stderr.is_empty());
         let mut unselected_input = std::io::Cursor::new(b"must remain unread".as_slice());
         let short_version =
@@ -16245,10 +17182,16 @@ mod tests {
     /// Doc comments are the pin's syntax: a module doc and a declaration's doc change nothing,
     /// and one that nothing can carry is refused. Verdicts measured at the pin on 2026-10-07.
     #[test]
-    fn the_lean_door_reads_doc_comments_as_the_pin_does() {
+    fn source_doc_comments_follow_the_pin_syntax() {
         let lean = |source: &str| {
-            let mut input = std::io::Cursor::new(source.as_bytes().to_vec());
-            run_lean_with_input([OsString::from("--stdin")], &mut input)
+            super::execute_source_bytes_with_publisher_and_presentation(
+                vec![source.as_bytes().to_vec()],
+                None,
+                SourcePublication::None,
+                SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
+                |_, _| Ok::<(), std::io::Error>(()),
+            )
         };
         // Pin: `43`.
         let documented = lean(
@@ -16309,6 +17252,7 @@ mod tests {
                 None,
                 SourcePublication::None,
                 SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
                 |_, _| Ok::<(), std::io::Error>(()),
             );
             assert_eq!(evaluated.exit_code, 0, "{source}: {}", evaluated.stderr);
@@ -16326,6 +17270,7 @@ mod tests {
                 None,
                 SourcePublication::None,
                 SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
                 |_, _| Ok::<(), std::io::Error>(()),
             )
         };
@@ -16400,6 +17345,7 @@ mod tests {
             None,
             SourcePublication::None,
             SourcePresentation::Lean,
+            fln::VmExecutionLimits::user_program(),
             |_, _| Ok::<(), std::io::Error>(()),
         );
         assert_eq!(evaluated.exit_code, 0, "{}", evaluated.stderr);
@@ -16407,7 +17353,16 @@ mod tests {
         assert!(evaluated.stderr.is_empty());
 
         let source = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
-        let definition_only = run_lean([source.into_os_string()]);
+        // This test exercises presentation against the same explicit seed as
+        // the adjacent cases. Actual file import worlds have installed tests.
+        let definition_only = super::execute_source_bytes_with_publisher_and_presentation(
+            vec![std::fs::read(source).unwrap()],
+            None,
+            SourcePublication::None,
+            SourcePresentation::Lean,
+            fln::VmExecutionLimits::user_program(),
+            |_, _| Ok::<(), std::io::Error>(()),
+        );
         assert_eq!(definition_only.exit_code, 0, "{}", definition_only.stderr);
         assert!(definition_only.stdout.is_empty());
         assert!(definition_only.stderr.is_empty());
@@ -16417,6 +17372,7 @@ mod tests {
             None,
             SourcePublication::None,
             SourcePresentation::Lean,
+            fln::VmExecutionLimits::user_program(),
             |_, _| Ok::<(), std::io::Error>(()),
         );
         assert_eq!(function_only.exit_code, 0, "{}", function_only.stderr);
@@ -16432,6 +17388,7 @@ mod tests {
                 None,
                 SourcePublication::None,
                 SourcePresentation::Lean,
+                fln::VmExecutionLimits::user_program(),
                 |_, _| Ok::<(), std::io::Error>(()),
             );
         assert_eq!(
@@ -16470,10 +17427,17 @@ mod tests {
         // which the hand-written token table refused; with the derived table every byte of it
         // lexes, and it is refused at `import Lean` as a module-graph input instead.)
         let source = repository_path("crates/fln-cli/tests/fixtures/lexical_refusal.lean");
-        let refused = run_lean([source.into_os_string()]);
+        // Explicit prelude keeps the lexer witness independent of whether
+        // the pinned library is installed; no Init lookup can mask its error.
+        let mut bytes = b"prelude\n".to_vec();
+        bytes.extend(std::fs::read(source).unwrap());
+        let refused = run_lean_with_input(
+            [OsString::from("--stdin")],
+            &mut std::io::Cursor::new(bytes),
+        );
         assert_eq!(refused.exit_code, 1);
         assert!(refused.stdout.is_empty());
-        assert!(refused.stderr.starts_with("lean: execution: "));
+        assert!(refused.stderr.starts_with("lean: input: "), "{refused:?}");
         assert!(refused.stderr.contains("frontend refused source"));
         assert!(!refused.stderr.contains(SOURCE_RUN_SCHEMA));
         assert!(!refused.stderr.contains("native source batch"));
@@ -17025,6 +17989,7 @@ mod tests {
             expected_product.len(),
             Some(&verified),
             true,
+            fln::VmExecutionLimits::user_program(),
         );
         assert_eq!(replay.exit_code, 0, "{}", replay.stderr);
         assert!(replay.stdout.contains("\"sidecar\":{\"verified\":true"));
@@ -17050,6 +18015,184 @@ mod tests {
         );
         assert_eq!(failed.exit_code, 1);
         assert_eq!(failed_publications, 0);
+    }
+
+    #[test]
+    fn execution_limit_options_share_strict_parsing_across_the_three_doors() {
+        for args in [
+            vec!["--fln-max-steps=17", "--fln-max-frames", "23", "Main.lean"],
+            vec!["Main.lean", "--fln-max-steps", "17", "--fln-max-frames=23"],
+        ] {
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            let super::MultiplexerCommand::SourceRun { vm_limits, .. } =
+                super::parse_source_run(args.clone()).unwrap()
+            else {
+                panic!("source command")
+            };
+            assert_eq!((vm_limits.max_steps, vm_limits.max_stack_depth), (17, 23));
+            let super::MultiplexerCommand::FlbcRun { vm_limits, .. } =
+                super::parse_flbc_run(args.clone()).unwrap()
+            else {
+                panic!("artifact command")
+            };
+            assert_eq!((vm_limits.max_steps, vm_limits.max_stack_depth), (17, 23));
+            let super::LeanCommand::Source { vm_limits, .. } =
+                super::parse_lean_command(args).unwrap()
+            else {
+                panic!("lean command")
+            };
+            assert_eq!((vm_limits.max_steps, vm_limits.max_stack_depth), (17, 23));
+        }
+        for flag in ["--fln-max-steps", "--fln-max-frames"] {
+            for value in ["", "-1", "+1", "1.5", " 1", "١", "18446744073709551616"] {
+                let args = vec![format!("{flag}={value}").into(), "Main.lean".into()];
+                assert!(
+                    super::parse_source_run(args.clone()).is_err(),
+                    "{flag}={value}"
+                );
+                assert!(
+                    super::parse_flbc_run(args.clone()).is_err(),
+                    "{flag}={value}"
+                );
+                assert!(super::parse_lean_command(args).is_err(), "{flag}={value}");
+            }
+            let duplicate = vec![
+                flag.into(),
+                "3".into(),
+                format!("{flag}=4").into(),
+                "Main.lean".into(),
+            ];
+            assert!(super::parse_source_run(duplicate.clone()).is_err());
+            assert!(super::parse_flbc_run(duplicate.clone()).is_err());
+            assert!(super::parse_lean_command(duplicate).is_err());
+            let missing = vec![flag.into()];
+            assert!(super::parse_source_run(missing.clone()).is_err());
+            assert!(super::parse_flbc_run(missing.clone()).is_err());
+            assert!(super::parse_lean_command(missing).is_err());
+            for value in [0, u64::MAX] {
+                let args = vec![format!("{flag}={value}").into(), "Main.lean".into()];
+                assert!(super::parse_source_run(args.clone()).is_ok());
+                assert!(super::parse_flbc_run(args.clone()).is_ok());
+                assert!(super::parse_lean_command(args).is_ok());
+            }
+        }
+        let stopped = vec!["--".into(), "--fln-max-steps=7".into()];
+        let super::LeanCommand::Source {
+            path, vm_limits, ..
+        } = super::parse_lean_command(stopped.clone()).unwrap()
+        else {
+            panic!("literal source path")
+        };
+        assert_eq!(path, PathBuf::from("--fln-max-steps=7"));
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+        let super::MultiplexerCommand::SourceRun {
+            paths, vm_limits, ..
+        } = super::parse_source_run(stopped.clone()).unwrap()
+        else {
+            panic!("literal source paths")
+        };
+        assert_eq!(paths, vec![path.clone()]);
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+        let super::MultiplexerCommand::FlbcRun {
+            path: actual,
+            vm_limits,
+            ..
+        } = super::parse_flbc_run(stopped).unwrap()
+        else {
+            panic!("literal artifact path")
+        };
+        assert_eq!(actual, path);
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+        assert!(
+            super::parse_lean_command([
+                "--src-deps".into(),
+                "--fln-max-steps=1".into(),
+                "Main.lean".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn execution_limit_options_preserve_operand_boundaries() {
+        for args in [
+            vec!["--max-bytes", "--fln-max-steps=0", "12", "Main.lean"],
+            vec!["--max-bytes", "--fln-max-frames=0", "12", "Main.lean"],
+            vec!["--fln-max-steps", "--jobs=1", "12", "Main.lean"],
+            vec!["--fln-max-frames", "--jobs=1", "12", "Main.lean"],
+            vec![
+                "--fln-max-steps",
+                "--import-posture=recheck",
+                "12",
+                "Main.lean",
+            ],
+            vec![
+                "--fln-max-frames",
+                "--import-posture=recheck",
+                "12",
+                "Main.lean",
+            ],
+            vec!["--jobs", "--fln-max-steps=0", "2", "Main.lean"],
+            vec![
+                "--import-posture",
+                "--fln-max-steps=0",
+                "recheck",
+                "Main.lean",
+            ],
+            vec!["--fln-max-steps", "--", "12", "Main.lean"],
+        ] {
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(super::parse_source_run(args.clone()).is_err(), "{args:?}");
+            assert!(super::parse_flbc_run(args.clone()).is_err(), "{args:?}");
+            assert!(super::parse_lean_command(args.clone()).is_err(), "{args:?}");
+        }
+
+        let super::MultiplexerCommand::SourceRun {
+            jobs,
+            import_posture,
+            emit_flbc,
+            emit_sidecar,
+            vm_limits,
+            ..
+        } = super::parse_source_run(
+            [
+                "--jobs=2",
+                "--import-posture",
+                "recheck",
+                "--emit-flbc",
+                "--fln-max-steps=17",
+                "--emit-sidecar",
+                "--jobs=3",
+                "Main.lean",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap()
+        else {
+            panic!("source command")
+        };
+        assert_eq!(jobs.unwrap().get(), 2);
+        assert_eq!(import_posture, super::ImportPosture::Recheck);
+        assert_eq!(emit_flbc, Some(PathBuf::from("--fln-max-steps=17")));
+        assert_eq!(emit_sidecar, Some(PathBuf::from("--jobs=3")));
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
+
+        let super::MultiplexerCommand::FlbcRun {
+            sidecar, vm_limits, ..
+        } = super::parse_flbc_run(
+            ["--sidecar", "--fln-max-frames=17", "product.flbc"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap()
+        else {
+            panic!("artifact command")
+        };
+        assert_eq!(sidecar, Some(PathBuf::from("--fln-max-frames=17")));
+        assert_eq!(vm_limits, fln::VmExecutionLimits::user_program());
     }
 
     #[test]
@@ -17384,7 +18527,7 @@ mod tests {
             usage,
         };
 
-        let output = render_lean_source_commands(&completed);
+        let output = render_lean_source_commands(&completed, super::WarningSink::Unreachable);
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.starts_with("lean: program-panic: "));
@@ -17550,10 +18693,17 @@ mod tests {
     /// One real checked environment, emitted through the product door, as an
     /// import-free non-module snapshot: the same artifact class the bounded
     /// check-olean and trust surfaces consume.
+    /// A source axiom, a theorem that uses it, and a definition whose closure is
+    /// axiom-free: `Nat` addition is a checked definition in this seed, not an
+    /// axiom. The pin accepts the file and prints `42`.
     fn checked_snapshot_fixture(root: &std::path::Path) -> PathBuf {
         let source = root.join("answer_source.lean");
-        std::fs::write(&source, "def answer : Nat := 40 + 2\n#eval answer\n")
-            .expect("write trust-surface source fixture");
+        std::fs::write(
+            &source,
+            "axiom answerAx : 40 + 2 = 42\ntheorem answer_eq : 40 + 2 = 42 := answerAx\n\
+             def answer : Nat := 40 + 2\n#eval answer\n",
+        )
+        .expect("write trust-surface source fixture");
         let snapshot = root.join("answer_snapshot.olean");
         let output = run([
             OsString::from("run"),
@@ -17617,14 +18767,16 @@ mod tests {
         assert!(robot.stdout.contains("\"schema\":\"fln.audit-tcb/1\""));
         assert!(robot.stdout.contains("\"modules\":1"));
         assert!(
-            robot.stdout.contains("\"name\":\"Nat.add\""),
-            "the remaining primitive addition axiom must appear in the inventory: {}",
+            robot.stdout.contains("\"name\":\"answerAx\""),
+            "the source's own axiom must appear in the inventory: {}",
             robot.stdout
         );
-        assert!(
-            !robot.stdout.contains("\"name\":\"Nat\""),
-            "the checked Nat inductive must not be inventoried as an axiom"
-        );
+        for checked in ["Nat", "Nat.add", "answer_eq", "answer"] {
+            assert!(
+                !robot.stdout.contains(&format!("\"name\":\"{checked}\"")),
+                "the checked `{checked}` must not be inventoried as an axiom"
+            );
+        }
         assert!(!robot.stdout.contains("\"unsafe\":true"));
 
         let human = run([
@@ -17634,8 +18786,10 @@ mod tests {
         ]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stdout.contains("trust surface inventory: complete"));
-        assert!(human.stdout.contains("axiom Nat.add"));
-        assert!(!human.stdout.lines().any(|line| line.trim() == "axiom Nat"));
+        let listed = |axiom: &str| human.stdout.lines().any(|line| line.trim() == axiom);
+        assert!(listed("axiom answerAx"));
+        assert!(!listed("axiom Nat"));
+        assert!(!listed("axiom Nat.add"));
         assert!(human.stdout.contains("scope: decoded declarations only"));
 
         let missing_flag = run([
@@ -17653,28 +18807,39 @@ mod tests {
         let robot = run([
             OsString::from("why-trusts"),
             OsString::from("--json"),
-            OsString::from("answer"),
+            OsString::from("answer_eq"),
             snapshot.clone().into_os_string(),
         ]);
         assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
         assert!(robot.stdout.contains("\"schema\":\"fln.why-trusts/1\""));
-        assert!(robot.stdout.contains("\"target\":\"answer\""));
-        assert!(robot.stdout.contains("\"kind\":\"definition\""));
+        assert!(robot.stdout.contains("\"target\":\"answer_eq\""));
+        assert!(robot.stdout.contains("\"kind\":\"theorem\""));
         assert!(
-            robot.stdout.contains("\"axioms\":[\"Nat.add\"]"),
-            "the trust closure must reach addition without inventing a Nat axiom: {}",
+            robot.stdout.contains("\"axioms\":[\"answerAx\"]"),
+            "the trust closure must reach the source axiom and invent no Nat axiom: {}",
             robot.stdout
         );
         assert!(robot.stdout.contains("\"truncated\":false"));
 
+        // Addition is checked, so a definition built from it trusts nothing.
+        let free = run([
+            OsString::from("why-trusts"),
+            OsString::from("--json"),
+            OsString::from("answer"),
+            snapshot.clone().into_os_string(),
+        ]);
+        assert_eq!(free.exit_code, 0, "{}", free.stderr);
+        assert!(free.stdout.contains("\"kind\":\"definition\""));
+        assert!(free.stdout.contains("\"axioms\":[]"), "{}", free.stdout);
+
         let human = run([
             OsString::from("why-trusts"),
-            OsString::from("answer"),
+            OsString::from("answer_eq"),
             snapshot.into_os_string(),
         ]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
-        assert!(human.stdout.contains("why-trusts: answer"));
-        assert!(human.stdout.contains("axioms: Nat.add\n"));
+        assert!(human.stdout.contains("why-trusts: answer_eq"));
+        assert!(human.stdout.contains("axioms: answerAx\n"));
         assert!(human.stdout.contains(
             "recursor rules, instance selections, and rewrite provenance are not traversed"
         ));

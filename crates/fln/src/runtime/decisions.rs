@@ -7,6 +7,8 @@
 //! never authorizes erasure. The logical declarations remain unchanged.
 
 use super::*;
+mod text;
+pub(super) use text::Store;
 
 fn required_decision_name(candidate: &Name, carrier: &str, instance: bool) -> bool {
     ["Bool", "Eq", "Decidable", "False", "True", "Not", "decide"]
@@ -54,7 +56,7 @@ impl Preparation<'_> {
             // Recognition includes the proof-field aliases and the closed
             // representative. A same-named foreign family cannot acquire this
             // erasure, and a failed check never fills the cached guard.
-            for expected in fln_elab::seed::source_seed_declarations() {
+            for expected in fln_elab::seed::source_seed_declarations_iter() {
                 self.tick()?;
                 match expected {
                     Declaration::Inductive(block)
@@ -117,10 +119,23 @@ impl Preparation<'_> {
         carrier: &str,
         instance: bool,
     ) -> Result<(), IngressError> {
+        let carrier_index = match carrier {
+            "Nat" => 0,
+            "Bool" => 1,
+            _ => return Err(unsupported("equality decision carrier")),
+        };
+        let form_index = usize::from(instance);
+        if self.specializations.equality_decisions_checked[carrier_index][form_index] {
+            // The preparation owns one immutable admitted environment. Reusing
+            // its completed contract is safe, but is still metered work. Only
+            // validation is shared: operands and strict bindings remain dynamic.
+            self.tick()?;
+            return Ok(());
+        }
         // Use the same candidates admitted by the source seed. Checking only
         // the instance wrapper would miss a replaced carrier decEq dependency;
         // checking only decEq would miss changed eliminator rules.
-        for expected in fln_elab::seed::source_seed_declarations() {
+        for expected in fln_elab::seed::source_seed_declarations_iter() {
             self.tick()?;
             let canonical = match expected {
                 Declaration::Axiom(expected)
@@ -179,6 +194,8 @@ impl Preparation<'_> {
                 return Err(unsupported("noncanonical equality decision definition"));
             }
         }
+        // A mismatch or resource stop above must never warm this contract.
+        self.specializations.equality_decisions_checked[carrier_index][form_index] = true;
         Ok(())
     }
 
@@ -244,7 +261,8 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if callee != &name("decide") || !levels.is_empty() || arguments.len() != 2 {
+        let pinned = callee == &name("Decidable.decide");
+        if (!pinned && callee != &name("decide")) || !levels.is_empty() || arguments.len() != 2 {
             return Ok(None);
         }
 
@@ -289,6 +307,19 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
+            if pinned {
+                if !levels.is_empty() {
+                    return Ok(None);
+                }
+                let Some(mut result) = self.text_equality_decision(callee, &operands)? else {
+                    return Ok(None);
+                };
+                for (name, type_, value, nondep) in bindings.into_iter().rev() {
+                    self.tick()?;
+                    result = Expr::let_e(name, type_, value, result, nondep);
+                }
+                return Ok(Some(result));
+            }
             let (carrier, instance) = if callee == &name("Nat.decEq") {
                 ("Nat", false)
             } else if callee == &name("instDecidableEqNat") {
@@ -331,6 +362,140 @@ mod tests {
 
     fn apply(spelling: &str, operands: impl IntoIterator<Item = Expr>) -> Expr {
         operands.into_iter().fold(constant(spelling), Expr::app)
+    }
+
+    #[test]
+    fn equality_contract_reuse_keeps_dynamic_operands_within_linear_work_budget() {
+        let env = environment("Nat", "");
+        let mut prep = Preparation::new(
+            &env,
+            IngressLimits {
+                max_nodes: 4096,
+                ..IngressLimits::default()
+            },
+        );
+        for ordinal in 0..256 {
+            let left = nat::literal(ordinal);
+            let right = nat::literal(ordinal + 1);
+            let callee = if ordinal % 2 == 0 {
+                "Nat.decEq"
+            } else {
+                "instDecidableEqNat"
+            };
+            assert_eq!(
+                prep.equality_decision(
+                    &constant("decide"),
+                    &decide_args(apply(callee, [left.clone(), right.clone()])),
+                )
+                .unwrap(),
+                Some(apply("Nat.beq", [left, right])),
+            );
+        }
+        assert!(prep.visited < 4096);
+        eprintln!(
+            "256 canonical equality decisions: {} preparation visits",
+            prep.visited
+        );
+    }
+
+    #[test]
+    fn equality_contract_cache_separates_carriers_and_instance_wrappers() {
+        for (carrier, carrier_index, other) in [("Nat", 0, "Bool"), ("Bool", 1, "Nat")] {
+            // The direct function is canonical but its instance wrapper is not.
+            // Checking the first must not authorize the second, nor a different
+            // carrier whose equality function was never installed here.
+            let env = environment(carrier, &format!("instDecidableEq{carrier}"));
+            let mut prep = Preparation::new(&env, IngressLimits::default());
+            prep.checked_equality_decision_contract(carrier, false)
+                .unwrap();
+            let before = prep.visited;
+            prep.checked_equality_decision_contract(carrier, false)
+                .unwrap();
+            assert_eq!(prep.visited - before, 1);
+            assert!(
+                prep.checked_equality_decision_contract(carrier, true)
+                    .is_err()
+            );
+            assert!(
+                prep.checked_equality_decision_contract(other, false)
+                    .is_err()
+            );
+            assert_eq!(
+                prep.specializations.equality_decisions_checked[carrier_index],
+                [true, false]
+            );
+            assert_eq!(
+                prep.specializations.equality_decisions_checked[1 - carrier_index],
+                [false; 2]
+            );
+            assert!(
+                prep.checked_equality_decision_contract("Unknown", false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn equality_contract_caches_only_complete_checks_and_never_bypasses_limits() {
+        for (carrier, carrier_index) in [("Nat", 0), ("Bool", 1)] {
+            for instance in [false, true] {
+                let env = environment(carrier, "");
+                let mut prep = Preparation::new(
+                    &env,
+                    IngressLimits {
+                        max_nodes: 64,
+                        ..IngressLimits::default()
+                    },
+                );
+                assert!(matches!(
+                    prep.checked_equality_decision_contract(carrier, instance),
+                    Err(IngressError::ResourceLimit { .. })
+                ));
+                assert_eq!(
+                    prep.specializations.equality_decisions_checked,
+                    [[false; 2]; 2]
+                );
+                let spent = prep.visited;
+                prep.limits = IngressLimits::default();
+                prep.checked_equality_decision_contract(carrier, instance)
+                    .unwrap();
+                assert!(prep.visited > spent);
+                assert!(
+                    prep.specializations.equality_decisions_checked[carrier_index]
+                        [usize::from(instance)]
+                );
+
+                let before = prep.visited;
+                prep.checked_equality_decision_contract(carrier, instance)
+                    .unwrap();
+                assert_eq!(prep.visited - before, 1);
+                prep.limits.max_nodes = prep.visited;
+                assert!(matches!(
+                    prep.checked_equality_decision_contract(carrier, instance),
+                    Err(IngressError::ResourceLimit { .. })
+                ));
+
+                // Another preparation cannot inherit the successful read, even
+                // when it borrows the same immutable environment.
+                let mut fresh = Preparation::new(
+                    &env,
+                    IngressLimits {
+                        max_nodes: 64,
+                        ..IngressLimits::default()
+                    },
+                );
+                assert!(
+                    fresh
+                        .checked_equality_decision_contract(carrier, instance)
+                        .is_err()
+                );
+                assert_eq!(
+                    fresh.specializations.equality_decisions_checked,
+                    [[false; 2]; 2]
+                );
+                assert!(fresh.lambdas.is_empty() && fresh.constructors.is_empty());
+            }
+        }
     }
 
     #[test]

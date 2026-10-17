@@ -79,7 +79,7 @@ fn priority_updates_preserve_first_registration_order_for_equal_priority_instanc
 fn a_diamond_exports_only_each_modules_own_instance_registrations() {
     let base = format!("{PICK}\ninstance (priority := 500) fallback : Pick := Pick.mk Token.left");
     let built = compiled(&[
-        ("Main", "prelude\nimport Left Right"),
+        ("Main", "prelude\nimport Left\nimport Right"),
         (
             "Left",
             "prelude\nimport Base\ninstance (priority := 2000) preferred : Pick := Pick.mk Token.right",
