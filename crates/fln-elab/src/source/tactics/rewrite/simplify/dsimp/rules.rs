@@ -1,215 +1,206 @@
-//! Recover reflexive-rule eligibility from admitted bodies, not theorem names.
-//! The pin's inferred defeq attribute additionally requires the GENERIC equation
-//! to hold at instances transparency. A particular lucky instantiation is not
-//! enough to turn an arbitrary simp theorem into a dsimp theorem.
+//! Reflexivity classification is structural, never proof-irrelevance conversion.
 use super::*;
 
 impl Context {
-    pub(super) fn dsimp_rules<'a>(
+    pub(super) fn dsimp_set<'a>(
         &mut self,
-        selected: Vec<SimpRule<'a>>,
-    ) -> Result<Rules<'a>, NatDefinitionElabError> {
-        let mut rules = Rules::default();
-        for rule in selected {
+        args: &'a [Syntax],
+    ) -> Result<DsimpSet<'a>, NatDefinitionElabError> {
+        let environment = self.txn.env.clone();
+        let tagged = scope::simp::defeq::read(&environment, || self.tick())?;
+        let mut set = DsimpSet {
+            definitions: Vec::new(),
+            reflexive: Vec::new(),
+        };
+        for rule in self.simp_rules(args)? {
             self.tick()?;
+            // Eligibility probes are not instance-synthesis/admission effects.
+            // Resolve fully and charge each candidate without keeping its holes.
             let mut trial = self.rewrite_trial();
             let classified = (|| {
-                let term = trial.selected_simp_term(&rule)?;
-                let bare = match &rule {
-                    SimpRule::Explicit(rule) => matches!(rule.syntax, Syntax::Ident { .. }),
-                    SimpRule::Global(entry) => entry.proof.is_none(),
-                    SimpRule::Local(_) => false,
-                };
-                if bare && !trial.dsimp_is_proposition(&term.type_)? {
-                    match term.value.node() {
-                        ExprNode::Const { name, .. } => {
-                            if let Some(ConstantInfo::Defn(definition)) = trial.txn.env.find(name)
-                                && definition.safety == DefinitionSafety::Safe
-                            {
-                                if rule.reverse() { return Err(error(TacticError::MalformedScript)); }
-                                rules.definitions.insert(name.clone(), definition.clone());
-                                return Ok(());
-                            }
-                        }
-                        ExprNode::FVar { id } => {
-                            if let Some(local) = trial.txn.lctx.find(id)
-                                && let Some(value) = &local.value
-                            {
-                                if rule.reverse() { return Err(error(TacticError::MalformedScript)); }
-                                rules.lets.insert(id.clone(), value.clone());
-                                return Ok(());
-                            }
-                        }
-                        _ => {}
-                    }
-                    return Err(error(TacticError::InvalidSimpTheorem));
+                if let Some(selection) = trial.simp_unfold_selection_for_rule(&rule)? {
+                    return Ok((Some(selection), false));
                 }
+                let term = trial.selected_simp_term(&rule)?;
                 if !trial.dsimp_is_proposition(&term.type_)? {
                     return Err(error(TacticError::InvalidSimpTheorem));
                 }
-                if trial.dsimp_rfl_eligible(&term)? {
-                    rules.reflexive.push(rule);
-                }
-                Ok(())
+                Ok((None, trial.dsimp_rfl_proof(term, &tagged)?))
             })();
             self.charge_rewrite_trial(&trial);
-            classified?;
+            let (selection, reflexive) = classified?;
+            if let Some(selection) = selection {
+                set.definitions.push(selection);
+            }
+            if reflexive {
+                set.reflexive.push(rule);
+            }
         }
-        Ok(rules)
+        Ok(set)
     }
 
-    fn dsimp_rfl_eligible(&mut self, term: &Typed) -> Result<bool, NatDefinitionElabError> {
-        let mut type_ = term.type_.clone();
-        let mut proof = term.value.clone();
-        let mut seen = HashSet::new();
+    pub(super) fn dsimp_spine(
+        &mut self,
+        term: &Expr,
+    ) -> Result<(Expr, Vec<Expr>), NatDefinitionElabError> {
+        let mut head = term.clone();
+        let mut arguments = Vec::new();
         loop {
             self.tick()?;
-            // A reference to a theorem is checked at its full generic telescope,
-            // including implicit binders that this application already filled.
-            let mut head = &proof;
-            let mut arguments = Vec::new();
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::App { f, a } => { arguments.push(a.clone()); head = f; }
-                    ExprNode::MData { expr, .. } => head = expr,
-                    _ => break,
+            match head.node() {
+                ExprNode::App { f, a } => {
+                    arguments.push(a.clone());
+                    head = f.clone();
                 }
+                ExprNode::MData { expr, .. } => head = expr.clone(),
+                _ => break,
             }
-            if let ExprNode::Const { name, .. } = head.node() {
-                if (name == &Name::from_components(["Eq", "refl"])
-                    || name == &Name::from_components(["rfl"])) && arguments.len() == 2
-                {
-                    return self.dsimp_generic_equation(&type_);
-                }
-                if name == &Name::from_components(["Eq", "symm"]) && arguments.len() == 4 {
-                    proof = arguments[0].clone();
-                    continue;
-                }
-                let Some(ConstantInfo::Thm(theorem)) = self.txn.env.find(name).cloned() else {
+        }
+        arguments.reverse();
+        Ok((head, arguments))
+    }
+
+    /// Constant proofs are classified by source metadata, not by unfolding
+    /// theorem bodies. Parenthesized/tactic proofs do not implicitly acquire the
+    /// pin's automatic `:= rfl` tag. Nonconstant reflexivity proofs retain the
+    /// structural Eq.refl / rfl / Eq.symm cases from the pinned implementation.
+    pub(in crate::source) fn dsimp_rfl_proof(
+        &mut self,
+        mut term: Typed,
+        tagged: &std::collections::BTreeSet<Name>,
+    ) -> Result<bool, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            if let ExprNode::Const { name, .. } = term.value.node() {
+                return Ok(tagged.contains(name));
+            }
+            while let ExprNode::ForallE {
+                body: type_body, ..
+            } = term.type_.node()
+            {
+                self.tick()?;
+                let ExprNode::Lam { body, .. } = term.value.node() else {
                     return Ok(false);
                 };
-                if !seen.insert(name.clone()) || !self.dsimp_generic_equation(&theorem.base.type_)? {
-                    return Ok(false);
-                }
-                type_ = theorem.base.type_;
-                proof = theorem.value;
-                continue;
+                term = Typed {
+                    value: body.clone(),
+                    type_: type_body.clone(),
+                };
             }
-            match (type_.node(), proof.node()) {
-                (ExprNode::ForallE { body: type_body, .. }, ExprNode::Lam { body, .. }) => {
-                    if !self.dsimp_generic_equation(&type_)? { return Ok(false); }
-                    type_ = type_body.clone();
-                    proof = body.clone();
-                    // Structural descent deliberately leaves bound variables
-                    // closed. The generic conversion was checked before descent.
-                    // Once the body is Eq.refl, no loose-variable query is needed.
-                    loop {
-                        self.tick()?;
-                        match (type_.node(), proof.node()) {
-                            (ExprNode::ForallE { body: ty, .. }, ExprNode::Lam { body, .. }) => {
-                                type_ = ty.clone(); proof = body.clone();
-                            }
-                            _ => break,
-                        }
-                    }
-                    return self.dsimp_rfl_body(&proof, &mut seen);
-                }
-                _ => return Ok(false),
+            if equality_target(&term.type_).is_none() {
+                return Ok(false);
             }
-        }
-    }
-
-    fn dsimp_rfl_body(
-        &mut self,
-        proof: &Expr,
-        seen: &mut HashSet<Name>,
-    ) -> Result<bool, NatDefinitionElabError> {
-        let mut current = proof.clone();
-        loop {
-            self.tick()?;
-            let mut head = &current;
-            let mut arguments = Vec::new();
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::App { f, a } => { arguments.push(a.clone()); head = f; }
-                    ExprNode::MData { expr, .. } => head = expr,
-                    // A referenced theorem's full value may have a telescope.
-                    ExprNode::Lam { body, .. } if arguments.is_empty() => head = body,
-                    _ => break,
-                }
-            }
-            let ExprNode::Const { name, .. } = head.node() else { return Ok(false); };
-            if (name == &Name::from_components(["Eq", "refl"])
-                || name == &Name::from_components(["rfl"])) && arguments.len() == 2
-            { return Ok(true); }
-            if name == &Name::from_components(["Eq", "symm"]) && arguments.len() == 4 {
-                current = arguments[0].clone();
-                continue;
-            }
-            let Some(ConstantInfo::Thm(theorem)) = self.txn.env.find(name).cloned() else {
+            let (head, arguments) = self.dsimp_spine(&term.value)?;
+            let ExprNode::Const { name, .. } = head.node() else {
                 return Ok(false);
             };
-            if !seen.insert(name.clone()) || !self.dsimp_generic_equation(&theorem.base.type_)? {
-                return Ok(false);
+            if arguments.len() == 2
+                && (name == &Name::from_components(["Eq", "refl"])
+                    || name == &Name::from_components(["rfl"]))
+            {
+                return Ok(true);
             }
-            current = theorem.value;
+            if name == &Name::from_components(["Eq", "symm"]) && arguments.len() == 4 {
+                term.value = arguments[3].clone();
+                continue;
+            }
+            return Ok(tagged.contains(name));
         }
     }
 
-    fn dsimp_generic_equation(&mut self, type_: &Expr) -> Result<bool, NatDefinitionElabError> {
+    /// Eligibility is a property of the whole theorem, not a lucky use-site
+    /// specialization. Open rigid parameters; a theorem that only reduces at
+    /// default transparency must not become a dsimp rule at one concrete input.
+    pub(in crate::source) fn dsimp_generic_defeq(
+        &mut self,
+        type_: &Expr,
+        levels: &[Name],
+    ) -> Result<bool, NatDefinitionElabError> {
         let mut trial = self.rewrite_trial();
         let result = (|| {
-            let mut body = type_.clone();
-            while let ExprNode::ForallE { binder_type, body: rest, .. } = body.node() {
+            for level in levels {
                 trial.tick()?;
-                let local = trial.equality_local(binder_type.clone())?;
-                let next = trial.substitute(rest, &Expr::fvar(local.id.clone()))?;
-                eliminate::add_local(&mut trial.txn.lctx, &local);
-                body = next;
+                if !trial.level_params.contains(level) {
+                    trial.level_params.push(level.clone());
+                }
             }
-            let Some((_, _, left, right)) = equality_target(&body) else { return Ok(false); };
+            let mut target = type_.clone();
+            loop {
+                trial.tick()?;
+                target = trial.whnf_with_transparency(
+                    &target,
+                    UnificationTransparency::SafeDefinitions,
+                    false,
+                )?;
+                let ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } = target.node()
+                else {
+                    break;
+                };
+                let mut local = trial.equality_local(binder_type.clone())?;
+                local.binder_info = *binder_info;
+                eliminate::add_local(&mut trial.txn.lctx, &local);
+                target = trial.substitute(body, &Expr::fvar(local.id))?;
+            }
+            let Some((_, _, left, right)) = equality_target(&target) else {
+                return Ok(false);
+            };
             let mut budget = UnificationBudget::new(trial.kernel);
             budget.transparency = UnificationTransparency::Instances;
+            budget.zeta_delta = false;
             trial.proof_types_match_with_budget(&left, &right, budget)
         })();
         self.charge_rewrite_trial(&trial);
         result
     }
 
-    pub(super) fn dsimp_rewrite_head(
+    /// Try at this exact node. The caller has already selected which children
+    /// are eligible; a recursive rule search would violate that decision.
+    pub(super) fn dsimp_rewrite(
         &mut self,
-        expr: &Expr,
-        rules: &Rules<'_>,
+        target: &Expr,
+        set: &DsimpSet<'_>,
     ) -> Result<Expr, NatDefinitionElabError> {
-        for rule in &rules.reflexive {
+        for rule in &set.reflexive {
             self.tick()?;
             let mut trial = self.rewrite_trial();
-            let result = (|| {
+            let attempt = (|| {
                 let term = trial.selected_simp_term(rule)?;
-                let Some(found) = trial.instantiate_rewrite_rule(term, expr, rule.reverse(), false, &[])? else {
+                let Some(found) = trial.instantiate_dsimp_rule(term, target, rule.reverse())?
+                else {
                     return Ok(None);
                 };
-                // Traversal owns descent and proof exclusion. Never let the
-                // rewrite matcher's search rewrite a hidden child or proof.
-                if !found.premises.is_empty() || !trial.rewrite_same(expr, &found.occurrence)? {
-                    return Ok(None);
+                if !found.premises.is_empty() || !trial.rewrite_same(target, &found.occurrence)? {
+                    return Err(error(TacticError::MalformedScript));
                 }
-                let Some((_, _, left, right)) = equality_target(&found.rule.type_) else {
-                    return Ok(None);
-                };
-                let next = trial.instantiate(if rule.reverse() { &left } else { &right })?;
-                if next.has_expr_mvar() || next.has_level_mvar() || trial.rewrite_same(expr, &next)? {
-                    return Ok(None);
-                }
+                let (_, _, left, right) = equality_target(&found.rule.type_)
+                    .ok_or_else(|| error(TacticError::ExpectedEquality))?;
+                let replacement = if rule.reverse() { left } else { right };
                 let mut budget = UnificationBudget::new(trial.kernel);
                 budget.transparency = UnificationTransparency::Instances;
-                Ok(trial.proof_types_match_with_budget(expr, &next, budget)?.then_some(next))
+                budget.zeta_delta = false;
+                if !trial.proof_types_match_with_budget(target, &replacement, budget)? {
+                    return Ok(None);
+                }
+                let replacement = trial.instantiate(&replacement)?;
+                if trial.rewrite_same(target, &replacement)? {
+                    return Ok(None);
+                }
+                Ok(Some(replacement))
             })();
             self.charge_rewrite_trial(&trial);
-            if let Some(next) = result? { return Ok(next); }
+            match attempt? {
+                Some(next) => {
+                    *self = trial;
+                    return Ok(next);
+                }
+                None => continue,
+            }
         }
-        Ok(expr.clone())
+        Ok(target.clone())
     }
 }

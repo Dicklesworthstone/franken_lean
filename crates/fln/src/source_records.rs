@@ -580,6 +580,20 @@ impl Engine {
         Ok(match result {
             Outcome::Complete(mut batch) => {
                 apply_batch_effects(&mut batch, irreducible, options)?;
+                if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
+                    for admitted in &batch.admissions {
+                        if let Declaration::Thm(theorem) = &admitted.declaration {
+                            batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                                batch.engine.environment(),
+                                &theorem.base.name,
+                                limits.kernel,
+                            )
+                            .map_err(DefinitionFrontendError::Elaborate)
+                            .map_err(EngineExecutionError::Frontend)?;
+                        }
+                    }
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
                 if let Some((name, priority)) = registration {
                     // Definitions, proof theorems and exported interfaces all
                     // retain the exact admitted generated instance name.

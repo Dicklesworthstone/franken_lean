@@ -4,6 +4,7 @@
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
 mod binders;
+mod dsimp;
 mod locations;
 mod simpa;
 mod unfold;
@@ -330,9 +331,16 @@ impl Context {
             _ => return Err(error(TacticError::MalformedScript)),
         };
         let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");
+        let dsimp = matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp");
         expect_atom(
             keyword,
-            if simpa { "simpa" } else { "simp" },
+            if simpa {
+                "simpa"
+            } else if dsimp {
+                "dsimp"
+            } else {
+                "simp"
+            },
             "simplification keyword",
         )?;
         expect_default_config(config, "default simplification configuration")?;
@@ -397,6 +405,10 @@ impl Context {
             }
             if matches!(row, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "simpStar"]))
             {
+                if dsimp {
+                    // The pin's dsimp argument category does not admit `[*]`.
+                    return Err(error(TacticError::MalformedScript));
+                }
                 let parts = expect_node(
                     row,
                     &parser_kind(&["Tactic", "simpStar"]),

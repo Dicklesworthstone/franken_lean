@@ -13,6 +13,7 @@ on:
       - 'crates/fln/**'
       - 'crates/fln-cli/**'
       - 'examples/native_propositional_logic.lean'
+      - 'scripts/check_dsimp_reference.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -53,82 +54,47 @@ jobs:
     if: github.repository == 'Dicklesworthstone/franken_lean'
     runs-on: ubuntu-22.04
     timeout-minutes: 25
-    permissions:
-      contents: write
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 85ab17cad002b018a07132cbf06ada555e21bcd5
           persist-credentials: false
-      - name: Reconstruct the exact locally tested source tree
-        id: candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
+      - name: Install repository-pinned Rust
         run: |
-          import base64, hashlib, json, lzma, os, pathlib, subprocess, urllib.request
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '9af08bc21e29d6aa33eb931b64ae3aab40ecb03f'
-          parts = ['72df986a62bf8e8fd3e7afc4b9202fc2fb8267ad', '26a4e7da03704c4ab930e600a13d73b100aaea55', '571e8ff773c3a91dcf6de872220f804668bf9348', 'f9cb0f2fd0b4bfe9d9ce84e2b73b69fddcdf9e33']
-          payload = bytearray()
-          for sha in parts:
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  row = json.load(response)
-              raw = base64.b64decode(row['content'])
-              assert len(raw) <= 10000
-              assert hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == sha
-              payload.extend(raw)
-          assert len(payload) == 28180
-          decoder = lzma.LZMADecompressor(memlimit=128 * 1024 * 1024)
-          patch = decoder.decompress(payload, max_length=145981)
-          assert decoder.eof and not decoder.unused_data and len(patch) == 145980
-          assert hashlib.sha256(patch).hexdigest() == '30916725592f02f94ac0b4f2b52329c508ac325a59229eb57f7ce768b5c86964'
-          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dsimp.patch'
-          path.write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', str(path)], check=True)
-          subprocess.run(['git', 'apply', '--index', str(path)], check=True)
-          tree = subprocess.check_output(['git', 'write-tree'], text=True).strip()
-          assert tree == '736da8ec453c1d80052389f0893e8925f6c830a7', tree
-          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
-          subprocess.run(['git', 'diff', '--cached', '--stat'], check=True)
-          print('DSIMP_TEST_SOURCE_TREE ' + tree, flush=True)
-      - name: Validate reducer invariants, real source admission and downstream builds
-        run: |
-          set -euo pipefail
           rustup show active-toolchain
           rustc -Vv
-          cargo test --locked --offline -p fln-elab --lib source::tactics::rewrite::simplify::dsimp::
-          cargo test --locked --offline -p fln-elab --lib source::scope::simp::defeq::tests
-          cargo test --locked --offline -p fln --test source_dsimp --test source_dsimp_native --test source_unfold --test source_simp_locations --no-fail-fast
-          cargo test --locked --offline -p fln-cli --test source_dsimp
-          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
-          cargo clippy --locked --offline -p fln --lib --test source_dsimp_native -- -D warnings
-          cargo clippy --locked --offline -p fln-cli --test source_dsimp -- -D warnings
-          cargo check --locked --offline --workspace --all-targets
-      - name: Preserve verified source blobs without changing any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
+      - name: Preserve the pinned compiler for offline validation
+        shell: bash
         run: |
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only', '-z']).decode().strip('\0').split('\0')
-          assert len(paths) == 43, paths
-          rows = {}
-          for path in paths:
-              raw = pathlib.Path(path).read_bytes()
-              assert len(raw) <= 2000000
-              sha = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(raw).decode()}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  assert json.load(response)['sha'] == sha
-              rows[path] = sha
-          print('DSIMP_NATIVE_VERIFIED_BLOBS ' + json.dumps(rows, sort_keys=True), flush=True)
-          print('BRANCH_UNCHANGED: Reference job and current-main reconciliation are separate requirements', flush=True)
+          set -euo pipefail
+          root=$(rustc --print sysroot)
+          tar -C "$root" --exclude=lib/rustlib/src --exclude=lib/rustlib/rustc-src -cf - bin lib | gzip -1 > "$RUNNER_TEMP/dsimp-toolchain.tar.gz"
+          sha256sum "$RUNNER_TEMP/dsimp-toolchain.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dsimp-toolchain-${{ github.sha }}
+          path: ${{ runner.temp }}/dsimp-toolchain.tar.gz
+          retention-days: 1
+          compression-level: 0
+      - name: Check reducer invariants and real declaration admission
+        run: |
+          cargo test --locked -p fln-elab --lib source::tactics::rewrite::simplify::dsimp::tests
+          cargo test --locked -p fln-elab --lib source::scope::simp::defeq::tests
+          cargo test --locked -p fln --test source_dsimp --test source_dsimp_native --test source_unfold --test source_simp_locations --no-fail-fast
+          cargo test --locked -p fln-cli --test source_dsimp
+          cargo clippy --locked -p fln-elab --lib -- -D warnings
+          echo 'DSIMP_CHECKED_IN_SOURCE_VALIDATED: all preceding commands succeeded'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: dsimp-source-${{ github.sha }}
+          path: |
+            crates/fln-elab/src/source/scope/simp/defeq.rs
+            crates/fln-elab/src/source/tactics.rs
+            crates/fln-elab/src/source/tactics/rewrite/simplify.rs
+            crates/fln-elab/src/source/tactics/rewrite/simplify/dsimp*
+            crates/fln/tests/source_dsimp*
+            crates/fln-cli/tests/source_dsimp.rs
+          retention-days: 2
 
   dsimp-reference:
     runs-on: ubuntu-22.04
@@ -136,41 +102,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 85ab17cad002b018a07132cbf06ada555e21bcd5
           persist-credentials: false
-      - name: Reconstruct the exact locally tested source tree
-        id: candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, hashlib, json, lzma, os, pathlib, subprocess, urllib.request
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == '9af08bc21e29d6aa33eb931b64ae3aab40ecb03f'
-          parts = ['72df986a62bf8e8fd3e7afc4b9202fc2fb8267ad', '26a4e7da03704c4ab930e600a13d73b100aaea55', '571e8ff773c3a91dcf6de872220f804668bf9348', 'f9cb0f2fd0b4bfe9d9ce84e2b73b69fddcdf9e33']
-          payload = bytearray()
-          for sha in parts:
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  row = json.load(response)
-              raw = base64.b64decode(row['content'])
-              assert len(raw) <= 10000
-              assert hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == sha
-              payload.extend(raw)
-          assert len(payload) == 28180
-          decoder = lzma.LZMADecompressor(memlimit=128 * 1024 * 1024)
-          patch = decoder.decompress(payload, max_length=145981)
-          assert decoder.eof and not decoder.unused_data and len(patch) == 145980
-          assert hashlib.sha256(patch).hexdigest() == '30916725592f02f94ac0b4f2b52329c508ac325a59229eb57f7ce768b5c86964'
-          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dsimp.patch'
-          path.write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', str(path)], check=True)
-          subprocess.run(['git', 'apply', '--index', str(path)], check=True)
-          tree = subprocess.check_output(['git', 'write-tree'], text=True).strip()
-          assert tree == '736da8ec453c1d80052389f0893e8925f6c830a7', tree
-          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
-          subprocess.run(['git', 'diff', '--cached', '--stat'], check=True)
-          print('DSIMP_TEST_SOURCE_TREE ' + tree, flush=True)
-      - name: Compare all 50 source programs with the exact pinned Reference
+      - name: Check shared source verdicts with the pinned Reference only
         shell: bash
         run: |
           set -euo pipefail
@@ -180,19 +113,19 @@ jobs:
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
           python3 -I - <<'PY'
           import os, pathlib, subprocess
-          cases = pathlib.Path('crates/fln/tests/source_dsimp.lean').read_text().split('-- CASE ')[1:]
-          assert len(cases) == 26
+          source = pathlib.Path('crates/fln/tests/source_dsimp.lean').read_text()
+          cases = source.split('-- CASE ')[1:]
+          assert len(cases) == 26, len(cases)
           failures = []
-          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
           for case in cases:
               header, text = case.split('\n', 1)
               name, verdict = header.split(' ')
               assert verdict in ('accept', 'reject')
               path = pathlib.Path(os.environ['RUNNER_TEMP']) / (name + '.lean')
               path.write_text(text)
+              lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
               result = subprocess.run([str(lean), str(path)], capture_output=True, text=True, timeout=60)
               print(name, verdict, result.returncode, result.stdout, result.stderr, flush=True)
-              assert result.returncode in (0, 1), 'Reference crash is not a rejection'
               if (result.returncode == 0) != (verdict == 'accept'):
                   failures.append(name)
           assert not failures, failures

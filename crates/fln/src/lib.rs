@@ -6857,6 +6857,18 @@ impl Engine {
                     elaborated.irreducible,
                     options,
                 )?;
+                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax())
+                    && let Declaration::Thm(theorem) = &admitted.declaration
+                {
+                    admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                        admitted.engine.environment(),
+                        &theorem.base.name,
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
                 if let Some((name, priority)) = registration {
                     // A proof instance is admitted as a theorem. Both it and
                     // a data definition register the actual completed name,

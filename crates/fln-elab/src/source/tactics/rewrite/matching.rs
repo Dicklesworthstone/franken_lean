@@ -315,11 +315,39 @@ impl Context {
     /// Bound-variable occurrences needing a newly opened binder are not guessed.
     pub(in crate::source) fn instantiate_rewrite_rule(
         &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+        inside_out: bool,
+        selected_rules: &[SimpRule<'_>],
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            inside_out,
+            selected_rules,
+            false,
+        )
+    }
+
+    pub(in crate::source) fn instantiate_dsimp_rule(
+        &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(rule, target, reverse, true, &[], true)
+    }
+
+    fn instantiate_rewrite_rule_with_scope(
+        &mut self,
         mut rule: Typed,
         target: &Expr,
         reverse: bool,
         inside_out: bool,
         selected_rules: &[SimpRule<'_>],
+        root_only: bool,
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
@@ -422,6 +450,44 @@ impl Context {
                 return Err(error(TacticError::ExpectedEquality));
             };
             let pattern = if reverse { rhs } else { lhs };
+            if root_only {
+                // Dsimp's rule lookup is head-directed. A conversion-based
+                // occurrence match must not unfold a named pattern into an
+                // unrelated node (e.g. `wrap ?n` into every Nat literal). That
+                // both expands the rule's domain and cycles with literal
+                // refolding. Parameter-headed patterns still use the solver.
+                let mut pattern_head = &pattern;
+                let mut target_head = target;
+                loop {
+                    template.tick()?;
+                    match pattern_head.node() {
+                        ExprNode::App { f, .. } => pattern_head = f,
+                        ExprNode::MData { expr, .. } => pattern_head = expr,
+                        _ => break,
+                    }
+                }
+                loop {
+                    template.tick()?;
+                    match target_head.node() {
+                        ExprNode::App { f, .. } => target_head = f,
+                        ExprNode::MData { expr, .. } => target_head = expr,
+                        _ => break,
+                    }
+                }
+                let mismatch = match pattern_head.node() {
+                    ExprNode::Const { name, .. } => !matches!(
+                        target_head.node(), ExprNode::Const { name: actual, .. } if actual == name
+                    ),
+                    ExprNode::FVar { id } => !matches!(
+                        target_head.node(), ExprNode::FVar { id: actual } if actual == id
+                    ),
+                    _ => false,
+                };
+                if mismatch {
+                    return Ok(None);
+                }
+            }
+
             self.charge_rewrite_trial(&template);
             if !inside_out {
                 let pattern = template.instantiate(&pattern)?;
@@ -453,7 +519,7 @@ impl Context {
                 if !visited.insert(term.allocation_identity()) {
                     continue;
                 }
-                if inside_out {
+                if inside_out && !root_only {
                     pending.push((term, true));
                     pending.extend(
                         children(term)
@@ -464,13 +530,15 @@ impl Context {
                     );
                     continue;
                 }
-                pending.extend(
-                    children(term)
-                        .into_iter()
-                        .rev()
-                        .flatten()
-                        .map(|child| (child, false)),
-                );
+                if !root_only {
+                    pending.extend(
+                        children(term)
+                            .into_iter()
+                            .rev()
+                            .flatten()
+                            .map(|child| (child, false)),
+                    );
+                }
             }
             if term.has_loose_bvars() {
                 continue;

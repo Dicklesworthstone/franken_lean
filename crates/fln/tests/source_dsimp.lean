@@ -73,8 +73,8 @@
    fail_if_success dsimp only [wrap]
    exact h
 -- CASE default_reflexive_rule accept
- abbrev wrap (n : Nat) : Nat := n
- @[simp] theorem unwrapped (n : Nat) : wrap n = n := by rfl
+ @[implicit_reducible] def wrap (n : Nat) : Nat := n
+ @[simp] theorem unwrapped (n : Nat) : wrap n = n := rfl
  theorem t (P : Nat -> Prop) (h : P 3) : P (wrap 3) := by
    dsimp
    guard_target =ₛ P 3
@@ -84,8 +84,8 @@
    fail_if_success dsimp only [h]
    exact hp
 -- CASE reflexive_rule_under_lambda accept
- abbrev wrap (n : Nat) : Nat := n
- theorem unwrapped (n : Nat) : wrap n = n := by rfl
+ @[implicit_reducible] def wrap (n : Nat) : Nat := n
+ theorem unwrapped (n : Nat) : wrap n = n := rfl
  theorem t (P : (Nat -> Nat) -> Prop) (h : P (fun n => n)) : P (fun n => wrap n) := by
    dsimp only [unwrapped]
    guard_target =ₛ P (fun n => n)

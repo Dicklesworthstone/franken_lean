@@ -14,6 +14,7 @@ use fln_env::{
     extensions::{CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance},
 };
 use std::collections::BTreeMap;
+pub mod defeq;
 mod imports;
 pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
 

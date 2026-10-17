@@ -79,6 +79,7 @@ pub enum TacticError {
     RewriteLocation,
     RewriteMetavariablePattern,
     SimplificationNoProgress,
+    DefinitionalSimplificationNoProgress,
     SimplificationCycle,
     EliminationLocal,
     EliminationCoverage,
@@ -188,6 +189,9 @@ impl std::fmt::Display for TacticError {
             ),
             Self::RewriteMetavariablePattern => {
                 write!(f, "rewrite pattern has an unresolved metavariable head")
+            }
+            Self::DefinitionalSimplificationNoProgress => {
+                write!(f, "`dsimp` made no progress")
             }
             Self::SimplificationNoProgress => write!(f, "simp only made no progress"),
             Self::SimplificationCycle => write!(f, "simp only encountered a rewrite cycle"),
@@ -1097,6 +1101,8 @@ impl Context {
                 });
             } else if kind == &parser_kind(&["Tactic", "simpAll"]) {
                 self.simplify_all_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "dsimp"]) {
+                self.dsimplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simpa"]) {
