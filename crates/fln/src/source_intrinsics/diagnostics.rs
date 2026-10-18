@@ -34,6 +34,65 @@ fn definition_matches(
         && comparison.expression(&actual.value, value)?)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanicDefault {
+    Projection,
+    SeedAlias,
+}
+
+impl PanicDefault {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Projection => "Inhabited.default",
+            Self::SeedAlias => "default",
+        }
+    }
+
+    fn dependencies(self) -> &'static [&'static str] {
+        match self {
+            Self::Projection => &["Inhabited.default"],
+            Self::SeedAlias => &["Inhabited.default", "default"],
+        }
+    }
+}
+
+/// The pin exports `default` as an alias, not a declaration: its panic body
+/// names `Inhabited.default` directly. The source seed also has a checked
+/// forwarding definition called `default`. Recognize exactly those two bodies
+/// and validate only the helper chain actually selected by the body. In
+/// particular, an unrelated declaration named `default` cannot authorize or
+/// prevent execution of the imported projection form.
+fn panic_default(
+    comparison: &mut Comparison<'_>,
+    actual: &DefinitionVal,
+) -> Result<Option<PanicDefault>, IngressError> {
+    let [universe] = actual.base.level_params.as_slice() else {
+        return Ok(None);
+    };
+    let u = Level::param(universe.clone());
+    let telescope = |result, lambda| {
+        bind(
+            Expr::sort(u.clone()),
+            bind(
+                Expr::app(c("Inhabited", vec![u.clone()]), b(0)),
+                bind(c("String", vec![]), result, BinderInfo::Default, lambda),
+                BinderInfo::InstImplicit,
+                lambda,
+            ),
+            BinderInfo::Implicit,
+            lambda,
+        )
+    };
+    let type_ = telescope(b(2), false);
+    for model in [PanicDefault::Projection, PanicDefault::SeedAlias] {
+        let value = Expr::app(Expr::app(c(model.label(), vec![u.clone()]), b(2)), b(1));
+        if definition_matches(comparison, actual, &type_, &telescope(value, true))? {
+            return Ok(Some(model));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn panic_matches(
     environment: &Environment,
     externs: &mut Option<fln_elab::externs::ExternTable>,
@@ -50,39 +109,19 @@ pub(crate) fn panic_matches(
     let Some(ConstantInfo::Defn(actual)) = environment.find(&requested) else {
         return Err(unsupported());
     };
-    let [universe] = actual.base.level_params.as_slice() else {
+    let mut comparison = Comparison { visited, limits };
+    let Some(model) = panic_default(&mut comparison, actual)? else {
         return Err(unsupported());
     };
-    let u = Level::param(universe.clone());
-    let telescope = |result, lambda| {
-        bind(
-            Expr::sort(u.clone()),
-            bind(
-                Expr::app(c("Inhabited", vec![u.clone()]), b(0)),
-                bind(c("String", vec![]), result, BinderInfo::Default, lambda),
-                BinderInfo::InstImplicit,
-                lambda,
-            ),
-            BinderInfo::Implicit,
-            lambda,
-        )
-    };
-    let value = Expr::app(Expr::app(c("default", vec![u.clone()]), b(2)), b(1));
-    let mut comparison = Comparison { visited, limits };
-    if !definition_matches(
-        &mut comparison,
-        actual,
-        &telescope(b(2), false),
-        &telescope(value, true),
-    )? || !comparison.declaration(
+    if !comparison.declaration(
         environment,
         fln_elab::seed::inhabited::inhabited_seed_declaration(),
     )? {
         return Err(unsupported());
     }
-    for qualified in [false, true] {
+    for &label in model.dependencies() {
         let Declaration::Defn(expected) =
-            fln_elab::seed::inhabited::default_seed_declaration(qualified)
+            fln_elab::seed::inhabited::default_seed_declaration(label == "Inhabited.default")
         else {
             unreachable!("fixed default model")
         };
@@ -100,7 +139,7 @@ pub(crate) fn panic_matches(
             return Err(unsupported());
         }
     }
-    for label in ["Inhabited.default", "default"] {
+    for &label in model.dependencies() {
         check_selected_extern_attribute(
             environment,
             &Name::from_components(label.split('.')),
@@ -110,4 +149,110 @@ pub(crate) fn panic_matches(
         )?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_env::constants::{ConstantVal, ReducibilityHints};
+
+    fn candidate(target: &str) -> DefinitionVal {
+        let name = Name::from_components(["panicCore"]);
+        let universe = Name::from_components(["u"]);
+        let u = Level::param(universe.clone());
+        let telescope = |body, lambda| {
+            bind(
+                Expr::sort(u.clone()),
+                bind(
+                    Expr::app(c("Inhabited", vec![u.clone()]), b(0)),
+                    bind(c("String", vec![]), body, BinderInfo::Default, lambda),
+                    BinderInfo::InstImplicit,
+                    lambda,
+                ),
+                BinderInfo::Implicit,
+                lambda,
+            )
+        };
+        DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: vec![universe],
+                type_: telescope(b(2), false),
+            },
+            value: telescope(
+                Expr::app(Expr::app(c(target, vec![u.clone()]), b(2)), b(1)),
+                true,
+            ),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name],
+        }
+    }
+
+    fn recognize(candidate: &DefinitionVal) -> Option<PanicDefault> {
+        panic_default(
+            &mut Comparison {
+                visited: &mut 0,
+                limits: IngressLimits::default(),
+            },
+            candidate,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn imported_projection_does_not_require_a_seed_only_alias() {
+        let model = recognize(&candidate("Inhabited.default")).unwrap();
+        assert_eq!(model, PanicDefault::Projection);
+        assert_eq!(model.dependencies(), &["Inhabited.default"]);
+    }
+
+    #[test]
+    fn seed_forwarder_still_requires_both_checked_helpers() {
+        let model = recognize(&candidate("default")).unwrap();
+        assert_eq!(model, PanicDefault::SeedAlias);
+        assert_eq!(model.dependencies(), &["Inhabited.default", "default"]);
+    }
+
+    #[test]
+    fn names_safety_universe_arity_and_bodies_remain_checked() {
+        assert_eq!(recognize(&candidate("User.default")), None);
+        assert_eq!(recognize(&candidate("User.Inhabited.default")), None);
+        let original = candidate("Inhabited.default");
+        let mut changed = original.clone();
+        changed.safety = DefinitionSafety::Unsafe;
+        assert_eq!(recognize(&changed), None);
+        let mut changed = original.clone();
+        changed.all.clear();
+        assert_eq!(recognize(&changed), None);
+        let mut changed = original.clone();
+        changed.base.level_params.push(Name::from_components(["v"]));
+        assert_eq!(recognize(&changed), None);
+        let mut changed = original.clone();
+        changed.base.type_ = c("Nat", vec![]);
+        assert_eq!(recognize(&changed), None);
+        let mut changed = original;
+        changed.value = c("Inhabited.default", vec![Level::one()]);
+        assert_eq!(recognize(&changed), None);
+    }
+
+    #[test]
+    fn recognizing_either_body_is_metered() {
+        for label in ["Inhabited.default", "default"] {
+            let limits = IngressLimits {
+                max_nodes: 0,
+                ..IngressLimits::default()
+            };
+            assert!(
+                panic_default(
+                    &mut Comparison {
+                        visited: &mut 0,
+                        limits,
+                    },
+                    &candidate(label),
+                )
+                .is_err()
+            );
+        }
+    }
 }
