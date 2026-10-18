@@ -41,6 +41,9 @@ use std::collections::{BTreeSet, HashSet};
 mod dependencies;
 mod types;
 
+#[cfg(test)]
+mod constructor_erasure_tests;
+
 const CSIMP_TABLE: &str = include_str!("../seed/csimp_recursors.tsv");
 const CSIMP_SCHEMA: &str = "schema fln-seed-csimp-recursors/1";
 
@@ -301,8 +304,19 @@ impl Context {
                         head = f;
                     }
                     args.reverse();
+                    let mut erased_params = 0;
                     if let ExprNode::Const { name, levels } = head.node() {
                         dependencies.check(name)?;
+                        // ToLCNF.visitCtor ignores noncomputability throughout
+                        // constructor parameters, which toMono later erases.
+                        // A parameter can itself be data (e.g. `n : Nat` in
+                        // `Box n`), so inspecting only its type is insufficient.
+                        // Read the admitted constructor's arity, never a name
+                        // convention. Fields and overapplication remain live;
+                        // the constructor itself still needs executable code.
+                        if let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(name) {
+                            erased_params = (ctor.num_params as usize).min(args.len());
+                        }
                         if named.contains(name) && self.compiled_application(name, levels, &args)? {
                             if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
                                 return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
@@ -316,7 +330,7 @@ impl Context {
                     } else {
                         work.push(Work::Visit(head.clone()));
                     }
-                    work.extend(args.into_iter().map(Work::Visit));
+                    work.extend(args.into_iter().skip(erased_params).map(Work::Visit));
                 }
                 // Domains are erased; bodies are opened rather than walking
                 // loose bvars without the telescope that gives them meaning.
