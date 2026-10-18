@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":649,"projection_hash":"fb575f118874e988d33df9c1384b7ba178cacb71d3fe3d263697cb5b2912d4f6"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":651,"projection_hash":"88f6a89eaeea71f0e533f11723d868b4e539aa32f3b4269be8c2360caa6d8f33"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -234,6 +234,7 @@
 {"id":"fln-macro-rung-e1rk"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
+{"id":"fln-match-alt-column-false-accept-u3fv"}
 {"id":"fln-merkle-decl-digest-80ni"}
 {"id":"fln-mirror-price-cszo"}
 {"id":"fln-module-header-tric"}
@@ -244,6 +245,7 @@
 {"id":"fln-nested-actions-e60c"}
 {"id":"fln-nhf5"}
 {"id":"fln-nomatch-nofun-h78u"}
+{"id":"fln-noncomputable-check-false-refusal-bhf2"}
 {"id":"fln-notation-from-imports-0edr"}
 {"id":"fln-nu8r"}
 {"id":"fln-o0j"}

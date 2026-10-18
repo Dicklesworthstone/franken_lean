@@ -23,6 +23,24 @@ The evidence matrix and Beads tracker remain authoritative where they carry stro
 
 ---
 
+## Measured state, 2026-10-17
+
+Collected by the reality check `fln-reality-check-1017-9l76` at origin/main `0e9d4c64`, with release binaries built from it and the pinned v4.32.0 `lean` as the oracle. One host under load from the check's own jobs. Re-run before citing.
+
+| What | Result | Reproduce |
+|---|---|---|
+| Whole-stdlib council frontier | 2,433 / 2,433 modules, 215,136 declarations, 0 failed, 0 inconclusive; 1,844 s at `--jobs 16`. This is the accept side only; the corpus holds no declaration the pin rejects | `fln check-olean --continue --jobs 16 --progress --json --max-bytes 17179869184 <pin>/lib/lean` |
+| Mathlib frontier | No run since S25 (binary `0a44e720`, 10-06). The corpus was relocated off the measurement host on 10-14 | `fln-r0yh`, `franken_lean-z8j.1.15` |
+| Upstream suite, plain stratum (no explicit import; 2,582 files) | `tests/elab`: 233 of 2,237 pin-accepted files accepted, **171 with identical stdout** (158 on 10-13, same stratum); **1 false accept** among 294 pin-rejected files (`elab_fail/matchAltIndent`). The 797 explicit-import files were not measured (cold closure admissions exceed the 300 s budget) | the reality check's runner; the in-repo scoreboard test cannot measure this stratum since `a5c5293c` (`fln-upstream-suite-scoreboard-n04o`) |
+| `tests/compile` via `lean --run` | 6 / 61 identical with the pin's `--run`; 3 more differ only by the pin's linter warnings; 0 false accepts | the reality check's runner |
+| Fresh held-out probe (50 + 12 controls) | 35 / 49 pin-accepted programs accepted, all 35 with identical stdout; 0 / 13 false accepts | written for the check, not checked in |
+| `Init/Prelude.lean` from source | 115 / 631 declarations admitted under a skip-on-refusal ladder; 39 commands still need blanking to parse | ladder over the pin's lossless command ranges |
+| Known regressions and false accepts | `head!`/`Option.get!` refused since `32c34528` (`fln-panic-contract-seed-regression-q8iy`); the noncomputability check refuses type-only dependencies and well-founded recursion (`fln-noncomputable-check-false-refusal-bhf2`); `#guard_msgs` over `trace_state` accepts a docstring the pin rejects (`fln-guard-msgs-trace-severity-iss2`); a `match` right-hand side left of its `\|` is accepted (`fln-match-alt-column-false-accept-u3fv`); the imported default `@[simp]` set was dropped by merge `9e3bdcb3` (`fln-simp-default-set-a4nb`) | the beads |
+| CI | product-gate reached its test step in 0 of 200 runs since 2026-10-13 (rustfmt 62 sites in 18 files; clippy 2 errors). `main` is unprotected | `fln-publisher-landing-contract-czyx` |
+| Cold `Init` admission, new binary | 1,711 s at `-j 32` (155% average CPU, 8.3 GB peak); the later reuse takes 14 s | `fln-uyuz` |
+
+---
+
 ## Measured state, 2026-10-05
 
 Collected for bead `franken_lean-z8j.1.19`. Rows marked **re-run** were executed for this table; the others cite the record they come from. Every row names its commit or record, and a later commit can move any number, so re-run the command before citing one. Rows marked **re-derived 2026-10-06** were re-measured at `3bfd6986` for the same bead; the first collection of this table (2026-10-05) was stale on two of them within a day, in both directions.
