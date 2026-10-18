@@ -22,6 +22,15 @@ pub(super) trait CheckSource {
     ) -> Result<Option<semantic::Answer>, String> {
         Ok(None)
     }
+    /// Presentations from the last actual check, never a second elaboration
+    /// initiated by cursor movement. Missing authority must remain an error.
+    fn diagnostics(
+        &self,
+        _: &str,
+        _: i64,
+    ) -> Result<&json::rpc::diagnostics::Batch, &'static str> {
+        Err("current native diagnostics are unavailable")
+    }
 
     fn tracks_dependencies(&self) -> bool {
         false

@@ -1,4 +1,4 @@
-//! Read-only Lean RPC goal procedures and their bounded, document-local sessions.
+//! Read-only Lean RPC goal and diagnostic procedures with bounded document-local sessions.
 //! Pinned contracts: Lean/Data/Lsp/Extra.lean and Lean/Server/Rpc/Basic.lean.
 //! The retained objects are immutable native presentations. They are not proof
 //! certificates or executable Meta contexts; unimplemented procedures refuse.
@@ -247,6 +247,19 @@ impl Sessions {
         let text = document
             .text
             .ok_or_else(|| failed("accepted editor source is unavailable"))?;
+        if call.method == "Lean.Widget.getInteractiveDiagnostics" {
+            // Unlike goals, this procedure takes only an optional lineRange.
+            // Read the latest completed native check, not a new elaboration at
+            // the cursor, and do not allocate fictitious expression references.
+            let range = params::diagnostics::line_range(call.params).map_err(invalid)?;
+            let result = checker
+                .diagnostics(&call.uri, document.version)
+                .map_err(failed)?
+                .response(range, MAX_RESPONSE_BYTES)
+                .map_err(failed)?;
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok(result);
+        }
         json::byte_offset(text, call.position).map_err(invalid)?;
         let kind = match call.method.as_str() {
             "Lean.Widget.getInteractiveGoals" => QueryKind::InteractiveGoals,

@@ -2,6 +2,8 @@
 //! UInt64/USize identifiers are JSON strings, preserving all 64 bits in clients.
 use super::*;
 
+pub(in crate::dispatch) mod diagnostics;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::dispatch) enum WireFormat {
     #[default]
