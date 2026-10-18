@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":648,"projection_hash":"cff2c7f5b8d152bdedbeff8980d295cd1eb3baa3b54b5ae4549a23facfd4f1a4"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":649,"projection_hash":"fb575f118874e988d33df9c1384b7ba178cacb71d3fe3d263697cb5b2912d4f6"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -255,6 +255,7 @@
 {"id":"fln-open-explicit-in-f9lk"}
 {"id":"fln-ordinary-lean-probe-g03u"}
 {"id":"fln-otk7"}
+{"id":"fln-panic-contract-seed-regression-q8iy"}
 {"id":"fln-panic-family-and-silent-panic-output-uyuk"}
 {"id":"fln-parity-freshness-denylist-direction-dy22"}
 {"id":"fln-parity-ledger-freshness-names-the-run-igxr"}
