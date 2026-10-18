@@ -1,0 +1,40 @@
+name: Native imported simp
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-imported-simp.yml'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
+      - 'crates/fln-elab/src/source/scope/simp*'
+      - 'crates/fln-elab/src/source/scope/simp/**'
+      - 'crates/fln/src/source_check/modules/**'
+      - 'crates/fln-olean/src/source_extensions*'
+      - 'crates/fln-olean/src/source_extensions/**'
+      - 'crates/fln-conformance/fixtures/tag_attributes/prelude.*'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  imported-simp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install repository toolchain
+        run: |
+          channel=$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+      - name: Test native proof and erasure journal
+        run: cargo test --locked -p fln-elab --lib source::scope::simp::imports -- --nocapture
+      - name: Test imported rules and the required checked-in Prelude
+        run: cargo test --locked -p fln --lib source_check::modules::imported::simp::tests -- --nocapture --test-threads=1
+      - name: Test ordinary source default simp
+        run: cargo test --locked -p fln --test source_default_simp -- --nocapture --test-threads=1

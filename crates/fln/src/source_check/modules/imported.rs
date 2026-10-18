@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 mod implemented_by;
 #[path = "imported/structures.rs"]
 mod structures;
+#[path = "imported/simp.rs"]
+mod simp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {
@@ -46,7 +48,13 @@ impl SourceOleanImportLimits {
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
-            metadata: DecodeLimits::default(),
+            // Restore the allowance for the selected simp index cells, as in
+            // fln-simp-default-set-a4nb's pinned Init measurement (96,786 cells).
+            // Byte, object, entry and instance-key limits remain independent.
+            metadata: DecodeLimits {
+                max_indices: 1 << 17,
+                ..DecodeLimits::default()
+            },
             capture: OleanWalkBudget::default(),
             max_capture_bytes: check.max_total_bytes.max(64 * 1024 * 1024),
             max_roots: 256,
@@ -89,6 +97,12 @@ pub struct SourceMetadataReport {
     /// No initialization action is executed by importing metadata.
     pub regular_initializers: usize,
     pub builtin_initializers: usize,
+    /// Decoded default simp entries, including explicitly deferred forms.
+    pub simps: usize,
+    /// Supported global forward post-phase entries replayed natively.
+    pub activated_simps: usize,
+    /// Unsupported scope, phase or proof forms; also named in `uninterpreted`.
+    pub deferred_simps: usize,
     pub uninterpreted: Vec<Name>,
 }
 
@@ -322,6 +336,7 @@ impl Engine {
             .chain([
                 metadata::structure_extension_name(),
                 Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
+                Name::from_components(metadata::SIMP_EXTENSION.split('.')),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -361,6 +376,9 @@ impl Engine {
                 implemented_by: 0,
                 regular_initializers: 0,
                 builtin_initializers: 0,
+                simps: 0,
+                activated_simps: 0,
+                deferred_simps: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -395,6 +413,7 @@ impl Engine {
                         10 => report.builtin_initializers = block.entries.len(),
                         11 => report.structures = block.entries.len(),
                         12 => report.noncomputable = block.entries.len(),
+                        13 => report.simps = block.entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -420,6 +439,7 @@ impl Engine {
         )?;
         let mut structure_scopes =
             structures::Scopes::new(&checked, &decoded.structures, limits.metadata.max_objects)?;
+        let simp_rows = decoded.simps;
         let mut structure_rows = decoded.structures.into_iter();
         let mut classes = decoded.classes.into_iter();
         let mut instances = decoded.instances.into_iter();
@@ -808,6 +828,21 @@ impl Engine {
                 "decoded metadata escaped its module inventory",
             ));
         }
+        // Simp is an independent journal. Preserve the kept registrar and add
+        // each module's ordered simp suffix to its retained replay snapshots.
+        engine.environment = match (simp::Replay {
+            checked: &checked,
+            origin: &self.environment,
+            order: &order,
+            limits: &limits,
+            cancellation,
+        })
+        .activate(&engine.environment, simp_rows, &mut reports, &mut journals)?
+        {
+            Outcome::Complete(environment) => environment,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         cancelled!("source-olean/before-publication");
         engine.executable_opaques = std::sync::Arc::new(executable_opaques);
         engine.runtime_initializers = std::sync::Arc::new(runtime_initializers);
