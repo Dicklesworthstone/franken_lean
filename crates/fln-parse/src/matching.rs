@@ -104,6 +104,19 @@ fn later_line(view: &SourceView, tokens: &[LexedToken], a: usize, b: usize) -> b
     view.normalized().line_of(tokens[a].extent.start())
         > view.normalized().line_of(tokens[b].extent.start())
 }
+/// `checkColGe` uses character columns, not byte offsets or terminal cell widths.
+/// Token extents are UTF-8 boundaries in the normalized source. Count leading
+/// bytes so a multibyte identifier/comment before an inline pipe does not make
+/// a correctly aligned RHS look under-indented. Same-line RHSs need no scan.
+fn character_column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
+    let source = view.normalized();
+    let pos = tokens[at].extent.start();
+    let start = source.line_start(source.line_of(pos)).expect("token line");
+    source.as_bytes()[start.0..pos.0]
+        .iter()
+        .filter(|&&byte| byte & 0xc0 != 0x80)
+        .count()
+}
 fn close(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -725,14 +738,19 @@ fn plan(
                     && alt.arrow.is_none()
                 {
                     alt.arrow = Some(at);
+                    // Term.matchAlt checks the next token against the first
+                    // pipe before invoking *any* RHS parser: term matches,
+                    // declaration equations, pattern functions and do/catch
+                    // alternatives all share this rule. Braces do not exempt
+                    // a RHS, and shared patterns keep their initial pipe.
+                    if at + 1 < range.end
+                        && later_line(view, tokens, at + 1, alt.pipe)
+                        && character_column(view, tokens, at + 1)
+                            < character_column(view, tokens, alt.pipe)
+                    {
+                        return Err(refuse(view, tokens, at + 1));
+                    }
                     if current.statement {
-                        if at + 1 < range.end
-                            && !is_symbol(tokens, at + 1, "{")
-                            && later_line(view, tokens, at + 1, at)
-                            && column(view, tokens, at + 1) < column(view, tokens, alt.pipe)
-                        {
-                            return Err(refuse(view, tokens, at + 1));
-                        }
                         do_scopes.open(view, tokens, at, depth, Some(current.start), range.end)?;
                     }
                 }
