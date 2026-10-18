@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":641,"projection_hash":"32a05fe0f094eee9b810ee99abad2979e245479050cd7ffdd262d1c03992ac0c"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":648,"projection_hash":"cff2c7f5b8d152bdedbeff8980d295cd1eb3baa3b54b5ae4549a23facfd4f1a4"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -91,6 +91,7 @@
 {"id":"fln-attribute-state-census-h14"}
 {"id":"fln-azxg"}
 {"id":"fln-b65e"}
+{"id":"fln-beads-stale-merge-guard-xzxt"}
 {"id":"fln-bench-apparatus-empty-referent-bkw6"}
 {"id":"fln-bot-publication-bypasses-gates-svj2"}
 {"id":"fln-boundary-api-no-admission-argument-discarded-ez07"}
@@ -141,6 +142,7 @@
 {"id":"fln-fei1"}
 {"id":"fln-ffam"}
 {"id":"fln-ffce"}
+{"id":"fln-file-scale-t2-differential-5f1b"}
 {"id":"fln-fixture-retention-unbounded-evit"}
 {"id":"fln-fln-definition-auxiliary-names-lv0n"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
@@ -160,6 +162,7 @@
 {"id":"fln-g1mc"}
 {"id":"fln-g6d1"}
 {"id":"fln-gates-and-governance-decision-cihe"}
+{"id":"fln-generated-builtin-grammar-spike-kcvj"}
 {"id":"fln-giap"}
 {"id":"fln-gjup"}
 {"id":"fln-gkhu"}
@@ -167,6 +170,7 @@
 {"id":"fln-golem-ordinary-loops-fbj6"}
 {"id":"fln-guard-lifetime-char-boundary-zydy"}
 {"id":"fln-guard-msgs-lls1"}
+{"id":"fln-guard-msgs-trace-severity-iss2"}
 {"id":"fln-h1k"}
 {"id":"fln-h1k.1"}
 {"id":"fln-h1k.2"}
@@ -185,6 +189,7 @@
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-import-reuse-composes-4ngt"}
 {"id":"fln-in1"}
+{"id":"fln-infoview-rpc-procedures-my8l"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
 {"id":"fln-init-control-council-4698-1yyb"}
@@ -263,6 +268,7 @@
 {"id":"fln-provisional-frontier-vf32"}
 {"id":"fln-pu6i"}
 {"id":"fln-publish-rewrite-indexes-gca"}
+{"id":"fln-publisher-landing-contract-czyx"}
 {"id":"fln-pv1"}
 {"id":"fln-q3u4"}
 {"id":"fln-q8qt"}
@@ -275,6 +281,7 @@
 {"id":"fln-reality-check-1004-y7ba"}
 {"id":"fln-reality-check-1007-kzz9"}
 {"id":"fln-reality-check-1013-wzr5"}
+{"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-rfl-for-step-limit-63a9"}
