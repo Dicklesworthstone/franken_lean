@@ -213,7 +213,7 @@ fn missing_or_data_valued_proofs_fail_atomically() {
 #[test]
 fn imported_population_is_not_limited_by_one_proofs_traversal_fuel() {
     let env = environment();
-    let population = MAX_TYPE_STEPS + 1;
+    let population = 4_097;
     let full = import_rules(&env, &vec![proof("first", 1); population]).unwrap();
     let rows = read(&full).unwrap();
     assert_eq!(rows.len(), 1);
@@ -266,8 +266,13 @@ fn imported_population_does_not_increase_proof_shape_fuel() {
         ),
         Expr::sort(Level::zero()),
     );
-    for _ in 0..MAX_TYPE_STEPS {
-        ty = Expr::forall_e(name("x"), Expr::sort(Level::zero()), ty, BinderInfo::Default);
+    for _ in 0..4_096 {
+        ty = Expr::forall_e(
+            name("x"),
+            Expr::sort(Level::zero()),
+            ty,
+            BinderInfo::Default,
+        );
     }
     let long = name("long");
     let env = environment()

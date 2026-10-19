@@ -9,6 +9,9 @@ on:
       - 'crates/fln-elab/src/source/scope/simp*'
       - 'crates/fln-elab/src/source/scope/simp/**'
       - 'crates/fln/src/source_check/modules/**'
+      - 'crates/fln-env/src/extensions.rs'
+      - 'crates/fln-olean/examples/simp_journal_population.rs'
+      - 'crates/fln/tests/source_default_simp.rs'
       - 'crates/fln-olean/src/source_extensions*'
       - 'crates/fln-olean/src/source_extensions/**'
       - 'crates/fln-conformance/fixtures/tag_attributes/prelude.*'
@@ -18,7 +21,7 @@ permissions:
 jobs:
   imported-simp:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -38,3 +41,25 @@ jobs:
         run: cargo test --locked -p fln --lib source_check::modules::imported::simp::tests -- --nocapture --test-threads=1
       - name: Test ordinary source default simp
         run: cargo test --locked -p fln --test source_default_simp -- --nocapture --test-threads=1
+      - name: Fetch the pinned library as artifact data
+        run: |
+          set -euo pipefail
+          python3 -I -c 'from pathlib import Path; rows=[line.split() for line in Path("SUITE.lock").read_text().splitlines() if line.startswith("reference ")]; assert len(rows)==1; row=rows[0]; assert row[1]=="leanprover/lean4" and "tag=v4.32.0" in row and "commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35" in row'
+          archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 3 https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst --output "$archive"
+          printf '%s  %s\n' fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 "$archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/fln-reference"
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP/fln-reference" --wildcards \
+            'lean-4.32.0-linux/lib/lean/*.olean' \
+            'lean-4.32.0-linux/lib/lean/*.olean.server' \
+            'lean-4.32.0-linux/lib/lean/*.olean.private'
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/fln-reference/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+          echo "FLN_REQUIRE_REFERENCE=1" >> "$GITHUB_ENV"
+      - name: Derive the pinned Init simp population natively
+        run: |
+          cargo test --locked -p fln-olean --example simp_journal_population
+          cargo run --locked --release -p fln-olean --example simp_journal_population -- "$FLN_REFERENCE_LIB" Init
+      - name: Import real Init and use its default List and Nat simp rules
+        run: cargo test --locked --release -p fln --lib source_check::modules::imported::simp::tests::pinned_init_restores_the_reported_list_and_nat_default_simp_goals -- --exact --nocapture --test-threads=1
+      - name: Derive the pinned Std and Lean simp populations natively
+        run: cargo run --locked --release -p fln-olean --example simp_journal_population -- "$FLN_REFERENCE_LIB" Std Lean

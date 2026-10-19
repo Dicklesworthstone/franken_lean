@@ -1,6 +1,8 @@
 use super::super::tests::{closure, inputs, limits, n, on_import_stack, pinned_lib};
 use super::*;
-use fln_env::constants::{AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+use fln_env::constants::{
+    AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+};
 
 fn model() -> Environment {
     // The minimal opaque-Nat seed contains neither Nat.zero nor Eq. Use
@@ -160,8 +162,12 @@ fn scoped_rules_are_dormant_and_deferred_globals_withdraw_stale_rules() {
         }
         let (operation, is_deferred) = select(&active, &n("Module"), &deferred).unwrap();
         assert!(is_deferred);
-        let next = native::import_rules(&active, &operation.into_iter().collect::<Vec<_>>()).unwrap();
-        assert_eq!(native::read(&next).unwrap().len(), usize::from(variant == 0));
+        let next =
+            native::import_rules(&active, &operation.into_iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(
+            native::read(&next).unwrap().len(),
+            usize::from(variant == 0)
+        );
         assert_eq!(native::read(&active).unwrap().len(), 1);
     }
 }
@@ -283,7 +289,10 @@ fn import_scope_budget_stops_are_typed_resource_errors() {
 fn retained_simp_suffixes_preserve_source_order_and_redundant_events() {
     use crate::source_check::modules::{Meter, SourceModuleCheckLimits, replay::Export};
     let before = model();
-    let proof = select(&before, &n("Module"), &theorem()).unwrap().0.unwrap();
+    let proof = select(&before, &n("Module"), &theorem())
+        .unwrap()
+        .0
+        .unwrap();
     let erase = ImportedSimpRule::Erase {
         declaration: n("origin"),
     };
@@ -301,7 +310,13 @@ fn retained_simp_suffixes_preserve_source_order_and_redundant_events() {
     let suffix = Export::capture(&module, &before, &erased, vec![], &mut meter).unwrap();
     let source = native::import_rules(&before, std::slice::from_ref(&proof)).unwrap();
     let replayed = suffix
-        .replay(Engine::from_environment(source), &module, &options, &mut meter, None)
+        .replay(
+            Engine::from_environment(source),
+            &module,
+            &options,
+            &mut meter,
+            None,
+        )
         .unwrap()
         .into_complete()
         .unwrap();
@@ -313,11 +328,20 @@ fn retained_simp_suffixes_preserve_source_order_and_redundant_events() {
     let module = n("ExternalReadd");
     let suffix = Export::capture(&module, &before, &after, vec![], &mut meter).unwrap();
     let replayed = suffix
-        .replay(Engine::from_environment(before), &module, &options, &mut meter, None)
+        .replay(
+            Engine::from_environment(before),
+            &module,
+            &options,
+            &mut meter,
+            None,
+        )
         .unwrap()
         .into_complete()
         .unwrap();
-    assert_eq!(native::read(replayed.environment()).unwrap(), native::read(&after).unwrap());
+    assert_eq!(
+        native::read(replayed.environment()).unwrap(),
+        native::read(&after).unwrap()
+    );
     let rows = native::read(replayed.environment()).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].proof, Some(n("proof")));
@@ -384,10 +408,22 @@ fn pinned_prelude_defaults_reach_source_simp_and_keep_negative_controls() {
             assert_eq!(result.checked.theorems, 1);
         }
         for (body, message) in [
-            ("theorem no_default (n : Nat) : id n = n := by simp only", "made no progress"),
-            ("theorem excluded (n : Nat) : id n = n := by simp [-id_eq]", "made no progress"),
-            ("attribute [-simp] id_eq\ntheorem erased (n : Nat) : id n = n := by simp", "made no progress"),
-            ("theorem false_goal : (0 : Nat) = 1 := by simp", "unsolved goals"),
+            (
+                "theorem no_default (n : Nat) : id n = n := by simp only",
+                "made no progress",
+            ),
+            (
+                "theorem excluded (n : Nat) : id n = n := by simp [-id_eq]",
+                "made no progress",
+            ),
+            (
+                "attribute [-simp] id_eq\ntheorem erased (n : Nat) : id n = n := by simp",
+                "made no progress",
+            ),
+            (
+                "theorem false_goal : (0 : Nat) = 1 := by simp",
+                "unsolved goals",
+            ),
         ] {
             let Err(crate::source_check::modules::SourceModuleCheckError::Source { error, .. }) =
                 check(body)
@@ -414,12 +450,27 @@ fn pinned_init_restores_the_reported_list_and_nat_default_simp_goals() {
             .unwrap()
             .into_complete()
             .unwrap();
-        assert!(receipt.modules.iter().map(|report| report.activated_simps).sum::<usize>() > 3);
+        let journal = receipt
+            .engine
+            .environment()
+            .extension(&n("FrankenLean.sourceSimp.v1"))
+            .expect("Init must retain its native default-simp journal");
+        // This is the historical failing population boundary, not a new
+        // capacity setting. Exercise it with the pin's real admitted rules.
+        assert!(journal.len() > 4096, "Init must exercise the old row ceiling");
+        eprintln!(
+            "Init native simp journal: {} events, {} retained payload bytes",
+            journal.len(),
+            journal.payload_bytes()
+        );
         let main = n("Main");
         let source = b"import Init\ntheorem imported_append (xs : List Nat) : (xs ++ []).length = xs.length := by simp\ntheorem imported_add (n : Nat) : n + 0 = n := by simp\n";
         let result = receipt
             .check_source_modules(
-                &[SourceModuleInput { name: &main, source }],
+                &[SourceModuleInput {
+                    name: &main,
+                    source,
+                }],
                 &main,
                 &KVMap::new(),
                 crate::source_check::modules::SourceModuleCheckLimits::new(SourceCheckLimits::new(

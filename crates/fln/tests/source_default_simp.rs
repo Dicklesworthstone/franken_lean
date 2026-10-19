@@ -685,9 +685,8 @@ fn named_simp_priorities_register_their_values() {
 #[test]
 fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
     let mut source = String::from(
-        "def wrap (n : Nat) : Nat := n
-         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl
-",
+        "def wrap (n : Nat) : Nat := n\n\
+         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\n",
     );
     for index in 0..34 {
         source.push_str(&format!(

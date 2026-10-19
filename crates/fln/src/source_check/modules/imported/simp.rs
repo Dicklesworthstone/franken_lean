@@ -22,7 +22,10 @@ impl Replay<'_> {
     ) -> Result<Outcome<Environment>> {
         macro_rules! cancelled {
             () => {
-                if self.cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                if self
+                    .cancellation
+                    .is_some_and(CancellationProbe::is_cancelled)
+                {
                     return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                         "source-olean/simp",
                     )));
@@ -76,9 +79,12 @@ impl Replay<'_> {
             if report.deferred_simps != 0 {
                 report.uninterpreted.push(extension_name());
             }
-            let (_, after) = journals.get_mut(&report.module).ok_or(
-                SourceOleanImportError::Internal("simp module lost its metadata snapshots"),
-            )?;
+            let (_, after) =
+                journals
+                    .get_mut(&report.module)
+                    .ok_or(SourceOleanImportError::Internal(
+                        "simp module lost its metadata snapshots",
+                    ))?;
             // Only the appended suffix is replayed by ImportContexts. Record
             // every operation, including redundant registrations and erasures,
             // so intervening source modules do not change what a suffix means.
@@ -108,7 +114,9 @@ fn origin_of(row: &metadata::SimpEntry) -> &Name {
     match &row.kind {
         metadata::SimpKind::Theorem(theorem) => &theorem.origin,
         metadata::SimpKind::Unfold(name)
-        | metadata::SimpKind::UnfoldTheorems { declaration: name, .. } => name,
+        | metadata::SimpKind::UnfoldTheorems {
+            declaration: name, ..
+        } => name,
     }
 }
 
@@ -214,7 +222,11 @@ struct ScopeIndex {
 }
 
 impl ScopeIndex {
-    fn new(checked: &CheckedOleanSet, rows: &[metadata::SimpEntry], work_left: u64) -> Result<Self> {
+    fn new(
+        checked: &CheckedOleanSet,
+        rows: &[metadata::SimpEntry],
+        work_left: u64,
+    ) -> Result<Self> {
         let mut result = Self {
             parents: Vec::new(),
             owners: BTreeMap::new(),
@@ -274,9 +286,12 @@ impl ScopeIndex {
             if !seen.insert(index) {
                 continue;
             }
-            let parents = self.parents.get(index).ok_or(
-                SourceOleanImportError::Internal("simp module index is outside its graph"),
-            )?;
+            let parents = self
+                .parents
+                .get(index)
+                .ok_or(SourceOleanImportError::Internal(
+                    "simp module index is outside its graph",
+                ))?;
             let count = parents.len();
             pending
                 .try_reserve(count)
