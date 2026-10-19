@@ -1254,8 +1254,23 @@ fn local_line_break(
         .iter()
         .take_while(|&&byte| byte == b' ' || byte == b'\t')
         .count();
-    tokens[at].extent.start().0 - source.line_start(line).expect("local continuation line").0
-        <= baseline
+    let line_begin = source.line_start(line).expect("local continuation line").0;
+    if tokens[at].extent.start().0 - line_begin <= baseline {
+        return true;
+    }
+    // The pin's `let`/`have` save the keyword's own position (`withPosition ("let" >> …)`) and an
+    // application argument must start right of it (`Term.argument`'s `checkColGt`). So a line
+    // whose first token is at or left of the keyword's column cannot continue the value, also
+    // when the keyword does not begin its line (`#eval let x := f a` then an indented body).
+    // Columns are codepoints, as in the pin's `FileMap`.
+    let first_on_line = at == 0 || source.line_of(tokens[at - 1].extent.start()) < line;
+    let column = |from: usize, to: usize| {
+        std::str::from_utf8(&source.as_bytes()[from..to])
+            .map_or(to - from, |text| text.chars().count())
+    };
+    first_on_line
+        && column(line_begin, tokens[at].extent.start().0)
+            <= column(begin, tokens[keyword].extent.start().0)
 }
 
 fn find_let_separator(
