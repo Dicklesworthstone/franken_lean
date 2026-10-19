@@ -7,6 +7,7 @@ on:
       - 'crates/fln/src/runtime/**'
       - 'crates/fln/src/runtime.rs'
       - 'crates/fln/tests/runtime_indexed_data.rs'
+      - 'crates/fln/tests/runtime_type_indexed_data.rs'
       - 'crates/fln-cli/tests/source_indexed_runtime.rs'
       - 'examples/native_indexed_vectors.lean'
       - 'crates/fln/tests/runtime_equality_transport.rs'
@@ -34,8 +35,11 @@ jobs:
       - name: Check indexed layouts, strictness, admission and installed replay
         run: |
           set -euo pipefail
+          cargo test --locked -p fln --test runtime_type_indexed_data
+          cargo test --locked -p fln --lib only_a_direct_type_index_becomes_a_boxed_motive_result
+          cargo test --locked -p fln --lib boxed_type_refinements_keep_the_payload_interface_and_typed_result_boundary
           cargo test --locked -p fln --lib --test runtime_indexed_data --test runtime_equality_transport --test runtime_recursive_data --test runtime_parameterized_data --test runtime_proof_data --test source_indexed --test source_indexed_elimination
           cargo test --locked -p fln-cli --test source_indexed_runtime --test source_proof_runtime
           cargo clippy --locked -p fln --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
-          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime/indexed.rs crates/fln/src/runtime/indexed/tests.rs crates/fln/src/runtime/transport.rs crates/fln/src/runtime/transport/tests.rs crates/fln/tests/runtime_equality_transport.rs crates/fln/tests/runtime_indexed_data.rs crates/fln-cli/tests/source_indexed_runtime.rs
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime/indexed.rs crates/fln/src/runtime/indexed/tests.rs crates/fln/src/runtime/transport.rs crates/fln/src/runtime/transport/tests.rs crates/fln/tests/runtime_equality_transport.rs crates/fln/tests/runtime_indexed_data.rs crates/fln/tests/runtime_type_indexed_data.rs crates/fln-cli/tests/source_indexed_runtime.rs

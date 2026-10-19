@@ -387,8 +387,9 @@ impl Preparation<'_> {
 }
 
 impl Preparation<'_> {
-    /// The logical motive may depend on erased value indices, but its runtime
-    /// result may not. Remove only binders absent after representation erasure.
+    /// A motive may return a checked Type index directly through the private
+    /// boxed carrier. Other index dependencies must disappear after runtime
+    /// erasure; a type computation over an index cannot select a layout here.
     pub(super) fn indexed_motive(
         &mut self,
         motive: &Expr,
@@ -411,6 +412,16 @@ impl Preparation<'_> {
             result = body.clone();
         }
         result = self.erase_runtime_type(&result)?;
+        if let ExprNode::BVar { idx } = result.node()
+            && let Some(position) = indices.len().checked_sub(*idx as usize)
+            && let Some(domain) = indices.get(position)
+            && matches!(domain.node(), ExprNode::Sort { level } if level.is_never_zero())
+        {
+            // The major is #0, so only #1..=#indices can name an index.
+            // The complete admitted telescope above established its Type
+            // domain. No type or runtime index expression is evaluated.
+            return self.enable_boxed_type().map(Some);
+        }
         let count = indices.len().saturating_add(1);
         for index in 0..count {
             self.tick()?;

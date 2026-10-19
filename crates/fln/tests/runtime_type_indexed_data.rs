@@ -180,8 +180,108 @@ fn type_index_erasure_does_not_discard_or_duplicate_actual_value_indices() {
     assert!(direct > idle + 80, "ordinary index computation was dropped");
 }
 
+
+const SELECTED: &str = r#"inductive Selected : Type -> Type 1 where
+  | pack (A : Type) (value : A) : Selected A
+  | nat (value : Nat) : Selected Nat
+def extract (A : Type) (value : Selected A) : A := match value with
+  | .pack A value => value
+  | .nat value => value
+"#;
+
 #[test]
-fn index_selected_runtime_results_and_dependent_layouts_remain_refusals() {
+fn type_index_selected_results_preserve_scalar_object_and_callback_payloads() {
+    for (expression, expected) in [
+        ("extract Nat (Selected.nat 42)", "42"),
+        ("extract Nat (Selected.pack Nat 42)", "42"),
+        (
+            "extract Nat (Selected.pack Nat 18446744073709551616)",
+            "18446744073709551616",
+        ),
+        (
+            r#"String.length (extract String (Selected.pack String "hello")) + 37"#,
+            "42",
+        ),
+        (
+            "if extract Bool (Selected.pack Bool true) then 42 else 0",
+            "42",
+        ),
+        (
+            "if extract Bool (Selected.pack Bool false) then 0 else 42",
+            "42",
+        ),
+        (
+            "List.foldl (fun (acc : Nat) (n : Nat) => acc + n) 0 (extract (List Nat) (Selected.pack (List Nat) [20, 22]))",
+            "42",
+        ),
+        (
+            "let f : Nat -> Nat := extract (Nat -> Nat) (Selected.pack (Nat -> Nat) (fun n => n + 5)); f 37",
+            "42",
+        ),
+        (
+            r#"let f : String -> Nat := extract (String -> Nat) (Selected.pack (String -> Nat) (fun s => String.length s + 37)); f "hello""#,
+            "42",
+        ),
+    ] {
+        run(&format!("{SELECTED}#eval {expression}"), expected);
+    }
+}
+
+#[test]
+fn type_index_selected_results_survive_recursive_wrappers_and_captured_functions() {
+    let source = r#"inductive Wrapped : Type -> Type 1 where
+  | pack (A : Type) (value : A) : Wrapped A
+  | nat (value : Nat) : Wrapped Nat
+  | next (A : Type) (child : Wrapped A) : Wrapped A
+def extract (A : Type) (value : Wrapped A) : A := match value with
+  | .pack A value => value
+  | .nat value => value
+  | .next A child => extract A child
+def result (offset : Nat) : Nat :=
+  let packed := Wrapped.next (Nat -> Nat) (Wrapped.pack (Nat -> Nat) (fun n => offset + n))
+  let f : Nat -> Nat := extract (Nat -> Nat) packed
+  f 5
+#eval result 37"#;
+    run(source, "42");
+}
+
+#[test]
+fn type_index_selected_payloads_execute_once_and_retry_after_resource_stops() {
+    let prefix = format!(
+        "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n"
+    );
+    let selected = |n| {
+        format!("{prefix}#eval extract Nat (Selected.pack Nat (work {n} + 42))")
+    };
+    let direct = |n| format!("{prefix}#eval work {n} + 42");
+    assert_eq!(
+        run(&selected(80), "42") - run(&selected(0), "42"),
+        run(&direct(80), "42") - run(&direct(0), "42"),
+        "boxing must preserve exactly one payload evaluation"
+    );
+
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = selected(80);
+    let mut bounded = limits();
+    bounded.vm.max_steps = 1;
+    assert!(matches!(
+        base.execute_source_definitions(&[source.as_bytes()], &options, bounded)
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    let first = execute(&base, &source);
+    let second = execute(&base, &source);
+    assert_eq!(
+        first.executions.last().unwrap().flbc_artifact,
+        second.executions.last().unwrap().flbc_artifact
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn index_computed_runtime_results_and_dependent_layouts_remain_refusals() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
@@ -189,10 +289,10 @@ fn index_selected_runtime_results_and_dependent_layouts_remain_refusals() {
         r#"inductive Selected : Type -> Type 1 where
   | pack (A : Type) (value : A) : Selected A
   | nat (value : Nat) : Selected Nat
-def extract (A : Type) (value : Selected A) : A := match value with
-  | .pack A value => value
-  | .nat value => value
-#eval extract Nat (Selected.nat 42)"#,
+def extractList (A : Type) (value : Selected A) : List A := match value with
+  | .pack A value => [value]
+  | .nat value => [value]
+#eval extractList Nat (Selected.nat 42)"#,
         r#"inductive Dependent : (A : Type) -> A -> Type 1 where
   | nat (n : Nat) : Dependent Nat n
   | flag (b : Bool) : Dependent Bool b
