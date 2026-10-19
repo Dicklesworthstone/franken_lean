@@ -91,8 +91,8 @@ jobs:
           python3 -I - "$RUNNER_TEMP" <<'PY'
           import pathlib, sys
           source = pathlib.Path('crates/fln/tests/fixtures/named_monad_match.lean').read_text()
-          assert source.count('chooseNamed (some 42) = (42 : Nat)') == 1
-          (pathlib.Path(sys.argv[1]) / 'FalseNamed.lean').write_text(source.replace('chooseNamed (some 42) = (42 : Nat)', 'chooseNamed (some 42) = (43 : Nat)'))
+          assert source.count('Eq (chooseNamed (some 42)) (42 : Nat)') == 1
+          (pathlib.Path(sys.argv[1]) / 'FalseNamed.lean').write_text(source.replace('Eq (chooseNamed (some 42)) (42 : Nat)', 'Eq (chooseNamed (some 42)) (43 : Nat)'))
           PY
           if "$reference" "$RUNNER_TEMP/FalseNamed.lean" > "$RUNNER_TEMP/false-named.log" 2>&1; then
             echo 'The negative reference control unexpectedly succeeded' >&2
