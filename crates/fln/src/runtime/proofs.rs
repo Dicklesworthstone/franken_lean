@@ -277,12 +277,15 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(inlined, expected));
                                 continue;
                             }
-                            // The checked constructor, not a name or a binder's
-                            // type, determines the erased datatype parameter prefix.
-                            // Data-valued parameters are static too (ToLCNF.visitCtor).
-                            let constructor_parameters = match head.node() {
+                            // Construction and elimination share the admitted
+                            // datatype parameter prefix. In particular, source
+                            // match/cases must not execute a data-valued parameter
+                            // that recursor_shape discards. Indices, minors and
+                            // the major are not part of this static prefix.
+                            let static_parameters = match head.node() {
                                 ExprNode::Const { name, .. } => match self.environment.find(name) {
                                     Some(ConstantInfo::Ctor(ctor)) => ctor.num_params as usize,
+                                    Some(ConstantInfo::Rec(rec)) => rec.num_params as usize,
                                     _ => 0,
                                 },
                                 _ => 0,
@@ -357,11 +360,11 @@ impl Preparation<'_> {
                                             arg.clone()
                                         },
                                     )
-                                } else if index < constructor_parameters {
-                                    // Retain the exact parameter for dependent field
-                                    // types and later layout specialization. Do not
-                                    // compile it or memoize it as an executable value:
-                                    // the same expression in a field must still visit.
+                                } else if index < static_parameters {
+                                    // Retain exact parameters for dependent domains
+                                    // and layout specialization, without caching an
+                                    // executable value. The same expression in a
+                                    // field, minor, index or major must still visit.
                                     Frame::Keep(arg.clone())
                                 } else {
                                     Frame::Visit(arg.clone(), domain)
@@ -555,3 +558,6 @@ mod context_tests;
 
 #[cfg(test)]
 mod constructor_parameters;
+
+#[cfg(test)]
+mod recursor_parameters;

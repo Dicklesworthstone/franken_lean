@@ -307,16 +307,18 @@ impl Context {
                     let mut erased_params = 0;
                     if let ExprNode::Const { name, levels } = head.node() {
                         dependencies.check(name)?;
-                        // ToLCNF.visitCtor ignores noncomputability throughout
-                        // constructor parameters, which toMono later erases.
-                        // A parameter can itself be data (e.g. `n : Nat` in
-                        // `Box n`), so inspecting only its type is insufficient.
-                        // Read the admitted constructor's arity, never a name
-                        // convention. Fields and overapplication remain live;
-                        // the constructor itself still needs executable code.
-                        if let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(name) {
-                            erased_params = (ctor.num_params as usize).min(args.len());
+                        // Datatype parameters are static in both construction
+                        // and elimination. Source match/cases lower to Rec here,
+                        // so a data-valued parameter must not regain an executable
+                        // dependency at the generated eliminator. Use only the
+                        // admitted prefix: fields, minors, indices and the major
+                        // remain live. The head and named-recursor gates still run.
+                        erased_params = match self.txn.env.find(name) {
+                            Some(ConstantInfo::Ctor(ctor)) => ctor.num_params as usize,
+                            Some(ConstantInfo::Rec(rec)) => rec.num_params as usize,
+                            _ => 0,
                         }
+                        .min(args.len());
                         if named.contains(name) && self.compiled_application(name, levels, &args)? {
                             if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
                                 return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
