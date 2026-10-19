@@ -33,6 +33,7 @@ mod search;
 mod trace;
 mod unfold;
 pub(in crate::source) use refine::RefinementFrame;
+pub(in crate::source) use rewrite::SimpKeyCache;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticError {

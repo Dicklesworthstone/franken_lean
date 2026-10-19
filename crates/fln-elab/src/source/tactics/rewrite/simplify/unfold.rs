@@ -29,6 +29,26 @@ impl Context {
         }
     }
 
+    /// Whether `simp_unfold_selection_for_rule` may select a definition for `rule`, or
+    /// report its unknown constant. Deciding it charges nothing: a registered
+    /// theorem and a local never unfold.
+    pub(super) fn simp_rule_may_unfold(&self, rule: &SimpRule<'_>) -> bool {
+        match rule {
+            SimpRule::Explicit(_) => true,
+            SimpRule::Local(_) => false,
+            SimpRule::Global(rule) => {
+                rule.proof.is_none()
+                    && match self.txn.env.find(&rule.declaration) {
+                        Some(ConstantInfo::Defn(definition)) => {
+                            definition.safety == DefinitionSafety::Safe && !rule.reverse
+                        }
+                        Some(_) => false,
+                        None => true,
+                    }
+            }
+        }
+    }
+
     pub(super) fn simp_unfold_selection_for_rule(
         &mut self,
         rule: &SimpRule<'_>,

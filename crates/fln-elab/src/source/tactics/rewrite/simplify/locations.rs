@@ -189,7 +189,12 @@ impl Context {
                         .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
                         .cloned()
                         .collect();
+                    let target = self.instantiate(&local.type_)?;
+                    let index = self.simp_target_index(&target)?;
                     for rule in &active {
+                        if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                            continue;
+                        }
                         self.tick()?;
                         let original = self.rewrite_trial();
                         let Some(replacement) = self.simp_hypothesis_step(&local, rule, &active)?

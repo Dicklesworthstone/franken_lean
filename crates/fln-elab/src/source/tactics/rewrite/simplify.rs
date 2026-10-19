@@ -11,7 +11,11 @@ mod unfold;
 
 use super::matching::RigidTypeHead;
 use super::*;
-use std::collections::HashSet;
+use crate::lctx::LocalContext;
+use fln_core::expr::BinderInfo;
+use fln_env::environment::Environment;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 use unfold::UnfoldResult;
 
 const MAX_SIMPLIFICATION_STEPS: usize = 256;
@@ -346,6 +350,147 @@ impl Context {
         Ok(false)
     }
 
+    /// Whether `rule` may match in the target `index` was built from. The pin's simp
+    /// retrieves candidates from a discrimination tree keyed at reducible
+    /// transparency and unifies only those; trying all of `Init`'s ~10,000
+    /// registered rules at every step exhausted the elaboration budget on ordinary
+    /// files (fln-simp-default-set-a4nb). A rule's key is memoized per environment
+    /// and charges nothing: it reads only the rule's admitted type. Explicit and
+    /// local rules, unfolded definitions and every shape not keyed here may match.
+    fn simp_rule_admitted(
+        &self,
+        rule: &SimpRule<'_>,
+        index: Option<&SimpTargetIndex>,
+        side: SimpKeySide,
+    ) -> bool {
+        let (Some(index), SimpRule::Global(entry)) = (index, rule) else {
+            return true;
+        };
+        let cache = Arc::clone(&self.simp_key_cache.0);
+        let mut memo = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if memo.environment.as_ref() != Some(&index.environment) {
+            *memo = SimpKeyMemo {
+                environment: Some(index.environment),
+                ..SimpKeyMemo::default()
+            };
+        }
+        let identity = (
+            entry.declaration.clone(),
+            entry.proof.clone(),
+            entry.reverse,
+        );
+        let keys = memo
+            .rules
+            .entry(identity)
+            .or_insert_with(|| simp_rule_keys(&self.txn.env, &index.table, entry));
+        keys[side as usize]
+            .as_ref()
+            .is_none_or(|key| index.admits(key))
+    }
+
+    /// Every application a candidate rule's key may need to find in `target`: the
+    /// target's own, closed over the values of definitions the key path may unfold at
+    /// reducible or instance transparency, plus each primitive projection's function
+    /// with any arguments. A superset of what a reducible key lookup reaches, so the
+    /// filter only skips rules that cannot match. A numeral is a literal key, as in the
+    /// pin's `DiscrTree`, so it never supplies a `Nat.succ` root: when it did, a match
+    /// that unifies offsets let `Nat.succ_eq_add_one` rewrite `3` to `2 + 1`, then `2`
+    /// to `1 + 1`, at every step. `None` (no filtering) past its work bound.
+    fn simp_target_index(
+        &mut self,
+        target: &Expr,
+    ) -> Result<Option<SimpTargetIndex>, NatDefinitionElabError> {
+        const MAX_KEY_NODES: usize = 1 << 16;
+        self.tick()?;
+        let table = crate::reducibility::table(&self.txn.env).map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        let env = &self.txn.env;
+        let mut applications: HashMap<Name, Vec<Vec<SimpArgKey>>> = HashMap::new();
+        let mut unfolded = HashSet::new();
+        let mut visited = HashSet::new();
+        // Only whole applications are entries: a spine's function prefixes would
+        // admit every rule on its head while comparing no argument.
+        let mut pending = vec![target.clone()];
+        while let Some(term) = pending.pop() {
+            if !visited.insert(term.allocation_identity()) {
+                continue;
+            }
+            if visited.len() > MAX_KEY_NODES {
+                return Ok(None);
+            }
+            let (head, args) = simp_key_spine(&term);
+            match head.node() {
+                ExprNode::Const { name, .. } => {
+                    let keys = args
+                        .iter()
+                        .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg))
+                        .collect();
+                    applications.entry(name.clone()).or_default().push(keys);
+                    if simp_key_unfolds(env, &table, name)
+                        && unfolded.insert(name.clone())
+                        && let Some(ConstantInfo::Defn(definition)) = env.find(name)
+                    {
+                        pending.push(definition.value.clone());
+                    }
+                }
+                ExprNode::Proj {
+                    struct_name, idx, ..
+                } => {
+                    if let Ok(idx) = usize::try_from(*idx)
+                        && let Some(projection) = self.simp_projection_function(struct_name, idx)
+                    {
+                        applications.entry(projection).or_default().push(Vec::new());
+                    }
+                }
+                _ => {}
+            }
+            pending.extend(args.into_iter().cloned());
+            if !matches!(head.node(), ExprNode::Const { .. }) {
+                pending.extend(children(head).into_iter().flatten().cloned());
+            }
+        }
+        Ok(Some(SimpTargetIndex {
+            applications,
+            environment: simp_key_environment(env),
+            table,
+        }))
+    }
+
+    /// The projection function behind a primitive projection: the structure's
+    /// constructor field name at `idx`, after its parameters.
+    fn simp_projection_function(&self, structure: &Name, idx: usize) -> Option<Name> {
+        let fln_env::constants::ConstantInfo::Induct(inductive) = self.txn.env.find(structure)?
+        else {
+            return None;
+        };
+        let [constructor] = inductive.ctors.as_slice() else {
+            return None;
+        };
+        let fln_env::constants::ConstantInfo::Ctor(constructor) = self.txn.env.find(constructor)?
+        else {
+            return None;
+        };
+        let mut type_ = &constructor.base.type_;
+        let mut index = 0usize;
+        while let ExprNode::ForallE {
+            binder_name, body, ..
+        } = type_.node()
+        {
+            if index == constructor.num_params as usize + idx {
+                return match binder_name.leaf_view() {
+                    LeafView::Str(field) => Some(Name::str(structure.clone(), field)),
+                    _ => None,
+                };
+            }
+            index += 1;
+            type_ = body;
+        }
+        None
+    }
+
     fn selected_simp_term(&mut self, rule: &SimpRule<'_>) -> Result<Typed, NatDefinitionElabError> {
         match rule {
             SimpRule::Explicit(rule) => self.simp_rule_term(rule.syntax),
@@ -631,9 +776,14 @@ impl Context {
         rules: &[SimpRule<'_>],
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut target = target.clone();
+        // A registered theorem never unfolds; only definitions take part here.
+        let unfoldable: Vec<_> = rules
+            .iter()
+            .filter(|rule| self.simp_rule_may_unfold(rule))
+            .collect();
         for _ in 0..MAX_SIMPLIFICATION_STEPS {
             let mut changed = false;
-            for rule in rules {
+            for rule in &unfoldable {
                 self.tick()?;
                 if let UnfoldResult::Changed(next) = self.unfold_simp_rule(rule, &target)? {
                     target = next;
@@ -652,7 +802,11 @@ impl Context {
         target: &Expr,
         rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let index = self.simp_target_index(target)?;
         for rule in rules {
+            if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Prove) {
+                continue;
+            }
             self.tick()?;
             if !self.simp_rule_may_prove(rule, target)? {
                 continue;
@@ -723,7 +877,12 @@ impl Context {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
+            let target = self.instantiate(&goal.target)?;
+            let index = self.simp_target_index(&target)?;
             for rule in rules {
+                if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                    continue;
+                }
                 self.tick()?;
                 let original = self.rewrite_trial();
                 let Some((next_goal, value)) = self.simp_step(&goal, rule, &[])? else {
@@ -873,7 +1032,12 @@ impl Context {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
+            let target = self.instantiate(&goal.target)?;
+            let index = self.simp_target_index(&target)?;
             for rule in rules {
+                if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                    continue;
+                }
                 self.tick()?;
                 let original = self.rewrite_trial();
                 let transition = self.simp_step(&goal, rule, rules)?;
@@ -920,6 +1084,754 @@ impl Context {
                 return Err(error(TacticError::SimplificationNoProgress));
             }
             return Ok(());
+        }
+    }
+}
+
+/// An application's head and arguments in order, looking through metadata.
+fn simp_key_spine(expr: &Expr) -> (&Expr, Vec<&Expr>) {
+    let mut head = expr;
+    let mut args = Vec::new();
+    loop {
+        match head.node() {
+            ExprNode::App { f, a } => {
+                args.push(a);
+                head = f;
+            }
+            ExprNode::MData { expr, .. } => head = expr,
+            _ => break,
+        }
+    }
+    args.reverse();
+    (head, args)
+}
+
+/// Which pattern of a rule a key describes: the one it rewrites (oriented), or its
+/// stated left side, which a selected proof must match.
+#[derive(Clone, Copy)]
+enum SimpKeySide {
+    Rewrite = 0,
+    Prove = 1,
+}
+
+/// One argument of a discrimination key. A rule's argument is `Any` (a pattern
+/// variable, or a shape the pin's key leaves open), the rigid constant it requires,
+/// or a numeral's value; a target's argument may also be `Other`, a rigid
+/// non-constant head (a parameter, a sort) that no constant key matches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SimpArgKey {
+    Any,
+    Const(Name),
+    /// A numeral, keyed by its value as the pin's `toNatLit?` keys it.
+    Lit(fln_core::expr::NatLit),
+    Other,
+}
+
+impl SimpArgKey {
+    fn admits(&self, target: &Self) -> bool {
+        match (self, target) {
+            (Self::Any, _) | (_, Self::Any) => true,
+            (Self::Const(rule), Self::Const(target)) => rule == target,
+            (Self::Lit(rule), Self::Lit(target)) => rule == target,
+            _ => false,
+        }
+    }
+}
+
+/// A rule's key: its pattern's rigid head and the keys of that head's keyed
+/// arguments, in order; positions the pin's key ignores are `Any`.
+#[derive(Clone, Debug)]
+struct SimpKey {
+    head: Name,
+    args: Vec<SimpArgKey>,
+}
+
+/// A target's applications by rigid head, with the environment they were read in.
+pub(super) struct SimpTargetIndex {
+    applications: HashMap<Name, Vec<Vec<SimpArgKey>>>,
+    environment: SimpKeyEnvironment,
+    table: Arc<crate::reducibility::ReducibilityTable>,
+}
+
+impl SimpTargetIndex {
+    /// Some application of the key's head agrees with every argument key both have.
+    fn admits(&self, key: &SimpKey) -> bool {
+        self.applications
+            .get(&key.head)
+            .is_some_and(|applications| {
+                applications.iter().any(|args| {
+                    key.args
+                        .iter()
+                        .zip(args)
+                        .all(|(rule, target)| rule.admits(target))
+                })
+            })
+    }
+}
+
+/// What a rule's key depends on: the declarations and reducibility statuses.
+type SimpKeyEnvironment = (
+    Option<[u8; 32]>,
+    (Option<[u8; 32]>, Option<[u8; 32]>),
+    usize,
+);
+
+fn simp_key_environment(env: &Environment) -> SimpKeyEnvironment {
+    (
+        crate::reducibility::journal_digest(env),
+        crate::instances::registry_identity(env),
+        env.len(),
+    )
+}
+
+/// Registered rules' keys, a pure function of the environment they were read in.
+/// Speculative snapshots share it, so restoring one never discards or changes it.
+#[derive(Clone, Default)]
+pub(in crate::source) struct SimpKeyCache(Arc<Mutex<SimpKeyMemo>>);
+
+#[derive(Default)]
+struct SimpKeyMemo {
+    environment: Option<SimpKeyEnvironment>,
+    rules: HashMap<(Name, Option<Name>, bool), [Option<SimpKey>; 2]>,
+}
+
+/// A registered rule's `[rewrite, prove]` keys, read from its admitted type: the
+/// pattern it rewrites (oriented) and its stated left side. A refutation, an
+/// unfolded definition and an unreadable shape are unkeyed.
+fn simp_rule_keys(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    entry: &scope::simp::SimpEntry,
+) -> [Option<SimpKey>; 2] {
+    let Some(info) = env.find(entry.proof.as_ref().unwrap_or(&entry.declaration)) else {
+        return [None, None];
+    };
+    if entry.proof.is_none() && matches!(info, ConstantInfo::Defn(_)) {
+        return [None, None];
+    }
+    let mut body = &info.constant_val().type_;
+    loop {
+        match body.node() {
+            ExprNode::ForallE { body: next, .. } => body = next,
+            ExprNode::MData { expr, .. } => body = expr,
+            _ => break,
+        }
+    }
+    let (head, args) = simp_key_spine(body);
+    let named = |text: &[&str]| Name::from_components(text.iter().copied());
+    let (forward, backward) = match head.node() {
+        ExprNode::Const { name, .. } if *name == named(&["Eq"]) && args.len() == 3 => {
+            (Some(args[1]), Some(args[2]))
+        }
+        ExprNode::Const { name, .. } if *name == named(&["Iff"]) && args.len() == 2 => {
+            (Some(args[0]), Some(args[1]))
+        }
+        ExprNode::Const { name, .. } if *name == named(&["Not"]) && args.len() == 1 => {
+            (Some(args[0]), None)
+        }
+        // A refutation `p → False` loses its premise binder above; keep it unkeyed.
+        ExprNode::Const { name, .. } if *name == named(&["False"]) => (None, None),
+        ExprNode::Const { .. } => (Some(body), None),
+        _ => (None, None),
+    };
+    let pattern = if entry.reverse { backward } else { forward };
+    let key =
+        |pattern: Option<&Expr>| pattern.and_then(|pattern| simp_pattern_key(env, table, pattern));
+    [key(pattern), key(forward)]
+}
+
+/// A pattern's rigid head and argument keys. A head the pin's key path would
+/// reduce at reducible transparency (an abbreviation other than a structure
+/// projection) and numerals, which the pin keys as literals, stay unkeyed.
+fn simp_pattern_key(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    pattern: &Expr,
+) -> Option<SimpKey> {
+    let (head, args) = simp_key_spine(pattern);
+    let ExprNode::Const { name, .. } = head.node() else {
+        return None;
+    };
+    if *name == Name::from_components(["OfNat", "ofNat"]) || simp_key_unfolds(env, table, name) {
+        return None;
+    }
+    let mut args = simp_key_arguments(env, table, name, &args);
+    while args.last() == Some(&SimpArgKey::Any) {
+        args.pop();
+    }
+    Some(SimpKey {
+        head: name.clone(),
+        args,
+    })
+}
+
+/// The argument keys of a pattern `head args`, at the positions the pin's key
+/// reads: an instance argument never, an implicit one only when it is a type, an
+/// explicit one unless it may be a proof. A position counts only where the
+/// binder type, read at the actual type arguments, shows that statically; an
+/// undecided position is left open, as `Any`.
+fn simp_key_arguments(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    head: &Name,
+    args: &[&Expr],
+) -> Vec<SimpArgKey> {
+    let Some(info) = env.find(head) else {
+        return Vec::new();
+    };
+    let mut binders: Vec<&Expr> = Vec::new();
+    let mut keys = Vec::new();
+    let mut type_ = &info.constant_val().type_;
+    while keys.len() < args.len() {
+        match type_.node() {
+            ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } => {
+                let keyed = match binder_info {
+                    BinderInfo::InstImplicit => false,
+                    BinderInfo::Implicit | BinderInfo::StrictImplicit => {
+                        simp_key_is_sort(binder_type)
+                    }
+                    BinderInfo::Default => {
+                        simp_key_is_sort(binder_type)
+                            || simp_key_is_data_type(env, binder_type, &binders, args)
+                    }
+                };
+                keys.push(if keyed {
+                    simp_rule_arg_key(env, table, args[keys.len()])
+                } else {
+                    SimpArgKey::Any
+                });
+                binders.push(binder_type);
+                type_ = body;
+            }
+            ExprNode::MData { expr, .. } => type_ = expr,
+            _ => break,
+        }
+    }
+    keys
+}
+
+fn simp_key_is_sort(type_: &Expr) -> bool {
+    matches!(simp_key_spine(type_).0.node(), ExprNode::Sort { .. })
+}
+
+/// Whether every inhabitant of the binder type `type_` is data, never a proof: its
+/// head is a constant whose type ends in a nonzero universe, or an earlier binder
+/// whose actual argument is such a type (or, failing that, ranges over one).
+fn simp_key_is_data_type(
+    env: &Environment,
+    type_: &Expr,
+    binders: &[&Expr],
+    args: &[&Expr],
+) -> bool {
+    let sort_is_not_zero = |type_: &Expr| matches!(simp_key_spine(type_).0.node(), ExprNode::Sort { level } if level.is_not_zero());
+    let constant_is_data_type = |name: &Name| {
+        env.find(name).is_some_and(|info| {
+            let mut result = &info.constant_val().type_;
+            loop {
+                match result.node() {
+                    ExprNode::ForallE { body, .. } => result = body,
+                    ExprNode::MData { expr, .. } => result = expr,
+                    _ => break sort_is_not_zero(result),
+                }
+            }
+        })
+    };
+    match simp_key_spine(type_).0.node() {
+        ExprNode::BVar { idx } => {
+            let Some(binder) = usize::try_from(*idx)
+                .ok()
+                .and_then(|idx| binders.len().checked_sub(idx + 1))
+            else {
+                return false;
+            };
+            match simp_key_spine(args[binder]).0.node() {
+                ExprNode::Const { name, .. } => constant_is_data_type(name),
+                ExprNode::Sort { .. } => true,
+                _ => sort_is_not_zero(binders[binder]),
+            }
+        }
+        ExprNode::Const { name, .. } => constant_is_data_type(name),
+        _ => false,
+    }
+}
+
+/// A rule's argument key: a numeral's value, the rigid constant the pin's key fixes
+/// there, or `Any` for a pattern variable, a reducible head, and the `Nat` offsets
+/// (`n + 1`, `Nat.succ n`) the pin leaves open as stars.
+fn simp_rule_arg_key(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    arg: &Expr,
+) -> SimpArgKey {
+    if let Some(value) = simp_key_numeral(arg) {
+        return SimpArgKey::Lit(value);
+    }
+    let (head, args) = simp_key_spine(arg);
+    match head.node() {
+        ExprNode::Const { name, .. }
+            if !simp_key_is_numeral_or_offset(name, &args)
+                && !simp_key_unfolds(env, table, name) =>
+        {
+            SimpArgKey::Const(name.clone())
+        }
+        _ => SimpArgKey::Any,
+    }
+}
+
+/// The value of a numeral as the pin's `DiscrTree` reads one (`isNumeral`,
+/// `toNatLit?`): a raw literal, `OfNat.ofNat _ n _` over a numeral, `Nat.zero`,
+/// and `Nat.succ` of a numeral whose value fits a word.
+fn simp_key_numeral(expr: &Expr) -> Option<fln_core::expr::NatLit> {
+    let (head, args) = simp_key_spine(expr);
+    let named = |name: &Name, text: [&str; 2]| *name == Name::from_components(text);
+    match (head.node(), args.as_slice()) {
+        (
+            ExprNode::Lit {
+                literal: fln_core::expr::Literal::Nat(value),
+            },
+            [],
+        ) => Some(value.clone()),
+        (ExprNode::Const { name, .. }, [_, value, _]) if named(name, ["OfNat", "ofNat"]) => {
+            simp_key_numeral(value)
+        }
+        (ExprNode::Const { name, .. }, []) if named(name, ["Nat", "zero"]) => {
+            Some(fln_core::expr::NatLit::from_u64(0))
+        }
+        (ExprNode::Const { name, .. }, [value]) if named(name, ["Nat", "succ"]) => {
+            let value = simp_key_numeral(value)?.to_u64()?.checked_add(1)?;
+            Some(fln_core::expr::NatLit::from_u64(value))
+        }
+        _ => None,
+    }
+}
+
+fn simp_key_is_numeral_or_offset(name: &Name, args: &[&Expr]) -> bool {
+    let named = |text: &[&str]| *name == Name::from_components(text.iter().copied());
+    if named(&["OfNat", "ofNat"]) || named(&["Nat", "zero"]) || named(&["Nat", "succ"]) {
+        return true;
+    }
+    (named(&["HAdd", "hAdd"]) || named(&["Add", "add"]) || named(&["Nat", "add"]))
+        && args.last().is_some_and(|last| {
+            let (head, _) = simp_key_spine(last);
+            match head.node() {
+                ExprNode::Lit { .. } => true,
+                ExprNode::Const { name, .. } => *name == Name::from_components(["OfNat", "ofNat"]),
+                _ => false,
+            }
+        })
+}
+
+/// A target's argument key: a numeral's value, its rigid constant head, `Other` for
+/// a parameter or a sort, and `Any` for whatever may reduce or unify further (an
+/// unread `Nat.succ`, a reducible head, a let-bound local, a binder, a metavariable).
+fn simp_target_arg_key(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    lctx: &LocalContext,
+    arg: &Expr,
+) -> SimpArgKey {
+    if let Some(value) = simp_key_numeral(arg) {
+        return SimpArgKey::Lit(value);
+    }
+    let (head, _) = simp_key_spine(arg);
+    match head.node() {
+        ExprNode::Const { name, .. } => {
+            // A `Nat.succ` whose value is not read here may still be a numeral.
+            if *name == Name::from_components(["OfNat", "ofNat"])
+                || *name == Name::from_components(["Nat", "succ"])
+                || simp_key_unfolds(env, table, name)
+            {
+                SimpArgKey::Any
+            } else {
+                SimpArgKey::Const(name.clone())
+            }
+        }
+        ExprNode::FVar { id } => match lctx.find(id) {
+            Some(local) if local.value.is_none() => SimpArgKey::Other,
+            _ => SimpArgKey::Any,
+        },
+        ExprNode::Sort { .. } => SimpArgKey::Other,
+        _ => SimpArgKey::Any,
+    }
+}
+
+/// Whether the key path may see through `name`: at reducible transparency, where the
+/// pin's simp computes both a rule's keys and a target's. An instance is rigid there.
+/// Unfolding instances admitted rules the pin never retrieves: `instAddNat` opens
+/// `Nat.add`, whose recursor body mentions `Nat.succ`, so `Nat.succ_eq_add_one`
+/// rewrote `3` to `2 + 1` at every step of `two + 1 = 3`, and every `Nat.add`-rooted
+/// rule was tried at every `Eq` goal. Structure projections are rigid keys: the pin
+/// keys `a + b` as `HAdd.hAdd`.
+fn simp_key_unfolds(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    name: &Name,
+) -> bool {
+    let Some(ConstantInfo::Defn(definition)) = env.find(name) else {
+        return false;
+    };
+    let mut value = &definition.value;
+    while let ExprNode::Lam { body, .. } = value.node() {
+        value = body;
+    }
+    if matches!(value.node(), ExprNode::Proj { .. }) {
+        return false;
+    }
+    match table.get(name) {
+        Some(status) => status == crate::reducibility::Reducibility::Reducible,
+        None => definition.hints == ReducibilityHints::Abbrev,
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use fln_env::constants::{AxiomVal, ConstantVal};
+
+    fn n(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+    fn c(text: &str) -> Expr {
+        Expr::const_(n(text), Vec::new())
+    }
+    fn bvar(index: u32) -> Expr {
+        Expr::bvar(index).unwrap()
+    }
+    fn apps(head: Expr, args: &[Expr]) -> Expr {
+        args.iter()
+            .fold(head, |function, arg| Expr::app(function, arg.clone()))
+    }
+    fn pi(binder: Expr, body: Expr, info: BinderInfo) -> Expr {
+        Expr::forall_e(Name::anonymous(), binder, body, info)
+    }
+    fn eq(type_: Expr, left: Expr, right: Expr) -> Expr {
+        apps(
+            Expr::const_(n("Eq"), vec![Level::one()]),
+            &[type_, left, right],
+        )
+    }
+
+    /// `Eq`, the data type `Nat` with `f` and `Nat.succ`, a class `C` with an
+    /// operation `op`, and the rules `fx : ∀ a b : Nat, f a = b` (keyed by `f`) and
+    /// `fne : ∀ a b : Nat, ¬ f a = b` (keyed by `Eq` at `Nat` with `f` on the left).
+    fn environment() -> Environment {
+        use BinderInfo::{Default, Implicit, InstImplicit};
+        let type0 = Expr::sort(Level::one());
+        let nat = c("Nat");
+        let axioms = [
+            (
+                "Eq",
+                vec![n("u")],
+                pi(
+                    Expr::sort(Level::param(n("u"))),
+                    pi(
+                        bvar(0),
+                        pi(bvar(1), Expr::sort(Level::zero()), Default),
+                        Default,
+                    ),
+                    Implicit,
+                ),
+            ),
+            (
+                "Not",
+                Vec::new(),
+                pi(
+                    Expr::sort(Level::zero()),
+                    Expr::sort(Level::zero()),
+                    Default,
+                ),
+            ),
+            ("Nat", Vec::new(), type0.clone()),
+            (
+                "List",
+                Vec::new(),
+                pi(type0.clone(), type0.clone(), Default),
+            ),
+            ("C", Vec::new(), pi(type0.clone(), type0.clone(), Default)),
+            (
+                "op",
+                Vec::new(),
+                pi(
+                    type0,
+                    pi(
+                        Expr::app(c("C"), bvar(0)),
+                        pi(bvar(1), pi(bvar(2), bvar(3), Default), Default),
+                        InstImplicit,
+                    ),
+                    Implicit,
+                ),
+            ),
+            ("f", Vec::new(), pi(nat.clone(), nat.clone(), Default)),
+            (
+                "Nat.succ",
+                Vec::new(),
+                pi(nat.clone(), nat.clone(), Default),
+            ),
+            (
+                "fx",
+                Vec::new(),
+                pi(
+                    nat.clone(),
+                    pi(
+                        nat.clone(),
+                        eq(nat.clone(), Expr::app(c("f"), bvar(1)), bvar(0)),
+                        Default,
+                    ),
+                    Default,
+                ),
+            ),
+            (
+                "fne",
+                Vec::new(),
+                pi(
+                    nat.clone(),
+                    pi(
+                        nat.clone(),
+                        Expr::app(c("Not"), eq(nat, Expr::app(c("f"), bvar(1)), bvar(0))),
+                        Default,
+                    ),
+                    Default,
+                ),
+            ),
+        ];
+        axioms
+            .into_iter()
+            .fold(Environment::new(), |env, (name, level_params, type_)| {
+                env.add_decl(ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: n(name),
+                        level_params,
+                        type_,
+                    },
+                    is_unsafe: false,
+                }))
+                .unwrap()
+            })
+    }
+
+    #[test]
+    fn keys_read_type_arguments_and_leave_instances_proofs_and_offsets_open() {
+        let env = environment();
+        let table = crate::reducibility::table(&env).unwrap();
+        let key = |pattern: Expr| simp_pattern_key(&env, &table, &pattern).unwrap();
+        // `f a = b` at `Nat`: the type and the left side's head are keyed.
+        let at_nat = key(eq(c("Nat"), Expr::app(c("f"), bvar(0)), bvar(1)));
+        assert_eq!(at_nat.head, n("Eq"));
+        assert_eq!(
+            at_nat.args,
+            [SimpArgKey::Const(n("Nat")), SimpArgKey::Const(n("f"))]
+        );
+        // At a pattern variable's type the sides may be proofs: only `Eq` is keyed.
+        let polymorphic = key(eq(bvar(2), Expr::app(c("f"), bvar(0)), bvar(1)));
+        assert_eq!(polymorphic.args, Vec::new());
+        // An instance argument is never keyed; a `Nat` offset is left open.
+        let operation = key(apps(
+            c("op"),
+            &[
+                c("Nat"),
+                bvar(3),
+                Expr::app(c("Nat.succ"), bvar(0)),
+                Expr::app(c("f"), bvar(1)),
+            ],
+        ));
+        assert_eq!(
+            operation.args,
+            [
+                SimpArgKey::Const(n("Nat")),
+                SimpArgKey::Any,
+                SimpArgKey::Any,
+                SimpArgKey::Const(n("f")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rule_is_admitted_only_where_its_argument_keys_can_match_and_skipping_is_free() {
+        let env = environment();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        for name in ["x", "y"] {
+            context
+                .txn
+                .lctx
+                .add_param(FVarId(n(name)), n(name), c("Nat"), BinderInfo::Default);
+        }
+        context
+            .txn
+            .lctx
+            .add_let(FVarId(n("z")), n("z"), c("Nat"), c("Nat"));
+        let rule = |name: &str| {
+            SimpRule::Global(scope::simp::SimpEntry {
+                declaration: n(name),
+                proof: None,
+                priority: 1000,
+                reverse: false,
+                order: 0,
+            })
+        };
+        let (rewrite, refutation) = (rule("fx"), rule("fne"));
+        let local = |name: &str| Expr::fvar(FVarId(n(name)));
+        // Each target with whether `fx` (head `f`) and `fne` (`f _ = _` at `Nat`) may match.
+        let cases = [
+            // A parameter is rigid: `f a = b` cannot match `x = y`.
+            (eq(c("Nat"), local("x"), local("y")), false, false),
+            (
+                eq(c("Nat"), Expr::app(c("f"), local("x")), local("y")),
+                true,
+                true,
+            ),
+            // Nested anywhere in the target, as an argument of another application.
+            (
+                eq(
+                    c("Nat"),
+                    Expr::app(
+                        c("Nat.succ"),
+                        eq(c("Nat"), Expr::app(c("f"), local("x")), local("y")),
+                    ),
+                    local("y"),
+                ),
+                true,
+                true,
+            ),
+            // Another type at `Eq`'s keyed type argument.
+            (
+                eq(
+                    Expr::app(c("List"), c("Nat")),
+                    Expr::app(c("f"), local("x")),
+                    local("y"),
+                ),
+                true,
+                false,
+            ),
+            // A let-bound local may unfold to anything; its value is not read.
+            (eq(c("Nat"), local("z"), local("y")), false, true),
+        ];
+        for (target, rewrites, refutes) in cases {
+            let before = context.txn.budget.heartbeats_consumed;
+            let index = context.simp_target_index(&target).unwrap();
+            assert_eq!(context.txn.budget.heartbeats_consumed, before + 1);
+            for _ in 0..1000 {
+                assert_eq!(
+                    context.simp_rule_admitted(&rewrite, index.as_ref(), SimpKeySide::Rewrite),
+                    rewrites,
+                    "{target:?}"
+                );
+                assert_eq!(
+                    context.simp_rule_admitted(&refutation, index.as_ref(), SimpKeySide::Rewrite),
+                    refutes,
+                    "{target:?}"
+                );
+                assert!(context.simp_rule_admitted(
+                    &SimpRule::Local(FVarId(n("x"))),
+                    index.as_ref(),
+                    SimpKeySide::Rewrite
+                ));
+            }
+            assert_eq!(context.txn.budget.heartbeats_consumed, before + 1);
+        }
+    }
+
+    #[test]
+    fn numerals_are_literal_keys_and_targets_unfold_only_reducible_definitions() {
+        use fln_core::expr::{Literal, NatLit};
+        use fln_env::constants::{DefinitionSafety, DefinitionVal};
+        let numeral = |value: u64| Expr::lit(Literal::Nat(NatLit::from_u64(value)));
+        let nat = c("Nat");
+        let rule_type = |left: Expr, right: Expr| eq(nat.clone(), left, right);
+        // `fzero : f 0 = 0` keys `f` at the literal 0; `succ_rule : ∀ n, Nat.succ n = n`
+        // is rooted at `Nat.succ`. `wrap n := Nat.succ n` is a plain definition.
+        let base = [
+            (
+                "fzero",
+                rule_type(Expr::app(c("f"), numeral(0)), numeral(0)),
+            ),
+            (
+                "succ_rule",
+                pi(
+                    nat.clone(),
+                    rule_type(Expr::app(c("Nat.succ"), bvar(0)), bvar(0)),
+                    BinderInfo::Default,
+                ),
+            ),
+        ]
+        .into_iter()
+        .fold(environment(), |env, (name, type_)| {
+            env.add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n(name),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            }))
+            .unwrap()
+        })
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("wrap"),
+                level_params: Vec::new(),
+                type_: pi(nat.clone(), nat.clone(), BinderInfo::Default),
+            },
+            value: Expr::lam(
+                Name::anonymous(),
+                nat.clone(),
+                Expr::app(c("Nat.succ"), bvar(0)),
+                BinderInfo::Default,
+            ),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![n("wrap")],
+        }))
+        .unwrap();
+        let rule = |name: &str| {
+            SimpRule::Global(scope::simp::SimpEntry {
+                declaration: n(name),
+                proof: None,
+                priority: 1000,
+                reverse: false,
+                order: 0,
+            })
+        };
+        let admitted = |env: &Environment, target: Expr, name: &str| {
+            let mut context = Context::new(env, Budget::DEFAULT);
+            context
+                .txn
+                .lctx
+                .add_param(FVarId(n("x")), n("x"), nat.clone(), BinderInfo::Default);
+            let index = context.simp_target_index(&target).unwrap();
+            context.simp_rule_admitted(&rule(name), index.as_ref(), SimpKeySide::Rewrite)
+        };
+        let x = Expr::fvar(FVarId(n("x")));
+        let f = |arg: Expr| Expr::app(c("f"), arg);
+        // A numeral argument matches only its own value; `Nat.zero` is the numeral 0.
+        assert!(admitted(&base, f(numeral(0)), "fzero"));
+        assert!(admitted(&base, f(c("Nat.zero")), "fzero"));
+        assert!(!admitted(&base, f(numeral(3)), "fzero"));
+        assert!(!admitted(&base, f(x.clone()), "fzero"));
+        // A numeral supplies no `Nat.succ` root; a written `Nat.succ` does.
+        assert!(!admitted(&base, f(numeral(3)), "succ_rule"));
+        assert!(admitted(
+            &base,
+            f(Expr::app(c("Nat.succ"), x.clone())),
+            "succ_rule"
+        ));
+        // The target closure unfolds a reducible definition, never an instance-reducible one.
+        let wrapped = f(Expr::app(c("wrap"), x));
+        assert!(!admitted(&base, wrapped.clone(), "succ_rule"));
+        for (status, expected) in [
+            (crate::reducibility::Reducibility::ImplicitReducible, false),
+            (crate::reducibility::Reducibility::Reducible, true),
+        ] {
+            let env = crate::reducibility::register(&base, &n("wrap"), status).unwrap();
+            assert_eq!(
+                admitted(&env, wrapped.clone(), "succ_rule"),
+                expected,
+                "{status:?}"
+            );
         }
     }
 }

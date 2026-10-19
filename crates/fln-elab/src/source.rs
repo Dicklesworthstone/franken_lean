@@ -570,6 +570,8 @@ struct Context {
     // Only explicitly generated/imported auxiliary declarations receive the
     // pin's eliminator elaboration; a declaration's suffix is insufficient.
     auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
+    // Registered simp rules' discrimination keys, shared by speculative snapshots.
+    simp_key_cache: tactics::SimpKeyCache,
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -668,6 +670,7 @@ impl Context {
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
             auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
+            simp_key_cache: tactics::SimpKeyCache::default(),
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,

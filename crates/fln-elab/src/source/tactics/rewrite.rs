@@ -4,6 +4,7 @@ mod locations;
 mod matching;
 mod offset;
 mod simplify;
+pub(in crate::source) use simplify::SimpKeyCache;
 use simplify::SimpRule;
 
 pub(in crate::source) struct RewriteMatch {
