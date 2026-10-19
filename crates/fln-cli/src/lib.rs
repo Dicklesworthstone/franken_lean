@@ -12309,7 +12309,13 @@ fn render_lean_source_commands(
                 4,
             );
         };
-        let from_check = messages.from_check;
+        // Only goal-display traces are reproduced. An expected `trace:` line from any other
+        // trace class has no producer here, so a mismatch against it is a non-answer too.
+        let from_check = messages.from_check
+            || guard
+                .expected
+                .lines()
+                .any(|line| line.trim_start().starts_with("trace:"));
         let produced = guard.spec.combine(messages.checked);
         if !guard.spec.matches(&guard.expected, &produced) {
             // This door's `#check` line is the pin's on the shapes measured, but its pretty

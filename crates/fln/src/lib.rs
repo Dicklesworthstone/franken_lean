@@ -7538,19 +7538,22 @@ impl Engine {
                         {
                             return Err(not_implemented("`#guard_msgs` inside `#guard_msgs`"));
                         }
-                        // The pin passes such a guard by capturing the command's errors,
-                        // warnings or traces, whose text this engine does not reproduce. Running
-                        // the command here would turn the pin's pass into a rejection. The one
-                        // warning it does reproduce, "declaration uses `sorry`", is judged.
+                        // The pin passes such a guard by capturing the command's errors or
+                        // warnings, whose text this engine does not reproduce. Running the command
+                        // here would turn the pin's pass into a rejection. The one warning it does
+                        // reproduce, "declaration uses `sorry`", is judged. Expected `trace:`
+                        // lines run: goal traces are reproduced and routed at trace severity, and
+                        // the `lean` front door makes any mismatch against an expected trace a
+                        // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
                             line != "warning: declaration uses `sorry`"
-                                && ["error:", "warning:", "trace:"]
+                                && ["error:", "warning:"]
                                     .iter()
                                     .any(|severity| line.starts_with(severity))
                         }) {
                             return Err(not_implemented(
-                                "`#guard_msgs` expecting an error, warning or trace message",
+                                "`#guard_msgs` expecting an error or warning message",
                             ));
                         }
                         guards.push(SourceGuard {

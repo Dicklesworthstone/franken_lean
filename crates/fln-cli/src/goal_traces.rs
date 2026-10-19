@@ -151,6 +151,111 @@ mod tests {
         }
     }
 
+    /// fln-guard-msgs-trace-severity-iss2: every literal is judged by the pinned `lean` first.
+    /// A row the pin rejects must never be accepted here. Rows whose messages this engine
+    /// reproduces exactly (`#eval` output, literal `trace`) must agree; goal-display rows may
+    /// instead take the typed refusal, since this door's goal printer is not proven the pin's.
+    #[test]
+    fn guard_literals_agree_with_the_pin_or_refuse() {
+        let pin = std::env::var_os("FLN_REFERENCE_LEAN")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    std::path::PathBuf::from(home)
+                        .join(".elan/toolchains/leanprover--lean4---v4.32.0/bin/lean")
+                })
+            })
+            .filter(|path| path.is_file());
+        let Some(pin) = pin else {
+            assert!(
+                std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                "FLN_REQUIRE_REFERENCE is set but the pinned Reference lean is absent"
+            );
+            eprintln!("SKIP: pinned Reference lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+            return;
+        };
+        let goal = "example (a b : Nat) (h : a = b) : a = b := by trace_state; exact h";
+        let shown = "a b : Nat\nh : a = b\n⊢ a = b";
+        let literal = "example : True := by trace \"hello\"; constructor";
+        // (source, whether this engine must agree exactly rather than refuse)
+        let rows = [
+            (
+                format!("/-- info: {shown} -/\n#guard_msgs in\n{goal}\n"),
+                false,
+            ),
+            (
+                format!("/-- trace: {shown} -/\n#guard_msgs in\n{goal}\n"),
+                false,
+            ),
+            (
+                format!("/-- info: not the goal -/\n#guard_msgs in\n{goal}\n"),
+                false,
+            ),
+            (
+                format!("/-- trace: not the goal -/\n#guard_msgs in\n{goal}\n"),
+                false,
+            ),
+            (format!("#guard_msgs in\n{goal}\n"), false),
+            (format!("{goal}\n"), false),
+            (
+                "/-- info: 3 -/\n#guard_msgs in\n#eval 1 + 1\n".to_owned(),
+                true,
+            ),
+            (
+                "/-- info: 2 -/\n#guard_msgs in\n#eval 1 + 1\n".to_owned(),
+                true,
+            ),
+            (
+                format!("/-- trace: hello -/\n#guard_msgs in\n{literal}\n"),
+                true,
+            ),
+            (
+                format!("/-- info: hello -/\n#guard_msgs in\n{literal}\n"),
+                true,
+            ),
+        ];
+        let directory = std::env::temp_dir().join(format!("fln-guard-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut seen = [false; 2];
+        for (index, (source, exact)) in rows.iter().enumerate() {
+            let path = directory.join(format!("row{index}.lean"));
+            std::fs::write(&path, source).unwrap();
+            let reference = std::process::Command::new(&pin)
+                .arg(&path)
+                .current_dir(&directory)
+                .output()
+                .expect("the pinned Reference lean runs");
+            let expected = reference.status.code().expect("the pin exits normally");
+            assert!(matches!(expected, 0 | 1), "{source}: pin exit {expected}");
+            seen[usize::from(expected == 1)] = true;
+            let ours = render(source);
+            assert!(
+                !(expected != 0 && ours.exit_code == 0),
+                "false accept: the pin rejects\n{source}"
+            );
+            if *exact || ours.exit_code != CAPABILITY_NOT_IMPLEMENTED_EXIT {
+                assert_eq!(
+                    i32::from(ours.exit_code),
+                    expected,
+                    "{source}\n{}",
+                    ours.stderr
+                );
+            }
+            if expected == 0 && ours.exit_code == 0 {
+                assert_eq!(
+                    ours.stdout.trim_end(),
+                    String::from_utf8_lossy(&reference.stdout).trim_end(),
+                    "{source}"
+                );
+            }
+        }
+        assert_eq!(
+            seen,
+            [true, true],
+            "the table must hold accepted and rejected rows"
+        );
+    }
+
     #[test]
     fn trace_only_guards_leave_evaluation_messages_on_info() {
         let result =

@@ -100,7 +100,7 @@ fn what_this_engine_cannot_reproduce_is_refused_never_judged() {
     for (program, named) in [
         (
             "/-- error: boom -/\n#guard_msgs in\n#eval 2 + 2\n",
-            "error, warning or trace",
+            "error or warning",
         ),
         (
             "/-- info: 4 -/\n#guard_msgs (drop error) in\n#eval 2 + 2\n",
