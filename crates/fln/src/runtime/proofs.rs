@@ -277,11 +277,21 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(inlined, expected));
                                 continue;
                             }
+                            // The checked constructor, not a name or a binder's
+                            // type, determines the erased datatype parameter prefix.
+                            // Data-valued parameters are static too (ToLCNF.visitCtor).
+                            let constructor_parameters = match head.node() {
+                                ExprNode::Const { name, .. } => match self.environment.find(name) {
+                                    Some(ConstantInfo::Ctor(ctor)) => ctor.num_params as usize,
+                                    _ => 0,
+                                },
+                                _ => 0,
+                            };
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
                             let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
                             let mut callback_types = Vec::new();
-                            for arg in &args {
+                            for (index, arg) in args.iter().enumerate() {
                                 self.tick()?;
                                 let domain = if let Some(current) = type_ {
                                     let normal = self.type_head(&current)?;
@@ -347,6 +357,12 @@ impl Preparation<'_> {
                                             arg.clone()
                                         },
                                     )
+                                } else if index < constructor_parameters {
+                                    // Retain the exact parameter for dependent field
+                                    // types and later layout specialization. Do not
+                                    // compile it or memoize it as an executable value:
+                                    // the same expression in a field must still visit.
+                                    Frame::Keep(arg.clone())
                                 } else {
                                     Frame::Visit(arg.clone(), domain)
                                 });
@@ -536,3 +552,6 @@ mod tests;
 
 #[cfg(test)]
 mod context_tests;
+
+#[cfg(test)]
+mod constructor_parameters;
