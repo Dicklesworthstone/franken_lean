@@ -1,4 +1,5 @@
 //! All expected values are shared verbatim with the actual pinned Lean oracle.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::{
     CheckerAdmissionGround, ClosedVmValue, EngineExecutionLimits, FlbcExecutionLimits, VmExit,

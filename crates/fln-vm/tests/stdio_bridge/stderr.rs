@@ -1,4 +1,5 @@
 //! stderr uses the existing guarded native callback protocol, not stdout capture.
+#![forbid(unsafe_code)]
 use super::*;
 
 fn getter(dst: u16) -> I {

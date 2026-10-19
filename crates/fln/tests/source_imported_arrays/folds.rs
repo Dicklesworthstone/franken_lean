@@ -1,4 +1,5 @@
 //! Bounded imported folds retain source authority and VM resource accounting.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::{
     ClosedVmValue, EngineAdmissionLimits, EngineExecutionLimits, FlbcExecutionLimits,

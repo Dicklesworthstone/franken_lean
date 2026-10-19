@@ -1,5 +1,6 @@
 //! Integer branching is an explicit Frontier capability. All successful source
 //! proofs and persisted products still pass both ordinary checker seats.
+#![forbid(unsafe_code)]
 use super::{assert_cases_complete, import_closure_in_mode, limits, n, record_case};
 use fln::source_check::modules::persisted::{
     ModuleDecision, ModuleRecordLookup, ModuleRecordWrite, PersistedModules, SourceModuleKey,

@@ -1,4 +1,5 @@
 //! Empty-record parameters are constraints, never a reason to erase an open term.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_core::level::LMVarId;
 

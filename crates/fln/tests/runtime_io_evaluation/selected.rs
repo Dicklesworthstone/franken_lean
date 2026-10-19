@@ -3,6 +3,7 @@
 //! The actual IO metadata is used only to elaborate and discover dependencies.
 //! Every discovered fixture declaration is admitted again over the selected,
 //! independently byte-read pin declarations before its explicit evaluation.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::{
     Declaration, ExprNode, IndependentReading, OleanFrontierJobs, OleanModuleInput,

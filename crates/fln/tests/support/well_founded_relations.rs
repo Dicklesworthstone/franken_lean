@@ -1,5 +1,6 @@
 //! Explicit measures use their selected checked well-founded relation, including
 //! lexicographic products and locally supplied inverse-image relations.
+#![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, SourceCheckLimits};
 
 // Every source/application pair was evaluated by the pinned Reference. Its

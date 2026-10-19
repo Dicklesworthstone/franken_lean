@@ -1,4 +1,5 @@
 //! Ground payload layouts cross one canonical ABI row per reference operation.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_rt::obj::Obj;
 

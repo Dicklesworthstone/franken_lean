@@ -1,5 +1,6 @@
 //! Ordinary matches specialize the checked well-founded continuation while
 //! retaining the original values of captured source variables and lets.
+#![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, SourceCheckLimits};
 
 const PROGRAMS: &[(&str, &str, &str)] = &[

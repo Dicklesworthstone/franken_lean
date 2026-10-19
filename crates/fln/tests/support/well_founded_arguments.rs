@@ -1,5 +1,6 @@
 //! Changing source arguments use a checked PSigma state, with fixed parameters
 //! removed before the explicit decreasing script receives its local context.
+#![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, SourceCheckLimits};
 
 const PROGRAMS: &[(&str, &str, &str)] = &[

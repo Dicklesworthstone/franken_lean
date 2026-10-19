@@ -1,6 +1,7 @@
 //! Installed IO result presentation through the complete actual import loader.
 //! All cases retain one Lean executable and record directory. This fixture does
 //! not treat a selected-declaration environment as full module admission.
+#![forbid(unsafe_code)]
 
 use super::*;
 

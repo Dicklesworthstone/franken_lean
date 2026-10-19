@@ -1,6 +1,7 @@
 //! Explicit product measures use the pin's default lexicographic constructor
 //! search and the checked arithmetic prover. The measure itself is supplied;
 //! automatic inference of a lexicographic measure remains a separate feature.
+#![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, SourceCheckLimits};
 
 // Independently evaluated by the pin with prelude, Init.WFComputable and

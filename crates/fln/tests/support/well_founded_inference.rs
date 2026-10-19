@@ -1,5 +1,6 @@
 //! Nat measure inference and default proofs reuse the imported checked fixpoint.
 //! These source cases follow the pinned WF/GuessLex and WFTactics definitions.
+#![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, SourceCheckLimits};
 use fln_core::outcome::InconclusiveCause;
 use fln_elab::NatDefinitionElabError;

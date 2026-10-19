@@ -1,4 +1,5 @@
 //! Public ST/EST source syntax over the already admitted artifact closure.
+#![forbid(unsafe_code)]
 use super::*;
 
 pub(super) const PROGRAMS: [(&str, &str); 3] = [
