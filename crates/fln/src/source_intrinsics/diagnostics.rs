@@ -22,6 +22,24 @@ fn bind(domain: Expr, body: Expr, info: BinderInfo, lambda: bool) -> Expr {
 /// Definitions may have different inlining/reducibility heights after native
 /// source checking. Those do not alter these closed terms. This comparison
 /// does not unfold a user definition or accept a different implementation.
+/// `fun {α} … => body` respelled `fun α … => body`; every other node is unchanged.
+fn with_explicit_outer_binder(value: &Expr) -> Expr {
+    match value.node() {
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            ..
+        } => Expr::lam(
+            binder_name.clone(),
+            binder_type.clone(),
+            body.clone(),
+            BinderInfo::Default,
+        ),
+        _ => value.clone(),
+    }
+}
+
 fn definition_matches(
     comparison: &mut Comparison<'_>,
     actual: &DefinitionVal,
@@ -128,13 +146,28 @@ pub(crate) fn panic_matches(
         let Some(ConstantInfo::Defn(actual)) = environment.find(&expected.base.name) else {
             return Err(unsupported());
         };
-        if actual.base.level_params != expected.base.level_params
-            || !definition_matches(
-                &mut comparison,
-                actual,
-                &expected.base.type_,
-                &expected.value,
-            )?
+        if actual.base.level_params != expected.base.level_params {
+            return Err(unsupported());
+        }
+        let seed_form = definition_matches(
+            &mut comparison,
+            actual,
+            &expected.base.type_,
+            &expected.value,
+        )?;
+        // The pin's structure projection (`Init.Prelude`'s `Inhabited.default`) binds its
+        // parameter `α` with default binder info in the value while the type keeps it
+        // implicit; the seed's value marks it implicit. Binder info is not logical content,
+        // so both spellings of the same projection satisfy the contract
+        // (fln-panic-contract-seed-regression-q8iy).
+        if !seed_form
+            && !(label == "Inhabited.default"
+                && definition_matches(
+                    &mut comparison,
+                    actual,
+                    &expected.base.type_,
+                    &with_explicit_outer_binder(&expected.value),
+                )?)
         {
             return Err(unsupported());
         }
