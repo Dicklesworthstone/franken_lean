@@ -2043,6 +2043,12 @@ impl ExtensionState {
         self.journal.len == 0
     }
 
+    /// Exact retained payload bytes, maintained by the persistent journal.
+    /// Reading this count never scans or materializes the entry history.
+    pub fn payload_bytes(&self) -> u128 {
+        self.journal.payload_bytes
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &ExtensionEntry> {
         self.journal.records().map(|record| &record.entry)
     }

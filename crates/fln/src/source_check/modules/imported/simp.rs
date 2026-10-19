@@ -322,4 +322,5 @@ impl ScopeIndex {
 }
 
 #[cfg(test)]
+#[path = "simp/tests.rs"]
 mod tests;

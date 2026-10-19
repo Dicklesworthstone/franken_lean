@@ -67,7 +67,7 @@ pub(super) fn validate_proof(env: &Environment, proof: &Name) -> Result<(), Simp
             // declaration checkers remain responsible for every actual use.
             let mut ty = &definition.base.type_;
             let mut applications = 0usize;
-            for _ in 0..MAX_ROWS {
+            for _ in 0..MAX_TYPE_STEPS {
                 match ty.node() {
                     ExprNode::MData { expr, .. } => ty = expr,
                     ExprNode::ForallE { body, .. } if applications == 0 => ty = body,
@@ -124,15 +124,15 @@ pub fn import_rules(
     rules: &[ImportedSimpRule],
 ) -> Result<Environment, SimpSetError> {
     read(env)?;
-    let count = env
+    let (count, bytes) = env
         .extension(&descriptor().name)
-        .map_or(0, |state| state.len());
-    if count
-        .checked_add(rules.len())
-        .is_none_or(|count| count > MAX_ROWS)
-    {
-        return Err(SimpSetError::Limit);
-    }
+        .map_or((0, 0), |state| (state.len(), state.payload_bytes()));
+    // Refuse an impossible batch before allocating any new journal nodes.
+    // Each append additionally accounts for its actual encoded payload.
+    check_journal_capacity(
+        count.checked_add(rules.len()).ok_or(SimpSetError::Limit)?,
+        bytes,
+    )?;
     let mut next = env.clone();
     for rule in rules {
         let payload = rule.payload(env)?;

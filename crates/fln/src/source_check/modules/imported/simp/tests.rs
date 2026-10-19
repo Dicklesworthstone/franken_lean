@@ -3,7 +3,24 @@ use super::*;
 use fln_env::constants::{AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
 
 fn model() -> Environment {
-    let mut env = fln_elab::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+    // The minimal opaque-Nat seed contains neither Nat.zero nor Eq. Use
+    // admitted declarations so the proposition classifier sees the actual
+    // generic Eq telescope instead of a dangling constant in a fake proof type.
+    let mut env = Engine::from_environment(Environment::new())
+        .admit_declarations(
+            &[
+                fln_elab::seed::nat_inductive_seed_declaration(),
+                fln_elab::seed::eq_seed_declaration(),
+            ],
+            &KVMap::new(),
+            EngineAdmissionLimits::new(Budget::DEFAULT),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine
+        .environment()
+        .clone();
     let nat = Expr::const_(n("Nat"), vec![]);
     let zero = Expr::const_(n("Nat.zero"), vec![]);
     let equality = Expr::app(
@@ -86,6 +103,20 @@ fn generic_proofs_retain_distinct_origins_and_numeric_names() {
         assert!(!active[0].reverse);
         assert!(native::read(&env).unwrap().is_empty());
     }
+}
+
+#[test]
+fn a_missing_equality_declaration_does_not_become_proof_evidence() {
+    let complete = model();
+    let incomplete = fln_elab::seed::bootstrap_nat_environment(Budget::DEFAULT)
+        .unwrap()
+        .add_decl(complete.find(&n("proof")).unwrap().clone())
+        .unwrap();
+    assert!(matches!(
+        native::register_imported_proof(&incomplete, &n("proof"), &n("proof"), 900),
+        Err(SimpSetError::UnsupportedDeclaration(name)) if name == n("proof")
+    ));
+    assert!(native::read(&incomplete).unwrap().is_empty());
 }
 
 #[test]
