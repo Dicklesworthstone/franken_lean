@@ -104,12 +104,12 @@ fn field(value: &Obj, index: usize) -> Obj {
         .unwrap_or_else(|| panic!("missing field {index}"))
 }
 
-fn returned(execution: &DefinitionExecution) -> &Obj {
+/// `ground` is exact per execution: the checked `mixedPayloadReport`
+/// definition is body-checked, while each #eval is quarantined (see
+/// `assert_scalar`).
+fn returned(execution: &DefinitionExecution, ground: CheckerAdmissionGround) -> &Obj {
     assert_eq!(execution.checker.schema, "fln.checker-admission/1");
-    assert_eq!(
-        execution.checker.ground,
-        CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
-    );
+    assert_eq!(execution.checker.ground, ground);
     let fln::VmExit::Returned(returned) = &execution.exit else {
         panic!("payload execution did not return: {:?}", execution.exit)
     };
@@ -117,7 +117,10 @@ fn returned(execution: &DefinitionExecution) -> &Obj {
 }
 
 fn report(execution: &DefinitionExecution) {
-    let value = returned(execution);
+    let value = returned(
+        execution,
+        CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
+    );
     for (index, expected) in [1, 2, 3].into_iter().enumerate() {
         nat(&field(value, index), expected);
     }
@@ -196,9 +199,15 @@ pub(super) fn check_payloads(engine: &Engine) {
         .iter()
         .map(|&index| &first.batch.executions[index])
         .collect();
-    assert_scalar(executions[0], 3);
-    text(returned(executions[1]), "direct");
-    text(returned(executions[2]), "shared initializer");
+    assert_scalar(executions[0], 3, CheckerAdmissionGround::UnsafeQuarantine);
+    text(
+        returned(executions[1], CheckerAdmissionGround::UnsafeQuarantine),
+        "direct",
+    );
+    text(
+        returned(executions[2], CheckerAdmissionGround::UnsafeQuarantine),
+        "shared initializer",
+    );
     let query = executions[1].declaration.clone();
     let artifacts: Vec<_> = first
         .batch

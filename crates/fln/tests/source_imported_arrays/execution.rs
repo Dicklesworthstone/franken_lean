@@ -96,9 +96,11 @@ pub(super) fn program(engine: &Engine, label: &str, source: &str, count: usize) 
     for (index, (&evaluation, expected)) in evaluations.iter().zip(&expected).enumerate() {
         let execution = &completed.batch.executions[evaluation];
         assert_eq!(execution.checker.schema, "fln.checker-admission/1");
+        // Every counted evaluation is an `#eval` (see `expected_values`), and
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
+            CheckerAdmissionGround::UnsafeQuarantine,
             "{label} evaluation {index}",
         );
         assert_value(&execution.exit, expected, label, index);

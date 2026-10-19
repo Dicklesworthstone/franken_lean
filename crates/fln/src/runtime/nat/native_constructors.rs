@@ -74,9 +74,10 @@ fn execute(engine: &Engine, source: &str, expected: &[(&str, bool)]) {
         .zip(expected)
     {
         let execution = &completed.batch.executions[index];
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         let program = fln_comp::flbc::decode_canonical(
             &execution.flbc_artifact,

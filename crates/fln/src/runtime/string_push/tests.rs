@@ -363,9 +363,10 @@ fn checked_string_push_preserves_characters_partial_applications_and_replay() {
         let batch = run(&engine, source);
         let index = batch.batch.source_evaluation_indices[0];
         let execution = &batch.batch.executions[index];
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         assert_result(&execution.exit, expected);
         assert_row(execution);
@@ -461,7 +462,7 @@ fn pinned_io_println_uses_string_push_and_writes_one_newline_per_execution() {
         let execution = &batch.batch.executions[batch.batch.source_evaluation_indices[0]];
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         assert_row(execution);
         assert_io_unit_packet(&execution.exit);

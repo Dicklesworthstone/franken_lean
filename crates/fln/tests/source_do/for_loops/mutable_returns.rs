@@ -123,9 +123,11 @@ fn mutable_loop_returns_match_the_pin_and_replay_flbc() {
         assert_eq!(run.batch.source_evaluation_indices.len(), 1);
         let execution = &run.batch.executions[run.batch.source_evaluation_indices[0]];
         assert_eq!(execution.checker.schema, "fln.checker-admission/1");
+        // Every probe query is an `#eval` line, and #eval's auxiliary is unsafe
+        // at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
+            CheckerAdmissionGround::UnsafeQuarantine,
         );
         assert_value(&execution.exit, &probe);
         let module = decode_canonical(&execution.flbc_artifact, CodecLimits::default())

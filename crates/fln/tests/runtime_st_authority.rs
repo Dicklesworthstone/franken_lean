@@ -87,12 +87,12 @@ fn ordinary_query(target: &str) -> Declaration {
     })
 }
 
-fn assert_scalar(execution: &DefinitionExecution, expected: usize) {
+/// `ground` is exact per execution: an ordinary safe query is body-checked,
+/// while #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92),
+/// so it and any re-execution of its declaration are quarantined.
+fn assert_scalar(execution: &DefinitionExecution, expected: usize, ground: CheckerAdmissionGround) {
     assert_eq!(execution.checker.schema, "fln.checker-admission/1");
-    assert_eq!(
-        execution.checker.ground,
-        CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
-    );
+    assert_eq!(execution.checker.ground, ground);
     assert_eq!(
         fln::closed_vm_value(&execution.exit).unwrap(),
         Some(ClosedVmValue::Scalar(expected)),
@@ -133,9 +133,17 @@ fn familiar_st_names_execute_their_ordinary_checked_bodies_without_externs() {
                 .unwrap()
         };
         let first = run();
-        assert_scalar(&first, 42);
+        assert_scalar(
+            &first,
+            42,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
+        );
         let repeated = run();
-        assert_scalar(&repeated, 42);
+        assert_scalar(
+            &repeated,
+            42,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
+        );
         assert_eq!(first.flbc_artifact, repeated.flbc_artifact, "{target}");
         assert_eq!(engine.logical_root(&options), root);
         assert!(!engine.environment().contains(&name("stAuthorityProbe")));
@@ -531,7 +539,11 @@ fn decoded_st_fixture_debugs_native_actions_without_import_admission() {
                 .iter()
                 .zip(expected)
             {
-                assert_scalar(&completed.batch.executions[index], expected);
+                assert_scalar(
+                    &completed.batch.executions[index],
+                    expected,
+                    CheckerAdmissionGround::UnsafeQuarantine,
+                );
             }
             assert_eq!(engine.logical_root(&options), root);
         })
@@ -661,7 +673,7 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
             let expected = [42, 2022, 4207, 1020, 0, 42, 1007, 42, 705, 41, 202042];
             assert_eq!(evaluations.len(), expected.len());
             for (execution, expected) in evaluations.iter().zip(expected) {
-                assert_scalar(execution, expected);
+                assert_scalar(execution, expected, CheckerAdmissionGround::UnsafeQuarantine);
             }
             // The alias/swap query invokes every supported mutable primitive.
             // Void.mk is checked separately and constructs a scalar world; it
@@ -693,7 +705,7 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
                 .zip(&bytecode)
             {
                 let execution = &batch.executions[index];
-                assert_scalar(execution, expected);
+                assert_scalar(execution, expected, CheckerAdmissionGround::UnsafeQuarantine);
                 assert_eq!(&execution.flbc_artifact, bytecode);
             }
             drop(repeated);
@@ -758,7 +770,8 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
                 .unwrap()
                 .into_complete()
                 .unwrap();
-            assert_scalar(&clean, 2022);
+            // `query` is the #eval's own unsafe declaration, re-executed.
+            assert_scalar(&clean, 2022, CheckerAdmissionGround::UnsafeQuarantine);
             assert_eq!(engine.logical_root(&options), root);
         })
         .unwrap()

@@ -155,11 +155,16 @@ fn source_environment() -> Option<Environment> {
 }
 
 fn evaluation(batch: &SourceCommandBatchExecution) -> &DefinitionExecution {
-    for execution in &batch.batch.executions {
-        assert_eq!(
-            execution.checker.ground,
+    // Exact per execution: evaluation indices are this raw door's `#eval`s,
+    // whose auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92); any
+    // other execution is an ordinary safe `def`.
+    for (index, execution) in batch.batch.executions.iter().enumerate() {
+        let expected = if batch.batch.source_evaluation_indices.contains(&index) {
+            CheckerAdmissionGround::UnsafeQuarantine
+        } else {
             CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
-        );
+        };
+        assert_eq!(execution.checker.ground, expected);
     }
     &batch.batch.executions[*batch.batch.source_evaluation_indices.last().unwrap()]
 }

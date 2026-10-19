@@ -148,9 +148,11 @@ fn assert_deferred(execution: &DefinitionExecution, operation: Operation) {
 }
 
 fn assert_result(execution: &DefinitionExecution, expected_type: &str, expected: usize) {
+    // Only an explicit `#eval` carries an IO evaluation outcome, and #eval's
+    // auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
     assert_eq!(
         execution.checker.ground,
-        CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        CheckerAdmissionGround::UnsafeQuarantine
     );
     let Some(IoEvaluationOutcome::Returned { runtime_type, exit }) =
         execution.io_evaluation_outcome().unwrap()

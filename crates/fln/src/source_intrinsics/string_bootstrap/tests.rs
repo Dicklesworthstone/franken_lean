@@ -386,9 +386,10 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
         let mut selected = BTreeSet::new();
         for (&index, expected) in indices.iter().zip(&expected) {
             let execution = &first.batch.executions[index];
+            // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
             assert_eq!(
                 execution.checker.ground,
-                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                CheckerAdmissionGround::UnsafeQuarantine
             );
             assert_eq!(
                 closed_vm_value(&execution.exit).unwrap().as_ref(),
@@ -492,7 +493,7 @@ fn folded_source_callbacks_capture_strings_partially_apply_and_replay_unicode() 
             let execution = &first.batch.executions[index];
             assert_eq!(
                 execution.checker.ground,
-                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                CheckerAdmissionGround::UnsafeQuarantine
             );
             assert_eq!(
                 closed_vm_value(&execution.exit).unwrap().as_ref(),
@@ -549,7 +550,7 @@ fn empty_source_fold_keeps_all_three_strict_operands_without_calling_the_callbac
             let execution = &complete.batch.executions[index];
             assert_eq!(
                 execution.checker.ground,
-                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                CheckerAdmissionGround::UnsafeQuarantine
             );
             assert_eq!(
                 closed_vm_value(&execution.exit).unwrap(),

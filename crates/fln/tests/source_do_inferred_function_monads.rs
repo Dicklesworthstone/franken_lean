@@ -51,11 +51,20 @@ fn execute(source: &str, expected: &str) {
         .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
         .into_complete()
         .unwrap();
-    for execution in &batch.executions {
-        assert_eq!(
-            execution.checker.ground,
+    // Each program ends in exactly one `#eval`; every earlier execution is an
+    // ordinary safe `def`. #eval's auxiliary is unsafe at the pin
+    // (BuiltinEvalCommand.lean:92), so only that final execution is quarantined.
+    assert_eq!(
+        batch.source_evaluation_indices,
+        [batch.executions.len() - 1]
+    );
+    for (index, execution) in batch.executions.iter().enumerate() {
+        let expected = if batch.source_evaluation_indices.contains(&index) {
+            CheckerAdmissionGround::UnsafeQuarantine
+        } else {
             CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
-        );
+        };
+        assert_eq!(execution.checker.ground, expected);
     }
     let VmExit::Returned(result) = &batch.executions.last().unwrap().exit else {
         panic!("the checked program did not return");

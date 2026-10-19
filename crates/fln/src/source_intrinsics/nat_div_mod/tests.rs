@@ -259,9 +259,10 @@ fn execute_and_replay(environment: &Environment, source: &str, expected: &[(&str
     assert_eq!(indices.len(), expected.len());
     for (&index, (expected, row)) in indices.iter().zip(expected) {
         let execution = &completed.batch.executions[index];
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         let program = fln_comp::flbc::decode_canonical(
             &execution.flbc_artifact,

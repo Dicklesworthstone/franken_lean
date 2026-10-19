@@ -517,9 +517,10 @@ pub(super) fn check_selected_programs(engine: Engine) {
             .into_complete()
             .unwrap();
         let execution = &completed.batch.executions[completed.batch.source_evaluation_indices[0]];
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         match execution
             .io_evaluation_outcome()

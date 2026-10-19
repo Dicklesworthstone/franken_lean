@@ -80,7 +80,7 @@ pub(super) fn check_public_api(engine: &Engine) {
         let first = run();
         assert_eq!(first.batch.source_evaluation_indices.len(), 1, "{label}");
         let execution = &first.batch.executions[first.batch.source_evaluation_indices[0]];
-        assert_scalar(execution, 42);
+        assert_scalar(execution, 42, CheckerAdmissionGround::UnsafeQuarantine);
         let bytecode = execution.flbc_artifact.clone();
         drop(first);
         assert_eq!(engine.logical_root(&options), root, "{label}");
@@ -88,7 +88,7 @@ pub(super) fn check_public_api(engine: &Engine) {
         let repeated = run();
         assert_eq!(repeated.batch.source_evaluation_indices.len(), 1, "{label}");
         let execution = &repeated.batch.executions[repeated.batch.source_evaluation_indices[0]];
-        assert_scalar(execution, 42);
+        assert_scalar(execution, 42, CheckerAdmissionGround::UnsafeQuarantine);
         assert_eq!(execution.flbc_artifact, bytecode, "{label}");
         drop(repeated);
         assert_eq!(engine.logical_root(&options), root, "{label}");
