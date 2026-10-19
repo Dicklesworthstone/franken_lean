@@ -260,3 +260,214 @@ fn diagnostic_preparation_is_bounded_and_execution_can_be_retried() {
     );
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
+
+const TRACE_SOURCE: &str = r#"
+inductive Unit where
+  | unit
+class ToString (α : Type u) where
+  toString : α -> String
+instance : ToString String := ToString.mk (fun value => value)
+instance : ToString Nat := ToString.mk (fun _ => "number")
+def dbgTrace {α : Type u} (message : String) (continuation : Unit -> α) : α :=
+  continuation Unit.unit
+"#;
+
+fn native_trace() -> Engine {
+    let engine = checked(&base(), TRACE_SOURCE);
+    decorate_trace(&engine, "lean_dbg_trace")
+}
+
+fn decorate_trace(engine: &Engine, symbol: &str) -> Engine {
+    Engine::from_environment(
+        fln_elab::externs::register(
+            engine.environment(),
+            &fln::Name::from_components(["dbgTrace"]),
+            vec![fln_elab::externs::ExternEntry::Standard {
+                backend: fln::Name::from_components(["all"]),
+                symbol: symbol.to_owned(),
+            }],
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn source_debug_traces_evaluate_message_and_continuation_once_in_order() {
+    if parent(
+        "source_debug_traces_evaluate_message_and_continuation_once_in_order",
+        "message\nouter\nbody\n",
+    ) {
+        return;
+    }
+    let result = run(
+        &native_trace(),
+        r#"#eval dbg_trace (dbg_trace "message"; "outer"); dbg_trace "body"; 42"#,
+    );
+    assert_eq!(
+        fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+}
+
+#[test]
+fn source_debug_trace_uses_interpolation_instances_and_linebreak_continuations() {
+    if parent(
+        "source_debug_trace_uses_interpolation_instances_and_linebreak_continuations",
+        "λ {literal}: number\nnumber\n",
+    ) {
+        return;
+    }
+    let result = run(
+        &native_trace(),
+        r#"#eval
+  dbg_trace "λ \{literal\}: {42}"
+  dbg_trace (40 + 2)
+  42"#,
+    );
+    assert_eq!(
+        fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+}
+
+#[test]
+fn source_debug_trace_retains_callable_results_and_skips_dead_branches() {
+    if parent(
+        "source_debug_trace_retains_callable_results_and_skips_dead_branches",
+        "closure\nlive\n",
+    ) {
+        return;
+    }
+    let engine = native_trace();
+    for source in [
+        r#"#eval (dbg_trace "closure"; fun n : Nat => n + 2) 40"#,
+        r#"#eval if false then (dbg_trace "dead"; 0) else (dbg_trace "live"; 42)"#,
+    ] {
+        let result = run(&engine, source);
+        assert_eq!(
+            fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+            Some(fln::ClosedVmValue::Scalar(42))
+        );
+    }
+}
+
+#[test]
+fn source_debug_trace_globals_resist_shadowing_and_partial_calls_stay_effectful() {
+    if parent(
+        "source_debug_trace_globals_resist_shadowing_and_partial_calls_stay_effectful",
+        "global\npartial\n",
+    ) {
+        return;
+    }
+    let engine = checked(
+        &native_trace(),
+        r#"
+namespace Shadow
+def dbgTrace (_message : String) (_body : Unit -> Nat) : Nat := 0
+def toString (_value : String) : String := "shadowed"
+def traced (message : String) : Nat := dbg_trace message; 42
+end Shadow
+def later : String -> (Unit -> Nat) -> Nat := @dbgTrace Nat
+"#,
+    );
+    for source in [
+        r#"#eval Shadow.traced "global""#,
+        r#"#eval later "partial" (fun _ => 42)"#,
+    ] {
+        let result = run(&engine, source);
+        assert_eq!(
+            fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+            Some(fln::ClosedVmValue::Scalar(42))
+        );
+    }
+}
+
+#[test]
+fn changed_trace_contracts_refuse_without_reporting_or_publication() {
+    if parent(
+        "changed_trace_contracts_refuse_without_reporting_or_publication",
+        "",
+    ) {
+        return;
+    }
+    let logical = checked(&base(), TRACE_SOURCE);
+    let altered = checked(
+        &base(),
+        &TRACE_SOURCE.replace(
+            "continuation Unit.unit",
+            "let result := continuation Unit.unit; result",
+        ),
+    );
+    let collision = checked(&native_trace(), "def _fln_runtime_debug_trace := Nat");
+    for engine in [
+        decorate_trace(&logical, "foreign_trace"),
+        decorate_trace(&altered, "lean_dbg_trace"),
+        collision,
+    ] {
+        let root = engine.logical_root(&KVMap::new());
+        let error = engine
+            .execute_source_definitions(
+                &[br#"#eval dbg_trace "must not print"; 42"#],
+                &KVMap::new(),
+                EngineExecutionLimits::new(limits().kernel),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            cause(error),
+            fln::EngineExecutionError::Ingress(fln::IngressError::UnsupportedNode { .. })
+        ));
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn trace_without_an_extern_keeps_its_ordinary_checked_definition() {
+    if parent("trace_without_an_extern_keeps_its_ordinary_checked_definition", "") {
+        return;
+    }
+    let result = run(
+        &checked(&base(), TRACE_SOURCE),
+        r#"#eval dbg_trace "logical definition"; 42"#,
+    );
+    assert_eq!(
+        fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+}
+
+#[test]
+fn tracing_and_panicking_share_the_checked_diagnostic_transport() {
+    if parent(
+        "tracing_and_panicking_share_the_checked_diagnostic_transport",
+        "before\npanic\nafter\n",
+    ) {
+        return;
+    }
+    let engine = decorate(&checked(&native_trace(), PANIC), "lean_panic_fn_borrowed");
+    let result = run(
+        &engine,
+        r#"#eval dbg_trace "before"; let recovered : Nat := panic "panic"; dbg_trace "after"; recovered + 42"#,
+    );
+    assert_eq!(
+        fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+}
+
+#[test]
+fn source_debug_trace_accepts_the_checked_punit_unit_aliases() {
+    if parent("source_debug_trace_accepts_the_checked_punit_unit_aliases", "alias\n") {
+        return;
+    }
+    let source = TRACE_SOURCE.replace(
+        "inductive Unit where\n  | unit",
+        "inductive PUnit : Sort u where\n  | unit\nabbrev Unit : Type := PUnit.{1}\nabbrev Unit.unit : Unit := PUnit.unit",
+    );
+    let logical = checked(&base(), &source);
+    let engine = decorate_trace(&logical, "lean_dbg_trace");
+    let result = run(&engine, r#"#eval dbg_trace "alias"; 42"#);
+    assert_eq!(
+        fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+}

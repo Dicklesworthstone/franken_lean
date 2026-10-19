@@ -151,6 +151,103 @@ pub(crate) fn panic_matches(
     Ok(true)
 }
 
+
+/// A trace is effectful only for the exact checked logical continuation and
+/// selected native extern. Unit's concrete runtime shape is checked at ingress.
+pub(crate) fn trace_matches(
+    environment: &Environment,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<Option<Expr>, IngressError> {
+    let requested = Name::from_components(["dbgTrace"]);
+    if !extern_attribute_matches(environment, &requested, true, externs, visited, limits)? {
+        return Ok(None);
+    }
+    let unsupported = || IngressError::UnsupportedNode {
+        kind: "native dbgTrace differs from its checked logical contract",
+    };
+    let Some(ConstantInfo::Defn(actual)) = environment.find(&requested) else {
+        return Err(unsupported());
+    };
+    let [universe] = actual.base.level_params.as_slice() else {
+        return Err(unsupported());
+    };
+    let u = Level::param(universe.clone());
+    let alpha_sort = Expr::sort(Level::succ(u).map_err(|_| unsupported())?);
+    let unit_types = [c("Unit", vec![]), c("PUnit", vec![Level::one()])];
+    let unit_values = [("Unit.unit", vec![]), ("PUnit.unit", vec![Level::one()])];
+    let mut selected = None;
+    {
+        let mut comparison = Comparison { visited, limits };
+        for unit in unit_types {
+            let telescope = |result, lambda| {
+                bind(
+                    alpha_sort.clone(),
+                    bind(
+                        c("String", vec![]),
+                        bind(
+                            Expr::forall_e(
+                                Name::anonymous(),
+                                unit.clone(),
+                                b(2),
+                                BinderInfo::Default,
+                            ),
+                            result,
+                            BinderInfo::Default,
+                            lambda,
+                        ),
+                        BinderInfo::Default,
+                        lambda,
+                    ),
+                    BinderInfo::Implicit,
+                    lambda,
+                )
+            };
+            for (label, levels) in &unit_values {
+                let constructor = Name::from_components(label.split('.'));
+                let dependencies = match environment.find(&constructor) {
+                    Some(ConstantInfo::Ctor(_)) => vec![constructor.clone()],
+                    Some(ConstantInfo::Defn(alias)) if *label == "Unit.unit" => {
+                        let target = Name::from_components(["PUnit", "unit"]);
+                        if !alias.base.level_params.is_empty()
+                            || !matches!(environment.find(&target), Some(ConstantInfo::Ctor(_)))
+                            || !definition_matches(
+                                &mut comparison,
+                                alias,
+                                &unit,
+                                &c("PUnit.unit", vec![Level::one()]),
+                            )?
+                        {
+                            continue;
+                        }
+                        vec![constructor.clone(), target]
+                    }
+                    _ => continue,
+                };
+                let value = Expr::app(b(0), c(label, levels.clone()));
+                if definition_matches(
+                    &mut comparison,
+                    actual,
+                    &telescope(b(2), false),
+                    &telescope(value, true),
+                )? {
+                    selected = Some((unit.clone(), dependencies));
+                    break;
+                }
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+    }
+    let (unit, dependencies) = selected.ok_or_else(unsupported)?;
+    for dependency in dependencies {
+        check_selected_extern_attribute(environment, &dependency, externs, visited, limits)?;
+    }
+    Ok(Some(unit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

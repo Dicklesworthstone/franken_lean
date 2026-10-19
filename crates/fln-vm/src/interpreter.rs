@@ -2569,6 +2569,7 @@ fn run(
                     || plan.implementation == IntrinsicImplementation::DbgTrace
                 {
                     let application = match closure_intrinsic_application(
+                        program,
                         plan.implementation,
                         plan.row,
                         values,
@@ -6895,12 +6896,13 @@ fn cache_thunk_value(thunk: &Obj, value: &Obj) -> Result<(), Stop> {
 }
 
 fn closure_intrinsic_application(
+    program: &ValidatedProgram,
     implementation: IntrinsicImplementation,
     row: &'static str,
     args: Vec<Obj>,
 ) -> Result<IntrinsicApplication, VmRefusal> {
     match implementation {
-        IntrinsicImplementation::DbgTrace => diagnostics::trace(row, args),
+        IntrinsicImplementation::DbgTrace => diagnostics::trace(program, row, args),
         IntrinsicImplementation::BaseIoAsTask | IntrinsicImplementation::TaskSpawn => {
             let [closure, priority] = exact_owned_args(row, args)?;
             let operation = if implementation == IntrinsicImplementation::BaseIoAsTask {

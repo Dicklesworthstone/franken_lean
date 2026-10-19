@@ -198,10 +198,17 @@ fn panic_returns_the_borrowed_default_and_preserves_aliases() {
 fn trace_continuation_reuses_the_checked_vm_call_stack() {
     let name = "trace_continuation_reuses_the_checked_vm_call_stack";
     if let Some(output) = subprocess(name) {
-        assert_eq!(output.stderr, b"trace\ntrace\n");
+        assert_eq!(output.stderr, b"trace\ntrace\ntrace\ntrace\ntrace\ntrace\n");
         return;
     }
-    for ownership in [false, true] {
+    for (ownership, unit_ownership) in [
+        (false, A::Scalar),
+        (true, A::Scalar),
+        (false, A::Borrowed),
+        (true, A::Borrowed),
+        (false, A::Owned),
+        (true, A::Owned),
+    ] {
         let program = replay(
             vec![
                 fun(
@@ -218,7 +225,7 @@ fn trace_continuation_reuses_the_checked_vm_call_stack() {
                 ),
                 fun(
                     1,
-                    &[A::Owned, A::Scalar],
+                    &[A::Owned, unit_ownership],
                     C::Owned,
                     vec![I::Return { src: r(0) }],
                 ),
@@ -370,30 +377,36 @@ fn diagnostics_reject_bad_values_and_contracts_before_reporting() {
         );
         drop(result);
     }
-    let program = replay(
-        vec![
-            fun(
-                0,
-                &[],
-                C::Erased,
-                vec![
-                    string(0, "wrong Unit ownership"),
-                    closure(1, 1, &[], &[]),
-                    intrinsic(2, TRACE, &[0, 1]),
-                    I::Return { src: r(2) },
-                ],
-            ),
-            fun(1, &[A::Owned], C::Owned, vec![I::Return { src: r(0) }]),
-        ],
-        false,
-    );
-    assert!(matches!(
-        execute(&program, ExecutionLimits::default(), None),
-        Outcome::Complete(VmExit::Refused {
-            refusal: VmRefusal::ApplyOwnershipMismatch { .. },
-            ..
-        })
-    ));
+    for parameters in [vec![A::Unique], vec![A::Unique, A::Scalar]] {
+        let program = replay(
+            vec![
+                fun(
+                    0,
+                    &[],
+                    C::Erased,
+                    vec![
+                        string(0, "unsupported Unit uniqueness"),
+                        closure(1, 1, &[], &[]),
+                        intrinsic(2, TRACE, &[0, 1]),
+                        I::Return { src: r(2) },
+                    ],
+                ),
+                fun(1, &parameters, C::Owned, vec![I::Return { src: r(0) }]),
+            ],
+            false,
+        );
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::ApplyOwnershipMismatch {
+                    expected: A::Unique,
+                    actual: A::Scalar,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
     clean_shadow();
 }
 

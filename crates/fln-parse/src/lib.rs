@@ -855,8 +855,13 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 /// (beads `fln-vokf`, `fln-notation-from-imports-0edr`). Under an entered grammar
 /// ([`extensions::with_grammar`]) the table is that grammar's: the file's imports and
 /// activated scopes.
-fn lex_source(text: &SourceText) -> fln_syntax::run::LexRun {
+fn lex_source(view: &SourceView) -> Result<fln_syntax::run::LexRun, NatDefinitionParseError> {
+    let text = view.normalized();
     extensions::with_token_table(|table| extensions::interpolate(text, table, lex_run(text, table)))
+        .map_err(|at| NatDefinitionParseError::OutsideSeedGrammar {
+            at: view.to_original(at),
+            expected: NatDefinitionExpectation::ScalarValue,
+        })
 }
 
 /// Whether a bracketed binder at `index` may start a dependent arrow
@@ -3698,6 +3703,19 @@ fn bounded_term_token(
             ))));
         }
         _ if grammar == DefinitionGrammar::Scalar
+            && term_locals::word(tokens, index, "dbg_trace") =>
+        {
+            let prefix = term_locals::Prefix::debug_trace(
+                leaves,
+                view,
+                tokens,
+                index,
+                &mut cursor,
+                range.end,
+            )?;
+            frames.push(term_binders::frame(prefix));
+        }
+        _ if grammar == DefinitionGrammar::Scalar
             && term_locals::word(tokens, index, "set_option") =>
         {
             let prefix = term_locals::Prefix::set_option(
@@ -4867,7 +4885,7 @@ fn grind_constraints(
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_source(view.normalized());
+    let run = lex_source(&view)?;
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -5615,7 +5633,7 @@ fn parse_definition_with_grammar(
 ) -> Result<ParsedDefinition, NatDefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_source(view.normalized());
+    let run = lex_source(&view)?;
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -6078,7 +6096,7 @@ pub fn partition_definition_commands(
 ) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_source(view.normalized());
+    let run = lex_source(&view)?;
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -6145,7 +6163,7 @@ pub fn partition_source_module(
 ) -> Result<PartitionedSourceModule<'_>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let run = lex_source(view.normalized());
+    let run = lex_source(&view)?;
     let diagnostics = run
         .diagnostics()
         .into_iter()
@@ -6279,6 +6297,93 @@ mod nat_definition_tests {
         };
         assert_eq!(kind, &Name::str(Name::anonymous(), expected));
         args
+    }
+
+    #[test]
+    fn debug_trace_bounds_lexical_interpolation_before_reentering_the_term_parser() {
+        let nested = |count| {
+            let mut body = "42".to_owned();
+            for _ in 0..count {
+                body = format!("dbg_trace \"{{({body})}}\"; 42");
+            }
+            format!("def traced : Nat := {body}")
+        };
+        parse_definition(nested(2).as_bytes()).unwrap();
+        let error = parse_definition(nested(64).as_bytes()).unwrap_err();
+        assert!(matches!(
+            error,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::ScalarValue,
+                ..
+            }
+        ));
+        // Failure cannot retain a live lexical or syntactic nesting frame.
+        parse_definition(b"def traced : Nat := dbg_trace \"{42}\"; 42").unwrap();
+    }
+
+    #[test]
+    fn debug_trace_reads_terms_interpolation_and_both_continuation_separators() {
+        for source in [
+            "def traced : Nat := dbg_trace (40 + 2); 42",
+            "def traced : Nat :=\n  dbg_trace (40 + 2)\n  42",
+            "def traced : Nat := dbg_trace \"value {40 + 2}\"; 42",
+            "def traced : Nat :=\n  dbg_trace \"value {40 + 2}\"\n  42",
+            "def traced : Nat := dbg_trace \"{(dbg_trace \"inner\"; 42)}\"; 42",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).expect(source);
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                definition_value(&parsed).kind(),
+                Some(&parser_kind(&["Term", "dbgTrace"])),
+                "{source}"
+            );
+            let expanded = parsed.expanded().expect(source);
+            let mut pending = vec![expanded.syntax()];
+            while let Some(node) = pending.pop() {
+                assert_ne!(node.kind(), Some(&parser_kind(&["Term", "dbgTrace"])));
+                assert_ne!(node.kind(), Some(&Name::from_components(["interpolatedStrKind"])));
+                if let Syntax::Node { args, .. } = node {
+                    pending.extend(args);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debug_trace_requires_a_message_and_a_complete_separated_continuation() {
+        for source in [
+            "def traced : Nat := dbg_trace",
+            "def traced : Nat := dbg_trace 42",
+            "def traced : Nat := dbg_trace 42;",
+            "def traced : Nat := dbg_trace \"message\" 42",
+            "def traced : Nat := dbg_trace \"message\";",
+            "def traced : Nat := dbg_trace \"missing {42\"; 42",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn debug_trace_sequences_expand_on_heap_frames() {
+        let source = format!("def traced : Nat := {}42", "dbg_trace \"step\"; ".repeat(256));
+        let expanded = parse_definition(source.as_bytes())
+            .unwrap()
+            .expanded()
+            .unwrap();
+        let mut pending = vec![expanded.syntax()];
+        let mut traces = 0;
+        while let Some(node) = pending.pop() {
+            if let Syntax::Ident { preresolved, .. } = node {
+                traces += usize::from(preresolved.iter().any(|reference| {
+                    matches!(reference, fln_syntax::tree::Preresolved::Decl { name, .. }
+                        if name == &Name::from_components(["dbgTrace"]))
+                }));
+            }
+            if let Syntax::Node { args, .. } = node {
+                pending.extend(args);
+            }
+        }
+        assert_eq!(traces, 256);
     }
 
     #[test]
