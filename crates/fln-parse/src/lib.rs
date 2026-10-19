@@ -1265,7 +1265,9 @@ fn local_line_break(
     // Columns are codepoints, as in the pin's `FileMap`.
     let first_on_line = at == 0 || source.line_of(tokens[at - 1].extent.start()) < line;
     let column = |from: usize, to: usize| {
-        std::str::from_utf8(&source.as_bytes()[from..to])
+        source
+            .as_str()
+            .get(from..to)
             .map_or(to - from, |text| text.chars().count())
     };
     first_on_line
