@@ -181,7 +181,28 @@ fn structure_theorem_and_execution_share_one_atomic_source_stream() {
     assert_eq!(batch.source_evaluation_indices, [1]);
     assert_eq!(batch.source_admissions.len(), 2);
     assert_eq!(batch.source_admissions[0].command_index, 0);
-    assert_eq!(batch.source_admissions[0].admission.admissions.len(), 3);
+    // The structure, its two projections, and the auxiliary recursors the pin also
+    // generates for every inductive (`recOn`, `casesOn`).
+    let admitted: Vec<String> = batch.source_admissions[0]
+        .admission
+        .admissions
+        .iter()
+        .map(|admission| match &admission.declaration {
+            fln::Declaration::Defn(definition) => definition.base.name.to_display_string(),
+            fln::Declaration::Inductive(block) => block.types[0].base.name.to_display_string(),
+            other => panic!("unexpected record admission {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        admitted,
+        [
+            "Point",
+            "Point.x",
+            "Point.y",
+            "Point.recOn",
+            "Point.casesOn"
+        ]
+    );
     assert_eq!(batch.source_admissions[1].command_index, 2);
     assert_eq!(batch.source_admissions[0].admission.base_logical_root, root);
     assert_eq!(
