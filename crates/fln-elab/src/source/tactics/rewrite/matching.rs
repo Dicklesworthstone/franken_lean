@@ -6,7 +6,7 @@ use super::*;
 use std::collections::HashSet;
 
 #[derive(Debug, PartialEq, Eq)]
-enum RigidTypeHead {
+pub(super) enum RigidTypeHead {
     Sort,
     Forall,
     Inductive(Name),
@@ -48,7 +48,7 @@ impl Context {
     /// aliases, lets, projections and stuck eliminators) goes to the full solver.
     /// Inductive applications must have their actual admitted arity; mere name
     /// spelling is never enough to classify an expression here.
-    fn rigid_rewrite_type_head(
+    pub(super) fn rigid_rewrite_type_head(
         &mut self,
         expr: &Expr,
     ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
@@ -87,7 +87,7 @@ impl Context {
         }
     }
 
-    fn rewrite_types_have_distinct_heads(
+    pub(super) fn rewrite_types_have_distinct_heads(
         &mut self,
         left: &Expr,
         right: &Expr,
@@ -105,9 +105,10 @@ impl Context {
     /// constant or partial application can still be function-valued; stripping
     /// its entire telescope would falsely discard rewrites of that function.
     /// Only the stable outer constructors recognized by rigid_rewrite_type_head
-    /// are used. A dependent result headed by a bound variable, alias or redex
-    /// stays unknown: this filter neither substitutes arguments nor unfolds.
-    fn rigid_rewrite_constant_result(
+    /// are used. A bare result type parameter selects its exact supplied
+    /// argument; applied motives, aliases, and redexes stay unknown. This filter
+    /// neither unfolds a definition nor infers a caller's argument types.
+    pub(super) fn rigid_rewrite_constant_result(
         &mut self,
         expression: &Expr,
     ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
@@ -150,7 +151,33 @@ impl Context {
                 _ => return Ok(None),
             }
         }
-        self.rigid_rewrite_type_head(&result)
+        let mut result_head = &result;
+        while let ExprNode::MData { expr, .. } = result_head.node() {
+            self.tick()?;
+            result_head = expr;
+        }
+        if let ExprNode::BVar { idx } = result_head.node() {
+            // The telescope's last consumed binder has index zero. Walk the
+            // actual application spine in the same order; never guess the
+            // carrier of a polymorphic constant (including numeric methods).
+            let mut applied = expression;
+            let mut remaining = *idx;
+            loop {
+                self.tick()?;
+                match applied.node() {
+                    ExprNode::MData { expr, .. } => applied = expr,
+                    ExprNode::App { f, a } => {
+                        if remaining == 0 {
+                            return self.rigid_rewrite_type_head(a);
+                        }
+                        remaining -= 1;
+                        applied = f;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+        self.rigid_rewrite_type_head(result_head)
     }
 
     pub(super) fn rewrite_trial(&self) -> Self {
@@ -667,6 +694,76 @@ mod outcome_tests {
             env = publication.environment;
         }
         Context::new(&env, budget)
+    }
+
+    #[test]
+    fn constant_result_discrimination_uses_the_actual_type_parameter() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        for source in [
+            "def carrier_first (A B : Type) (a : A) (b : B) : A := a",
+            "def carrier_second (A B : Type) (a : A) (b : B) : B := b",
+        ] {
+            let declaration =
+                crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                    .unwrap()
+                    .declaration;
+            let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+                panic!("definition admission did not complete");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("definition was rejected");
+            };
+            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+                checked.publish(
+                    DeclarationBudget::default(),
+                    CollisionBudget::default(),
+                    None,
+                )
+            else {
+                panic!("definition publication did not complete");
+            };
+            ctx.txn.env = publication.environment;
+        }
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let bool_ = Expr::const_(Name::from_components(["Bool"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let false_ = Expr::const_(Name::from_components(["Bool", "false"]), vec![]);
+        for (name, result) in [("carrier_first", "Nat"), ("carrier_second", "Bool")] {
+            let selected = Expr::const_(Name::from_components([name]), vec![]);
+            assert_eq!(
+                ctx.rigid_rewrite_constant_result(&app(
+                    selected.clone(),
+                    [nat.clone(), bool_.clone(), zero.clone(), false_.clone()],
+                ))
+                .unwrap(),
+                Some(RigidTypeHead::Inductive(Name::from_components([result])))
+            );
+            assert_eq!(
+                ctx.rigid_rewrite_constant_result(&app(
+                    selected,
+                    [nat.clone(), bool_.clone(), zero.clone()],
+                ))
+                .unwrap(),
+                Some(RigidTypeHead::Forall)
+            );
+        }
+        let carrier = ctx.hole(Expr::sort(Level::one())).unwrap();
+        let before = ctx.txn.mvars.clone();
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&app(
+                Expr::const_(Name::from_components(["carrier_first"]), vec![]),
+                [carrier, bool_, zero, false_],
+            ))
+            .unwrap(),
+            None
+        );
+        assert_eq!(ctx.txn.mvars, before);
     }
 
     #[test]

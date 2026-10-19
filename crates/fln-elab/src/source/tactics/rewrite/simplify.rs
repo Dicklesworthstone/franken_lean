@@ -9,7 +9,9 @@ mod locations;
 mod simpa;
 mod unfold;
 
+use super::matching::RigidTypeHead;
 use super::*;
+use std::collections::HashSet;
 use unfold::UnfoldResult;
 
 const MAX_SIMPLIFICATION_STEPS: usize = 256;
@@ -238,6 +240,111 @@ impl Context {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Read the admitted type before allocating a fresh instance of the proof.
+    /// Unknown metadata remains an ordinary elaboration candidate.
+    fn registered_simp_type(
+        &mut self,
+        rule: &SimpRule<'_>,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let SimpRule::Global(rule) = rule else {
+            return Ok(None);
+        };
+        self.tick()?;
+        Ok(self
+            .txn
+            .env
+            .find(rule.proof.as_ref().unwrap_or(&rule.declaration))
+            .map(|info| info.constant_val().type_.clone()))
+    }
+
+    /// Reject only stable, different outer types. Selected-definition expansion
+    /// cannot change an admitted inductive, Sort, or forall into another head.
+    fn simp_rule_may_prove(
+        &mut self,
+        rule: &SimpRule<'_>,
+        target: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let Some(type_) = self.registered_simp_type(rule)? else {
+            return Ok(true);
+        };
+        Ok(!self.rewrite_types_have_distinct_heads(&type_, target)?)
+    }
+
+    /// A registered fact P rewrites the proposition P, not its evidence.
+    /// For a rigid admitted proposition, discard the rule only if every target
+    /// occurrence has a distinct rigid head or cannot itself be a type. This
+    /// runs before fresh universes, proof construction, or premise conversion.
+    /// Equality, equivalence, parameters, aliases, and explicit/local rules keep
+    /// the full matcher. No successful conversion is inferred by this filter.
+    fn simp_rule_may_rewrite(
+        &mut self,
+        rule: &SimpRule<'_>,
+        target: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let SimpRule::Global(entry) = rule else {
+            return Ok(true);
+        };
+        self.tick()?;
+        let Some(info) = self
+            .txn
+            .env
+            .find(entry.proof.as_ref().unwrap_or(&entry.declaration))
+        else {
+            return Ok(true);
+        };
+        // A definition selects its body, rather than a rewrite of its type.
+        // Keep unsupported reversed facts on the existing typed-refusal path.
+        if entry.reverse
+            || entry.proof.is_none() && matches!(info, fln_env::constants::ConstantInfo::Defn(_))
+        {
+            return Ok(true);
+        }
+        let type_ = info.constant_val().type_.clone();
+        let Some(head @ RigidTypeHead::Inductive(_)) = self.rigid_rewrite_type_head(&type_)?
+        else {
+            return Ok(true);
+        };
+        if matches!(&head, RigidTypeHead::Inductive(name)
+            if name == &Name::from_components(["Eq"])
+                || name == &Name::from_components(["Iff"]))
+        {
+            return Ok(true);
+        }
+        let mut pending = vec![target];
+        let mut visited = HashSet::new();
+        while let Some(term) = pending.pop() {
+            self.tick()?;
+            if !visited.insert(term.allocation_identity()) {
+                continue;
+            }
+            pending.extend(children(term).into_iter().rev().flatten());
+            if let Some(actual) = self.rigid_rewrite_type_head(term)?
+                && actual != head
+            {
+                continue;
+            }
+            let cannot_be_type = match term.node() {
+                ExprNode::Lit { .. } => true,
+                ExprNode::FVar { id } => {
+                    let type_ = self.txn.lctx.find(id).map(|local| local.type_.clone());
+                    match type_ {
+                        Some(type_) => self
+                            .rigid_rewrite_type_head(&type_)?
+                            .is_some_and(|head| head != RigidTypeHead::Sort),
+                        None => false,
+                    }
+                }
+                _ => self
+                    .rigid_rewrite_constant_result(term)?
+                    .is_some_and(|head| head != RigidTypeHead::Sort),
+            };
+            if !cannot_be_type {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn selected_simp_term(&mut self, rule: &SimpRule<'_>) -> Result<Typed, NatDefinitionElabError> {
@@ -548,6 +655,9 @@ impl Context {
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         for rule in rules {
             self.tick()?;
+            if !self.simp_rule_may_prove(rule, target)? {
+                continue;
+            }
             let selected = self.selected_simp_term(rule)?;
             let type_ = self.simp_premise_target(&selected.type_, rules)?;
             let Some(universe) = self.known_type(&type_)? else {
@@ -663,6 +773,9 @@ impl Context {
         premise_rules: &[SimpRule<'_>],
     ) -> Result<Option<(ProofGoal, Expr)>, NatDefinitionElabError> {
         let target = self.instantiate(&goal.target)?;
+        if !self.simp_rule_may_rewrite(rule, &target)? {
+            return Ok(None);
+        }
         match self.unfold_simp_rule(rule, &target)? {
             UnfoldResult::Unchanged => Ok(None),
             UnfoldResult::Changed(next_target) => {

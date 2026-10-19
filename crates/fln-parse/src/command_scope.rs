@@ -100,13 +100,11 @@ pub enum ScopeCommand {
 /// recognises (`namespace`, `end`, `open`, `universe`, `scoped`, `omit`, …) is a token at the
 /// pin, so nothing is added by hand; `prelude` is header-only and lives in `imports`' header
 /// table.
-fn lex(view: &SourceView) -> fln_syntax::run::LexRun {
-    crate::extensions::with_token_table(|table| {
-        crate::extensions::interpolate(view.normalized(), table, lex_run(view.normalized(), table))
-    })
+fn lex(view: &SourceView) -> Result<fln_syntax::run::LexRun, DefinitionParseError> {
+    crate::lex_source(view)
 }
 pub(crate) fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
-    let run = lex(view);
+    let run = lex(view)?;
     let diagnostics: Vec<_> = run
         .diagnostics()
         .into_iter()
@@ -188,7 +186,7 @@ pub fn declaration_warning_offset(source: &[u8]) -> Option<usize> {
 /// comment, string or identifier escape, which runs on past the command) still refuses the whole
 /// source.
 fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
-    let run = lex(view);
+    let run = lex(view)?;
     let diagnostics: Vec<_> = run
         .events
         .iter()
