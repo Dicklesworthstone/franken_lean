@@ -16,7 +16,7 @@ inductive ParamMatch (n : Nat) where
 inductive TwoParamMatch (n m : Nat) where
   | mk (value : Nat)
 inductive IndexedMatch : Nat -> Type where
-  | mk (n value : Nat) : IndexedMatch n
+  | mk (n value : Nat) : IndexedMatch (Nat.succ n)
 namespace OrdinaryRecursor
 def rec (n value : Nat) : Nat := value
 end OrdinaryRecursor
@@ -104,27 +104,46 @@ fn recursor_parameter_prefix_is_static_at_partial_and_saturated_uses() {
 }
 
 #[test]
-fn captured_parameters_keep_the_original_motive_and_major_telescope() {
+fn captured_parameters_stay_static_and_the_motive_uses_the_erased_layout_key() {
     let engine = engine();
     let parameter = application(
         constant("Nat.add"),
         [Expr::bvar(0).unwrap(), constant("hiddenRecursorParameter")],
     );
     let parameters = [parameter];
+    let major = constructor("ParamMatch", &parameters, nat::literal(42));
     let input = lambda(
         constant("Nat"),
         application(
             recursor("ParamMatch"),
-            arguments(
-                "ParamMatch",
-                &parameters,
-                identity(),
-                constructor("ParamMatch", &parameters, nat::literal(42)),
-            ),
+            arguments("ParamMatch", &parameters, identity(), major.clone()),
+        ),
+    );
+    // The parameter and the major's parameter are kept verbatim and never
+    // executed. The motive is a runtime type that captures a local, so
+    // erase_type_argument keys its value parameter by the erased layout
+    // parameter, which serves every value (runtime/indexed.rs). The source
+    // program for this shape reaches the VM in
+    // tests/source_noncomputable_parameters.rs.
+    let erased_motive = lambda(
+        application(
+            constant("ParamMatch"),
+            [constant("_fln_runtime_erased_parameter")],
+        ),
+        constant("Nat"),
+    );
+    let expected = lambda(
+        constant("Nat"),
+        application(
+            recursor("ParamMatch"),
+            parameters
+                .iter()
+                .cloned()
+                .chain([erased_motive, identity(), major]),
         ),
     );
     let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
-    assert_eq!(preparation.erase_proofs(&input, None).unwrap(), input);
+    assert_eq!(preparation.erase_proofs(&input, None).unwrap(), expected);
 }
 
 #[test]
@@ -171,10 +190,13 @@ fn value_indices_are_not_mistaken_for_datatype_parameters() {
     let minor = lambda(constant("Nat"), identity());
     let major = application(
         constant("IndexedMatch.mk"),
-        [nat::literal(5), nat::literal(42)],
+        [nat::literal(4), nat::literal(42)],
     );
-    // hiddenRecursorParameter reduces logically to 5, so the major has the
-    // required source type. Its separate scalar index remains executable.
+    // hiddenRecursorParameter reduces logically to 5 = Nat.succ 4, so the
+    // major has the required source type. Its separate scalar index remains
+    // executable. The index is `Nat.succ n`, not a bare constructor variable:
+    // the pin promotes a uniform `IndexedMatch n` index to a parameter
+    // (numParams=1, numIndices=0), which would test nothing here.
     let input = application(
         recursor("IndexedMatch"),
         [motive, minor, constant("hiddenRecursorParameter"), major],
