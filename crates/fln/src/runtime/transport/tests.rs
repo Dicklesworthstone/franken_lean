@@ -125,12 +125,7 @@ fn boxed_type_refinements_keep_the_payload_interface_and_typed_result_boundary()
     let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
     let boxed = prep.enable_boxed_type().unwrap();
     let nat = Expr::const_(name("Nat"), vec![]);
-    let callback = Expr::forall_e(
-        name("n"),
-        nat.clone(),
-        nat.clone(),
-        BinderInfo::Default,
-    );
+    let callback = Expr::forall_e(name("n"), nat.clone(), nat.clone(), BinderInfo::Default);
     let lambda = Expr::lam(
         name("n"),
         nat.clone(),

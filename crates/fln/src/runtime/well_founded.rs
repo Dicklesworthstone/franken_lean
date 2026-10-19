@@ -9,9 +9,9 @@
 use super::*;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod family_tests;
+#[cfg(test)]
+mod tests;
 
 fn source_name() -> Name {
     name("WellFounded.fix")
@@ -33,7 +33,11 @@ fn equation_for(requested: &Name) -> Option<(Name, Name)> {
         ("Acc.rec", "Acc.recC", "Acc.rec_eq_recC"),
         ("Acc.ndrec", "Acc.ndrecC", "Acc.ndrec_eq_ndrecC"),
         ("Acc.ndrecOn", "Acc.ndrecOnC", "Acc.ndrecOn_eq_ndrecOnC"),
-        ("WellFounded.fixF", "WellFounded.fixFC", "WellFounded.fixF_eq_fixFC"),
+        (
+            "WellFounded.fixF",
+            "WellFounded.fixFC",
+            "WellFounded.fixF_eq_fixFC",
+        ),
     ] {
         if requested == &name(source) {
             return Some((name(target), name(equation)));
@@ -282,8 +286,14 @@ impl Preparation<'_> {
                 (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
                 (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) if a == b => {}
                 (
-                    ExprNode::Const { name: a, levels: al },
-                    ExprNode::Const { name: b, levels: bl },
+                    ExprNode::Const {
+                        name: a,
+                        levels: al,
+                    },
+                    ExprNode::Const {
+                        name: b,
+                        levels: bl,
+                    },
                 ) if a == b && al == bl => {}
                 (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
                     work.push((aa, ba));
@@ -291,12 +301,32 @@ impl Preparation<'_> {
                     work.push((af, bf));
                 }
                 (
-                    ExprNode::ForallE { binder_type: at, body: ab, binder_info: ai, .. },
-                    ExprNode::ForallE { binder_type: bt, body: bb, binder_info: bi, .. },
+                    ExprNode::ForallE {
+                        binder_type: at,
+                        body: ab,
+                        binder_info: ai,
+                        ..
+                    },
+                    ExprNode::ForallE {
+                        binder_type: bt,
+                        body: bb,
+                        binder_info: bi,
+                        ..
+                    },
                 )
                 | (
-                    ExprNode::Lam { binder_type: at, body: ab, binder_info: ai, .. },
-                    ExprNode::Lam { binder_type: bt, body: bb, binder_info: bi, .. },
+                    ExprNode::Lam {
+                        binder_type: at,
+                        body: ab,
+                        binder_info: ai,
+                        ..
+                    },
+                    ExprNode::Lam {
+                        binder_type: bt,
+                        body: bb,
+                        binder_info: bi,
+                        ..
+                    },
                 ) if ai == bi => {
                     work.push((ab, bb));
                     reserve(&mut work, self.limits.max_nodes)?;
@@ -307,5 +337,4 @@ impl Preparation<'_> {
         }
         Ok(true)
     }
-
 }

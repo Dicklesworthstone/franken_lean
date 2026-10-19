@@ -252,7 +252,6 @@ partial def shadow (default : Bool) (n : Nat) : Nat := if n == 0 then 8 else sha
     );
 }
 
-
 #[test]
 fn an_inferred_header_preserves_ordered_tactics_and_lexical_shadowing() {
     let base = check(

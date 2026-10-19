@@ -34,7 +34,9 @@ fn natural(raw: RawField<'_>) -> Result<u64, Refusal> {
     {
         return Err("diagnostic line range requires unambiguous natural numbers");
     }
-    value.parse().map_err(|_| "diagnostic line range exceeds UInt64")
+    value
+        .parse()
+        .map_err(|_| "diagnostic line range exceeds UInt64")
 }
 
 pub(in crate::dispatch) fn line_range(value: RawField<'_>) -> Result<Option<LineRange>, Refusal> {
@@ -69,8 +71,8 @@ fn members(value: &str) -> Result<Vec<(String, &str)>, Refusal> {
             return Err("diagnostic has too many fields");
         }
         let key_end = scan_string_end(bytes, cursor).ok_or("malformed diagnostic key")?;
-        let key = decode_json_string_value(&value[cursor..key_end])
-            .ok_or("invalid diagnostic key")?;
+        let key =
+            decode_json_string_value(&value[cursor..key_end]).ok_or("invalid diagnostic key")?;
         if !seen.insert(key.clone()) {
             return Err("diagnostic contains duplicate decoded keys");
         }
@@ -103,7 +105,10 @@ impl Diagnostic {
     fn decode(value: &str) -> Result<Self, Refusal> {
         let fields = members(value)?;
         let get = |key: &str| {
-            fields.iter().find(|(name, _)| name == key).map(|(_, value)| *value)
+            fields
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| *value)
         };
         let ordinary_range = range(get("range").ok_or("diagnostic has no range")?)?;
         let full_range = match get("fullRange") {
@@ -114,10 +119,10 @@ impl Diagnostic {
         if decode_json_string_value(message).is_none() {
             return Err("native diagnostic message is not a valid string");
         }
-        if let Some(severity) = get("severity").filter(|value| *value != "null") {
-            if !matches!(natural(RawField::Value(severity)), Ok(1..=4)) {
-                return Err("diagnostic severity is invalid");
-            }
+        if let Some(severity) = get("severity").filter(|value| *value != "null")
+            && !matches!(natural(RawField::Value(severity)), Ok(1..=4))
+        {
+            return Err("diagnostic severity is invalid");
         }
         let mut wire = String::from("{");
         for (index, (key, value)) in fields.iter().enumerate() {
@@ -139,9 +144,12 @@ impl Diagnostic {
         // excludes a following line reached only at column zero, and includes
         // a zero-width diagnostic when its start line is in the requested range.
         let start_line = u64::from(full_range.0.line);
-        let end_line = u64::from(full_range.1.line)
-            + u64::from(full_range.1.character != 0);
-        Ok(Self { wire, start_line, end_line })
+        let end_line = u64::from(full_range.1.line) + u64::from(full_range.1.character != 0);
+        Ok(Self {
+            wire,
+            start_line,
+            end_line,
+        })
     }
 
     fn selected(&self, range: Option<LineRange>) -> bool {
@@ -163,9 +171,11 @@ impl Batch {
         if notifications.len() > MAX_DIAGNOSTICS {
             return Err("diagnostic callback exceeds its message limit");
         }
-        let total = notifications.iter().try_fold(0usize, |bytes, notification| {
-            bytes.checked_add(notification.len())
-        });
+        let total = notifications
+            .iter()
+            .try_fold(0usize, |bytes, notification| {
+                bytes.checked_add(notification.len())
+            });
         if total.is_none_or(|bytes| bytes > MAX_CALLBACK_BYTES) {
             return Err("diagnostic callback exceeds its byte budget");
         }
@@ -186,7 +196,11 @@ impl Batch {
                     match direct_version(envelope.params) {
                         VersionField::Missing => {}
                         VersionField::Valid(current) if current == version => {}
-                        _ => return Err("diagnostics do not belong to the current document version"),
+                        _ => {
+                            return Err(
+                                "diagnostics do not belong to the current document version",
+                            );
+                        }
                     }
                     let raw = object(envelope.params)?;
                     let RawField::Value(array) = object_field(raw, "diagnostics") else {
@@ -230,7 +244,9 @@ impl Batch {
                 return Err("diagnostic count exceeds its limit");
             }
             let end = parse_value_end(array, cursor, 0).ok_or("malformed diagnostic")?;
-            batch.diagnostics.push(Diagnostic::decode(&array[cursor..end])?);
+            batch
+                .diagnostics
+                .push(Diagnostic::decode(&array[cursor..end])?);
             cursor = skip_ws(bytes, end);
             match bytes.get(cursor) {
                 Some(b']') => return Ok(batch),
@@ -241,10 +257,15 @@ impl Batch {
     }
 
     pub(in crate::dispatch) fn retained_bytes(&self) -> Option<usize> {
-        let storage = self.diagnostics.capacity().checked_mul(std::mem::size_of::<Diagnostic>())?;
-        self.diagnostics.iter().try_fold(storage, |bytes, diagnostic| {
-            bytes.checked_add(diagnostic.wire.capacity())
-        })
+        let storage = self
+            .diagnostics
+            .capacity()
+            .checked_mul(std::mem::size_of::<Diagnostic>())?;
+        self.diagnostics
+            .iter()
+            .try_fold(storage, |bytes, diagnostic| {
+                bytes.checked_add(diagnostic.wire.capacity())
+            })
     }
 
     pub(in crate::dispatch) fn response(
@@ -257,9 +278,15 @@ impl Batch {
         }
         let mut result = String::from("[");
         let mut first = true;
-        for diagnostic in self.diagnostics.iter().filter(|diagnostic| diagnostic.selected(range)) {
+        for diagnostic in self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.selected(range))
+        {
             let separator = usize::from(!first);
-            let size = result.len().checked_add(separator)
+            let size = result
+                .len()
+                .checked_add(separator)
                 .and_then(|size| size.checked_add(diagnostic.wire.len()))
                 .and_then(|size| size.checked_add(1))
                 .ok_or("diagnostic response accounting overflow")?;
@@ -293,14 +320,24 @@ mod tests {
         )
     }
     fn batch(rows: &[String]) -> Batch {
-        Batch::from_notifications(&[notification(&format!("[{}]", rows.join(",")), "")], URI, 1)
-            .unwrap()
+        Batch::from_notifications(
+            &[notification(&format!("[{}]", rows.join(",")), "")],
+            URI,
+            1,
+        )
+        .unwrap()
     }
     #[test]
     fn optional_line_ranges_use_decoded_unambiguous_natural_numbers() {
         assert_eq!(line_range(RawField::Value("{}")), Ok(None));
-        assert_eq!(line_range(RawField::Value(r#"{"lineRange":null}"#)), Ok(None));
-        assert_eq!(line_range(RawField::Value(r#"{"lineRange":{"start":2,"end":5}}"#)), Ok(Some((2, 5))));
+        assert_eq!(
+            line_range(RawField::Value(r#"{"lineRange":null}"#)),
+            Ok(None)
+        );
+        assert_eq!(
+            line_range(RawField::Value(r#"{"lineRange":{"start":2,"end":5}}"#)),
+            Ok(Some((2, 5)))
+        );
         for value in [
             r#"{"lineRange":[],"line\u0052ange":null}"#,
             r#"{"lineRange":{"start":0,"start":1,"end":2}}"#,
@@ -314,50 +351,107 @@ mod tests {
     }
     #[test]
     fn messages_are_tagged_text_and_existing_diagnostic_fields_survive() {
-        let result = batch(&[diagnostic(0, 0, 2, "β \"quoted\"\nnext")]).response(None, 4096).unwrap();
-        assert!(result.contains(r#""message":{"text":"β \"quoted\"\nnext"}"#), "{result}");
+        let result = batch(&[diagnostic(0, 0, 2, "β \"quoted\"\nnext")])
+            .response(None, 4096)
+            .unwrap();
+        assert!(
+            result.contains(r#""message":{"text":"β \"quoted\"\nnext"}"#),
+            "{result}"
+        );
         assert!(result.contains(r#""code":"lean.error","leanTags":[1]"#));
         assert!(!result.contains("__rpcref"));
     }
     #[test]
     fn full_range_and_exclusive_end_line_match_the_pin() {
         let ordinary = diagnostic(2, 4, 0, "multiline");
-        let extended = ordinary.replacen("{", r#"{"fullRange":{"start":{"line":1,"character":0},"end":{"line":6,"character":0}},"#, 1);
+        let extended = ordinary.replacen(
+            "{",
+            r#"{"fullRange":{"start":{"line":1,"character":0},"end":{"line":6,"character":0}},"#,
+            1,
+        );
         let data = batch(&[ordinary, extended]);
-        assert!(data.response(Some((1, 2)), 4096).unwrap().contains("multiline"));
-        assert_eq!(data.response(Some((4, 5)), 4096).unwrap().matches("multiline").count(), 1);
+        assert!(
+            data.response(Some((1, 2)), 4096)
+                .unwrap()
+                .contains("multiline")
+        );
+        assert_eq!(
+            data.response(Some((4, 5)), 4096)
+                .unwrap()
+                .matches("multiline")
+                .count(),
+            1
+        );
         assert_eq!(data.response(Some((6, 7)), 4096).unwrap(), "[]");
-        assert!(batch(&[diagnostic(4, 4, 0, "point")]).response(Some((4, 5)), 4096).unwrap().contains("point"));
-        assert!(batch(&[diagnostic(2, 4, 1, "column")]).response(Some((4, 5)), 4096).unwrap().contains("column"));
+        assert!(
+            batch(&[diagnostic(4, 4, 0, "point")])
+                .response(Some((4, 5)), 4096)
+                .unwrap()
+                .contains("point")
+        );
+        assert!(
+            batch(&[diagnostic(2, 4, 1, "column")])
+                .response(Some((4, 5)), 4096)
+                .unwrap()
+                .contains("column")
+        );
     }
     #[test]
     fn stale_or_duplicate_notifications_never_become_current_results() {
         let valid = notification("[]", ",\"version\":1");
-        assert!(Batch::from_notifications(&[valid.clone()], URI, 1).is_ok());
-        assert!(Batch::from_notifications(&[valid.clone()], URI, 2).is_err());
+        assert!(Batch::from_notifications(std::slice::from_ref(&valid), URI, 1).is_ok());
+        assert!(Batch::from_notifications(std::slice::from_ref(&valid), URI, 2).is_err());
         assert!(Batch::from_notifications(&[valid.clone(), valid], URI, 1).is_err());
-        assert!(Batch::from_notifications(&[notification("[]", ",\"version\":1,\"version\":1")], URI, 1).is_err());
+        assert!(
+            Batch::from_notifications(
+                &[notification("[]", ",\"version\":1,\"version\":1")],
+                URI,
+                1
+            )
+            .is_err()
+        );
     }
     #[test]
     fn failed_missing_and_contradictory_terminals_are_not_empty_diagnostics() {
-        use crate::dispatch::wire::{clear_diagnostics_notification, diagnostic_callback_failure_notification};
+        use crate::dispatch::wire::{
+            clear_diagnostics_notification, diagnostic_callback_failure_notification,
+        };
         let clear = clear_diagnostics_notification(URI);
         let failed = diagnostic_callback_failure_notification(URI);
-        assert!(Batch::from_notifications(&[clear.clone()], URI, 1).is_ok());
+        assert!(Batch::from_notifications(std::slice::from_ref(&clear), URI, 1).is_ok());
         assert!(Batch::from_notifications(&[clear, failed], URI, 1).is_err());
         assert!(Batch::from_notifications(&[], URI, 1).is_err());
-        assert!(Batch::from_notifications(&[clear_diagnostics_notification("other")], URI, 1).is_err());
+        assert!(
+            Batch::from_notifications(&[clear_diagnostics_notification("other")], URI, 1).is_err()
+        );
         let complete = r#"{"jsonrpc":"2.0","method":"$/lean/diagnosticOutcome","params":{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":0}}"#.to_owned();
-        assert_eq!(Batch::from_notifications(&[complete.clone()], URI, 1).unwrap().response(None, 2).unwrap(), "[]");
+        assert_eq!(
+            Batch::from_notifications(std::slice::from_ref(&complete), URI, 1)
+                .unwrap()
+                .response(None, 2)
+                .unwrap(),
+            "[]"
+        );
         let message = notification(&format!("[{}]", diagnostic(0, 0, 1, "error")), "");
         assert!(Batch::from_notifications(&[message, complete], URI, 1).is_err());
     }
     #[test]
     fn excluded_diagnostics_are_still_validated_and_output_limits_do_not_truncate() {
         let valid = diagnostic(0, 0, 1, "valid");
-        let duplicate = valid.replacen(r#""message":"valid""#, r#""message":"valid","mess\u0061ge":"other""#, 1);
-        for invalid in [duplicate, valid.replace(r#""severity":1"#, r#""severity":9"#), valid.replace(r#""message":"valid""#, r#""message":{}"#)] {
-            assert!(Batch::from_notifications(&[notification(&format!("[{invalid}]"), "")], URI, 1).is_err());
+        let duplicate = valid.replacen(
+            r#""message":"valid""#,
+            r#""message":"valid","mess\u0061ge":"other""#,
+            1,
+        );
+        for invalid in [
+            duplicate,
+            valid.replace(r#""severity":1"#, r#""severity":9"#),
+            valid.replace(r#""message":"valid""#, r#""message":{}"#),
+        ] {
+            assert!(
+                Batch::from_notifications(&[notification(&format!("[{invalid}]"), "")], URI, 1)
+                    .is_err()
+            );
         }
         let data = batch(&[valid]);
         assert!(data.response(None, 2).is_err());

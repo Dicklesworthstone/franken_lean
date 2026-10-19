@@ -798,16 +798,18 @@ mod tests {
     #[test]
     fn erasure_respects_the_scope_event_limit_without_losing_the_active_instance() {
         let env = cache_fixture(true);
-        let mut scopes = ActiveScopes::default();
         // Exercise the same frozen boundary as public activation without doing
         // thousands of unrelated full registry reads in this focused test.
-        scopes.activations = Arc::new(vec![
-            Activation {
-                kind: ActivationKind::Namespace(Name::from_components(["unused"])),
-                at: 0,
-            };
-            MAX_SCOPES
-        ]);
+        let mut scopes = ActiveScopes {
+            activations: Arc::new(vec![
+                Activation {
+                    kind: ActivationKind::Namespace(Name::from_components(["unused"])),
+                    at: 0,
+                };
+                MAX_SCOPES
+            ]),
+            ..ActiveScopes::default()
+        };
         let saved = scopes.clone();
         assert_eq!(
             scopes.erase(&env, &Name::from_components(["global"])),

@@ -163,8 +163,13 @@ fn reassignment<'a>(
     let arrow = term_args(syntax, "doReassignArrow").is_ok();
     let [declaration] = term_args(
         syntax,
-        if arrow { "doReassignArrow" } else { "doReassign" },
-    )? else {
+        if arrow {
+            "doReassignArrow"
+        } else {
+            "doReassign"
+        },
+    )?
+    else {
         return Err(unsupported_binder());
     };
     let (id, parameters, annotation, operator, value) = if arrow {
@@ -349,14 +354,9 @@ pub(super) fn visit<'a>(
     }
     // These shapes also bind identifiers. Until their scope is analysed, do
     // not send them through the generic walk and pre-resolve binders as globals.
-    if [
-        "doLetRec",
-        "doMatch",
-        "doIfLet",
-        "doTry",
-    ]
-    .iter()
-    .any(|k| term_kind(kind, k))
+    if ["doLetRec", "doMatch", "doIfLet", "doTry"]
+        .iter()
+        .any(|k| term_kind(kind, k))
     {
         return Err(unsupported_binder());
     }
@@ -539,7 +539,6 @@ pub(super) fn conditional<'a>(
     tasks.push(Task::Copy(keyword));
     Ok(())
 }
-
 
 /// A protected sequence, each catch handler, and the finalizer have separate
 /// lexical scopes. The ordinary exception elaborator owns their dynamic

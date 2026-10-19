@@ -109,7 +109,10 @@ fn inference_only_dependent_local_retains_its_type() {
 fn a_completed_term_still_has_one_term_goal() {
     let goal = goal_at("def completed (x : Nat) : Nat := x", "x");
     assert_eq!(goal.target, nat());
-    assert_eq!(goal.locals.find_by_user_name(&name("x")).unwrap().type_, nat());
+    assert_eq!(
+        goal.locals.find_by_user_name(&name("x")).unwrap().type_,
+        nat()
+    );
 }
 
 #[test]
@@ -143,7 +146,9 @@ fn unavailable_term_info_is_not_fabricated_after_an_elaboration_failure() {
     ] {
         let environment = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
         let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
-        let offset = source.rfind('_').unwrap_or_else(|| source.find("notDefined").unwrap());
+        let offset = source
+            .rfind('_')
+            .unwrap_or_else(|| source.find("notDefined").unwrap());
         assert!(
             inspect::declaration(
                 parsed.syntax(),

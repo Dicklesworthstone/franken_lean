@@ -38,15 +38,14 @@ fn event_count(blocks: &[ExtensionBlock]) -> Result<u64, String> {
     Ok(count)
 }
 
-fn inspect(
-    public: &[u8],
-    companions: Option<(&[u8], &[u8])>,
-) -> Result<Population, String> {
+fn inspect(public: &[u8], companions: Option<(&[u8], &[u8])>) -> Result<Population, String> {
     let budget = WalkBudget::default();
     check_pinned_header(public).map_err(|error| error.to_string())?;
     let view = OleanView::parse(public).map_err(|error| error.to_string())?;
     view.walk(budget).map_err(|error| error.to_string())?;
-    let module = view.module_data(budget).map_err(|error| error.to_string())?;
+    let module = view
+        .module_data(budget)
+        .map_err(|error| error.to_string())?;
     let events = if module.is_module {
         let (server, private) =
             companions.ok_or("module-system artifact requires server and private companions")?;
@@ -55,7 +54,9 @@ fn inspect(
         }
         let private_view = OleanView::parse_with_dependencies(private, &[public, server])
             .map_err(|error| error.to_string())?;
-        private_view.walk(budget).map_err(|error| error.to_string())?;
+        private_view
+            .walk(budget)
+            .map_err(|error| error.to_string())?;
         let final_module = private_view
             .module_data(budget)
             .map_err(|error| error.to_string())?;
@@ -64,7 +65,11 @@ fn inspect(
         event_count(&module.extensions)?
     };
     Ok(Population {
-        imports: module.imports.into_iter().map(|import| import.module).collect(),
+        imports: module
+            .imports
+            .into_iter()
+            .map(|import| import.module)
+            .collect(),
         events,
     })
 }
@@ -117,7 +122,9 @@ fn run(args: &[String]) -> Result<String, String> {
         return Err("usage: simp_journal_population LIB/lean Init [Std] [Lean]".to_owned());
     };
     if roots.is_empty()
-        || roots.iter().any(|root| !matches!(root.as_str(), "Init" | "Std" | "Lean"))
+        || roots
+            .iter()
+            .any(|root| !matches!(root.as_str(), "Init" | "Std" | "Lean"))
     {
         return Err("request at least one of the pinned roots Init, Std, or Lean".to_owned());
     }
@@ -137,10 +144,10 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             let population = match modules.entry(name.clone()) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                    read_module(Path::new(lib), &name)
-                        .map_err(|error| format!("module {}: {error}", name.to_display_string()))?,
-                ),
+                std::collections::btree_map::Entry::Vacant(entry) => entry
+                    .insert(read_module(Path::new(lib), &name).map_err(|error| {
+                        format!("module {}: {error}", name.to_display_string())
+                    })?),
             };
             events = events
                 .checked_add(population.events)
@@ -148,13 +155,14 @@ fn run(args: &[String]) -> Result<String, String> {
             pending.extend(population.imports.iter().cloned());
         }
         if events == 0 {
-            return Err(format!("root {} has no simp entries", root.to_display_string()));
+            return Err(format!(
+                "root {} has no simp entries",
+                root.to_display_string()
+            ));
         }
         closures.push((root, seen.len(), events));
     }
-    let mut output = format!(
-        "schema fln-simp-journal-population/1\npin {PIN_TAG} {PIN_COMMIT}\n"
-    );
+    let mut output = format!("schema fln-simp-journal-population/1\npin {PIN_TAG} {PIN_COMMIT}\n");
     for (name, population) in &modules {
         output.push_str(&format!(
             "module\t{}\t{}\n",

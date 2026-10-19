@@ -6341,7 +6341,10 @@ mod nat_definition_tests {
             let mut pending = vec![expanded.syntax()];
             while let Some(node) = pending.pop() {
                 assert_ne!(node.kind(), Some(&parser_kind(&["Term", "dbgTrace"])));
-                assert_ne!(node.kind(), Some(&Name::from_components(["interpolatedStrKind"])));
+                assert_ne!(
+                    node.kind(),
+                    Some(&Name::from_components(["interpolatedStrKind"]))
+                );
                 if let Syntax::Node { args, .. } = node {
                     pending.extend(args);
                 }
@@ -6365,7 +6368,10 @@ mod nat_definition_tests {
 
     #[test]
     fn debug_trace_sequences_expand_on_heap_frames() {
-        let source = format!("def traced : Nat := {}42", "dbg_trace \"step\"; ".repeat(256));
+        let source = format!(
+            "def traced : Nat := {}42",
+            "dbg_trace \"step\"; ".repeat(256)
+        );
         let expanded = parse_definition(source.as_bytes())
             .unwrap()
             .expanded()

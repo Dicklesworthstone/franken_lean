@@ -1177,7 +1177,10 @@ mod tests {
         use fln::EvaluationPresentation::{Lean, PreferRaw};
         assert_eq!(evaluation_presentation(Presentation::Lean), Lean);
         for json in [false, true] {
-            assert_eq!(evaluation_presentation(Presentation::Fln { json }), PreferRaw);
+            assert_eq!(
+                evaluation_presentation(Presentation::Fln { json }),
+                PreferRaw
+            );
         }
     }
 

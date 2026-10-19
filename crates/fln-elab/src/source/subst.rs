@@ -137,9 +137,8 @@ impl Context {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
                 };
-                let operand = self.substitution_operand(
-                    operand, &operand_expected, &oriented, &proof,
-                )?;
+                let operand =
+                    self.substitution_operand(operand, &operand_expected, &oriented, &proof)?;
                 (abstracted, operand)
             }
             None => {
@@ -159,7 +158,15 @@ impl Context {
             }
         };
         self.substitution_transport(
-            &Equality { level, alpha, lhs, rhs }, abstracted, operand, proof,
+            &Equality {
+                level,
+                alpha,
+                lhs,
+                rhs,
+            },
+            abstracted,
+            operand,
+            proof,
         )
     }
 
@@ -172,7 +179,12 @@ impl Context {
         operand: Typed,
         proof: Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let Equality { level, alpha, lhs, rhs } = equality;
+        let Equality {
+            level,
+            alpha,
+            lhs,
+            rhs,
+        } = equality;
         // The motive `fun x (h : lhs = x) => abstracted[x]`, and its universe.
         let result_type = self.substitute(&abstracted, rhs)?;
         let sort = self
@@ -201,9 +213,16 @@ impl Context {
             Name::from_components(["Eq", "rec"]),
             vec![motive_level, level.clone()],
         );
-        let value = [alpha.clone(), lhs.clone(), motive, operand.value, rhs.clone(), proof]
-            .into_iter()
-            .fold(rec, Expr::app);
+        let value = [
+            alpha.clone(),
+            lhs.clone(),
+            motive,
+            operand.value,
+            rhs.clone(),
+            proof,
+        ]
+        .into_iter()
+        .fold(rec, Expr::app);
         Ok(Typed {
             value,
             type_: result_type,

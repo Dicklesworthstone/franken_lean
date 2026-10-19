@@ -719,12 +719,13 @@ mod outcome_tests {
             else {
                 panic!("definition was rejected");
             };
-            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
-                checked.publish(
-                    DeclarationBudget::default(),
-                    CollisionBudget::default(),
-                    None,
-                )
+            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
             else {
                 panic!("definition publication did not complete");
             };

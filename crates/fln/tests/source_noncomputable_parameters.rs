@@ -89,7 +89,11 @@ def matched : Nat :=
 #eval matched
 "#,
     );
-    assert!(!engine.environment().contains(&Name::from_components(["matched"])));
+    assert!(
+        !engine
+            .environment()
+            .contains(&Name::from_components(["matched"]))
+    );
 }
 
 #[test]

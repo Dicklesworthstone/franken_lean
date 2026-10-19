@@ -5,7 +5,10 @@ use super::*;
 const RANGE: &str = r#"{"start":{"line":1,"character":2},"end":{"line":1,"character":3}}"#;
 
 fn result(goal: &str, range: &str) -> String {
-    format!("{{\"goal\":{},\"range\":{range}}}", crate::json_string(goal))
+    format!(
+        "{{\"goal\":{},\"range\":{range}}}",
+        crate::json_string(goal)
+    )
 }
 
 fn frames(messages: &[&str]) -> Vec<u8> {
@@ -48,7 +51,9 @@ fn accepts_bounded_term_goal_payloads_without_confusing_them_with_tactic_goals()
     let value = result("α : Type\nx : α\n⊢ α", RANGE);
     assert!(crate::json::plain_term_goal_result(&value));
     assert!(!crate::json::plain_goal_result(&value));
-    assert!(!crate::json::plain_term_goal_result(r#"{"rendered":"no goals","goals":[]}"#));
+    assert!(!crate::json::plain_term_goal_result(
+        r#"{"rendered":"no goals","goals":[]}"#
+    ));
     assert!(crate::json::plain_term_goal_result(&result(
         "⊢ \"quoted\" \\ 😀",
         r#"{"start":{"line":1,"character":99},"end":{"line":2,"character":0}}"#,
@@ -77,23 +82,44 @@ fn rejects_missing_duplicated_mistyped_and_inverted_term_goal_fields() {
         good.replace("\"character\":2", "\"character\":3"),
         result("A", r#"{"start":{"line":0,"character":0}}"#),
         result("A", r#"{"start":null,"end":{"line":1,"character":0}}"#),
-        result("A", r#"{"start":{"line":1,"character":0},"end":{"line":0,"character":99}}"#),
+        result(
+            "A",
+            r#"{"start":{"line":1,"character":0},"end":{"line":0,"character":99}}"#,
+        ),
     ];
     for value in invalid {
-        assert!(!crate::json::plain_term_goal_result(&value), "accepted {value}");
+        assert!(
+            !crate::json::plain_term_goal_result(&value),
+            "accepted {value}"
+        );
     }
 }
 
 #[test]
 fn decoded_text_and_total_wire_have_independent_ceilings() {
-    assert!(crate::json::plain_term_goal_result(&result(&"a".repeat(64 * 1024), RANGE)));
-    assert!(!crate::json::plain_term_goal_result(&result(&"a".repeat(64 * 1024 + 1), RANGE)));
+    assert!(crate::json::plain_term_goal_result(&result(
+        &"a".repeat(64 * 1024),
+        RANGE
+    )));
+    assert!(!crate::json::plain_term_goal_result(&result(
+        &"a".repeat(64 * 1024 + 1),
+        RANGE
+    )));
     // Escaped ASCII occupies six wire bytes but one decoded byte. Unicode
     // occupies its UTF-8 byte count, not merely its scalar count.
-    let escaped = format!("{{\"goal\":\"{}\",\"range\":{RANGE}}}", "\\u0061".repeat(64 * 1024));
+    let escaped = format!(
+        "{{\"goal\":\"{}\",\"range\":{RANGE}}}",
+        "\\u0061".repeat(64 * 1024)
+    );
     assert!(crate::json::plain_term_goal_result(&escaped));
-    assert!(!crate::json::plain_term_goal_result(&result(&"😀".repeat(16 * 1024 + 1), RANGE)));
-    let oversized = format!("{{\"goal\":\"A\",\"range\":{RANGE},\"extra\":\"{}\"}}", "x".repeat(1024 * 1024));
+    assert!(!crate::json::plain_term_goal_result(&result(
+        &"😀".repeat(16 * 1024 + 1),
+        RANGE
+    )));
+    let oversized = format!(
+        "{{\"goal\":\"A\",\"range\":{RANGE},\"extra\":\"{}\"}}",
+        "x".repeat(1024 * 1024)
+    );
     assert!(!crate::json::plain_term_goal_result(&oversized));
 }
 
@@ -107,7 +133,10 @@ fn correlates_real_term_goal_shapes_and_retains_null_as_no_information() {
     assert_eq!(stats.semantic_query_results, 1);
     assert_eq!(stats.no_information_query_results, 0);
     assert_eq!(stats.semantic_query_errors, 0);
-    assert!(render_correlation(stats).contains("\"methodResponseSchema\":\"fln.lsp-method-response/4\""));
+    assert!(
+        render_correlation(stats)
+            .contains("\"methodResponseSchema\":\"fln.lsp-method-response/4\"")
+    );
 
     let (client, server) = pair(&reply("null"), false);
     let stats = correlate_transcripts(&client, &server).unwrap();
@@ -118,7 +147,9 @@ fn correlates_real_term_goal_shapes_and_retains_null_as_no_information() {
 #[test]
 fn preserves_semantic_errors_and_cancelled_target_accounting() {
     for code in [-32602, -32803, -32800] {
-        let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"error\":{{\"code\":{code},\"message\":\"query did not complete\"}}}}");
+        let response = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"error\":{{\"code\":{code},\"message\":\"query did not complete\"}}}}"
+        );
         let (client, server) = pair(&response, true);
         let stats = correlate_transcripts(&client, &server).unwrap();
         assert_eq!(stats.semantic_query_errors, 1);
@@ -126,8 +157,14 @@ fn preserves_semantic_errors_and_cancelled_target_accounting() {
         assert_eq!(stats.no_information_query_results, 0);
         assert_eq!(stats.server.error_responses, 1);
         assert_eq!(stats.client.other_request_cancellation_targets, 1);
-        assert_eq!(stats.cancelled_target_request_cancelled_responses, u64::from(code == -32800));
-        assert_eq!(stats.cancelled_target_other_error_responses, u64::from(code != -32800));
+        assert_eq!(
+            stats.cancelled_target_request_cancelled_responses,
+            u64::from(code == -32800)
+        );
+        assert_eq!(
+            stats.cancelled_target_other_error_responses,
+            u64::from(code != -32800)
+        );
     }
     let response = reply(&result("⊢ A", RANGE));
     let (client, server) = pair(&response, true);
@@ -144,12 +181,18 @@ fn refuses_other_response_shapes_errors_and_normalized_numeric_ids() {
         assert!(error.contains("plain-term-goal method contract"), "{error}");
     }
     for code in [-32601, -32603, 0] {
-        let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"error\":{{\"code\":{code},\"message\":\"wrong error\"}}}}");
+        let response = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"error\":{{\"code\":{code},\"message\":\"wrong error\"}}}}"
+        );
         let (client, server) = pair(&response, false);
         let error = correlate_transcripts(&client, &server).unwrap_err();
         assert!(error.contains("plain-term-goal method contract"), "{error}");
     }
     let response = reply(&result("⊢ A", RANGE)).replace("1.25e2", "125");
     let (client, server) = pair(&response, false);
-    assert!(correlate_transcripts(&client, &server).unwrap_err().contains("unknown canonical request ID 125"));
+    assert!(
+        correlate_transcripts(&client, &server)
+            .unwrap_err()
+            .contains("unknown canonical request ID 125")
+    );
 }

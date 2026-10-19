@@ -539,10 +539,16 @@ impl Prefix {
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
         let p = match self {
             Self::DebugTrace(p) => {
-                let argument = p.argument.ok_or(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: leaves.leaf(p.keyword)?.info().pos(false).unwrap_or(BytePos(0)),
-                    expected: NatDefinitionExpectation::ScalarValue,
-                })?;
+                let argument = p
+                    .argument
+                    .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: leaves
+                            .leaf(p.keyword)?
+                            .info()
+                            .pos(false)
+                            .unwrap_or(BytePos(0)),
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    })?;
                 let syntax = Syntax::node(
                     parser_kind(&["Term", "dbgTrace"]),
                     vec![

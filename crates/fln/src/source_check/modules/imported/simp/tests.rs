@@ -457,7 +457,10 @@ fn pinned_init_restores_the_reported_list_and_nat_default_simp_goals() {
             .expect("Init must retain its native default-simp journal");
         // This is the historical failing population boundary, not a new
         // capacity setting. Exercise it with the pin's real admitted rules.
-        assert!(journal.len() > 4096, "Init must exercise the old row ceiling");
+        assert!(
+            journal.len() > 4096,
+            "Init must exercise the old row ceiling"
+        );
         eprintln!(
             "Init native simp journal: {} events, {} retained payload bytes",
             journal.len(),

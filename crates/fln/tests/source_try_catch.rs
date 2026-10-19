@@ -237,7 +237,6 @@ fn rejected_handler_scopes_do_not_hide_invalid_or_unsupported_code() {
     }
 }
 
-
 #[test]
 fn quoted_exception_handlers_bind_locally_without_capturing_inputs() {
     execute(

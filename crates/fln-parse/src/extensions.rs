@@ -2353,10 +2353,7 @@ impl Expander {
             )
         };
         let message = if argument.kind() == Some(&Name::from_components(["interpolatedStrKind"])) {
-            self.expand_interpolation(&[
-                Syntax::atom(SourceInfo::None, "s!"),
-                argument,
-            ])?
+            self.expand_interpolation(&[Syntax::atom(SourceInfo::None, "s!"), argument])?
         } else {
             app(global(&["ToString", "toString"]), vec![argument])
         };
@@ -3347,7 +3344,9 @@ fn interpolate_at(
     depth: usize,
 ) -> Result<LexRun, BytePos> {
     let grammar = active();
-    if grammar.as_ref().is_none_or(|grammar| grammar.interpolated.is_empty())
+    if grammar
+        .as_ref()
+        .is_none_or(|grammar| grammar.interpolated.is_empty())
         && !run.events.iter().any(|event| {
             matches!(event, Event::Token(LexedToken { kind: TokenKind::Symbol(symbol), .. })
                 if symbol == "dbg_trace")
@@ -3412,12 +3411,12 @@ pub(crate) fn interpolated_term(
     }
     crate::NESTED_TERMS.with(|open| open.set(open.get() + 1));
     let _entered = crate::NestedTerm;
-    let (mut items, next) = Run { leaves, view, tokens }.interpolated(
-        &Descr::Cat(Name::from_components(["term"]), 0),
-        at,
-        end,
-        0,
-    )?;
+    let (mut items, next) = Run {
+        leaves,
+        view,
+        tokens,
+    }
+    .interpolated(&Descr::Cat(Name::from_components(["term"]), 0), at, end, 0)?;
     if items.len() != 1 {
         return None;
     }

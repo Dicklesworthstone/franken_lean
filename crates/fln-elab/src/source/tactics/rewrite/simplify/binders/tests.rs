@@ -163,7 +163,7 @@ fn quantified_rewrites_and_leaf_closure_restore_every_interrupted_context() {
         for allowance in 0..used {
             let mut limited = original.clone();
             limited.txn.budget.max_heartbeats = start + allowance;
-            let problem = run(&mut limited).err().expect("not completed evidence");
+            let problem = run(&mut limited).expect_err("not completed evidence");
             assert!(
                 !backtrack::recoverable(&problem),
                 "{allowance}: {problem:?}"

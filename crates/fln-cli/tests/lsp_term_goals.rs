@@ -65,8 +65,7 @@ fn run(fln: bool, messages: Vec<String>) -> Vec<String> {
         .expect("start native server");
     let mut input = child.stdin.take().unwrap();
     let initialize = [
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#
-            .to_owned(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#.to_owned(),
         r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_owned(),
     ];
     let shutdown = [
@@ -89,7 +88,11 @@ fn run(fln: bool, messages: Vec<String>) -> Vec<String> {
 fn reply(messages: &[String], id: u32) -> &str {
     let needle = format!("\"id\":{id},");
     let replies: Vec<_> = messages.iter().filter(|m| m.contains(&needle)).collect();
-    assert_eq!(replies.len(), 1, "one response for request {id}: {messages:?}");
+    assert_eq!(
+        replies.len(),
+        1,
+        "one response for request {id}: {messages:?}"
+    );
     replies[0]
 }
 
@@ -113,15 +116,18 @@ fn term_goals_follow_unsaved_changes_and_disappear_when_the_document_closes() {
             "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{{\"textDocument\":{{\"uri\":{}}}}}}}",
             quoted(URI),
         );
-        let messages = run(fln, vec![
-            open(first),
-            request(2, 1, hole_column(first)),
-            change,
-            request(3, 1, hole_column(second)),
-            request(4, 1, u32::MAX),
-            close,
-            request(5, 1, hole_column(second)),
-        ]);
+        let messages = run(
+            fln,
+            vec![
+                open(first),
+                request(2, 1, hole_column(first)),
+                change,
+                request(3, 1, hole_column(second)),
+                request(4, 1, u32::MAX),
+                close,
+                request(5, 1, hole_column(second)),
+            ],
+        );
         let before = reply(&messages, 2);
         assert!(before.contains("\"goal\":"), "{before}");
         assert!(before.contains("x : A"), "{before}");
@@ -140,11 +146,17 @@ fn term_goal_range_survives_source_normalization_and_utf16_query_decoding() {
     for fln in [false, true] {
         let source = "-- 😀\r\nprelude\r\ndef pending (A : Type) (x : A) : A := _\r\n";
         let column = hole_column(source);
-        let messages = run(fln, vec![open(source), request(2, 2, column), request(3, 0, 4)]);
+        let messages = run(
+            fln,
+            vec![open(source), request(2, 2, column), request(3, 0, 4)],
+        );
         let goal = reply(&messages, 2);
         assert!(goal.contains("⊢ A"), "{goal}");
         assert!(goal.contains(&format!("\"start\":{{\"line\":2,\"character\":{column}}}")));
-        assert!(goal.contains(&format!("\"end\":{{\"line\":2,\"character\":{}}}", column + 1)));
+        assert!(goal.contains(&format!(
+            "\"end\":{{\"line\":2,\"character\":{}}}",
+            column + 1
+        )));
         // Position 4 splits the emoji after the three ASCII prefix characters.
         assert!(reply(&messages, 3).contains("\"code\":-32602"));
     }
@@ -155,7 +167,8 @@ fn inferred_term_goal_uses_the_same_dependent_context_as_elaboration() {
     for fln in [false, true] {
         let source = "prelude\ndef inferred (A : Type) (x : A) := x";
         let line = source.lines().last().unwrap();
-        let column = u32::try_from(line[..line.rfind('x').unwrap()].encode_utf16().count()).unwrap();
+        let column =
+            u32::try_from(line[..line.rfind('x').unwrap()].encode_utf16().count()).unwrap();
         let messages = run(fln, vec![open(source), request(2, 1, column)]);
         let goal = reply(&messages, 2);
         assert!(goal.contains("\"goal\":"), "{goal}");
@@ -168,7 +181,8 @@ fn inferred_term_goal_uses_the_same_dependent_context_as_elaboration() {
 fn invalid_source_does_not_fabricate_a_term_goal() {
     for fln in [false, true] {
         let source = "prelude\ndef pending (A : Type) : A := missing";
-        let column = u32::try_from(source.lines().last().unwrap().find("missing").unwrap()).unwrap();
+        let column =
+            u32::try_from(source.lines().last().unwrap().find("missing").unwrap()).unwrap();
         let messages = run(fln, vec![open(source), request(2, 1, column)]);
         let result = reply(&messages, 2);
         assert!(result.contains("\"code\":-32803"), "{result}");

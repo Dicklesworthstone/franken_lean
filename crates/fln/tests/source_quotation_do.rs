@@ -740,7 +740,6 @@ theorem imported_value : result = 43 := rfl
     assert_eq!(base.logical_root(&options), before);
 }
 
-
 #[test]
 fn quoted_loop_mutable_and_monadic_reassignment_preserve_hygienic_state() {
     let base = loop_engine();
@@ -774,7 +773,10 @@ def rejectedValue : Id Nat := do
   let n <- stealMutable
   return n
 "#;
-    assert!(base.check_source_files(&[source], &options, limits()).is_err());
+    assert!(
+        base.check_source_files(&[source], &options, limits())
+            .is_err()
+    );
     assert_eq!(base.logical_root(&options), before);
     loop_values(
         &base,

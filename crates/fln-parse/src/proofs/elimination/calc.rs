@@ -175,7 +175,7 @@ mod tests {
     }
 
     fn tokens(view: &SourceView) -> Vec<LexedToken> {
-        let run = lex_source(view.normalized());
+        let run = lex_source(view).expect("the calc fixture lexes");
         assert!(run.diagnostics().is_empty());
         run.events
             .into_iter()

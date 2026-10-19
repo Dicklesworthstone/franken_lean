@@ -12,10 +12,10 @@ use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[path = "imported/implemented_by.rs"]
 mod implemented_by;
-#[path = "imported/structures.rs"]
-mod structures;
 #[path = "imported/simp.rs"]
 mod simp;
+#[path = "imported/structures.rs"]
+mod structures;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {

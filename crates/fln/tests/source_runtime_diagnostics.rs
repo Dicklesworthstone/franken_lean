@@ -422,7 +422,10 @@ fn changed_trace_contracts_refuse_without_reporting_or_publication() {
 
 #[test]
 fn trace_without_an_extern_keeps_its_ordinary_checked_definition() {
-    if parent("trace_without_an_extern_keeps_its_ordinary_checked_definition", "") {
+    if parent(
+        "trace_without_an_extern_keeps_its_ordinary_checked_definition",
+        "",
+    ) {
         return;
     }
     let result = run(
@@ -456,7 +459,10 @@ fn tracing_and_panicking_share_the_checked_diagnostic_transport() {
 
 #[test]
 fn source_debug_trace_accepts_the_checked_punit_unit_aliases() {
-    if parent("source_debug_trace_accepts_the_checked_punit_unit_aliases", "alias\n") {
+    if parent(
+        "source_debug_trace_accepts_the_checked_punit_unit_aliases",
+        "alias\n",
+    ) {
         return;
     }
     let source = TRACE_SOURCE.replace(

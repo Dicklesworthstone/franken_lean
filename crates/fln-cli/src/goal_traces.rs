@@ -153,9 +153,8 @@ mod tests {
 
     #[test]
     fn trace_only_guards_leave_evaluation_messages_on_info() {
-        let result = render(
-            "#guard_msgs (trace) in\n#eval 7\n/-- info: 8 -/\n#guard_msgs in\n#eval 8",
-        );
+        let result =
+            render("#guard_msgs (trace) in\n#eval 7\n/-- info: 8 -/\n#guard_msgs in\n#eval 8");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         assert_eq!(result.stdout, "7\n");
     }
@@ -180,16 +179,27 @@ mod tests {
         let trace = &commands.traces[0];
         let guard = &commands.guards[0];
         let mut guards = guard_messages::Guards::new();
-        guards.insert(guard.command_index, guard_messages::Buffer::new(&guard.spec));
+        guards.insert(
+            guard.command_index,
+            guard_messages::Buffer::new(&guard.spec),
+        );
         let mut stdout = String::new();
         let mut budget = source_evaluation::FormattedOutputBudget::new(1);
         let failure = Message::Trace(trace)
-            .emit(WarningSink::Unreachable, &mut guards, &mut stdout, &mut budget)
+            .emit(
+                WarningSink::Unreachable,
+                &mut guards,
+                &mut stdout,
+                &mut budget,
+            )
             .unwrap_err();
         assert_eq!(failure.exit_code, 3);
         assert!(failure.stdout.is_empty() && stdout.is_empty());
         let buffer = &guards[&trace.command_index];
         assert!(buffer.checked.is_empty());
-        assert!(!buffer.from_check, "discarded goals cannot taint checked messages");
+        assert!(
+            !buffer.from_check,
+            "discarded goals cannot taint checked messages"
+        );
     }
 }

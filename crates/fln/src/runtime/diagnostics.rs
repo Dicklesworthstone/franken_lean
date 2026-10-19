@@ -96,7 +96,8 @@ impl Preparation<'_> {
             &mut self.externs,
             &mut self.visited,
             self.limits,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         if self.environment.contains(&name(TRACE)) {

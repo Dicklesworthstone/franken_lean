@@ -180,7 +180,6 @@ fn type_index_erasure_does_not_discard_or_duplicate_actual_value_indices() {
     assert!(direct > idle + 80, "ordinary index computation was dropped");
 }
 
-
 const SELECTED: &str = r#"inductive Selected : Type -> Type 1 where
   | pack (A : Type) (value : A) : Selected A
   | nat (value : Nat) : Selected Nat
@@ -250,9 +249,7 @@ fn type_index_selected_payloads_execute_once_and_retry_after_resource_stops() {
     let prefix = format!(
         "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n"
     );
-    let selected = |n| {
-        format!("{prefix}#eval extract Nat (Selected.pack Nat (work {n} + 42))")
-    };
+    let selected = |n| format!("{prefix}#eval extract Nat (Selected.pack Nat (work {n} + 42))");
     let direct = |n| format!("{prefix}#eval work {n} + 42");
     assert_eq!(
         run(&selected(80), "42") - run(&selected(0), "42"),

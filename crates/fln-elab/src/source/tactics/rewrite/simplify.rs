@@ -302,8 +302,7 @@ impl Context {
             return Ok(true);
         }
         let type_ = info.constant_val().type_.clone();
-        let Some(head @ RigidTypeHead::Inductive(_)) = self.rigid_rewrite_type_head(&type_)?
-        else {
+        let Some(head @ RigidTypeHead::Inductive(_)) = self.rigid_rewrite_type_head(&type_)? else {
             return Ok(true);
         };
         if matches!(&head, RigidTypeHead::Inductive(name)

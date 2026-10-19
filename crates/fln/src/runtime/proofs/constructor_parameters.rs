@@ -53,10 +53,7 @@ fn checked_data_parameter_prefix_survives_saturated_and_partial_applications() {
     let engine = engine();
     let root = engine.logical_root(&KVMap::new());
     let secret = constant("hiddenParameter");
-    for (constructor, parameters) in [
-        ("ErasureCarrier.mk", 1),
-        ("TwoErasureParameters.mk", 2),
-    ] {
+    for (constructor, parameters) in [("ErasureCarrier.mk", 1), ("TwoErasureParameters.mk", 2)] {
         let Some(ConstantInfo::Ctor(info)) = engine.environment.find(&name(constructor)) else {
             panic!("source did not admit the constructor");
         };
@@ -65,15 +62,17 @@ fn checked_data_parameter_prefix_survives_saturated_and_partial_applications() {
         // telescope, not only at a fully saturated constructor expression.
         for supplied in 1..=parameters as usize {
             let partial = call(constructor, vec![secret.clone(); supplied]);
-            let mut preparation =
-                Preparation::new(&engine.environment, IngressLimits::default());
+            let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
             assert_eq!(preparation.erase_proofs(&partial, None).unwrap(), partial);
         }
         let mut arguments = vec![secret.clone(); parameters as usize];
         arguments.push(nat::literal(42));
         let saturated = call(constructor, arguments);
         let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
-        assert_eq!(preparation.erase_proofs(&saturated, None).unwrap(), saturated);
+        assert_eq!(
+            preparation.erase_proofs(&saturated, None).unwrap(),
+            saturated
+        );
     }
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
@@ -153,8 +152,7 @@ fn static_parameters_do_not_exempt_the_constructor_head_or_corrupt_metadata() {
     // Deliberately altered metadata is an analysis-only negative control; it
     // supplies no checked declaration and is never submitted for execution.
     let unavailable =
-        fln_elab::noncomputable::register(&engine.environment, &name("ErasureCarrier.mk"))
-            .unwrap();
+        fln_elab::noncomputable::register(&engine.environment, &name("ErasureCarrier.mk")).unwrap();
     noncomputable_refusal(&unavailable, &input);
     let corrupt = engine
         .environment

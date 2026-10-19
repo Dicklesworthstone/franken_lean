@@ -152,7 +152,12 @@ fn constructor_erasure_does_not_exempt_the_constructor_itself() {
 #[test]
 fn a_definition_with_a_constructor_shaped_type_has_no_erased_parameter_prefix() {
     let env = environment();
-    let type_ = env.find(&n("ParamBox.mk")).unwrap().constant_val().type_.clone();
+    let type_ = env
+        .find(&n("ParamBox.mk"))
+        .unwrap()
+        .constant_val()
+        .type_
+        .clone();
     let env = env
         .add_decl(ConstantInfo::Defn(DefinitionVal {
             base: ConstantVal {
@@ -183,6 +188,10 @@ fn erased_parameters_do_not_hide_malformed_dependency_metadata() {
         type_: box_type(c("hidden")),
         value: construct(c("hidden"), number(9)),
     };
-    assert!(matches!(check(&env, &term),
-        Err(NatDefinitionElabError::Inference(SourceInferenceError::NoncomputableJournal(_)))));
+    assert!(matches!(
+        check(&env, &term),
+        Err(NatDefinitionElabError::Inference(
+            SourceInferenceError::NoncomputableJournal(_)
+        ))
+    ));
 }

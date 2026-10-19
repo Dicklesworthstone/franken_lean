@@ -121,21 +121,28 @@ impl Context {
             rhs: equality.lhs.clone(),
         };
         let reverse_proof = self.symm(
-            &equality.level, &equality.alpha, &equality.lhs, &equality.rhs, proof.clone(),
+            &equality.level,
+            &equality.alpha,
+            &equality.lhs,
+            &equality.rhs,
+            proof.clone(),
         )?;
-        self.substitution_transport(&reverse, abstracted, operand, reverse_proof).map(Some)
+        self.substitution_transport(&reverse, abstracted, operand, reverse_proof)
+            .map(Some)
     }
 }
 
 /// An inconclusive or deferred equation is not evidence of a type mismatch.
 fn definite_mismatch(error: &NatDefinitionElabError) -> bool {
-    matches!(error, NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. }))
-        || matches!(error,
-            NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict))
-                if matches!(verdict.as_ref(), Verdict::Rejected {
-                    class: fln_kernel::verdict::RejectClass::NotDefEq, ..
-                })
-        )
+    matches!(
+        error,
+        NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. })
+    ) || matches!(error,
+        NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict))
+            if matches!(verdict.as_ref(), Verdict::Rejected {
+                class: fln_kernel::verdict::RejectClass::NotDefEq, ..
+            })
+    )
 }
 
 /// A speculative unifier can stop on a closed equation inside a tactic
@@ -151,7 +158,8 @@ fn attempt_deferral(error: &NatDefinitionElabError) -> bool {
 }
 
 fn observation_complete(error: &NatDefinitionElabError) -> bool {
-    matches!(error,
+    matches!(
+        error,
         NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)
     )
 }

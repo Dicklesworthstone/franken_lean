@@ -151,7 +151,6 @@ pub(crate) fn panic_matches(
     Ok(true)
 }
 
-
 /// A trace is effectful only for the exact checked logical continuation and
 /// selected native extern. Unit's concrete runtime shape is checked at ingress.
 pub(crate) fn trace_matches(

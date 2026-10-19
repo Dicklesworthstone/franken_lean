@@ -197,7 +197,6 @@ def run : State Nat := do
 #[path = "source_for_membership/unless_tests.rs"]
 mod unless_tests;
 
-
 #[test]
 fn quoted_membership_proofs_keep_hygienic_identities_through_checked_execution() {
     let base = engine();

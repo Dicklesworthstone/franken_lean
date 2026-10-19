@@ -24,11 +24,7 @@ pub(super) trait CheckSource {
     }
     /// Presentations from the last actual check, never a second elaboration
     /// initiated by cursor movement. Missing authority must remain an error.
-    fn diagnostics(
-        &self,
-        _: &str,
-        _: i64,
-    ) -> Result<&json::rpc::diagnostics::Batch, &'static str> {
+    fn diagnostics(&self, _: &str, _: i64) -> Result<&json::rpc::diagnostics::Batch, &'static str> {
         Err("current native diagnostics are unavailable")
     }
 

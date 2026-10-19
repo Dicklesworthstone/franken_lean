@@ -2,6 +2,7 @@
 //! Lean v4.32.0's Parser/Term.lean matchAlt applies checkColGe before
 //! every RHS parser. These tests exercise the real native parser, not a
 //! standalone indentation predicate; accepted inputs must round-trip intact.
+#![forbid(unsafe_code)]
 use fln_parse::parse_definition;
 
 fn accepts(source: &str) {
@@ -79,8 +80,12 @@ fn next_line_arrow_cannot_reset_the_pipe_baseline() {
 #[test]
 fn brackets_and_proof_bodies_do_not_bypass_the_boundary() {
     for rhs in ["(7)", "{ value := 7 }", "by exact 7"] {
-        accepts(&format!("def f (n : Nat) := match n with\n    | _ =>\n    {rhs}\n"));
-        refuses(&format!("def f (n : Nat) := match n with\n    | _ =>\n   {rhs}\n"));
+        accepts(&format!(
+            "def f (n : Nat) := match n with\n    | _ =>\n    {rhs}\n"
+        ));
+        refuses(&format!(
+            "def f (n : Nat) := match n with\n    | _ =>\n   {rhs}\n"
+        ));
     }
 }
 
@@ -99,7 +104,10 @@ fn unicode_before_an_inline_pipe_uses_character_not_byte_columns() {
     ] {
         let byte_offset = header.find('|').unwrap();
         let column = header[..byte_offset].chars().count();
-        assert!(byte_offset > column, "control must distinguish byte columns");
+        assert!(
+            byte_offset > column,
+            "control must distinguish byte columns"
+        );
         accepts(&format!("{header}\n{}n\n", " ".repeat(column)));
         refuses(&format!("{header}\n{}n\n", " ".repeat(column - 1)));
     }
@@ -107,6 +115,10 @@ fn unicode_before_an_inline_pipe_uses_character_not_byte_columns() {
 
 #[test]
 fn nested_match_uses_its_own_pipe_not_the_outer_pipe() {
-    accepts("def f (b : Bool) := match b with\n  | true => match b with\n    | _ =>\n    7\n  | false => 0\n");
-    refuses("def f (b : Bool) := match b with\n  | true => match b with\n    | _ =>\n   7\n  | false => 0\n");
+    accepts(
+        "def f (b : Bool) := match b with\n  | true => match b with\n    | _ =>\n    7\n  | false => 0\n",
+    );
+    refuses(
+        "def f (b : Bool) := match b with\n  | true => match b with\n    | _ =>\n   7\n  | false => 0\n",
+    );
 }
