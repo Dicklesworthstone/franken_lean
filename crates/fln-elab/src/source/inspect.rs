@@ -222,7 +222,17 @@ fn select(
                     range: r,
                     kind: None,
                 }),
-                Syntax::Node { kind, .. } if kind.parent() == parser_kind(&["Term"]) => {
+                // Literals are `numLitKind`, `scientificLitKind`, `strLitKind`, `charLitKind`
+                // and `nameLitKind` nodes, not `Term.*` ones, yet the pin's literal elaborators
+                // record term info for them, so plainTermGoal answers at a literal too.
+                Syntax::Node { kind, .. }
+                    if kind.parent() == parser_kind(&["Term"])
+                        || (kind.parent() == Name::anonymous()
+                            && matches!(
+                                kind.to_display_string().as_str(),
+                                "num" | "scientific" | "str" | "char" | "name"
+                            )) =>
+                {
                     sites.push(Site::TermGoal {
                         range: r,
                         kind: Some(kind.clone()),
