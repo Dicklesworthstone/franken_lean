@@ -1,16 +1,17 @@
-//! Execute general well-founded fixpoints through the admitted equality from
-//! `Init.WFComputable`. The source term and both checking seats keep `fix`;
-//! only compiler preparation selects `fixC`, whose checked recursive companion
-//! follows the ordinary executable-body path. No accessibility proof is run.
+//! Execute the five constant-replacement equations in `Init.WFComputable`.
+//! Both checking seats retain the logical expressions; compiler preparation
+//! selects the equal computable definitions and their ordinary companions.
+//! Accessibility proofs are never evaluated by this bridge.
 //!
-//! This is the native bridge for this one library equation, not a general
-//! implementation of the imported `csimp` registry. The equation itself must
-//! be present, with both constant endpoints and their complete universe/type
-//! interfaces checked. A declaration with the theorem's spelling is not enough.
+//! This is not a general imported `csimp` registry. Each named equation must
+//! actually be an admitted equality with the exact constant endpoints and
+//! complete universe/type interfaces. Names alone authorize no replacement.
 use super::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod family_tests;
 
 fn source_name() -> Name {
     name("WellFounded.fix")
@@ -24,28 +25,73 @@ fn equation_name() -> Name {
     name("WellFounded.fix_eq_fixC")
 }
 
+fn equation_for(requested: &Name) -> Option<(Name, Name)> {
+    if requested == &source_name() {
+        return Some((target_name(), equation_name()));
+    }
+    for (source, target, equation) in [
+        ("Acc.rec", "Acc.recC", "Acc.rec_eq_recC"),
+        ("Acc.ndrec", "Acc.ndrecC", "Acc.ndrec_eq_ndrecC"),
+        ("Acc.ndrecOn", "Acc.ndrecOnC", "Acc.ndrecOn_eq_ndrecOnC"),
+        ("WellFounded.fixF", "WellFounded.fixFC", "WellFounded.fixF_eq_fixFC"),
+    ] {
+        if requested == &name(source) {
+            return Some((name(target), name(equation)));
+        }
+    }
+    None
+}
+
 impl Preparation<'_> {
-    /// Called after explicit implementation lookup. A present companion keeps
-    /// its ordinary selection path, including refusal on invalid linkage.
-    /// It never creates an environment declaration or supplies a proof.
+    /// Explicit implementations and existing companions retain their priority.
+    /// Follow mixed equation/attribute chains on a bounded heap worklist so a
+    /// cycle across two different well-founded operations cannot hide behind
+    /// individually acyclic implemented_by metadata.
     pub(super) fn well_founded_fix_target(
         &mut self,
         requested: &Name,
     ) -> Result<Option<Name>, IngressError> {
-        if requested != &source_name() {
-            return Ok(None);
+        let mut current = requested.clone();
+        let mut result = None;
+        let mut seen = HashSet::new();
+        let mut checked_fix = false;
+        while let Some((target, equation)) = equation_for(&current) {
+            self.tick()?;
+            seen.try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: seen.len().saturating_add(1),
+                })?;
+            if !seen.insert(current.clone()) {
+                return Err(unsupported("well-founded executable replacement cycle"));
+            }
+            let Some(next) = self.well_founded_equation_target(&current, &target, &equation)?
+            else {
+                break;
+            };
+            checked_fix |= current == source_name();
+            result = Some(next.clone());
+            current = next;
         }
-        // A present companion retains the pin's existing selection priority.
-        // Even a malformed companion blocks this bridge: ordinary linkage
+        // The existing cache certifies only fix_eq_fixC, never another entry.
+        // A failed mixed chain must not publish a new successful cache state.
+        self.well_founded_fix_checked |= checked_fix;
+        Ok(result)
+    }
+
+    fn well_founded_equation_target(
+        &mut self,
+        requested: &Name,
+        target: &Name,
+        equation: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        // Even a malformed companion blocks the equation: ordinary linkage
         // validation must refuse it instead of silently choosing another body.
         if self.has_recursive_companion(requested)? {
             return Ok(None);
         }
         self.tick()?;
-        let equation = equation_name();
-        let Some(info) = self.environment.find(&equation) else {
-            // The imported WF definitions alone do not make the generic
-            // fixpoint executable. Retain the ordinary unsupported outcome.
+        let Some(info) = self.environment.find(equation) else {
             return Ok(None);
         };
         if !matches!(info, ConstantInfo::Thm(_)) {
@@ -75,20 +121,14 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let target = target_name();
-        // Attribute chains and this native equation cannot form a second,
-        // otherwise invisible cycle across the two selection mechanisms.
-        let replacement = self.implementation_target(&target)?;
+        let replacement = self.implementation_target(target)?;
         if replacement.as_ref() == Some(requested) {
             return Err(unsupported("well-founded executable replacement cycle"));
         }
         if replacement.is_none() {
-            // The equality cannot erase the target's runtime authority when
-            // no companion remains to check it before body specialization.
-            // An explicit target implementation retains ordinary precedence.
             if self
                 .runtime_initializers
-                .is_some_and(|names| names.contains(&target))
+                .is_some_and(|names| names.contains(target))
             {
                 return Err(unsupported(
                     "well-founded execution target requires runtime initialization",
@@ -96,7 +136,7 @@ impl Preparation<'_> {
             }
             source_intrinsics::check_selected_extern_attribute(
                 self.environment,
-                &target,
+                target,
                 &mut self.externs,
                 &mut self.visited,
                 self.limits,
@@ -104,17 +144,17 @@ impl Preparation<'_> {
             if self
                 .externs
                 .as_ref()
-                .is_some_and(|table| table.get(&target).is_some())
+                .is_some_and(|table| table.get(target).is_some())
             {
                 return Err(unsupported(
                     "well-founded execution target extern has no supported native implementation",
                 ));
             }
         }
-        if self.well_founded_fix_checked {
-            return Ok(Some(replacement.unwrap_or(target)));
+        if requested == &source_name() && self.well_founded_fix_checked {
+            return Ok(Some(replacement.unwrap_or_else(|| target.clone())));
         }
-        let ConstantInfo::Thm(theorem) = self.environment.find(&equation).unwrap().clone() else {
+        let ConstantInfo::Thm(theorem) = self.environment.find(equation).unwrap().clone() else {
             unreachable!("immutable admitted equation");
         };
         let (head, arguments) = self.spine(&theorem.base.type_)?;
@@ -139,7 +179,7 @@ impl Preparation<'_> {
             ));
         };
         if from != requested
-            || to != &target
+            || to != target
             || levels != other
             || levels.len() != theorem.base.level_params.len()
         {
@@ -170,27 +210,31 @@ impl Preparation<'_> {
                 ));
             }
         }
-        for endpoint in [requested, &target] {
+        for endpoint in [requested, target] {
             self.tick()?;
-            let Some(ConstantInfo::Defn(definition)) = self.environment.find(endpoint).cloned()
-            else {
+            let Some(info) = self.environment.find(endpoint).cloned() else {
                 return Err(unsupported(
                     "well-founded execution requires safe definition endpoints",
                 ));
             };
-            if definition.safety != DefinitionSafety::Safe
-                || definition.base.level_params.len() != levels.len()
-            {
+            // Acc.rec is the admitted primitive recursor, not a definition.
+            // Only this logical source may use Rec; executable targets must
+            // remain safe definitions, checked again at companion selection.
+            let safe = match &info {
+                ConstantInfo::Defn(definition) => definition.safety == DefinitionSafety::Safe,
+                ConstantInfo::Rec(recursor) => {
+                    endpoint == requested && requested == &name("Acc.rec") && !recursor.is_unsafe
+                }
+                _ => false,
+            };
+            let base = info.constant_val();
+            if !safe || base.level_params.len() != levels.len() {
                 return Err(unsupported(
                     "well-founded execution endpoint universe or safety",
                 ));
             }
-            let type_ = self.universe_instance(
-                &definition.base.type_,
-                &definition.base.level_params,
-                levels,
-            )?;
-            if type_ != arguments[0] {
+            let type_ = self.universe_instance(&base.type_, &base.level_params, levels)?;
+            if !self.well_founded_interface_matches(&type_, &arguments[0])? {
                 return Err(unsupported(
                     "well-founded execution equation interface mismatch",
                 ));
@@ -205,9 +249,63 @@ impl Preparation<'_> {
                 "well-founded execution requires canonical equality",
             ));
         }
-        // Cache only after all theorem/interface/metadata checks and metered
-        // work succeed. Preparation is bound to one immutable environment.
-        self.well_founded_fix_checked = true;
-        Ok(Some(replacement.unwrap_or(target)))
+        Ok(Some(replacement.unwrap_or_else(|| target.clone())))
     }
+
+    // Recursor-generated and source-written telescopes may use different
+    // binder labels and transparent annotations. Compare their de Bruijn
+    // structure without reducing executable definitions or erasing domains.
+    fn well_founded_interface_matches(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<bool, IngressError> {
+        let mut work = vec![(actual, expected)];
+        let mut seen = HashSet::new();
+        while let Some((a, b)) = work.pop() {
+            self.tick()?;
+            if a.allocation_identity() == b.allocation_identity() {
+                continue;
+            }
+            seen.try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: seen.len().saturating_add(1),
+                })?;
+            if !seen.insert((a.allocation_identity(), b.allocation_identity())) {
+                continue;
+            }
+            reserve(&mut work, self.limits.max_nodes)?;
+            match (a.node(), b.node()) {
+                (ExprNode::MData { expr, .. }, _) => work.push((expr, b)),
+                (_, ExprNode::MData { expr, .. }) => work.push((a, expr)),
+                (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
+                (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) if a == b => {}
+                (
+                    ExprNode::Const { name: a, levels: al },
+                    ExprNode::Const { name: b, levels: bl },
+                ) if a == b && al == bl => {}
+                (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                    work.push((aa, ba));
+                    reserve(&mut work, self.limits.max_nodes)?;
+                    work.push((af, bf));
+                }
+                (
+                    ExprNode::ForallE { binder_type: at, body: ab, binder_info: ai, .. },
+                    ExprNode::ForallE { binder_type: bt, body: bb, binder_info: bi, .. },
+                )
+                | (
+                    ExprNode::Lam { binder_type: at, body: ab, binder_info: ai, .. },
+                    ExprNode::Lam { binder_type: bt, body: bb, binder_info: bi, .. },
+                ) if ai == bi => {
+                    work.push((ab, bb));
+                    reserve(&mut work, self.limits.max_nodes)?;
+                    work.push((at, bt));
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
 }
