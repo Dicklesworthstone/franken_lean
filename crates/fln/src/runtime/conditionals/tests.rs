@@ -172,3 +172,71 @@ fn actual_prelude_conditional_models_include_cases_on_proof_minor_lambdas() {
         );
     }
 }
+
+/// Only a `casesOn` in the admitted auxiliary-recursor journal and a reducible match
+/// auxiliary are inlined; look-alike names stay ordinary calls.
+#[test]
+fn eliminators_inline_only_registered_cases_on_and_reducible_matchers() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[br#"
+inductive Opt where
+  | none
+  | some (value : Nat)
+def Fake.casesOn (n : Nat) : Nat := n
+def fake.match_1 (n : Nat) : Nat := n
+"#],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let constant = |label: &str| Expr::const_(name(label), vec![]);
+    let nat = constant("Nat");
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let arguments = [
+        Expr::lam(
+            Name::anonymous(),
+            constant("Opt"),
+            nat.clone(),
+            BinderInfo::Default,
+        ),
+        constant("Opt.none"),
+        nat::literal(7),
+        Expr::lam(
+            Name::anonymous(),
+            nat,
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        ),
+    ];
+    let inlined = preparation
+        .lazy_eliminator(
+            &Expr::const_(name("Opt.casesOn"), vec![Level::one()]),
+            &arguments,
+        )
+        .unwrap()
+        .expect("a registered casesOn is inlined");
+    let (head, args) = preparation.spine(&inlined).unwrap();
+    assert!(
+        matches!(head.node(), ExprNode::Const { name: rec, .. } if *rec == name("Opt.rec")),
+        "{inlined:?}"
+    );
+    // The `none` alternative is an argument of the recursor, not evaluated before it.
+    assert!(args.iter().any(|argument| *argument == nat::literal(7)));
+    for look_alike in ["Fake.casesOn", "fake.match_1"] {
+        assert!(
+            preparation
+                .lazy_eliminator(&constant(look_alike), &[nat::literal(1)])
+                .unwrap()
+                .is_none(),
+            "{look_alike}"
+        );
+    }
+}

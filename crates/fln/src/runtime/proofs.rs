@@ -277,6 +277,11 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(inlined, expected));
                                 continue;
                             }
+                            if let Some(inlined) = self.lazy_eliminator(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(inlined, expected));
+                                continue;
+                            }
                             // Construction and elimination share the admitted
                             // datatype parameter prefix. In particular, source
                             // match/cases must not execute a data-valued parameter
