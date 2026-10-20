@@ -493,12 +493,43 @@ impl Context {
             // An alias owns its method namespace. Only a failed lookup
             // unfolds one definition, so intermediate aliases are not skipped
             // in favor of a field on the final underlying structure.
-            if self.txn.env.contains(&method) {
-                return Ok(FieldResolution::Method {
+            // The pin's `findMethod?` resolves exports as well as declarations,
+            // with currNamespace cleared (Lean/Elab/App.lean). Keep `base`
+            // unchanged: an alias target must accept this receiver's type,
+            // not merely the type to which it could unfold after a missed lookup.
+            let mut lookup = self.source_scope.clone();
+            lookup.namespace = Name::anonymous();
+            let method = lookup.user_name(&method);
+            for _ in 0..=lookup.opened.len() {
+                self.tick()?;
+            }
+            let aliases = self
+                .alias_cache
+                .read(&self.txn.env)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            let protected = self
+                .protected_cache
+                .read(&self.txn.env)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            match lookup.resolve_with_aliases(
+                &method,
+                |name| self.txn.env.contains(name),
+                &aliases,
+                &protected,
+            ) {
+                Ok(Some(method)) => return Ok(FieldResolution::Method {
                     function: self.constant(&method)?,
                     receiver,
                     base,
-                });
+                }),
+                // resolveLValLoop retries failed lookup after one unfolding,
+                // including ambiguous exports, but never retries an unusable
+                // receiver on a method that lookup successfully selected.
+                Err(reason @ scope::ScopeError::Ambiguous(_, _)) => {
+                    missing = failure(SourceInferenceError::NameScope(reason));
+                }
+                Err(reason) => return Err(failure(SourceInferenceError::NameScope(reason))),
+                Ok(None) => {}
             }
             let Some(ConstantInfo::Defn(definition)) = definition else {
                 return Err(missing);

@@ -110,6 +110,92 @@ fn record_projections_aliases_and_method_namespaces_keep_their_priority() {
 }
 
 #[test]
+fn exported_methods_use_the_alias_namespace_and_ignore_the_current_namespace() {
+    check(
+        "def Alias := Nat\n\
+         def Nat.exportedStep (n : Alias) : Nat := Nat.add n 1\n\
+         namespace Alias\nexport Nat (exportedStep)\nend Alias\n\
+         theorem exported (n : Alias) : n.exportedStep = Nat.add n 1 := by rfl\n\
+         namespace Shadow\n\
+         def Alias.exportedStep (n : Alias) : Nat := 99\n\
+         theorem rooted (n : Alias) : n.exportedStep = Nat.add n 1 := by rfl\n\
+         end Shadow",
+    );
+}
+
+#[test]
+fn an_exported_method_cannot_fall_back_to_a_different_receiver_type() {
+    let options = KVMap::new();
+    let source = "def Alias := Nat\n\
+                  def Nat.exportedStep (n : Nat) : Nat := Nat.add n 1\n\
+                  namespace Alias\nexport Nat (exportedStep)\nend Alias";
+    let base = engine()
+        .check_source_files(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    let invalid = b"def prefix : Nat := 7\ndef bad (n : Alias) : Nat := n.exportedStep";
+    let error = base
+        .check_source_files(&[invalid], &options, limits())
+        .expect_err("the exported target has no parameter of type Alias");
+    assert_eq!(error.disposition().0, "elaboration", "{error}");
+    assert!(format!("{error:?}").contains("InvalidFieldReceiver"), "{error}");
+    assert_eq!(base.logical_root(&options), root);
+    for name in ["prefix", "bad"] {
+        assert!(!base.environment().contains(&Name::from_components([name])));
+    }
+    // Definitional equality still permits ordinary applications, and the
+    // underlying type's own field notation still names the same method.
+    let repaired = b"def repaired (n : Alias) : Nat := Nat.exportedStep n\n\
+                     theorem underlying (n : Nat) : n.exportedStep = Nat.add n 1 := by rfl";
+    assert!(matches!(
+        base.check_source_files(&[repaired], &options, limits()),
+        Ok(Outcome::Complete(_))
+    ));
+}
+
+#[test]
+fn exported_field_methods_preserve_ambiguity_and_exact_declaration_priority() {
+    let source = "def Alias := Nat\n\
+                  def First.step (n : Alias) : Nat := Nat.add n 1\n\
+                  def Second.step (n : Alias) : Nat := Nat.add n 2\n\
+                  namespace Alias\nexport First (step)\nexport Second (step)\nend Alias";
+    let options = KVMap::new();
+    let base = engine()
+        .check_source_files(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    let error = base
+        .check_source_files(
+            &[b"def bad (n : Alias) : Nat := n.step"],
+            &options,
+            limits(),
+        )
+        .expect_err("two exported targets do not select an arbitrary method");
+    assert_eq!(error.disposition().0, "elaboration", "{error}");
+    assert_eq!(base.logical_root(&options), root);
+    let recovered = b"def Alias.step (n : Alias) : Nat := 3\n\
+                      theorem selected (n : Alias) : n.step = 3 := by rfl";
+    assert!(matches!(
+        base.check_source_files(&[recovered], &options, limits()),
+        Ok(Outcome::Complete(_))
+    ));
+    // Failed lookup, including ambiguity, still unfolds the receiver as at
+    // the pin. A successfully selected but unusable method must not do so.
+    let fallback = b"def Nat.step (n : Nat) : Nat := Nat.add n 3\n\
+                     theorem fallback (n : Alias) : n.step = Nat.add n 3 := by rfl";
+    assert!(matches!(
+        base.check_source_files(&[fallback], &options, limits()),
+        Ok(Outcome::Complete(_))
+    ));
+}
+
+#[test]
 fn invalid_receivers_do_not_select_later_parameters_or_publish_a_prefix() {
     let base = engine();
     let options = KVMap::new();
