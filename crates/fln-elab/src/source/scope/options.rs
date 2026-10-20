@@ -129,6 +129,13 @@ use Policy::*;
 /// The table, in one place. `maxRecDepth`'s default is `defaultMaxRecDepth`, 512
 /// (`Init/Prelude.lean`).
 pub const ROWS: &[Row] = &[
+    // Simp may re-synthesize occurrence-assigned theorem dictionaries.
+    row(
+        "tactic.skipAssignedInstances",
+        Bool(true),
+        "Lean/Meta/Tactic/Util.lean:176",
+        Honored,
+    ),
     // Read by the elaborator's monad-lift coercion (`coercions/monad.rs`).
     row("autoLift", Bool(true), "Lean/Meta/Coe.lean:72", Honored),
     // Read by Golem at command entry for `#eval`. Elaboration does not count the pin's
@@ -808,6 +815,8 @@ mod tests {
             .filter(|row| matches!(row.policy, Honored | HonoredAtLeast { .. } | HonoredOff))
             .map(|row| row.name)
             .collect();
+        // `tactic.skipAssignedInstances`: matching/instance_args.rs;
+        // source_simp_instance_matching exercises both values.
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
         // `linter.*`: the unused-variables, deprecated-syntax and defProp warnings (`fln`,
         // `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
@@ -816,6 +825,7 @@ mod tests {
         assert_eq!(
             honored,
             [
+                "tactic.skipAssignedInstances",
                 "autoLift",
                 "maxHeartbeats",
                 "synthInstance.maxSize",

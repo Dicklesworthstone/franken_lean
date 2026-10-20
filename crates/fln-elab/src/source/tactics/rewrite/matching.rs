@@ -4,6 +4,7 @@
 
 use super::*;
 use std::collections::HashSet;
+mod instance_args;
 
 /// Where a rule instantiation looks for its occurrence.
 #[derive(Clone, Copy)]
@@ -440,6 +441,7 @@ impl Context {
                 pending.extend(children(term).into_iter().rev().flatten());
             }
             let mut holes = Vec::new();
+            let mut rule_instances = Vec::new();
             loop {
                 template.tick()?;
                 // The pin prepares simp theorems at reducible transparency without
@@ -472,13 +474,18 @@ impl Context {
                 };
                 let domain = binder_type.clone();
                 let body = body.clone();
-                let argument = if *binder_info == BinderInfo::InstImplicit {
+                // Simp theorem parameters are patterns; ordinary rw retains
+                // its existing elaboration-time dictionary synthesis.
+                let argument = if !inside_out && *binder_info == BinderInfo::InstImplicit {
                     template.instance_hole(domain)?
                 } else {
                     template.hole(domain)?
                 };
                 if let ExprNode::MVar { id } = argument.node() {
                     holes.push(id.clone());
+                    if inside_out && *binder_info == BinderInfo::InstImplicit {
+                        rule_instances.push(id.clone());
+                    }
                 }
                 rule.type_ = template.substitute(&body, &argument)?;
                 rule.value = Expr::app(rule.value, argument);
@@ -486,13 +493,13 @@ impl Context {
             // Rewrite's newly applied parameters precede the unresolved implicit
             // arguments inserted while elaborating the selected rule expression.
             holes.extend(implicit_holes);
-            // A known class input must select its dictionary before matching a
-            // pattern containing that dictionary. Synthetic-opaque instance holes
-            // cannot be assigned by occurrence unification. Inputs learned from
-            // the occurrence still get the second synthesis pass below.
-            let resolution = template.resolve_instances(false);
-            self.charge_rewrite_trial(&template);
-            resolution?;
+            // Only ordinary rw pre-synthesizes its rule arguments. Simp first
+            // matches occurrence dictionaries, then synthesizes missing ones.
+            if !inside_out {
+                let resolution = template.resolve_instances(false);
+                self.charge_rewrite_trial(&template);
+                resolution?;
+            }
             let compiled = (|| {
                 let rule = template.equivalence_rewrite_rule(rule)?;
                 if inside_out {
@@ -572,10 +579,10 @@ impl Context {
                     }
                 }
             }
-            Ok(Some((rule, alpha, pattern, holes)))
+            Ok(Some((rule, alpha, pattern, holes, rule_instances)))
         })();
         self.charge_rewrite_trial(&template);
-        let Some((rule, alpha, pattern, holes)) = prepared? else {
+        let Some((rule, alpha, pattern, holes, rule_instances)) = prepared? else {
             return Ok(None);
         };
         let mut pending = vec![(target, false)];
@@ -619,6 +626,9 @@ impl Context {
             trial.txn.budget = self.txn.budget.clone();
             let attempt = (|| {
                 if !trial.match_rewrite_occurrence(&pattern, &alpha, term)? {
+                    return Ok(None);
+                }
+                if inside_out && !trial.synthesize_simp_rule_instances(&holes, &rule_instances)? {
                     return Ok(None);
                 }
                 trial.resolve_instances(false)?;
