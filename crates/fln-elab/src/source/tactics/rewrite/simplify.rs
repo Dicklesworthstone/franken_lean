@@ -1252,8 +1252,11 @@ fn simp_pattern_key(
     let ExprNode::Const { name, .. } = head.node() else {
         return None;
     };
-    if *name == Name::from_components(["OfNat", "ofNat"]) || simp_key_unfolds(env, table, name) {
+    if *name == Name::from_components(["OfNat", "ofNat"]) {
         return None;
+    }
+    if simp_key_unfolds(env, table, name) {
+        return simp_unfolded_head_key(env, table, name);
     }
     let mut args = simp_key_arguments(env, table, name, &args);
     while args.last() == Some(&SimpArgKey::Any) {
@@ -1263,6 +1266,46 @@ fn simp_pattern_key(
         head: name.clone(),
         args,
     })
+}
+
+/// A reducible head's key, as the pin's `whnfR` reaches it: the rigid head of its
+/// unfolding, through further reducible heads, with every argument open (`a > b` is
+/// keyed under `LT.lt`, `Array.getD` under `dite`). `None` where the unfolding's head
+/// is a bound variable or a numeral.
+fn simp_unfolded_head_key(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    name: &Name,
+) -> Option<SimpKey> {
+    const MAX_UNFOLDINGS: usize = 8;
+    let mut current = name.clone();
+    for _ in 0..MAX_UNFOLDINGS {
+        let Some(ConstantInfo::Defn(definition)) = env.find(&current) else {
+            return None;
+        };
+        let mut value = &definition.value;
+        loop {
+            match value.node() {
+                ExprNode::Lam { body, .. } => value = body,
+                ExprNode::MData { expr, .. } => value = expr,
+                _ => break,
+            }
+        }
+        let ExprNode::Const { name: next, .. } = simp_key_spine(value).0.node() else {
+            return None;
+        };
+        if *next == Name::from_components(["OfNat", "ofNat"]) {
+            return None;
+        }
+        if !simp_key_unfolds(env, table, next) {
+            return Some(SimpKey {
+                head: next.clone(),
+                args: Vec::new(),
+            });
+        }
+        current = next.clone();
+    }
+    None
 }
 
 /// The argument keys of a pattern `head args`, at the positions the pin's key
@@ -1298,6 +1341,7 @@ fn simp_key_arguments(
                     BinderInfo::Default => {
                         simp_key_is_sort(binder_type)
                             || simp_key_is_data_type(env, binder_type, &binders, args)
+                            || simp_key_arg_is_data(env, args[keys.len()])
                     }
                 };
                 keys.push(if keyed {
@@ -1316,7 +1360,73 @@ fn simp_key_arguments(
 }
 
 fn simp_key_is_sort(type_: &Expr) -> bool {
-    matches!(simp_key_spine(type_).0.node(), ExprNode::Sort { .. })
+    matches!(
+        simp_key_spine(simp_key_without_out_param(type_)).0.node(),
+        ExprNode::Sort { .. }
+    )
+}
+
+/// `outParam T` and `semiOutParam T` are `T` (reducible identities in `Init.Prelude`).
+fn simp_key_without_out_param(type_: &Expr) -> &Expr {
+    match simp_key_spine(type_) {
+        (head, args)
+            if args.len() == 1
+                && matches!(head.node(), ExprNode::Const { name, .. }
+                    if *name == Name::from_components(["outParam"])
+                        || *name == Name::from_components(["semiOutParam"])) =>
+        {
+            args[0]
+        }
+        _ => type_,
+    }
+}
+
+/// Whether an argument is data by its own head, as the pin's `isProof` reads it: the head
+/// constant's result is a sort (the argument is a type), a type in a nonzero universe, or one
+/// of the head's own type parameters ranging over one.
+fn simp_key_arg_is_data(env: &Environment, arg: &Expr) -> bool {
+    let ExprNode::Const { name, .. } = simp_key_spine(arg).0.node() else {
+        return false;
+    };
+    let Some(info) = env.find(name) else {
+        return false;
+    };
+    let mut binders: Vec<&Expr> = Vec::new();
+    let mut result = &info.constant_val().type_;
+    loop {
+        match result.node() {
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                binders.push(binder_type);
+                result = body;
+            }
+            ExprNode::MData { expr, .. } => result = expr,
+            _ => break,
+        }
+    }
+    let sort_is_not_zero = |type_: &Expr| {
+        matches!(simp_key_spine(simp_key_without_out_param(type_)).0.node(),
+            ExprNode::Sort { level } if level.is_not_zero())
+    };
+    match simp_key_spine(result).0.node() {
+        ExprNode::Sort { .. } => true,
+        ExprNode::BVar { idx } => usize::try_from(*idx)
+            .ok()
+            .and_then(|idx| binders.len().checked_sub(idx + 1))
+            .is_some_and(|binder| sort_is_not_zero(binders[binder])),
+        ExprNode::Const { name, .. } => env.find(name).is_some_and(|info| {
+            let mut codomain = &info.constant_val().type_;
+            loop {
+                match codomain.node() {
+                    ExprNode::ForallE { body, .. } => codomain = body,
+                    ExprNode::MData { expr, .. } => codomain = expr,
+                    _ => break sort_is_not_zero(codomain),
+                }
+            }
+        }),
+        _ => false,
+    }
 }
 
 /// Whether every inhabitant of the binder type `type_` is data, never a proof: its
@@ -1328,7 +1438,10 @@ fn simp_key_is_data_type(
     binders: &[&Expr],
     args: &[&Expr],
 ) -> bool {
-    let sort_is_not_zero = |type_: &Expr| matches!(simp_key_spine(type_).0.node(), ExprNode::Sort { level } if level.is_not_zero());
+    let sort_is_not_zero = |type_: &Expr| {
+        matches!(simp_key_spine(simp_key_without_out_param(type_)).0.node(),
+            ExprNode::Sort { level } if level.is_not_zero())
+    };
     let constant_is_data_type = |name: &Name| {
         env.find(name).is_some_and(|info| {
             let mut result = &info.constant_val().type_;
@@ -1626,9 +1739,18 @@ mod key_tests {
             at_nat.args,
             [SimpArgKey::Const(n("Nat")), SimpArgKey::Const(n("f"))]
         );
-        // At a pattern variable's type the sides may be proofs: only `Eq` is keyed.
+        // At a pattern variable's type a side is keyed when its own head shows it is data
+        // (`f` returns `Nat`); a pattern variable stays open.
         let polymorphic = key(eq(bvar(2), Expr::app(c("f"), bvar(0)), bvar(1)));
-        assert_eq!(polymorphic.args, Vec::new());
+        assert_eq!(
+            polymorphic.args,
+            [SimpArgKey::Any, SimpArgKey::Const(n("f"))]
+        );
+        let open = key(eq(bvar(2), bvar(0), Expr::app(c("f"), bvar(1))));
+        assert_eq!(
+            open.args,
+            [SimpArgKey::Any, SimpArgKey::Any, SimpArgKey::Const(n("f"))]
+        );
         // An instance argument is never keyed; a `Nat` offset is left open.
         let operation = key(apps(
             c("op"),
@@ -1833,5 +1955,21 @@ mod key_tests {
                 "{status:?}"
             );
         }
+        // A rule rooted at a reducible head is keyed by its unfolding's head, as the pin's
+        // `whnfR` keys it; a plain definition keys itself.
+        let pattern = Expr::app(c("wrap"), bvar(0));
+        let head = |env: &Environment| {
+            let table = crate::reducibility::table(env).unwrap();
+            simp_pattern_key(env, &table, &pattern).unwrap()
+        };
+        let reducible = crate::reducibility::register(
+            &base,
+            &n("wrap"),
+            crate::reducibility::Reducibility::Reducible,
+        )
+        .unwrap();
+        assert_eq!(head(&reducible).head, n("Nat.succ"));
+        assert!(head(&reducible).args.is_empty());
+        assert_eq!(head(&base).head, n("wrap"));
     }
 }
