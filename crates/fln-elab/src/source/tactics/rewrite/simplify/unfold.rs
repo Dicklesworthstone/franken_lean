@@ -161,7 +161,7 @@ impl Context {
         target: &Expr,
         selection: &Selection,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
-        let result = self.simp_unfold_selected(target, selection)?;
+        let result = self.simp_unfold_selected(target, Some(selection))?;
         // Unfolding normalizes every node it rebuilds, as the pin's simp beta- and
         // zeta-reduces. Removing a source ascription's `let` is not progress: the pin's
         // term has none, so `simp` on `(10 : USize) + 2 = x` makes no progress there.
@@ -279,10 +279,26 @@ impl Context {
         Ok(done[&root.allocation_identity()].clone())
     }
 
+    /// `target` beta-, zeta- and iota-reduced at every node, as the pin's simp reduces before
+    /// rewriting (`Simp.Config.beta`, `zeta`, `iota`, `proj`), or `None` where that changes
+    /// nothing but source ascriptions. This happened here only while unfolding a selected
+    /// definition, so `simp only []` made no progress on `(fun z => z) x + 2 = y`.
+    pub(super) fn simp_normalize(
+        &mut self,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let result = self.simp_unfold_selected(target, None)?;
+        if self.simp_same_up_to_ascriptions(&result, target)? {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
     fn simp_unfold_selected(
         &mut self,
         root: &Expr,
-        selection: &Selection,
+        selection: Option<&Selection>,
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut done: HashMap<usize, Expr> = HashMap::new();
         let mut work = vec![(root, false)];
@@ -348,16 +364,16 @@ impl Context {
                     expr,
                 } => Expr::proj(struct_name.clone(), *idx, child(expr)),
                 ExprNode::FVar { id } => match selection {
-                    Selection::Local(selected, value) if selected == id => value.clone(),
+                    Some(Selection::Local(selected, value)) if selected == id => value.clone(),
                     _ => term.clone(),
                 },
                 _ => term.clone(),
             };
             let rebuilt = match selection {
-                Selection::Global(definition) => {
+                Some(Selection::Global(definition)) => {
                     self.unfold_selected_definition(&rebuilt, definition)?
                 }
-                Selection::Local(..) => rebuilt,
+                _ => rebuilt,
             };
             let normalized = self.simp_beta_zeta(&rebuilt)?;
             done.insert(key, normalized);
@@ -425,7 +441,7 @@ mod tests {
         );
         let mut ctx = Context::new(&Environment::new(), Budget::for_stack_bytes(1024 * 1024));
         assert_eq!(
-            ctx.simp_unfold_selected(&input, &Selection::Global(definition))
+            ctx.simp_unfold_selected(&input, Some(&Selection::Global(definition)))
                 .unwrap(),
             expected
         );
@@ -441,7 +457,7 @@ mod tests {
         }
         let selection = Selection::Local(id, value);
         let mut ctx = Context::new(&Environment::new(), Budget::for_stack_bytes(1024 * 1024));
-        let mut output = ctx.simp_unfold_selected(&input, &selection).unwrap();
+        let mut output = ctx.simp_unfold_selected(&input, Some(&selection)).unwrap();
         for _ in 0..40 {
             let ExprNode::App { f, a } = output.node() else {
                 panic!("application retained");
@@ -451,7 +467,7 @@ mod tests {
         }
         ctx.txn.budget.max_heartbeats = 1;
         assert!(matches!(
-            ctx.simp_unfold_selected(&input, &selection),
+            ctx.simp_unfold_selected(&input, Some(&selection)),
             Err(NatDefinitionElabError::Inference(
                 SourceInferenceError::ResourceLimit
             ))

@@ -32,6 +32,21 @@ impl DsimpSet<'_> {
             matches!(selection, Selection::Global(definition) if &definition.base.name == name)
         })
     }
+
+    /// The selected definition, or local, that `head` names: one lookup, as the pin's
+    /// `toUnfold` set answers. Charging every selection at every node exhausted the work
+    /// limit under the default set, which selects every registered simp definition.
+    fn selection_for(&self, head: &Expr) -> Option<&Selection> {
+        self.definitions
+            .iter()
+            .find(|selection| match (selection, head.node()) {
+                (Selection::Local(id, _), ExprNode::FVar { id: actual }) => id == actual,
+                (Selection::Global(definition), ExprNode::Const { name, .. }) => {
+                    &definition.base.name == name
+                }
+                _ => false,
+            })
+    }
 }
 
 impl Context {

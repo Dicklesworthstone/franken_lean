@@ -19,6 +19,15 @@ impl Context {
                 set.rewrites.push((rule, std::cell::Cell::new(None)));
                 continue;
             }
+            // A registered definition selects itself by name: no elaboration, so no
+            // speculative copy of the context, which cost one clone per registered
+            // definition per call. Only an explicit term needs the trial below.
+            if matches!(rule, SimpRule::Global(_))
+                && let Some(selection) = self.simp_unfold_selection_for_rule(&rule)?
+            {
+                set.definitions.push(selection);
+                continue;
+            }
             self.tick()?;
             // Eligibility probes are not instance-synthesis/admission effects.
             // Resolve fully and charge each candidate without keeping its holes.

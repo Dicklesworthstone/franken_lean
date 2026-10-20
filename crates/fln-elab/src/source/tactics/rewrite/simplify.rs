@@ -442,6 +442,24 @@ impl Context {
             .is_none_or(|index| index.admits(key)))
     }
 
+    /// Whether `rule` is a registered definition that occurs nowhere in the target `index`
+    /// was built from. The pin's simp unfolds a definition at the nodes it heads; here each
+    /// one walked and rebuilt the whole target, once per registered definition per step.
+    /// The goal loop's own normalization step (`simp_normalize`) now does the beta and zeta
+    /// reduction that walk used to supply.
+    fn simp_definition_absent(&self, rule: &SimpRule<'_>, index: Option<&SimpTargetIndex>) -> bool {
+        let (Some(index), SimpRule::Global(entry)) = (index, rule) else {
+            return false;
+        };
+        entry.proof.is_none()
+            && !entry.reverse
+            && matches!(
+                self.txn.env.find(&entry.declaration),
+                Some(ConstantInfo::Defn(_))
+            )
+            && !index.applications.contains_key(&entry.declaration)
+    }
+
     /// Every application a candidate rule's key may need to find in `target`: the
     /// target's own, closed over the values of definitions the key path may unfold at
     /// reducible or instance transparency, plus each primitive projection's function
@@ -1155,9 +1173,28 @@ impl Context {
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
             let target = self.instantiate(&goal.target)?;
+            if let Some(normalized) = self.simp_normalize(&target)? {
+                if steps >= MAX_SIMPLIFICATION_STEPS {
+                    return Err(failure(SourceInferenceError::ResourceLimit));
+                }
+                for previous in &history {
+                    self.tick()?;
+                    if self.rewrite_same(previous, &normalized)? {
+                        return Err(error(TacticError::SimplificationCycle));
+                    }
+                }
+                history.push(normalized.clone());
+                let (value, next_goal) = self.proof_goal(normalized)?;
+                proof.work.push(Work::Close(goal, value));
+                goal = next_goal;
+                steps += 1;
+                continue;
+            }
             let index = self.simp_target_index(&target)?;
             for rule in rules {
-                if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
+                    || self.simp_definition_absent(rule, index.as_ref())
+                {
                     continue;
                 }
                 self.tick()?;

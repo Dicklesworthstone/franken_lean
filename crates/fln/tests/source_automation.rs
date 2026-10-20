@@ -794,3 +794,28 @@ fn removing_a_source_ascription_is_not_simplification_progress() {
         "theorem beta (x y : Nat) (h : x + 2 = y) : (fun z => z) x + 2 = y := by\n  simp only [g]\n  exact h",
     );
 }
+
+#[test]
+fn simp_beta_and_zeta_reduce_without_a_selected_definition() {
+    // Each judged by the pinned lean. Its simp beta- and zeta-reduces before rewriting
+    // (`Simp.Config.beta`, `zeta`), so both are progress under `simp only []`; this engine
+    // did it only while unfolding a selected definition. An ascription is still none.
+    let base = engine();
+    admit(
+        &base,
+        "theorem beta (x y : Nat) (h : x + 2 = y) : (fun z => z) x + 2 = y := by\n  simp only []\n  exact h",
+    );
+    admit(
+        &base,
+        "theorem zeta (x y : Nat) (h : x + 2 = y) : (let z := x; z) + 2 = y := by\n  simp only []\n  exact h",
+    );
+    let refused = "theorem bad (x y : Nat) (h : (x : Nat) + 2 = y) : (x : Nat) + 2 = y := by\n  simp only []\n  exact h";
+    let Err(error) = base.admit_source_declaration(refused.as_bytes(), &KVMap::new(), limits())
+    else {
+        panic!("removing an ascription was simplification progress: {refused}");
+    };
+    assert!(
+        error.to_string().contains("simp only made no progress"),
+        "{error}"
+    );
+}

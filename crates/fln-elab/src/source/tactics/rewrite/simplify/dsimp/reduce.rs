@@ -363,35 +363,31 @@ impl Context {
         }
         let (head, arguments) = self.dsimp_spine(term)?;
         // Check saturated heads, never the function part of a partial call.
-        for selection in &set.definitions {
+        if let Some(selection) = set.selection_for(&head) {
             self.tick()?;
-            match (selection, head.node()) {
-                (Selection::Local(id, value), ExprNode::FVar { id: actual }) if id == actual => {
+            match selection {
+                Selection::Local(_, value) => {
                     return Ok(arguments.into_iter().fold(value.clone(), Expr::app));
                 }
-                (Selection::Global(definition), ExprNode::Const { name, .. })
-                    if &definition.base.name == name =>
-                {
-                    if !self.dsimp_unfoldable(definition)? {
-                        continue;
-                    }
-                    let mut body = &definition.value;
-                    let mut arity = 0usize;
-                    while let ExprNode::Lam { body: next, .. } = body.node() {
-                        self.tick()?;
-                        arity = arity
-                            .checked_add(1)
-                            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
-                        body = next;
-                    }
-                    if arguments.len() >= arity {
-                        let next = self.unfold_selected_definition(term, definition)?;
-                        if !self.rewrite_same(term, &next)? {
-                            return Ok(next);
+                Selection::Global(definition) => {
+                    if self.dsimp_unfoldable(definition)? {
+                        let mut body = &definition.value;
+                        let mut arity = 0usize;
+                        while let ExprNode::Lam { body: next, .. } = body.node() {
+                            self.tick()?;
+                            arity = arity
+                                .checked_add(1)
+                                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                            body = next;
+                        }
+                        if arguments.len() >= arity {
+                            let next = self.unfold_selected_definition(term, definition)?;
+                            if !self.rewrite_same(term, &next)? {
+                                return Ok(next);
+                            }
                         }
                     }
                 }
-                _ => {}
             }
         }
         if let ExprNode::Const { name, .. } = head.node()

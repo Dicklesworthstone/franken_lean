@@ -270,3 +270,40 @@ fn ordinary_no_progress_is_recoverable_but_not_successful() {
     assert_eq!(ctx.txn, before.txn);
     assert_eq!(ctx.next, before.next);
 }
+
+#[test]
+fn selected_definitions_are_looked_up_not_charged_at_every_node() {
+    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal};
+    // The default set selects every registered simp definition; charging each one at
+    // every node exhausted the work limit on `dsimp2`. A node's head is looked up once.
+    let mut ctx = context();
+    let ty = Expr::sort(Level::one());
+    let a = local(&mut ctx, "a", ty.clone());
+    let target = arrow(a.clone(), arrow(a.clone(), a));
+    let charge = |set: &DsimpSet<'_>| {
+        let mut ctx = ctx.clone();
+        let before = ctx.txn.budget.heartbeats_consumed;
+        ctx.dsimp_expression(&target, set).unwrap();
+        ctx.txn.budget.heartbeats_consumed - before
+    };
+    let many = DsimpSet {
+        definitions: (0..500)
+            .map(|index| {
+                let name = Name::from_components([format!("d{index}").as_str()]);
+                Selection::Global(DefinitionVal {
+                    base: ConstantVal {
+                        name: name.clone(),
+                        level_params: Vec::new(),
+                        type_: ty.clone(),
+                    },
+                    value: ty.clone(),
+                    hints: ReducibilityHints::Regular(1),
+                    safety: DefinitionSafety::Safe,
+                    all: vec![name],
+                })
+            })
+            .collect(),
+        ..DsimpSet::default()
+    };
+    assert_eq!(charge(&many), charge(&empty()));
+}
