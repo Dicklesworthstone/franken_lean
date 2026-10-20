@@ -15,6 +15,9 @@ fn engine() -> &'static Engine {
 structure Projection (n : Nat) where
   value : Nat
 def replacement (n : Nat) (r : Projection n) : Nat := n + r.value
+class Weight (n : Nat) where
+  weight : Nat
+instance fiveWeight : Weight 5 := { weight := 42 }
 "#],
                 &KVMap::new(),
                 SourceCheckLimits::new(limits),
@@ -61,6 +64,22 @@ fn partial_projection_keeps_one_receiver_and_full_projection_is_idempotent() {
             .inline_generated_projection(&complete, &[])
             .unwrap()
             .is_none()
+    );
+}
+/// A class projection takes its structure instance-implicitly and stays an application:
+/// inlined, `pure ()` and `(1.5 : Float)` left `inst.1` for an ingress that lowers class
+/// methods only through the application.
+#[test]
+fn a_class_projection_is_not_inlined() {
+    let environment = engine().environment();
+    let mut preparation = Preparation::new(environment, IngressLimits::default());
+    let head = Expr::const_(name("Weight.weight"), vec![]);
+    let arguments = [nat::literal(5), Expr::const_(name("fiveWeight"), vec![])];
+    assert_eq!(
+        preparation
+            .inline_generated_projection(&head, &arguments)
+            .unwrap(),
+        None
     );
 }
 #[test]

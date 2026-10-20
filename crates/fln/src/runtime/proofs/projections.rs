@@ -33,6 +33,31 @@ impl Preparation<'_> {
         if parameters == 0 || self.has_implementation(name)? {
             return Ok(None);
         }
+        // A class projection (`Pure.pure`, `Bind.bind`, `OfScientific.ofScientific`) takes
+        // its structure as an instance-implicit argument, and stays an application, as it was
+        // before this inlining. Inlined, it left `inst.1` for ingress, which lowers a class
+        // method through the application and not through the instance's field:
+        // `def main : IO Unit := pure ()` was refused (`structure projection `Pure` field 0
+        // … is absent`), and `(1.5 : Float)` reached `Float.ofScientific` as an unknown
+        // constant. The pin's `ToLCNF.visitProjFn` inlines these too; this runtime does not
+        // lower the result yet.
+        let mut type_ = &definition.base.type_;
+        for _ in 0..parameters {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = type_.node() else {
+                return Ok(None);
+            };
+            type_ = body;
+        }
+        if matches!(
+            type_.node(),
+            ExprNode::ForallE {
+                binder_info: BinderInfo::InstImplicit,
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
         // An explicit extern owns the executable semantics, even for a
         // generated field. Do not turn its logical body into a fallback.
         source_intrinsics::check_selected_extern_attribute(
