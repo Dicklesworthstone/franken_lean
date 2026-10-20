@@ -302,3 +302,80 @@ fn interruption_is_not_caught_and_retry_reproduces_cleanup_and_artifact() {
         Some("12007")
     );
 }
+
+#[test]
+fn quoted_cleanup_keeps_outer_names_and_runs_once_after_each_outcome() {
+    let base = base();
+    let before = base.logical_root(&KVMap::new());
+    execute(
+        &base,
+        r#"
+def e : Nat := 8
+macro "cleanupQuoted " input:term:max : term => `(do {
+  try { mark 1; raise (5 : Nat) }
+  catch e => { mark 2; return Nat.add e $input }
+  finally { mark e } })
+macro "successQuoted " : term => `(do {
+  try { mark 1; return 7 }
+  finally { mark 2 } })
+macro "rethrowQuoted " : term => `(do {
+  try { mark 1; raise (5 : Nat) }
+  catch e => { mark 2; raise (Nat.add e 1) }
+  finally { mark 3 } })
+def value (e : Nat) : Logged Nat := cleanupQuoted e
+def success : Logged Nat := successQuoted
+def rethrown : Logged Nat := rethrowQuoted
+#eval observed (value 37)
+#eval observed success
+#eval observed rethrown
+"#,
+        &["128042", "12007", "123106"],
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn quoted_cleanup_does_not_swallow_suffix_failures_or_escape_its_region() {
+    let base = base();
+    execute(
+        &base,
+        r#"
+macro "suffixQuoted " : term => `(do {
+  try { mark 1 } catch e => { mark 9 }
+  finally { mark 2 }
+  raise (7 : Nat) })
+macro "failureQuoted " : term => `(do {
+  try { mark 1; return 42 }
+  finally { mark 2; (raise (9 : Nat) : Logged PUnit) } })
+def suffixValue : Logged Nat := suffixQuoted
+def cleanupFailure : Logged Nat := failureQuoted
+#eval observed suffixValue
+#eval observed cleanupFailure
+"#,
+        &["12107", "12109"],
+    );
+    let before = base.logical_root(&KVMap::new());
+    for declaration in [
+        r#"macro "badCleanup " : term => `(do { try { raise (5 : Nat) } catch fresh => { return fresh } finally { mark fresh } })"#,
+        r#"macro "badCleanup " : term => `(do { try { let secret : Nat := 42; return secret } finally { mark secret } })"#,
+        r#"macro "badCleanup " : term => `(do { try { return 42 } finally { return 7 } })"#,
+    ] {
+        checked(&base, declaration);
+        let source = format!("{declaration}\ndef bad : Logged Nat := badCleanup");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        let fln::SourceCheckError::Command { command, error, .. } = error else {
+            panic!("expected a command error: {error:?}");
+        };
+        assert_eq!(command, 1);
+        assert!(
+            matches!(
+                error.as_ref(),
+                fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(_))
+            ),
+            "{source}\n{error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+}

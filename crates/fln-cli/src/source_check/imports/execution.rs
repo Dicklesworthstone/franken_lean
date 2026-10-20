@@ -24,7 +24,7 @@ pub(in crate::source_check) enum Presentation {
 /// A missing printer is a refusal, including in an explicit prelude world.
 fn evaluation_presentation(presentation: Presentation) -> fln::EvaluationPresentation {
     match presentation {
-        Presentation::Fln { .. } => fln::EvaluationPresentation::Raw,
+        Presentation::Fln { .. } => fln::EvaluationPresentation::PreferRaw,
         Presentation::Lean => fln::EvaluationPresentation::Lean,
     }
 }
@@ -888,6 +888,33 @@ fn render(
         }
         render_commands(commands, &name, json, &mut output)?;
         if json {
+            append(&mut output, "],\"traces\":[")?;
+        }
+        for (index, trace) in commands.traces.iter().enumerate() {
+            if json {
+                if index != 0 {
+                    append(&mut output, ",")?;
+                }
+                append(
+                    &mut output,
+                    &format!(
+                        "{{\"command\":{},\"byteOffset\":{},\"message\":{}}}",
+                        trace.command_index,
+                        trace.at.0,
+                        json_string(&trace.message),
+                    ),
+                )?;
+            } else {
+                append(
+                    &mut output,
+                    &format!(
+                        "Trace {name}, command {}, byte {}:\n{}\n",
+                        trace.command_index, trace.at.0, trace.message
+                    ),
+                )?;
+            }
+        }
+        if json {
             append(&mut output, "]}")?;
         }
     }
@@ -947,11 +974,26 @@ fn render_commands(
                         .ok_or_else(|| {
                             internal("source program evaluation escaped the execution table")
                         })?;
-                let value = source_evaluation::value(execution)
+                // The printer was checked and executed with the source term.
+                // Reading its Format never re-executes a value or IO action.
+                let (kind, value, human) = match source_evaluation::formatted(execution)
                     .map_err(evaluation_error)?
-                    .ok_or_else(|| Failure::new("capability", &format!(
-                        "module `{module}`, command {command}: raw result is not a supported closed Nat, String, Bool, Float, Float32, or nested List value",
-                    ), false, CAPABILITY_NOT_IMPLEMENTED_EXIT))?;
+                {
+                    Some(source_evaluation::PresentedEvaluation::Text(text)) => {
+                        ("format", json_string(&text), text)
+                    }
+                    Some(source_evaluation::PresentedEvaluation::IoUnit) => {
+                        ("unit", "null".to_owned(), "()".to_owned())
+                    }
+                    None => {
+                        let value = source_evaluation::value(execution)
+                            .map_err(evaluation_error)?
+                            .ok_or_else(|| Failure::new("capability", &format!(
+                                "module `{module}`, command {command}: result has neither a supported raw projection nor a checked printer",
+                            ), false, CAPABILITY_NOT_IMPLEMENTED_EXIT))?;
+                        (value.kind(), value.json(), value.to_string())
+                    }
+                };
                 let fln::VmExit::Returned(returned) = &execution.exit else {
                     return Err(internal(
                         "non-returning source execution escaped terminal validation",
@@ -962,15 +1004,15 @@ fn render_commands(
                         output,
                         &format!(
                             "{{\"command\":{command},\"event\":\"evaluation\",\"kind\":{},\"value\":{},\"steps\":{},\"systemPolls\":{},\"peakStackDepth\":{}}}",
-                            json_string(value.kind()),
-                            value.json(),
+                            json_string(kind),
+                            value,
                             returned.usage.steps,
                             returned.usage.system_polls,
                             returned.usage.peak_stack_depth,
                         ),
                     )?;
                 } else {
-                    append(output, &format!("  command {command}, #eval: {value}\n"))?;
+                    append(output, &format!("  command {command}, #eval: {human}\n"))?;
                 }
                 evaluations += 1;
             }
@@ -1132,10 +1174,13 @@ mod tests {
 
     #[test]
     fn lean_presentation_always_requires_its_checked_printer() {
-        use fln::EvaluationPresentation::{Lean, Raw};
+        use fln::EvaluationPresentation::{Lean, PreferRaw};
         assert_eq!(evaluation_presentation(Presentation::Lean), Lean);
         for json in [false, true] {
-            assert_eq!(evaluation_presentation(Presentation::Fln { json }), Raw);
+            assert_eq!(
+                evaluation_presentation(Presentation::Fln { json }),
+                PreferRaw
+            );
         }
     }
 

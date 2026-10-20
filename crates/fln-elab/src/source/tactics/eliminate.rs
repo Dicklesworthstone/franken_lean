@@ -235,6 +235,57 @@ impl Context {
         }
         Ok(value)
     }
+    /// The pin instantiates a recursor's motive and parameters with `instantiateForall`, whose
+    /// `instantiateBetaRevRange` reduces the redexes that substitution exposes: an induction
+    /// hypothesis reads `tail.append [] = tail`, never `(fun a => a.append [] = a) tail`, and
+    /// `rw [ih]` takes the former's `Eq` head without reducing. A recursor's own type puts no
+    /// lambda in head position, so a substitution-made redex can stand only at the result of a
+    /// binder's telescope (`motive tail`, `∀ a, motive (f a)`).
+    fn beta_telescope_result(&mut self, type_: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        // The motive may still be an assigned metavariable here (`?motive tail`).
+        let type_ = &self.instantiate(type_)?;
+        let mut binders = Vec::new();
+        let mut body = type_.clone();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body: next,
+            binder_info,
+        } = body.node()
+        {
+            self.tick()?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            body = next.clone();
+        }
+        let mut reduced = false;
+        loop {
+            self.tick()?;
+            let mut args = Vec::new();
+            let mut head = body.clone();
+            while let ExprNode::App { f, a } = head.node() {
+                self.tick()?;
+                args.push(a.clone());
+                head = f.clone();
+            }
+            let (ExprNode::Lam { body: inner, .. }, Some(first)) = (head.node(), args.pop()) else {
+                break;
+            };
+            body = self.substitute(inner, &first)?;
+            while let Some(arg) = args.pop() {
+                body = Expr::app(body, arg);
+            }
+            reduced = true;
+        }
+        if !reduced {
+            return Ok(type_.clone());
+        }
+        for (name, domain, info) in binders.into_iter().rev() {
+            self.tick()?;
+            body = Expr::forall_e(name, domain, body, info);
+        }
+        Ok(body)
+    }
+
     fn elimination_binder(
         &mut self,
         goal: &mut ProofGoal,
@@ -243,24 +294,20 @@ impl Context {
     ) -> Result<LocalDecl, NatDefinitionElabError> {
         let target = self.whnf(&goal.target)?;
         let ExprNode::ForallE {
-            binder_name,
             binder_type,
             body,
             binder_info,
+            ..
         } = target.node()
         else {
             return Err(error(TacticError::UnsupportedEliminator));
         };
-        let name = if visible && name.is_anonymous() {
-            self.fresh_inaccessible(binder_name)?
-        } else {
-            name
-        };
         let id = FVarId(self.fresh_name()?);
+        let type_ = self.beta_telescope_result(binder_type)?;
         let local = LocalDecl {
             id: id.clone(),
             user_name: name,
-            type_: binder_type.clone(),
+            type_,
             value: None,
             binder_info: *binder_info,
             index: self.txn.lctx.len(),
@@ -379,7 +426,7 @@ impl Context {
                 .transpose()?;
             let id = FVarId(self.fresh_name()?);
             let name = if names.contains(&old.user_name) {
-                self.fresh_inaccessible(&old.user_name)?
+                Name::anonymous()
             } else {
                 old.user_name.clone()
             };
@@ -1181,10 +1228,7 @@ impl Context {
                 return Err(error(TacticError::UnsupportedEliminator));
             };
             self.txn.lctx = retained.clone();
-            let (hole, mut branch) = self.proof_goal(minor.clone())?;
-            if let LeafView::Str(leaf) = constructor.base.name.leaf_view() {
-                branch.tag = append_goal_tag(&goal.tag, &Name::from_components([leaf]));
-            }
+            let (hole, branch) = self.proof_goal(minor.clone())?;
             let script = scripts.remove(&rule.ctor);
             let alternative = script.as_ref().or(fallback.as_ref());
             let mut hypotheses = Vec::new();
@@ -1218,12 +1262,7 @@ impl Context {
             )?;
             let work_start = proof.work.len();
             let branch = if let Some(equations) = equations {
-                self.refine_index_branch(
-                    proof,
-                    branch,
-                    &equations.names,
-                    equations.tactic_major.as_ref(),
-                )?
+                self.refine_index_branch(proof, branch, &equations.names)?
             } else {
                 Some(branch)
             };

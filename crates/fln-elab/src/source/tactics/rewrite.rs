@@ -4,6 +4,7 @@ mod locations;
 mod matching;
 mod offset;
 mod simplify;
+pub(in crate::source) use simplify::SimpKeyCache;
 use simplify::SimpRule;
 
 pub(in crate::source) struct RewriteMatch {
@@ -331,8 +332,7 @@ impl Context {
         let ExprNode::Sort { level: v } = universe.node() else {
             return Err(failure(SourceInferenceError::ExpectedType));
         };
-        let (child, mut next_goal) = self.proof_goal(next_target)?;
-        next_goal.tag = goal.tag.clone();
+        let (child, next_goal) = self.proof_goal(next_target)?;
         // Retain the original rule even for definitionally equal endpoints.
         // Its arguments must reach final admission before beta/zeta reduction
         // can erase them, including answers to otherwise unused side goals.

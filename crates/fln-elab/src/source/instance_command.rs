@@ -60,12 +60,10 @@ pub(super) fn prepare_header(
             None => {}
         }
     }
-    if !is_proof && no_expose {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "public data instances with exposed bodies",
-        });
-    }
-    Ok((is_proof, is_proof && (no_expose || !expose)))
+    // no_expose wins over explicit and automatic exposure, for data as
+    // well as proof instances (MutualDef.finishElab). The public driver
+    // admits the hidden implementation before exporting its exact type.
+    Ok((is_proof, no_expose || (is_proof && !expose)))
 }
 
 /// An instance's declaration binders and result are fixed in the public world.

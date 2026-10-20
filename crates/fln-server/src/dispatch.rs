@@ -22,6 +22,7 @@ pub mod semantic;
 use documents::CheckSource;
 pub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};
 mod json;
+mod rpc;
 mod session;
 mod wait;
 mod wire;
@@ -841,6 +842,7 @@ fn serve_inner(
     let mut waits = PendingDiagnosticWaits::new();
     let mut frontiers = BTreeMap::new();
     let mut file_watcher = watch::Registration::default();
+    let mut rpc_sessions = rpc::Sessions::default();
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -852,7 +854,11 @@ fn serve_inner(
             });
         };
         let text = match String::from_utf8(message) {
-            Ok(text) => text,
+            // Sessions are also checked at use, including after native queries.
+            Ok(text) => {
+                rpc_sessions.sweep(std::time::Instant::now());
+                text
+            }
             Err(_) => {
                 write_protocol_message(
                     output,
@@ -931,6 +937,12 @@ fn serve_inner(
         let mut checked_event = None;
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
+                if on_did_open.semantic_queries()
+                    && let Err(problem) = rpc_sessions.configure(envelope.params)
+                {
+                    write_protocol_message(output, error_response(request_id, -32602, problem))?;
+                    continue;
+                }
                 file_watcher.configure(envelope.params, on_did_open.tracks_dependencies());
                 let response = if on_did_open.semantic_queries() {
                     semantic::initialize_response(request_id)
@@ -965,6 +977,7 @@ fn serve_inner(
                 write_protocol_message(output, null_response(request_id))?;
                 state = ServerState::ShuttingDown;
                 file_watcher.stop();
+                rpc_sessions.clear();
             }
             ("shutdown", Some(request_id), _) => {
                 if !running_request(output, state, request_id)? {
@@ -984,6 +997,7 @@ fn serve_inner(
                     handle_open(output, &mut session, envelope.params, on_did_open)?
                 {
                     documents_opened = documents_opened.saturating_add(1);
+                    rpc_sessions.close(&checked.uri);
                     checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
@@ -1035,6 +1049,7 @@ fn serve_inner(
                 if let Some(uri) =
                     handle_close(output, &mut session, &mut frontiers, envelope.params)?
                 {
+                    rpc_sessions.close(&uri);
                     fail_waits(
                         output,
                         waits.drain_uri(&uri),
@@ -1076,10 +1091,9 @@ fn serve_inner(
             }
             ("$/lean/rpc/keepAlive", None, ServerState::Running)
             | ("$/lean/rpc/release", None, ServerState::Running) => {
-                write_warning(
-                    output,
-                    "FrankenLean ignored an RPC-session notification because Lean RPC sessions are not implemented",
-                )?;
+                if let Err((_, problem)) = rpc_sessions.notify(&method, envelope.params) {
+                    write_warning(output, &problem)?;
+                }
             }
             (method, None, state) if is_notification_method(method) => {
                 let message = match state {
@@ -1094,6 +1108,7 @@ fn serve_inner(
                 write_warning(output, message)?;
             }
             ("$/lean/plainGoal", Some(request_id), state)
+            | ("$/lean/plainTermGoal", Some(request_id), state)
             | ("textDocument/hover", Some(request_id), state)
             | ("textDocument/definition", Some(request_id), state)
             | ("textDocument/completion", Some(request_id), state) => {
@@ -1108,20 +1123,17 @@ fn serve_inner(
                     )?;
                 }
             }
-            ("$/lean/plainTermGoal", Some(request_id), state) => {
-                if running_request(output, state, request_id)? {
-                    write_protocol_message(output, null_response(request_id))?;
-                }
-            }
             ("$/lean/rpc/connect", Some(request_id), state)
             | ("$/lean/rpc/call", Some(request_id), state) => {
                 if running_request(output, state, request_id)? {
                     write_protocol_message(
                         output,
-                        error_response(
+                        rpc_sessions.request(
+                            &method,
+                            envelope.params,
                             request_id,
-                            REQUEST_FAILED_CODE,
-                            "Lean RPC sessions are not implemented by this FrankenLean server",
+                            &session,
+                            on_did_open,
                         ),
                     )?;
                 }
@@ -1276,7 +1288,7 @@ mod tests {
         ]);
         assert!(outcome.clean);
         assert!(output.contains("\"id\":\"rpc\",\"error\":{\"code\":-32803"));
-        assert!(output.contains("Lean RPC sessions are not implemented"));
+        assert!(output.contains("Lean RPC requires a native semantic query provider"));
     }
 
     #[test]

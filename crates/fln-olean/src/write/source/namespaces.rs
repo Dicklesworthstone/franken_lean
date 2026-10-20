@@ -89,6 +89,7 @@ pub(super) fn encode(
             && metadata.protected.is_empty()
             && metadata.aux_recursors.is_empty()
             && metadata.noncomputable.is_empty()
+            && metadata.defeq.is_empty()
             && metadata.reducibility.is_empty()
         {
             encode_module(input, header, budget)

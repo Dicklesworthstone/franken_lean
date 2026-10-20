@@ -1040,8 +1040,9 @@ fn symbol_then_argument(body: &Descr) -> bool {
                 if simple(category).as_deref() == Some("term") && *prec >= 1023))
 }
 
-/// Whether every input `descr` reads ends with an atom, so the parser it compiles to ends where
-/// that atom does rather than where a trailing term would.
+/// Whether every input `descr` reads has an atom-bounded endpoint. An argument-
+/// precedence term has the same boundary: `Run::term_end` reads one complete
+/// atom or bracketed term, not the remaining enclosing expression.
 fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
     if depth > MAX_DESCR_DEPTH {
         return false;
@@ -1055,6 +1056,10 @@ fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
             simple(name).as_deref(),
             Some("ident" | "num" | "str" | "char" | "scientific" | "name")
         ),
+        // This applies to the final argument of a whole sequence, not just
+        // `symbol_then_argument`'s one-argument spelling. Without it a valid
+        // two-argument macro is registered but never offered to the parser.
+        Descr::Cat(category, prec) => simple(category).as_deref() == Some("term") && *prec >= 1023,
         Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
             ends_with_atom(body, depth + 1)
         }
@@ -2247,7 +2252,10 @@ impl Expander {
     /// declaration referred to rather than to a binder at the use. Notation inside an expansion
     /// is expanded too, to a bounded depth.
     pub fn expand(&self, syntax: &Syntax) -> Result<Syntax, &'static str> {
-        if self.rules.is_empty() && self.interpolation_kinds.is_empty() {
+        if self.rules.is_empty()
+            && self.interpolation_kinds.is_empty()
+            && !contains_debug_trace(syntax)
+        {
             return Ok(syntax.clone());
         }
         self.expand_at(syntax, 0)
@@ -2292,16 +2300,82 @@ impl Expander {
                 Task::Visit(leaf) => built.push(leaf.clone()),
                 Task::Build(info, kind, count) => {
                     let args = built.split_off(built.len() - count);
-                    let node = Syntax::Node {
-                        info,
-                        kind: kind.clone(),
-                        args,
-                    };
-                    built.push(node);
+                    if kind == &crate::parser_kind(&["Term", "dbgTrace"]) {
+                        built.push(self.expand_debug_trace(args)?);
+                    } else {
+                        built.push(Syntax::Node {
+                            info,
+                            kind: kind.clone(),
+                            args,
+                        });
+                    }
                 }
             }
         }
         built.pop().ok_or("an empty expansion")
+    }
+
+    /// The pin's builtin expandDbgTrace macro (Lean/Elab/BuiltinNotation.lean).
+    /// Children are already expanded by the surrounding heap walk. The anonymous
+    /// Unit binder cannot capture a user variable, and globals are resolved at
+    /// their original declarations even under local or namespace shadowing.
+    fn expand_debug_trace(&self, mut args: Vec<Syntax>) -> Result<Syntax, &'static str> {
+        if args.len() != 4 {
+            return Err("a dbg_trace syntax shape");
+        }
+        let body = args.pop().ok_or("a dbg_trace body")?;
+        let separator = args.pop().ok_or("a dbg_trace separator")?;
+        let argument = args.pop().ok_or("a dbg_trace argument")?;
+        let keyword = args.pop().ok_or("a dbg_trace keyword")?;
+        if !matches!(&keyword, Syntax::Atom { val, .. } if val == "dbg_trace")
+            || !(matches!(&separator, Syntax::Atom { val, .. } if val == ";")
+                || matches!(&separator, Syntax::Node { kind, args, .. }
+                    if *kind == Name::from_components(["null"]) && args.is_empty()))
+        {
+            return Err("a dbg_trace keyword or continuation separator");
+        }
+        let global = |parts: &[&str]| {
+            let name = Name::from_components(parts.iter().copied());
+            Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::empty_at(BytePos(0)),
+                val: Name::from_components(["_root_"]).append_core(&name),
+                preresolved: vec![Preresolved::Decl {
+                    name,
+                    fields: Vec::new(),
+                }],
+            }
+        };
+        let app = |function: Syntax, arguments: Vec<Syntax>| {
+            Syntax::node(
+                crate::parser_kind(&["Term", "app"]),
+                vec![function, null_node(arguments)],
+            )
+        };
+        let message = if argument.kind() == Some(&Name::from_components(["interpolatedStrKind"])) {
+            self.expand_interpolation(&[Syntax::atom(SourceInfo::None, "s!"), argument])?
+        } else {
+            app(global(&["ToString", "toString"]), vec![argument])
+        };
+        let thunk = Syntax::node(
+            crate::parser_kind(&["Term", "fun"]),
+            vec![
+                Syntax::atom(SourceInfo::None, "fun"),
+                Syntax::node(
+                    crate::parser_kind(&["Term", "basicFun"]),
+                    vec![
+                        null_node(vec![Syntax::node(
+                            crate::parser_kind(&["Term", "hole"]),
+                            vec![Syntax::atom(SourceInfo::None, "_")],
+                        )]),
+                        null_node(Vec::new()),
+                        Syntax::atom(SourceInfo::None, "=>"),
+                        body,
+                    ],
+                ),
+            ],
+        );
+        Ok(app(global(&["dbgTrace"]), vec![message, thunk]))
     }
 
     /// Native `Init.Data.ToString.Macro` expansion, following
@@ -2406,6 +2480,7 @@ impl Expander {
         // Rebuild the template bottom-up with the substitutions applied.
         enum Step<'a> {
             Visit(&'a Syntax),
+            Raw(&'a Syntax),
             Build(fln_syntax::source::SourceInfo, &'a Name, usize),
         }
         let mut steps = vec![Step::Visit(&rule.rhs)];
@@ -2413,8 +2488,21 @@ impl Expander {
             match step {
                 Step::Visit(Syntax::Node { info, kind, args }) => {
                     steps.push(Step::Build(*info, kind, args.len()));
-                    steps.extend(args.iter().rev().map(Step::Visit));
+                    steps.extend(args.iter().enumerate().rev().map(|(index, child)| {
+                        if raw_identifier_slot(kind, index) {
+                            Step::Raw(child)
+                        } else {
+                            Step::Visit(child)
+                        }
+                    }));
                 }
+                // Labels are not hygienic term identifiers (the pin uses
+                // rawIdent or erases macro scopes when interpreting them).
+                // Antiquoted labels still substitute their syntax.
+                Step::Raw(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
+                    leaves.push(bound[val].clone());
+                }
+                Step::Raw(leaf) => leaves.push(leaf.clone()),
                 Step::Visit(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
                     leaves.push(bound[val].clone());
                 }
@@ -2447,6 +2535,23 @@ impl Expander {
         }
         leaves.pop().ok_or("an empty template")
     }
+}
+
+/// Literal identifier positions with the pin's raw-label semantics.
+/// Quotation name resolution and instantiation share this distinction: a label
+/// is neither a global reference nor a local binder. Its value expression is.
+pub fn raw_identifier_slot(kind: &Name, index: usize) -> bool {
+    [
+        ("namedArgument", 1),
+        ("structInstLVal", 0),
+        ("proj", 2),
+        ("dotIdent", 1),
+        ("pipeProj", 2),
+    ]
+    .iter()
+    .any(|(leaf, slot)| {
+        index == *slot && *kind == Name::from_components(["Lean", "Parser", "Term", leaf])
+    })
 }
 
 /// What a node of a notation the file declared expands to: `elabNotation`'s `macro_rules` (the
@@ -3224,12 +3329,30 @@ pub(crate) fn with_token_table<R>(lex: impl FnOnce(&TokenTable) -> R) -> R {
 /// closes its brace. The plain lexer read such a string as one literal, or, with a `"` inside a
 /// hole, as several, so the run is re-lexed from the string on. A string this cannot read (no
 /// closing quote, a refused token in a hole) is left as the plain lexer read it.
-pub(crate) fn interpolate(text: &SourceText, table: &TokenTable, run: LexRun) -> LexRun {
-    let Some(grammar) = active() else {
-        return run;
-    };
-    if grammar.interpolated.is_empty() {
-        return run;
+pub(crate) fn interpolate(
+    text: &SourceText,
+    table: &TokenTable,
+    run: LexRun,
+) -> Result<LexRun, BytePos> {
+    interpolate_at(text, table, run, 0)
+}
+
+fn interpolate_at(
+    text: &SourceText,
+    table: &TokenTable,
+    run: LexRun,
+    depth: usize,
+) -> Result<LexRun, BytePos> {
+    let grammar = active();
+    if grammar
+        .as_ref()
+        .is_none_or(|grammar| grammar.interpolated.is_empty())
+        && !run.events.iter().any(|event| {
+            matches!(event, Event::Token(LexedToken { kind: TokenKind::Symbol(symbol), .. })
+                if symbol == "dbg_trace")
+        })
+    {
+        return Ok(run);
     }
     let mut events = Vec::with_capacity(run.events.len());
     let mut pending = run.events;
@@ -3238,18 +3361,16 @@ pub(crate) fn interpolate(text: &SourceText, table: &TokenTable, run: LexRun) ->
         let event = pending[index].clone();
         index += 1;
         let head = matches!(&event, Event::Token(LexedToken { kind: TokenKind::Symbol(symbol), .. })
-            if grammar.interpolated.contains(symbol.as_str()));
+            if symbol == "dbg_trace"
+                || grammar.as_ref().is_some_and(|grammar| grammar.interpolated.contains(symbol.as_str())));
         events.push(event);
         if !head {
             continue;
         }
-        // Trivia, then the string the head reads.
         let mut next = index;
         while matches!(pending.get(next), Some(Event::Trivia(_))) {
             next += 1;
         }
-        // The plain lexer may have refused the string: an interpolated string's escapes
-        // (`\{`) are no plain string's.
         let start = match pending.get(next) {
             Some(Event::Token(string)) => string.extent.start(),
             Some(Event::Refused { skipped, .. }) => skipped.start(),
@@ -3258,7 +3379,13 @@ pub(crate) fn interpolate(text: &SourceText, table: &TokenTable, run: LexRun) ->
         if !text.as_str()[start.0..].starts_with('"') {
             continue;
         }
-        let Some((chunks, end)) = interpolated_string(text, table, start) else {
+        // Lexical recursion happens before the syntax parser's own guard.
+        // Propagate exhaustion immediately instead of retrying the remaining
+        // nested strings as plain tokens at every level.
+        if depth >= crate::NESTED_TERM_DEPTH {
+            return Err(start);
+        }
+        let Some((chunks, end)) = interpolated_string(text, table, start, depth + 1)? else {
             continue;
         };
         events.extend(pending[index..next].iter().cloned());
@@ -3266,7 +3393,34 @@ pub(crate) fn interpolate(text: &SourceText, table: &TokenTable, run: LexRun) ->
         pending = lex_run_from(text, table, end).events;
         index = 0;
     }
-    LexRun { events }
+    Ok(LexRun { events })
+}
+
+/// The builtin diagnostic parser shares the exact chunk and hole reader used
+/// by imported interpolation syntax. Reentry through a hole uses the parser's
+/// existing host-stack bound, rather than creating an unbounded recursive lane.
+pub(crate) fn interpolated_term(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+    end: usize,
+) -> Option<(Syntax, usize)> {
+    if crate::NESTED_TERMS.with(|open| open.get()) >= crate::NESTED_TERM_DEPTH {
+        return None;
+    }
+    crate::NESTED_TERMS.with(|open| open.set(open.get() + 1));
+    let _entered = crate::NestedTerm;
+    let (mut items, next) = Run {
+        leaves,
+        view,
+        tokens,
+    }
+    .interpolated(&Descr::Cat(Name::from_components(["term"]), 0), at, end, 0)?;
+    if items.len() != 1 {
+        return None;
+    }
+    Some((items.pop()?, next))
 }
 
 /// The events of one interpolated string at `start` (its opening quote), and where it ends.
@@ -3274,81 +3428,119 @@ fn interpolated_string(
     text: &SourceText,
     table: &TokenTable,
     start: BytePos,
-) -> Option<(Vec<Event>, BytePos)> {
-    let source = text.as_str();
-    let chunk = |from: usize, to: usize| {
-        ByteSpan::new(BytePos(from), BytePos(to)).map(|extent| {
-            Event::Token(LexedToken {
-                kind: TokenKind::Literal(LiteralKind::Str),
-                extent,
+    depth: usize,
+) -> Result<Option<(Vec<Event>, BytePos)>, BytePos> {
+    let mut refusal = None;
+    let result = (|| {
+        let source = text.as_str();
+        let chunk = |from: usize, to: usize| {
+            ByteSpan::new(BytePos(from), BytePos(to)).map(|extent| {
+                Event::Token(LexedToken {
+                    kind: TokenKind::Literal(LiteralKind::Str),
+                    extent,
+                })
             })
-        })
-    };
-    let mut out = Vec::new();
-    let mut chunk_start = start.0;
-    let mut at = start.0 + 1;
-    loop {
-        let c = source[at..].chars().next()?;
-        match c {
-            '\\' => {
-                at += 1;
-                at += source[at..].chars().next()?.len_utf8();
-            }
-            '"' => {
-                out.push(chunk(chunk_start, at + 1)?);
-                return Some((out, BytePos(at + 1)));
-            }
-            '{' => {
-                out.push(chunk(chunk_start, at + 1)?);
-                let mut depth = 0usize;
-                let mut close = None;
-                // An interpolated string inside the hole (`{… s!"x{i}" …}`) is read as one too;
-                // its chunks are literals, so the braces counted here stay the hole's.
-                for event in
-                    interpolate(text, table, lex_run_from(text, table, BytePos(at + 1))).events
-                {
-                    match &event {
-                        Event::Refused { .. } => return None,
-                        Event::Token(LexedToken {
-                            kind: TokenKind::Symbol(symbol),
-                            extent,
-                        }) if symbol == "}" => {
-                            if depth == 0 {
-                                close = Some(extent.start().0);
-                                break;
-                            }
-                            depth -= 1;
-                        }
-                        Event::Token(LexedToken {
-                            kind: TokenKind::Symbol(symbol),
-                            ..
-                        }) if symbol == "{" => depth += 1,
-                        _ => {}
-                    }
-                    out.push(event);
+        };
+        let mut out = Vec::new();
+        let mut chunk_start = start.0;
+        let mut at = start.0 + 1;
+        loop {
+            let c = source[at..].chars().next()?;
+            match c {
+                '\\' => {
+                    at += 1;
+                    at += source[at..].chars().next()?.len_utf8();
                 }
-                chunk_start = close?;
-                at = chunk_start + 1;
+                '"' => {
+                    out.push(chunk(chunk_start, at + 1)?);
+                    return Some((out, BytePos(at + 1)));
+                }
+                '{' => {
+                    out.push(chunk(chunk_start, at + 1)?);
+                    let mut nesting = 0usize;
+                    let mut close = None;
+                    let nested = match interpolate_at(
+                        text,
+                        table,
+                        lex_run_from(text, table, BytePos(at + 1)),
+                        depth,
+                    ) {
+                        Ok(run) => run,
+                        Err(at) => {
+                            refusal = Some(at);
+                            return None;
+                        }
+                    };
+                    for event in nested.events {
+                        match &event {
+                            Event::Refused { .. } => return None,
+                            Event::Token(LexedToken {
+                                kind: TokenKind::Symbol(symbol),
+                                extent,
+                            }) if symbol == "}" => {
+                                if nesting == 0 {
+                                    close = Some(extent.start().0);
+                                    break;
+                                }
+                                nesting -= 1;
+                            }
+                            Event::Token(LexedToken {
+                                kind: TokenKind::Symbol(symbol),
+                                ..
+                            }) if symbol == "{" => nesting += 1,
+                            _ => {}
+                        }
+                        out.push(event);
+                    }
+                    chunk_start = close?;
+                    at = chunk_start + 1;
+                }
+                c => at += c.len_utf8(),
             }
-            c => at += c.len_utf8(),
         }
+    })();
+    match refusal {
+        Some(at) => Err(at),
+        None => Ok(result),
     }
 }
 
-/// Expand the notations of the entered grammar's file in `syntax` ([`Expander::expand`]):
-/// `None` when no grammar is entered or its file declared none, so the caller keeps its tree.
-pub fn expand_active(syntax: &Syntax) -> Result<Option<Syntax>, &'static str> {
-    let Some(grammar) = active() else {
-        return Ok(None);
-    };
-    match &grammar.expander {
-        Some(expander)
-            if !expander.rules.is_empty() || !expander.interpolation_kinds.is_empty() =>
-        {
-            expander.expand(syntax).map(Some)
+fn contains_debug_trace(syntax: &Syntax) -> bool {
+    let kind = crate::parser_kind(&["Term", "dbgTrace"]);
+    let mut pending = vec![syntax];
+    while let Some(node) = pending.pop() {
+        if node.kind() == Some(&kind) {
+            return true;
         }
-        _ => Ok(None),
+        if let Syntax::Node { args, .. } = node {
+            pending.extend(args);
+        }
     }
+    false
+}
+
+/// Expand the entered grammar's notations and builtin diagnostic syntax.
+/// Builtins remain available to callers without a file grammar; all declaration
+/// lookup and type-class synthesis still occur in ordinary elaboration.
+pub fn expand_active(syntax: &Syntax) -> Result<Option<Syntax>, &'static str> {
+    let builtin = contains_debug_trace(syntax);
+    if let Some(grammar) = active()
+        && let Some(expander) = &grammar.expander
+        && (builtin || !expander.rules.is_empty() || !expander.interpolation_kinds.is_empty())
+    {
+        return expander.expand(syntax).map(Some);
+    }
+    if !builtin {
+        return Ok(None);
+    }
+    Expander {
+        rules: Arc::new(BTreeMap::new()),
+        interpolation_kinds: Arc::new(BTreeSet::new()),
+        expansions: Rc::new(Cell::new(0)),
+        context: Name::anonymous(),
+    }
+    .expand(syntax)
+    .map(Some)
 }
 
 /// The active infix declarations spelled `symbol`.

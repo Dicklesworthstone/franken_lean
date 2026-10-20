@@ -114,3 +114,118 @@ fn equal_machine_categories_do_not_authorize_a_representation_changing_cast() {
         .is_err()
     );
 }
+
+#[test]
+fn boxed_type_refinements_keep_the_payload_interface_and_typed_result_boundary() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+    let boxed = prep.enable_boxed_type().unwrap();
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let callback = Expr::forall_e(name("n"), nat.clone(), nat.clone(), BinderInfo::Default);
+    let lambda = Expr::lam(
+        name("n"),
+        nat.clone(),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let recursor = Expr::const_(
+        name("Eq.rec"),
+        vec![Level::one(), Level::succ(Level::one()).unwrap()],
+    );
+    let motive = Expr::lam(
+        name("A"),
+        Expr::sort(Level::one()),
+        Expr::lam(
+            name("proof"),
+            Expr::sort(Level::zero()),
+            Expr::bvar(1).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let arguments = |before: Expr, after: Expr, value: Expr| {
+        [
+            Expr::sort(Level::one()),
+            before,
+            motive.clone(),
+            value,
+            after,
+            Expr::const_(name("Bool.false"), vec![]),
+        ]
+    };
+
+    // These private-ingress probes inspect the representation boundary with
+    // synthetic proof metadata. The source integration tests establish that
+    // real checked Type refinements reach it; no public checker accepts this
+    // deliberately fabricated proof.
+    let boxed_lambda = prep
+        .equality_transport(
+            &recursor,
+            &arguments(callback.clone(), boxed.clone(), lambda.clone()),
+        )
+        .unwrap()
+        .unwrap();
+    let ExprNode::LetE { type_, value, .. } = boxed_lambda.node() else {
+        panic!("boxing keeps a typed value binding")
+    };
+    assert_eq!(*type_, boxed);
+    let ExprNode::LetE { type_, value, .. } = value.node() else {
+        panic!("a literal callback must retain its concrete interface")
+    };
+    assert_eq!(*type_, callback);
+    assert_eq!(*value, lambda);
+
+    for concrete in [nat, callback] {
+        let unboxed = prep
+            .equality_transport(
+                &recursor,
+                &arguments(boxed.clone(), concrete.clone(), Expr::bvar(0).unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+        let ExprNode::LetE { type_, value, .. } = unboxed.node() else {
+            panic!("unboxing keeps a typed result binding")
+        };
+        assert_eq!(*type_, concrete);
+        assert_eq!(*value, Expr::bvar(0).unwrap());
+    }
+
+    // Enabling the boxed carrier does not authorize two concrete layouts,
+    // an unsupported payload type, or value-level endpoint erasure.
+    for (before, after, carrier) in [
+        (
+            Expr::const_(name("Nat"), vec![]),
+            Expr::const_(name("String"), vec![]),
+            Expr::sort(Level::one()),
+        ),
+        (
+            indexed::pending_parameter(),
+            boxed.clone(),
+            Expr::sort(Level::one()),
+        ),
+        (
+            Expr::const_(name("Nat"), vec![]),
+            boxed.clone(),
+            Expr::const_(name("Nat"), vec![]),
+        ),
+    ] {
+        let mut args = arguments(before, after, nat::literal(42));
+        args[0] = carrier;
+        assert!(prep.equality_transport(&recursor, &args).is_err());
+    }
+
+    let mut unregistered = Preparation::new(&engine.environment, IngressLimits::default());
+    assert!(
+        unregistered
+            .equality_transport(
+                &recursor,
+                &arguments(Expr::const_(name("Nat"), vec![]), boxed, nat::literal(42)),
+            )
+            .is_err(),
+        "a private name alone is not permission to box a value"
+    );
+}

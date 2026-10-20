@@ -1,0 +1,131 @@
+name: Native default prerequisites
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-default-prerequisites.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'Dicklesworthstone/franken_lean'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare readable candidate and Reference-accepted fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, re, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-evidence'
+          root.mkdir()
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          def fetch(sha):
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
+                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = base64.b64decode(json.load(response)['content'])
+              assert blob(data) == sha
+              return data.decode('utf-8')
+          production = pathlib.Path('crates/fln-elab/src/source/instances.rs')
+          assert blob(production.read_bytes()) == 'f9cea5186bbaba747971873c35f6e151151c4d7c'
+          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          patch = fetch('feec874f532ff69a3b3c64ca41b7aa734eb9c3c4')
+          (root / 'implementation.patch').write_text(patch)
+          test_path = pathlib.Path('crates/fln/tests/source_default_prerequisites.rs')
+          fixture_path = pathlib.Path('crates/fln/tests/support/default_prerequisites.lean')
+          assert not test_path.exists() and not fixture_path.exists()
+          test = fetch('a7d8156f08a6d8577e07f16d74a7fba8de79aefc')
+          test = test.replace('fn ordinary_instance_metadata_does_not_reorder_default_prerequisites()', 'fn default_only_outer_candidate_preserves_reverse_telescope_order()')
+          test = test.replace('"@[default_instance] def preferred",\n        "@[default_instance] instance preferred",', '"@[default_instance] instance preferred",\n        "@[default_instance] def preferred",')
+          test = test.replace('let next = index + 1;\n        source.push_str', 'let next = index + 1;\n        let kind = if index == 0 { "instance" } else { "def" };\n        source.push_str').replace('def link{index}', '{kind} link{index}')
+          test_path.write_text(test)
+          fixture = fetch('b0d01a38112b57331efc95fe4cd76e3f13dae56e')
+          fixture = re.sub(r'(@\[default_instance[^]]*\]) def (preferred|fallback|unavailable)([^\n]* : Supply[^\n]*)', r'\1 instance \2\3', fixture)
+          anchor = '@[default_instance] instance preferred {A : Type} [First A] [Last A] : Supply A :=\n  { value := First.value }'
+          assert fixture.count(anchor) == 1
+          fixture = fixture.replace(anchor, anchor + '\ninstance (priority := 1) alternate : Supply Nat := { value := 9 }')
+          fixture_path.write_text(fixture)
+          subprocess.run(['git', 'apply', '--check', str(root / 'implementation.patch')], check=True)
+      - name: Verify exact compiler and Reference
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          test "$(rustc -vV | sed -n 's/^commit-hash: //p')" = 90850177249efe0321573c569aec5d12b257f8d6
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Check shared Reference computation proofs
+        run: '"$FLN_REFERENCE_LIB/../../bin/lean" crates/fln/tests/support/default_prerequisites.lean'
+      - name: Reproduce the original concrete-prerequisite failure
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          result = subprocess.run(['cargo', 'test', '--locked', '--offline', '-p', 'fln', '--test', 'source_default_prerequisites', 'concrete_prerequisite_uses_a_default_only_registration', '--', '--exact', '--nocapture'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          print(result.stdout, flush=True)
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-evidence/baseline.log').write_text(result.stdout)
+          assert result.returncode == 101 and 'test result: FAILED.' in result.stdout
+          assert 'concrete_prerequisite_uses_a_default_only_registration ... FAILED' in result.stdout
+      - name: Apply and verify the exact locally checked source bytes
+        run: |
+          set -euo pipefail
+          git apply "$RUNNER_TEMP/default-evidence/implementation.patch"
+          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/source/instances.rs crates/fln/tests/source_default_prerequisites.rs
+          test "$(git hash-object crates/fln-elab/src/source/instances.rs)" = 8781c22650fcee7c0557d3dd001a2d0632f04f4d
+          test "$(git hash-object crates/fln/tests/source_default_prerequisites.rs)" = 5317491713664f5b0bd9d437b5ef95e450295c41
+          test "$(git hash-object crates/fln/tests/support/default_prerequisites.lean)" = 60349ece5ea1e20b7ef029864fdba19da333505d
+          git diff --check
+      - name: Check nested defaults and retained instance behavior
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln --test source_default_prerequisites --test source_default_instances --test source_numeric_literals --test source_postponed_applications --test source_instance_universe_holes --no-fail-fast -- --nocapture --test-threads=2
+          cargo test --locked --offline -p fln-elab --lib source::instances -- --test-threads=2
+          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln --test source_default_prerequisites -- -D warnings
+      - name: Preserve tested objects without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, urllib.request
+          blobs = {}
+          for path in ['crates/fln-elab/src/source/instances.rs', 'crates/fln/tests/source_default_prerequisites.rs', 'crates/fln/tests/support/default_prerequisites.lean']:
+              data = pathlib.Path(path).read_bytes()
+              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs',
+                  data=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode(),
+                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  assert json.load(response)['sha'] == expected
+              blobs[path] = expected
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-evidence'
+          receipt = {'base': (root / 'base.txt').read_text().strip(), 'blobs': blobs, 'published_branch': False}
+          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2), flush=True)
+      - name: Preserve exact source snapshot for further local validation
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/default-evidence"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/default-evidence/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/default-evidence/source-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: default-prerequisites-${{ github.sha }}
+          path: ${{ runner.temp }}/default-evidence
+          retention-days: 7

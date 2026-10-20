@@ -5,6 +5,11 @@ use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
 mod elaboration;
+mod library;
+mod local_functions;
+mod public_body;
+pub(crate) mod traces;
+pub use local_functions::SourceDeclarationAdmission;
 
 pub(crate) use elaboration::{
     apply_admission_effects, apply_batch_effects, apply_execution_effects,
@@ -131,7 +136,7 @@ impl EngineBuilder {
                     },
                 )?;
         }
-        Ok(Outcome::Complete(engine))
+        library::append_lemmas(engine, limits)
     }
 
     /// Construct a bounded coercion-seed engine using configured or default calibrated limits.
@@ -216,7 +221,10 @@ impl Engine {
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
             ScopedCommandSyntax::Mutual(members) => {
-                if members.iter().any(fln_elab::source::partial::is_partial) {
+                if members.iter().any(|member| {
+                    fln_elab::source::partial::is_partial(member)
+                        || fln_elab::source::partial::is_unsafe_definition(member)
+                }) {
                     let declarations = match elaboration_outcome(
                         fln_elab::source::partial::elaborate_group(
                             &members,
@@ -238,7 +246,7 @@ impl Engine {
                     match self
                         .check_parsed_source_command_in_scope(parsed, options, limits, 0, scope)?
                     {
-                        Outcome::Complete(checked) => {
+                        Outcome::Complete(_) => {
                             let root = self.logical_root(options);
                             Outcome::Complete(DeclarationBatchAdmission {
                                 engine: self.clone(),
@@ -246,7 +254,6 @@ impl Engine {
                                 result_logical_root: root,
                                 admissions: Vec::new(),
                                 local_instance: None,
-                                traces: checked.traces,
                             })
                         }
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -276,6 +283,23 @@ impl Engine {
         private_scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
         let parsed = match parse_scoped_command(source)? {
+            ScopedCommandSyntax::Definition(parsed)
+                if fln_elab::source::is_definition_body(parsed.syntax())
+                    && !public_scope
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                        .expose_definitions =>
+            {
+                return self.admit_hidden_public_definition(
+                    public,
+                    parsed.syntax(),
+                    options,
+                    limits,
+                    public_scope,
+                    private_scope,
+                );
+            }
             ScopedCommandSyntax::Definition(parsed)
                 if fln_elab::source::is_theorem(parsed.syntax())
                     || fln_elab::source::instance_registration(parsed.syntax())
@@ -312,12 +336,17 @@ impl Engine {
         };
         let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
         let candidate = if is_theorem {
-            fln_elab::source::elaborate_public_theorem_with_traces(
-                parsed.syntax(),
-                &worlds,
-                limits.kernel,
+            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel).map(
+                |theorem| {
+                    (
+                        theorem.declaration,
+                        true,
+                        true,
+                        theorem.noncomputable,
+                        theorem.local_functions,
+                    )
+                },
             )
-            .map(|(declaration, traces)| (declaration, true, true, false, traces))
         } else {
             fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
                 .map(|instance| {
@@ -326,19 +355,33 @@ impl Engine {
                         instance.proof_valued,
                         instance.hidden_body,
                         instance.noncomputable,
-                        instance.traces,
+                        instance.local_functions,
                     )
                 })
         };
-        let (candidate, proof_valued, hidden_body, inferred_noncomputable, traces) =
+        let (candidate, proof_valued, hidden_body, inferred_noncomputable, local_functions) =
             match elaboration_outcome(candidate)? {
                 Outcome::Complete(candidate) => candidate,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
         if !proof_valued {
-            if hidden_body
-                || !matches!(&candidate, Declaration::Defn(definition)
+            if hidden_body {
+                return self.admit_hidden_public_candidate(
+                    public,
+                    parsed.syntax(),
+                    fln_elab::source::ElaboratedDeclaration {
+                        declaration: candidate,
+                        local_functions,
+                        irreducible: false,
+                        noncomputable: inferred_noncomputable,
+                    },
+                    options,
+                    limits,
+                    public_scope,
+                );
+            }
+            if !matches!(&candidate, Declaration::Defn(definition)
                     if definition.safety == DefinitionSafety::Safe)
             {
                 return Err(EngineExecutionError::NotImplemented {
@@ -351,17 +394,15 @@ impl Engine {
                     candidate,
                     false,
                     inferred_noncomputable,
+                    local_functions,
                     options,
                     limits,
                     public_scope,
                 )? {
-                    Outcome::Complete(mut public) => {
-                        public.traces = traces;
-                        Outcome::Complete(PublicSourceAdmission {
-                            public,
-                            private_implementation: None,
-                        })
-                    }
+                    Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
+                        public,
+                        private_implementation: None,
+                    }),
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 },
@@ -395,7 +436,7 @@ impl Engine {
             };
             admitted.declaration.clone()
         };
-        let mut private_implementation = match self
+        let private_implementation = match self
             .admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)?
         {
@@ -403,7 +444,6 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        private_implementation.traces = traces;
         // Obtain the interface from the actual successful admission, never
         // from an independently supplied or caller-authored signature.
         let [admitted] = private_implementation.admissions.as_slice() else {
@@ -420,12 +460,23 @@ impl Engine {
             base: theorem.base.clone(),
             is_unsafe: false,
         });
+        let private_implementation = match self.finish_local_function_batch(
+            private_implementation,
+            &local_functions,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         Ok(
             match public.admit_scoped_candidate(
                 parsed.syntax(),
                 interface,
                 false,
                 false,
+                Vec::new(),
                 options,
                 limits,
                 public_scope,
@@ -485,6 +536,7 @@ impl Engine {
         declaration: Declaration,
         irreducible: bool,
         inferred_noncomputable: bool,
+        local_functions: Vec<Declaration>,
         options: &KVMap,
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
@@ -529,6 +581,20 @@ impl Engine {
         Ok(match result {
             Outcome::Complete(mut batch) => {
                 apply_batch_effects(&mut batch, irreducible, options)?;
+                if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
+                    for admitted in &batch.admissions {
+                        if let Declaration::Thm(theorem) = &admitted.declaration {
+                            batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                                batch.engine.environment(),
+                                &theorem.base.name,
+                                limits.kernel,
+                            )
+                            .map_err(DefinitionFrontendError::Elaborate)
+                            .map_err(EngineExecutionError::Frontend)?;
+                        }
+                    }
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
                 if let Some((name, priority)) = registration {
                     // Definitions, proof theorems and exported interfaces all
                     // retain the exact admitted generated instance name.
@@ -639,7 +705,7 @@ impl Engine {
                     batch.engine.environment = tag_protected(&batch.engine, &name)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                Outcome::Complete(batch)
+                return self.finish_local_function_batch(batch, &local_functions, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -855,34 +921,20 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                let traces = elaborated.traces;
-                return Ok(self
-                    .admit_scoped_candidate(
-                        parsed.syntax(),
-                        elaborated.declaration,
-                        elaborated.irreducible,
-                        elaborated.noncomputable,
-                        options,
-                        limits,
-                        scope,
-                    )?
-                    .map_complete(|mut batch| {
-                        batch.traces = traces;
-                        batch
-                    }));
+                return self.admit_scoped_candidate(
+                    parsed.syntax(),
+                    elaborated.declaration,
+                    elaborated.irreducible,
+                    elaborated.noncomputable,
+                    elaborated.local_functions,
+                    options,
+                    limits,
+                    scope,
+                );
             }
             return Ok(
-                match self.admit_source_declaration_with_traces(source, options, limits)? {
-                    Outcome::Complete((admitted, traces)) => {
-                        Outcome::Complete(DeclarationBatchAdmission {
-                            engine: admitted.engine.clone(),
-                            base_logical_root: admitted.base_logical_root,
-                            result_logical_root: admitted.result_logical_root,
-                            admissions: vec![admitted],
-                            local_instance: None,
-                            traces,
-                        })
-                    }
+                match self.admit_source_declaration(source, options, limits)? {
+                    Outcome::Complete(admitted) => Outcome::Complete(admitted.into_batch()),
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 },

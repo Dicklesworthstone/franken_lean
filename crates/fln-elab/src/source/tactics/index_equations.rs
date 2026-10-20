@@ -15,7 +15,6 @@ use std::collections::{HashSet, VecDeque};
 pub(super) struct IndexEquations {
     pub names: Vec<Name>,
     pub induction_major: Option<FVarId>,
-    pub tactic_major: Option<FVarId>,
 }
 
 fn apply(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
@@ -303,7 +302,6 @@ impl Context {
         }
         self.txn.lctx = saved;
         let (hole, mut inner) = self.proof_goal(type_)?;
-        inner.tag = goal.tag.clone();
         inner.target = goal.target.clone();
         inner.lctx = expanded.clone();
         inner.introduced = binders;
@@ -311,14 +309,9 @@ impl Context {
             .work
             .push(Work::Close(goal, apply(hole, applications)));
         self.txn.lctx = expanded;
-        let tactic_elim = matches!(
-            input,
-            eliminate::EliminationSyntax::Tactic(_) | eliminate::EliminationSyntax::RCases(_)
-        );
         let equations = IndexEquations {
             names: equations,
             induction_major: induction.then(|| major.id.clone()),
-            tactic_major: tactic_elim.then(|| major.id.clone()),
         };
         self.eliminate_proof_goal_with_indices(
             proof,
@@ -343,7 +336,6 @@ impl Context {
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
         equations: &[Name],
-        tactic_major: Option<&FVarId>,
     ) -> Result<Option<ProofGoal>, NatDefinitionElabError> {
         let mut pending: VecDeque<_> = equations.iter().cloned().collect();
         loop {
@@ -375,13 +367,8 @@ impl Context {
                 }
                 let saved = self.clone();
                 let work = proof.work.len();
-                match self.substitute_proof_goal_preserving_names(
-                    proof,
-                    goal.clone(),
-                    &name,
-                    true,
-                    tactic_major,
-                ) {
+                match self.substitute_proof_goal_preserving_names(proof, goal.clone(), &name, true)
+                {
                     Ok(()) => {
                         let Some(Work::Goal(child)) = proof.work.pop() else {
                             return Err(error(TacticError::MalformedScript));

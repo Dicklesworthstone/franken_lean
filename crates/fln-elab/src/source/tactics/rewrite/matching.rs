@@ -6,7 +6,7 @@ use super::*;
 use std::collections::HashSet;
 
 #[derive(Debug, PartialEq, Eq)]
-enum RigidTypeHead {
+pub(super) enum RigidTypeHead {
     Sort,
     Forall,
     Inductive(Name),
@@ -48,7 +48,7 @@ impl Context {
     /// aliases, lets, projections and stuck eliminators) goes to the full solver.
     /// Inductive applications must have their actual admitted arity; mere name
     /// spelling is never enough to classify an expression here.
-    fn rigid_rewrite_type_head(
+    pub(super) fn rigid_rewrite_type_head(
         &mut self,
         expr: &Expr,
     ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
@@ -87,7 +87,7 @@ impl Context {
         }
     }
 
-    fn rewrite_types_have_distinct_heads(
+    pub(super) fn rewrite_types_have_distinct_heads(
         &mut self,
         left: &Expr,
         right: &Expr,
@@ -105,9 +105,10 @@ impl Context {
     /// constant or partial application can still be function-valued; stripping
     /// its entire telescope would falsely discard rewrites of that function.
     /// Only the stable outer constructors recognized by rigid_rewrite_type_head
-    /// are used. A dependent result headed by a bound variable, alias or redex
-    /// stays unknown: this filter neither substitutes arguments nor unfolds.
-    fn rigid_rewrite_constant_result(
+    /// are used. A bare result type parameter selects its exact supplied
+    /// argument; applied motives, aliases, and redexes stay unknown. This filter
+    /// neither unfolds a definition nor infers a caller's argument types.
+    pub(super) fn rigid_rewrite_constant_result(
         &mut self,
         expression: &Expr,
     ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
@@ -150,7 +151,33 @@ impl Context {
                 _ => return Ok(None),
             }
         }
-        self.rigid_rewrite_type_head(&result)
+        let mut result_head = &result;
+        while let ExprNode::MData { expr, .. } = result_head.node() {
+            self.tick()?;
+            result_head = expr;
+        }
+        if let ExprNode::BVar { idx } = result_head.node() {
+            // The telescope's last consumed binder has index zero. Walk the
+            // actual application spine in the same order; never guess the
+            // carrier of a polymorphic constant (including numeric methods).
+            let mut applied = expression;
+            let mut remaining = *idx;
+            loop {
+                self.tick()?;
+                match applied.node() {
+                    ExprNode::MData { expr, .. } => applied = expr,
+                    ExprNode::App { f, a } => {
+                        if remaining == 0 {
+                            return self.rigid_rewrite_type_head(a);
+                        }
+                        remaining -= 1;
+                        applied = f;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+        self.rigid_rewrite_type_head(result_head)
     }
 
     pub(super) fn rewrite_trial(&self) -> Self {
@@ -315,127 +342,202 @@ impl Context {
     /// Bound-variable occurrences needing a newly opened binder are not guessed.
     pub(in crate::source) fn instantiate_rewrite_rule(
         &mut self,
-        mut rule: Typed,
+        rule: Typed,
         target: &Expr,
         reverse: bool,
         inside_out: bool,
         selected_rules: &[SimpRule<'_>],
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            inside_out,
+            selected_rules,
+            false,
+        )
+    }
+
+    pub(in crate::source) fn instantiate_dsimp_rule(
+        &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(rule, target, reverse, true, &[], true)
+    }
+
+    fn instantiate_rewrite_rule_with_scope(
+        &mut self,
+        mut rule: Typed,
+        target: &Expr,
+        reverse: bool,
+        inside_out: bool,
+        selected_rules: &[SimpRule<'_>],
+        root_only: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
-        let mut implicit_holes = Vec::new();
-        // Rule elaboration has already inserted implicit arguments. They are
-        // obligations too, even when equality transport later erases the rule.
-        rule.value = template.instantiate(&rule.value)?;
-        let mut pending = vec![&rule.value];
-        let mut visited = HashSet::new();
-        while let Some(term) = pending.pop() {
-            template.tick()?;
-            if !visited.insert(term.allocation_identity()) {
-                continue;
+        // Preparing a rule is speculative too. Charge its private context on
+        // EVERY exit, including interruption while opening its telescope.
+        let prepared = (|| {
+            let mut implicit_holes = Vec::new();
+            // Rule elaboration has already inserted implicit arguments. They are
+            // obligations too, even when equality transport later erases the rule.
+            rule.value = template.instantiate(&rule.value)?;
+            let mut pending = vec![&rule.value];
+            let mut visited = HashSet::new();
+            while let Some(term) = pending.pop() {
+                template.tick()?;
+                if !visited.insert(term.allocation_identity()) {
+                    continue;
+                }
+                if let ExprNode::MVar { id } = term.node()
+                    && !implicit_holes.contains(id)
+                {
+                    implicit_holes.push(id.clone());
+                }
+                pending.extend(children(term).into_iter().rev().flatten());
             }
-            if let ExprNode::MVar { id } = term.node()
-                && !implicit_holes.contains(id)
-            {
-                implicit_holes.push(id.clone());
+            let mut holes = Vec::new();
+            loop {
+                template.tick()?;
+                // The pin prepares simp theorems at reducible transparency without
+                // unfolding local lets. Preserve the final proposition's head too:
+                // unfolding Nat.lt here would hide it from the occurrence matcher.
+                rule.type_ = if inside_out {
+                    template.whnf_with_transparency(
+                        &rule.type_,
+                        UnificationTransparency::Abbreviations,
+                        false,
+                    )?
+                } else {
+                    template.whnf(&rule.type_)?
+                };
+                // A refutation is a rewrite of its proposition to False, not an
+                // implication whose antecedent simp must first prove. Stop before
+                // consuming that final proof binder; outer parameters still infer
+                // normally from the selected occurrence.
+                if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
+                    break;
+                }
+                let ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } = rule.type_.node()
+                else {
+                    break;
+                };
+                let domain = binder_type.clone();
+                let body = body.clone();
+                let argument = if *binder_info == BinderInfo::InstImplicit {
+                    template.instance_hole(domain)?
+                } else {
+                    template.hole(domain)?
+                };
+                if let ExprNode::MVar { id } = argument.node() {
+                    holes.push(id.clone());
+                }
+                rule.type_ = template.substitute(&body, &argument)?;
+                rule.value = Expr::app(rule.value, argument);
             }
-            pending.extend(children(term).into_iter().rev().flatten());
-        }
-        let mut holes = Vec::new();
-        loop {
-            template.tick()?;
-            // The pin prepares simp theorems at reducible transparency without
-            // unfolding local lets. Preserve the final proposition's head too:
-            // unfolding Nat.lt here would hide it from the occurrence matcher.
-            rule.type_ = if inside_out {
-                template.whnf_with_transparency(
-                    &rule.type_,
-                    UnificationTransparency::Abbreviations,
-                    false,
-                )?
-            } else {
-                template.whnf(&rule.type_)?
+            // Rewrite's newly applied parameters precede the unresolved implicit
+            // arguments inserted while elaborating the selected rule expression.
+            holes.extend(implicit_holes);
+            // A known class input must select its dictionary before matching a
+            // pattern containing that dictionary. Synthetic-opaque instance holes
+            // cannot be assigned by occurrence unification. Inputs learned from
+            // the occurrence still get the second synthesis pass below.
+            let resolution = template.resolve_instances(false);
+            self.charge_rewrite_trial(&template);
+            resolution?;
+            let compiled = (|| {
+                let rule = template.equivalence_rewrite_rule(rule)?;
+                if inside_out {
+                    let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
+                    template.equivalence_rewrite_rule(rule)
+                } else {
+                    Ok(rule)
+                }
+            })();
+            self.charge_rewrite_trial(&template);
+            let rule = compiled?;
+            let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
+                // An explicitly selected proposition proof can discharge another
+                // rule's premise without itself being an equality rewrite.
+                if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
+                    let universe = template.whnf(&universe)?;
+                    if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                        self.charge_rewrite_trial(&template);
+                        return Ok(None);
+                    }
+                }
+                return Err(error(TacticError::ExpectedEquality));
             };
-            // A refutation is a rewrite of its proposition to False, not an
-            // implication whose antecedent simp must first prove. Stop before
-            // consuming that final proof binder; outer parameters still infer
-            // normally from the selected occurrence.
-            if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
-                break;
-            }
-            let ExprNode::ForallE {
-                binder_type,
-                body,
-                binder_info,
-                ..
-            } = rule.type_.node()
-            else {
-                break;
-            };
-            let domain = binder_type.clone();
-            let body = body.clone();
-            let argument = if *binder_info == BinderInfo::InstImplicit {
-                template.instance_hole(domain)?
-            } else {
-                template.hole(domain)?
-            };
-            if let ExprNode::MVar { id } = argument.node() {
-                holes.push(id.clone());
-            }
-            rule.type_ = template.substitute(&body, &argument)?;
-            rule.value = Expr::app(rule.value, argument);
-        }
-        // Rewrite's newly applied parameters precede the unresolved implicit
-        // arguments inserted while elaborating the selected rule expression.
-        holes.extend(implicit_holes);
-        // A known class input must select its dictionary before matching a
-        // pattern containing that dictionary. Synthetic-opaque instance holes
-        // cannot be assigned by occurrence unification. Inputs learned from
-        // the occurrence still get the second synthesis pass below.
-        let resolution = template.resolve_instances(false);
-        self.charge_rewrite_trial(&template);
-        resolution?;
-        let compiled = (|| {
-            let rule = template.equivalence_rewrite_rule(rule)?;
-            if inside_out {
-                let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
-                template.equivalence_rewrite_rule(rule)
-            } else {
-                Ok(rule)
-            }
-        })();
-        self.charge_rewrite_trial(&template);
-        let rule = compiled?;
-        let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
-            // An explicitly selected proposition proof can discharge another
-            // rule's premise without itself being an equality rewrite.
-            if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
-                let universe = template.whnf(&universe)?;
-                if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
-                    self.charge_rewrite_trial(&template);
+            let pattern = if reverse { rhs } else { lhs };
+            if root_only {
+                // Dsimp's rule lookup is head-directed. A conversion-based
+                // occurrence match must not unfold a named pattern into an
+                // unrelated node (e.g. `wrap ?n` into every Nat literal). That
+                // both expands the rule's domain and cycles with literal
+                // refolding. Parameter-headed patterns still use the solver.
+                let mut pattern_head = &pattern;
+                let mut target_head = target;
+                loop {
+                    template.tick()?;
+                    match pattern_head.node() {
+                        ExprNode::App { f, .. } => pattern_head = f,
+                        ExprNode::MData { expr, .. } => pattern_head = expr,
+                        _ => break,
+                    }
+                }
+                loop {
+                    template.tick()?;
+                    match target_head.node() {
+                        ExprNode::App { f, .. } => target_head = f,
+                        ExprNode::MData { expr, .. } => target_head = expr,
+                        _ => break,
+                    }
+                }
+                let mismatch = match pattern_head.node() {
+                    ExprNode::Const { name, .. } => !matches!(
+                        target_head.node(), ExprNode::Const { name: actual, .. } if actual == name
+                    ),
+                    ExprNode::FVar { id } => !matches!(
+                        target_head.node(), ExprNode::FVar { id: actual } if actual == id
+                    ),
+                    _ => false,
+                };
+                if mismatch {
                     return Ok(None);
                 }
             }
-            return Err(error(TacticError::ExpectedEquality));
-        };
-        let pattern = if reverse { rhs } else { lhs };
-        self.charge_rewrite_trial(&template);
-        if !inside_out {
-            let pattern = template.instantiate(&pattern)?;
+
             self.charge_rewrite_trial(&template);
-            let mut head = &pattern;
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::App { f, .. } => head = f,
-                    ExprNode::MData { expr, .. } => head = expr,
-                    ExprNode::MVar { .. } => {
-                        return Err(error(TacticError::RewriteMetavariablePattern));
+            if !inside_out {
+                let pattern = template.instantiate(&pattern)?;
+                self.charge_rewrite_trial(&template);
+                let mut head = &pattern;
+                loop {
+                    template.tick()?;
+                    match head.node() {
+                        ExprNode::App { f, .. } => head = f,
+                        ExprNode::MData { expr, .. } => head = expr,
+                        ExprNode::MVar { .. } => {
+                            return Err(error(TacticError::RewriteMetavariablePattern));
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
             }
-        }
+            Ok(Some((rule, alpha, pattern, holes)))
+        })();
+        self.charge_rewrite_trial(&template);
+        let Some((rule, alpha, pattern, holes)) = prepared? else {
+            return Ok(None);
+        };
         let mut pending = vec![(target, false)];
         let mut visited = HashSet::new();
         while let Some((term, exit)) = pending.pop() {
@@ -444,7 +546,7 @@ impl Context {
                 if !visited.insert(term.allocation_identity()) {
                     continue;
                 }
-                if inside_out {
+                if inside_out && !root_only {
                     pending.push((term, true));
                     pending.extend(
                         children(term)
@@ -455,13 +557,15 @@ impl Context {
                     );
                     continue;
                 }
-                pending.extend(
-                    children(term)
-                        .into_iter()
-                        .rev()
-                        .flatten()
-                        .map(|child| (child, false)),
-                );
+                if !root_only {
+                    pending.extend(
+                        children(term)
+                            .into_iter()
+                            .rev()
+                            .flatten()
+                            .map(|child| (child, false)),
+                    );
+                }
             }
             if term.has_loose_bvars() {
                 continue;
@@ -533,7 +637,6 @@ impl Context {
                             target,
                             lctx: declaration.lctx,
                             introduced: Vec::new(),
-                            tag: Name::anonymous(),
                         });
                     }
                 }
@@ -591,6 +694,77 @@ mod outcome_tests {
             env = publication.environment;
         }
         Context::new(&env, budget)
+    }
+
+    #[test]
+    fn constant_result_discrimination_uses_the_actual_type_parameter() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        for source in [
+            "def carrier_first (A B : Type) (a : A) (b : B) : A := a",
+            "def carrier_second (A B : Type) (a : A) (b : B) : B := b",
+        ] {
+            let declaration =
+                crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                    .unwrap()
+                    .declaration;
+            let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+                panic!("definition admission did not complete");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("definition was rejected");
+            };
+            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+            else {
+                panic!("definition publication did not complete");
+            };
+            ctx.txn.env = publication.environment;
+        }
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let bool_ = Expr::const_(Name::from_components(["Bool"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let false_ = Expr::const_(Name::from_components(["Bool", "false"]), vec![]);
+        for (name, result) in [("carrier_first", "Nat"), ("carrier_second", "Bool")] {
+            let selected = Expr::const_(Name::from_components([name]), vec![]);
+            assert_eq!(
+                ctx.rigid_rewrite_constant_result(&app(
+                    selected.clone(),
+                    [nat.clone(), bool_.clone(), zero.clone(), false_.clone()],
+                ))
+                .unwrap(),
+                Some(RigidTypeHead::Inductive(Name::from_components([result])))
+            );
+            assert_eq!(
+                ctx.rigid_rewrite_constant_result(&app(
+                    selected,
+                    [nat.clone(), bool_.clone(), zero.clone()],
+                ))
+                .unwrap(),
+                Some(RigidTypeHead::Forall)
+            );
+        }
+        let carrier = ctx.hole(Expr::sort(Level::one())).unwrap();
+        let before = ctx.txn.mvars.clone();
+        assert_eq!(
+            ctx.rigid_rewrite_constant_result(&app(
+                Expr::const_(Name::from_components(["carrier_first"]), vec![]),
+                [carrier, bool_, zero, false_],
+            ))
+            .unwrap(),
+            None
+        );
+        assert_eq!(ctx.txn.mvars, before);
     }
 
     #[test]

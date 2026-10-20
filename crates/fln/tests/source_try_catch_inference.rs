@@ -78,9 +78,11 @@ fn execute(base: &Engine, source: &str, expected: &[&str]) {
         .unwrap();
     assert_eq!(run.executions.len(), expected.len());
     for (execution, expected) in run.executions.iter().zip(expected) {
+        // `queries` holds only `#eval` commands, and #eval's auxiliary is
+        // unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         let VmExit::Returned(value) = &execution.exit else {
             panic!("{:?}", execution.exit)

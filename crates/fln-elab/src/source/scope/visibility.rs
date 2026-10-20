@@ -133,7 +133,7 @@ impl SourceScope {
     /// This native slice exports fully exposed definitions, data instances and
     /// complete public data bundles. A public theorem or proof instance selects
     /// its exported signature world; its driver checks the hidden proof privately.
-    /// Ordinary hidden-body public definitions remain explicitly refused.
+    /// Hidden definition bodies use the same two-world publication boundary.
     pub fn for_declaration(&self, syntax: &Syntax) -> Result<Self, NatDefinitionElabError> {
         let declaration = expect_node(
             syntax,
@@ -174,17 +174,23 @@ impl SourceScope {
         }
         if effective.exports_declaration() {
             if kind == Some(&parser_kind(&["Command", "definition"])) {
-                if !effective.expose_definitions {
-                    return Err(refused(
-                        "@[expose] public definitions; hidden bodies are not yet exported",
-                    ));
-                }
+                // The header selects this world. The module admission driver
+                // elaborates a hidden body in its private predecessor and only
+                // exports the signature of the successfully checked body.
+            } else if kind == Some(&parser_kind(&["Command", "abbrev"])) {
+                // Abbreviations expose their reduction rule by default,
+                // independently of an enclosing expose section.
+                effective.expose_definitions = !no_expose;
+            } else if kind == Some(&parser_kind(&["Command", "opaque"])) {
+                // An expose section applies to `def`, not `opaque`
+                // (MutualDef.finishElab). An explicit tag still applies.
+                effective.expose_definitions = expose && !no_expose;
             } else if kind == Some(&parser_kind(&["Command", "instance"])) {
                 // MutualDef.finishElab automatically exposes data instances.
                 // Whether the result is a proposition is established from the
                 // elaborated header, before entering its body. Proof instances
-                // may explicitly retain a hidden body with no_expose; a data
-                // instance with that attribute is refused after classification.
+                // may explicitly retain a hidden body with no_expose; data
+                // instances use the same hidden-body path when explicitly tagged.
                 // This selector only chooses the public header environment.
             } else if kind == Some(&parser_kind(&["Command", "theorem"]))
                 || kind == Some(&parser_kind(&["Command", "axiom"]))

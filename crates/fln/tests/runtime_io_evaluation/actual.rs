@@ -1,5 +1,6 @@
 //! Actual IO artifact metadata for diagnostics only; no module admission.
 //! This fixture never creates import receipts or verified reuse entries.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_core::level::Level;
 use fln_elab::instances::{self, imported::ImportActivation};

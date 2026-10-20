@@ -102,7 +102,6 @@ impl Context {
             .map_err(|reason| failure(SourceInferenceError::Unification(Box::new(reason))))?;
         assert!(report.awakened.is_empty(), "private source queue");
         let (root, mut child) = self.proof_goal(target.clone())?;
-        child.tag = goal.tag.clone();
         self.introduce_proof_binder(&mut child, name)?;
         let discriminant = child
             .introduced
@@ -152,28 +151,20 @@ impl Context {
                 body,
                 binder_info,
             } => {
-                let name = if name.is_anonymous() {
-                    self.fresh_inaccessible(binder_name)?
-                } else {
-                    name
-                };
+                self.trace_introduced_name(&id, &name, binder_name);
                 goal.target = self.substitute(body, &Expr::fvar(id.clone()))?;
                 self.txn
                     .lctx
                     .add_param(id.clone(), name, binder_type.clone(), *binder_info);
             }
             ExprNode::LetE {
-                decl_name,
+                decl_name: binder_name,
                 type_,
                 value,
                 body,
                 ..
             } => {
-                let name = if name.is_anonymous() {
-                    self.fresh_inaccessible(decl_name)?
-                } else {
-                    name
-                };
+                self.trace_introduced_name(&id, &name, binder_name);
                 goal.target = self.substitute(body, &Expr::fvar(id.clone()))?;
                 self.txn
                     .lctx
@@ -253,8 +244,7 @@ impl Context {
             };
         }
         self.txn.lctx = retained;
-        let (mut value, mut child) = self.proof_goal(target)?;
-        child.tag = goal.tag.clone();
+        let (mut value, child) = self.proof_goal(target)?;
         for local in reverted {
             self.tick()?;
             if local.value.is_none() {

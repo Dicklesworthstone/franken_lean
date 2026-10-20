@@ -29,19 +29,21 @@ fn parts(library: &Path, label: &Name) -> [Vec<u8>; 3] {
     ]
 }
 
+fn pinned_library() -> Option<PathBuf> {
+    std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
+            })
+        })
+        .filter(|path| path.is_dir())
+}
+
 fn fixture() -> &'static Environment {
     static FIXTURE: OnceLock<Environment> = OnceLock::new();
     FIXTURE.get_or_init(|| {
-        let library = std::env::var_os("FLN_REFERENCE_LIB")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| {
-                    PathBuf::from(home)
-                        .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
-                })
-            })
-            .filter(|path| path.is_dir())
-            .expect("the actual pinned Array model is mandatory; set FLN_REFERENCE_LIB");
+        let library = pinned_library().expect("the actual pinned Array model is mandatory here");
         let mut pending = vec![
             (named("Init.Data.Array.Basic"), false),
             (named("Init.Data.List.Control"), false),
@@ -140,7 +142,18 @@ fn fixture() -> &'static Environment {
     })
 }
 
+/// The actual pinned model is the only model these tests accept; without it they take the
+/// typed skip every other pin-gated test takes, and `FLN_REQUIRE_REFERENCE` (set by the
+/// lane that installs the pin) turns that skip into a failure.
 fn with_fixture(test: impl FnOnce(&Environment) + Send + 'static) {
+    if pinned_library().is_none() {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned Reference lib/lean is absent"
+        );
+        eprintln!("SKIP: pinned Reference lib/lean is absent");
+        return;
+    }
     std::thread::Builder::new()
         .name("actual-array-fold-model".to_owned())
         .stack_size(STACK)
@@ -394,12 +407,14 @@ fn private_name_collisions_and_direct_unsafe_calls_do_not_gain_authority() {
         assert!(preparation.array_fold.adapter.is_none());
 
         let mut direct = Preparation::new(environment, IngressLimits::default());
-        assert!(
-            direct
-                .executable_definition(&selected_name())
-                .unwrap()
-                .is_none()
-        );
+        // An explicitly unsafe definition is its own executable body (b28eab42), as the pin's
+        // `#eval` runs a direct call to it. That grants it no adapter or replacement authority.
+        let own = direct
+            .executable_definition(&selected_name())
+            .unwrap()
+            .expect("the unsafe implementation is its own executable body");
+        assert_eq!(own.base.name, selected_name());
+        assert_eq!(own.safety, DefinitionSafety::Unsafe);
         assert!(direct.specialized_definition(&private_name()).is_none());
         assert!(direct.array_fold.adapter.is_none());
         let mut fresh = Preparation::new(environment, IngressLimits::default());

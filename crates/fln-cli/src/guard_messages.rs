@@ -5,8 +5,6 @@ pub(super) struct Buffer<'a> {
     pub spec: &'a GuardSpec,
     pub checked: Vec<String>,
     pub from_check: bool,
-    pub from_trace_state: bool,
-    pub has_trace: bool,
 }
 
 pub(super) type Guards<'a> = std::collections::BTreeMap<usize, Buffer<'a>>;
@@ -17,8 +15,6 @@ impl<'a> Buffer<'a> {
             spec,
             checked: Vec::new(),
             from_check: false,
-            from_trace_state: false,
-            has_trace: false,
         }
     }
 
@@ -44,24 +40,6 @@ impl<'a> Buffer<'a> {
             }
             Action::Drop => {}
             Action::Pass => stdout.push_str(line),
-        }
-    }
-
-    /// Route one tactic trace message (`trace_state` or `trace "msg"`).
-    pub fn trace(&mut self, text: &str, from_trace_state: bool, stdout: &mut String) {
-        self.has_trace = true;
-        match self.spec.action(Severity::Trace) {
-            Action::Check => {
-                self.checked.push(super::guard_message("trace", text));
-                self.from_trace_state |= from_trace_state;
-            }
-            Action::Drop => {}
-            Action::Pass => {
-                stdout.push_str(text);
-                if !text.ends_with('\n') {
-                    stdout.push('\n');
-                }
-            }
         }
     }
 

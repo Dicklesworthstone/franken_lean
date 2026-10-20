@@ -182,3 +182,235 @@ end
         ["43", "67"]
     );
 }
+
+#[test]
+fn named_function_results_use_whole_argument_inhabitants_before_opening() {
+    assert_eq!(
+        values(
+            &engine(),
+            include_str!("../../fln-parse/tests/fixtures/partial_definitions/FunctionResult.lean")
+        ),
+        ["42"]
+    );
+}
+
+#[test]
+fn intermediate_function_alias_instances_are_tried_before_the_codomain() {
+    let base = check(
+        &engine(),
+        r#"
+inductive Token where
+  | stop
+  | again
+def InnerFunction : Type := Nat -> Token
+instance innerFunctionWitness : Inhabited InnerFunction := ⟨fun _ => Token.stop⟩
+def OuterFunction : Type := InnerFunction
+partial def chooseFunction (n : Nat) : OuterFunction :=
+  if n == 0 then (fun _ => Token.again) else chooseFunction (n - 1)
+"#,
+    );
+    let Some(ConstantInfo::Opaque(value)) = base
+        .environment()
+        .find(&Name::from_components(["chooseFunction"]))
+    else {
+        panic!("opaque partial interface")
+    };
+    assert!(references(
+        &value.value,
+        &Name::from_components(["innerFunctionWitness"])
+    ));
+}
+
+#[test]
+fn hidden_dependent_telescopes_contribute_providers_in_lexical_order() {
+    assert_eq!(
+        values(
+            &engine(),
+            r#"
+def Callback (A : Type) : Type := A -> A
+def Factory (A : Type) : Type := A -> Callback A
+partial def makeFactory {A : Type} (n : Nat) : Factory A :=
+  if n == 0 then (fun x _ => x) else makeFactory (n - 1)
+#eval makeFactory 4 42 91
+"#
+        ),
+        ["42"]
+    );
+}
+
+#[test]
+fn mutual_function_results_share_whole_function_inhabitants() {
+    assert_eq!(
+        values(
+            &engine(),
+            r#"
+def Callback (A : Type) : Type := Nat -> A
+mutual
+partial def first {A : Type} (f : Callback A) (n : Nat) : Callback A :=
+  if n == 0 then f else second f (n - 1)
+partial def second {A : Type} (f : Callback A) (n : Nat) : Callback A :=
+  if n == 0 then f else first f (n - 1)
+end
+#eval first (fun n => n + 5) 4 12
+#eval second (fun n => n + 9) 3 12
+"#
+        ),
+        ["17", "21"]
+    );
+}
+
+#[test]
+fn captured_function_providers_close_with_the_partial_section() {
+    assert_eq!(
+        values(
+            &engine(),
+            r#"
+def Callback (A : Type) : Type := Nat -> A
+section
+variable {A : Type} (f : Callback A)
+partial def capture (n : Nat) : Callback A :=
+  if n == 0 then f else capture (n - 1)
+end
+#eval capture (fun n => n + 30) 3 12
+"#
+        ),
+        ["42"]
+    );
+}
+
+#[test]
+fn function_aliases_cannot_turn_opaque_execution_into_a_proof() {
+    let base = check(
+        &engine(),
+        r#"
+def Callback : Type := Nat -> Nat
+partial def makeCallback (n : Nat) : Callback :=
+  if n == 0 then (fun k => k + 3) else makeCallback (n - 1)
+"#,
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem invalid : makeCallback 0 0 = 3 := by rfl",
+        "def leak (n : Nat) : Nat := makeCallback._unsafe_rec n n",
+        "def ImpossibleFunction : Type := Nat -> False\npartial def bad (n : Nat) : ImpossibleFunction := bad (n + 1)",
+        "def CallbackTo (A : Type) : Type := Nat -> A\npartial def confused {A : Type} (f : CallbackTo A) (n : Nat) : CallbackTo A := if n == 0 then true else confused f (n - 1)",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    assert_eq!(values(&base, "#eval makeCallback 3 7\n"), ["10"]);
+}
+
+// A constructive, local fallback provider exercises strategy ordering without
+// an installed Init artifact or introducing a choice axiom into this model.
+const NONEMPTY_MODEL: &str = r#"
+class Nonempty (A : Type) where
+  witness : A
+def Classical.ofNonempty {A : Type} [inst : Nonempty A] : A := inst.witness
+inductive Token where
+  | stop
+  | again
+def Callback : Type := Nat -> Token
+instance nonemptyCallback : Nonempty Callback := ⟨fun _ => Token.stop⟩
+"#;
+
+#[test]
+fn fallback_restarts_at_the_function_alias_without_leaking_opened_parameters() {
+    let base = check(&engine(), NONEMPTY_MODEL);
+    let base = check(
+        &base,
+        r#"
+partial def fallback (n : Nat) : Callback :=
+  if n == 0 then (fun _ => Token.again) else fallback (n - 1)
+"#,
+    );
+    let Some(ConstantInfo::Opaque(value)) = base
+        .environment()
+        .find(&Name::from_components(["fallback"]))
+    else {
+        panic!("opaque partial interface")
+    };
+    assert!(references(
+        &value.value,
+        &Name::from_components(["nonemptyCallback"])
+    ));
+    assert!(references(
+        &value.value,
+        &Name::from_components(["Classical", "ofNonempty"])
+    ));
+    assert_eq!(
+        values(
+            &base,
+            "#eval match fallback 3 8 with | Token.stop => 0 | Token.again => 42\n"
+        ),
+        ["42"]
+    );
+}
+
+#[test]
+fn all_inhabited_paths_precede_an_available_outer_nonempty_provider() {
+    let base = check(&engine(), NONEMPTY_MODEL);
+    let base = check(
+        &base,
+        r#"
+instance tokenWitness : Inhabited Token := ⟨Token.again⟩
+partial def preferred (n : Nat) : Callback :=
+  if n == 0 then (fun _ => Token.stop) else preferred (n - 1)
+"#,
+    );
+    let Some(ConstantInfo::Opaque(value)) = base
+        .environment()
+        .find(&Name::from_components(["preferred"]))
+    else {
+        panic!("opaque partial interface")
+    };
+    assert!(references(
+        &value.value,
+        &Name::from_components(["tokenWitness"])
+    ));
+    assert!(!references(
+        &value.value,
+        &Name::from_components(["nonemptyCallback"])
+    ));
+    assert!(!references(
+        &value.value,
+        &Name::from_components(["Classical", "ofNonempty"])
+    ));
+}
+
+#[test]
+fn polymorphic_function_alias_witnesses_are_closed_checked_terms() {
+    // This checks the logical admission boundary, not runtime specialization of
+    // a polymorphic callback computed after an effectful prefix.
+    let base = check(
+        &engine(),
+        r#"
+def Endo (A : Type) : Type := A -> A
+def PolymorphicFactory : Type 1 := (A : Type) -> Endo A
+partial def polymorphicFactory (n : Nat) : PolymorphicFactory :=
+  if n == 0 then (fun A x => x) else polymorphicFactory (n - 1)
+"#,
+    );
+    let Some(ConstantInfo::Opaque(value)) = base
+        .environment()
+        .find(&Name::from_components(["polymorphicFactory"]))
+    else {
+        panic!("opaque partial interface")
+    };
+    assert!(!value.value.has_fvar());
+    assert!(!value.value.has_loose_bvars());
+    assert!(!value.value.has_expr_mvar());
+    assert!(!value.value.has_level_mvar());
+    assert!(base.environment().contains(&Name::from_components([
+        "polymorphicFactory",
+        "_unsafe_rec"
+    ])));
+}

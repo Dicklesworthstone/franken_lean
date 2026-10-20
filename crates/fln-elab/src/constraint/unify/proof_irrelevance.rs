@@ -90,7 +90,7 @@ impl Engine<'_> {
             // Type inference cannot erase a residual proof obligation.
             return Ok(false);
         }
-        let checked = self.check_proof_pair(proposition, left, right, locals)?;
+        let checked = self.check_typed_pair(proposition, Level::zero(), left, right, locals)?;
         if checked && let Some(equation) = closed_type_equation {
             // K1 validates both original proofs but has broader delta rules.
             // Publication also requires their types to compare at the caller's
@@ -138,9 +138,13 @@ impl Engine<'_> {
         }
     }
 
-    fn check_proof_pair(
+    /// Check both original inhabitants, not merely their synthesized types.
+    /// Also shared by zero-field structure eta, where the sort need not be Prop.
+    /// This is a typing guard, not a conversion or declaration-publication API.
+    pub(super) fn check_typed_pair(
         &mut self,
         mut type_: Expr,
+        sort: Level,
         left: Expr,
         right: Expr,
         locals: &LocalContext,
@@ -149,7 +153,7 @@ impl Engine<'_> {
         let anonymous = Name::anonymous();
         let guard = Expr::lam(
             anonymous.clone(),
-            Expr::sort(Level::zero()),
+            Expr::sort(sort),
             Expr::lam(
                 anonymous.clone(),
                 bv(0),

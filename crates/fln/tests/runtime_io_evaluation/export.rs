@@ -1,4 +1,5 @@
 //! Optional retained CLI fixture; this creates a new module, never an IO import receipt.
+#![forbid(unsafe_code)]
 use super::*;
 use std::io::Write;
 

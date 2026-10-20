@@ -257,9 +257,10 @@ fn check_programs(engine: &Engine) {
         let index = first.batch.source_evaluation_indices[0];
         let execution = &first.batch.executions[index];
         assert_eq!(execution.checker.schema, "fln.checker-admission/1");
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         let Some(IoEvaluationOutcome::Returned { runtime_type, exit }) =
             execution.io_evaluation_outcome().unwrap()

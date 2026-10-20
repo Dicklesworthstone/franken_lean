@@ -50,3 +50,10 @@ pub mod obj {
 pub mod heartbeat {
     pub use fln_unsafe_abi::{allocation_heartbeats, set_allocation_heartbeats};
 }
+
+/// Language diagnostics shared by generated native code and Golem. These
+/// report runtime effects only; no kernel or declaration authority crosses
+/// this boundary. Panic reporting observes the existing runtime panic policy.
+pub mod diagnostics {
+    pub use fln_unsafe_abi::{report_panic, trace_message};
+}

@@ -304,9 +304,10 @@ def applyRenderer (render : List Char → String) (chars : List Char) : String :
         assert_eq!(first.source_evaluation_indices.len(), expected.len());
         for (&index, expected) in first.source_evaluation_indices.iter().zip(expected) {
             let execution = &first.executions[index];
+            // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
             assert_eq!(
                 execution.checker.ground,
-                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                CheckerAdmissionGround::UnsafeQuarantine
             );
             let decoded =
                 flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
@@ -511,7 +512,7 @@ fn string_from_list_preserves_root_replacements_and_remains_a_native_replacement
                 let execution = &run.executions[index];
                 assert_eq!(
                     execution.checker.ground,
-                    CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                    CheckerAdmissionGround::UnsafeQuarantine
                 );
                 let replay =
                     execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())

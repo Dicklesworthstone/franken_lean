@@ -1,0 +1,42 @@
+name: native trace regressions
+
+# Auxiliary native source regression suite, not a replacement for existing gates.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-goal-traces.yml'
+      - 'crates/fln-elab/src/source/trace.rs'
+      - 'crates/fln-elab/src/source/tactics/trace.rs'
+      - 'crates/fln/src/source_records/traces.rs'
+      - 'crates/fln/src/pretty/goals.rs'
+      - 'crates/fln-cli/src/goal_traces.rs'
+      - 'crates/fln/tests/source_traces.rs'
+      - 'crates/fln-cli/tests/lean_trace_state.rs'
+permissions:
+  contents: read
+jobs:
+  traces:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: install the repository-pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal
+      - name: run native trace regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln-elab --lib source::trace::tests --no-fail-fast
+          cargo test --locked --offline -p fln --test source_traces --no-fail-fast
+          cargo test --locked --offline -p fln-cli --test lean_trace_state --no-fail-fast
+          cargo test --locked --offline -p fln-cli --lib goal_traces::tests --no-fail-fast

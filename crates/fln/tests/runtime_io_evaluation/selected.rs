@@ -3,6 +3,7 @@
 //! The actual IO metadata is used only to elaborate and discover dependencies.
 //! Every discovered fixture declaration is admitted again over the selected,
 //! independently byte-read pin declarations before its explicit evaluation.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::{
     Declaration, ExprNode, IndependentReading, OleanFrontierJobs, OleanModuleInput,
@@ -516,9 +517,10 @@ pub(super) fn check_selected_programs(engine: Engine) {
             .into_complete()
             .unwrap();
         let execution = &completed.batch.executions[completed.batch.source_evaluation_indices[0]];
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         match execution
             .io_evaluation_outcome()

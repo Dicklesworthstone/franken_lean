@@ -40,6 +40,8 @@ impl Eq for Revision {}
 /// The source interval in which a native answer applies. Endpoints are included
 /// for editor cursors; an empty interval denotes exactly one position. Narrower
 /// intervals take precedence; equally narrow records use the later input row.
+/// A term-goal selection must lie wholly inside its answer's half-open source
+/// range: even the included selection endpoint must precede the range's end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
     pub selection: Range<usize>,
@@ -86,6 +88,9 @@ pub struct SemanticIndex {
 fn kind(answer: &Answer) -> QueryKind {
     match answer {
         Answer::Goals { .. } => QueryKind::Goals,
+        Answer::TermGoal { .. } => QueryKind::TermGoal,
+        Answer::InteractiveGoals { .. } => QueryKind::InteractiveGoals,
+        Answer::InteractiveTermGoal(_) => QueryKind::InteractiveTermGoal,
         Answer::Hover { .. } => QueryKind::Hover,
         Answer::Definition { .. } => QueryKind::Definition,
         Answer::Completion { .. } => QueryKind::Completion,
@@ -103,6 +108,10 @@ fn add(total: &mut usize, amount: usize, limit: usize) -> Result<(), IndexRefusa
 fn payload_bytes(answer: &Answer) -> Result<usize, IndexRefusal> {
     let mut total = 0;
     match answer {
+        Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_) => {
+            return super::interactive::payload_bytes(answer)
+                .map_err(|_| IndexRefusal::InvalidAnnotation);
+        }
         Answer::Goals { goals } => {
             if goals.len() > super::MAX_GOALS {
                 return Err(IndexRefusal::ResourceLimit);
@@ -113,6 +122,9 @@ fn payload_bytes(answer: &Answer) -> Result<usize, IndexRefusal> {
         }
         Answer::Hover { contents, .. } => {
             add(&mut total, contents.len(), MAX_PAYLOAD_BYTES)?;
+        }
+        Answer::TermGoal { goal, .. } => {
+            add(&mut total, goal.len(), MAX_PAYLOAD_BYTES)?;
         }
         Answer::Definition { uri, source, .. } => {
             add(&mut total, uri.len(), MAX_PAYLOAD_BYTES)?;
@@ -182,6 +194,18 @@ impl SemanticIndex {
             add(&mut work, cost, MAX_BUILD_WORK)?;
             exact_range(query.text, &annotation.selection)?;
             match &annotation.answer {
+                Answer::TermGoal { range, .. } => {
+                    // Selection endpoints are included, but a term-goal answer
+                    // only applies strictly before the end of its source span.
+                    // Validate every possible selected cursor, not just the
+                    // sample at selection.start used for wire validation below.
+                    if range.start > annotation.selection.start
+                        || range.end <= annotation.selection.end
+                    {
+                        return Err(IndexRefusal::InvalidAnnotation);
+                    }
+                    exact_range(query.text, range)?;
+                }
                 Answer::Hover { range, .. } | Answer::Completion { range, .. } => {
                     if range.start > annotation.selection.start
                         || range.end < annotation.selection.end
@@ -190,15 +214,33 @@ impl SemanticIndex {
                     }
                     exact_range(query.text, range)?;
                 }
-                Answer::Goals { .. } | Answer::Definition { .. } => {}
+                Answer::InteractiveTermGoal(goal) => {
+                    if goal.range.start > annotation.selection.start
+                        || goal.range.end <= annotation.selection.end
+                    {
+                        return Err(IndexRefusal::InvalidAnnotation);
+                    }
+                    exact_range(query.text, &goal.range)?;
+                }
+                Answer::Goals { .. }
+                | Answer::InteractiveGoals { .. }
+                | Answer::Definition { .. } => {}
             }
             let sample = Query {
                 kind: kind(&annotation.answer),
                 offset: annotation.selection.start,
                 ..query
             };
-            super::result_json(annotation.answer.clone(), sample)
-                .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+            if matches!(
+                annotation.answer,
+                Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_)
+            ) {
+                super::interactive::validate(&annotation.answer, sample)
+                    .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+            } else {
+                super::result_json(annotation.answer.clone(), sample)
+                    .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+            }
             entries.push(Entry { annotation, order });
         }
         entries.sort_by_key(|entry| (entry.annotation.selection.start, entry.order));
@@ -270,7 +312,16 @@ impl SemanticIndex {
             .map_err(|_| IndexRefusal::ContentModified)?;
         let answer = entry.annotation.answer.clone();
         // Validate against the actual cursor, not just the construction sample.
-        super::result_json(answer.clone(), query).map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        if matches!(
+            answer,
+            Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_)
+        ) {
+            super::interactive::validate(&answer, query)
+                .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        } else {
+            super::result_json(answer.clone(), query)
+                .map_err(|_| IndexRefusal::InvalidAnnotation)?;
+        }
         Ok(Some(answer))
     }
 }

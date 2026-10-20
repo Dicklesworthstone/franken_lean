@@ -15,6 +15,7 @@ pub(super) use elimination::calculation;
 mod guard_hyp;
 mod locations;
 mod rcases;
+mod search;
 
 /// Proof blocks open on one thread at once; the next is refused rather than recursed into on
 /// a small host stack. A count, not a stack measurement, so the refusal is the same on every
@@ -300,6 +301,8 @@ pub(crate) fn tactic(
             "exact",
             "assumption",
             "solve_by_elim",
+            "apply_assumption",
+            "apply_rules",
             "apply",
             "refine",
             "constructor",
@@ -325,6 +328,8 @@ pub(crate) fn tactic(
             "by_cases",
             "decide",
             "skip",
+            "trace_state",
+            "trace",
             "fail",
             "omega",
             "unfold",
@@ -347,6 +352,7 @@ pub(crate) fn tactic(
             "conv",
             "infer_instance",
             "exfalso",
+            "false_or_by_contra",
             "clear",
             "norm_cast",
             // `syntax (name := done) "done" : tactic` (`Init/Tactics.lean`).
@@ -371,6 +377,9 @@ pub(crate) fn tactic(
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word])),
+        // An imported token table may classify the tactic keyword as a symbol.
+        // Do not change the lexer's policy for ordinary declaration names.
+        TokenKind::Symbol(symbol) if symbol == "false_or_by_contra" => Some("false_or_by_contra"),
         // `suffices` is a keyword token, not an identifier.
         TokenKind::Symbol(symbol) if symbol == "suffices" => Some("suffices"),
         TokenKind::Symbol(symbol) if symbol == "exists" => Some("exists"),
@@ -465,25 +474,6 @@ fn local_tactic(
             };
             args.push(null_node(depth));
         }
-        // `syntax "funext" (ppSpace colGt term:max)* : tactic` (`Init/Tactics.lean`), a root
-        // kind; only names and holes are read.
-        "funext" => {
-            let mut names = Vec::new();
-            for index in start + 1..range.end {
-                names.push(match &tokens[index].kind {
-                    TokenKind::Ident(_) => leaves.leaf(index)?,
-                    TokenKind::Symbol(symbol) if symbol == "_" => {
-                        Syntax::node(parser_kind(&["Term", "hole"]), vec![leaves.leaf(index)?])
-                    }
-                    _ => return Err(refusal(view, tokens, index)),
-                });
-            }
-            args.push(null_node(names));
-            return Ok(Syntax::node(
-                Name::from_components(["tacticFunext___"]),
-                args,
-            ));
-        }
         // `syntax (name := renameI) "rename_i" (ppSpace colGt binderIdent)+ : tactic`
         // (`Init/Tactics.lean`).
         "rename_i" if range.end > start + 1 => {
@@ -505,11 +495,11 @@ fn local_tactic(
         }
         // `intros` is `"intros" (ppSpace colGt (ident <|> hole))*`; `intro`'s arguments are
         // `term:max`, a bracketed pattern too (`intro ⟨a, b⟩ (k : T)`) (`Init/Tactics.lean`).
-        "intro" | "intros" => {
+        "intro" | "intros" | "funext" => {
             let mut names = Vec::new();
             let mut index = start + 1;
             while index < range.end {
-                let bracket = keyword == "intro"
+                let bracket = keyword != "intros"
                     && matches!(&tokens[index].kind, TokenKind::Symbol(symbol) if symbol == "⟨" || symbol == "(");
                 if matches!(&tokens[index].kind, TokenKind::Ident(_)) {
                     names.push(leaves.leaf(index)?);
@@ -537,6 +527,12 @@ fn local_tactic(
                 index += 1;
             }
             args.push(null_node(names));
+            if keyword == "funext" {
+                return Ok(Syntax::node(
+                    Name::from_components(["tacticFunext___"]),
+                    args,
+                ));
+            }
         }
         "injection"
             if range.end >= start + 2 && matches!(&tokens[start + 1].kind, TokenKind::Ident(_)) =>
@@ -621,6 +617,19 @@ fn local_tactic(
                 Vec::new()
             }));
         }
+        // The pin's `trace` accepts exactly a string literal, not a term.
+        "trace"
+            if range.end == start + 2
+                && matches!(
+                    &tokens[start + 1].kind,
+                    TokenKind::Literal(LiteralKind::Str)
+                ) =>
+        {
+            args.push(Syntax::node(
+                Name::from_components(["str"]),
+                vec![leaves.leaf(start + 1)?],
+            ));
+        }
         // `decide` and `omega` are `"…" optConfig` (`Init/Tactics.lean`); the empty
         // configuration is a node of its own in the pin's tree.
         "decide" | "omega" => {
@@ -630,18 +639,22 @@ fn local_tactic(
             }
             args.push(config);
         }
+        "solve_by_elim" | "apply_assumption" | "apply_rules" => {
+            return search::parse(leaves, view, tokens, range, args.remove(0));
+        }
         "assumption"
-        | "solve_by_elim"
         | "rfl"
         | "contradiction"
         | "constructor"
         | "left"
         | "right"
         | "skip"
+        | "trace_state"
         | "trivial"
         | "ac_rfl"
         | "infer_instance"
         | "exfalso"
+        | "false_or_by_contra"
         | "sorry"
         | "admit"
         | "done"
@@ -718,24 +731,6 @@ fn local_tactic(
         }
         _ => return Err(refusal(view, tokens, start)),
     }
-    // `syntax (name := solveByElim) "solve_by_elim" "*"? optConfig (&" only")? args? using_? :
-    // tactic` (`Init/Tactics.lean`), every optional slot empty.
-    if keyword == "solve_by_elim" {
-        return Ok(Syntax::node(
-            parser_kind(&["Tactic", "solveByElim"]),
-            vec![
-                args.remove(0),
-                null_node(Vec::new()),
-                Syntax::node(
-                    parser_kind(&["Tactic", "optConfig"]),
-                    vec![null_node(Vec::new())],
-                ),
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-                null_node(Vec::new()),
-            ],
-        ));
-    }
     // `macro "w" : tactic` and `syntax "w" : tactic` at the root name their kind `tacticW`.
     if matches!(
         keyword,
@@ -758,20 +753,21 @@ fn local_tactic(
         // `macro "trivial" : tactic` (`Init/Tactics.lean`).
         "trivial" => "tacticTrivial",
         "rename_i" => "renameI",
+        "trace_state" => "traceState",
+        "trace" => "traceMessage",
         // `syntax (name := acRfl) "ac_rfl" : tactic` (`Init/Tactics.lean`).
         "ac_rfl" => "acRfl",
         // `macro "infer_instance" : tactic`, `macro "exfalso" : tactic` and `norm_cast`'s
         // `tacticNorm_cast__` (`Init/Tactics.lean`).
         "infer_instance" => "tacticInfer_instance",
         "exfalso" => "tacticExfalso",
+        "false_or_by_contra" => "falseOrByContra",
         "sorry" => "tacticSorry",
         "admit" => "tacticAdmit",
         "norm_cast" => "tacticNorm_cast__",
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",
         "rotate_right" => "rotateRight",
-        "trace_state" => "traceState",
-        "trace" => "traceMessage",
         _ => keyword,
     };
     Ok(Syntax::node(parser_kind(&["Tactic", kind]), args))
@@ -2404,6 +2400,15 @@ mod search_tests {
             "theorem t (p : Prop) (h : p) : p := by\r\n  solve_by_elim /- local search -/\r\n",
             "theorem t : P := by first | solve_by_elim | assumption",
             "theorem t : And P Q := by constructor <;> (solve_by_elim)",
+            "theorem t : P := by solve_by_elim only",
+            "theorem t : P := by solve_by_elim only []",
+            "theorem t : P := by solve_by_elim only [h,]",
+            "theorem t : P := by solve_by_elim [f (g x), -(h), h]",
+            "theorem t : P := by solve_by_elim only [*, -h, replacement]",
+            "theorem t : P := by\r\n  solve_by_elim /- pick -/ only [h, f]\r\n",
+            // Option names and values are retained syntax. The elaborator
+            // rejects unsupported configuration instead of the parser dropping it.
+            "theorem t : P := by solve_by_elim (config := {})",
         ] {
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());
@@ -2418,9 +2423,12 @@ mod search_tests {
     fn solve_by_elim_does_not_silently_ignore_unsupported_options() {
         for tail in [
             "solve_by_elim h",
-            "solve_by_elim [h]",
-            "solve_by_elim only",
-            "solve_by_elim (config := {})",
+            "solve_by_elim [h,, h]",
+            "solve_by_elim [,h]",
+            "solve_by_elim [-]",
+            "solve_by_elim [* h]",
+            "solve_by_elim [-h x]",
+            "solve_by_elim [h] using localRules",
             "solve_by_elim at h",
         ] {
             let source = format!("theorem t : True := by {tail}");
@@ -2482,12 +2490,14 @@ mod simp_all_tests {
 #[cfg(test)]
 mod trace_tests {
     use super::*;
-
     #[test]
-    fn trace_state_and_trace_message_are_contextual_and_lossless() {
+    fn trace_messages_and_goal_snapshots_preserve_every_source_leaf() {
         for source in [
-            "def trace_state (n : Nat) : Nat := n",
             "def trace (n : Nat) : Nat := n",
+            "theorem t : True := by\r\n  trace /- λ -/ \"line\\nnext\"\r\n  trace_state\r\n  constructor",
+            "theorem t : True := by first | (trace \"first\"; fail) | constructor",
+            "theorem t : True := by constructor; trace \"\"",
+            "def trace_state (n : Nat) : Nat := n",
             "theorem t : True := by\r\n  trace_state; trace \"msg\"; trivial\r\n",
             "theorem t (h : 0 = 1) : False := by first | trace_state; fail | contradiction",
             "theorem t (h : 0 = 1) : False := by first | trace \"first branch\"; fail | contradiction",
@@ -2499,13 +2509,20 @@ mod trace_tests {
                 source.replace("\r\n", "\n").as_bytes()
             );
         }
-        for bad in [
-            "theorem t : True := by trace_state 1",
-            "theorem t : True := by trace",
-            "theorem t : True := by trace 1",
-            "theorem t : True := by trace \"a\" \"b\"",
+    }
+    #[test]
+    fn trace_requires_its_complete_literal_shape() {
+        for tail in [
+            "trace",
+            "trace 1",
+            "trace True",
+            "trace \"a\" \"b\"",
+            "trace (\"a\")",
+            "trace_state 1",
+            "trace_state \"a\"",
         ] {
-            assert!(parse_source_command(bad.as_bytes()).is_err(), "{bad}");
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
         }
     }
 }

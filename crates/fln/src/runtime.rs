@@ -9,6 +9,7 @@ mod callables;
 mod conditionals;
 mod data_recursion;
 mod decisions;
+mod diagnostics;
 mod empty;
 mod evaluation;
 mod floats;
@@ -85,6 +86,7 @@ pub(super) struct Preparation<'a> {
     text_decisions: decisions::Store,
     array_fold: array_fold::Store,
     array_iteration: array_iteration::Store,
+    diagnostics: diagnostics::Store,
     st: st::Store,
     io: io::Store,
     fs: fs::Store,
@@ -181,6 +183,7 @@ impl<'a> Preparation<'a> {
             text_decisions: decisions::Store::default(),
             array_fold: array_fold::Store::default(),
             array_iteration: array_iteration::Store::default(),
+            diagnostics: diagnostics::Store::default(),
             st: st::Store::default(),
             io: io::Store::default(),
             fs: fs::Store::default(),
@@ -535,6 +538,10 @@ impl<'a> Preparation<'a> {
                         }
                         if let Some(replacement) = self.implemented_by_call(&head, &args)? {
                             tasks.push(Task::Visit(replacement));
+                            continue;
+                        }
+                        if let Some(value) = self.diagnostic_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
                             continue;
                         }
                         if let Some(decision) = self.nat_equality_decision(&head, &args)? {

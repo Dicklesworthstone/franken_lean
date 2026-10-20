@@ -225,9 +225,10 @@ fn admitted_numeric_printers_preserve_logical_values_and_replay_native_printing(
             assert_eq!(first.executions.len(), expected.len());
             let mut rows = std::collections::BTreeSet::new();
             for (execution, expected) in first.executions.iter().zip(expected) {
+                // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
                 assert_eq!(
                     execution.checker.ground,
-                    fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                    fln::CheckerAdmissionGround::UnsafeQuarantine
                 );
                 let expected = Some(fln::ClosedVmValue::String(expected.to_owned()));
                 assert_eq!(fln::closed_vm_value(&execution.exit).unwrap(), expected);
@@ -551,7 +552,7 @@ fn admitted_string_quote_executes_escaping_callbacks_and_replays_native_bytecode
                 let expected = Some(fln::ClosedVmValue::String(expected.to_owned()));
                 assert_eq!(
                     execution.checker.ground,
-                    fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                    fln::CheckerAdmissionGround::UnsafeQuarantine
                 );
                 assert_eq!(fln::closed_vm_value(&execution.exit).unwrap(), expected);
                 let decoded =

@@ -1,5 +1,6 @@
 //! Installed executable-main behavior through the full actual import loader.
 //! Every subprocess uses the same Lean binary, roots and private record store.
+#![forbid(unsafe_code)]
 
 use super::*;
 

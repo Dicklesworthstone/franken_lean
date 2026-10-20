@@ -61,9 +61,16 @@ jobs:
           rustc --version
       - name: rustfmt
         run: cargo fmt --all --check
+      # clippy and the tests run even when an earlier step is red. The job's
+      # verdict is unchanged: any red step still fails the gate. What changes is
+      # that a formatting red no longer hides the test tally. From 2026-10-13
+      # to 2026-10-19 every run stopped at rustfmt, so the gate executed no test
+      # in over 200 runs while regressions landed (bead fln-publisher-landing-contract-czyx).
       - name: clippy (workspace, all targets, warnings denied)
+        if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test (workspace, no fail-fast)
+        if: ${{ !cancelled() }}
         # Six tests are skipped here BY NAME, and only these; each name is unique
         # across the workspace, so no filter can drop an unrelated test. They
         # guard the main-tree checkout's own state, not the product, and a CI

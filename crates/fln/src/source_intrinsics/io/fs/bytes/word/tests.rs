@@ -243,9 +243,10 @@ fn execute_and_replay(engine: &Engine, source: &str, expected: &[Expected]) {
     assert_eq!(indices.len(), expected.len());
     for (&index, expected) in indices.iter().zip(expected) {
         let execution = &completed.batch.executions[index];
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+            CheckerAdmissionGround::UnsafeQuarantine
         );
         assert_value(&execution.exit, expected);
         let replay = execute_flbc_artifact(

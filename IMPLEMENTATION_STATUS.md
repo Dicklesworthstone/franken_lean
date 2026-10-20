@@ -23,6 +23,24 @@ The evidence matrix and Beads tracker remain authoritative where they carry stro
 
 ---
 
+## Measured state, 2026-10-17
+
+Collected by the reality check `fln-reality-check-1017-9l76` at origin/main `0e9d4c64`, with release binaries built from it and the pinned v4.32.0 `lean` as the oracle. One host under load from the check's own jobs. Re-run before citing.
+
+| What | Result | Reproduce |
+|---|---|---|
+| Whole-stdlib council frontier | 2,433 / 2,433 modules, 215,136 declarations, 0 failed, 0 inconclusive; 1,844 s at `--jobs 16`. This is the accept side only; the corpus holds no declaration the pin rejects | `fln check-olean --continue --jobs 16 --progress --json --max-bytes 17179869184 <pin>/lib/lean` |
+| Mathlib frontier | No run since S25 (binary `0a44e720`, 10-06). The corpus was relocated off the measurement host on 10-14 | `fln-r0yh`, `franken_lean-z8j.1.15` |
+| Upstream suite, plain stratum (no explicit import; 2,582 files) | `tests/elab`: 233 of 2,237 pin-accepted files accepted, **171 with identical stdout** (158 on 10-13, same stratum); **1 false accept** among 294 pin-rejected files (`elab_fail/matchAltIndent`). The 797 explicit-import files were not measured (cold closure admissions exceed the 300 s budget) | the reality check's runner; the in-repo scoreboard test cannot measure this stratum since `a5c5293c` (`fln-upstream-suite-scoreboard-n04o`) |
+| `tests/compile` via `lean --run` | 6 / 61 identical with the pin's `--run`; 3 more differ only by the pin's linter warnings; 0 false accepts | the reality check's runner |
+| Fresh held-out probe (50 + 12 controls) | 35 / 49 pin-accepted programs accepted, all 35 with identical stdout; 0 / 13 false accepts | written for the check, not checked in |
+| `Init/Prelude.lean` from source | 115 / 631 declarations admitted under a skip-on-refusal ladder; 39 commands still need blanking to parse | ladder over the pin's lossless command ranges |
+| Known regressions and false accepts | `head!`/`Option.get!` refused since `32c34528` (`fln-panic-contract-seed-regression-q8iy`); the noncomputability check refuses type-only dependencies and well-founded recursion (`fln-noncomputable-check-false-refusal-bhf2`); `#guard_msgs` over `trace_state` accepts a docstring the pin rejects (`fln-guard-msgs-trace-severity-iss2`); a `match` right-hand side left of its `\|` is accepted (`fln-match-alt-column-false-accept-u3fv`); the imported default `@[simp]` set was dropped by merge `9e3bdcb3` (`fln-simp-default-set-a4nb`) | the beads |
+| CI | product-gate reached its test step in 0 of 200 runs since 2026-10-13 (rustfmt 62 sites in 18 files; clippy 2 errors). `main` is unprotected | `fln-publisher-landing-contract-czyx` |
+| Cold `Init` admission, new binary | 1,711 s at `-j 32` (155% average CPU, 8.3 GB peak); the later reuse takes 14 s | `fln-uyuz` |
+
+---
+
 ## Measured state, 2026-10-05
 
 Collected for bead `franken_lean-z8j.1.19`. Rows marked **re-run** were executed for this table; the others cite the record they come from. Every row names its commit or record, and a later commit can move any number, so re-run the command before citing one. Rows marked **re-derived 2026-10-06** were re-measured at `3bfd6986` for the same bead; the first collection of this table (2026-10-05) was stale on two of them within a day, in both directions.
@@ -105,7 +123,7 @@ The integration repairs independent-checker application conversion (normalize re
 
 ### Lantern / LSP server
 
-**Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, source-aware installed entry points, and layered transcript evidence; semantic editor and daemon architecture remain incomplete.**
+**Status: usable bounded transport, full and bounded incremental document synchronization, synchronous diagnostic waiting, source-aware installed entry points, native goals and term goals, a bounded Lean RPC session serving two of the pin's ten builtin procedures, and layered transcript evidence; semantic editor and daemon architecture remain incomplete.**
 
 #### Transport, parser, and wire ground
 
@@ -122,7 +140,7 @@ Landed:
 Landed:
 
 - `initialize`, `initialized`, `shutdown`, and `exit`, with UTF-16 position encoding advertised and Full text synchronization selected.
-- Full-sync `didOpen`, `didChange`, `didSave`, and `didClose`. Ranged or incremental fragments, duplicate opens, unopened changes and saves, non-monotone versions, and malformed transitions fail closed.
+- `didOpen`, `didChange`, `didSave`, and `didClose`. Since `9560674e` (2026-09-18) `initialize` advertises incremental synchronization (`change: 2`), and `didChange` applies either full text or bounded UTF-16 ranged edits (`crates/fln-server/src/dispatch/incremental.rs`). Duplicate opens, unopened changes and saves, non-monotone versions, and malformed transitions fail closed.
 - Open-document membership and accepted versions remain authoritative independently of retained source bytes.
 - Session-local state is independently bounded to 1,024 open documents, 256 MiB of retained source, and 4 MiB of aggregate URI keys.
 - Textless saves recheck the newest retained snapshot. Missing or invalidated text is visible and cannot replay stale source.
@@ -176,13 +194,13 @@ Landed:
 - Correlation independently rebuilds request and cancellation indexes and requires their accounting and prior-request facts to agree with the client-session pass.
 - Missing, duplicate, unsolicited, and numerically normalized response IDs fail closed. Equivalent JSON string spellings correlate by decoded value.
 - Client-request, server-response, and cancellation-target indexes are independently bounded to 262,144 IDs and 32 MiB of canonical ID bytes.
-- Correlation schema `fln.lsp-client-server-correlation/7` names `fln.lsp-method-response/3` and validates each response against the current bounded dispatcher's outer method contract:
+- Correlation schema `fln.lsp-client-server-correlation/7` names `fln.lsp-method-response/4` and validates each response against the bounded dispatcher's outer method contract:
   - `initialize` returns an object;
   - `shutdown` returns `null`;
   - `waitForDiagnostics` returns an object, `RequestCancelled`, or `RequestFailed`;
   - plain goals, hover, completion and definition return `null`, a result in the native server's profile for that method, or `InvalidParams`, `RequestFailed` or `RequestCancelled`. Completion must be a `CompletionList` of at most 256 plaintext items with single-line edits; definition must be one `Location` with a nonempty range (method-response/3, 2026-10-05; before that, completion and definition accepted only `null`);
-  - term goals must return the no-information `null` result;
-  - unsupported Lean RPC calls return `RequestFailed`;
+  - term goals return `null` or a typed native result (method-response/4, `70ad2477`, 2026-10-16);
+  - Lean RPC calls must return `RequestFailed`. **This contract is now behind the server:** since `f63e9e3f` (2026-10-16) the server answers `$/lean/rpc/connect` with a session and two procedures with results, but `crates/fln-server/src/correlation.rs` still classes `$/lean/rpc/connect` and `$/lean/rpc/call` as unsupported (`:75`) and calls a result a violation (`:603-610`). A transcript containing a live RPC session therefore fails correlation (bead `fln-infoview-rpc-procedures-my8l`);
   - unknown methods return `MethodNotFound`.
 - Method-derived result and error counts must reconcile exactly with the server transcript's validated totals, and every matched response must belong to one method contract class.
 - Cancelled targets are classified independently as `RequestCancelled`, normal result, or another valid error. Separate client and server streams disclose that result but cannot prove response order.
@@ -205,8 +223,8 @@ Landed:
 - Independent `CLIENT` and `SERVER` recordings still have no shared order. The new `TIMELINE` profile supplies recorder-defined event order, not wall-clock time, duration, scheduler execution, transport flush completion, or active CPU-work intervals.
 - No production recorder yet emits and identity-binds the interleaved event format. Fixture or caller-generated timelines must not be promoted to live-daemon evidence by implication.
 - Timeline schema v1 does not yet bind a particular `didOpen`, `didChange`, or `didSave` to its progress, terminal publication, diagnostic clearing, and completion episode. Complete document-to-progress-to-publication causality remains open.
-- Both installed front doors (`fln serve-lsp` and `lean --server`) answer plain goals and hover from the native source elaborator at the cursor (2026-09-21, `8c0fb54d` and `f6a00138`), definition navigation (2026-09-26, `e845bbbd`) and checked global-name completion (2026-09-27, `46e05cf3`); see [NATIVE_EDITOR_QUERIES.md](docs/NATIVE_EDITOR_QUERIES.md). Each covers only syntax the native parser supports. `$/lean/plainTermGoal` still returns `null`.
-- Lean RPC sessions are not implemented. RPC calls fail visibly; keepAlive and release do not fabricate a session.
+- Both installed front doors (`fln serve-lsp` and `lean --server`) answer plain goals and hover from the native source elaborator at the cursor (2026-09-21, `8c0fb54d` and `f6a00138`), definition navigation (2026-09-26, `e845bbbd`) and checked global-name completion (2026-09-27, `46e05cf3`); see [NATIVE_EDITOR_QUERIES.md](docs/NATIVE_EDITOR_QUERIES.md). Each covers only syntax the native parser supports. Since `0d44f9a2` (2026-10-16) `$/lean/plainTermGoal` also answers from the native elaborator.
+- Lean RPC sessions exist since `f63e9e3f` (2026-10-16). `$/lean/rpc/connect` returns a session. `Lean.Widget.getInteractiveGoals` and `Lean.Widget.getInteractiveTermGoal` answer from the native elaborator (`crates/fln-server/src/dispatch/rpc.rs`). The pin registers ten builtin procedures; the other eight return `-32601 "RPC procedure … is not implemented"`. That includes `getInteractiveDiagnostics`, which vscode-lean4's message panels call, and `getWidgets` (bead `fln-infoview-rpc-procedures-my8l`).
 - Retained source is session-local input state, not a declaration-granular shared elaboration and import environment.
 - The server remains synchronous and does not implement asupersync regions, active elaboration cancellation, shared immutable import heaps, stable diagnostic identities, crash isolation, or full unmodified `vscode-lean4` parity.
 
@@ -227,7 +245,7 @@ This is intended to make agent work accretive: failed hypotheses and verified fr
 
 **Status: mixed partial implementation.**
 
-These subsystems contain real contract planes, data structures, bounded execution slices, or integration work, but the repository has not reached the README's finished-system claims. Full mathlib-compatible elaboration and tactics, the complete native `Lean.*` Mirror, full Lake and Ledger behavior, production Iron code generation and JIT, semantic LSP and RPC, complete MCP orchestration, and release-grade cross-platform distribution remain active program work.
+These subsystems contain real contract planes, data structures, bounded execution slices, or integration work, but the repository has not reached the README's finished-system claims. Measured 2026-10-17: `fln-mcp`, `fln-wasm`, `fln-hound`, `fln-doc`, `fln-tui`, `fln-trace` and `fln-ledger` are single-file crates of type definitions (161–383 lines) that no other crate depends on, and `fln-unsafe-jit` is a 15-line stub. Full mathlib-compatible elaboration and tactics, the complete native `Lean.*` Mirror, full Lake and Ledger behavior, production Iron code generation and JIT, semantic LSP and RPC, complete MCP orchestration, and release-grade cross-platform distribution remain active program work.
 
 One concrete increment within this surface landed at `046ab940`: **Anvil** (`fln-anvil`) now carries a real first-order discrimination-tree lookup substrate — `flatten(&Expr)` (preorder key encoding; unknowns and an over-`u64` `Nat` collapse to a `Star` wildcard) plus an in-memory `DTree` with `insert(pattern, rule)` and `candidates(term)` wildcard-skip retrieval, deterministic and deduplicated, covered by nine unit tests (clippy `-D warnings` and fmt clean). It is the candidate index simp/aesop query at plan §12.2 (B5), but it is a **substrate, not yet consumed by a live simp tactic** (no rewrite engine imports `fln-anvil` today), and it stays an untrusted accelerator (FL-INV-06): retrieval is a sound candidate pre-filter — a superset of the true matches for the caller to confirm by unification — never an admission path.
 
@@ -244,8 +262,8 @@ The new native unifier makes **expected-type propagation and source/tactic-gener
 5. **Add a production timeline recorder with identity.** Bind executable, Git tree, epoch, producer semantics, final daemon state, first divergence, and the exact outer stream; do not synthesize order from independent recordings.
 6. **Keep independent-checker authority boundaries intact.** The checker may veto or observe; it must never become a second admission authority.
 7. **Deepen method-result contracts deliberately.** Bind the exact initialize capability object and exact diagnostic-wait success payload before claiming those inner semantics.
-8. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Goals, hover, definition and completion are answered; term goals and RPC sessions remain. Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
-9. **Promote retained text into real declaration and import state deliberately.** The latest-text cache supports truthful Full-sync lifecycle semantics; it is not dependency-aware incremental elaboration.
+8. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Goals, term goals, hover, definition, completion and two RPC procedures are answered; eight of the pin's builtin RPC procedures remain. Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
+9. **Promote retained text into real declaration and import state deliberately.** The latest-text cache supports truthful document lifecycle semantics, for both full and bounded incremental changes; it is not dependency-aware incremental elaboration.
 10. **Keep JSON-RPC decoding narrow but structural.** Extend typed extraction deliberately; never reintroduce substring routing or unbounded generic decoding.
 11. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin or artifact identity, and outcome class.
 

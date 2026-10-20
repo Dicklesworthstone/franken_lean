@@ -8,6 +8,7 @@
 //! Every child uses the ordinary solver, every assignment crosses the parent's
 //! K1 barrier, and neither path has environment-publication authority.
 mod projection;
+mod unit_like;
 
 use super::*;
 
@@ -61,7 +62,7 @@ impl Engine<'_> {
             return Ok(true);
         }
         let Some(eta) = self.record_eta_equations(left, right, locals)? else {
-            return Ok(false);
+            return self.unit_like_eta(left, right, locals, pending);
         };
         if self.preserve_pending_record_eta(
             &eta.constructor,

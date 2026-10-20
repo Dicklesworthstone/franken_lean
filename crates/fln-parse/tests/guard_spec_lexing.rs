@@ -1,4 +1,5 @@
 //! Real lexer/header boundaries for native message specifications.
+#![forbid(unsafe_code)]
 use fln_parse::command_scope::{
     self, ScopeCommand,
     guard_spec::{self, Action, Severity, Whitespace},

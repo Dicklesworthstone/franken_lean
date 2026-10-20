@@ -211,16 +211,83 @@ fn missing_or_data_valued_proofs_fail_atomically() {
     );
 }
 #[test]
-fn full_batches_cannot_partially_publish_or_bypass_capacity() {
+fn imported_population_is_not_limited_by_one_proofs_traversal_fuel() {
     let env = environment();
-    let full = import_rules(&env, &vec![proof("first", 1); MAX_ROWS]).unwrap();
+    let population = 4_097;
+    let full = import_rules(&env, &vec![proof("first", 1); population]).unwrap();
     let rows = read(&full).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].order, MAX_ROWS - 1);
-    assert!(matches!(
-        import_rules(&full, &[proof("second", 2)]),
-        Err(SimpSetError::Limit)
-    ));
+    assert_eq!(rows[0].order, population - 1);
+    let next = import_rules(&full, &[proof("second", 2)]).unwrap();
+    let next_rows = read(&next).unwrap();
+    assert_eq!(next_rows.len(), 2);
+    assert_eq!(next_rows[0].proof, Some(name("second")));
+    assert_eq!(next_rows[0].order, population);
+    let journal = next.extension(&descriptor().name).unwrap();
+    assert_eq!(
+        journal.payload_bytes(),
+        journal
+            .entries()
+            .map(|row| row.payload.len() as u128)
+            .sum::<u128>()
+    );
     assert_eq!(read(&full).unwrap(), rows);
+    assert!(env.extension(&descriptor().name).is_none());
+}
+
+#[test]
+fn journal_bytes_and_entry_handles_share_a_checked_aggregate_bound() {
+    let remaining = MAX_JOURNAL_BYTES - ENTRY_ACCOUNTING_BYTES;
+    assert_eq!(check_journal_capacity(1, remaining), Ok(()));
+    assert_eq!(
+        check_journal_capacity(1, remaining + 1),
+        Err(SimpSetError::Limit)
+    );
+    assert_eq!(
+        check_journal_capacity(2, remaining),
+        Err(SimpSetError::Limit)
+    );
+    assert_eq!(
+        check_journal_capacity(1, u128::MAX),
+        Err(SimpSetError::Limit)
+    );
+}
+
+#[test]
+fn imported_population_does_not_increase_proof_shape_fuel() {
+    use fln_core::expr::BinderInfo;
+    let mut ty = Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                Expr::sort(Level::zero()),
+            ),
+            Expr::sort(Level::zero()),
+        ),
+        Expr::sort(Level::zero()),
+    );
+    for _ in 0..4_096 {
+        ty = Expr::forall_e(
+            name("x"),
+            Expr::sort(Level::zero()),
+            ty,
+            BinderInfo::Default,
+        );
+    }
+    let long = name("long");
+    let env = environment()
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: long.clone(),
+                level_params: vec![],
+                type_: ty,
+            },
+            value: Expr::sort(Level::zero()),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![long.clone()],
+        }))
+        .unwrap();
+    assert_eq!(validate_proof(&env, &long), Err(SimpSetError::Limit));
     assert!(env.extension(&descriptor().name).is_none());
 }

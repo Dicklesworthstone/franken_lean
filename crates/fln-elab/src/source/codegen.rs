@@ -39,6 +39,10 @@ use fln_env::constants::ConstantInfo;
 use std::collections::{BTreeSet, HashSet};
 
 mod dependencies;
+mod types;
+
+#[cfg(test)]
+mod constructor_erasure_tests;
 
 const CSIMP_TABLE: &str = include_str!("../seed/csimp_recursors.tsv");
 const CSIMP_SCHEMA: &str = "schema fln-seed-csimp-recursors/1";
@@ -214,13 +218,12 @@ impl Context {
             .cloned()
             .collect();
         let dependencies = dependencies::Dependencies::read(self)?;
-        if named.is_empty() && dependencies.is_empty() {
-            return Ok(());
-        }
+        // Untagged axioms can still lack executable code. An empty registry
+        // must not bypass the typed walk of a computational declaration.
         // Proof declarations and type formers have no runtime body. This is
         // also necessary for brecOn.go: its PProd result is data even with a
         // Prop-valued motive, but a projection used solely as a proof erases.
-        if type_former_motive(&term.type_) {
+        if self.codegen_type_former(&term.type_)? {
             return Ok(());
         }
         if let Some(sort) = self.known_type(&term.type_)? {
@@ -244,7 +247,7 @@ impl Context {
         let Some(type_) = self.known_type(value)? else {
             return Ok(false);
         };
-        if type_former_motive(&type_) {
+        if self.codegen_type_former(&type_)? {
             return Ok(true);
         }
         let Some(sort) = self.known_type(&type_)? else {
@@ -301,8 +304,21 @@ impl Context {
                         head = f;
                     }
                     args.reverse();
+                    let mut erased_params = 0;
                     if let ExprNode::Const { name, levels } = head.node() {
                         dependencies.check(name)?;
+                        // Datatype parameters are static in both construction
+                        // and elimination. Source match/cases lower to Rec here,
+                        // so a data-valued parameter must not regain an executable
+                        // dependency at the generated eliminator. Use only the
+                        // admitted prefix: fields, minors, indices and the major
+                        // remain live. The head and named-recursor gates still run.
+                        erased_params = match self.txn.env.find(name) {
+                            Some(ConstantInfo::Ctor(ctor)) => ctor.num_params as usize,
+                            Some(ConstantInfo::Rec(rec)) => rec.num_params as usize,
+                            _ => 0,
+                        }
+                        .min(args.len());
                         if named.contains(name) && self.compiled_application(name, levels, &args)? {
                             if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
                                 return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
@@ -316,7 +332,7 @@ impl Context {
                     } else {
                         work.push(Work::Visit(head.clone()));
                     }
-                    work.extend(args.into_iter().map(Work::Visit));
+                    work.extend(args.into_iter().skip(erased_params).map(Work::Visit));
                 }
                 // Domains are erased; bodies are opened rather than walking
                 // loose bvars without the telescope that gives them meaning.

@@ -9,6 +9,16 @@ impl Context {
         goal: ProofGoal,
         selected: Option<usize>,
     ) -> Result<(), NatDefinitionElabError> {
+        self.construct_proof_goal_ordered(proof, goal, selected, ApplyGoalOrder::NonDependentFirst)
+    }
+
+    pub(super) fn construct_proof_goal_ordered(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        selected: Option<usize>,
+        order: ApplyGoalOrder,
+    ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         let target = self.whnf(&goal.target)?;
         let mut head = &target;
@@ -46,7 +56,7 @@ impl Context {
             }
             let instance_start = self.instance_goals.len();
             let term = self.constant(&constructor)?;
-            match self.apply_proof_term(proof, goal.clone(), term, instance_start) {
+            match self.apply_proof_term_ordered(proof, goal.clone(), term, instance_start, order) {
                 Ok(()) => return Ok(()),
                 Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
                     TacticError::ApplyMismatch,

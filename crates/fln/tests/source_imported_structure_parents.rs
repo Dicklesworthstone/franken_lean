@@ -311,9 +311,10 @@ fn check_and_replay(engine: &Engine) {
         assert_eq!(completed.batch.source_evaluation_indices.len(), 1);
         let execution = &completed.batch.executions[completed.batch.source_evaluation_indices[0]];
         assert_eq!(execution.checker.schema, "fln.checker-admission/1");
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
         assert_eq!(
             execution.checker.ground,
-            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
+            CheckerAdmissionGround::UnsafeQuarantine,
         );
         assert_nat(&execution.exit, expected, expression);
         let module = decode_canonical(&execution.flbc_artifact, CodecLimits::default())

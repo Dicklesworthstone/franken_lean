@@ -1,5 +1,6 @@
 //! The bounded default decreasing prover shares the existing checked Nat
 //! fixpoint and ordinary source arithmetic. Explicit scripts retain priority.
+#![forbid(unsafe_code)]
 use super::limits;
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, SourceCheckLimits};
 use fln_core::outcome::InconclusiveCause;

@@ -1,0 +1,204 @@
+name: Default prerequisite search
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-default-search.yml']
+permissions:
+  contents: read
+jobs:
+  default-search:
+    if: github.repository == 'Dicklesworthstone/franken_lean'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      FLN_REQUIRE_REFERENCE: '1'
+      CANDIDATE_SHA: c61ae541d5244bad2b913b42bcc9f07ac24ac5e5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: c61ae541d5244bad2b913b42bcc9f07ac24ac5e5
+          persist-credentials: false
+      - name: Verify the immutable source and install the exact Reference
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git hash-object crates/fln-elab/src/source/instances.rs)" = f9cea5186bbaba747971873c35f6e151151c4d7c
+          rustup show active-toolchain
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
+      - name: Materialize shared implicit-carrier regression inputs
+        id: fixtures
+        shell: python
+        run: |
+          import pathlib
+          root = pathlib.Path('crates/fln/tests/source_default_search')
+          getter = 'def supplied {A : Type} [Need0 A] : Nat := Need0.value (A := A)\n'
+          query = 'def inferred : Nat := supplied'
+          for path in sorted(root.glob('*.lean')):
+              source = path.read_text().replace('] def ', '] abbrev ')
+              if path.stem == 'cycle':
+                  source += getter
+              else:
+                  old = 'def inferred := let value : _ := Need0.value; value'
+                  assert source.count(old) == 1
+                  source = source.replace(old, getter + query)
+              path.write_text(source)
+          path = pathlib.Path('crates/fln/tests/source_default_search.rs')
+          source = path.read_text()
+          old = 'def inferred := let value : _ := Need0.value; value'
+          assert source.count(old) == 1
+          source = source.replace(old, query)
+          old = '    let error = base\n        .check_source_files(&[USE.as_bytes()], &KVMap::new(), limits())\n        .unwrap_err();'
+          assert source.count(old) == 1
+          source = source.replace(old, '    let error = match base.check_source_files(&[USE.as_bytes()], &KVMap::new(), limits()) {\n        Err(error) => error,\n        Ok(_) => panic!("cyclic default search unexpectedly completed"),\n    };')
+          path.write_text(source)
+      - name: Observe explicit and implicit synthesis entry points on the exact pin
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-entry.lean'
+          prefixes = {
+              'phantom': 'class P (A : Type) where\n  value : Nat\n@[default_instance] abbrev p : P Nat := P.mk 42\ndef supplied {A : Type} [P A] : Nat := P.value (A := A)\n',
+              'dependent': 'class P (A : Type) where\n  value : A\n@[default_instance] abbrev p : P Nat := P.mk 42\ndef supplied {A : Type} [P A] : A := P.value\n',
+          }
+          for shape, prefix in prefixes.items():
+              for query in ('def answer : Nat := P.value (A := _)', 'def answer : Nat := supplied', 'def answer := let value : _ := supplied; value'):
+                  fixture.write_text(prefix + 'set_option trace.Elab.defaultInstance true\n' + query + '\n#eval answer\n')
+                  p = subprocess.run([str(lean), str(fixture)], capture_output=True, text=True, timeout=60)
+                  print('DEFAULT_ENTRY', shape, query, p.returncode, p.stdout, p.stderr, flush=True)
+      - name: Check shared proofs and cyclic refusal using the pinned Lean toolchain
+        id: oracle
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          lean = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lean-4.32.0-linux/bin/lean'
+          root = pathlib.Path('crates/fln/tests/source_default_search')
+          fixture = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-search.lean'
+          failures = []
+          for name in ('deep', 'fallback', 'siblings'):
+              fixture.write_text((root / (name + '.lean')).read_text() + '\n#eval inferred\n')
+              p = subprocess.run([str(lean), str(fixture)], capture_output=True, text=True, timeout=120)
+              print(name, p.returncode, p.stdout, p.stderr, flush=True)
+              if p.returncode != 0 or [s for s in p.stdout.splitlines() if s.isdecimal()] != ['42']:
+                  failures.append(name)
+          fixture.write_text('set_option maxRecDepth 128\n' + (root / 'cycle.lean').read_text() + '\ndef inferred : Nat := supplied\n')
+          p = subprocess.run([str(lean), str(fixture)], capture_output=True, text=True, timeout=120)
+          print('cycle', p.returncode, p.stdout, p.stderr, flush=True)
+          if p.returncode == 0 or 'maximum recursion depth' not in (p.stdout + p.stderr):
+              failures.append('cycle')
+          assert not failures, failures
+      - name: Compile and run the new regressions on unchanged production code
+        if: (success() || failure()) && steps.fixtures.outcome == 'success'
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln --test source_default_search --no-run
+          set +e
+          cargo test --locked --offline -p fln --test source_default_search -- --nocapture --test-threads=1 > "$RUNNER_TEMP/default-baseline.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/default-baseline.log"
+          test "$status" = 101
+          grep -F '3 failed' "$RUNNER_TEMP/default-baseline.log"
+          grep -F '1 passed' "$RUNNER_TEMP/default-baseline.log"
+      - name: Integrate the explicit continuation machine on the checked source identity
+        if: (success() || failure()) && steps.fixtures.outcome == 'success'
+        id: integrated
+        shell: python
+        run: |
+          import pathlib, subprocess, textwrap
+          path = pathlib.Path('crates/fln-elab/src/source/instances.rs')
+          assert subprocess.check_output(['git', 'hash-object', str(path)], text=True).strip() == 'f9cea5186bbaba747971873c35f6e151151c4d7c'
+          source = path.read_text()
+          marker = 'mod parameters;'
+          assert source.count(marker) == 1
+          source = source.replace(marker, 'mod default_search;\n' + marker)
+          old = 'self.default_at_priority(&id, &class, priority, registry, &defaults, 0)?'
+          assert source.count(old) == 1
+          source = source.replace(old, 'self.default_at_priority(&id, &class, priority, registry, &defaults)?')
+          begin = source.index('    /// `synthesizeUsingDefaultPrio`')
+          end = source.index('    /// Build a speculative frame.', begin)
+          replacement = '''/// Try this priority in the registry's newest-first order. The continuation
+          /// machine settles all prerequisites before publishing the selected default.
+          fn default_at_priority(
+              &mut self,
+              id: &MVarId,
+              class: &Name,
+              priority: u32,
+              registry: &InstanceRegistry,
+              defaults: &[crate::instances::defaults::DefaultInstance],
+          ) -> Result<bool, NatDefinitionElabError> {
+              for row in defaults {
+                  self.tick()?;
+                  if row.candidate.priority != priority || &row.class != class {
+                      continue;
+                  }
+                  if default_search::apply(self, id, &row.candidate.declaration, registry, defaults)? {
+                      return Ok(true);
+                  }
+              }
+              Ok(false)
+          }
+          '''
+          path.write_text(source[:begin] + textwrap.indent(replacement, '    ') + '\n' + source[end:])
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', str(path), 'crates/fln-elab/src/source/instances/default_search.rs', 'crates/fln/tests/source_default_search.rs'], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          subprocess.run(['git', 'diff', '--stat'], check=True)
+      - name: Run new and retained source instance regressions
+        if: (success() || failure()) && steps.integrated.outcome == 'success'
+        run: cargo test --locked --offline -p fln --test source_default_search --test source_default_instances --test source_numeric_literals --test source_olean_instances --test source_instance_universe_holes --no-fail-fast -- --nocapture --test-threads=1
+      - name: Run elaborator unit tests
+        if: (success() || failure()) && steps.integrated.outcome == 'success'
+        run: cargo test --locked --offline -p fln-elab --lib --no-fail-fast -- --test-threads=1
+      - name: Check changed Rust targets and formatting
+        if: (success() || failure()) && steps.integrated.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source/instances.rs crates/fln-elab/src/source/instances/default_search.rs crates/fln/tests/source_default_search.rs
+          cargo clippy --locked --offline -p fln-elab --lib -- -D warnings
+          cargo clippy --locked --offline -p fln --test source_default_search -- -D warnings
+          cargo check --locked --offline --workspace --all-targets
+      - name: Preserve only the successfully tested immutable Git blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, urllib.request
+          paths = ['crates/fln-elab/src/source/instances.rs', 'crates/fln-elab/src/source/instances/default_search.rs', 'crates/fln/tests/source_default_search.rs']
+          paths += [str(p) for p in sorted(pathlib.Path('crates/fln/tests/source_default_search').glob('*.lean'))]
+          result = {}
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              body = json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=body, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  actual = json.load(response)['sha']
+              assert actual == expected, path
+              result[path] = actual
+          print('DEFAULT_SEARCH_TESTED_BLOBS ' + json.dumps(result, sort_keys=True), flush=True)
+          print('BRANCH_NOT_MODIFIED: publication requires the connected caller to check current main and fast-forward it', flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: (success() || failure()) && steps.pin.outcome == 'success'
+        with:
+          name: exact-default-search-reference
+          path: ${{ runner.temp }}/lean.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error

@@ -2,6 +2,8 @@
 use super::*;
 use std::collections::BTreeSet;
 
+mod diagnostics;
+
 /// An import-aware checker that can identify the open documents affected by a
 /// source event. `affected` must include transitive consumers, or conservatively
 /// include every possible consumer when dependency discovery was incomplete.
@@ -38,7 +40,11 @@ pub trait WorkspaceChecker {
     -> Vec<String>;
 }
 
-struct Adapter<'a>(&'a mut dyn WorkspaceChecker, semantic::index::Revision);
+struct Adapter<'a>(
+    &'a mut dyn WorkspaceChecker,
+    semantic::index::Revision,
+    diagnostics::Cache,
+);
 impl CheckSource for Adapter<'_> {
     fn semantic_queries(&self) -> bool {
         self.0.semantic_queries()
@@ -50,6 +56,13 @@ impl CheckSource for Adapter<'_> {
     ) -> Result<Option<semantic::Answer>, String> {
         self.0.query_with_revision(query, &self.1, documents)
     }
+    fn diagnostics(
+        &self,
+        uri: &str,
+        version: i64,
+    ) -> Result<&json::rpc::diagnostics::Batch, &'static str> {
+        self.2.get(uri, version)
+    }
 
     fn check(
         &mut self,
@@ -60,7 +73,9 @@ impl CheckSource for Adapter<'_> {
         // A same-version save is still a new editor world. Conservatively renew
         // on every check, including checks of reverse-dependent documents.
         self.1 = semantic::index::Revision::new();
-        self.0.check(uri, text, documents)
+        let notifications = self.0.check(uri, text, documents);
+        self.2.record(uri, text, documents, &notifications);
+        notifications
     }
     fn tracks_dependencies(&self) -> bool {
         true
@@ -73,6 +88,7 @@ impl CheckSource for Adapter<'_> {
         // Close/invalidation and watched-file events may trigger no check at
         // all. They must still retire answers from the previous dependency world.
         self.1 = semantic::index::Revision::new();
+        self.2.prune(documents);
         self.0.affected(changed, documents)
     }
 }
@@ -86,7 +102,11 @@ pub fn serve_workspace(
     checker: &mut dyn WorkspaceChecker,
 ) -> io::Result<ServerOutcome> {
     let revision = semantic::index::Revision::new();
-    super::serve_inner(input, output, &mut Adapter(checker, revision))
+    super::serve_inner(
+        input,
+        output,
+        &mut Adapter(checker, revision, diagnostics::Cache::default()),
+    )
 }
 
 /// Only bounded URI/version/availability metadata is copied, never source text.

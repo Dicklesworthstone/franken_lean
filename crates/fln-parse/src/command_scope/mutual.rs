@@ -1,7 +1,7 @@
-//! Atomic source groups for native mutual-inductive and partial elaboration.
+//! Atomic source groups for native mutual inductives, partial and unsafe definitions.
 //!
 //! The pin's Command.mutual encloses commands between `mutual` and `end`.
-//! This door accepts one to eight inductive declarations or partial definitions;
+//! This door accepts one to eight uniformly inductive, partial or unsafe declarations;
 //! mixed groups, nested groups and scope changes are never sequentialized.
 //! Members use the ordinary declaration parser over their exact source bytes.
 use super::*;
@@ -103,6 +103,7 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
 enum MemberKind {
     Inductive,
     PartialDefinition,
+    UnsafeDefinition,
 }
 
 /// This is only group classification. Preserve the complete declaration and
@@ -144,16 +145,21 @@ fn member_kind(syntax: &Syntax) -> Option<MemberKind> {
     {
         return None;
     }
-    let Syntax::Node { kind, args, .. } = &args[6] else {
-        return None;
+    let has_modifier = |slot: usize, modifier: &str| {
+        matches!(&args[slot], Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["null"])
+                && args.len() == 1
+                && args[0].kind() == Some(&Name::from_components(["Lean", "Parser", "Command", modifier])))
     };
-    (kind == &Name::from_components(["null"])
-        && args.len() == 1
-        && args[0].kind()
-            == Some(&Name::from_components([
-                "Lean", "Parser", "Command", "partial",
-            ])))
-    .then_some(MemberKind::PartialDefinition)
+    // Keep both markers on a conflicting unsafe/partial declaration; the
+    // elaborator, not this classifier, must reject its complete modifier set.
+    if has_modifier(6, "partial") {
+        Some(MemberKind::PartialDefinition)
+    } else if has_modifier(5, "unsafe") {
+        Some(MemberKind::UnsafeDefinition)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

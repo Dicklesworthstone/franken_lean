@@ -40,6 +40,7 @@ pub mod source_main;
 #[cfg(test)]
 mod source_nat_add_binding_tests;
 mod source_records;
+pub use source_records::SourceDeclarationAdmission;
 #[cfg(test)]
 mod source_seed_names;
 pub use fln_rt::obj::{CapturedStdout, StdoutCapture, StdoutCaptureError, flush_native_stdout};
@@ -94,9 +95,7 @@ pub use fln_core::name::{LeafView, Name};
 pub use fln_core::options::{DataValue, KVMap};
 pub use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 pub use fln_elab::{
-    DefinitionFrontendError, NatDefinitionFrontendError,
-    seed::SeedEnvironmentError,
-    source::{TracePayload, TraceRecord},
+    DefinitionFrontendError, NatDefinitionFrontendError, seed::SeedEnvironmentError,
 };
 pub use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
@@ -6782,7 +6781,6 @@ impl Engine {
             result_logical_root,
             admissions,
             local_instance: None,
-            traces: Vec::new(),
         }))
     }
 
@@ -6796,21 +6794,7 @@ impl Engine {
         source: &[u8],
         options: &KVMap,
         limits: EngineAdmissionLimits,
-    ) -> Result<Outcome<DeclarationAdmission>, EngineExecutionError> {
-        Ok(self
-            .admit_source_declaration_with_traces(source, options, limits)?
-            .map_complete(|(admitted, _)| admitted))
-    }
-
-    pub(crate) fn admit_source_declaration_with_traces(
-        &self,
-        source: &[u8],
-        options: &KVMap,
-        limits: EngineAdmissionLimits,
-    ) -> Result<
-        Outcome<(DeclarationAdmission, Vec<fln_elab::source::TraceRecord>)>,
-        EngineExecutionError,
-    > {
+    ) -> Result<Outcome<SourceDeclarationAdmission>, EngineExecutionError> {
         // Under an entered grammar (`source_check::grammar`) the file's notations expand first,
         // as `source_records::parse_scoped_command` expands them.
         let parsed = fln_parse::parse_definition(source)
@@ -6873,6 +6857,18 @@ impl Engine {
                     elaborated.irreducible,
                     options,
                 )?;
+                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax())
+                    && let Declaration::Thm(theorem) = &admitted.declaration
+                {
+                    admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                        admitted.engine.environment(),
+                        &theorem.base.name,
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
                 if let Some((name, priority)) = registration {
                     // A proof instance is admitted as a theorem. Both it and
                     // a data definition register the actual completed name,
@@ -6976,7 +6972,12 @@ impl Engine {
                         source_records::tag_protected(&admitted.engine, &name)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                Outcome::Complete((admitted, elaborated.traces))
+                return self.finish_local_function_admission(
+                    admitted,
+                    &elaborated.local_functions,
+                    options,
+                    limits,
+                );
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7086,8 +7087,8 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
         let name = fresh_generated_command_name(self.environment(), command_index)?;
-        let elaborated = source_records::elaboration_outcome(match parsed.kind() {
-            SourceCommandKind::Example => fln_elab::source::scope::elaborate_example_with_traces(
+        let declaration = source_records::elaboration_outcome(match parsed.kind() {
+            SourceCommandKind::Example => fln_elab::source::scope::elaborate_example(
                 parsed.syntax(),
                 name,
                 self.environment(),
@@ -7104,19 +7105,17 @@ impl Engine {
                     limits.kernel,
                     scope,
                 )
-                .map(|decl| (decl, Vec::new()))
             }
             SourceCommandKind::Check => fln_elab::elaborate_check_in_with_budget(
                 parsed.syntax(),
                 name,
                 self.environment(),
                 limits.kernel,
-            )
-            .map(|decl| (decl, Vec::new())),
+            ),
             _ => return Err(EngineExecutionError::StandaloneCheckRequired),
         })?;
-        let (declaration, traces) = match elaborated {
-            Outcome::Complete(elaborated) => elaborated,
+        let declaration = match declaration {
+            Outcome::Complete(declaration) => declaration,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
@@ -7137,7 +7136,6 @@ impl Engine {
                     environment_root: admission.base_logical_root,
                     checker: admission.checker,
                     scope: scope.clone(),
-                    traces,
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7283,7 +7281,8 @@ impl Engine {
             }
         })?;
         let mut guards: Vec<SourceGuard> = Vec::new();
-        let mut traces: Vec<SourceTrace> = Vec::new();
+        let mut trace_messages = Vec::new();
+        let mut trace_bytes = 0usize;
         // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
         // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
         let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
@@ -7539,20 +7538,22 @@ impl Engine {
                         {
                             return Err(not_implemented("`#guard_msgs` inside `#guard_msgs`"));
                         }
-                        // The pin passes such a guard by capturing the command's errors,
-                        // warnings or named trace classes (`trace: [cls]`), whose text this engine
-                        // does not reproduce. Running the command here would turn the pin's pass
-                        // into a rejection. The one warning it does reproduce ("declaration uses
-                        // `sorry`") and raw tactic traces (`trace_state`, `trace "msg"`) are judged.
+                        // The pin passes such a guard by capturing the command's errors or
+                        // warnings, whose text this engine does not reproduce. Running the command
+                        // here would turn the pin's pass into a rejection. The one warning it does
+                        // reproduce, "declaration uses `sorry`", is judged. Expected `trace:`
+                        // lines run: goal traces are reproduced and routed at trace severity, and
+                        // the `lean` front door makes any mismatch against an expected trace a
+                        // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
                             line != "warning: declaration uses `sorry`"
-                                && ["error:", "warning:", "trace: ["]
+                                && ["error:", "warning:"]
                                     .iter()
                                     .any(|severity| line.starts_with(severity))
                         }) {
                             return Err(not_implemented(
-                                "`#guard_msgs` expecting an error, warning or trace message",
+                                "`#guard_msgs` expecting an error or warning message",
                             ));
                         }
                         guards.push(SourceGuard {
@@ -7679,12 +7680,6 @@ impl Engine {
                     .map_err(|error| {
                         scope_error(command_index, original_offset, error.message())
                     })?;
-                if !admission.traces.is_empty() {
-                    traces.push(SourceTrace {
-                        command_index,
-                        traces: admission.traces.clone(),
-                    });
-                }
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
                     admission,
@@ -7729,12 +7724,6 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                if !admission.traces.is_empty() {
-                    traces.push(SourceTrace {
-                        command_index,
-                        traces: admission.traces.clone(),
-                    });
-                }
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
                     admission,
@@ -7803,13 +7792,27 @@ impl Engine {
                         at: Some(original_offset),
                     });
                 }
-                let checked = match engine.check_parsed_source_command_in_scope(
-                    parsed,
-                    options,
-                    limits.admission(),
-                    command_index,
-                    &scope,
-                ) {
+                let observed =
+                    if is_example && fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                        engine.check_observed_source_example(
+                            parsed,
+                            options,
+                            limits.admission(),
+                            command_index,
+                            &scope,
+                        )
+                    } else {
+                        engine
+                            .check_parsed_source_command_in_scope(
+                                parsed,
+                                options,
+                                limits.admission(),
+                                command_index,
+                                &scope,
+                            )
+                            .map(|outcome| outcome.map_complete(|check| (check, Vec::new())))
+                    };
+                let (checked, traces) = match observed {
                     Ok(Outcome::Complete(checked)) => checked,
                     Ok(Outcome::Inconclusive(reason)) => {
                         return Ok(Outcome::Inconclusive(reason));
@@ -7825,12 +7828,15 @@ impl Engine {
                         });
                     }
                 };
-                if !checked.traces.is_empty() {
-                    traces.push(SourceTrace {
-                        command_index,
-                        traces: checked.traces.clone(),
-                    });
-                }
+                source_records::traces::append(
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    traces,
+                    &checked.parsed,
+                    engine.environment(),
+                    command_index,
+                    original_offset,
+                )?;
                 let check_index = checks.len();
                 checks.push(checked);
                 outputs.push(if is_example {
@@ -7878,14 +7884,33 @@ impl Engine {
                 || (scope.noncomputable_section
                     && parsed.kind() == fln_parse::SourceCommandKind::Definition)
             {
-                let admission = match grammar
+                let (admission, traces) = match grammar
                     .enter(|| {
-                        engine.admit_source_command_in_scope(
-                            command_source,
-                            options,
-                            limits.admission(),
-                            &scope,
-                        )
+                        if fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                            engine
+                                .admit_observed_source_definition(
+                                    &parsed,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                )
+                                .map(|outcome| {
+                                    outcome.map_complete(|observed| {
+                                        (observed.admission, observed.traces)
+                                    })
+                                })
+                        } else {
+                            engine
+                                .admit_source_command_in_scope(
+                                    command_source,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                )
+                                .map(|outcome| {
+                                    outcome.map_complete(|admission| (admission, Vec::new()))
+                                })
+                        }
                     })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -7896,18 +7921,21 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                source_records::traces::append(
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    traces,
+                    &parsed,
+                    engine.environment(),
+                    command_index,
+                    original_offset,
+                )?;
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
                     .map_err(|error| {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                if !admission.traces.is_empty() {
-                    traces.push(SourceTrace {
-                        command_index,
-                        traces: admission.traces.clone(),
-                    });
-                }
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
                     admission,
@@ -7943,6 +7971,7 @@ impl Engine {
                     at: Some(original_offset),
                 });
             }
+            let mut traces = Vec::new();
             let declaration = if is_evaluation {
                 let name = fresh_generated_command_name(engine.environment(), command_index)
                     .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7964,12 +7993,25 @@ impl Engine {
                         (
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
+                                local_functions: Vec::new(),
                                 irreducible: false,
                                 noncomputable: false,
-                                traces: Vec::new(),
                             },
                             presentation,
                         )
+                    })
+                })
+            } else if fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                source_records::elaboration_outcome(fln_elab::source::trace::elaborate_definition(
+                    parsed.syntax(),
+                    engine.environment(),
+                    limits.kernel,
+                    &scope,
+                ))
+                .map(|outcome| {
+                    outcome.map_complete(|observed| {
+                        traces = observed.traces;
+                        (observed.candidate, None)
                     })
                 })
             } else {
@@ -8009,11 +8051,20 @@ impl Engine {
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
+            source_records::traces::append(
+                &mut trace_messages,
+                &mut trace_bytes,
+                traces,
+                &parsed,
+                engine.environment(),
+                command_index,
+                original_offset,
+            )?;
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
+                local_functions,
                 irreducible,
                 noncomputable,
-                traces: command_traces,
             } = elaborated;
             if noncomputable {
                 return Err(EngineExecutionError::UnexpectedPublication {
@@ -8127,7 +8178,6 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                admission.traces = command_traces.clone();
                 source_records::apply_batch_effects(&mut admission, irreducible, options).map_err(
                     |error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -8146,18 +8196,22 @@ impl Engine {
                         )?;
                     admission.result_logical_root = admission.engine.logical_root(options);
                 }
+                let admission = match engine.finish_local_function_batch(
+                    admission,
+                    &local_functions,
+                    options,
+                    limits.admission(),
+                )? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
                     .map_err(|error| {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                if !command_traces.is_empty() {
-                    traces.push(SourceTrace {
-                        command_index,
-                        traces: command_traces,
-                    });
-                }
                 source_admissions.push(SourceCommandAdmission {
                     command_index,
                     admission,
@@ -8178,8 +8232,9 @@ impl Engine {
                 }
                 merged
             });
-            let mut execution = match engine.execute_definition_entry(
+            let mut execution = match engine.execute_definition_entry_with_helpers(
                 declaration,
+                &local_functions,
                 scoped_options.as_ref().unwrap_or(options),
                 limits,
                 entry,
@@ -8223,13 +8278,12 @@ impl Engine {
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
-            if !command_traces.is_empty() {
-                traces.push(SourceTrace {
-                    command_index,
-                    traces: command_traces,
-                });
-            }
             execution.evaluation_presentation = evaluation_presentation;
+            if !is_evaluation {
+                for helper in &execution.local_functions {
+                    scopes.admitted(&helper.declaration);
+                }
+            }
             let execution_index = executions.len();
             // Printer candidates retain their checked successor in the
             // execution evidence, but never become source declarations.
@@ -8252,27 +8306,6 @@ impl Engine {
                 outputs.push(SourceCommandOutput::Evaluation {
                     command_index,
                     execution_index,
-                });
-            }
-        }
-
-        for guard in &guards {
-            if guard
-                .expected
-                .lines()
-                .any(|line| line.trim_start().starts_with("trace:"))
-                && !traces
-                    .iter()
-                    .any(|trace| trace.command_index == guard.command_index)
-            {
-                return Err(EngineExecutionError::BatchCommand {
-                    index: guard.command_index,
-                    error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: "`#guard_msgs` expecting an error, warning or trace message",
-                    }),
-                    at: warning_sites
-                        .get(&guard.command_index)
-                        .map(|(offset, _, _)| *offset),
                 });
             }
         }
@@ -8354,7 +8387,7 @@ impl Engine {
             checks,
             guards,
             warnings,
-            traces,
+            traces: trace_messages,
         }))
     }
 
@@ -8806,7 +8839,13 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         Ok(
-            match self.execute_definition(elaborated.declaration, options, limits)? {
+            match self.execute_definition_entry_with_helpers(
+                elaborated.declaration,
+                &elaborated.local_functions,
+                options,
+                limits,
+                source_evaluation::Entry::Value,
+            )? {
                 Outcome::Complete(mut execution) => {
                     source_records::apply_execution_effects(
                         &mut execution,
@@ -9275,6 +9314,11 @@ impl Engine {
                     at: None,
                 });
             }
+            if !mixed.traces.is_empty() {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "raw tactic traces in a source module build without a message channel",
+                });
+            }
             let SourceCommandBatchExecution {
                 mut batch,
                 command_count,
@@ -9321,7 +9365,12 @@ impl Engine {
                             at: None,
                         });
                     }
-                    None => Outcome::Complete(completed.batch),
+                    None if completed.traces.is_empty() => Outcome::Complete(completed.batch),
+                    None => {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "raw tactic traces without a command output channel",
+                        });
+                    }
                 },
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -9440,6 +9489,17 @@ impl Engine {
         limits: EngineExecutionLimits,
         entry: source_evaluation::Entry,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        self.execute_definition_entry_with_helpers(declaration, &[], options, limits, entry)
+    }
+
+    fn execute_definition_entry_with_helpers(
+        &self,
+        declaration: Declaration,
+        helpers: &[Declaration],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        entry: source_evaluation::Entry,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
         let (expression, declared_type) = match &declaration {
             Declaration::Defn(definition) => {
                 (definition.value.clone(), definition.base.type_.clone())
@@ -9478,7 +9538,30 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress)
+        // Check every generated helper BEFORE running any body. A bad helper
+        // cannot turn a rejected source command into observable IO effects.
+        let admission = match self.finish_local_function_admission(
+            admission,
+            helpers,
+            options,
+            limits.admission(),
+        )? {
+            Outcome::Complete(admission) => admission,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // An unsafe recursive definition is its own executable body. Its
+        // recursive constant exists only in the checked successor, unlike a
+        // safe source definition's already-admitted executable companion.
+        // Never use an unchecked header to make the compiler accept the call.
+        let executable_environment = if matches!(&admission.declaration,
+            Declaration::Defn(definition) if definition.safety == DefinitionSafety::Unsafe)
+        {
+            admission.engine.environment()
+        } else {
+            self.environment()
+        };
+        let mut preparation = runtime::Preparation::new(executable_environment, limits.ingress)
             .with_executable_opaques(&self.executable_opaques)
             .with_runtime_initializers(&self.runtime_initializers);
         let evaluated = match entry {
@@ -9499,7 +9582,7 @@ impl Engine {
             .expression_at_type(&expression, Some(declared_type.clone()))
             .map_err(EngineExecutionError::Ingress)?;
         let mut catalog = executable_dependencies(
-            &self.environment,
+            executable_environment,
             &expression,
             limits.ingress,
             &mut preparation,
@@ -9561,6 +9644,7 @@ impl Engine {
             flbc_artifact,
             exit,
             checker: admission.checker,
+            local_functions: admission.admissions.into_iter().skip(1).collect(),
         }))
     }
 }
@@ -11755,8 +11839,6 @@ pub struct DeclarationBatchAdmission {
     /// scope. Its declaration and reducibility are in `engine`, but its local
     /// registration is never part of a persistent environment or module export.
     pub local_instance: Option<(Name, u32)>,
-    /// Tactic trace records (`trace_state`, `trace "msg"`) captured during elaboration.
-    pub traces: Vec<fln_elab::source::TraceRecord>,
 }
 
 /// The authoritative outputs of one completed bounded engine run.
@@ -11787,6 +11869,10 @@ pub struct DefinitionExecution {
     pub exit: VmExit,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+    /// Separate checked helper transitions, after the primary declaration.
+    /// Empty for raw declaration execution; source APIs retain these receipts
+    /// and the final engine only when the entire helper batch succeeds.
+    pub local_functions: Vec<DeclarationAdmission>,
 }
 
 /// One bounded `#check` query or anonymous example validated by both checker seats.
@@ -11810,8 +11896,6 @@ pub struct SourceCheck {
     /// The scope in force at the command (namespace, `open`s): its output names constants
     /// the way they resolve there, as the pin's delaborator does.
     pub scope: fln_elab::source::scope::SourceScope,
-    /// Tactic trace records (`trace_state`, `trace "msg"`) captured during elaboration.
-    pub traces: Vec<fln_elab::source::TraceRecord>,
 }
 
 /// One completed definition-only source prefix followed by a terminal check.
@@ -11870,16 +11954,11 @@ pub struct SourceCommandBatchExecution {
     pub guards: Vec<SourceGuard>,
     /// Warnings the pin would log, in command order, at most one per command.
     pub warnings: Vec<SourceWarning>,
-    /// Tactic traces (`trace_state`, `trace "msg"`) produced by commands, in command order.
-    pub traces: Vec<SourceTrace>,
+    /// Raw tactic messages, captured in execution order (including backtracked branches).
+    pub traces: Vec<SourceTraceMessage>,
 }
 
-/// Tactic trace records produced by one source command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceTrace {
-    pub command_index: usize,
-    pub traces: Vec<fln_elab::source::TraceRecord>,
-}
+pub use source_records::traces::SourceTraceMessage;
 
 /// A warning a source command produced. The only one today is the pin's "declaration uses
 /// `sorry`" (`warnIfUsesSorry`, `Lean/AddDecl.lean`): a command whose admitted declarations

@@ -14,6 +14,7 @@ use fln_env::{
     extensions::{CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance},
 };
 use std::collections::BTreeMap;
+pub mod defeq;
 mod imports;
 pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
 
@@ -371,8 +372,27 @@ const MAGIC: &[u8] = b"FLNSIMP\x01";
 const STRUCTURAL_MAGIC: &[u8] = b"FLNSIMP\x02";
 // Auxiliary proofs add a new row form; existing v1/v2 rows keep their bytes.
 const PROOF_MAGIC: &[u8] = b"FLNSIMP\x03";
-const MAX_ROWS: usize = 4096;
+// A proof's type traversal and an imported library's journal are independent
+// resources. Init alone carries more than 4,096 simp events.
+const MAX_TYPE_STEPS: usize = 4096;
 const MAX_BYTES: usize = 16384;
+// Preserve the old 4,096 * 16,384-byte envelope while accounting for each
+// retained entry handle too. Small rules may share the available space;
+// admitting a larger library never grants more work to any proof classifier.
+const MAX_JOURNAL_BYTES: u128 = 4096 * MAX_BYTES as u128;
+const ENTRY_ACCOUNTING_BYTES: u128 =
+    std::mem::size_of::<fln_env::extensions::ExtensionEntry>() as u128;
+
+fn check_journal_capacity(entries: usize, payload_bytes: u128) -> Result<(), SimpSetError> {
+    let bytes = (entries as u128)
+        .checked_mul(ENTRY_ACCOUNTING_BYTES)
+        .and_then(|overhead| overhead.checked_add(payload_bytes))
+        .ok_or(SimpSetError::Limit)?;
+    if bytes > MAX_JOURNAL_BYTES {
+        return Err(SimpSetError::Limit);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimpSetError {
@@ -440,7 +460,7 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
     };
     // Reversed rules retain the bounded equality/Iff classifier.
     let mut applications = 0;
-    for _ in 0..MAX_ROWS {
+    for _ in 0..MAX_TYPE_STEPS {
         match ty.node() {
             ExprNode::MData { expr, .. } => ty = expr,
             ExprNode::ForallE { body, .. } if applications == 0 => ty = body,
@@ -470,7 +490,7 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
 /// terms or grant proof authority. Aliases/projections needing normalization
 /// remain unsupported; the ordinary tactic driver still checks every use.
 fn is_proposition(env: &Environment, expression: &Expr) -> Result<bool, SimpSetError> {
-    let mut remaining = MAX_ROWS;
+    let mut remaining = MAX_TYPE_STEPS;
     let mut spend = || -> Result<(), SimpSetError> {
         remaining = remaining.checked_sub(1).ok_or(SimpSetError::Limit)?;
         Ok(())
@@ -610,9 +630,7 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
     if extension.descriptor != expected {
         return Err(SimpSetError::Malformed);
     }
-    if extension.len() > MAX_ROWS {
-        return Err(SimpSetError::Limit);
-    }
+    check_journal_capacity(extension.len(), extension.payload_bytes())?;
     let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
     for (order, row) in extension.entries().enumerate() {
         if row.payload.len() > MAX_BYTES {
@@ -776,14 +794,21 @@ fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, SimpSetErr
     if payload.len() > MAX_BYTES {
         return Err(SimpSetError::Limit);
     }
-    if let Some(state) = env.extension(&expected.name) {
+    let (entries, bytes) = if let Some(state) = env.extension(&expected.name) {
         if state.descriptor != expected {
             return Err(SimpSetError::Malformed);
         }
-        if state.len() >= MAX_ROWS {
-            return Err(SimpSetError::Limit);
-        }
-    }
+        (
+            state.len().checked_add(1).ok_or(SimpSetError::Limit)?,
+            state
+                .payload_bytes()
+                .checked_add(payload.len() as u128)
+                .ok_or(SimpSetError::Limit)?,
+        )
+    } else {
+        (1, payload.len() as u128)
+    };
+    check_journal_capacity(entries, bytes)?;
     let env = if env.extension(&expected.name).is_none() {
         env.register_extension(expected.clone())
             .map_err(|_| SimpSetError::Malformed)?

@@ -8,6 +8,9 @@ use super::*;
 pub(super) enum Prefix {
     Binders(Box<term_binders::Prefix>),
     Assertion(Box<Assertion>),
+    /// `dbg_trace argument; body`: the argument and continuation occupy separate
+    /// phases on this same heap stack, including a line break in place of `;`.
+    DebugTrace(Box<DebugTrace>),
     Do(Box<term_do::Prefix>),
     /// `← e` (`Term.nestedAction`, `"← " doElem` at minimum precedence): the `←` token; its
     /// body is the rest of the enclosing group.
@@ -50,6 +53,12 @@ fn range_argument(mut head: Vec<(Syntax, usize)>, body: Syntax) -> (Syntax, usiz
         vec![function, null_node(arguments)],
     );
     (syntax, start)
+}
+
+pub(super) struct DebugTrace {
+    keyword: usize,
+    argument: Option<Syntax>,
+    separator: Option<usize>,
 }
 
 pub(super) struct Assertion {
@@ -147,6 +156,7 @@ fn pending_value(frames: &[BoundedTermFrame]) -> Option<usize> {
         }
         match frame.prefix.as_ref()? {
             Prefix::Assertion(p) if matches!(p.phase, Phase::Value) => return Some(p.keyword),
+            Prefix::DebugTrace(p) if p.argument.is_none() => return Some(p.keyword),
             prefix if prefix.body() => {}
             _ => return None,
         }
@@ -226,6 +236,44 @@ fn primed_proof(mut proof: Syntax) -> Syntax {
 }
 
 impl Prefix {
+    pub(super) fn debug_trace(
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        keyword: usize,
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        if *cursor >= end {
+            return Err(refuse(view, tokens, *cursor));
+        }
+        let mut trace = DebugTrace {
+            keyword,
+            argument: None,
+            separator: None,
+        };
+        // The pin tries interpolatedStr before termParser. Even a string without
+        // holes uses this branch; the closing quote finishes its whole argument.
+        if matches!(
+            tokens.get(*cursor).map(|token| &token.kind),
+            Some(TokenKind::Literal(fln_syntax::literal::LiteralKind::Str))
+        ) {
+            let (argument, next) =
+                extensions::interpolated_term(leaves, view, tokens, *cursor, end)
+                    .ok_or_else(|| refuse(view, tokens, *cursor))?;
+            if next >= end || (!word(tokens, next, ";") && !newline(view, tokens, next)) {
+                return Err(refuse(view, tokens, next));
+            }
+            trace.argument = Some(argument);
+            trace.separator = word(tokens, next, ";").then_some(next);
+            *cursor = next + usize::from(trace.separator.is_some());
+            if *cursor >= end {
+                return Err(refuse(view, tokens, *cursor));
+            }
+        }
+        Ok(Self::DebugTrace(Box::new(trace)))
+    }
+
     pub(super) fn set_option(
         leaves: &Leaves,
         view: &SourceView,
@@ -363,6 +411,7 @@ impl Prefix {
             Prefix::Do(prefix) => prefix.jump_keyword(),
             Prefix::Binders(_)
             | Prefix::Assertion(_)
+            | Prefix::DebugTrace(_)
             | Prefix::Nested(_)
             | Prefix::Return(_)
             | Prefix::SetOption { .. }
@@ -375,6 +424,7 @@ impl Prefix {
             Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
+            Self::DebugTrace(p) => p.argument.is_some(),
             Self::Nested(_)
             | Self::Return(_)
             | Self::SetOption { .. }
@@ -386,6 +436,7 @@ impl Prefix {
         match self {
             Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
+            Self::DebugTrace(p) => p.argument.is_none() && word(tokens, at, ";"),
             Self::Nested(_)
             | Self::Return(_)
             | Self::SetOption { .. }
@@ -411,6 +462,18 @@ impl Prefix {
         end: usize,
     ) -> Result<(Self, usize), NatDefinitionParseError> {
         let mut p = match self {
+            Self::DebugTrace(mut p) => {
+                if p.argument.is_some() {
+                    return Err(refuse(view, tokens, at));
+                }
+                p.argument = Some(expression);
+                p.separator = word(tokens, at, ";").then_some(at);
+                let next = at + usize::from(p.separator.is_some());
+                if next >= end {
+                    return Err(refuse(view, tokens, next));
+                }
+                return Ok((Self::DebugTrace(p), next));
+            }
             Self::Do(p) => {
                 return p
                     .finish_header(leaves, view, tokens, at, expression, end)
@@ -475,6 +538,28 @@ impl Prefix {
         body: Syntax,
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
         let p = match self {
+            Self::DebugTrace(p) => {
+                let argument = p
+                    .argument
+                    .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: leaves
+                            .leaf(p.keyword)?
+                            .info()
+                            .pos(false)
+                            .unwrap_or(BytePos(0)),
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    })?;
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "dbgTrace"]),
+                    vec![
+                        atom(leaves, p.keyword, "dbg_trace")?,
+                        argument,
+                        separator(leaves, p.separator)?,
+                        body,
+                    ],
+                );
+                return Ok((syntax, p.keyword));
+            }
             Self::Do(p) => return p.finish(leaves, body),
             Self::Binders(p) => return p.finish(leaves, body),
             Self::Nested(arrow) => {

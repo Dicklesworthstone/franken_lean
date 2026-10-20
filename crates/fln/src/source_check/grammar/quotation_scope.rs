@@ -11,8 +11,12 @@ use fln_parse::extensions::NotationRule;
 use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::{Preresolved, Syntax};
 
+mod do_notation;
+mod matches;
+
 enum Task<'a> {
     Visit(&'a Syntax),
+    DoSequence(&'a Syntax, bool),
     Copy(&'a Syntax),
     Emit(Syntax),
     Build(SourceInfo, &'a Name, usize),
@@ -493,6 +497,126 @@ fn shared_binder<'a>(
     Ok(())
 }
 
+/// Fields and argument labels are raw identifiers at the pin. Only their
+/// values are terms. Method binders scope over that field's annotation and
+/// initializer, never over a sibling field or an update source.
+fn field_syntax<'a>(
+    syntax: &'a Syntax,
+    rule: &NotationRule,
+    tasks: &mut Vec<Task<'a>>,
+    scope_depth: usize,
+) -> Result<bool, EngineExecutionError> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Ok(false);
+    };
+    let named = term_kind(kind, "namedArgument");
+    let field = term_kind(kind, "structInstField");
+    if !named
+        && !field
+        && !["proj", "pipeProj", "dotIdent", "structInst"]
+            .iter()
+            .any(|leaf| term_kind(kind, leaf))
+    {
+        return Ok(false);
+    }
+    // Only application named arguments have a quotation-precheck hook.
+    // Supporting unchecked user macros must not widen checked notations.
+    if rule.prechecked && !named {
+        return Err(unsupported_binder());
+    }
+    let raw = |syntax: &Syntax| match syntax {
+        Syntax::Ident { val, .. }
+            if !val.is_anonymous()
+                && !rule.variables.iter().any(|(_, variable)| variable == val) =>
+        {
+            Ok(())
+        }
+        Syntax::Node { kind, args, .. }
+            if *kind == Name::from_components(["fieldIdx"])
+                && matches!(args.as_slice(), [Syntax::Atom { .. }]) =>
+        {
+            Ok(())
+        }
+        _ => Err(unsupported_binder()),
+    };
+    if field {
+        let [label, payload] = args.as_slice() else {
+            return Err(unsupported_binder());
+        };
+        let [name, path] = term_args(label, "structInstLVal")? else {
+            return Err(unsupported_binder());
+        };
+        raw(name)?;
+        if !null_args(path)?.is_empty() {
+            return Err(unsupported_binder());
+        }
+        let entries = null_args(payload)?;
+        tasks.push(Task::Restore(scope_depth));
+        tasks.push(build(syntax)?);
+        if entries.is_empty() {
+            // `{ field }` reads a value as well as naming a field. Give that
+            // value its own identifier so global pre-resolution never changes
+            // the field label, and ordinary expansion retains its hygiene.
+            let null = || Name::from_components(["null"]);
+            tasks.push(Task::BuildNew(null(), 3));
+            tasks.push(Task::BuildNew(
+                Name::from_components(["Lean", "Parser", "Term", "structInstFieldDef"]),
+                3,
+            ));
+            tasks.push(Task::Visit(name));
+            tasks.push(Task::Emit(Syntax::node(null(), vec![])));
+            tasks.push(Task::Emit(Syntax::atom(SourceInfo::None, ":=")));
+            tasks.push(Task::Emit(Syntax::node(null(), vec![])));
+            tasks.push(Task::Emit(Syntax::node(null(), vec![])));
+        } else {
+            let [binders, annotation, definition] = entries else {
+                return Err(unsupported_binder());
+            };
+            null_args(binders)?;
+            shared_type(annotation)?;
+            let [assignment, private, value] = term_args(definition, "structInstFieldDef")? else {
+                return Err(unsupported_binder());
+            };
+            if !atom(assignment, &[":="]) || !null_args(private)?.is_empty() {
+                return Err(unsupported_binder());
+            }
+            tasks.push(build(payload)?);
+            tasks.push(build(definition)?);
+            tasks.push(Task::Visit(value));
+            tasks.push(Task::Copy(private));
+            tasks.push(Task::Copy(assignment));
+            tasks.push(Task::Visit(annotation));
+            tasks.push(Task::Binders(binders));
+        }
+        tasks.push(Task::Copy(label));
+        return Ok(true);
+    }
+    let expected = if named {
+        5
+    } else if term_kind(kind, "proj") {
+        3
+    } else if term_kind(kind, "pipeProj") {
+        5
+    } else if term_kind(kind, "dotIdent") {
+        2
+    } else {
+        6
+    };
+    if args.len() != expected {
+        return Err(unsupported_binder());
+    }
+    tasks.push(build(syntax)?);
+    for (index, child) in args.iter().enumerate().rev() {
+        if fln_parse::extensions::raw_identifier_slot(kind, index) {
+            raw(child)?;
+            tasks.push(Task::Copy(child));
+        } else {
+            tasks.push(Task::Visit(child));
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn preresolve(
     rule: &NotationRule,
     resolve: &impl Fn(&Name) -> Resolution,
@@ -503,6 +627,27 @@ pub(super) fn preresolve(
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(node @ Syntax::Node { kind, args, .. }) => {
+                if matches::conditional(node, rule, resolve, &mut tasks, &locals)? {
+                    continue;
+                }
+                if term_kind(kind, "match") || term_kind(kind, "doMatch") {
+                    matches::schedule(node, rule, resolve, &mut tasks, &locals)?;
+                    continue;
+                }
+                if term_kind(kind, "doIf") {
+                    do_notation::conditional(node, rule, resolve, &mut tasks, &locals)?;
+                    continue;
+                }
+                if term_kind(kind, "doTry") {
+                    do_notation::exception_region(node, rule, resolve, &mut tasks, &locals)?;
+                    continue;
+                }
+                if do_notation::visit(node, rule, &mut tasks, locals.len())? {
+                    continue;
+                }
+                if field_syntax(node, rule, &mut tasks, locals.len())? {
+                    continue;
+                }
                 if term_kind(kind, "fun") {
                     lambda(node, &mut tasks, locals.len())?;
                     continue;
@@ -547,15 +692,17 @@ pub(super) fn preresolve(
                     continue;
                 }
                 match resolve(val) {
-                    Resolution::Global(global) => built.push(Syntax::Ident {
-                        info: *info,
-                        raw_val: *raw_val,
-                        val: Name::from_components(["_root_"]).append_core(&global),
-                        preresolved: vec![Preresolved::Decl {
-                            name: global,
-                            fields: Vec::new(),
-                        }],
-                    }),
+                    Resolution::Global(global) | Resolution::Constructor(global) => {
+                        built.push(Syntax::Ident {
+                            info: *info,
+                            raw_val: *raw_val,
+                            val: Name::from_components(["_root_"]).append_core(&global),
+                            preresolved: vec![Preresolved::Decl {
+                                name: global,
+                                fields: Vec::new(),
+                            }],
+                        })
+                    }
                     Resolution::Unchecked => built.push(ident.clone()),
                     Resolution::Nothing if !rule.prechecked => built.push(ident.clone()),
                     Resolution::Nothing => {
@@ -569,6 +716,9 @@ pub(super) fn preresolve(
                         });
                     }
                 }
+            }
+            Task::DoSequence(sequence, scoped) => {
+                do_notation::sequence(sequence, &mut tasks, scoped.then_some(locals.len()))?;
             }
             Task::Visit(leaf) | Task::Copy(leaf) => built.push(leaf.clone()),
             Task::Emit(syntax) => built.push(syntax),
@@ -1005,5 +1155,134 @@ mod tests {
             preresolve(&rule, &global),
             Err(EngineExecutionError::NotImplemented { .. })
         ));
+    }
+    #[test]
+    fn do_quotation_names_bind_only_after_the_initializer() {
+        let mut rule = rule("notation \"seq\" => do { let x : Nat := x; let y ← x; return y }");
+        rule.prechecked = false;
+        assert_eq!(
+            names(&preresolve(&rule, &global).unwrap()),
+            [
+                "x",
+                "_root_.Declared.Nat",
+                "_root_.Declared.x",
+                "y",
+                "x",
+                "y"
+            ]
+        );
+    }
+
+    #[test]
+    fn do_function_domains_and_continuations_have_distinct_scopes() {
+        let mut rule = rule("notation \"seq\" => do { let f (x : Nat) : Nat := x; return x }");
+        rule.prechecked = false;
+        assert_eq!(
+            names(&preresolve(&rule, &global).unwrap()),
+            [
+                "f",
+                "x",
+                "_root_.Declared.Nat",
+                "_root_.Declared.Nat",
+                "x",
+                "_root_.Declared.x"
+            ]
+        );
+    }
+
+    #[test]
+    fn do_scopes_restore_at_term_boundaries_and_flatten_bare_nested_blocks() {
+        for (source, expected) in [
+            (
+                "notation \"seq\" => (do { let x := x; return x }) x",
+                vec!["x", "_root_.Declared.x", "x", "_root_.Declared.x"],
+            ),
+            (
+                "notation \"seq\" => do { do { let x := x; return x }; return x }",
+                vec!["x", "_root_.Declared.x", "x", "x"],
+            ),
+        ] {
+            let mut rule = rule(source);
+            rule.prechecked = false;
+            assert_eq!(names(&preresolve(&rule, &global).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn do_quotation_unsupported_patterns_are_not_walked_as_global_names() {
+        for source in [
+            "notation \"seq\" => do { let (x, y) := pair; return x }",
+            "notation \"seq\" => do { let rec f (n : Nat) := f n; return f }",
+        ] {
+            let mut rule = rule(source);
+            rule.prechecked = false;
+            assert!(matches!(
+                preresolve(&rule, &global),
+                Err(EngineExecutionError::NotImplemented { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn match_constructor_heads_are_globals_while_fields_are_local() {
+        let rule =
+            rule("notation \"m\" => match subject with | zero => fallback | succ value => value");
+        let resolved = preresolve(&rule, &|name| {
+            let global_name = Name::from_components(["Declared"]).append_core(name);
+            if ["zero", "succ"]
+                .iter()
+                .any(|text| *name == Name::from_components([*text]))
+            {
+                Resolution::Constructor(global_name)
+            } else {
+                Resolution::Global(global_name)
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            names(&resolved),
+            [
+                "_root_.Declared.subject",
+                "_root_.Declared.zero",
+                "_root_.Declared.fallback",
+                "_root_.Declared.succ",
+                "value",
+                "value"
+            ]
+        );
+    }
+
+    #[test]
+    fn match_pattern_locals_never_leak_into_the_subject_or_another_branch() {
+        let branch = rule(
+            "notation \"m\" subject => match subject with | .some value => value | .none => value",
+        );
+        unknown(
+            preresolve(&branch, &|_| Resolution::Nothing).unwrap_err(),
+            "value",
+        );
+        let subject =
+            rule("notation \"m\" => match value with | .some value => value | .none => 0");
+        unknown(
+            preresolve(&subject, &|_| Resolution::Nothing).unwrap_err(),
+            "value",
+        );
+    }
+
+    #[test]
+    fn malformed_match_nodes_are_typed_refusals() {
+        let mut rule = rule(
+            "notation \"m\" subject => match subject with | .some value => value | .none => 0",
+        );
+        for args in [Vec::new(), vec![Syntax::Missing; 6]] {
+            rule.rhs = Syntax::node(
+                Name::from_components(["Lean", "Parser", "Term", "match"]),
+                args,
+            );
+            assert!(matches!(
+                preresolve(&rule, &global),
+                Err(EngineExecutionError::NotImplemented { .. })
+            ));
+        }
     }
 }

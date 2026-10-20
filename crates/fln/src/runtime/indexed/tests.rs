@@ -250,3 +250,62 @@ fn predicate_canonicalization_keeps_data_families_and_checked_decision_carriers(
         );
     }
 }
+
+#[test]
+fn only_a_direct_type_index_becomes_a_boxed_motive_result() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[b"inductive Selected : Type -> Type 1 where\n  | pack (A : Type) (value : A) : Selected A\n  | nat (value : Nat) : Selected Nat"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+    let type_ = Expr::sort(Level::one());
+    let family = constant("Selected");
+    let motive = |result| {
+        Expr::lam(
+            name("A"),
+            type_.clone(),
+            Expr::lam(
+                name("value"),
+                Expr::app(family.clone(), Expr::bvar(0).unwrap()),
+                result,
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    let direct = prep
+        .indexed_motive(
+            &motive(Expr::bvar(1).unwrap()),
+            std::slice::from_ref(&type_),
+            &family,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(direct, records::boxed_slot_type());
+    assert_eq!(prep.value_type(&direct).unwrap(), Some(ValueType::Abi));
+
+    let dependent_list = Expr::app(
+        Expr::const_(name("List"), vec![Level::zero()]),
+        Expr::bvar(1).unwrap(),
+    );
+    assert_eq!(
+        prep.indexed_motive(
+            &motive(dependent_list),
+            std::slice::from_ref(&type_),
+            &family,
+        )
+        .unwrap(),
+        None,
+        "a result containing the index does not authorize a uniform layout"
+    );
+}

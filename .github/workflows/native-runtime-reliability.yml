@@ -8,6 +8,12 @@ on:
       - 'crates/fln-elab/src/seed/**'
       - 'crates/fln/src/runtime.rs'
       - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/source_intrinsics/diagnostics.rs'
+      - 'crates/fln-parse/src/**'
+      - 'crates/fln-vm/src/interpreter.rs'
+      - 'crates/fln-vm/src/interpreter/diagnostics.rs'
+      - 'crates/fln-vm/tests/runtime_diagnostics.rs'
+      - 'crates/fln/tests/source_runtime_diagnostics.rs'
       - 'crates/fln/tests/runtime_*.rs'
       - 'crates/fln/tests/source_*decisions.rs'
       - 'crates/fln-cli/tests/source_equality_decisions.rs'
@@ -40,6 +46,14 @@ jobs:
           persist-credentials: false
       - name: Install repository-pinned Rust
         run: rustup show active-toolchain
+      - name: Parse and expand builtin diagnostic terms
+        run: cargo test --locked -p fln-parse --lib
+      - name: Execute checked source diagnostic continuations
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --test source_runtime_diagnostics -- --nocapture --test-threads=1
+      - name: Validate diagnostic ABI ownership and resource stops
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln-vm --test runtime_diagnostics
       - name: Canonical seed streaming and small-stack runtime preparation
         run: |
           cargo test --locked -p fln-elab seed_stream_and_early_drop_fit_a_small_stack_without_changing_declarations

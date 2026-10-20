@@ -389,3 +389,163 @@ fn both_editor_doors_classify_proof_headers_before_using_the_private_body_world(
         }
     }
 }
+
+#[test]
+fn installed_hidden_definitions_keep_local_execution_and_import_only_checked_signatures() {
+    let project = Project::new();
+    let api = format!(
+        "{HEADER}private def hiddenFlag : Bool := Bool.true\npublic def flag : Bool := hiddenFlag\npublic opaque sealedFlag : Bool := hiddenFlag\n@[no_expose] public instance chosen : Pick := Pick.mk hiddenFlag\npublic abbrev visibleFlag : Bool := Bool.false"
+    );
+    project.write("Main.lean", &api);
+    project.complete("check-source");
+    let lean = project.lean();
+    assert!(lean.status.success(), "{lean:?}");
+    assert!(lean.stdout.is_empty());
+    assert!(lean.stderr.is_empty());
+    // `run` returns structured native values; this custom prelude has no Repr
+    // instance, so it does not claim the lean personality's #eval printer.
+    project.write(
+        "Main.lean",
+        &format!("{api}\n#eval flag\n#eval Pick.value\n#eval visibleFlag"),
+    );
+    let run = project.complete("run");
+    assert_eq!(
+        run.matches("\"kind\":\"bool\",\"value\":true").count(),
+        2,
+        "{run}"
+    );
+    assert_eq!(
+        run.matches("\"kind\":\"bool\",\"value\":false").count(),
+        1,
+        "{run}"
+    );
+    project.write("Api.lean", &api);
+    let main = "prelude\nimport Api\nnoncomputable def use : Bool := flag\nnoncomputable def useOpaque : Bool := sealedFlag\nnoncomputable def useDictionary : Bool := Pick.value\ndef visible : Bool := visibleFlag";
+    project.write("Main.lean", main);
+    project.complete("check-source");
+    assert!(project.lean().status.success());
+    for bad in [
+        "public def flag : Bool := missingHelper",
+        "@[expose] public def flag : Bool := hiddenFlag",
+        "public def flag : Secret := Secret.make",
+    ] {
+        project.write(
+            "Api.lean",
+            &format!("{HEADER}private def hiddenFlag : Bool := Bool.true\n{bad}"),
+        );
+        let failed = project.command("check-source");
+        assert!(!failed.status.success(), "{bad}: {failed:?}");
+        assert!(
+            failed.stdout.is_empty(),
+            "failed body exported a result: {failed:?}"
+        );
+        assert!(!failed.stderr.is_empty());
+        project.write("Api.lean", &api);
+        project.complete("check-source");
+    }
+}
+
+#[test]
+fn both_editor_doors_use_checked_private_definition_contexts_and_recover() {
+    let project = Project::new();
+    let uri = project.uri("Api.lean");
+    let prefix = format!("{HEADER}private def hiddenFlag : Bool := Bool.true\n");
+    let pending = format!("{prefix}public def pending : Bool := by");
+    let complete = format!("{pending}\n  exact hiddenFlag");
+    let bad_header = format!("{prefix}public def pending : Secret := by exact Secret.make");
+    for (binary, argument) in [
+        (env!("CARGO_BIN_EXE_fln"), "serve-lsp"),
+        (env!("CARGO_BIN_EXE_lean"), "--server"),
+    ] {
+        let mut input = vec![
+            open(&uri, &pending),
+            query("goal", "$/lean/plainGoal", &uri, &pending, pending.len()),
+            change(&uri, 2, &complete),
+            query("done", "$/lean/plainGoal", &uri, &complete, complete.len()),
+            query(
+                "hover",
+                "textDocument/hover",
+                &uri,
+                &complete,
+                complete.rfind("hiddenFlag").unwrap() + 2,
+            ),
+            change(&uri, 3, &bad_header),
+            query(
+                "bad-header",
+                "$/lean/plainGoal",
+                &uri,
+                &bad_header,
+                bad_header.len(),
+            ),
+            change(&uri, 4, &complete),
+            query(
+                "recovered",
+                "$/lean/plainGoal",
+                &uri,
+                &complete,
+                complete.len(),
+            ),
+        ];
+        for (version, id, declaration) in [
+            (5, "private-body", "public def pending : Bool := hid"),
+            (6, "public-header", "public def pending : hid"),
+            (
+                7,
+                "exposed-body",
+                "@[expose] public def pending : Bool := hid",
+            ),
+            (
+                8,
+                "hidden-abbrev",
+                "@[no_expose] public abbrev pending : Bool := hid",
+            ),
+            (9, "exposed-abbrev", "public abbrev pending : Bool := hid"),
+            (
+                10,
+                "opaque-body",
+                "@[expose] public section\nopaque pending : Bool := hid",
+            ),
+        ] {
+            let source = format!("{prefix}{declaration}");
+            input.push(change(&uri, version, &source));
+            input.push(query(
+                id,
+                "textDocument/completion",
+                &uri,
+                &source,
+                source.len(),
+            ));
+        }
+        let replies = project.server(binary, argument, input);
+        assert!(reply(&replies, "goal").contains("Bool"), "{replies:#?}");
+        assert!(!reply(&replies, "goal").contains("\"error\":"));
+        for id in ["done", "recovered"] {
+            assert!(reply(&replies, id).contains("\"goals\":[]"), "{replies:#?}");
+        }
+        assert!(
+            reply(&replies, "hover").contains("hiddenFlag"),
+            "{replies:#?}"
+        );
+        assert!(!reply(&replies, "hover").contains("\"error\":"));
+        assert!(
+            reply(&replies, "bad-header").contains("\"code\":-32803"),
+            "{replies:#?}"
+        );
+        for (id, visible) in [
+            ("private-body", true),
+            ("public-header", false),
+            ("exposed-body", false),
+            ("hidden-abbrev", true),
+            ("exposed-abbrev", false),
+            ("opaque-body", true),
+        ] {
+            let response = reply(&replies, id);
+            assert!(response.contains("\"items\":"), "{replies:#?}");
+            assert_eq!(
+                response.contains("\"label\":\"hiddenFlag\""),
+                visible,
+                "{id}: {replies:#?}"
+            );
+        }
+    }
+}

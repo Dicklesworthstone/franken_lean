@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":641,"projection_hash":"32a05fe0f094eee9b810ee99abad2979e245479050cd7ffdd262d1c03992ac0c"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":657,"projection_hash":"c90bd4f3495c70f87b5331fe7a35dd4a3e3d566a9eae83e136c0d2ccc35589af"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -91,6 +91,7 @@
 {"id":"fln-attribute-state-census-h14"}
 {"id":"fln-azxg"}
 {"id":"fln-b65e"}
+{"id":"fln-beads-stale-merge-guard-xzxt"}
 {"id":"fln-bench-apparatus-empty-referent-bkw6"}
 {"id":"fln-bot-publication-bypasses-gates-svj2"}
 {"id":"fln-boundary-api-no-admission-argument-discarded-ez07"}
@@ -103,6 +104,7 @@
 {"id":"fln-checker-free-binding-cycle-false-reject-u1vk"}
 {"id":"fln-checker-mathlib-shapes-qne9"}
 {"id":"fln-ci-fixture-root-dev-host-path-8gdb"}
+{"id":"fln-ci-tests-need-pin-d3ci"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
 {"id":"fln-d18-product-half-rgsg"}
@@ -127,6 +129,7 @@
 {"id":"fln-eq4k"}
 {"id":"fln-ersf"}
 {"id":"fln-euo"}
+{"id":"fln-eval-stderr-capture-ay5r"}
 {"id":"fln-evidence-runner-bootstrap-btk"}
 {"id":"fln-ew20"}
 {"id":"fln-export-aliases-ub7i"}
@@ -141,6 +144,7 @@
 {"id":"fln-fei1"}
 {"id":"fln-ffam"}
 {"id":"fln-ffce"}
+{"id":"fln-file-scale-t2-differential-5f1b"}
 {"id":"fln-fixture-retention-unbounded-evit"}
 {"id":"fln-fln-definition-auxiliary-names-lv0n"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
@@ -160,6 +164,7 @@
 {"id":"fln-g1mc"}
 {"id":"fln-g6d1"}
 {"id":"fln-gates-and-governance-decision-cihe"}
+{"id":"fln-generated-builtin-grammar-spike-kcvj"}
 {"id":"fln-giap"}
 {"id":"fln-gjup"}
 {"id":"fln-gkhu"}
@@ -167,6 +172,7 @@
 {"id":"fln-golem-ordinary-loops-fbj6"}
 {"id":"fln-guard-lifetime-char-boundary-zydy"}
 {"id":"fln-guard-msgs-lls1"}
+{"id":"fln-guard-msgs-trace-severity-iss2"}
 {"id":"fln-h1k"}
 {"id":"fln-h1k.1"}
 {"id":"fln-h1k.2"}
@@ -185,10 +191,12 @@
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-import-reuse-composes-4ngt"}
 {"id":"fln-in1"}
+{"id":"fln-infoview-rpc-procedures-my8l"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
 {"id":"fln-init-control-council-4698-1yyb"}
 {"id":"fln-init-core-council-4442-aiwk"}
+{"id":"fln-init-simp-journal-overflow-p8ht"}
 {"id":"fln-init-sizeof-council-3290-w4xk"}
 {"id":"fln-invalid-yaml-landing-workflows-waaq"}
 {"id":"fln-ir-decoder-call-graph-sjzl"}
@@ -218,6 +226,7 @@
 {"id":"fln-l8f"}
 {"id":"fln-lake-clean-symlink-comments-vlp1"}
 {"id":"fln-laxj"}
+{"id":"fln-layout-column-false-accepts-cbfm"}
 {"id":"fln-library-elab-inconclusive-typing-yj3w"}
 {"id":"fln-lld"}
 {"id":"fln-llg3"}
@@ -229,6 +238,7 @@
 {"id":"fln-macro-rung-e1rk"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
+{"id":"fln-match-alt-column-false-accept-u3fv"}
 {"id":"fln-merkle-decl-digest-80ni"}
 {"id":"fln-mirror-price-cszo"}
 {"id":"fln-module-header-tric"}
@@ -239,6 +249,7 @@
 {"id":"fln-nested-actions-e60c"}
 {"id":"fln-nhf5"}
 {"id":"fln-nomatch-nofun-h78u"}
+{"id":"fln-noncomputable-check-false-refusal-bhf2"}
 {"id":"fln-notation-from-imports-0edr"}
 {"id":"fln-nu8r"}
 {"id":"fln-o0j"}
@@ -250,6 +261,7 @@
 {"id":"fln-open-explicit-in-f9lk"}
 {"id":"fln-ordinary-lean-probe-g03u"}
 {"id":"fln-otk7"}
+{"id":"fln-panic-contract-seed-regression-q8iy"}
 {"id":"fln-panic-family-and-silent-panic-output-uyuk"}
 {"id":"fln-parity-freshness-denylist-direction-dy22"}
 {"id":"fln-parity-ledger-freshness-names-the-run-igxr"}
@@ -259,10 +271,12 @@
 {"id":"fln-path-classification-coverage-unbound-9teu"}
 {"id":"fln-peer-header-incremental-4t82"}
 {"id":"fln-pin-syntax-corpus-7b5b"}
+{"id":"fln-prelude-list-literal-false-accept-uvga"}
 {"id":"fln-private-index-worktree-sync-mbh9"}
 {"id":"fln-provisional-frontier-vf32"}
 {"id":"fln-pu6i"}
 {"id":"fln-publish-rewrite-indexes-gca"}
+{"id":"fln-publisher-landing-contract-czyx"}
 {"id":"fln-pv1"}
 {"id":"fln-q3u4"}
 {"id":"fln-q8qt"}
@@ -275,8 +289,10 @@
 {"id":"fln-reality-check-1004-y7ba"}
 {"id":"fln-reality-check-1007-kzz9"}
 {"id":"fln-reality-check-1013-wzr5"}
+{"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-registry-batch-preflight-sszd"}
+{"id":"fln-repr-ingress-lambda-application-xchs"}
 {"id":"fln-rfl-for-step-limit-63a9"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}

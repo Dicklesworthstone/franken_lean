@@ -81,7 +81,9 @@ fn theorem_candidate_retains_private_proof_but_exact_public_statement() {
         public_scope: &scope,
         private_scope: &scope,
     };
-    let theorem = source::elaborate_public_theorem(syntax.syntax(), &worlds, budget()).unwrap();
+    let elaborated = source::elaborate_public_theorem(syntax.syntax(), &worlds, budget()).unwrap();
+    assert!(elaborated.local_functions.is_empty());
+    let theorem = elaborated.declaration;
     let Declaration::Thm(value) = &theorem else {
         panic!("the proof remains a theorem candidate")
     };

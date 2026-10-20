@@ -20,6 +20,7 @@ use fln_core::expr::NatLit;
 use fln_core::level::LevelView;
 
 pub mod format;
+pub mod goals;
 mod print;
 use format::Format;
 
@@ -471,8 +472,6 @@ pub struct Printer<'a> {
     names: Vec<String>,
     /// Each binder's type, relative to the binders outside it.
     types: Vec<Expr>,
-    fvar_names: std::collections::HashMap<fln_core::expr::FVarId, String>,
-    fvar_types: std::collections::HashMap<fln_core::expr::FVarId, Expr>,
     /// Inside a call to [`Printer::expr`]: the root call decides `proofs`.
     nested: bool,
     /// The pin's `pp.proofs`: false by default, true when the printed term is itself a
@@ -583,33 +582,6 @@ fn ends_in_prop(type_: &Expr) -> bool {
     }
 }
 
-fn expr_contains_fvar(e: &Expr, target: &fln_core::expr::FVarId) -> bool {
-    if !e.has_fvar() {
-        return false;
-    }
-    match e.node() {
-        ExprNode::FVar { id } => id == target,
-        ExprNode::App { f, a } => expr_contains_fvar(f, target) || expr_contains_fvar(a, target),
-        ExprNode::Lam {
-            binder_type, body, ..
-        }
-        | ExprNode::ForallE {
-            binder_type, body, ..
-        } => expr_contains_fvar(binder_type, target) || expr_contains_fvar(body, target),
-        ExprNode::LetE {
-            type_, value, body, ..
-        } => {
-            expr_contains_fvar(type_, target)
-                || expr_contains_fvar(value, target)
-                || expr_contains_fvar(body, target)
-        }
-        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
-            expr_contains_fvar(expr, target)
-        }
-        _ => false,
-    }
-}
-
 impl<'a> Printer<'a> {
     pub fn new(env: &'a Environment) -> Self {
         Self {
@@ -617,8 +589,6 @@ impl<'a> Printer<'a> {
             scope: None,
             names: Vec::new(),
             types: Vec::new(),
-            fvar_names: std::collections::HashMap::new(),
-            fvar_types: std::collections::HashMap::new(),
             nested: false,
             proofs: false,
             budget: 100_000,
@@ -696,16 +666,11 @@ impl<'a> Printer<'a> {
     /// connective, or a `∀` into one. The head is a constant whose type ends in `Prop`, or
     /// a bound variable whose type does (a motive into `Prop`).
     fn is_prop(&self, e: &Expr) -> bool {
-        Self::prop_in(self.env, &self.fvar_types, &self.types, e)
+        Self::prop_in(self.env, &self.types, e)
     }
 
     /// [`Printer::is_prop`] for `e` under the binder types `scope` (innermost last).
-    fn prop_in(
-        env: &Environment,
-        fvar_types: &std::collections::HashMap<fln_core::expr::FVarId, Expr>,
-        scope: &[Expr],
-        e: &Expr,
-    ) -> bool {
+    fn prop_in(env: &Environment, scope: &[Expr], e: &Expr) -> bool {
         let mut local: Vec<&Expr> = Vec::new();
         let mut e = e;
         loop {
@@ -725,7 +690,6 @@ impl<'a> Printer<'a> {
             ExprNode::Const { name, .. } => env
                 .find(name)
                 .is_some_and(|info| ends_in_prop(&info.constant_val().type_)),
-            ExprNode::FVar { id } => fvar_types.get(id).is_some_and(ends_in_prop),
             ExprNode::BVar { idx } => {
                 let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
                 if idx < local.len() {
@@ -745,17 +709,12 @@ impl<'a> Printer<'a> {
     /// Whether `e` is a proof: its type is a proposition. The type is read from the head's
     /// type, which suffices for a constant or a bound variable at the head.
     fn is_proof(&self, e: &Expr) -> bool {
-        Self::proof_in(self.env, &self.fvar_types, &self.types, e)
+        Self::proof_in(self.env, &self.types, e)
     }
 
     /// [`Printer::is_proof`] for `e` under the binder types `scope` (innermost last). A `fun`
     /// is a proof when its body is one: its type is a `∀` into the body's type.
-    fn proof_in(
-        env: &Environment,
-        fvar_types: &std::collections::HashMap<fln_core::expr::FVarId, Expr>,
-        scope: &[Expr],
-        e: &Expr,
-    ) -> bool {
+    fn proof_in(env: &Environment, scope: &[Expr], e: &Expr) -> bool {
         let mut local: Vec<Expr> = Vec::new();
         let mut e = e;
         while let ExprNode::Lam {
@@ -767,12 +726,9 @@ impl<'a> Printer<'a> {
         }
         let (head, _) = spine(e);
         match head.node() {
-            ExprNode::Const { name, .. } => env.find(name).is_some_and(|info| {
-                Self::prop_in(env, fvar_types, &[], &info.constant_val().type_)
-            }),
-            ExprNode::FVar { id } => fvar_types
-                .get(id)
-                .is_some_and(|type_| Self::prop_in(env, fvar_types, &[], type_)),
+            ExprNode::Const { name, .. } => env
+                .find(name)
+                .is_some_and(|info| Self::prop_in(env, &[], &info.constant_val().type_)),
             // A binder's type is relative to the binders outside it.
             ExprNode::BVar { idx } => {
                 let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
@@ -783,13 +739,13 @@ impl<'a> Printer<'a> {
                         .chain(&local[..at])
                         .cloned()
                         .collect::<Vec<_>>();
-                    Self::prop_in(env, fvar_types, &outside, &local[at])
+                    Self::prop_in(env, &outside, &local[at])
                 } else {
                     let outer = idx - local.len();
                     scope
                         .len()
                         .checked_sub(outer + 1)
-                        .is_some_and(|at| Self::prop_in(env, fvar_types, &scope[..at], &scope[at]))
+                        .is_some_and(|at| Self::prop_in(env, &scope[..at], &scope[at]))
                 }
             }
             _ => false,
@@ -813,122 +769,6 @@ impl<'a> Printer<'a> {
     pub fn typed_text(&mut self, term: &str, type_: &Expr) -> Printed {
         let type_ = self.doc(type_, 0)?;
         Ok(Format::text(format!("{term} : ")).then(type_).pretty(WIDTH))
-    }
-
-    /// One tactic goal as `Lean.Meta.ppGoal` (`Lean/Meta/PPGoal.lean:76-139`) prints it.
-    pub fn goal(&mut self, goal: &fln_elab::source::inspect::ObservedGoal) -> Printed {
-        let saved_names = std::mem::take(&mut self.fvar_names);
-        let saved_types = std::mem::take(&mut self.fvar_types);
-        let result = (|| {
-            let mut seen = std::collections::HashSet::<Name>::new();
-            let mut stem_idx = std::collections::HashMap::<Name, usize>::new();
-            let mut locals = Vec::with_capacity(goal.locals.decls().len());
-            for decl in goal.locals.decls().iter().rev() {
-                let shown = if decl.user_name.is_anonymous()
-                    || !accessible(&decl.user_name)
-                    || decl.user_name.has_macro_scopes()
-                    || seen.contains(&decl.user_name)
-                {
-                    seen.insert(decl.user_name.clone());
-                    let erased = decl.user_name.erase_macro_scopes();
-                    let stem_name = if erased.is_anonymous() {
-                        Name::from_components(["a"])
-                    } else if !accessible(&erased) {
-                        Name::from_components(["x"])
-                    } else {
-                        erased
-                    };
-                    let stem_text = escaped_name(&stem_name);
-                    let idx = stem_idx.entry(stem_name).or_insert(0);
-                    let sanitized = if *idx == 0 {
-                        format!("{stem_text}✝")
-                    } else {
-                        let digits: String = idx
-                            .to_string()
-                            .chars()
-                            .filter_map(|d| {
-                                d.to_digit(10)
-                                    .and_then(|n| SUPERSCRIPTS.chars().nth(n as usize))
-                            })
-                            .collect();
-                        format!("{stem_text}✝{digits}")
-                    };
-                    *idx += 1;
-                    sanitized
-                } else {
-                    seen.insert(decl.user_name.clone());
-                    escaped_name(&decl.user_name)
-                };
-                self.fvar_names.insert(decl.id.clone(), shown.clone());
-                self.fvar_types.insert(decl.id.clone(), decl.type_.clone());
-                locals.push((decl, shown));
-            }
-            locals.reverse();
-
-            let mut lines: Vec<String> = Vec::new();
-            if !goal.tag.is_anonymous() {
-                let tag = escaped_name(&goal.tag.erase_macro_scopes());
-                if !tag.is_empty() {
-                    lines.push(format!("case {tag}"));
-                }
-            }
-            let mut pending_names: Vec<String> = Vec::new();
-            let mut pending_type: Option<Expr> = None;
-            let flush = |this: &mut Self,
-                         names: &mut Vec<String>,
-                         prev_type: &mut Option<Expr>,
-                         lines: &mut Vec<String>|
-             -> Result<(), Unsupported> {
-                if let Some(type_) = prev_type.take() {
-                    let type_doc = this.doc(&type_, 0)?;
-                    let group = Format::text(format!("{} :", names.join(" ")))
-                        .then(Format::Line.then(type_doc).nest(2))
-                        .group();
-                    lines.push(group.pretty(WIDTH));
-                    names.clear();
-                }
-                Ok(())
-            };
-            for (decl, shown) in locals {
-                if let Some(val) = &decl.value {
-                    flush(self, &mut pending_names, &mut pending_type, &mut lines)?;
-                    let type_doc = self.doc(&decl.type_, 0)?;
-                    let val_doc = self.doc(val, 0)?;
-                    let elem = Format::text(format!("{shown} : "))
-                        .then(type_doc)
-                        .then(Format::text(" :="))
-                        .then(Format::Line.then(val_doc).nest(2))
-                        .group();
-                    lines.push(elem.pretty(WIDTH));
-                } else if pending_type.as_ref() == Some(&decl.type_) {
-                    pending_names.push(shown);
-                } else {
-                    flush(self, &mut pending_names, &mut pending_type, &mut lines)?;
-                    pending_names.push(shown);
-                    pending_type = Some(decl.type_.clone());
-                }
-            }
-            flush(self, &mut pending_names, &mut pending_type, &mut lines)?;
-            let target_doc = self.doc(&goal.target, 0)?;
-            let target_line = Format::text("⊢ ").then(target_doc.nest(2)).pretty(WIDTH);
-            lines.push(target_line);
-            Ok(lines.join("\n"))
-        })();
-        self.fvar_names = saved_names;
-        self.fvar_types = saved_types;
-        result
-    }
-
-    /// Tactic goals as `goalsToMessageData` (`Lean/Elab/Tactic/Basic.lean`) formats them.
-    pub fn goals(&mut self, goals: &[fln_elab::source::inspect::ObservedGoal]) -> Printed {
-        if goals.is_empty() {
-            return Ok("no goals".to_owned());
-        }
-        let mut rendered = Vec::with_capacity(goals.len());
-        for goal in goals {
-            rendered.push(self.goal(goal)?);
-        }
-        Ok(rendered.join("\n\n"))
     }
 
     /// `e` as the pin's formatter lays it out, with the pin's `pp.proofs`: a proof inside the
@@ -964,12 +804,7 @@ impl<'a> Printer<'a> {
                     .map(Format::text)
                     .ok_or(Unsupported("a loose bound variable"))
             }
-            ExprNode::FVar { id } => self
-                .fvar_names
-                .get(id)
-                .cloned()
-                .map(Format::text)
-                .ok_or(Unsupported("a free variable")),
+            ExprNode::FVar { .. } => Err(Unsupported("a free variable")),
             ExprNode::MVar { .. } => Err(Unsupported("a metavariable")),
             ExprNode::Sort { level } => {
                 let text = sort(level)?;
@@ -1285,7 +1120,7 @@ impl<'a> Printer<'a> {
             return None;
         }
         let signature = &self.env.find(name)?.constant_val().type_;
-        if Self::prop_in(self.env, &self.fvar_types, &[], signature) {
+        if Self::prop_in(self.env, &[], signature) {
             return None;
         }
         // The first parameter whose type is an application of the namespace is the receiver;
@@ -1407,19 +1242,13 @@ impl<'a> Printer<'a> {
         let shadows_a_used_binder = self.names.iter().enumerate().any(|(position, shown)| {
             *shown == base
                 && body.has_loose_bvar(u32::try_from(depth - position).unwrap_or(u32::MAX))
-        }) || self
-            .fvar_names
-            .iter()
-            .any(|(id, shown)| *shown == base && expr_contains_fvar(body, id));
+        });
         if !shadows_a_used_binder {
             return base;
         }
         (1u64..)
             .map(|i| format!("{base}_{i}"))
-            .find(|candidate| {
-                !self.names.contains(candidate)
-                    && !self.fvar_names.values().any(|shown| shown == candidate)
-            })
+            .find(|candidate| !self.names.contains(candidate))
             .unwrap_or(base)
     }
 

@@ -125,9 +125,13 @@ impl Context {
                     return Err(error(TacticError::SimplificationCycle));
                 }
             }
+            let index = self.simp_target_index(&target)?;
             history.push(target);
             let mut changed = false;
             for rule in rules {
+                if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                    continue;
+                }
                 self.tick()?;
                 let original = self.rewrite_trial();
                 let Some(replacement) = self.simp_hypothesis_step(&local, rule, rules)? else {

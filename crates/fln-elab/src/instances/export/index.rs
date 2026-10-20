@@ -86,15 +86,7 @@ impl Indexer<'_> {
             .env
             .find(declaration)
             .ok_or_else(|| InstanceRegistryError::UnknownDeclaration(declaration.clone()))?;
-        let safe = match info {
-            ConstantInfo::Defn(value) => value.safety == DefinitionSafety::Safe,
-            ConstantInfo::Thm(_) => true,
-            ConstantInfo::Opaque(value) => !value.is_unsafe,
-            ConstantInfo::Axiom(value) => !value.is_unsafe,
-            ConstantInfo::Ctor(value) => !value.is_unsafe,
-            _ => false,
-        };
-        if !safe {
+        if !instance_declaration_is_supported(info) {
             return Err(InstanceRegistryError::InvalidInstance(declaration.clone()).into());
         }
         let mut target = info.constant_val().type_.clone();

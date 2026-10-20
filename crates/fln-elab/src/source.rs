@@ -43,13 +43,17 @@ mod optional;
 mod overload;
 pub mod partial;
 mod pattern_typing;
+mod public_body;
+pub use public_body::{
+    elaborate_public_definition, is_definition_body, public_definition_header_is_hidden,
+};
 mod patterns;
 mod record;
 mod record_terms;
 mod recursion;
 mod reduce;
 mod tactics;
-pub use tactics::{TracePayload, TraceRecord};
+pub mod trace;
 
 use super::*;
 use crate::constraint::unify::{
@@ -496,18 +500,23 @@ impl SourceEquation {
 #[derive(Clone)]
 struct Context {
     inspection: Option<inspect::Probe>,
+    traces: trace::TraceLog,
+    goal_tags: std::collections::HashMap<MVarId, Name>,
+    trace_local_names: std::collections::HashMap<FVarId, Name>,
     // Public proof declarations fix their signatures in the exported world
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
     private_proof_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
     public_theorem_signature: Option<ConstantVal>,
+    private_definition_body: bool,
+    public_definition_header: Option<public_body::Header>,
     public_instance_signature: Option<instance_command::PublicHeader>,
     /// A frozen public instance header does not itself imply a private body:
     /// an explicitly exposed proof is checked in the public predecessor.
     private_instance_body: bool,
-    // Completion may observe only a resolved instance header. The value is
+    // Completion may observe only a resolved declaration header. The value is
     // returned at that boundary; no body or declaration is constructed.
-    instance_header_probe: Option<bool>,
+    declaration_header_probe: Option<bool>,
     source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
@@ -520,6 +529,7 @@ struct Context {
     // opaque after leaving their lexical scope, until their enclosing
     // declaration has completed all source constraints.
     deferred_local_functions: Vec<local_functions::Deferred>,
+    local_function_lifting: local_functions::lifting::Lifting,
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
@@ -560,6 +570,8 @@ struct Context {
     // Only explicitly generated/imported auxiliary declarations receive the
     // pin's eliminator elaboration; a declaration's suffix is insufficient.
     auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
+    // Registered simp rules' discrimination keys, shared by speculative snapshots.
+    simp_key_cache: tactics::SimpKeyCache,
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -599,7 +611,6 @@ struct Context {
     // Recursors the source names directly, which a compiled declaration may not apply
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
-    traces: Vec<tactics::TraceRecord>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -624,15 +635,21 @@ impl Context {
         txn.budget.max_heartbeats = 1_000_000;
         Self {
             inspection: None,
+            traces: trace::TraceLog::default(),
+            goal_tags: std::collections::HashMap::new(),
+            trace_local_names: std::collections::HashMap::new(),
             private_proof_body: None,
             public_theorem_signature: None,
+            private_definition_body: false,
+            public_definition_header: None,
             public_instance_signature: None,
             private_instance_body: false,
-            instance_header_probe: None,
+            declaration_header_probe: None,
             source_scope: SourceScope::default(),
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
             deferred_local_functions: Vec::new(),
+            local_function_lifting: local_functions::lifting::Lifting::default(),
             txn,
             kernel,
             next: 0,
@@ -653,6 +670,7 @@ impl Context {
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
             auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
+            simp_key_cache: tactics::SimpKeyCache::default(),
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,
@@ -667,7 +685,6 @@ impl Context {
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
             source_recursors: Vec::new(),
-            traces: Vec::new(),
         }
     }
 
@@ -688,6 +705,9 @@ impl Context {
         Ok(Name::num(Name::from_components(["_fln_source"]), id))
     }
 
+    /// Hygienic binder. Macro scopes keep it out of source lookup (`h` does not
+    /// see `h✝`) while `assumption` can still use the local. Anonymous or
+    /// `_fln*` stems fall back to `a`, matching Lean's inaccessible-name printer.
     pub(super) fn fresh_inaccessible(
         &mut self,
         stem: &Name,
@@ -706,20 +726,6 @@ impl Context {
         };
         let hyg = base.append_core(&Name::from_components(["_@", "_internal", "_hyg"]));
         Ok(Name::num(hyg, id))
-    }
-
-    pub(super) fn instantiate_traces(&mut self) -> Result<(), NatDefinitionElabError> {
-        let mut traces = std::mem::take(&mut self.traces);
-        for trace in &mut traces {
-            if let tactics::TracePayload::Goals(goals) = &mut trace.payload {
-                for goal in goals {
-                    goal.target = self.instantiate(&goal.target)?;
-                    goal.locals = self.observation_locals(&goal.locals)?;
-                }
-            }
-        }
-        self.traces = traces;
-        Ok(())
     }
 
     fn level(&mut self) -> Result<Level, NatDefinitionElabError> {
@@ -3638,7 +3644,7 @@ impl Context {
                                 }
                             }
                             let value = if build.binding.recursive {
-                                self.defer_local_function(value)?
+                                self.defer_local_function(value, build.lift_name)?
                             } else {
                                 value
                             };
@@ -4446,8 +4452,8 @@ impl Context {
     }
 }
 
-/// The two checked predecessor views used by a module's public proof declaration. The
-/// signature sees `public`; only its proof sees `private`. Scope histories are
+/// The two checked predecessor views used by a module's public declaration. The
+/// signature sees `public`; a hidden implementation sees `private`. Scope histories are
 /// supplied separately because each anchors a different instance journal.
 #[derive(Clone, Copy)]
 pub struct TheoremWorlds<'a> {
@@ -4479,14 +4485,16 @@ pub fn is_instance(syntax: &Syntax) -> bool {
 #[derive(Debug)]
 pub struct PublicInstance {
     pub declaration: Declaration,
+    /// Independently checked local helpers, kept in the selected body world.
+    pub local_functions: Vec<Declaration>,
     pub proof_valued: bool,
     pub hidden_body: bool,
     pub noncomputable: bool,
-    pub traces: Vec<TraceRecord>,
 }
 
 /// Elaborate a public instance once, choosing its body world from the resolved
-/// header. Data instances and explicitly exposed proofs stay entirely public.
+/// header. Automatically exposed data and explicitly exposed proofs stay public;
+/// `no_expose` selects the private body world for either kind.
 /// Proof instances become theorems with frozen public types, as in the pin's
 /// `addNonRecAux`; their body exposure does not change their declaration kind.
 pub fn elaborate_public_instance(
@@ -4496,16 +4504,17 @@ pub fn elaborate_public_instance(
 ) -> Result<PublicInstance, NatDefinitionElabError> {
     let mut context = Context::public_instance(syntax, worlds, kernel)?;
     let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
     Ok(PublicInstance {
+        local_functions,
         proof_valued: matches!(&declaration, Declaration::Thm(_)),
         hidden_body: context.private_instance_body,
         noncomputable: context.noncomputable_definition,
         declaration,
-        traces: context.traces,
     })
 }
 
-/// Observe whether a complete public instance header selects a private proof
+/// Observe whether a complete public instance header selects a private
 /// body. The syntax may contain a placeholder body: it is never elaborated.
 /// This bounded query grants no declaration or export authority.
 pub fn public_instance_header_is_hidden(
@@ -4520,12 +4529,24 @@ pub fn public_instance_header_is_hidden(
             expected: "a public instance header in a module file",
         });
     }
-    let mut context = Context::scoped(environment, kernel, &scope);
-    context.instance_header_probe = Some(false);
+    probe_header_visibility(syntax, environment, kernel, &scope)
+}
+
+fn probe_header_visibility(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<bool, NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope);
+    // There is no final candidate admission after a header-only query. Rigid
+    // typing failures must be observed before revealing a private body context.
+    context.attempt_depth = 1;
+    context.declaration_header_probe = Some(false);
     match definition_in_context(syntax, &mut context) {
         Err(NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)) => {
             context
-                .instance_header_probe
+                .declaration_header_probe
                 .ok_or_else(|| failure(SourceInferenceError::Scope))
         }
         Err(error) => Err(error),
@@ -4534,26 +4555,23 @@ pub fn public_instance_header_is_hidden(
 }
 
 /// Elaborate a public theorem's header and proof in their respective worlds.
-/// This produces only an untrusted candidate, never an exported assumption or
-/// an environment successor. Its proof must pass ordinary declaration admission.
+/// This produces only untrusted candidates, never an exported assumption or
+/// an environment successor. The proof and every named local helper must pass
+/// separate ordinary admissions in the private world before publication.
 pub fn elaborate_public_theorem(
     syntax: &Syntax,
     worlds: &TheoremWorlds<'_>,
     kernel: Budget,
-) -> Result<Declaration, NatDefinitionElabError> {
-    Ok(elaborate_public_theorem_with_traces(syntax, worlds, kernel)?.0)
-}
-
-/// Elaborate a public theorem's header and proof in their respective worlds,
-/// returning captured tactic trace records alongside the candidate declaration.
-pub fn elaborate_public_theorem_with_traces(
-    syntax: &Syntax,
-    worlds: &TheoremWorlds<'_>,
-    kernel: Budget,
-) -> Result<(Declaration, Vec<TraceRecord>), NatDefinitionElabError> {
+) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let mut context = Context::public_theorem(syntax, worlds, kernel)?;
     let declaration = definition_in_context(syntax, &mut context)?;
-    Ok((declaration, context.traces))
+    let local_functions = context.lift_local_functions(&declaration)?;
+    Ok(ElaboratedDeclaration {
+        declaration,
+        local_functions,
+        irreducible: false,
+        noncomputable: context.noncomputable_definition,
+    })
 }
 
 impl Context {
@@ -4671,13 +4689,15 @@ pub(super) fn definition(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElaboratedDeclaration {
     pub declaration: Declaration,
+    /// Closed local recursive helpers. They grant no authority: callers must
+    /// admit every helper and the owner atomically through both checkers.
+    pub local_functions: Vec<Declaration>,
     /// The definition actually used well-founded lowering. A source spelling or
     /// a body mentioning `WellFounded.Nat.fix` does not set this effect.
     pub irreducible: bool,
     /// An actual supported code-generation refusal suppressed by the enclosing
     /// noncomputable section, not merely the presence of that section.
     pub noncomputable: bool,
-    pub traces: Vec<tactics::TraceRecord>,
 }
 
 fn definition_scoped(
@@ -4699,11 +4719,12 @@ fn definition_scoped_with_effects(
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope);
     let declaration = definition_in_context(syntax, &mut context)?;
+    let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
+        local_functions,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,
-        traces: context.traces,
     })
 }
 
@@ -4839,6 +4860,7 @@ fn definition_in_context_named(
     scope::simp::registration(syntax)?;
     let mut is_protected = false;
     let mut is_noncomputable = false;
+    let mut is_unsafe = false;
     for (index, modifier) in modifiers.iter().enumerate() {
         match index {
             0 => doc_comment_slot(modifier)?,
@@ -4849,7 +4871,30 @@ fn definition_in_context_named(
             PROTECTED_SLOT => is_protected = protected_slot(modifier)?,
             // Validated, with the declaration kind, by `noncomputable_registration` below.
             NONCOMPUTABLE_SLOT => is_noncomputable = noncomputable_slot(modifier)?,
-            6 if context.partial.is_some() => partial::validate_modifier(modifier)?,
+            5 => match expect_null_args(modifier, "unsafe modifier")? {
+                [] => {}
+                [modifier] => {
+                    let [keyword] = expect_node(
+                        modifier,
+                        &parser_kind(&["Command", "unsafe"]),
+                        1,
+                        "unsafe modifier",
+                    )?
+                    else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    expect_atom(keyword, "unsafe", "unsafe modifier")?;
+                    is_unsafe = true;
+                }
+                _ => return Err(failure(SourceInferenceError::Scope)),
+            },
+            6 if context
+                .partial
+                .as_ref()
+                .is_some_and(|state| state.kind == partial::Kind::Partial) =>
+            {
+                partial::validate_modifier(modifier)?
+            }
             _ => expect_empty_null(modifier, "empty declaration modifier")?,
         }
     }
@@ -4868,6 +4913,27 @@ fn definition_in_context_named(
     // `axiom` is `"axiom " declId declSig` (vendored `Lean/Elab/Declaration.lean`,
     // `elabAxiom`): a theorem's header and no value.
     let is_axiom = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","axiom"]));
+    if is_unsafe {
+        // MutualDef.check at the pin forbids unsafe theorems and unsafe
+        // partial declarations. Opaque/axiom forms need a separate source
+        // door; do not accidentally give them recursive-definition machinery.
+        if is_theorem
+            || is_opaque
+            || is_axiom
+            || context
+                .partial
+                .as_ref()
+                .is_some_and(|state| state.kind != partial::Kind::Unsafe)
+        {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "unsafe def, abbrev, or data instance without partial",
+            });
+        }
+        context.partial.get_or_insert(partial::State {
+            kind: partial::Kind::Unsafe,
+            ..partial::State::default()
+        });
+    }
     if is_opaque {
         let parts = expect_node(
             &declaration[1],
@@ -4979,6 +5045,8 @@ fn definition_in_context_named(
             owned
         }
     };
+    context.local_function_lifting.parent =
+        (!owned_name.is_anonymous()).then(|| owned_name.clone());
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
@@ -5072,14 +5140,19 @@ fn definition_in_context_named(
             .as_ref()
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         owned_name = context.generated_instance_name(&parameters, expected)?;
+        context.local_function_lifting.parent = Some(owned_name.clone());
     }
     if is_instance && !hidden_instance {
         // Naming may consult the private predecessor only for collisions. Once
         // the name is chosen, an exposed body retains only its public world.
         context.private_proof_body = None;
     }
-    if let Some(probe) = &mut context.instance_header_probe {
-        *probe = hidden_instance;
+    if let Some(probe) = &mut context.declaration_header_probe {
+        *probe = if is_instance {
+            hidden_instance
+        } else {
+            context.source_scope.exports_declaration() && !context.source_scope.expose_definitions
+        };
         return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
@@ -5161,6 +5234,11 @@ fn definition_in_context_named(
             context.enter_private_proof()?;
             context.private_instance_body = true;
         }
+    } else if hidden_instance && context.source_scope.exports_declaration() {
+        context.enter_public_definition_body(&parameters, expected.as_ref())?;
+        context.private_instance_body = true;
+    } else if context.private_definition_body {
+        context.enter_public_definition_body(&parameters, expected.as_ref())?;
     } else if context.private_proof_body.is_some() {
         context.enter_public_theorem_proof(
             name,
@@ -5282,6 +5360,11 @@ fn definition_in_context_named(
         roots.extend([term.type_.clone(), term.value.clone()]);
         context.section_parameters(&roots, false)?
     };
+    let public_definition_type = context
+        .public_definition_header
+        .clone()
+        .map(|header| header.close(context, &section_parameters, &term.type_))
+        .transpose()?;
     let partial_captures = section_parameters.clone();
     let instance_type = context
         .public_instance_signature
@@ -5294,8 +5377,8 @@ fn definition_in_context_named(
         .map(|parameter| parameter.type_.clone())
         .collect();
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
+    universe_roots.extend(context.local_function_lifting.roots());
     context.generalize_declaration_universes(&universe_roots)?;
-    context.instantiate_traces()?;
     let mut term = context.finish(term)?;
     context.close_partial_reference(&mut term, &parameters, &partial_captures)?;
     // Preserve the source's actual lambda stages. Eta-expanding a computed
@@ -5336,7 +5419,11 @@ fn definition_in_context_named(
     if !is_theorem && !proof_instance && !is_noncomputable {
         context.noncomputable_definition = context.check_definition_codegen(&term)?;
     }
-    let type_ = instance_type.unwrap_or(term.type_);
+    let type_ = if let Some(header) = public_definition_type {
+        context.instantiate(&header)?
+    } else {
+        instance_type.unwrap_or(term.type_)
+    };
     let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
     let mut base = ConstantVal {
         name: name.clone(),
@@ -5369,6 +5456,40 @@ fn definition_in_context_named(
             is_unsafe: false,
             all: vec![name.clone()],
         }))
+    } else if context
+        .partial
+        .as_ref()
+        .is_some_and(|state| state.kind == partial::Kind::Unsafe)
+    {
+        // Basic.addAndCompileUnsafe retains direct recursive references and
+        // opaque hints. Even a nonrecursive unsafe definition stays Unsafe;
+        // it never acquires a safe logical inhabitant or companion.
+        let recursive = context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.reference.is_some());
+        let definition = DefinitionVal {
+            base,
+            value: term.value,
+            hints: if recursive {
+                ReducibilityHints::Opaque
+            } else if is_abbrev {
+                ReducibilityHints::Abbrev
+            } else {
+                ReducibilityHints::Regular(1)
+            },
+            safety: DefinitionSafety::Unsafe,
+            all: vec![name.clone()],
+        };
+        if context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.group.is_some())
+        {
+            Ok(Declaration::Mutual(vec![definition]))
+        } else {
+            Ok(Declaration::Defn(definition))
+        }
     } else if context
         .partial
         .as_ref()
@@ -5534,7 +5655,16 @@ fn query_in(
     evaluate: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
     let (term, level_params) = query_term(syntax, &name, &mut context, evaluate)?;
-    Ok(query_declaration(name, term, level_params))
+    Ok(query_declaration(
+        name,
+        term,
+        level_params,
+        if evaluate {
+            DefinitionSafety::Unsafe
+        } else {
+            DefinitionSafety::Safe
+        },
+    ))
 }
 
 fn query_term(
@@ -5644,7 +5774,12 @@ fn query_term(
     Ok((term, level_params))
 }
 
-fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declaration {
+fn query_declaration(
+    name: Name,
+    term: Typed,
+    level_params: Vec<Name>,
+    safety: DefinitionSafety,
+) -> Declaration {
     Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: name.clone(),
@@ -5653,7 +5788,7 @@ fn query_declaration(name: Name, term: Typed, level_params: Vec<Name>) -> Declar
         },
         value: term.value,
         hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
+        safety,
         all: vec![name],
     })
 }

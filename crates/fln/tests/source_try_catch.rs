@@ -236,3 +236,134 @@ fn rejected_handler_scopes_do_not_hide_invalid_or_unsupported_code() {
         assert_eq!(engine.logical_root(&KVMap::new()), before);
     }
 }
+
+#[test]
+fn quoted_exception_handlers_bind_locally_without_capturing_inputs() {
+    execute(
+        &base(),
+        r#"
+def e : Nat := 100
+macro "quotedCatch " input:term:max : term => `(do {
+  try { raise (5 : Nat) }
+  catch e : Nat => { return Nat.add e $input } })
+macro "quotedPass " action:term:max : term => `(do {
+  try { $action:term }
+  catch e => { return Nat.add e 100 } })
+def value (e : Nat) : Trial Nat := quotedCatch e
+def success : Trial Nat := quotedPass (succeed (42 : Nat))
+theorem caught_value : result (value 37) = 42 := rfl
+#eval result (value 37)
+#eval result success
+"#,
+        &["42", "42"],
+    );
+}
+
+#[test]
+fn quoted_exception_scopes_restore_across_handlers_and_continuations() {
+    execute(
+        &base(),
+        r#"
+def e : Nat := 7
+macro "quotedChain " : term => `(do {
+  try { raise (1 : Nat) }
+  catch e => { raise (Nat.add e 1) }
+  catch e => { succeed (Nat.add e 40) } })
+macro "quotedSuffix " : term => `(do {
+  let n <- (do { try { raise (5 : Nat) } catch e => { return e } })
+  return Nat.add n e })
+def chain : Trial Nat := quotedChain
+def suffixValue : Trial Nat := quotedSuffix
+#eval result chain
+#eval result suffixValue
+"#,
+        &["42", "12"],
+    );
+}
+
+#[test]
+fn quoted_pattern_handlers_reuse_checked_match_scopes() {
+    execute(
+        &base(),
+        r#"
+def n : Nat := 900
+macro "quotedPattern " input:term:max : term => `(do {
+  try { raise $input }
+  catch | Nat.zero => return 0 | Nat.succ n => return Nat.add n 1 })
+def zeroValue : Trial Nat := quotedPattern (0 : Nat)
+def nextValue : Trial Nat := quotedPattern (42 : Nat)
+#eval result zeroValue
+#eval result nextValue
+"#,
+        &["0", "42"],
+    );
+}
+
+#[test]
+fn quoted_handler_annotations_and_imports_keep_the_defining_world() {
+    let base = base();
+    let before = base.logical_root(&KVMap::new());
+    let library = fln::Name::from_components(["HandlerLibrary"]);
+    let main = fln::Name::from_components(["HandlerConsumer"]);
+    let checked = base.check_source_modules(
+        &[
+            fln::SourceModuleInput {
+                name: &library,
+                source: br#"namespace Lib
+abbrev Error : Type := Nat
+macro "importedCatch " input:term:max : term => `(do { try { raise (5 : Nat) } catch Error : Error => { return Nat.add Error $input } })
+end Lib"#,
+            },
+            fln::SourceModuleInput {
+                name: &main,
+                source: br#"import HandlerLibrary
+abbrev Error : Type := Bool
+def value (Error : Nat) : Trial Nat := importedCatch Error
+theorem value_correct : result (value 37) = 42 := rfl"#,
+            },
+        ],
+        &main,
+        &KVMap::new(),
+        fln::source_check::modules::SourceModuleCheckLimits::new(limits()),
+    ).unwrap().into_complete().unwrap();
+    assert_eq!(checked.checked.theorems, 1);
+    execute(&checked.checked.engine, "#eval result (value 37)", &["42"]);
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn quoted_handler_invalid_uses_leave_no_declarations_or_scope_leaks() {
+    let base = base();
+    let before = base.logical_root(&KVMap::new());
+    for declaration in [
+        r#"macro "badCatch " : term => `(do { try { raise (5 : Nat) } catch fresh => { return fresh }; return fresh })"#,
+        r#"macro "badCatch " : term => `(do { try { let secret : Nat := 42; raise (5 : Nat) } catch e => { return secret } })"#,
+        r#"macro "badCatch " : term => `(do { try { return 42 } catch e => { return "wrong" } })"#,
+        r#"macro "badCatch " : term => `(do { try { raise (5 : Nat) } catch e : Bool => { return 42 } })"#,
+        r#"macro "badCatch " : term => `(do { try { raise (5 : Nat) } catch | Nat.zero => return 42 })"#,
+    ] {
+        checked(&base, declaration);
+        let source = format!("{declaration}\ndef bad : Trial Nat := badCatch");
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        let fln::SourceCheckError::Command { command, error, .. } = error else {
+            panic!("expected a command error: {error:?}");
+        };
+        assert_eq!(command, 1);
+        assert!(
+            matches!(
+                error.as_ref(),
+                fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(_))
+            ),
+            "{source}\n{error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+    execute(
+        &base,
+        "macro \"retryCatch \" : term => `(do { try { raise (5 : Nat) } catch e => { return e + 37 } })\ndef recovered : Trial Nat := retryCatch\n#eval result recovered",
+        &["42"],
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}

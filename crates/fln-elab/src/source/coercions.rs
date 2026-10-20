@@ -242,7 +242,7 @@ impl Context {
                 UnificationError::Reducibility(error),
             )))
         })?;
-        match fln_kernel::check_def_eq_with_unfolding(
+        let outcome = fln_kernel::check_def_eq_with_unfolding(
             &self.txn.env,
             &params.into_iter().collect::<Vec<_>>(),
             &left,
@@ -252,7 +252,22 @@ impl Context {
                 opaque_definitions: reducibility.opaque_definitions(),
                 unfold_theorems: false,
             },
-        ) {
+        );
+        // A step-limited query reports actual work even without a verdict.
+        // Retain that work before returning the original typed nonanswer;
+        // restoring the enclosing proof choice must not refund kernel steps.
+        if let Outcome::Inconclusive(problem) = &outcome
+            && let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } =
+                &problem.cause
+            && matches!(usage.reason, fln_core::diag::ResourceReason::ExecutionSteps)
+        {
+            self.txn.budget.heartbeats_consumed = self
+                .txn
+                .budget
+                .heartbeats_consumed
+                .saturating_add(usage.observed);
+        }
+        match outcome {
             Outcome::Complete(verdict) => {
                 let consumed = match &verdict {
                     Verdict::Accepted { consumption } | Verdict::Rejected { consumption, .. } => {

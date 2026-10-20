@@ -372,16 +372,40 @@ impl FormattedOutputBudget {
         stdout: &mut String,
         guarded: Option<&mut Vec<String>>,
     ) -> Result<(), Error> {
-        // SerialMessage.toString and GuardMsgs.messageToString retain the
-        // printer's line endings, adding a newline only when one is absent.
-        let needs_newline = !text.ends_with('\n');
-        let prefix = if guarded.is_none() {
-            ""
-        } else if text.starts_with('\n') {
+        let prefix = if text.starts_with('\n') {
             "info:"
         } else {
             "info: "
         };
+        self.append_with_prefix(text, stdout, guarded, prefix)
+    }
+
+    /// Raw tactic traces have their own guard severity. Plain output is unchanged.
+    pub(super) fn append_trace(
+        &mut self,
+        text: &str,
+        stdout: &mut String,
+        guarded: Option<&mut Vec<String>>,
+    ) -> Result<(), Error> {
+        let prefix = if text.starts_with('\n') {
+            "trace:"
+        } else {
+            "trace: "
+        };
+        self.append_with_prefix(text, stdout, guarded, prefix)
+    }
+
+    fn append_with_prefix(
+        &mut self,
+        text: &str,
+        stdout: &mut String,
+        guarded: Option<&mut Vec<String>>,
+        prefix: &'static str,
+    ) -> Result<(), Error> {
+        // SerialMessage.toString and GuardMsgs.messageToString retain the
+        // printer's line endings, adding a newline only when one is absent.
+        let needs_newline = !text.ends_with('\n');
+        let prefix = if guarded.is_some() { prefix } else { "" };
         let required = text
             .len()
             .checked_add(prefix.len())
@@ -762,5 +786,69 @@ mod tests {
             ),
             Err(Error::InvalidException)
         ));
+    }
+
+    #[test]
+    fn trace_output_uses_its_own_prefix_and_exact_utf8_budget() {
+        for (text, plain, guarded) in [
+            ("", "\n", "trace: \n"),
+            ("x", "x\n", "trace: x\n"),
+            ("x\n\n", "x\n\n", "trace: x\n\n"),
+            ("λ", "λ\n", "trace: λ\n"),
+            ("\nλ\n\n", "\nλ\n\n", "trace:\nλ\n\n"),
+        ] {
+            let mut stdout = String::new();
+            let mut messages = Vec::new();
+            let mut budget = FormattedOutputBudget::new(guarded.len() - 1);
+            assert!(matches!(
+                budget.append_trace(text, &mut stdout, Some(&mut messages)),
+                Err(Error::OutputLimit { .. })
+            ));
+            assert!(stdout.is_empty() && messages.is_empty());
+            assert_eq!(budget.bytes, 0);
+
+            let mut budget = FormattedOutputBudget::new(guarded.len());
+            budget
+                .append_trace(text, &mut stdout, Some(&mut messages))
+                .unwrap();
+            assert_eq!(messages, [guarded]);
+            assert_eq!(budget.bytes, guarded.len());
+            assert!(stdout.is_empty());
+            assert!(
+                budget
+                    .append_trace("", &mut stdout, Some(&mut messages))
+                    .is_err()
+            );
+            assert_eq!(messages, [guarded], "a refusal must not publish a prefix");
+
+            let mut budget = FormattedOutputBudget::new(plain.len());
+            budget.append_trace(text, &mut stdout, None).unwrap();
+            assert_eq!(stdout, plain);
+            assert_eq!(budget.bytes, plain.len());
+        }
+    }
+
+    #[test]
+    fn trace_and_evaluation_messages_share_one_cumulative_output_bound() {
+        let mut stdout = String::new();
+        let mut messages = Vec::new();
+        let mut budget = FormattedOutputBudget::new(19);
+        budget
+            .append("λ", &mut stdout, Some(&mut messages))
+            .unwrap();
+        budget
+            .append_trace("λ", &mut stdout, Some(&mut messages))
+            .unwrap();
+        assert_eq!(messages, ["info: λ\n", "trace: λ\n"]);
+        assert_eq!(budget.bytes, 19);
+        assert!(matches!(
+            budget.append_trace("x", &mut stdout, None),
+            Err(Error::OutputLimit {
+                limit: 19,
+                observed: 21,
+            })
+        ));
+        assert!(stdout.is_empty());
+        assert_eq!(messages, ["info: λ\n", "trace: λ\n"]);
     }
 }

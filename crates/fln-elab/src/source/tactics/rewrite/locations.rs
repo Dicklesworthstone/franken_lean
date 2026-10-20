@@ -3,14 +3,14 @@
 //! identity under an inaccessible name; otherwise it leaves the live context.
 use super::*;
 
-pub(super) struct RewriteLocations {
-    pub(super) hypotheses: Vec<Name>,
-    pub(super) target: bool,
-    pub(super) all: bool,
+pub(in crate::source) struct RewriteLocations {
+    pub(in crate::source) hypotheses: Vec<Name>,
+    pub(in crate::source) target: bool,
+    pub(in crate::source) all: bool,
 }
 
 impl Context {
-    pub(super) fn rewrite_locations(
+    pub(in crate::source) fn rewrite_locations(
         &mut self,
         syntax: &Syntax,
     ) -> Result<Option<RewriteLocations>, NatDefinitionElabError> {
@@ -296,8 +296,7 @@ impl Context {
             }
         }
         self.txn.lctx = context.clone();
-        let (child, mut next) = self.proof_goal(target)?;
-        next.tag = parent.tag.clone();
+        let (child, next) = self.proof_goal(target)?;
         // Delay abstraction until the child and all rule premises are solved.
         // The parent retains the old variable needed by the transport's RHS.
         parent.introduced.push(binding);

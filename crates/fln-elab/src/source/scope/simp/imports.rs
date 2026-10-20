@@ -18,6 +18,47 @@ pub enum ImportedSimpRule {
     },
 }
 
+impl ImportedSimpRule {
+    /// Validate one operation against fixed admitted declarations without reading
+    /// or changing the journal. Consumers may defer UnsupportedDeclaration, but
+    /// must propagate malformed input, missing names and resource exhaustion.
+    /// This selects metadata; it does not check or admit a proof.
+    pub fn validate(&self, env: &Environment) -> Result<(), SimpSetError> {
+        self.payload(env).map(|_| ())
+    }
+
+    fn payload(&self, env: &Environment) -> Result<Vec<u8>, SimpSetError> {
+        let origin = match self {
+            ImportedSimpRule::Proof { origin, .. } => origin,
+            ImportedSimpRule::Unfold { declaration } | ImportedSimpRule::Erase { declaration } => {
+                declaration
+            }
+        };
+        if !env.contains(origin) {
+            return Err(SimpSetError::UnknownDeclaration(origin.clone()));
+        }
+        let payload = match self {
+            ImportedSimpRule::Proof {
+                origin,
+                proof,
+                priority,
+            } => {
+                validate_proof(env, proof)?;
+                proof_payload(origin, proof, *priority)?
+            }
+            ImportedSimpRule::Unfold { declaration } => {
+                if !matches!(env.find(declaration), Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe)
+                {
+                    return Err(SimpSetError::UnsupportedDeclaration(declaration.clone()));
+                }
+                source_payload(declaration, Some((1000, false)))?
+            }
+            ImportedSimpRule::Erase { declaration } => source_payload(declaration, None)?,
+        };
+        Ok(payload)
+    }
+}
+
 pub(super) fn validate_proof(env: &Environment, proof: &Name) -> Result<(), SimpSetError> {
     match env.find(proof) {
         Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe => {
@@ -26,7 +67,7 @@ pub(super) fn validate_proof(env: &Environment, proof: &Name) -> Result<(), Simp
             // declaration checkers remain responsible for every actual use.
             let mut ty = &definition.base.type_;
             let mut applications = 0usize;
-            for _ in 0..MAX_ROWS {
+            for _ in 0..MAX_TYPE_STEPS {
                 match ty.node() {
                     ExprNode::MData { expr, .. } => ty = expr,
                     ExprNode::ForallE { body, .. } if applications == 0 => ty = body,
@@ -83,44 +124,18 @@ pub fn import_rules(
     rules: &[ImportedSimpRule],
 ) -> Result<Environment, SimpSetError> {
     read(env)?;
-    let count = env
+    let (count, bytes) = env
         .extension(&descriptor().name)
-        .map_or(0, |state| state.len());
-    if count
-        .checked_add(rules.len())
-        .is_none_or(|count| count > MAX_ROWS)
-    {
-        return Err(SimpSetError::Limit);
-    }
+        .map_or((0, 0), |state| (state.len(), state.payload_bytes()));
+    // Refuse an impossible batch before allocating any new journal nodes.
+    // Each append additionally accounts for its actual encoded payload.
+    check_journal_capacity(
+        count.checked_add(rules.len()).ok_or(SimpSetError::Limit)?,
+        bytes,
+    )?;
     let mut next = env.clone();
     for rule in rules {
-        let origin = match rule {
-            ImportedSimpRule::Proof { origin, .. } => origin,
-            ImportedSimpRule::Unfold { declaration } | ImportedSimpRule::Erase { declaration } => {
-                declaration
-            }
-        };
-        if !env.contains(origin) {
-            return Err(SimpSetError::UnknownDeclaration(origin.clone()));
-        }
-        let payload = match rule {
-            ImportedSimpRule::Proof {
-                origin,
-                proof,
-                priority,
-            } => {
-                validate_proof(env, proof)?;
-                proof_payload(origin, proof, *priority)?
-            }
-            ImportedSimpRule::Unfold { declaration } => {
-                if !matches!(env.find(declaration), Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe)
-                {
-                    return Err(SimpSetError::UnsupportedDeclaration(declaration.clone()));
-                }
-                source_payload(declaration, Some((1000, false)))?
-            }
-            ImportedSimpRule::Erase { declaration } => source_payload(declaration, None)?,
-        };
+        let payload = rule.payload(env)?;
         next = append(&next, payload)?;
     }
     Ok(next)

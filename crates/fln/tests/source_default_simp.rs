@@ -685,9 +685,8 @@ fn named_simp_priorities_register_their_values() {
 #[test]
 fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
     let mut source = String::from(
-        "def wrap (n : Nat) : Nat := n
-         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl
-",
+        "def wrap (n : Nat) : Nat := n\n\
+         @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\n",
     );
     for index in 0..34 {
         source.push_str(&format!(
@@ -728,4 +727,34 @@ theorem missing_rule (n : Nat) : wrap n = n := by simp",
             "{diagnostic}"
         );
     }
+}
+
+#[test]
+fn default_rule_discrimination_preserves_occurrences_aliases_and_premises() {
+    let base = checked(
+        &engine(),
+        &[concat!(
+            "@[simp] theorem paired_truth : True ∧ True := And.intro True.intro True.intro\n",
+            "abbrev TruthPair : Prop := True ∧ True\n",
+            "def guarded_wrap (n : Nat) : Nat := n\n",
+            "@[simp] theorem guarded_unwrap (n : Nat) (h : True ∧ True) : guarded_wrap n = n := by rfl\n",
+        )],
+    )
+    .engine;
+    checked(
+        &base,
+        &[concat!(
+            "theorem fact_goal : True ∧ True := by simp\n",
+            "theorem fact_occurrence : (True ∧ True) = True := by simp\n",
+            "theorem fact_alias : TruthPair := by simp\n",
+            "theorem fact_premise (n : Nat) : guarded_wrap n = n := by simp\n",
+        )],
+    );
+    refused(
+        &base,
+        concat!(
+            "attribute [-simp] paired_truth\n",
+            "theorem missing_fact (n : Nat) : guarded_wrap n = n := by simp\n",
+        ),
+    );
 }

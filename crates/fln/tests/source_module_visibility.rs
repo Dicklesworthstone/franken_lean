@@ -510,14 +510,38 @@ fn exposed_public_sections_restore_visibility_and_private_names_cannot_collide()
     for body in [
         "def duplicate.{u} {A : Sort u} (x : A) : A := x\n@[expose] public def duplicate.{u} {A : Sort u} (x : A) : A := x",
         "@[expose] public def duplicate.{u} {A : Sort u} (x : A) : A := x\nprivate def duplicate.{u} {A : Sort u} (x : A) : A := x",
-        "public def hiddenBody.{u} {A : Sort u} (x : A) : A := x",
-        "@[expose] public section\n@[no_expose] def hiddenBody.{u} {A : Sort u} (x : A) : A := x",
     ] {
         let source = format!("module\nprelude\n{body}");
         for result in check_in_both_import_contexts(&[("Main", &source)]) {
             assert!(
                 matches!(result, Err(SourceModuleCheckError::Source { .. })),
                 "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hidden_public_definitions_enter_both_import_contexts_without_exporting_values() {
+    for body in [
+        "public def hiddenBody.{u} {A : Sort u} (x : A) : A := x",
+        "@[expose] public section\n@[no_expose] def hiddenBody.{u} {A : Sort u} (x : A) : A := x\nend",
+    ] {
+        let api = format!("module\nprelude\n{body}");
+        for result in check_in_both_import_contexts(&[("Api", &api)]) {
+            let checked = result.unwrap().into_complete().unwrap();
+            assert!(matches!(
+                checked.checked.engine.environment().find(&n("hiddenBody")),
+                Some(fln_env::constants::ConstantInfo::Defn(_))
+            ));
+        }
+        for result in
+            check_in_both_import_contexts(&[("Main", "prelude\nimport Api"), ("Api", &api)])
+        {
+            let checked = result.unwrap().into_complete().unwrap();
+            assert!(
+                matches!(checked.checked.engine.environment().find(&n("hiddenBody")),
+                Some(fln_env::constants::ConstantInfo::Axiom(signature)) if !signature.is_unsafe)
             );
         }
     }

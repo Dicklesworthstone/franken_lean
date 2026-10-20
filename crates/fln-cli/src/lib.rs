@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod goal_traces;
 #[cfg(test)]
 mod guard_filter_tests;
 mod guard_messages;
@@ -12026,59 +12027,6 @@ fn emit_lean_warning(
     }
 }
 
-/// Send one command's tactic traces (`trace_state` and `trace "msg"`) to its guard's messages
-/// or to `stdout`, grouped and ordered by source position (`addTraceAsMessages`, `Trace.lean:459`).
-fn emit_lean_trace(
-    trace: &fln::SourceTrace,
-    environment: &fln::Environment,
-    guarded: &mut guard_messages::Guards<'_>,
-    stdout: &mut String,
-) -> Result<(), MultiplexerOutput> {
-    let mut by_pos: std::collections::BTreeMap<(usize, usize), (Vec<String>, bool)> =
-        std::collections::BTreeMap::new();
-    for record in &trace.traces {
-        let (text, is_goals) = match &record.payload {
-            fln::TracePayload::Goals(goals) => {
-                let mut printer = fln::pretty::Printer::in_scope(environment, &record.scope);
-                let formatted =
-                    printer
-                        .goals(goals)
-                        .map_err(|fln::pretty::Unsupported(reason)| {
-                            source_failure(
-                                "capability",
-                                &format!(
-                                    "command {}: `trace_state` goal display requires unsupported expression formatting ({reason})",
-                                    trace.command_index
-                                ),
-                                false,
-                                SourcePresentation::Lean,
-                                CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                            )
-                        })?;
-                (formatted, true)
-            }
-            fln::TracePayload::Message(message) => (message.clone(), false),
-        };
-        let entry = by_pos
-            .entry(record.pos)
-            .or_insert_with(|| (Vec::new(), false));
-        entry.0.push(text);
-        entry.1 |= is_goals;
-    }
-    for (_pos, (parts, from_trace_state)) in by_pos {
-        let joined = parts.join("\n");
-        if let Some(guard) = guarded.get_mut(&trace.command_index) {
-            guard.trace(&joined, from_trace_state, stdout);
-            continue;
-        }
-        stdout.push_str(&joined);
-        if !joined.ends_with('\n') {
-            stdout.push('\n');
-        }
-    }
-    Ok(())
-}
-
 fn render_lean_source_commands(
     completed: &fln::SourceCommandBatchExecution,
     sink: WarningSink<'_>,
@@ -12159,45 +12107,22 @@ fn render_lean_source_commands(
             guard_messages::Buffer::new(&guard.spec),
         );
     }
-    // Traces and warnings interleave with the outputs in command order, as the pin logs them.
-    let mut traces = completed.traces.iter().peekable();
-    let mut warnings = completed.warnings.iter().peekable();
+    let messages = match goal_traces::ordered(completed) {
+        Ok(messages) => messages,
+        Err(failure) => return failure,
+    };
+    let mut messages = messages.iter().peekable();
     for output in &completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
             | fln::SourceCommandOutput::Check { command_index, .. }
             | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
-        while traces
-            .peek()
-            .is_some_and(|trace| trace.command_index <= command_index)
-            || warnings
-                .peek()
-                .is_some_and(|warning| warning.command_index <= command_index)
-        {
-            let next_trace = traces
-                .peek()
-                .filter(|trace| trace.command_index <= command_index)
-                .map(|trace| trace.command_index);
-            let next_warning = warnings
-                .peek()
-                .filter(|warning| warning.command_index <= command_index)
-                .map(|warning| warning.command_index);
-            if next_trace.is_some_and(|t| next_warning.is_none_or(|w| t <= w)) {
-                let trace = traces.next().expect("peeked trace");
-                if let Err(failure) = emit_lean_trace(
-                    trace,
-                    completed.batch.engine.environment(),
-                    &mut guarded,
-                    &mut stdout,
-                ) {
-                    return failure;
-                }
-            } else {
-                let warning = warnings.next().expect("peeked warning");
-                if let Err(failure) = emit_lean_warning(warning, sink, &mut guarded, &mut stdout) {
-                    return failure;
-                }
+        while let Some(message) = messages.next_if(|message| message.command() <= command_index) {
+            if let Err(failure) =
+                message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output)
+            {
+                return failure;
             }
         }
         if command_index >= completed.command_count
@@ -12367,24 +12292,9 @@ fn render_lean_source_commands(
             }
         }
     }
-    while traces.peek().is_some() || warnings.peek().is_some() {
-        let next_trace = traces.peek().map(|trace| trace.command_index);
-        let next_warning = warnings.peek().map(|warning| warning.command_index);
-        if next_trace.is_some_and(|t| next_warning.is_none_or(|w| t <= w)) {
-            let trace = traces.next().expect("peeked trace");
-            if let Err(failure) = emit_lean_trace(
-                trace,
-                completed.batch.engine.environment(),
-                &mut guarded,
-                &mut stdout,
-            ) {
-                return failure;
-            }
-        } else {
-            let warning = warnings.next().expect("peeked warning");
-            if let Err(failure) = emit_lean_warning(warning, sink, &mut guarded, &mut stdout) {
-                return failure;
-            }
+    for message in messages {
+        if let Err(failure) = message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output) {
+            return failure;
         }
     }
     // The pin sorts individual messages before joining and trimming, then applies the
@@ -12399,37 +12309,24 @@ fn render_lean_source_commands(
                 4,
             );
         };
-        if guard
-            .expected
-            .lines()
-            .any(|line| line.trim_start().starts_with("trace:"))
-            && !messages.has_trace
-        {
-            return source_failure(
-                "capability",
-                &format!(
-                    "command {}: `#guard_msgs` expecting an error, warning or trace message",
-                    guard.command_index
-                ),
-                false,
-                SourcePresentation::Lean,
-                CAPABILITY_NOT_IMPLEMENTED_EXIT,
-            );
-        }
-        let from_check = messages.from_check;
-        let from_trace_state = messages.from_trace_state;
+        // Only goal-display traces are reproduced. An expected `trace:` line from any other
+        // trace class has no producer here, so a mismatch against it is a non-answer too.
+        let from_check = messages.from_check
+            || guard
+                .expected
+                .lines()
+                .any(|line| line.trim_start().starts_with("trace:"));
         let produced = guard.spec.combine(messages.checked);
         if !guard.spec.matches(&guard.expected, &produced) {
-            // This door's `#check` and `trace_state` renderings are the pin's on the shapes
-            // measured, but its pretty printer is not proven equal to the pin's in general:
-            // a mismatch there may be this rendering, so it is a non-answer, never a rejection.
-            if from_check || from_trace_state {
-                let kind = if from_check { "#check" } else { "trace_state" };
+            // This door's `#check` line is the pin's on the shapes measured, but its pretty
+            // printer is not proven equal to the pin's in general: a mismatch there may be
+            // this rendering, so it is a non-answer, never a rejection.
+            if from_check {
                 return source_failure(
                     "capability",
                     &format!(
-                        "command {}: `#guard_msgs` over `{kind}` produced a message that differs \
-                         from the docstring, and this door's `{kind}` rendering is not proven to be \
+                        "command {}: `#guard_msgs` over `#check` or a raw goal trace produced a message that differs \
+                         from the docstring, and this door's goal/`#check` rendering is not proven to be \
                          the pin's:\n\n{produced}",
                         guard.command_index
                     ),

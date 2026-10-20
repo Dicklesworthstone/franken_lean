@@ -1,5 +1,6 @@
 //! Executable mains share the ordinarily admitted IO fixture. Arguments are
 //! passed through the engine API as checked Lean data, never parsed as source.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::source_main::{MainExecution, MainExecutionError, MainOutcome};
 

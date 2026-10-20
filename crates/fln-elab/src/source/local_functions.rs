@@ -1,8 +1,11 @@
 //! Local functions close over their lexical context as ordinary checked terms.
 //! Structural `let rec` uses the declaration recursor compiler, on the same
-//! heap worklist as nonrecursive lets. No generated global or axiom is used.
+//! heap worklist as nonrecursive lets. Closure values remain opaque until the
+//! owner is complete; the source engine separately admits their lifted names.
 use super::*;
 use std::collections::HashSet;
+
+pub(super) mod lifting;
 
 /// A local recursive value is checked before its continuation, but remains
 /// opaque until the enclosing declaration has finished elaborating. Captures
@@ -13,6 +16,8 @@ pub(super) struct Deferred {
     pub id: MVarId,
     value: Typed,
     captures: Vec<LocalDecl>,
+    lift_name: Option<Name>,
+    lift_context: LocalContext,
 }
 
 #[derive(Clone)]
@@ -34,6 +39,8 @@ pub(super) struct Build<'a> {
     pub result_type: Option<Expr>,
     pub value_syntax: &'a Syntax,
     pub checkpoint: Option<usize>,
+    pub lift_name: Option<Name>,
+    outer_parent: Option<Name>,
     parameters: Vec<LocalDecl>,
     header_parameters: usize,
     lambdas: Vec<binders::Telescope<'a>>,
@@ -166,6 +173,7 @@ impl Context {
     pub(super) fn defer_local_function(
         &mut self,
         value: Typed,
+        lift_name: Option<Name>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let locals = self.txn.lctx.decls().to_vec();
         let mut reads = self.elimination_reads(&value.value)?;
@@ -215,6 +223,8 @@ impl Context {
             id,
             value,
             captures,
+            lift_name,
+            lift_context: self.txn.lctx.clone(),
         });
         Ok(Typed {
             value: reference,
@@ -248,6 +258,13 @@ impl Context {
                     local.binder_info,
                 );
             }
+            if let Some(name) = pending.lift_name {
+                self.local_function_lifting.closed.push(lifting::Closed {
+                    name,
+                    term: pending.value,
+                    context: pending.lift_context,
+                });
+            }
             self.txn
                 .mvars
                 .assign(pending.id, value, AssignmentJustification::UserGiven)
@@ -269,9 +286,11 @@ impl Context {
         }
         let mvars = self.txn.mvars.clone();
         let deferred = self.deferred_local_functions.clone();
+        let lifting = self.local_function_lifting.clone();
         let result = self.complete_local_functions().and_then(|()| freeze(self));
         self.txn.mvars = mvars;
         self.deferred_local_functions = deferred;
+        self.local_function_lifting = lifting;
         result
     }
 
@@ -285,6 +304,12 @@ impl Context {
                 recursion::RecursionError::ResultTypeRequired,
             )));
         }
+        let lift_name = if binding.recursive {
+            self.reserve_local_function_name(&binding.name)?
+        } else {
+            None
+        };
+        let outer_parent = self.local_function_lifting.parent.clone();
         let saved = self.txn.lctx.clone();
         let parameters = self.bind_parameters(binding.parameters)?;
         let header_parameters = parameters.len();
@@ -296,6 +321,8 @@ impl Context {
             expected,
             result_type: None,
             checkpoint: None,
+            lift_name,
+            outer_parent,
             parameters,
             header_parameters,
             lambdas: Vec::new(),
@@ -320,6 +347,7 @@ impl Context {
         let saved = self.txn.lctx.clone();
         let outer = self.recursion.clone();
         let enclosing = self.enclosing_recursions.len();
+        let parent = self.local_function_lifting.parent.clone();
         self.start_local_function_value(build, None)?;
         let marker = build
             .marker
@@ -356,6 +384,7 @@ impl Context {
         }
         self.recursion = outer;
         self.enclosing_recursions.truncate(enclosing);
+        self.local_function_lifting.parent = parent;
         build.marker = None;
         build.outer_recursion = None;
         build.value_syntax = body;
@@ -372,6 +401,7 @@ impl Context {
         if !build.binding.recursive {
             return Ok(());
         }
+        self.local_function_lifting.parent = build.lift_name.clone();
         // The function is not in scope in its signature. Only now can its
         // complete type and private recursive marker be introduced.
         build.outer_recursion = self.recursion.take();
@@ -543,6 +573,7 @@ impl Context {
         }
         self.txn.lctx = build.saved.clone();
         if build.binding.recursive {
+            self.local_function_lifting.parent = build.outer_parent.clone();
             self.recursion = build.outer_recursion.clone();
             if build.outer_recursion.is_some() {
                 self.enclosing_recursions.pop();
@@ -578,6 +609,8 @@ mod tests {
             result_type: None,
             value_syntax: &missing,
             checkpoint: None,
+            lift_name: None,
+            outer_parent: None,
             parameters: Vec::new(),
             header_parameters: 0,
             lambdas: Vec::new(),

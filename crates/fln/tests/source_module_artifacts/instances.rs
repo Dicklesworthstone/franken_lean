@@ -1,4 +1,5 @@
 //! Native instance registrations remain usable across compiled module boundaries.
+#![forbid(unsafe_code)]
 use super::*;
 
 const PICK: &str =

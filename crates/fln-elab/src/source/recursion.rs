@@ -569,6 +569,23 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         self.defining = Some(name.clone());
         let snapshot = self.clone();
+        if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.group.is_none())
+        {
+            // Partial self references must be in scope before tactics select
+            // alternatives. An initial unknown-self trial can otherwise choose
+            // a different successful branch and silently change the program.
+            // Mutual groups already register all peer headers before bodies.
+            let result = self.partial_definition_body(name, parameters, syntax, expected);
+            if result.is_err() {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = snapshot;
+                self.txn.budget.heartbeats_consumed = spent;
+            }
+            return result;
+        }
         match self.term(syntax, expected.clone()) {
             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
                 found,

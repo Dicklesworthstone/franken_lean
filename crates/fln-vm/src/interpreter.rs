@@ -60,6 +60,7 @@ use std::fmt;
 
 mod array_construction;
 mod arrays;
+mod diagnostics;
 mod floats;
 mod string_fold;
 mod strings;
@@ -564,6 +565,8 @@ struct IntrinsicPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
+    PanicCore,
+    DbgTrace,
     Float(floats::Intrinsic),
     StringInternal(strings::Intrinsic),
     BaseIoAsTask,
@@ -895,6 +898,8 @@ enum IntrinsicImplementation {
 impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         match row {
+            "extern:panicCore" => Self::PanicCore,
+            "extern:dbgTrace" => Self::DbgTrace,
             "extern:BaseIO.asTask" => Self::BaseIoAsTask,
             "extern:BaseIO.bindTask" => Self::BaseIoBindTask,
             "extern:BaseIO.mapTask" => Self::BaseIoMapTask,
@@ -1816,9 +1821,9 @@ enum ReturnTo {
         state: string_fold::State,
         result_ownership: ResultOwnership,
     },
-    CompleteManagerlessTask {
+    CompleteIntrinsicApplication {
         destination: Register,
-        completion: ManagerlessTaskCompletion,
+        completion: IntrinsicCompletion,
         row: &'static str,
         result_ownership: ResultOwnership,
     },
@@ -1849,17 +1854,19 @@ struct InspectedClosure {
     captures: Vec<Obj>,
 }
 
-enum ManagerlessTaskCompletion {
+enum IntrinsicCompletion {
     WrapPure,
     RequireFinishedTask,
+    RawResult,
 }
 
-struct ManagerlessTaskApplication {
+struct IntrinsicApplication {
     row: &'static str,
     closure: Obj,
     arguments: Vec<Obj>,
     argument_ownership: Vec<ArgumentOwnership>,
-    completion: ManagerlessTaskCompletion,
+    completion: IntrinsicCompletion,
+    trace: Option<String>,
 }
 
 struct IntrinsicResult {
@@ -2558,17 +2565,23 @@ fn run(
                             });
                         }
                     }
-                } else if plan.implementation.is_managerless_task() {
-                    let application =
-                        match managerless_task_application(plan.implementation, plan.row, values) {
-                            Ok(application) => application,
-                            Err(refusal) => {
-                                return Ok(VmExit::Refused {
-                                    refusal,
-                                    usage: usage(steps, peak_stack_depth),
-                                });
-                            }
-                        };
+                } else if plan.implementation.is_managerless_task()
+                    || plan.implementation == IntrinsicImplementation::DbgTrace
+                {
+                    let application = match closure_intrinsic_application(
+                        program,
+                        plan.implementation,
+                        plan.row,
+                        values,
+                    ) {
+                        Ok(application) => application,
+                        Err(refusal) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                    };
                     match prepare_internal_apply_many(
                         program,
                         &application.closure,
@@ -2576,9 +2589,13 @@ fn run(
                         application.argument_ownership,
                     ) {
                         Ok(PreparedApply::Partial { function, captures }) => {
+                            if let Some(message) = &application.trace {
+                                fln_rt::diagnostics::trace_message(message.as_bytes());
+                            }
                             let value = make_golem_closure(program, function, captures)?;
                             let value =
-                                match complete_managerless_task(application.completion, value) {
+                                match complete_intrinsic_application(application.completion, value)
+                                {
                                     Ok(value) => value,
                                     Err(refusal) => {
                                         return Ok(VmExit::Refused {
@@ -2590,7 +2607,7 @@ fn run(
                             let value = match finish_intrinsic_result(
                                 application.row,
                                 result_ownership,
-                                IntrinsicResult::owned(value),
+                                value,
                             ) {
                                 Ok(value) => value,
                                 Err(refusal) => {
@@ -2611,9 +2628,12 @@ fn run(
                         }) => {
                             if !remainder.is_empty() {
                                 return Err(Stop::InternalFault(InternalFault::new(
-                                    "FLBC-TASK-APPLY",
-                                    "managerless task arguments over-applied a validated closure",
+                                    "FLBC-INTRINSIC-APPLY",
+                                    "intrinsic arguments over-applied a validated closure",
                                 )));
+                            }
+                            if let Some(message) = &application.trace {
+                                fln_rt::diagnostics::trace_message(message.as_bytes());
                             }
                             advance(current_frame_mut(&mut stack)?)?;
                             let next_depth = push_call(
@@ -2621,7 +2641,7 @@ fn run(
                                 &mut stack,
                                 function,
                                 args,
-                                ReturnTo::CompleteManagerlessTask {
+                                ReturnTo::CompleteIntrinsicApplication {
                                     destination: dst,
                                     completion: application.completion,
                                     row: application.row,
@@ -3181,13 +3201,14 @@ fn run(
                                     });
                                 }
                             },
-                            ReturnTo::CompleteManagerlessTask {
+                            ReturnTo::CompleteIntrinsicApplication {
                                 destination,
                                 completion,
                                 row,
                                 result_ownership,
                             } => {
-                                let value = match complete_managerless_task(completion, value) {
+                                let value = match complete_intrinsic_application(completion, value)
+                                {
                                     Ok(value) => value,
                                     Err(refusal) => {
                                         return Ok(VmExit::Refused {
@@ -3196,19 +3217,16 @@ fn run(
                                         });
                                     }
                                 };
-                                let value = match finish_intrinsic_result(
-                                    row,
-                                    result_ownership,
-                                    IntrinsicResult::owned(value),
-                                ) {
-                                    Ok(value) => value,
-                                    Err(refusal) => {
-                                        return Ok(VmExit::Refused {
-                                            refusal,
-                                            usage: usage(steps, peak_stack_depth),
-                                        });
-                                    }
-                                };
+                                let value =
+                                    match finish_intrinsic_result(row, result_ownership, value) {
+                                        Ok(value) => value,
+                                        Err(refusal) => {
+                                            return Ok(VmExit::Refused {
+                                                refusal,
+                                                usage: usage(steps, peak_stack_depth),
+                                            });
+                                        }
+                                    };
                                 set_register(current_frame_mut(&mut stack)?, destination, value)?;
                             }
                         }
@@ -3908,8 +3926,8 @@ fn resolve_intrinsic_plan(
             reason: error.message().to_string(),
         }
     })?;
-    let expected_arguments = ownership
-        .argument_ownership(declared_arguments.len())
+    let expected_arguments = diagnostics::argument_ownership(generated, declared_arguments.len())
+        .unwrap_or_else(|| ownership.argument_ownership(declared_arguments.len()))
         .map_err(|error| VmRefusal::IntrinsicOwnershipContract {
             row: row.to_string(),
             reason: error.message().to_string(),
@@ -4320,6 +4338,7 @@ fn dispatch_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
+        IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
@@ -6843,6 +6862,7 @@ fn dispatch_intrinsic(
         | IntrinsicImplementation::TaskMap
         | IntrinsicImplementation::TaskBind
         | IntrinsicImplementation::StringInternalFoldl
+        | IntrinsicImplementation::DbgTrace
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }
@@ -6875,12 +6895,14 @@ fn cache_thunk_value(thunk: &Obj, value: &Obj) -> Result<(), Stop> {
     )))
 }
 
-fn managerless_task_application(
+fn closure_intrinsic_application(
+    program: &ValidatedProgram,
     implementation: IntrinsicImplementation,
     row: &'static str,
     args: Vec<Obj>,
-) -> Result<ManagerlessTaskApplication, VmRefusal> {
+) -> Result<IntrinsicApplication, VmRefusal> {
     match implementation {
+        IntrinsicImplementation::DbgTrace => diagnostics::trace(program, row, args),
         IntrinsicImplementation::BaseIoAsTask | IntrinsicImplementation::TaskSpawn => {
             let [closure, priority] = exact_owned_args(row, args)?;
             let operation = if implementation == IntrinsicImplementation::BaseIoAsTask {
@@ -6894,12 +6916,13 @@ fn managerless_task_application(
             // mismatch would treat 2^64 as ill-typed rather than a valid
             // (and here unused) priority.
             with_nat_view(&priority, operation, 1, |_| ())?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![Obj::mk_nat(0)],
                 argument_ownership: vec![ArgumentOwnership::Scalar],
-                completion: ManagerlessTaskCompletion::WrapPure,
+                completion: IntrinsicCompletion::WrapPure,
+                trace: None,
             })
         }
         IntrinsicImplementation::BaseIoMapTask => {
@@ -6911,12 +6934,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
                 argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
-                completion: ManagerlessTaskCompletion::WrapPure,
+                completion: IntrinsicCompletion::WrapPure,
+                trace: None,
             })
         }
         IntrinsicImplementation::BaseIoBindTask => {
@@ -6934,12 +6958,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
                 argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
-                completion: ManagerlessTaskCompletion::RequireFinishedTask,
+                completion: IntrinsicCompletion::RequireFinishedTask,
+                trace: None,
             })
         }
         IntrinsicImplementation::TaskMap => {
@@ -6951,12 +6976,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
                 argument_ownership: vec![ArgumentOwnership::Owned],
-                completion: ManagerlessTaskCompletion::WrapPure,
+                completion: IntrinsicCompletion::WrapPure,
+                trace: None,
             })
         }
         IntrinsicImplementation::TaskBind => {
@@ -6968,12 +6994,13 @@ fn managerless_task_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
-            Ok(ManagerlessTaskApplication {
+            Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
                 argument_ownership: vec![ArgumentOwnership::Owned],
-                completion: ManagerlessTaskCompletion::RequireFinishedTask,
+                completion: IntrinsicCompletion::RequireFinishedTask,
+                trace: None,
             })
         }
         IntrinsicImplementation::NatAdd
@@ -7295,6 +7322,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayExtra(_)
         | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::StringInternal(_)
+        | IntrinsicImplementation::PanicCore
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }),
@@ -7328,13 +7356,14 @@ fn expect_golem_task_closure(
     Ok(())
 }
 
-fn complete_managerless_task(
-    completion: ManagerlessTaskCompletion,
+fn complete_intrinsic_application(
+    completion: IntrinsicCompletion,
     value: Obj,
-) -> Result<Obj, VmRefusal> {
+) -> Result<IntrinsicResult, VmRefusal> {
     match completion {
-        ManagerlessTaskCompletion::WrapPure => Ok(Obj::mk_task_pure(value)),
-        ManagerlessTaskCompletion::RequireFinishedTask => {
+        IntrinsicCompletion::RawResult => Ok(IntrinsicResult::raw_object(value)),
+        IntrinsicCompletion::WrapPure => Ok(IntrinsicResult::owned(Obj::mk_task_pure(value))),
+        IntrinsicCompletion::RequireFinishedTask => {
             expect_value_kind(
                 &value,
                 "Task.bind result",
@@ -7345,7 +7374,7 @@ fn complete_managerless_task(
             if value.finished_task_value().is_none() {
                 return Err(VmRefusal::UnsupportedTaskState);
             }
-            Ok(value)
+            Ok(IntrinsicResult::owned(value))
         }
     }
 }

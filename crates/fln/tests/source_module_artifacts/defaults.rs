@@ -1,4 +1,5 @@
 //! Defaults survive physical library imports without duplicating inherited rows.
+#![forbid(unsafe_code)]
 use super::*;
 
 const BASE: &str = "prelude\ninductive First where | mk\ninductive Second where | mk\nclass Choice (A : Type) where\n  value : A\n@[default_instance 2000] def firstChoice : Choice First := Choice.mk First.mk\ndef secondChoice : Choice Second := Choice.mk Second.mk";

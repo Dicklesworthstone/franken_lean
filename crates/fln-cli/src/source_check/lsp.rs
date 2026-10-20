@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 mod completion;
 mod dependencies;
+mod interactive;
 mod navigation;
 mod render;
 use fln::source_check::inspect::{ObservationKind, SourceObservation};
@@ -507,7 +508,8 @@ fn inspect_sources(
         .map(|(name, source)| fln::SourceModuleInput { name, source })
         .collect();
     let wanted = match kind {
-        QueryKind::Goals => ObservationKind::Goals,
+        QueryKind::Goals | QueryKind::InteractiveGoals => ObservationKind::Goals,
+        QueryKind::TermGoal | QueryKind::InteractiveTermGoal => ObservationKind::TermGoal,
         QueryKind::Hover => ObservationKind::Term,
         QueryKind::Definition => {
             return navigation::definition(session, sources, &inputs, offset);
@@ -530,9 +532,20 @@ fn inspect_sources(
     };
     Ok(match inspected.observation {
         None => None,
-        Some(SourceObservation::Goals { goals, .. }) => {
+        Some(SourceObservation::Goals { range, goals })
+            if matches!(
+                kind,
+                QueryKind::InteractiveGoals | QueryKind::InteractiveTermGoal
+            ) =>
+        {
+            Some(interactive::observe(goals, range, kind)?)
+        }
+        Some(SourceObservation::Goals { range, goals }) => {
             if goals.len() > 256 {
                 return Err("too many goals for one editor response".to_owned());
+            }
+            if kind == QueryKind::TermGoal && goals.len() != 1 {
+                return Err("term inspection did not return exactly one goal".to_owned());
             }
             let mut displayed = Vec::new();
             let mut total = 0usize;
@@ -559,7 +572,12 @@ fn inspect_sources(
                     .ok_or("goal display exceeded its byte limit")?;
                 displayed.push(text);
             }
-            Some(Answer::Goals { goals: displayed })
+            if kind == QueryKind::TermGoal {
+                let goal = displayed.pop().ok_or("term goal display is missing")?;
+                Some(Answer::TermGoal { goal, range })
+            } else {
+                Some(Answer::Goals { goals: displayed })
+            }
         }
         Some(SourceObservation::Term {
             range,

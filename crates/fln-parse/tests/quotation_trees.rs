@@ -405,3 +405,40 @@ fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
     }
 }
+
+#[test]
+fn typed_captures_do_not_end_their_enclosing_match_or_conditional() {
+    let mut grammar = FileGrammar::new(false, &[], None).expect("Init");
+    for source in [
+        "macro \"m \" input:term:max : term => `(match $input:term with | Nat.zero => 0 | Nat.succ n => n)",
+        "macro \"m2 \" a:term:max b:term:max : term => `(match $a:term, $b:term with | _, _ => 0)",
+        "macro \"m3 \" c:term:max a:term:max b:term:max : term => `(if $c:term then $a:term else $b:term)",
+    ] {
+        parse(&mut grammar, source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+    for source in [
+        "macro \"bad \" a:term:max : term => `(match $a:unknown with | _ => 0)",
+        "macro \"bad \" a:term:max : term => `(match $a: with | _ => 0)",
+        "macro \"bad \" a:term:max : term => `(match $a with | _ => 0)",
+        "def bad : Nat := match $a:term with | _ => 0",
+    ] {
+        assert!(parse(&mut grammar, source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn single_arm_do_matches_remain_syntax_inside_macro_quotations() {
+    let mut grammar = FileGrammar::new(false, &[], None).expect("Init");
+    for source in [
+        r#"macro "onlyZeroTyped " arg:term:max : term => `(do { match $arg:term with | Nat.zero => return 42 })"#,
+        r#"macro "onlySucc " arg:term:max : term => `(do { match $arg:term with | Nat.succ n => return n })"#,
+    ] {
+        parse(&mut grammar, source).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+    }
+    // The pin consumes a bare antiquotation here as an optional match switch,
+    // not as the discriminant. Keep that refusal rather than silently changing
+    // the quotation grammar to make the nonexhaustive test easier to write.
+    assert!(parse(&mut grammar,
+        r#"macro "bareMatch " arg:term:max : term => `(do { match $arg with | Nat.zero => return 42 })"#
+    ).is_err());
+}

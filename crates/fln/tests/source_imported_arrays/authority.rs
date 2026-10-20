@@ -1,4 +1,5 @@
 //! Checked alternate bodies and explicit safe replacements keep their authority.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::{
     BinderInfo, CheckerAdmissionGround, Declaration, EngineAdmissionLimits, EngineExecutionLimits,

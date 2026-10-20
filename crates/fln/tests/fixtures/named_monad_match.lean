@@ -17,9 +17,11 @@ def chooseAscribed (o : Option Nat) : HintId Nat :=
 def chooseType (o : Option Type) : HintId Type :=
   bind (m := HintId) (match o with | some A => pure A | none => pure Nat) (fun A => pure A)
 
-theorem namedSome : chooseNamed (some 42) = (42 : Nat) := by rfl
-theorem namedNone : chooseNamed none = (0 : Nat) := by rfl
-theorem plainSome : choosePlain (some 42) = (42 : Nat) := by rfl
-theorem ascribedSome : chooseAscribed (some 42) = (42 : Nat) := by rfl
-theorem higherUniverse : chooseType (some Bool) = Bool := by rfl
-theorem higherDefault : chooseType none = Nat := by rfl
+-- `=` (Init/Core) and the `rfl` tactic (Init/Tactics) are not available under this header;
+-- the pin answers "expected token" for them. `Eq` and the term `rfl` are in Init.Prelude.
+theorem namedSome : Eq (chooseNamed (some 42)) (42 : Nat) := rfl
+theorem namedNone : Eq (chooseNamed none) (0 : Nat) := rfl
+theorem plainSome : Eq (choosePlain (some 42)) (42 : Nat) := rfl
+theorem ascribedSome : Eq (chooseAscribed (some 42)) (42 : Nat) := rfl
+theorem higherUniverse : Eq (chooseType (some Bool)) Bool := rfl
+theorem higherDefault : Eq (chooseType none) Nat := rfl

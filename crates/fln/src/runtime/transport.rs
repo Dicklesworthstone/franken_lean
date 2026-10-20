@@ -1,6 +1,7 @@
-//! Equality transport after admission. A cast may disappear only when both
-//! logical endpoints erase to the same executable type. No proof is executed,
-//! and ordinary endpoint/payload evaluation is retained in source order.
+//! Equality transport after admission. Concrete layout changes remain refused;
+//! a checked Type equality can cross the private boxed carrier while retaining
+//! the concrete payload and result interfaces. No proof is executed, and
+//! ordinary endpoint/payload evaluation is retained in source order.
 mod quotient;
 
 use super::*;
@@ -54,14 +55,23 @@ impl Preparation<'_> {
         let after = application(args[2].clone(), [args[4].clone(), args[5].clone()]);
         let before = self.erase_runtime_type(&before)?;
         let after = self.erase_runtime_type(&after)?;
-        if before != after {
+        let carrier = self.erase_runtime_type(&args[0])?;
+        let static_endpoints = self.type_parameter(&carrier)?;
+        let boxed = self.value_types.boxed.as_ref();
+        let boxed_refinement =
+            static_endpoints && (boxed == Some(&before) || boxed == Some(&after));
+        if before != after && !boxed_refinement {
             return Err(unsupported("representation-dependent equality transport"));
         }
         let result = self
             .value_type(&after)?
             .ok_or_else(|| unsupported("equality transport result representation"))?;
-        let carrier = self.erase_runtime_type(&args[0])?;
-        let static_endpoints = self.type_parameter(&carrier)?;
+        let payload_type = if before == after {
+            result
+        } else {
+            self.value_type(&before)?
+                .ok_or_else(|| unsupported("equality transport payload representation"))?
+        };
         if !static_endpoints && self.value_type(&carrier)?.is_none() {
             return Err(unsupported("equality transport carrier representation"));
         }
@@ -77,7 +87,10 @@ impl Preparation<'_> {
                 .ok_or_else(|| unsupported("transport arity"))?;
             codomain = body;
         }
-        if matches!(args[3].node(), ExprNode::Lam { .. }) && args.len() - 6 >= arity {
+        if before == after
+            && matches!(args[3].node(), ExprNode::Lam { .. })
+            && args.len() - 6 >= arity
+        {
             let depth = if static_endpoints { 0 } else { 2 };
             if depth as usize > self.limits.max_context_depth {
                 return Err(IngressError::ResourceLimit {
@@ -103,7 +116,7 @@ impl Preparation<'_> {
             }
             return Ok(Some(applied));
         }
-        let payload = self.typed_callable_result(args[3].clone(), after.clone(), result)?;
+        let payload = self.typed_callable_result(args[3].clone(), before, payload_type)?;
         let bindings = if static_endpoints {
             vec![(after, payload)]
         } else {

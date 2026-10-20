@@ -295,7 +295,8 @@ import Init.Data.String.Bootstrap
         // source-declaration admission, without rebuilding any compiler state.
         let mut string_rows = std::collections::BTreeSet::new();
         for execution in executions {
-            assert_eq!(execution.checker.ground, fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType);
+            // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
+            assert_eq!(execution.checker.ground, fln::CheckerAdmissionGround::UnsafeQuarantine);
             let decoded = fln_comp::flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
             assert_eq!(fln_comp::flbc::encode_canonical(&decoded, Default::default()).unwrap(), execution.flbc_artifact);
             for instruction in decoded.functions().iter().flat_map(|function| &function.code) {

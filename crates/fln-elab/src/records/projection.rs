@@ -19,6 +19,25 @@ pub(crate) struct ClassProjection {
 pub(crate) fn class_projection<E>(
     environment: &Environment,
     definition: &DefinitionVal,
+    tick: impl FnMut() -> Result<(), E>,
+) -> Result<Option<ClassProjection>, E> {
+    field_projection(environment, definition, true, tick)
+}
+
+/// The generated projection law also applies to non-class record fields during
+/// definitional simplification. Ordinary lookalike functions are still refused.
+pub(crate) fn generated_projection<E>(
+    environment: &Environment,
+    definition: &DefinitionVal,
+    tick: impl FnMut() -> Result<(), E>,
+) -> Result<Option<ClassProjection>, E> {
+    field_projection(environment, definition, false, tick)
+}
+
+fn field_projection<E>(
+    environment: &Environment,
+    definition: &DefinitionVal,
+    require_instance: bool,
     mut tick: impl FnMut() -> Result<(), E>,
 ) -> Result<Option<ClassProjection>, E> {
     if definition.safety != DefinitionSafety::Safe
@@ -55,7 +74,9 @@ pub(crate) fn class_projection<E>(
     else {
         return Ok(None);
     };
-    if receiver != BinderInfo::InstImplicit || !matches!(expr.node(), ExprNode::BVar { idx: 0 }) {
+    if (require_instance && receiver != BinderInfo::InstImplicit)
+        || !matches!(expr.node(), ExprNode::BVar { idx: 0 })
+    {
         return Ok(None);
     }
     let Some(ConstantInfo::Induct(family)) = environment.find(struct_name) else {

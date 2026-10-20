@@ -513,7 +513,8 @@ fn directory_actual_pinned_io_import_executes_and_replays_live_entries() {
         ).expect("ordinary source imports and reads its owned directory").into_complete().expect("directory source evaluation completes");
         let batch = &program.modules[0].commands;
         let read = &batch.batch.executions[batch.batch.source_evaluation_indices[0]];
-        assert_eq!(read.checker.ground, CheckerAdmissionGround::BodyCheckedAgainstDeclaredType);
+        // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
+        assert_eq!(read.checker.ground, CheckerAdmissionGround::UnsafeQuarantine);
         assert_eq!(logical_entries(&read.exit), expected_entries(&directory));
         assert_eq!(nat_decimal(&child(returned(&evaluation(batch).exit), 0)).as_deref(), Some("3"));
         let replay = assert_rows(read, &[Operation::ReadDir]);

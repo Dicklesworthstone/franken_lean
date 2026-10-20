@@ -323,9 +323,10 @@ fn decoded_four_module_string_fixture_executes_unicode_without_import_admission(
             for (&index, expected) in indices.iter().zip([0, 3, 2, 3]) {
                 let execution = &first.batch.executions[index];
                 assert_eq!(execution.checker.schema, "fln.checker-admission/1");
+                // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
                 assert_eq!(
                     execution.checker.ground,
-                    CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                    CheckerAdmissionGround::UnsafeQuarantine
                 );
                 assert_eq!(
                     closed_vm_value(&execution.exit).unwrap(),

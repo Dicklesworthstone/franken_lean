@@ -35,6 +35,11 @@ pub(super) fn mode(kind: &Name) -> Option<Mode> {
         None
     }
 }
+pub(super) fn is_scope(kind: &Name) -> bool {
+    kind == &parser_kind(&["Tactic", "set_option"])
+        || kind == &parser_kind(&["Tactic", "classical"])
+}
+
 #[derive(Clone)]
 pub(super) struct Frame<'a> {
     mode: Mode,
@@ -49,16 +54,43 @@ pub(super) struct Frame<'a> {
     after: Option<Vec<&'a Syntax>>,
 }
 impl Context {
-    /// Options wrap the whole visible goal frontier, not just its main goal.
+    /// Lexical scopes wrap the whole visible frontier, not just its main goal.
     /// In particular an enclosed all_goals still sees the caller's siblings,
     /// and an unfinished body returns its goals to the outer sequence.
-    pub(super) fn start_tactic_options<'a>(
+    pub(super) fn start_tactic_scope<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
+        kind: &Name,
         args: &'a [Syntax],
     ) -> Result<(), NatDefinitionElabError> {
-        let (syntax, options) = self.enter_source_options(args)?;
-        let body = self.proof_instructions(syntax)?;
+        let instance_scopes = self.source_scope.instance_scopes.clone();
+        let (body, options) = if kind == &parser_kind(&["Tactic", "classical"]) {
+            let [keyword, sequence] = args else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "classical", "classical tactic")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "classical"])?;
+            let body = self.proof_instructions(sequence)?;
+            let provider = Name::from_components(["Classical", "propDecidable"]);
+            if !self.txn.env.contains(&provider) {
+                // An ordinary elaboration failure, not corrupted registry data:
+                // `first` may try its next alternative when imports omit this.
+                return Err(failure(SourceInferenceError::UnknownConstant(provider)));
+            }
+            // Lean/Elab/Tactic/Classical.lean adds this already admitted
+            // declaration as a LOCAL instance at priority 10. Opening the
+            // namespace would activate unrelated instances at other priorities.
+            // No persistent registration or new proof authority is installed.
+            self.tick()?;
+            self.source_scope
+                .instance_scopes
+                .register_local(&self.txn.env, &provider, 10)
+                .map_err(instances::registry_error)?;
+            (body, self.txn.options.clone())
+        } else {
+            let (syntax, options) = self.enter_source_options(args)?;
+            (self.proof_instructions(syntax)?, options)
+        };
         let boundary = proof
             .work
             .iter()
@@ -74,6 +106,7 @@ impl Context {
             .map_or(0, |position| position + 1);
         let scope = OptionScope {
             options,
+            instance_scopes,
             instructions: std::mem::replace(&mut proof.instructions, body),
             cursor: proof.cursor + 1,
         };
@@ -93,6 +126,7 @@ impl Context {
             return Err(error(TacticError::NoGoals));
         }
         self.txn.options = scope.options;
+        self.source_scope.instance_scopes = scope.instance_scopes;
         proof.instructions = scope.instructions;
         proof.cursor = scope.cursor;
         Ok(())

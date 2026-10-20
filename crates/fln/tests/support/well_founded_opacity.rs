@@ -1,5 +1,6 @@
 //! Real source programs exercise the semantic effects of successful lowering
 //! through every public admission/execution door and cached module replay.
+#![forbid(unsafe_code)]
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
 };

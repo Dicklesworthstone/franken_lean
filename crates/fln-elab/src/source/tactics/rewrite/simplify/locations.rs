@@ -17,18 +17,12 @@ impl Context {
                 type_,
             })),
             UnfoldResult::NotDefinition => {
-                let mut term = self.selected_simp_term(rule)?;
-                term.type_ = self.simp_premise_target(&term.type_, rules)?;
-                let Some(RewriteMatch {
-                    rule: term,
-                    occurrence,
-                    premises,
-                }) = self.instantiate_rewrite_rule(term, &target, rule.reverse(), true, rules)?
+                let Some((term, occurrence, reverse)) =
+                    self.simp_rule_evidence(&target, rule, rules)?
                 else {
                     return Ok(None);
                 };
-                assert!(premises.is_empty(), "simp discharges its own premises");
-                self.rewrite_hypothesis_value(local, term, &occurrence, rule.reverse())
+                self.rewrite_hypothesis_value(local, term, &occurrence, reverse)
                     .map(Some)
             }
         }
@@ -195,7 +189,12 @@ impl Context {
                         .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
                         .cloned()
                         .collect();
+                    let target = self.instantiate(&local.type_)?;
+                    let index = self.simp_target_index(&target)?;
                     for rule in &active {
+                        if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                            continue;
+                        }
                         self.tick()?;
                         let original = self.rewrite_trial();
                         let Some(replacement) = self.simp_hypothesis_step(&local, rule, &active)?

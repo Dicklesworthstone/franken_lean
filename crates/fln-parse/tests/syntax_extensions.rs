@@ -56,6 +56,44 @@ fn grammar_after(imports: &[&str], commands: &[&str]) -> FileGrammar {
 }
 
 #[test]
+fn leading_syntax_can_end_in_a_later_argument_precedence_term() {
+    let grammar = grammar_after(
+        &[],
+        &[
+            "macro \"addParts \" x:term:max y:term:max : term => `(Nat.add $x $y)",
+            "macro \"addWith \" x:term:max \" and \" y:term:max : term => `(Nat.add $x $y)",
+            "syntax (name := bounded3) \"triple \" term:max term:max term:arg : term",
+        ],
+    );
+    for source in [
+        "def v := addParts 4 5",
+        "def v := addParts (Nat.succ 4) (Nat.succ 5)",
+        "def v := addWith 4 and 5 + 6",
+        "def v := triple 1 (Nat.succ 2) 3",
+        "def v := (addParts 4 5, addParts 6 7)",
+    ] {
+        let parsed = with_grammar(&grammar.grammar(), || {
+            parse_source_command(source.as_bytes())
+        })
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    }
+    for source in [
+        "def v := addParts 4",
+        "def v := addWith 4 5",
+        "def v := triple 1 2",
+    ] {
+        assert!(
+            with_grammar(&grammar.grammar(), || parse_source_command(
+                source.as_bytes()
+            ))
+            .is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn the_census_descriptions_parse_and_count() {
     let census = extension_census();
     assert_eq!(

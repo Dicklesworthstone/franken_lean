@@ -142,7 +142,11 @@ pub(super) enum MatchStep<'a> {
 
 pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
     if let Syntax::Ident { val, .. } = syntax {
-        if val.is_anonymous() || !val.parent().is_anonymous() {
+        // Quotation-generated pattern binders are atomic before macro scopes
+        // are attached. Retain the scoped identity for local lookup; erasing
+        // it here would capture caller variables in the branch body.
+        let unscoped = val.erase_macro_scopes();
+        if unscoped.is_anonymous() || !unscoped.parent().is_anonymous() {
             return Err(error(MatchError::InvalidPattern));
         }
         return Ok(Some(val.clone()));
@@ -256,7 +260,9 @@ impl Context {
                 let Syntax::Ident { val, .. } = &name[0] else {
                     return Err(error(MatchError::InvalidPattern));
                 };
-                if val.is_anonymous() || !val.parent().is_anonymous() {
+                if val.erase_macro_scopes().is_anonymous()
+                    || !val.erase_macro_scopes().parent().is_anonymous()
+                {
                     return Err(error(MatchError::InvalidPattern));
                 }
                 (Some(val), &parts[3..])
@@ -292,7 +298,8 @@ impl Context {
             let binding = match expect_null_args(&parts[1], "conditional evidence")? {
                 [] => None,
                 [Syntax::Ident { val, .. }, colon]
-                    if !val.is_anonymous() && val.parent().is_anonymous() =>
+                    if !val.erase_macro_scopes().is_anonymous()
+                        && val.erase_macro_scopes().parent().is_anonymous() =>
                 {
                     expect_atom(colon, ":", "conditional evidence separator")?;
                     Some(val)

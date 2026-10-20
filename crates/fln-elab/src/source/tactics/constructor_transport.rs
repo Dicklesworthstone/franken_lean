@@ -591,7 +591,6 @@ impl Context {
         let continuation_type =
             self.close_constructor_locals(&locals, goal.target.clone(), false)?;
         let (hole, mut child) = self.proof_goal(continuation_type)?;
-        child.tag = goal.tag.clone();
         for mut local in locals {
             local.index = self.txn.lctx.len();
             eliminate::add_local(&mut self.txn.lctx, &local);

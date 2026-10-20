@@ -325,9 +325,10 @@ fn actual_public_append_executes_checked_unicode_empty_partial_and_repeated_call
         assert_eq!(indices.len(), 5);
         for (&index, expected) in indices.iter().zip(["", "λ\0é😀", "λ🙂", "éé", "left"]) {
             let execution = &first.batch.executions[index];
+            // #eval's auxiliary is unsafe at the pin (BuiltinEvalCommand.lean:92).
             assert_eq!(
                 execution.checker.ground,
-                CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+                CheckerAdmissionGround::UnsafeQuarantine
             );
             assert_eq!(
                 closed_vm_value(&execution.exit).unwrap(),

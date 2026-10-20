@@ -183,11 +183,6 @@ impl Scopes {
         Ok(scope)
     }
 
-    /// The pin's `elabExport` (vendored Lean/Elab/BuiltinCommand.lean): `namespace` resolves as
-    /// `open` resolves it (`resolveNamespace`), a single resolution equal to the current namespace
-    /// is a self export, and each name must denote exactly one declaration `ns ++ name` among
-    /// those namespaces (`resolveNameUsingNamespaces`). The result pairs each alias,
-    /// `currentNamespace ++ name`, with its declaration.
     /// `open Ns (a b …)`: each name with the one declaration `ns ++ name` it denotes among the
     /// namespaces `Ns` resolves to (`resolveNameUsingNamespacesCore`).
     fn explicit_opens(
@@ -203,25 +198,11 @@ impl Scopes {
                 namespace.to_display_string()
             ));
         }
-        let mut opens = Vec::with_capacity(names.len());
-        for name in names {
-            let candidates: Vec<Name> = namespaces
-                .iter()
-                .map(|ns| ns.append_core(name))
-                .filter(|candidate| env.contains(candidate))
-                .collect();
-            let [declaration] = candidates.as_slice() else {
-                return Err(if candidates.is_empty() {
-                    format!("unknown declaration `{}`", name.to_display_string())
-                } else {
-                    format!("ambiguous identifier `{}`", name.to_display_string())
-                });
-            };
-            opens.push((name.clone(), declaration.clone()));
-        }
-        Ok(opens)
+        self.namespace_members(env, &namespaces, names)
     }
 
+    /// `elabExport` uses the same member resolver as an explicit open, and
+    /// rejects a single namespace equal to the enclosing namespace.
     pub fn export_aliases(
         &self,
         env: &Environment,
@@ -238,26 +219,57 @@ impl Scopes {
         if namespaces == [self.current.namespace.clone()] {
             return Err("invalid 'export', self export".into());
         }
+        Ok(self
+            .namespace_members(env, &namespaces, names)?
+            .into_iter()
+            .map(|(name, declaration)| (self.current.namespace.append_core(&name), declaration))
+            .collect())
+    }
+
+    fn namespace_members(
+        &self,
+        env: &Environment,
+        namespaces: &[Name],
+        names: &[Name],
+    ) -> Result<Vec<(Name, Name)>, String> {
+        let table = fln_elab::aliases::AliasTable::read(env).map_err(|error| error.to_string())?;
+        let protected = fln_elab::protected_names::ProtectedNames::read(env)
+            .map_err(|error| error.to_string())?;
         let mut aliases = Vec::with_capacity(names.len());
         for name in names {
-            let candidates: Vec<Name> = namespaces
-                .iter()
-                .map(|ns| ns.append_core(name))
-                .filter(|candidate| env.contains(candidate))
-                .collect();
+            // The pin's `OpenDecl.resolveId` first tries the exact declaration,
+            // including protected names. Only an absent exact name falls back to
+            // ordinary global resolution; this is what permits re-exported aliases.
+            // A failed namespace does not mask a unique success in another one.
+            let mut candidates = Vec::new();
+            let mut last_error = None;
+            for ns in namespaces {
+                let qualified = ns.append_core(name);
+                if env.contains(&qualified) {
+                    candidates.push(qualified);
+                    continue;
+                }
+                match self.current.resolve_with_aliases(
+                    &qualified,
+                    |candidate| env.contains(candidate),
+                    &table,
+                    &protected,
+                ) {
+                    Ok(Some(declaration)) => candidates.push(declaration),
+                    Ok(None) => {}
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
             let [declaration] = candidates.as_slice() else {
                 return Err(if candidates.is_empty() {
-                    format!("unknown declaration `{}`", name.to_display_string())
+                    last_error.unwrap_or_else(|| {
+                        format!("unknown declaration `{}`", name.to_display_string())
+                    })
                 } else {
                     format!("ambiguous identifier `{}`", name.to_display_string())
                 });
             };
-            let alias = if self.current.namespace.is_anonymous() {
-                name.clone()
-            } else {
-                self.current.namespace.append_core(name)
-            };
-            aliases.push((alias, declaration.clone()));
+            aliases.push((name.clone(), declaration.clone()));
         }
         Ok(aliases)
     }

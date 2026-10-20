@@ -277,11 +277,29 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(inlined, expected));
                                 continue;
                             }
+                            if let Some(inlined) = self.lazy_eliminator(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(inlined, expected));
+                                continue;
+                            }
+                            // Construction and elimination share the admitted
+                            // datatype parameter prefix. In particular, source
+                            // match/cases must not execute a data-valued parameter
+                            // that recursor_shape discards. Indices, minors and
+                            // the major are not part of this static prefix.
+                            let static_parameters = match head.node() {
+                                ExprNode::Const { name, .. } => match self.environment.find(name) {
+                                    Some(ConstantInfo::Ctor(ctor)) => ctor.num_params as usize,
+                                    Some(ConstantInfo::Rec(rec)) => rec.num_params as usize,
+                                    _ => 0,
+                                },
+                                _ => 0,
+                            };
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
                             let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
                             let mut callback_types = Vec::new();
-                            for arg in &args {
+                            for (index, arg) in args.iter().enumerate() {
                                 self.tick()?;
                                 let domain = if let Some(current) = type_ {
                                     let normal = self.type_head(&current)?;
@@ -347,6 +365,12 @@ impl Preparation<'_> {
                                             arg.clone()
                                         },
                                     )
+                                } else if index < static_parameters {
+                                    // Retain exact parameters for dependent domains
+                                    // and layout specialization, without caching an
+                                    // executable value. The same expression in a
+                                    // field, minor, index or major must still visit.
+                                    Frame::Keep(arg.clone())
                                 } else {
                                     Frame::Visit(arg.clone(), domain)
                                 });
@@ -536,3 +560,9 @@ mod tests;
 
 #[cfg(test)]
 mod context_tests;
+
+#[cfg(test)]
+mod constructor_parameters;
+
+#[cfg(test)]
+mod recursor_parameters;

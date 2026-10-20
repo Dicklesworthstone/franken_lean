@@ -291,6 +291,8 @@ impl SourceGrammar {
 pub(crate) enum Resolution {
     /// Exactly this declaration.
     Global(Name),
+    /// A constructor, whose bare use in a match pattern is not a variable.
+    Constructor(Name),
     /// Nothing: the quotation precheck refuses the notation.
     Nothing,
     /// Several declarations, or the scope tables could not be read.
@@ -318,7 +320,16 @@ pub(crate) fn resolver<'e>(
             aliases,
             protected,
         ) {
-            Ok(Some(global)) => Resolution::Global(global),
+            Ok(Some(global)) => {
+                if matches!(
+                    environment.find(&global),
+                    Some(fln_env::constants::ConstantInfo::Ctor(_))
+                ) {
+                    Resolution::Constructor(global)
+                } else {
+                    Resolution::Global(global)
+                }
+            }
             Ok(None) => Resolution::Nothing,
             Err(_) => Resolution::Undetermined,
         }

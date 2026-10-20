@@ -216,6 +216,7 @@ impl Preparation<'_> {
             || self.specializations.definitions.contains_key(name)
             || self.specializations.constructor_types.contains_key(name)
             || self.nat_primitive_intrinsic_type(name).is_some()
+            || self.diagnostic_intrinsic_type(name).is_some()
             || self.st_intrinsic_type(name).is_some()
             || self.io_intrinsic_type(name).is_some()
             || self.fs_intrinsic_type(name).is_some()
@@ -1013,6 +1014,7 @@ impl Preparation<'_> {
         if levels.is_empty()
             && let Some(type_) = self
                 .nat_primitive_intrinsic_type(name)
+                .or_else(|| self.diagnostic_intrinsic_type(name))
                 .or_else(|| self.st_intrinsic_type(name))
                 .or_else(|| self.io_intrinsic_type(name))
                 .or_else(|| self.fs_intrinsic_type(name))

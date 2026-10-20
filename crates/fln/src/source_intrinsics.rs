@@ -10,6 +10,7 @@ use super::*;
 use std::collections::HashSet;
 pub(super) mod array_fold;
 pub(super) mod array_iteration;
+pub(super) mod diagnostics;
 pub(super) mod float;
 pub(super) mod io;
 mod nat_div_mod;

@@ -1,5 +1,6 @@
 //! Interpolated strings expand to real class applications that execute through Golem.
 //! The Reference is executed only here as the differential oracle.
+#![forbid(unsafe_code)]
 
 use super::*;
 

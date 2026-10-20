@@ -3,6 +3,7 @@
 //! Raw actual IO metadata discovers the test's dependency slice only. All pin
 //! declarations in the execution engine are admitted with both readers/checkers
 //! before their actual metadata is registered and source is checked again.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{

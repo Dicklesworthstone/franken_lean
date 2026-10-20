@@ -162,6 +162,13 @@ fn declarations(
                 .entry(command)
                 .or_default()
                 .push(execution.declaration.clone());
+            for helper in &execution.local_functions {
+                meter.work(1)?;
+                ordered
+                    .entry(command)
+                    .or_default()
+                    .push(helper.declaration.clone());
+            }
         }
     }
     for admission in &completed.batch.source_admissions {

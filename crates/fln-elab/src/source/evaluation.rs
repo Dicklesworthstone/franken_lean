@@ -87,6 +87,7 @@ pub struct PreparedEvaluation {
     name: Name,
     context: Context,
     term: Typed,
+    safety: DefinitionSafety,
 }
 
 /// An unadmitted action whose successful result is either silent Unit or a
@@ -105,7 +106,8 @@ impl PreparedEvaluation {
         scope: &SourceScope,
     ) -> Result<Self, NatDefinitionElabError> {
         let mut context = Context::scoped(environment, budget, scope);
-        let term = if syntax.kind() == Some(&parser_kind(&["Command", "guardCmd"])) {
+        let guard = syntax.kind() == Some(&parser_kind(&["Command", "guardCmd"]));
+        let term = if guard {
             guard_term(syntax, &mut context)
         } else {
             query_term(syntax, &generated_name, &mut context, true).map(|(term, _)| term)
@@ -115,6 +117,14 @@ impl PreparedEvaluation {
             name: generated_name,
             context,
             term,
+            // BuiltinEvalCommand.addAndCompileExprForEval uses an unsafe
+            // temporary definition. #guard's evalExpr remains safe. Every
+            // candidate still passes ordinary council admission.
+            safety: if guard {
+                DefinitionSafety::Safe
+            } else {
+                DefinitionSafety::Unsafe
+            },
         })
     }
 
@@ -124,7 +134,7 @@ impl PreparedEvaluation {
 
     /// Retain the original evaluation candidate without adding a printer.
     pub fn into_raw(self) -> Declaration {
-        query_declaration(self.name, self.term, Vec::new())
+        query_declaration(self.name, self.term, Vec::new(), self.safety)
     }
 
     /// Use the pin's Init-level order: `repr value`, then
@@ -134,7 +144,12 @@ impl PreparedEvaluation {
     pub fn into_format(mut self) -> Result<Declaration, NatDefinitionElabError> {
         let result = self.format_value()?;
         self.context.check_compiled_recursors(&result)?;
-        Ok(query_declaration(self.name, result, Vec::new()))
+        Ok(query_declaration(
+            self.name,
+            result,
+            Vec::new(),
+            self.safety,
+        ))
     }
 
     /// Map the selected printer over one already resolved IO action, using its
@@ -244,6 +259,7 @@ impl PreparedEvaluation {
             self.name,
             result,
             Vec::new(),
+            self.safety,
         )))
     }
 

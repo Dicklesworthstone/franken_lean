@@ -6,6 +6,7 @@ use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::BTreeSet;
 mod group;
+mod inhabitant;
 pub use group::elaborate_group;
 #[cfg(test)]
 mod codegen_tests;
@@ -102,8 +103,18 @@ impl ElaboratedPartial {
 
 #[derive(Clone, Default)]
 pub(super) struct State {
+    /// Both forms elaborate recursion against private typed locals. Only
+    /// `partial` subsequently needs a safe inhabited logical interface.
+    pub kind: Kind,
     pub reference: Option<Reference>,
     pub group: Option<group::Group>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Kind {
+    #[default]
+    Partial,
+    Unsafe,
 }
 
 #[derive(Clone)]
@@ -127,6 +138,37 @@ pub fn is_partial(syntax: &Syntax) -> bool {
     modifiers
         .get(6)
         .is_some_and(|slot| validate_modifier(slot).is_ok())
+}
+
+/// Classify an unsafe `def` for mutual admission without dropping its syntax.
+/// This is not validation: the complete modifier/header/body checks still run.
+pub fn is_unsafe_definition(syntax: &Syntax) -> bool {
+    let Some(args) = syntax_args(syntax, &parser_kind(&["Command", "declaration"])) else {
+        return false;
+    };
+    if args.get(1).and_then(Syntax::kind) != Some(&parser_kind(&["Command", "definition"])) {
+        return false;
+    }
+    args.first()
+        .and_then(|node| syntax_args(node, &parser_kind(&["Command", "declModifiers"])))
+        .and_then(|modifiers| modifiers.get(5))
+        .is_some_and(|slot| validate_unsafe_modifier(slot).is_ok())
+}
+
+pub(super) fn validate_unsafe_modifier(slot: &Syntax) -> Result<(), NatDefinitionElabError> {
+    let [modifier] = expect_null_args(slot, "unsafe modifier")? else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    let [keyword] = expect_node(
+        modifier,
+        &parser_kind(&["Command", "unsafe"]),
+        1,
+        "unsafe modifier",
+    )?
+    else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    expect_atom(keyword, "unsafe", "unsafe modifier").map(|_| ())
 }
 
 fn syntax_args<'a>(syntax: &'a Syntax, expected: &Name) -> Option<&'a [Syntax]> {
@@ -259,32 +301,41 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let mut type_ = expected.clone().ok_or_else(|| {
-            failure(SourceInferenceError::Recursion(
-                recursion::RecursionError::ResultTypeRequired,
-            ))
-        })?;
-        for parameter in parameters.iter().rev() {
+        // A written result type supplies the whole recursive signature. Only
+        // inferred results require opening the actual leading lambda telescope;
+        // do not move lambdas through lets, applications, or effects.
+        let mut recursive_parameters = parameters.to_vec();
+        let (syntax, expected, lambdas) = if expected.is_none() {
+            self.open_recursive_lambdas(syntax, expected, &mut recursive_parameters)?
+        } else {
+            (syntax, expected, Vec::new())
+        };
+        let expected = match expected {
+            Some(expected) => expected,
+            None => {
+                // Allocate the result hole before the self local. Its scope
+                // cannot accidentally capture that private recursive reference.
+                let sort = self.type_expected()?;
+                self.hole(sort)?
+            }
+        };
+        let mut type_ = self.instantiate(&expected)?;
+        for parameter in recursive_parameters.iter().rev() {
             self.tick()?;
             type_ = type_
                 .abstract_fvar(&parameter.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
             type_ = Expr::forall_e(
                 parameter.user_name.clone(),
-                parameter.type_.clone(),
+                self.instantiate(&parameter.type_)?,
                 type_,
                 parameter.binder_info,
             );
         }
-        if !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. }) {
-            return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "a function type for recursive partial def",
-            });
-        }
         let marker = FVarId(self.fresh_name()?);
         self.txn.lctx.add_param(
             marker.clone(),
-            name.clone(),
+            Name::anonymous(),
             type_.clone(),
             BinderInfo::Default,
         );
@@ -295,11 +346,48 @@ impl Context {
             name: name.clone(),
             marker: marker.clone(),
             term: Typed {
-                value: Expr::fvar(marker),
-                type_,
+                value: Expr::fvar(marker.clone()),
+                type_: type_.clone(),
             },
         });
-        self.term(syntax, expected)
+        let body = self.term(syntax, Some(expected))?;
+        let body = self.finish_open_universes(body)?;
+        let body = self.close_recursive_lambdas(&lambdas, body)?;
+        // A failed tactic alternative can discard its recursive reference.
+        // Judge the surviving checked term, not whether a trial mentioned self.
+        if !body
+            .value
+            .abstract_fvar(&marker, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?
+            .has_loose_bvar(0)
+        {
+            self.partial
+                .as_mut()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?
+                .reference = None;
+            return Ok(body);
+        }
+        // The pin permits nonrecursive partial constants. Only a surviving
+        // recursive edge imposes this restriction on the function signature.
+        if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.kind == Kind::Partial)
+            && !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. })
+        {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a function type for recursive partial def",
+            });
+        }
+        // Closing written lambdas restores their original lexical scope. Keep
+        // the private header until ordinary declaration closure substitutes the
+        // checked executable companion and captures its section parameters.
+        if self.txn.lctx.find(&marker).is_none() {
+            self.txn
+                .lctx
+                .add_param(marker, Name::anonymous(), type_, BinderInfo::Default);
+        }
+        Ok(body)
     }
 
     pub(super) fn close_partial_reference(
@@ -320,8 +408,17 @@ impl Context {
             roots.push(self.instantiate(&parameter.type_)?);
         }
         let levels = self.declaration_levels(&roots)?;
+        let executable_name = if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.kind == Kind::Unsafe)
+        {
+            reference.name
+        } else {
+            Name::str(reference.name, "_unsafe_rec")
+        };
         let mut executable = Expr::const_(
-            Name::str(reference.name, "_unsafe_rec"),
+            executable_name,
             levels.into_iter().map(Level::param).collect(),
         );
         for capture in captures {
@@ -335,161 +432,5 @@ impl Context {
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         term.value = self.substitute(&abstracted, &executable)?;
         Ok(())
-    }
-
-    /// The logical witness is synthesized WITHOUT the recursive local. Open the
-    /// complete telescope, making every parameter an Inhabited provider as in
-    /// the pin's MkInhabitant.lean. Search Inhabited first, then Nonempty; no
-    /// axiom, arbitrary zero value, or unsafe body may fill the logical half.
-    fn partial_inhabitant(&mut self, type_: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        let mut remaining = type_.clone();
-        let mut parameters = Vec::new();
-        loop {
-            let normalized = self.whnf(&remaining)?;
-            let ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } = normalized.node()
-            else {
-                break;
-            };
-            let id = FVarId(self.fresh_name()?);
-            self.txn.lctx.add_param(
-                id.clone(),
-                binder_name.clone(),
-                binder_type.clone(),
-                *binder_info,
-            );
-            parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
-            remaining = self.substitute(body, &Expr::fvar(id))?;
-        }
-        let parameter_context = self.txn.lctx.clone();
-        for parameter in &parameters {
-            self.tick()?;
-            let type_of_type = self
-                .known_type(&parameter.type_)?
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-            let level = self.sort_level(&Typed {
-                value: parameter.type_.clone(),
-                type_: type_of_type,
-            })?;
-            let instance_type = Expr::app(
-                Expr::const_(Name::from_components(["Inhabited"]), vec![level.clone()]),
-                parameter.type_.clone(),
-            );
-            let instance_value = Expr::app(
-                Expr::app(
-                    Expr::const_(Name::from_components(["Inhabited", "mk"]), vec![level]),
-                    parameter.type_.clone(),
-                ),
-                Expr::fvar(parameter.id.clone()),
-            );
-            let id = FVarId(self.fresh_name()?);
-            self.txn
-                .lctx
-                .add_let(id.clone(), id.0.clone(), instance_type, instance_value);
-        }
-        let mut value = None;
-        'strategies: for components in [&["default"][..], &["Classical", "ofNonempty"][..]] {
-            if !self
-                .txn
-                .env
-                .contains(&Name::from_components(components.iter().copied()))
-            {
-                continue;
-            }
-            let syntax = Syntax::Ident {
-                info: fln_syntax::source::SourceInfo::None,
-                raw_val: fln_syntax::source::ByteSpan::default(),
-                // These are elaborator support constants, not user syntax.
-                // Namespace/local declarations named `default` must not change
-                // which inhabitant-synthesis operation is attempted.
-                val: Name::from_components(
-                    std::iter::once("_root_").chain(components.iter().copied()),
-                ),
-                preresolved: Vec::new(),
-            };
-            // Instance search uses `instances` transparency. A semireducible
-            // return-type alias may hide an otherwise available witness. Try
-            // every alias before unfolding it, including intermediate aliases
-            // with their own instances; full whnf would skip those providers.
-            // Exhaust this Inhabited path before trying Nonempty at the original
-            // result type (the pin's MkInhabitantForAux? strategy order).
-            let mut target = remaining.clone();
-            loop {
-                self.tick()?;
-                let snapshot = self.clone();
-                let attempt = self
-                    .term(&syntax, Some(target.clone()))
-                    .and_then(|term| self.finish(term));
-                match attempt {
-                    Ok(term) => {
-                        value = Some(term.value);
-                        break 'strategies;
-                    }
-                    Err(error)
-                        if instances::nonmatch(&error)
-                            || matches!(
-                                error,
-                                NatDefinitionElabError::Inference(
-                                    SourceInferenceError::InstanceSynthesisRequired
-                                        | SourceInferenceError::UnresolvedHoles { .. }
-                                )
-                            ) =>
-                    {
-                        let spent = self.txn.budget.heartbeats_consumed;
-                        *self = snapshot;
-                        self.txn.budget.heartbeats_consumed = spent;
-                    }
-                    Err(error) => return Err(error),
-                }
-                let reduced =
-                    self.whnf_with_transparency(&target, UnificationTransparency::None, true)?;
-                let Some(unfolded) = self.unfold_head_definition(&reduced)? else {
-                    break;
-                };
-                target = unfolded;
-            }
-        }
-        let mut value = value.ok_or(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "an inhabited result type for partial def",
-        })?;
-        // Close every synthetic provider as a let; unused providers are harmless
-        // but still checked, and cannot leave their private free IDs in the value.
-        let providers = self.txn.lctx.decls()[parameter_context.decls().len()..].to_vec();
-        for provider in providers.into_iter().rev() {
-            self.tick()?;
-            value = value
-                .abstract_fvar(&provider.id, 0)
-                .map_err(|_| failure(SourceInferenceError::Scope))?;
-            value = Expr::let_e(
-                provider.user_name,
-                self.instantiate(&provider.type_)?,
-                self.instantiate(
-                    provider
-                        .value
-                        .as_ref()
-                        .ok_or_else(|| failure(SourceInferenceError::Scope))?,
-                )?,
-                value,
-                false,
-            );
-        }
-        for parameter in parameters.into_iter().rev() {
-            self.tick()?;
-            value = value
-                .abstract_fvar(&parameter.id, 0)
-                .map_err(|_| failure(SourceInferenceError::Scope))?;
-            value = Expr::lam(
-                parameter.user_name,
-                self.instantiate(&parameter.type_)?,
-                value,
-                parameter.binder_info,
-            );
-        }
-        self.require_resolved(&[value.clone()])?;
-        Ok(value)
     }
 }

@@ -287,7 +287,7 @@ impl Context {
                 }));
             }
         }
-        self.substitute_proof_goal_preserving_names(proof, goal, name, false, None)
+        self.substitute_proof_goal_preserving_names(proof, goal, name, false)
     }
 
     pub(super) fn substitute_proof_goal_preserving_names(
@@ -296,7 +296,6 @@ impl Context {
         mut goal: ProofGoal,
         name: &Name,
         aliases: bool,
-        tactic_major: Option<&FVarId>,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
@@ -308,14 +307,7 @@ impl Context {
             .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
         let type_ = self.whnf(&selected.type_)?;
         if heterogeneous_target(&type_).is_none() {
-            return self.substitute_homogeneous_proof_goal(
-                proof,
-                goal,
-                name,
-                None,
-                aliases,
-                tactic_major,
-            );
+            return self.substitute_homogeneous_proof_goal(proof, goal, name, None, aliases);
         }
         // At most two dependent transports: first identify local endpoint
         // types, then identify their values. Arbitrary equations between type
@@ -394,7 +386,6 @@ impl Context {
                 &derived_name,
                 same_type.then_some(&selected.id),
                 aliases,
-                tactic_major,
             )?;
             if same_type {
                 return Ok(());
@@ -414,7 +405,6 @@ impl Context {
         name: &Name,
         hide: Option<&FVarId>,
         aliases: bool,
-        tactic_major: Option<&FVarId>,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
@@ -526,17 +516,16 @@ impl Context {
         let target = self.specialize_locals(&generalized, &replacements)?;
         self.txn.lctx = retained;
         let (hole, mut child) = self.proof_goal(target)?;
-        child.tag = goal.tag.clone();
         for local in &reverted {
-            let name = if local.id == witness.id || hide == Some(&local.id) {
-                Name::anonymous()
-            } else if aliases
-                && goal
-                    .lctx
-                    .find_by_user_name(&local.user_name)
-                    .is_some_and(|active| active.id != local.id)
+            let name = if local.id == witness.id
+                || hide == Some(&local.id)
+                || (aliases
+                    && goal
+                        .lctx
+                        .find_by_user_name(&local.user_name)
+                        .is_some_and(|active| active.id != local.id))
             {
-                self.fresh_inaccessible(&local.user_name)?
+                Name::anonymous()
             } else {
                 local.user_name.clone()
             };
@@ -560,7 +549,7 @@ impl Context {
             replacements.push((local.id.clone(), Expr::fvar(id)));
         }
         child.target = self.specialize_locals(&goal.target, &replacements)?;
-        if aliases && tactic_major != Some(&variable) {
+        if aliases {
             let old = goal
                 .lctx
                 .find(&variable)

@@ -6,6 +6,9 @@
 
 pub mod parameters;
 
+#[cfg(test)]
+mod simplification_tests;
+
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::level::{LMVarId, Level, LevelTooDeep, LevelView};
 use std::collections::{HashMap, HashSet};
@@ -23,69 +26,200 @@ pub enum UniverseInstantiationError {
 }
 
 /// `(base, k)` with `level = succ^k base` and `base` not a successor.
-fn level_offset(level: &Level) -> (&Level, u32) {
+/// Inspecting an assigned, otherwise skipped successor chain spends the same
+/// request budget as instantiating it would; there is no unmetered peel loop.
+fn level_offset<'a>(
+    level: &'a Level,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(&'a Level, u32), UniverseInstantiationError> {
     let mut base = level;
     let mut offset = 0u32;
-    while let LevelView::Succ(inner) = base.view() {
-        base = inner;
-        offset = offset.saturating_add(1);
+    loop {
+        visit(remaining, limit)?;
+        match base.view() {
+            LevelView::Succ(inner) => {
+                base = inner;
+                offset = offset.saturating_add(1);
+            }
+            _ => return Ok((base, offset)),
+        }
     }
-    (base, offset)
+}
+
+/// Cheap identity through the public borrowed view. A clone of a compound
+/// level returns the very same child references; leaves expose their stored
+/// name/id by reference. No structural walk or allocation is needed here.
+fn shared_level_root(left: &Level, right: &Level) -> bool {
+    if std::ptr::eq(left, right) {
+        return true;
+    }
+    match (left.view(), right.view()) {
+        (LevelView::Zero, LevelView::Zero) => true,
+        (LevelView::Succ(a), LevelView::Succ(b)) => std::ptr::eq(a, b),
+        (LevelView::Max(a1, a2), LevelView::Max(b1, b2))
+        | (LevelView::IMax(a1, a2), LevelView::IMax(b1, b2)) => {
+            std::ptr::eq(a1, b1) && std::ptr::eq(a2, b2)
+        }
+        (LevelView::Param(a), LevelView::Param(b)) => std::ptr::eq(a, b),
+        (LevelView::MVar(a), LevelView::MVar(b)) => std::ptr::eq(a, b),
+        _ => false,
+    }
+}
+
+/// Structural equality for smart-constructor decisions, not definitional
+/// equality or normalization. Core's `Level::eq` is DAG-aware and stack-safe,
+/// but it has no caller budget. Invoking it on skipped, mvar-free assignments
+/// here would let their entire graphs be compared outside the request limit.
+///
+/// Only allocation PAIRS are memoized, never hashes or one side alone. The
+/// immutable roots pin both graphs throughout this call. Child-reference
+/// identity preserves constant-time comparison of cloned compound levels
+/// without exposing the core's private `Arc` representation.
+fn equal_levels(
+    left: &Level,
+    right: &Level,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<bool, UniverseInstantiationError> {
+    // The overwhelmingly common unchanged/obviously different cases must
+    // not allocate a worklist or memo table just to charge a single pair.
+    if left.data() != right.data() {
+        visit(remaining, limit)?;
+        return Ok(false);
+    }
+    if shared_level_root(left, right) {
+        visit(remaining, limit)?;
+        return Ok(true);
+    }
+    let mut visited = HashSet::new();
+    let mut pending = vec![(left, right)];
+    while let Some((left, right)) = pending.pop() {
+        let pair = (std::ptr::from_ref(left), std::ptr::from_ref(right));
+        if visited.contains(&pair) {
+            continue;
+        }
+        visit(remaining, limit)?;
+        visited.insert(pair);
+        if left.data() != right.data() {
+            return Ok(false);
+        }
+        if std::ptr::eq(left, right) {
+            continue;
+        }
+        match (left.view(), right.view()) {
+            (LevelView::Zero, LevelView::Zero) => {}
+            (LevelView::Succ(a), LevelView::Succ(b)) => {
+                if !std::ptr::eq(a, b) {
+                    pending.push((a, b));
+                }
+            }
+            (LevelView::Max(a1, a2), LevelView::Max(b1, b2))
+            | (LevelView::IMax(a1, a2), LevelView::IMax(b1, b2)) => {
+                if !std::ptr::eq(a2, b2) {
+                    pending.push((a2, b2));
+                }
+                if !std::ptr::eq(a1, b1) {
+                    pending.push((a1, b1));
+                }
+            }
+            (LevelView::Param(a), LevelView::Param(b)) if a == b => {}
+            (LevelView::MVar(a), LevelView::MVar(b)) if a == b => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 fn is_zero_level(level: &Level) -> bool {
     matches!(level.view(), LevelView::Zero)
 }
 
-/// The pin's `is_not_zero` (kernel/level.cpp).
-fn is_never_zero(level: &Level) -> bool {
-    match level.view() {
-        LevelView::Succ(_) => true,
-        LevelView::Max(left, right) => is_never_zero(left) || is_never_zero(right),
-        LevelView::IMax(_, right) => is_never_zero(right),
-        LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => false,
+/// The pin's `is_not_zero` (kernel/level.cpp), under the caller's work budget.
+///
+/// A mvar-free branch was deliberately not expanded by instantiation. Looking
+/// inside it here must not bypass that operation's resource limit or turn its
+/// shared DAG into a recursive, exponentially large tree walk. The borrowed
+/// root pins every address until this call returns; no memo key escapes it.
+fn is_never_zero(
+    level: &Level,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<bool, UniverseInstantiationError> {
+    let mut visited = HashSet::new();
+    let mut pending = vec![level];
+    while let Some(current) = pending.pop() {
+        let key = std::ptr::from_ref(current);
+        if visited.contains(&key) {
+            continue;
+        }
+        visit(remaining, limit)?;
+        visited.insert(key);
+        match current.view() {
+            LevelView::Succ(_) => return Ok(true),
+            LevelView::Max(left, right) => {
+                // Match the pin's left-to-right short circuit.
+                pending.push(right);
+                pending.push(left);
+            }
+            LevelView::IMax(_, right) => pending.push(right),
+            LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => {}
+        }
     }
+    Ok(false)
 }
 
 /// The pin's `mk_max` (kernel/level.cpp:81): cheap simplifications only.
-fn pin_mk_max(l1: Level, l2: Level) -> Result<Level, UniverseInstantiationError> {
-    let (base1, k1) = level_offset(&l1);
-    let (base2, k2) = level_offset(&l2);
+fn pin_mk_max(
+    l1: Level,
+    l2: Level,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<Level, UniverseInstantiationError> {
+    let (base1, k1) = level_offset(&l1, remaining, limit)?;
+    let (base2, k2) = level_offset(&l2, remaining, limit)?;
     if is_zero_level(base1) && is_zero_level(base2) {
         return Ok(if k1 >= k2 { l1 } else { l2 });
     }
-    if l1 == l2 || is_zero_level(&l2) {
+    if equal_levels(&l1, &l2, remaining, limit)? || is_zero_level(&l2) {
         return Ok(l1);
     }
     if is_zero_level(&l1) {
         return Ok(l2);
     }
     if let LevelView::Max(left, right) = l2.view()
-        && (left == &l1 || right == &l1)
+        && (equal_levels(left, &l1, remaining, limit)?
+            || equal_levels(right, &l1, remaining, limit)?)
     {
         return Ok(l2);
     }
     if let LevelView::Max(left, right) = l1.view()
-        && (left == &l2 || right == &l2)
+        && (equal_levels(left, &l2, remaining, limit)?
+            || equal_levels(right, &l2, remaining, limit)?)
     {
         return Ok(l1);
     }
-    if base1 == base2 {
+    if equal_levels(base1, base2, remaining, limit)? {
         return Ok(if k1 > k2 { l1 } else { l2 });
     }
     Ok(Level::max(l1, l2)?)
 }
 
 /// The pin's `mk_imax` (kernel/level.cpp:112).
-fn pin_mk_imax(l1: Level, l2: Level) -> Result<Level, UniverseInstantiationError> {
-    if is_never_zero(&l2) {
-        return pin_mk_max(l1, l2);
+fn pin_mk_imax(
+    l1: Level,
+    l2: Level,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<Level, UniverseInstantiationError> {
+    if is_never_zero(&l2, remaining, limit)? {
+        return pin_mk_max(l1, l2, remaining, limit);
     }
     let one = matches!(l1.view(), LevelView::Succ(inner) if is_zero_level(inner));
     if is_zero_level(&l2) || is_zero_level(&l1) || one {
         return Ok(l2);
     }
-    if l1 == l2 {
+    if equal_levels(&l1, &l2, remaining, limit)? {
         return Ok(l1);
     }
     Ok(Level::imax(l1, l2)?)
@@ -168,8 +302,14 @@ impl UniverseStore {
         self.instantiate_with_limit(level, DEFAULT_UNIVERSE_VISIT_LIMIT)
     }
 
-    /// Expand the reachable graph under an explicit node budget. Cycles and
-    /// exhaustion are different errors; neither changes any stored assignment.
+    /// Expand the reachable graph under an explicit work budget. It covers
+    /// instantiation visits and smart-constructor inspections: successor peeling,
+    /// nonzero queries, and structural comparison pairs. These can inspect
+    /// mvar-free branches that instantiation itself skips. Each helper charges
+    /// its own work, including repeated inspections across helper calls.
+    ///
+    /// Cycles and exhaustion are different errors; neither changes any stored
+    /// assignment. Cheap returns for an empty store or mvar-free root remain free.
     pub fn instantiate_with_limit(
         &self,
         level: &Level,
@@ -242,12 +382,14 @@ impl UniverseStore {
                 // with `update_max` (kernel/level.cpp:293), which simplifies.
                 LevelView::Max(left, right) | LevelView::IMax(left, right) => {
                     let (new_left, new_right) = (child(left), child(right));
-                    if &new_left == left && &new_right == right {
+                    if equal_levels(&new_left, left, remaining, limit)?
+                        && equal_levels(&new_right, right, remaining, limit)?
+                    {
                         current.clone()
                     } else if matches!(current.view(), LevelView::Max(..)) {
-                        pin_mk_max(new_left, new_right)?
+                        pin_mk_max(new_left, new_right, remaining, limit)?
                     } else {
-                        pin_mk_imax(new_left, new_right)?
+                        pin_mk_imax(new_left, new_right, remaining, limit)?
                     }
                 }
                 LevelView::Zero | LevelView::Param(_) => current.clone(),
@@ -267,7 +409,8 @@ impl UniverseStore {
         self.instantiate_expr_with_limit(expr, DEFAULT_UNIVERSE_VISIT_LIMIT)
     }
 
-    /// The budget covers both expression nodes and reachable level nodes.
+    /// The shared budget covers expression and level visits, including the
+    /// level smart-constructor work described by [`Self::instantiate_with_limit`].
     /// Memo keys are request-local allocation identities, never semantic or
     /// serialized identities. The borrowed input and store pin all key owners.
     #[allow(clippy::too_many_lines)]

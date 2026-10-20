@@ -189,4 +189,79 @@ impl Preparation<'_> {
         }
         Ok(Some(body))
     }
+
+    /// A `casesOn` auxiliary or a match auxiliary is inlined at its call site, as the pin's
+    /// compiler does (`toLCNF` turns `casesOn` into `cases` and inlines matchers), so each
+    /// alternative stays a branch of the underlying recursor, evaluated only when selected.
+    /// Called as an ordinary function, every alternative was evaluated before one was chosen:
+    /// `Option.get!`'s matcher passes `h_2 Unit.unit`, so its panic printed on every call
+    /// (fln-panic-contract-seed-regression-q8iy). Inlining is delta reduction of a checked,
+    /// safe, non-recursive definition. `Decidable.casesOn` keeps its decision path.
+    pub(super) fn lazy_eliminator(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const {
+            name: callee,
+            levels,
+        } = head.node()
+        else {
+            return Ok(None);
+        };
+        let fln_core::name::LeafView::Str(leaf) = callee.leaf_view() else {
+            return Ok(None);
+        };
+        let cases_on = leaf == "casesOn";
+        let matcher = leaf
+            .strip_prefix("match_")
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
+        if !cases_on && !matcher || callee == &name("Decidable.casesOn") {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Defn(definition)) = self.environment.find(callee).cloned() else {
+            return Ok(None);
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params.len() != levels.len()
+        {
+            return Ok(None);
+        }
+        self.tick()?;
+        let eligible = if cases_on {
+            fln_elab::aux_recursors::AuxRecursors::read(self.environment)
+                .map_err(|_| unsupported("auxiliary recursor journal"))?
+                .contains(callee)
+        } else {
+            fln_elab::reducibility::table(self.environment)
+                .map_err(|_| unsupported("matcher reducibility"))?
+                .get(callee)
+                .is_some_and(|status| {
+                    matches!(
+                        status,
+                        fln_elab::reducibility::Reducibility::Reducible
+                            | fln_elab::reducibility::Reducibility::ImplicitReducible
+                    )
+                })
+        };
+        if !eligible {
+            return Ok(None);
+        }
+        let mut body =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        let mut rest = arguments.iter();
+        for argument in rest.by_ref() {
+            self.tick()?;
+            let ExprNode::Lam { body: next, .. } = body.node() else {
+                body = Expr::app(body, argument.clone());
+                break;
+            };
+            body = self.substitution(next, argument)?;
+        }
+        for argument in rest {
+            self.tick()?;
+            body = Expr::app(body, argument.clone());
+        }
+        Ok(Some(body))
+    }
 }
