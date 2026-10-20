@@ -1,0 +1,99 @@
+name: Native panic notation
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-panic-notation.yml'
+      - 'crates/fln-elab/src/source/**'
+      - 'crates/fln-elab/src/source.rs'
+      - 'crates/fln-parse/**'
+      - 'crates/fln/src/**'
+      - 'crates/fln/tests/source_panic_notation.rs'
+      - 'rust-toolchain.toml'
+      - 'SUITE.lock'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-panic:
+    if: github.repository == 'Dicklesworthstone/franken_lean'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      LEAN_BACKTRACE: '0'
+      FLN_REQUIRE_REFERENCE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 75dce78c6c3409083b9bfd1ddb707314fc7444b4
+          persist-credentials: false
+      - name: Reconstruct the exact locally tested candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, lzma, os, pathlib, subprocess, urllib.request
+          assert subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip() == '2ddf45fd22c540b9f7049b4c86471ccccdf88de5'
+          sha = 'fc0f9ad629a08079d4775bfc13498b1fc9f17741'
+          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              raw = base64.b64decode(json.load(response)['content'])
+          assert len(raw) == 12268
+          assert hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == sha
+          decoder = lzma.LZMADecompressor(memlimit=128 * 1024 * 1024)
+          patch = decoder.decompress(raw, max_length=51056)
+          assert decoder.eof and not decoder.unused_data and len(patch) == 51055
+          assert hashlib.sha256(patch).hexdigest() == 'c6c8f169e1da0af97c10fbd8a958c3e3ad5221528eda0a7c35f847f2c42be240'
+          path = pathlib.Path(os.environ['RUNNER_TEMP'], 'panic-candidate.patch')
+          path.write_bytes(patch)
+          subprocess.run(['git','apply','--check',str(path)], check=True)
+          subprocess.run(['git','apply','--index',str(path)], check=True)
+          tree = subprocess.check_output(['git','write-tree'], text=True).strip()
+          assert tree == 'c1771f14c7688e378d4aa2d622f9d7ce7102a9a9', tree
+          subprocess.run(['git','diff','--cached','--check'], check=True)
+          print('PANIC_CANDIDATE_TREE ' + tree, flush=True)
+      - name: Install the exact pinned test toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustc -Vv
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Check syntax, original source sites and real native execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p fln-parse --test panic_notation
+          cargo test --locked --offline -p fln-elab --lib source::scope::site
+          cargo test --locked --offline -p fln --test source_panic_notation -- --test-threads=1
+          cargo check --locked --offline --workspace --all-targets
+          cargo clippy --locked --offline -p fln-parse -p fln-elab -p fln --all-targets -- -D warnings
+      - name: Preserve checked candidate blobs without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          paths = subprocess.check_output(['git','diff','--cached','--name-only','-z']).decode().strip('\0').split('\0')
+          assert len(paths) == 15, paths
+          rows = {}
+          for path in paths:
+              raw = pathlib.Path(path).read_bytes()
+              assert len(raw) < 2000000
+              sha = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=json.dumps({'encoding':'base64','content':base64.b64encode(raw).decode()}).encode(), headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type':'application/json','Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  assert json.load(response)['sha'] == sha
+              rows[path] = sha
+          print('PANIC_VERIFIED_BLOBS ' + json.dumps(rows, sort_keys=True), flush=True)
+          print('NO_BRANCH_CHANGED: expected-head publication is separate', flush=True)
