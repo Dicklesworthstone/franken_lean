@@ -81,6 +81,8 @@ pub struct SourceMetadataReport {
     pub aux_recursors: usize,
     /// Compilation restrictions owned by this module, including partial companions.
     pub noncomputable: usize,
+    /// `@[defeq]` tags (the pin's `Lean.defeqAttr`), which select `dsimp`'s rfl lemmas.
+    pub defeq: usize,
     /// Original structure fields and direct-parent metadata, validated against
     /// this module's checked constructor and projection interfaces.
     pub structures: usize,
@@ -337,6 +339,7 @@ impl Engine {
                 metadata::structure_extension_name(),
                 Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
                 Name::from_components(metadata::SIMP_EXTENSION.split('.')),
+                Name::from_components(metadata::DEFEQ_EXTENSION.split('.')),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -349,6 +352,7 @@ impl Engine {
         let mut reports = Vec::new();
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
+        let mut defeq_payloads = HashSet::new();
         // Each module's capture reads only its own parts, so the walks run
         // `limits.read_jobs` at once; the cumulative byte allowance is charged below
         // in replay order, exactly as when one walk followed another.
@@ -370,6 +374,7 @@ impl Engine {
                 protected: 0,
                 aux_recursors: 0,
                 noncomputable: 0,
+                defeq: 0,
                 structures: 0,
                 reducibility: 0,
                 externs: 0,
@@ -396,24 +401,33 @@ impl Engine {
                         .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
                 }
                 if let Some(kind) = selected.iter().position(|name| name == &block.name) {
+                    let mut entries = block.entries;
+                    if kind == 14 {
+                        // An equation theorem realized in several modules carries its
+                        // `@[defeq]` tag in each (`Nat.lt_wfRel.eq_1` in five of `Init`'s);
+                        // the first module's tag stands for the others. The decoder still
+                        // refuses a repeat within the stream it is given.
+                        entries.retain(|payload| defeq_payloads.insert(payload.clone()));
+                    }
                     entries_left = entries_left
-                        .checked_sub(block.entries.len())
+                        .checked_sub(entries.len())
                         .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
                     match kind {
-                        0 => report.classes = block.entries.len(),
-                        1 => report.instances = block.entries.len(),
-                        2 => report.defaults = block.entries.len(),
-                        3 => report.aliases = block.entries.len(),
-                        4 => report.protected = block.entries.len(),
-                        5 => report.reducibility = block.entries.len(),
-                        6 => report.externs = block.entries.len(),
-                        7 => report.implemented_by = block.entries.len(),
-                        8 => report.aux_recursors = block.entries.len(),
-                        9 => report.regular_initializers = block.entries.len(),
-                        10 => report.builtin_initializers = block.entries.len(),
-                        11 => report.structures = block.entries.len(),
-                        12 => report.noncomputable = block.entries.len(),
-                        13 => report.simps = block.entries.len(),
+                        0 => report.classes = entries.len(),
+                        1 => report.instances = entries.len(),
+                        2 => report.defaults = entries.len(),
+                        3 => report.aliases = entries.len(),
+                        4 => report.protected = entries.len(),
+                        5 => report.reducibility = entries.len(),
+                        6 => report.externs = entries.len(),
+                        7 => report.implemented_by = entries.len(),
+                        8 => report.aux_recursors = entries.len(),
+                        9 => report.regular_initializers = entries.len(),
+                        10 => report.builtin_initializers = entries.len(),
+                        11 => report.structures = entries.len(),
+                        12 => report.noncomputable = entries.len(),
+                        13 => report.simps = entries.len(),
+                        14 => report.defeq = entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -422,7 +436,7 @@ impl Engine {
                     }
                     // Move payloads, not copies. Decoding once gives all modules
                     // one cumulative byte/object/index allowance.
-                    blocks[kind].entries.extend(block.entries);
+                    blocks[kind].entries.extend(entries);
                 } else if !block.entries.is_empty() {
                     report.uninterpreted.push(block.name);
                 }
@@ -448,6 +462,7 @@ impl Engine {
         let mut protected = decoded.protected.into_iter();
         let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
+        let mut defeq = decoded.defeq.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
@@ -662,6 +677,28 @@ impl Engine {
                         .map_err(|error| noncomputable_error(&report.module, error))?;
                 }
             }
+            if report.defeq != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.defeq,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.defeq {
+                    cancelled!("source-olean/defeq");
+                    let declaration = defeq.next().ok_or(SourceOleanImportError::Internal(
+                        "defeq count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation.register_defeq(&declaration).map_err(|_| {
+                        SourceOleanImportError::Metadata {
+                            module: report.module.clone(),
+                            declaration: declaration.clone(),
+                            reason: "defeq tag cannot be recorded",
+                        }
+                    })?;
+                }
+            }
             for _ in 0..report.reducibility {
                 cancelled!("source-olean/reducibility");
                 let row = reducibility.next().ok_or(SourceOleanImportError::Internal(
@@ -818,6 +855,7 @@ impl Engine {
             || protected.next().is_some()
             || aux_recursors.next().is_some()
             || noncomputable.next().is_some()
+            || defeq.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
@@ -966,6 +1004,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError>;
+    fn register_defeq(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError>;
     fn register_reducibility(
         self,
         declaration: &Name,
@@ -1040,6 +1082,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
         self.register_noncomputable(declaration)
+    }
+    fn register_defeq(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
+        self.register_defeq(declaration)
     }
     fn register_reducibility(
         self,
@@ -1564,6 +1612,52 @@ pub(super) mod tests {
         });
     }
 
+    /// The pin's `@[defeq]` tags (`Lean.defeqAttr`) are activated with each module's
+    /// other metadata, so `dsimp` reads an imported rfl lemma as reflexive. None was
+    /// imported before: `dsimp` on `P (id x)` made no progress, where the pinned lean
+    /// (`prelude`, `import Init.Tactics`) rewrites it with `id_eq` and accepts the proof.
+    #[test]
+    fn imported_defeq_tags_make_dsimp_use_imported_rfl_lemmas() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        let roots = ["Init.Tactics"];
+        let closure = closure(&lib, &roots);
+        let inputs = inputs(&closure);
+        let roots: Vec<Name> = roots.iter().map(|root| n(root)).collect();
+        on_import_stack(|| {
+            let imported = import(&inputs, &roots, limits(1))
+                .expect("the pinned closure imports")
+                .into_complete()
+                .expect("the pinned closure imports completely");
+            let prelude = imported
+                .modules
+                .iter()
+                .find(|report| report.module == n("Init.Prelude"))
+                .expect("the closure contains Init.Prelude");
+            assert!(prelude.defeq > 0, "Init.Prelude carries defeq tags");
+            let main = n("Main");
+            let source = b"prelude\nimport Init.Tactics\ntheorem viaIdEq (x : Nat) (P : Nat \xe2\x86\x92 Prop) (h : P x) : P (id x) := by\n  dsimp\n  exact h\n";
+            imported
+                .check_source_modules(
+                    &[SourceModuleInput {
+                        name: &main,
+                        source,
+                    }],
+                    &main,
+                    &KVMap::new(),
+                    super::super::SourceModuleCheckLimits::new(SourceCheckLimits::new(
+                        EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+                    )),
+                    None,
+                )
+                .expect("dsimp rewrites `id x` with the imported rfl lemma")
+                .into_complete()
+                .expect("source checks completely");
+        });
+    }
+
     #[test]
     fn pinned_opaque_identity_runs_after_complete_private_metadata() {
         let Some(lib) = pinned_lib() else {
@@ -1673,6 +1767,13 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
             fln_elab::noncomputable::register(&self.0, declaration).map(Sequential)
+        }
+        fn register_defeq(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
+            fln_elab::source::scope::simp::defeq::register_imported(&self.0, declaration)
+                .map(Sequential)
         }
         fn register_reducibility(
             self,

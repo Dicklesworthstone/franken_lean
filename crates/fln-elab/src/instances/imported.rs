@@ -611,6 +611,17 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record an imported `@[defeq]` tag
+    /// ([`crate::source::scope::simp::defeq::register_imported`]). The tag journal is
+    /// not one this activation keeps or reads.
+    pub fn register_defeq(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::NatDefinitionElabError> {
+        self.env = crate::source::scope::simp::defeq::register_imported(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Record one imported reducibility status in the environment being
     /// activated ([`crate::reducibility::register`]). The reducibility journal is
     /// not one this activation keeps or reads, so the kept class and instance

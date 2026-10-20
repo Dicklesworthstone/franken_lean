@@ -14,7 +14,8 @@ use fln_env::extensions::{
 use std::collections::BTreeSet;
 
 const MAGIC: &[u8] = b"FLNDSIMP\x01";
-const MAX_ROWS: usize = 4096;
+// The pinned `Init` alone tags 1,559 theorems; `Std` and `Lean` add more.
+const MAX_ROWS: usize = 1 << 16;
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
 
 fn descriptor() -> ExtensionDescriptor {
@@ -116,6 +117,38 @@ pub(in crate::source) fn read(
         }
     }
     Ok(names)
+}
+
+/// Record an imported module's `Lean.defeqAttr` tag (the pin's `@[defeq]`, which its
+/// `dsimp` reads through `isRflTheorem`). Like the imported simp attribute it is the
+/// pin's own metadata, and like every tag it selects candidates only: `dsimp` still
+/// checks each replacement by conversion. A name the import exposes only as an
+/// interface, not a theorem, keeps no tag. Without these, under the real `Init` no
+/// imported rfl lemma (`id_eq`, `Nat.add_zero`, …) was ever reflexive to `dsimp`.
+pub fn register_imported(
+    environment: &Environment,
+    name: &Name,
+) -> Result<Environment, NatDefinitionElabError> {
+    if !matches!(environment.find(name), Some(ConstantInfo::Thm(_))) {
+        return Ok(environment.clone());
+    }
+    let mut payload = MAGIC.to_vec();
+    crate::instances::write_name(name, &mut payload).map_err(codec)?;
+    if payload.len() > MAX_ENTRY_BYTES {
+        return Err(limit());
+    }
+    let descriptor = descriptor();
+    let environment = match environment.extension(&descriptor.name) {
+        None => environment
+            .register_extension(descriptor.clone())
+            .map_err(|_| malformed())?,
+        Some(state) if state.descriptor != descriptor => return Err(malformed()),
+        Some(state) if state.len() >= MAX_ROWS => return Err(limit()),
+        Some(_) => environment.clone(),
+    };
+    environment
+        .push_extension_entry(&descriptor.name, payload)
+        .map_err(|_| malformed())
 }
 
 /// Called only on the successor of checked source theorem admission. No
