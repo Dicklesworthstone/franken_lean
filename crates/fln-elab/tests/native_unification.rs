@@ -1200,6 +1200,31 @@ fn symbolic_nat_offsets_do_not_identify_different_bases_or_invalid_heads() {
     assert_semantics_unchanged(&impostor, &before);
 }
 
+/// `x + k` with `k > 0` is never `x`. Where delta would open `Nat.add` with a literal
+/// second argument, the pin's smart-unfolding step stands for it
+/// (`n + (k + 1) = (n + k).succ`), not the compiled course-of-values body the seed
+/// models, as the pinned library does. Through that body each refutation cost 5,647 to
+/// 10,739 heartbeats; with the step, at most 176.
+#[test]
+fn literal_nat_offsets_refute_their_own_base_without_the_compiled_body() {
+    let mut base = arithmetic_transaction();
+    let x = local(&mut base, "literalStepBase", nat());
+    for k in [1, 3] {
+        let offset = nat_operation("add", &[x.clone(), numeral(k)]);
+        for (left, right) in [(&offset, &x), (&x, &offset)] {
+            let mut txn = base.clone();
+            let before = txn.budget.heartbeats_consumed;
+            assert!(matches!(
+                txn.unify(left, right, default_budget()),
+                Err(UnificationError::Deferred(_))
+            ));
+            let spent = txn.budget.heartbeats_consumed - before;
+            assert!(spent < 1_000, "k={k}: {spent} heartbeats");
+            assert_semantics_unchanged(&txn, &base);
+        }
+    }
+}
+
 #[test]
 fn symbolic_nat_offsets_stay_compact_and_use_bounded_iteration() {
     let mut txn = arithmetic_transaction();

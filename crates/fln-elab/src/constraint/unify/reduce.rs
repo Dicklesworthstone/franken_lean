@@ -205,6 +205,12 @@ impl Engine<'_> {
                             {
                                 let value = definition.value.clone();
                                 let parameters = definition.base.level_params.clone();
+                                // Unfolding `Nat.add` or `Nat.sub` takes its smart-unfolding step instead.
+                                if let Some(step) = self.nat_literal_step(&head, &args, locals)? {
+                                    head = step;
+                                    args = Vec::new();
+                                    continue;
+                                }
                                 self.scan(&value)?;
                                 head = crate::universe::parameters::instantiate(
                                     || self.meter.node(),

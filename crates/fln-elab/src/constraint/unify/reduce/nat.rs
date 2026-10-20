@@ -172,6 +172,16 @@ impl Engine<'_> {
         ) {
             return Ok(None);
         }
+        self.nat_operation_signature(head, arity)
+    }
+
+    /// Whether `head` is the admitted Nat operation of this name and arity, at any
+    /// transparency.
+    fn nat_operation_signature(
+        &mut self,
+        head: &Expr,
+        arity: usize,
+    ) -> Result<Option<NatOperation>, UnificationError> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
@@ -362,6 +372,26 @@ impl Engine<'_> {
         if !lhs.found && !rhs.found {
             return Ok(None);
         }
+        // `x + k` with `k > 0` is never `x` itself: no natural number is its own
+        // successor, and definitional equality implies equality. The pin refutes it
+        // by unfolding `Nat.add` (smart unfolding) to `Nat.succ _` against `x`; delta
+        // here reaches `Nat.add`'s compiled recursor body instead, which cost a simp
+        // trial matching `?n < ?n` against `acc + 1 < acc` some 18,000 steps.
+        if lhs.found != rhs.found {
+            let (offset, other) = if lhs.found {
+                (&lhs, &rhs)
+            } else {
+                (&rhs, &lhs)
+            };
+            if !BigNatView::from_limbs_le(offset.value.limbs_le()).is_zero()
+                && !other.literal
+                && same_terms(&offset.base, &other.base, &mut self.meter)?
+            {
+                return Err(UnificationError::Deferred(
+                    UnificationDeferred::UnsupportedEquation,
+                ));
+            }
+        }
         // The pin cancels against another offset or a literal. A positive
         // one-sided offset against a bare symbolic term gives no new equation.
         // In particular, rewriting n = succ n to n = n+1 would cycle with delta
@@ -409,6 +439,58 @@ impl Engine<'_> {
         } else {
             Ok(Some((new_left, new_right)))
         }
+    }
+
+    /// The pin's smart unfolding of `Nat.add` and `Nat.sub`, which recurse on their second
+    /// argument (`_sunfold`): with a literal second argument `k`, `n + 0` and `n - 0` are
+    /// `n`, `n + (k + 1)` is `(n + k).succ` and `n - (k + 1)` is `(n - k).pred`, the
+    /// recursive call left folded. Called only where delta is about to unfold the
+    /// operation, at whatever transparency permits that (both are `implicit_reducible` at
+    /// the pin). Delta reached the compiled recursor body instead, leaving `Nat.succ` over
+    /// recursor residue where the offset rules no longer see `n`: refuting
+    /// `acc + 1 =?= acc` in a simp match cost thousands of steps. `None` unless `head` is
+    /// `Nat.add` or `Nat.sub` applied to exactly two arguments (`arguments` is the reversed
+    /// spine, so the second is `arguments[0]`) whose second reduces to a literal.
+    pub(super) fn nat_literal_step(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+        locals: &LocalContext,
+    ) -> Result<Option<Expr>, UnificationError> {
+        let [second, first] = arguments else {
+            return Ok(None);
+        };
+        let wrapper = match self.nat_operation_signature(head, 2)? {
+            Some(NatOperation::Add) => Name::from_components(["Nat", "succ"]),
+            Some(NatOperation::Sub) => {
+                let pred = Name::from_components(["Nat", "pred"]);
+                if !matches!(self.work.env.find(&pred), Some(ConstantInfo::Defn(info))
+                    if info.safety == DefinitionSafety::Safe && info.base.level_params.is_empty())
+                {
+                    return Ok(None);
+                }
+                pred
+            }
+            _ => return Ok(None),
+        };
+        let second = self.whnf(second, locals)?;
+        let Some(value) = self.nat_operand(&second)? else {
+            return Ok(None);
+        };
+        if BigNatView::from_limbs_le(value.limbs_le()).is_zero() {
+            return Ok(Some(first.clone()));
+        }
+        let previous = self.combine_nat_offsets(&value, &NatLit::from_u64(1), true)?;
+        for _ in 0..4 {
+            self.meter.node()?;
+        }
+        Ok(Some(Expr::app(
+            Expr::const_(wrapper, Vec::new()),
+            Expr::app(
+                Expr::app(head.clone(), first.clone()),
+                Expr::lit(Literal::Nat(previous)),
+            ),
+        )))
     }
 
     pub(super) fn nat_operand(&mut self, expr: &Expr) -> Result<Option<NatLit>, UnificationError> {
