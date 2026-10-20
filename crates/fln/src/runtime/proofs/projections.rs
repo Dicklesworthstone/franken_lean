@@ -4,6 +4,67 @@
 use super::*;
 
 impl Preparation<'_> {
+    /// The pin inlines generated projection functions before visiting operands
+    /// (ToLCNF.visitProjFn). Only their datatype parameters disappear: the
+    /// receiver occurs once, and an overapplied callable field keeps every arg.
+    /// Partial application retains the remaining typed lambda telescope.
+    pub(in crate::runtime) fn inline_generated_projection(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let environment = self.environment;
+        let Some(ConstantInfo::Defn(definition)) = environment.find(name) else {
+            return Ok(None);
+        };
+        if arguments.is_empty() || definition.base.level_params.len() != levels.len() {
+            return Ok(None);
+        }
+        let Some(parameters) =
+            fln_elab::records::generated_projection_parameters(environment, definition, || {
+                self.tick()
+            })?
+        else {
+            return Ok(None);
+        };
+        if parameters == 0 || self.has_implementation(name)? {
+            return Ok(None);
+        }
+        // An explicit extern owns the executable semantics, even for a
+        // generated field. Do not turn its logical body into a fallback.
+        source_intrinsics::check_selected_extern_attribute(
+            environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(name).is_some())
+        {
+            return Ok(None);
+        }
+        let mut body =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        for (index, argument) in arguments.iter().enumerate() {
+            self.tick()?;
+            if index <= parameters {
+                let ExprNode::Lam { body: next, .. } = body.node() else {
+                    return Err(unsupported("generated projection telescope"));
+                };
+                body = self.substitution(next, argument)?;
+            } else {
+                body = Expr::app(body, argument.clone());
+            }
+        }
+        Ok(Some(body))
+    }
+
     pub(in crate::runtime) fn original_projection_type(
         &mut self,
         receiver_type: &Expr,
@@ -81,3 +142,6 @@ impl Preparation<'_> {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -98,6 +98,16 @@ impl Dependencies {
         Ok(())
     }
 
+    /// Projection erasure cannot borrow a logical field body's semantics when
+    /// another executable implementation (including a companion) was selected.
+    pub(super) fn has_runtime_override(&self, declaration: &Name) -> bool {
+        self.implemented_by.get(declaration).is_some()
+            || self.externs.get(declaration).is_some()
+            || self
+                .environment
+                .contains(&Name::str(declaration.clone(), "_unsafe_rec"))
+    }
+
     pub(super) fn check(&self, declaration: &Name) -> Result<(), NatDefinitionElabError> {
         let selected = self
             .implemented_by

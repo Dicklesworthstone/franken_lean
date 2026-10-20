@@ -316,6 +316,18 @@ impl Context {
                         erased_params = match self.txn.env.find(name) {
                             Some(ConstantInfo::Ctor(ctor)) => ctor.num_params as usize,
                             Some(ConstantInfo::Rec(rec)) => rec.num_params as usize,
+                            Some(ConstantInfo::Defn(definition))
+                                if !dependencies.has_runtime_override(name) =>
+                            {
+                                let definition = definition.clone();
+                                let environment = self.txn.env.clone();
+                                crate::records::generated_projection_parameters(
+                                    &environment,
+                                    &definition,
+                                    || self.tick(),
+                                )?
+                                .unwrap_or(0)
+                            }
                             _ => 0,
                         }
                         .min(args.len());

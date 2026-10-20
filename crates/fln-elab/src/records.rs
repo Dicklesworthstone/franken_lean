@@ -8,6 +8,19 @@ pub mod imported;
 pub mod inheritance;
 pub(crate) mod projection;
 
+/// Recover the static datatype prefix of an admitted, generated field projection.
+/// This is an untrusted descriptor, not compilation or declaration authority.
+/// Callers must separately preserve explicit implementations, externs and init
+/// effects before using it to erase arguments. Ordinary lookalikes return None.
+pub fn generated_projection_parameters<E>(
+    environment: &fln_env::environment::Environment,
+    definition: &fln_env::constants::DefinitionVal,
+    tick: impl FnMut() -> Result<(), E>,
+) -> Result<Option<usize>, E> {
+    projection::generated_projection(environment, definition, tick)
+        .map(|projection| projection.map(|projection| projection.parameters))
+}
+
 use crate::lctx::LocalDecl;
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;
