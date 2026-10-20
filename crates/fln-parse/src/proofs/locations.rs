@@ -59,6 +59,11 @@ pub(super) fn split(
         let mut names = Vec::new();
         let mut index = at + 1;
         while index < range.end {
+            // location saves the position of `at`; locationHyp checks colGt
+            // for every entry. The wildcard branch deliberately has no guard.
+            if !leaves.starts_right_of(view.normalized(), index, at) {
+                return Err(refusal(view, tokens, index));
+            }
             let leaf = leaves.leaf(index)?;
             names.push(match &tokens[index].kind {
                 TokenKind::Ident(_) => leaf,

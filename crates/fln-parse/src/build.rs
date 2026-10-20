@@ -94,6 +94,19 @@ impl Leaves {
             .ok_or(BuildError::NoSuchToken { index })
     }
 
+    /// Compare scalar columns at actual token starts, as Parser.checkColGt.
+    /// Newlines, comments and multibyte characters do not change the anchor.
+    pub(crate) fn starts_right_of(&self, text: &SourceText, token: usize, anchor: usize) -> bool {
+        let position = |index| {
+            self.extent(index)
+                .and_then(|span| text.position_of(span.start()))
+        };
+        match (position(token), position(anchor)) {
+            (Some(current), Some(saved)) => current.scalar_column > saved.scalar_column,
+            _ => false,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.leaves.len()
     }
@@ -157,7 +170,7 @@ fn slice_of(text: &SourceText, span: ByteSpan) -> String {
 ///
 /// Upstream's `Syntax.node` carries no position: a node's span is derived from its arguments
 /// (asserted in `fln_syntax::tree`'s "an interior node's own info contributes nothing"). Storing
-/// one here would be a second place for a span to live and therefore a second place for it to be
+/// one here would be a second place for a position to live and therefore a second place to be
 /// wrong.
 pub fn node(kind: Name, args: Vec<Syntax>) -> Syntax {
     Syntax::node(kind, args)

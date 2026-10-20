@@ -25,6 +25,16 @@ pub(super) fn parse_until(
         });
     }
     let leaves = Leaves::build(view.normalized(), tokens)?;
+    // Command.variable checks colGt at each bracketed binder. Only its
+    // opening token is constrained; the interior runs withoutPosition.
+    for group in &groups {
+        if !leaves.starts_right_of(view.normalized(), group.open, 0) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, group.open),
+                expected: NatDefinitionExpectation::EndOfCommand,
+            });
+        }
+    }
     Ok(null_node(bounded_binder_syntax(
         &leaves,
         view,
