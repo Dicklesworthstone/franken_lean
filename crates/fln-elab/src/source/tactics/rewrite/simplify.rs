@@ -1677,7 +1677,7 @@ fn simp_key_unfolds(
 }
 
 #[cfg(test)]
-mod key_tests {
+mod tests {
     use super::*;
     use fln_env::constants::{AxiomVal, ConstantVal};
 
