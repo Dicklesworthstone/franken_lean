@@ -617,6 +617,29 @@ impl Context {
                 table,
             }));
         }
+        // A primitive projection `s.i a…` is keyed as its projection function applied to the
+        // structure's parameters and the structure, all open, then to its own arguments. The
+        // pin keys it `.proj`, so this admits a superset of what it retrieves. Unindexed, every
+        // `*.sizeOf_spec` rule was tried at `hiddenSize.1 a` inside a `termination_by` measure,
+        // some 14,000 heartbeats each.
+        if let ExprNode::Proj {
+            struct_name, idx, ..
+        } = head.node()
+            && let Ok(idx) = usize::try_from(*idx)
+            && let Some(projection) = self.simp_projection_function(struct_name, idx)
+            && let Some(ConstantInfo::Induct(structure)) = env.find(struct_name)
+        {
+            let mut keys = vec![SimpArgKey::Any; structure.num_params as usize + 1];
+            keys.extend(
+                args.iter()
+                    .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg, 0)),
+            );
+            return Ok(Some(SimpTargetIndex {
+                applications: HashMap::from([(projection, vec![keys])]),
+                environment: simp_key_environment(env),
+                table,
+            }));
+        }
         let ExprNode::Const { name, .. } = head.node() else {
             return Ok(None);
         };
@@ -2803,5 +2826,65 @@ mod tests {
             ],
         );
         assert!(context.simp_node_admits(&key, &unfolds_to_f).unwrap());
+    }
+
+    /// The source seed, which declares the structure `And` (`And.intro (left : a) (right : b)`).
+    fn seeded_context() -> Context {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+        let mut env = Environment::new();
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        for declaration in crate::seed::source_seed_declarations() {
+            let Outcome::Complete(admitted) = admit(&env, declaration, budget) else {
+                panic!("seed nonanswer")
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("seed rejected")
+            };
+            env = match checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            ) {
+                Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                    result,
+                ))) => result.environment,
+                Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+                other => panic!("seed publication {other:?}"),
+            };
+        }
+        Context::new(&env, budget)
+    }
+
+    /// A primitive projection `h.1` is keyed by its projection function, `And.left`, so a
+    /// rule keyed by another head is not tried there. Unindexed, every rule was: each
+    /// `*.sizeOf_spec` rule was tried at `hiddenSize.1 a` inside a `termination_by`
+    /// measure, some 14,000 heartbeats apiece.
+    #[test]
+    fn a_primitive_projection_is_keyed_by_its_projection_function() {
+        let mut context = seeded_context();
+        let prop = Expr::sort(Level::zero());
+        let mut local = |name: &str, type_: Expr| {
+            let id = FVarId(n(name));
+            context
+                .txn
+                .lctx
+                .add_param(id.clone(), n(name), type_, BinderInfo::Default);
+            Expr::fvar(id)
+        };
+        let p = local("p", prop.clone());
+        let q = local("q", prop);
+        let h = local("h", Expr::app(Expr::app(c("And"), p), q));
+        let node = Expr::proj(n("And"), 0, h);
+        let rule = |head: &str| SimpKey {
+            head: n(head),
+            args: Vec::new(),
+        };
+        assert!(context.simp_node_admits(&rule("And.left"), &node).unwrap());
+        assert!(!context.simp_node_admits(&rule("Nat.succ"), &node).unwrap());
+        assert!(!context.simp_node_admits(&rule("And.right"), &node).unwrap());
     }
 }
