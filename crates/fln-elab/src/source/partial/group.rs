@@ -3,6 +3,8 @@
 //! The pin partitions dependencies into SCCs before choosing partial/nonrec.
 use super::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
+mod ordinary;
+pub use ordinary::{elaborate_ordinary_group, is_ordinary_group_member};
 
 #[derive(Clone, Default)]
 pub(in crate::source) struct Group {

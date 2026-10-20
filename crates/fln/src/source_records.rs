@@ -239,6 +239,24 @@ impl Engine {
                     };
                     return self.admit_partial_result(&declarations, options, limits);
                 }
+                if members
+                    .iter()
+                    .any(fln_elab::source::partial::is_ordinary_group_member)
+                {
+                    let declarations = match elaboration_outcome(
+                        fln_elab::source::partial::elaborate_ordinary_group(
+                            &members,
+                            self.environment(),
+                            limits.kernel,
+                            scope,
+                        ),
+                    )? {
+                        Outcome::Complete(declarations) => declarations,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    return self.admit_partial_result(&declarations, options, limits);
+                }
                 return self.admit_scoped_inductives(&members, options, limits, scope);
             }
             ScopedCommandSyntax::Example(parsed) => {

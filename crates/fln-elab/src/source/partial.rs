@@ -7,7 +7,7 @@ use fln_env::constants::ConstantInfo;
 use std::collections::BTreeSet;
 mod group;
 mod inhabitant;
-pub use group::elaborate_group;
+pub use group::{elaborate_group, elaborate_ordinary_group, is_ordinary_group_member};
 #[cfg(test)]
 mod codegen_tests;
 
