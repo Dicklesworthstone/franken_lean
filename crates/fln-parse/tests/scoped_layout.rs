@@ -192,6 +192,50 @@ fn scoped_layout_verdicts_agree_with_the_actual_pinned_compiler() {
         "theorem t (n : Nat) : n + 0 = n := by\n  simp only [Nat.add_zero] at\n    *\n".into(),
         true,
     ));
+    for valid in [false, true] {
+        let indent = if valid { "  " } else { "" };
+        let library = "namespace Library\ndef item : Nat := 3\nend Library\n";
+        for (label, source) in [
+            (
+                "open",
+                format!("{library}open\n{indent}Library\n#check item\n"),
+            ),
+            (
+                "open-scoped",
+                format!("{library}open scoped\n{indent}Library\n#check Nat\n"),
+            ),
+            ("universe", format!("universe\n{indent}u\n#check Type u\n")),
+            (
+                "include",
+                format!(
+                    "section\nvariable (h : True)\ninclude\n{indent}h\ntheorem t : True := h\nend\n"
+                ),
+            ),
+            (
+                "omit",
+                format!(
+                    "section\nvariable (h : True)\ninclude h\nomit\n{indent}h\ntheorem t : True := True.intro\nend\n"
+                ),
+            ),
+            (
+                "namespace",
+                format!("namespace\n{indent}Library\ndef item : Nat := 3\nend Library\n"),
+            ),
+            (
+                "section",
+                format!("section\n{indent}Names\ntheorem t : True := True.intro\nend Names\n"),
+            ),
+            ("end", format!("section Names\nend\n{indent}Names\n")),
+        ] {
+            cases.push((format!("{label}-{valid}"), source, valid));
+        }
+    }
+    cases.push((
+        "explicit-open".into(),
+        "namespace Library\ndef item : Nat := 3\nend Library\nopen\nLibrary (item)\n#check item\n"
+            .into(),
+        true,
+    ));
     for (label, source, expected) in cases {
         let path = root.join(format!("{label}.lean"));
         std::fs::write(&path, &source).unwrap();
@@ -221,5 +265,37 @@ fn scoped_layout_verdicts_agree_with_the_actual_pinned_compiler() {
             "{label}: reference={}, native_parser={native}",
             output.status.code().unwrap()
         );
+    }
+}
+
+#[test]
+fn scope_name_continuations_use_the_command_anchor() {
+    for head in [
+        "namespace",
+        "section",
+        "end",
+        "open",
+        "open scoped",
+        "universe",
+        "include",
+        "omit",
+    ] {
+        for (indent, accepts) in [("", false), ("  ", false), ("   ", true)] {
+            let source = format!("  {head}\n{indent}N");
+            assert_eq!(
+                command_scope::parse(source.as_bytes()).is_ok(),
+                accepts,
+                "{source}"
+            );
+        }
+    }
+    // Non-simple opens use their own grammar, not a blanket indentation rule.
+    for source in [
+        "open\nN (x)",
+        "open N in\ntheorem t : True := True.intro",
+        "section",
+        "end",
+    ] {
+        assert!(command_scope::parse(source.as_bytes()).is_ok(), "{source}");
     }
 }

@@ -581,6 +581,7 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         && tokens.get(1).is_some_and(
             |token| matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "scoped"),
         );
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
     let mut names = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(if scoped { 2 } else { 1 }) {
         let TokenKind::Ident(name) = &token.kind else {
@@ -600,6 +601,12 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
             }
             return Err(bad(index));
         };
+        // Module.commandParser saves the command start; these identifier
+        // lists all use checkColGt. Bracketed explicit opens were handled
+        // separately above and do not inherit this list's column restriction.
+        if !leaves.starts_right_of(view.normalized(), index, 0) {
+            return Err(bad(index));
+        }
         names.push(name.clone());
     }
     let command = match keyword.as_str() {
