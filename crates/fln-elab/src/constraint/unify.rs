@@ -732,6 +732,26 @@ impl Engine<'_> {
         ))
     }
 
+    /// The constant heading `expr`'s spine when it is an inductive type or a constructor,
+    /// which no reduction changes. Two applications headed by different such constants are
+    /// never definitionally equal: the pin's `isDefEqApp` compares arguments only under the
+    /// same function, and proof irrelevance and structure eta are earlier rungs here.
+    fn rigid_constructor_head(&mut self, expr: &Expr) -> Result<Option<Name>, UnificationError> {
+        let mut head = expr;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.meter.tick()?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        Ok(matches!(
+            self.work.env.find(name),
+            Some(ConstantInfo::Induct(_) | ConstantInfo::Ctor(_))
+        )
+        .then(|| name.clone()))
+    }
+
     fn levels(&mut self, left: &Level, right: &Level) -> Result<(), UnificationError> {
         let mut pending = vec![(left.clone(), right.clone())];
         while let Some((left, right)) = pending.pop() {
@@ -1026,6 +1046,17 @@ impl Engine<'_> {
                     // Decomposing it now would guess that the eventual function
                     // is injective. Other rungs, including function eta, remain
                     // available above and below this rigid-congruence case.
+                    return Err(UnificationError::Deferred(reason));
+                }
+                // `PSigma.Lex r s ⟨?a, ?b⟩ ⟨?a, ?c⟩ =?= Nat.le x.succ (x + 1)` (`x < x + 1`
+                // unfolded) is refused here. Decomposed, its argument equations went on to
+                // unfold `x + 1` against `⟨?a, ?c⟩`: some 28,000 steps for each failed
+                // `apply PSigma.Lex.right` of the default `decreasing_by`.
+                if let (Some(a), Some(b)) = (
+                    self.rigid_constructor_head(&left)?,
+                    self.rigid_constructor_head(&right)?,
+                ) && a != b
+                {
                     return Err(UnificationError::Deferred(reason));
                 }
                 if self.preserve_pending_application(&left, &right, locals)? {

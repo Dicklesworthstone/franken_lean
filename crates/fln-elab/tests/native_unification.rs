@@ -1225,6 +1225,54 @@ fn literal_nat_offsets_refute_their_own_base_without_the_compiled_body() {
     }
 }
 
+/// Two applications headed by different inductive types are never definitionally equal: the
+/// pin's `isDefEqApp` compares arguments only under one function. Decomposed here, the
+/// argument equations of `HEq Nat (x + y) Nat ?c =?= Eq Nat ?a.succ x` assigned `?c` and
+/// unfolded `x + y` against `Nat` before the heads were found to differ: 4,593 and 10,073
+/// heartbeats, where the refusal costs under 500.
+#[test]
+fn applications_with_different_inductive_heads_are_refused_without_their_arguments() {
+    let mut base = arithmetic_transaction();
+    let x = local(&mut base, "rigidHeadX", nat());
+    let y = local(&mut base, "rigidHeadY", nat());
+    let c = Expr::mvar(natural(&mut base, "rigidHeadC", nat()));
+    let a = Expr::mvar(natural(&mut base, "rigidHeadA", nat()));
+    let family = |head: &str, arguments: Vec<Expr>| {
+        arguments
+            .into_iter()
+            .fold(Expr::const_(name(head), vec![Level::one()]), Expr::app)
+    };
+    let heterogeneous = family(
+        "HEq",
+        vec![nat(), nat_operation("add", &[x.clone(), y]), nat(), c],
+    );
+    let homogeneous = family(
+        "Eq",
+        vec![
+            nat(),
+            Expr::app(
+                Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new()),
+                a,
+            ),
+            x,
+        ],
+    );
+    for (left, right) in [
+        (&heterogeneous, &homogeneous),
+        (&homogeneous, &heterogeneous),
+    ] {
+        let mut txn = base.clone();
+        let before = txn.budget.heartbeats_consumed;
+        assert!(matches!(
+            txn.unify(left, right, default_budget()),
+            Err(UnificationError::Deferred(_))
+        ));
+        let spent = txn.budget.heartbeats_consumed - before;
+        assert!(spent < 1_000, "{spent} heartbeats");
+        assert_semantics_unchanged(&txn, &base);
+    }
+}
+
 #[test]
 fn symbolic_nat_offsets_stay_compact_and_use_bounded_iteration() {
     let mut txn = arithmetic_transaction();
