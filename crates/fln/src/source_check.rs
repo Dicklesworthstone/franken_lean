@@ -109,7 +109,7 @@ impl SourceCheckError {
         }
     }
 }
-fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
+pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
     use fln_elab::constraint::unify::UnificationError;
     use fln_elab::universe::UniverseInstantiationError;
     use fln_elab::{NatDefinitionElabError, source::SourceInferenceError};

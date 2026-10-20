@@ -30,6 +30,18 @@ impl<'a> Buffer<'a> {
         }
     }
 
+    /// An error the engine logged for this guard's command, which it logs only when the
+    /// guard checks errors and expects one; a mismatch against it is a non-answer.
+    pub fn error(&mut self, message: &str) -> bool {
+        match self.spec.action(Severity::Error) {
+            Action::Check => {
+                self.checked.push(super::guard_message("error", message));
+                true
+            }
+            Action::Drop | Action::Pass => false,
+        }
+    }
+
     /// `line` is the original display line, including its final newline.
     pub fn info(&mut self, line: &str, from_check: bool, stdout: &mut String) {
         match self.spec.action(Severity::Info) {

@@ -11994,6 +11994,22 @@ fn emit_lean_warning(
     guarded: &mut guard_messages::Guards<'_>,
     stdout: &mut String,
 ) -> Result<(), MultiplexerOutput> {
+    if warning.severity == fln::SourceSeverity::Error {
+        // The engine logs an error only for a command whose guard checks errors.
+        let judged = guarded
+            .get_mut(&warning.command_index)
+            .is_some_and(|guard| guard.error(&warning.message));
+        return match judged {
+            true => Ok(()),
+            false => Err(source_failure(
+                "internal-fault",
+                "a source error was logged outside a guard that checks errors",
+                false,
+                SourcePresentation::Lean,
+                4,
+            )),
+        };
+    }
     if let Some(guard) = guarded.get_mut(&warning.command_index)
         && guard.warning(&warning.message)
     {
@@ -12310,12 +12326,14 @@ fn render_lean_source_commands(
             );
         };
         // Only goal-display traces are reproduced. An expected `trace:` line from any other
-        // trace class has no producer here, so a mismatch against it is a non-answer too.
+        // trace class has no producer here, so a mismatch against it is a non-answer too. So
+        // is one against an expected `error:` line: this engine may word the error otherwise,
+        // or accept the command the pin rejects.
         let from_check = messages.from_check
-            || guard
-                .expected
-                .lines()
-                .any(|line| line.trim_start().starts_with("trace:"));
+            || guard.expected.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("trace:") || line.starts_with("error:")
+            });
         let produced = guard.spec.combine(messages.checked);
         if !guard.spec.matches(&guard.expected, &produced) {
             // This door's `#check` line is the pin's on the shapes measured, but its pretty
@@ -12325,9 +12343,9 @@ fn render_lean_source_commands(
                 return source_failure(
                     "capability",
                     &format!(
-                        "command {}: `#guard_msgs` over `#check` or a raw goal trace produced a message that differs \
-                         from the docstring, and this door's goal/`#check` rendering is not proven to be \
-                         the pin's:\n\n{produced}",
+                        "command {}: `#guard_msgs` over `#check`, a raw goal trace or an expected error produced a \
+                         message that differs from the docstring, and this door's goal/`#check`/error rendering \
+                         is not proven to be the pin's:\n\n{produced}",
                         guard.command_index
                     ),
                     false,

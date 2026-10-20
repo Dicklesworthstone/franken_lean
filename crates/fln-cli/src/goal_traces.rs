@@ -98,6 +98,29 @@ mod tests {
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         assert_eq!(result.stdout, "1\n⊢ True\n2\n");
     }
+    /// An `example` that fails to elaborate under a guard expecting its error logs the error,
+    /// which the guard judges, as the pin does; it declares nothing. A different wording is
+    /// a non-answer, not a rejection, and so is an `example` that elaborates: this engine may
+    /// accept what the pin rejects.
+    #[test]
+    fn a_guarded_example_error_is_judged_as_the_pins_message() {
+        let accepted = render(
+            "/-- error: Unknown identifier `nope` -/\n#guard_msgs in\nexample : Nat := nope\n#eval 3",
+        );
+        assert_eq!(accepted.exit_code, 0, "{}", accepted.stderr);
+        assert_eq!(accepted.stdout, "3\n");
+        let reworded =
+            render("/-- error: Unknown constant `nope` -/\n#guard_msgs in\nexample : Nat := nope");
+        assert_eq!(reworded.exit_code, CAPABILITY_NOT_IMPLEMENTED_EXIT);
+        let elaborated =
+            render("/-- error: Unknown identifier `nope` -/\n#guard_msgs in\nexample : Nat := 3");
+        assert_eq!(
+            elaborated.exit_code, CAPABILITY_NOT_IMPLEMENTED_EXIT,
+            "{}",
+            elaborated.stderr
+        );
+    }
+
     #[test]
     fn goal_display_mismatch_is_not_a_false_reference_rejection() {
         let result = render(

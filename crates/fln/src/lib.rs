@@ -7283,6 +7283,8 @@ impl Engine {
             }
         })?;
         let mut guards: Vec<SourceGuard> = Vec::new();
+        // Errors of guarded commands whose `#guard_msgs` checks errors, in command order.
+        let mut guarded_errors: Vec<SourceWarning> = Vec::new();
         let mut trace_messages = Vec::new();
         let mut trace_bytes = 0usize;
         // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
@@ -7403,6 +7405,7 @@ impl Engine {
                                     + command_source.len().saturating_sub("#exit".len()),
                             ),
                             message: "using 'exit' to interrupt Lean".to_owned(),
+                            severity: SourceSeverity::Warning,
                         });
                     }
                     ScopeCommand::OpenIn {
@@ -7550,12 +7553,13 @@ impl Engine {
                         // lines run: goal traces are reproduced and routed at trace severity, and
                         // the `lean` front door makes any mismatch against an expected trace a
                         // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
+                        // An expected error is judged when the guarded command is an `example`
+                        // or `#check`, which declare nothing: its elaboration error is logged and
+                        // compared as the pin's (below). Other commands keep this refusal.
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
                             line != "warning: declaration uses `sorry`"
-                                && ["error:", "warning:"]
-                                    .iter()
-                                    .any(|severity| line.starts_with(severity))
+                                && line.starts_with("warning:")
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error or warning message",
@@ -7663,6 +7667,18 @@ impl Engine {
                 );
             }
             let scoped = scope != fln_elab::source::scope::SourceScope::default();
+            // Only an `example` or `#check` is judged by its error (below): the pin would still
+            // add any other failing declaration, which this engine cannot reproduce.
+            let guarded_error = guard_checks_expected_error(guards.last(), command_index);
+            if guarded_error && scope.exports_declaration() {
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`#guard_msgs` expecting an error or warning message",
+                    }),
+                    at: Some(original_offset),
+                });
+            }
             if scope.exports_declaration()
                 && let Some(public) = public.as_deref_mut()
             {
@@ -7798,6 +7814,20 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_empty();
+            if guarded_error
+                && !(matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Check | SourceCommandKind::Example
+                ) && !(has_inline_simp || has_inline_default))
+            {
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`#guard_msgs` expecting an error or warning message",
+                    }),
+                    at: Some(original_offset),
+                });
+            }
             if matches!(
                 parsed.kind(),
                 SourceCommandKind::Check | SourceCommandKind::Example
@@ -7840,6 +7870,21 @@ impl Engine {
                         return Ok(Outcome::InternalFault(fault));
                     }
                     Err(error) => {
+                        // Under a `#guard_msgs` that checks errors, an `example` or `#check`
+                        // that fails to elaborate logs its error, which the guard judges as
+                        // the pin's message, and declares nothing. A resource stop, an
+                        // inconclusive check or a kernel answer still ends the batch.
+                        if let Some(message) =
+                            guarded_elaboration_error(guards.last(), command_index, &error)
+                        {
+                            guarded_errors.push(SourceWarning {
+                                command_index,
+                                at: original_offset,
+                                message,
+                                severity: SourceSeverity::Error,
+                            });
+                            continue;
+                        }
                         return Err(EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error),
@@ -8385,6 +8430,7 @@ impl Engine {
                                 .unwrap_or(0),
                     ),
                     message: "declaration uses `sorry`".to_owned(),
+                    severity: SourceSeverity::Warning,
                 })
             })
             .collect();
@@ -8465,12 +8511,16 @@ impl Engine {
                         command_index: command,
                         at: fln_parse::BytePos(offset.0 + lint.at),
                         message: lint.message,
+                        severity: SourceSeverity::Warning,
                     });
                 }
             }
             // A command's lint warnings follow its other warnings, in source order.
             warnings.sort_by_key(|warning| warning.command_index);
         }
+        // A guarded command's error follows its traces and precedes later commands' warnings.
+        warnings.extend(guarded_errors);
+        warnings.sort_by_key(|warning| warning.command_index);
         // The last command, so the order by command stays.
         warnings.extend(exit_warning);
         Ok(Outcome::Complete(SourceCommandBatchExecution {
@@ -12073,6 +12123,50 @@ pub struct SourceWarning {
     pub command_index: usize,
     pub at: fln_parse::BytePos,
     pub message: String,
+    pub severity: SourceSeverity,
+}
+
+/// The severity a [`SourceWarning`] is logged at. An error is logged only for a command
+/// whose `#guard_msgs` checks errors: the command is then judged by its message, as at the
+/// pin, instead of failing the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceSeverity {
+    Warning,
+    Error,
+}
+
+/// The pin's message for `error`, when `guard` is the `#guard_msgs` of `command_index`,
+/// checks errors, and expects one, and `error` is an elaboration refusal (not a resource
+/// stop, an inconclusive or kernel answer, or an internal fault).
+fn guarded_elaboration_error(
+    guard: Option<&SourceGuard>,
+    command_index: usize,
+    error: &EngineExecutionError,
+) -> Option<String> {
+    if !guard_checks_expected_error(guard, command_index)
+        || source_check::classify(error).0 != "elaboration"
+    {
+        return None;
+    }
+    match error {
+        EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(error)) => {
+            Some(error.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `guard` is the `#guard_msgs` of `command_index`, checks errors, and expects one.
+fn guard_checks_expected_error(guard: Option<&SourceGuard>, command_index: usize) -> bool {
+    use fln_parse::command_scope::guard_spec::{Action, Severity};
+    guard.is_some_and(|guard| {
+        guard.command_index == command_index
+            && guard.spec.action(Severity::Error) == Action::Check
+            && guard
+                .expected
+                .lines()
+                .any(|line| line.trim_start().starts_with("error:"))
+    })
 }
 
 /// The admitted type and value `command` declares: the declaration named by its `declId`

@@ -72,6 +72,7 @@ fn warning_batch(source: &str) -> fln::SourceCommandBatchExecution {
         command_index: 0,
         at: fln_parse::BytePos(0),
         message: "declaration uses `sorry`".to_owned(),
+        severity: fln::SourceSeverity::Warning,
     });
     completed
 }
