@@ -1285,6 +1285,7 @@ fn noncomputable_error(
             (name, "a declaration is tagged noncomputable twice")
         }
         NoncomputableError::Malformed => (module.clone(), "malformed noncomputable journal"),
+        NoncomputableError::CompilerEquation { theorem, reason } => (theorem, reason),
     };
     SourceOleanImportError::Metadata {
         module: module.clone(),
