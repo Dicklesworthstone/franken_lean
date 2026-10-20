@@ -686,7 +686,10 @@ impl Context {
         let mut generalized = Vec::new();
         if recursive {
             self.recursive_indices(name, &parameters, &indices)?;
-        } else if !indices.is_empty() || self.well_founded_continuation().is_some() {
+        } else {
+            // An ordinary, unindexed discriminant can also occur in a local's
+            // type (Token n, Nat.below motive n). Generalize that dependent
+            // telescope before specializing it to each constructor.
             // Well-founded matches specialize the private continuation and
             // dependent hypotheses too. Genuine source lets remain captured,
             // retaining their original values in recursive call arguments.
