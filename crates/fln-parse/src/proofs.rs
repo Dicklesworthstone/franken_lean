@@ -364,6 +364,10 @@ pub(crate) fn tactic(
             "guard_hyp",
             // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`).
             "admit",
+            // `syntax (name := traceState) "trace_state" : tactic` and
+            // `syntax (name := traceMessage) "trace " str : tactic` (`Init/Tactics.lean`).
+            "trace_state",
+            "trace",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word])),
@@ -648,7 +652,21 @@ fn local_tactic(
         | "decreasing_trivial"
         | "decreasing_trivial_pre_omega"
         | "decreasing_tactic"
+        | "trace_state"
             if range.end == start + 1 => {}
+        // `"trace " str` (`Init/Tactics.lean`, `Lean.Parser.Tactic.traceMessage`).
+        "trace"
+            if range.end == start + 2
+                && matches!(
+                    &tokens[start + 1].kind,
+                    TokenKind::Literal(LiteralKind::Str)
+                ) =>
+        {
+            args.push(Syntax::node(
+                Name::str(Name::anonymous(), "str"),
+                vec![leaves.leaf(start + 1)?],
+            ));
+        }
         // `"rotate_left" (ppSpace num)?` and `rotate_right` (`Init/Tactics.lean`).
         "rotate_left" | "rotate_right"
             if range.end == start + 1
@@ -752,6 +770,8 @@ fn local_tactic(
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",
         "rotate_right" => "rotateRight",
+        "trace_state" => "traceState",
+        "trace" => "traceMessage",
         _ => keyword,
     };
     Ok(Syntax::node(parser_kind(&["Tactic", kind]), args))
@@ -2455,6 +2475,37 @@ mod simp_all_tests {
         ] {
             let source = format!("theorem t : True := by {tactic}");
             assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn trace_state_and_trace_message_are_contextual_and_lossless() {
+        for source in [
+            "def trace_state (n : Nat) : Nat := n",
+            "def trace (n : Nat) : Nat := n",
+            "theorem t : True := by\r\n  trace_state; trace \"msg\"; trivial\r\n",
+            "theorem t (h : 0 = 1) : False := by first | trace_state; fail | contradiction",
+            "theorem t (h : 0 = 1) : False := by first | trace \"first branch\"; fail | contradiction",
+        ] {
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+        for bad in [
+            "theorem t : True := by trace_state 1",
+            "theorem t : True := by trace",
+            "theorem t : True := by trace 1",
+            "theorem t : True := by trace \"a\" \"b\"",
+        ] {
+            assert!(parse_source_command(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 }

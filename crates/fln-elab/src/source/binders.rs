@@ -334,10 +334,10 @@ impl Context {
         loop {
             self.tick()?;
             let ExprNode::ForallE {
+                binder_name,
                 binder_type,
                 body,
                 binder_info,
-                ..
             } = expected.node()
             else {
                 break;
@@ -354,7 +354,12 @@ impl Context {
                 self.validate_instance_binder(binder_type)?;
             }
             let id = FVarId(self.fresh_name()?);
-            let name = self.fresh_name()?;
+            let stem = if *binder_info == BinderInfo::InstImplicit && binder_name.is_anonymous() {
+                Name::from_components(["inst"])
+            } else {
+                binder_name.clone()
+            };
+            let name = self.fresh_inaccessible(&stem)?;
             self.txn
                 .lctx
                 .add_param(id.clone(), name, binder_type.clone(), *binder_info);
@@ -435,7 +440,11 @@ impl Context {
             }
             let id = FVarId(self.fresh_name()?);
             let name = if name.is_anonymous() {
-                self.fresh_name()?
+                if group.style == BinderInfo::InstImplicit {
+                    self.fresh_inaccessible(&Name::from_components(["inst"]))?
+                } else {
+                    self.fresh_name()?
+                }
             } else {
                 name.clone()
             };

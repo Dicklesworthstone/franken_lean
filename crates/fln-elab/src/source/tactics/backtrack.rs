@@ -81,8 +81,10 @@ impl<'a> Checkpoint<'a> {
     }
     pub fn restore(&self, context: &mut Context) {
         let spent = context.txn.budget.heartbeats_consumed;
+        let traces = std::mem::take(&mut context.traces);
         *context = (*self.context).clone();
         context.txn.budget.heartbeats_consumed = spent;
+        context.traces = traces;
     }
     pub fn retry(&self) -> bool {
         self.next < self.spec.branches.len()

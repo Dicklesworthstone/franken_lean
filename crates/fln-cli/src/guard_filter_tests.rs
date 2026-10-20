@@ -140,3 +140,107 @@ fn guard_filters_reject_ambiguous_retained_guard_tables() {
     let output = render_lean_source_commands(&completed, WarningSink::Unreachable);
     assert_eq!(output.exit_code, 4);
 }
+
+#[test]
+fn trace_state_and_trace_message_match_pinned_lean_cases() {
+    // 1. traceStateBacktracking.lean: traces survive failed tactic branches (`CoreM.lean:407-410`).
+    let backtracking = concat!(
+        "example (h : 0 = 1) : False := by\n",
+        "  first | trace_state; fail | contradiction\n\n",
+        "example (h : 0 = 1) : False := by\n",
+        "  first | trace \"first branch\"; fail | contradiction\n",
+    );
+    let output = render(backtracking);
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "h : 0 = 1\n⊢ False\nfirst branch\n");
+
+    // 2. 813.lean: universe generalization instantiates `Sort u_1` in `trace_state`.
+    let case_813 = concat!(
+        "def Function.const {α : Sort u} (β : Sort v) (a : α) (b : β) : α := a\n",
+        "open Function\n",
+        "theorem constApply {y : β} {x : α} : const α y x = y := rfl\n",
+        "example (p : Nat → Prop) (h : p 1) : p (const Nat 1 2) := by simp only [constApply]; trace_state; exact h\n",
+        "example (p : α → Prop) (h : p a) : p (const Nat a 2) := by simp only [constApply]; trace_state; exact h\n",
+        "example (f : α → α) (p : α → Prop) (h : p (f a)) : p (const Nat (f a) 2) := by simp only [constApply]; trace_state; exact h\n",
+    );
+    let output = render(case_813);
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "p : Nat → Prop\nh : p 1\n⊢ p 1\n",
+            "α : Sort u_1\na : α\np : α → Prop\nh : p a\n⊢ p a\n",
+            "α : Sort u_1\na : α\nf : α → α\np : α → Prop\nh : p (f a)\n⊢ p (f a)\n",
+        )
+    );
+
+    // 3. 1027.lean: `simp_all` followed by `trace_state` and `sorry`.
+    let case_1027 = "example (h : x ≠ 0) : Unit := by\n  simp_all\n  trace_state\n  sorry\n";
+    let completed = execute(case_1027).unwrap();
+    let output = render_lean_source_commands(
+        &completed,
+        WarningSink::Print {
+            file: "1027.lean",
+            source: case_1027.as_bytes(),
+        },
+    );
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        "x : Nat\nh : ¬x = 0\n⊢ Unit\n1027.lean:1:0: warning: declaration uses `sorry`\n"
+    );
+
+    // 4. 1235.lean: `generalize` followed by `trace_state` and `sorry`.
+    let case_1235 = concat!(
+        "opaque f (a b : Nat) : Nat\n",
+        "example : f 1 2 = f 2 1 := by\n",
+        "  generalize h : f 1 = g\n",
+        "  trace_state\n",
+        "  sorry\n",
+    );
+    let completed = execute(case_1235).unwrap();
+    let output = render_lean_source_commands(
+        &completed,
+        WarningSink::Print {
+            file: "1235.lean",
+            source: case_1235.as_bytes(),
+        },
+    );
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        "g : Nat → Nat\nh : f 1 = g\n⊢ g 2 = f 2 1\n1235.lean:2:0: warning: declaration uses `sorry`\n"
+    );
+
+    // 5. Guarded `trace_state`, `trace "msg"`, `no goals`, case tags, and filter policies.
+    let guarded = concat!(
+        "/--\ntrace: x : Nat\n⊢ x = x\n-/\n",
+        "#guard_msgs in\n",
+        "theorem t1 (x : Nat) : x = x := by\n  trace_state\n  rfl\n\n",
+        "/-- trace: no goals -/\n",
+        "#guard_msgs in\n",
+        "theorem t2 : True := by\n  trivial\n  trace_state\n\n",
+        "/-- trace: hello -/\n",
+        "#guard_msgs (trace) in\n",
+        "theorem t3 : True := by\n  trace \"hello\"\n  trivial\n\n",
+        "#guard_msgs (drop trace) in\n",
+        "theorem t4 : True := by\n  trace_state\n  trivial\n\n",
+        "#guard_msgs (pass trace) in\n",
+        "theorem t5 : True := by\n  trace \"passed\"\n  trivial\n",
+    );
+    let output = render(guarded);
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "passed\n");
+
+    // Mismatch on `trace_state` returns capability non-answer (exit 5), while mismatch on
+    // literal `trace "msg"` returns guard-msgs failure (exit 1).
+    let mismatch_goal = render(
+        "/-- trace: wrong -/\n#guard_msgs in\ntheorem m1 : True := by\n  trace_state\n  trivial\n",
+    );
+    assert_eq!(mismatch_goal.exit_code, CAPABILITY_NOT_IMPLEMENTED_EXIT);
+
+    let mismatch_msg = render(
+        "/-- trace: wrong -/\n#guard_msgs in\ntheorem m2 : True := by\n  trace \"actual\"\n  trivial\n",
+    );
+    assert_eq!(mismatch_msg.exit_code, 1);
+}

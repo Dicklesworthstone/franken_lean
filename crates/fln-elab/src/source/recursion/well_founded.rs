@@ -1062,6 +1062,7 @@ impl Context {
                 target,
                 lctx: locals,
                 introduced: Vec::new(),
+                tag: goal.tag.clone(),
             };
             let state = self.start_decreasing_proof(proof, vec![fresh])?;
             self.run_decreasing_proof(proof, state).map(|_| ())
@@ -1731,8 +1732,11 @@ impl Context {
                 hidden.push(local.user_name.clone());
             }
             let mut local = local.clone();
-            if proof_inaccessible.contains(&local.id) {
-                local.user_name = Name::anonymous();
+            if proof_inaccessible.contains(&local.id)
+                && !local.user_name.is_anonymous()
+                && !local.user_name.has_macro_scopes()
+            {
+                local.user_name = self.fresh_inaccessible(&local.user_name)?;
             }
             tactics::eliminate::add_local(&mut proof_lctx, &local);
         }
@@ -1741,6 +1745,7 @@ impl Context {
             target,
             lctx: proof_lctx,
             introduced: Vec::new(),
+            tag: Name::anonymous(),
         };
         // Retain full captures even when proof-context cleanup later removes
         // an unrelated local. Let values can still depend on the hidden

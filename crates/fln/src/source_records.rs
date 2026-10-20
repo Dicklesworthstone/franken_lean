@@ -238,7 +238,7 @@ impl Engine {
                     match self
                         .check_parsed_source_command_in_scope(parsed, options, limits, 0, scope)?
                     {
-                        Outcome::Complete(_) => {
+                        Outcome::Complete(checked) => {
                             let root = self.logical_root(options);
                             Outcome::Complete(DeclarationBatchAdmission {
                                 engine: self.clone(),
@@ -246,6 +246,7 @@ impl Engine {
                                 result_logical_root: root,
                                 admissions: Vec::new(),
                                 local_instance: None,
+                                traces: checked.traces,
                             })
                         }
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -311,8 +312,12 @@ impl Engine {
         };
         let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
         let candidate = if is_theorem {
-            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel)
-                .map(|declaration| (declaration, true, true, false))
+            fln_elab::source::elaborate_public_theorem_with_traces(
+                parsed.syntax(),
+                &worlds,
+                limits.kernel,
+            )
+            .map(|(declaration, traces)| (declaration, true, true, false, traces))
         } else {
             fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
                 .map(|instance| {
@@ -321,10 +326,11 @@ impl Engine {
                         instance.proof_valued,
                         instance.hidden_body,
                         instance.noncomputable,
+                        instance.traces,
                     )
                 })
         };
-        let (candidate, proof_valued, hidden_body, inferred_noncomputable) =
+        let (candidate, proof_valued, hidden_body, inferred_noncomputable, traces) =
             match elaboration_outcome(candidate)? {
                 Outcome::Complete(candidate) => candidate,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -349,10 +355,13 @@ impl Engine {
                     limits,
                     public_scope,
                 )? {
-                    Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
-                        public,
-                        private_implementation: None,
-                    }),
+                    Outcome::Complete(mut public) => {
+                        public.traces = traces;
+                        Outcome::Complete(PublicSourceAdmission {
+                            public,
+                            private_implementation: None,
+                        })
+                    }
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 },
@@ -386,7 +395,7 @@ impl Engine {
             };
             admitted.declaration.clone()
         };
-        let private_implementation = match self
+        let mut private_implementation = match self
             .admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)?
         {
@@ -394,6 +403,7 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        private_implementation.traces = traces;
         // Obtain the interface from the actual successful admission, never
         // from an independently supplied or caller-authored signature.
         let [admitted] = private_implementation.admissions.as_slice() else {
@@ -845,25 +855,34 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                return self.admit_scoped_candidate(
-                    parsed.syntax(),
-                    elaborated.declaration,
-                    elaborated.irreducible,
-                    elaborated.noncomputable,
-                    options,
-                    limits,
-                    scope,
-                );
+                let traces = elaborated.traces;
+                return Ok(self
+                    .admit_scoped_candidate(
+                        parsed.syntax(),
+                        elaborated.declaration,
+                        elaborated.irreducible,
+                        elaborated.noncomputable,
+                        options,
+                        limits,
+                        scope,
+                    )?
+                    .map_complete(|mut batch| {
+                        batch.traces = traces;
+                        batch
+                    }));
             }
             return Ok(
-                match self.admit_source_declaration(source, options, limits)? {
-                    Outcome::Complete(admitted) => Outcome::Complete(DeclarationBatchAdmission {
-                        engine: admitted.engine.clone(),
-                        base_logical_root: admitted.base_logical_root,
-                        result_logical_root: admitted.result_logical_root,
-                        admissions: vec![admitted],
-                        local_instance: None,
-                    }),
+                match self.admit_source_declaration_with_traces(source, options, limits)? {
+                    Outcome::Complete((admitted, traces)) => {
+                        Outcome::Complete(DeclarationBatchAdmission {
+                            engine: admitted.engine.clone(),
+                            base_logical_root: admitted.base_logical_root,
+                            result_logical_root: admitted.result_logical_root,
+                            admissions: vec![admitted],
+                            local_instance: None,
+                            traces,
+                        })
+                    }
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 },

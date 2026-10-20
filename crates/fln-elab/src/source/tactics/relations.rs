@@ -17,7 +17,8 @@ impl Context {
             equality_target(&target).ok_or_else(|| error(TacticError::ExpectedEquality))?;
         let reversed =
             equality::equation(level.clone(), alpha.clone(), right.clone(), left.clone());
-        let (witness, child) = self.proof_goal(reversed)?;
+        let (witness, mut child) = self.proof_goal(reversed)?;
+        child.tag = goal.tag.clone();
         let value = self.symmetric_equality(&level, &alpha, &right, &left, witness)?;
         proof.work.push(Work::Close(goal, value));
         proof.work.push(Work::Goal(child));

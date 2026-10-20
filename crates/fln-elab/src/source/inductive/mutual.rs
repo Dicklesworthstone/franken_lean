@@ -27,8 +27,9 @@ fn printed_levels(header: &Header<'_>, scope: &SourceScope) -> Vec<Name> {
 /// A binder name this elaborator generated (`Context::fresh_name`) for an anonymous
 /// binder. It stands for the macro-scoped name the pin generates there.
 fn generated(name: &Name) -> bool {
-    matches!(name.leaf_view(), LeafView::Num(_))
-        && name.parent() == Name::from_components(["_fln_source"])
+    name.has_macro_scopes()
+        || (matches!(name.leaf_view(), LeafView::Num(_))
+            && name.parent() == Name::from_components(["_fln_source"]))
 }
 
 fn family_type(

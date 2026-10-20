@@ -243,13 +243,18 @@ impl Context {
     ) -> Result<LocalDecl, NatDefinitionElabError> {
         let target = self.whnf(&goal.target)?;
         let ExprNode::ForallE {
+            binder_name,
             binder_type,
             body,
             binder_info,
-            ..
         } = target.node()
         else {
             return Err(error(TacticError::UnsupportedEliminator));
+        };
+        let name = if visible && name.is_anonymous() {
+            self.fresh_inaccessible(binder_name)?
+        } else {
+            name
         };
         let id = FVarId(self.fresh_name()?);
         let local = LocalDecl {
@@ -374,7 +379,7 @@ impl Context {
                 .transpose()?;
             let id = FVarId(self.fresh_name()?);
             let name = if names.contains(&old.user_name) {
-                Name::anonymous()
+                self.fresh_inaccessible(&old.user_name)?
             } else {
                 old.user_name.clone()
             };
@@ -1176,7 +1181,10 @@ impl Context {
                 return Err(error(TacticError::UnsupportedEliminator));
             };
             self.txn.lctx = retained.clone();
-            let (hole, branch) = self.proof_goal(minor.clone())?;
+            let (hole, mut branch) = self.proof_goal(minor.clone())?;
+            if let LeafView::Str(leaf) = constructor.base.name.leaf_view() {
+                branch.tag = append_goal_tag(&goal.tag, &Name::from_components([leaf]));
+            }
             let script = scripts.remove(&rule.ctor);
             let alternative = script.as_ref().or(fallback.as_ref());
             let mut hypotheses = Vec::new();
@@ -1210,7 +1218,12 @@ impl Context {
             )?;
             let work_start = proof.work.len();
             let branch = if let Some(equations) = equations {
-                self.refine_index_branch(proof, branch, &equations.names)?
+                self.refine_index_branch(
+                    proof,
+                    branch,
+                    &equations.names,
+                    equations.tactic_major.as_ref(),
+                )?
             } else {
                 Some(branch)
             };

@@ -87,6 +87,7 @@ impl Context {
             );
             let goal = ProofGoal {
                 id,
+                tag: name.clone().unwrap_or_else(Name::anonymous),
                 target: type_.clone(),
                 lctx: self.txn.lctx.clone(),
                 introduced: locals,

@@ -296,7 +296,8 @@ impl Context {
             }
         }
         self.txn.lctx = context.clone();
-        let (child, next) = self.proof_goal(target)?;
+        let (child, mut next) = self.proof_goal(target)?;
+        next.tag = parent.tag.clone();
         // Delay abstraction until the child and all rule premises are solved.
         // The parent retains the old variable needed by the transport's RHS.
         parent.introduced.push(binding);

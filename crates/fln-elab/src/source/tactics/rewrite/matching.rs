@@ -533,6 +533,7 @@ impl Context {
                             target,
                             lctx: declaration.lctx,
                             introduced: Vec::new(),
+                            tag: Name::anonymous(),
                         });
                     }
                 }

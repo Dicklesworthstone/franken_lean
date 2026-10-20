@@ -331,7 +331,8 @@ impl Context {
         let ExprNode::Sort { level: v } = universe.node() else {
             return Err(failure(SourceInferenceError::ExpectedType));
         };
-        let (child, next_goal) = self.proof_goal(next_target)?;
+        let (child, mut next_goal) = self.proof_goal(next_target)?;
+        next_goal.tag = goal.tag.clone();
         // Retain the original rule even for definitionally equal endpoints.
         // Its arguments must reach final admission before beta/zeta reduction
         // can erase them, including answers to otherwise unused side goals.

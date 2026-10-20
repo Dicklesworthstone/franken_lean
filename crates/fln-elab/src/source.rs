@@ -49,6 +49,7 @@ mod record_terms;
 mod recursion;
 mod reduce;
 mod tactics;
+pub use tactics::{TracePayload, TraceRecord};
 
 use super::*;
 use crate::constraint::unify::{
@@ -598,6 +599,7 @@ struct Context {
     // Recursors the source names directly, which a compiled declaration may not apply
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
+    traces: Vec<tactics::TraceRecord>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -665,6 +667,7 @@ impl Context {
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
             source_recursors: Vec::new(),
+            traces: Vec::new(),
         }
     }
 
@@ -683,6 +686,40 @@ impl Context {
             .checked_add(1)
             .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
         Ok(Name::num(Name::from_components(["_fln_source"]), id))
+    }
+
+    pub(super) fn fresh_inaccessible(
+        &mut self,
+        stem: &Name,
+    ) -> Result<Name, NatDefinitionElabError> {
+        self.tick()?;
+        let id = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        let erased = stem.erase_macro_scopes();
+        let base = if erased.is_anonymous() || erased.to_display_string().starts_with("_fln") {
+            Name::from_components(["a"])
+        } else {
+            erased
+        };
+        let hyg = base.append_core(&Name::from_components(["_@", "_internal", "_hyg"]));
+        Ok(Name::num(hyg, id))
+    }
+
+    pub(super) fn instantiate_traces(&mut self) -> Result<(), NatDefinitionElabError> {
+        let mut traces = std::mem::take(&mut self.traces);
+        for trace in &mut traces {
+            if let tactics::TracePayload::Goals(goals) = &mut trace.payload {
+                for goal in goals {
+                    goal.target = self.instantiate(&goal.target)?;
+                    goal.locals = self.observation_locals(&goal.locals)?;
+                }
+            }
+        }
+        self.traces = traces;
+        Ok(())
     }
 
     fn level(&mut self) -> Result<Level, NatDefinitionElabError> {
@@ -4315,7 +4352,7 @@ impl Context {
                 expect_atom(&parts[3], "]", "instance binder closer")?;
                 let optional = expect_null_args(&parts[1], "optional instance name")?;
                 let user_name = match optional {
-                    [] => self.fresh_name()?,
+                    [] => self.fresh_inaccessible(&Name::from_components(["inst"]))?,
                     [Syntax::Ident { val, .. }, colon] => {
                         expect_atom(colon, ":", "instance name colon")?;
                         val.clone()
@@ -4445,6 +4482,7 @@ pub struct PublicInstance {
     pub proof_valued: bool,
     pub hidden_body: bool,
     pub noncomputable: bool,
+    pub traces: Vec<TraceRecord>,
 }
 
 /// Elaborate a public instance once, choosing its body world from the resolved
@@ -4463,6 +4501,7 @@ pub fn elaborate_public_instance(
         hidden_body: context.private_instance_body,
         noncomputable: context.noncomputable_definition,
         declaration,
+        traces: context.traces,
     })
 }
 
@@ -4502,8 +4541,19 @@ pub fn elaborate_public_theorem(
     worlds: &TheoremWorlds<'_>,
     kernel: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    Ok(elaborate_public_theorem_with_traces(syntax, worlds, kernel)?.0)
+}
+
+/// Elaborate a public theorem's header and proof in their respective worlds,
+/// returning captured tactic trace records alongside the candidate declaration.
+pub fn elaborate_public_theorem_with_traces(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+) -> Result<(Declaration, Vec<TraceRecord>), NatDefinitionElabError> {
     let mut context = Context::public_theorem(syntax, worlds, kernel)?;
-    definition_in_context(syntax, &mut context)
+    let declaration = definition_in_context(syntax, &mut context)?;
+    Ok((declaration, context.traces))
 }
 
 impl Context {
@@ -4627,6 +4677,7 @@ pub struct ElaboratedDeclaration {
     /// An actual supported code-generation refusal suppressed by the enclosing
     /// noncomputable section, not merely the presence of that section.
     pub noncomputable: bool,
+    pub traces: Vec<tactics::TraceRecord>,
 }
 
 fn definition_scoped(
@@ -4652,6 +4703,7 @@ fn definition_scoped_with_effects(
         declaration,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,
+        traces: context.traces,
     })
 }
 
@@ -5050,6 +5102,52 @@ fn definition_in_context_named(
     } else {
         None
     };
+    let prop_header = if is_theorem {
+        true
+    } else if !is_instance
+        && let Some(result) = &expected
+        && let Some(sort) = context.known_type(result)?
+    {
+        let sort = context.whnf(&sort)?;
+        matches!(sort.node(), ExprNode::Sort { level } if level.normalize().is_zero())
+    } else {
+        false
+    };
+    if prop_header {
+        // `levelMVarToParamHeaders` (`MutualDef.lean:1148-1161`): eagerly convert
+        // universe metavariables occurring in theorem headers or `Prop`-typed
+        // headers (including `example ... : Prop`) to universe parameters before
+        // elaborating the body.
+        let mut roots: Vec<_> = context
+            .source_scope
+            .variables
+            .locals()
+            .decls()
+            .iter()
+            .chain(&parameters)
+            .map(|local| local.type_.clone())
+            .collect();
+        roots.extend(expected.iter().cloned());
+        context.generalize_declaration_universes(&roots)?;
+    }
+    if prop_header || proof_instance {
+        for parameter in &mut parameters {
+            parameter.type_ = context.instantiate(&parameter.type_)?;
+        }
+        if let Some(expected) = &mut expected {
+            *expected = context.instantiate(expected)?;
+        }
+        let locals = context.txn.lctx.decls().to_vec();
+        let mut lctx = LocalContext::new();
+        for mut local in locals {
+            local.type_ = context.instantiate(&local.type_)?;
+            if let Some(value) = &mut local.value {
+                *value = context.instantiate(value)?;
+            }
+            tactics::eliminate::add_local(&mut lctx, &local);
+        }
+        context.txn.lctx = lctx;
+    }
     if proof_instance && context.source_scope.exports_declaration() {
         context.public_instance_signature = Some(instance_command::PublicHeader::freeze(
             context,
@@ -5197,6 +5295,7 @@ fn definition_in_context_named(
         .collect();
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
     context.generalize_declaration_universes(&universe_roots)?;
+    context.instantiate_traces()?;
     let mut term = context.finish(term)?;
     context.close_partial_reference(&mut term, &parameters, &partial_captures)?;
     // Preserve the source's actual lambda stages. Eta-expanding a computed

@@ -20,8 +20,9 @@ pub enum ObservationKind {
 
 /// A live obligation, not an accepted proof. Types and locals are instantiated
 /// through the same metavariable store used by the native tactic driver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedGoal {
+    pub tag: Name,
     pub target: Expr,
     pub locals: LocalContext,
 }
@@ -280,13 +281,22 @@ impl Context {
         }
         Ok(range)
     }
-    fn observation_locals(
+    pub(super) fn observation_locals(
         &mut self,
         source: &LocalContext,
     ) -> Result<LocalContext, NatDefinitionElabError> {
         let mut result = LocalContext::new();
         for local in source.decls() {
             self.tick()?;
+            if self.is_matrix_hypothesis(local)
+                || local.user_name.is_anonymous()
+                || local
+                    .user_name
+                    .to_display_string()
+                    .starts_with("_fln_source")
+            {
+                continue;
+            }
             let mut local = local.clone();
             local.type_ = self.instantiate(&local.type_)?;
             local.value = local
@@ -350,7 +360,11 @@ impl Context {
         }) = &self.inspection
             && keyword.info().pos(true).is_some_and(|p| p.0 == range.start)
         {
-            return self.observe_goals(&[(goal.target.clone(), goal.lctx.clone())]);
+            return self.observe_goals(&[(
+                goal.tag.clone(),
+                goal.target.clone(),
+                goal.lctx.clone(),
+            )]);
         }
         Ok(())
     }
@@ -374,24 +388,35 @@ impl Context {
     pub(super) fn observe_proof_end(
         &mut self,
         extent: Option<&Range<usize>>,
-        goals: &[(Expr, LocalContext)],
+        goals: &[(Name, Expr, LocalContext)],
     ) -> Result<(), NatDefinitionElabError> {
         if self.observes_goal(None, extent)? {
             self.observe_goals(goals)?;
         }
         Ok(())
     }
-    pub(super) fn observe_goals(
+    pub(super) fn snapshot_goals(
         &mut self,
-        goals: &[(Expr, LocalContext)],
-    ) -> Result<(), NatDefinitionElabError> {
+        goals: &[(Name, Expr, LocalContext)],
+    ) -> Result<Vec<ObservedGoal>, NatDefinitionElabError> {
         self.flush(true)?;
         let mut observed = Vec::new();
-        for (target, locals) in goals {
+        for (tag, target, locals) in goals {
             let target = self.instantiate(target)?;
             let locals = self.observation_locals(locals)?;
-            observed.push(ObservedGoal { target, locals });
+            observed.push(ObservedGoal {
+                tag: tag.clone(),
+                target,
+                locals,
+            });
         }
+        Ok(observed)
+    }
+    pub(super) fn observe_goals(
+        &mut self,
+        goals: &[(Name, Expr, LocalContext)],
+    ) -> Result<(), NatDefinitionElabError> {
+        let observed = self.snapshot_goals(goals)?;
         let probe = self.inspection.as_mut().expect("selected probe");
         probe.result = Some(SourceObservation::Goals {
             range: probe.site.range().clone(),

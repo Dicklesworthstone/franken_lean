@@ -672,13 +672,13 @@ pub fn elaborate_check(
 /// `elabMutualDef` discards its entire successor environment. This function
 /// supplies only the candidate: callers must dual-check it in a scratch
 /// successor, never publish it. The original example syntax remains intact.
-pub fn elaborate_example(
+pub fn elaborate_example_with_traces(
     syntax: &Syntax,
     name: Name,
     env: &Environment,
     kernel: Budget,
     scope: &SourceScope,
-) -> Result<Declaration, NatDefinitionElabError> {
+) -> Result<(Declaration, Vec<super::TraceRecord>), NatDefinitionElabError> {
     use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
 
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
@@ -745,7 +745,18 @@ pub fn elaborate_example(
         vec![declaration[0].clone(), definition],
     );
     let mut context = Context::scoped(env, kernel, scope);
-    super::definition_in_context_named(&candidate, &mut context, Some(name))
+    let declaration = super::definition_in_context_named(&candidate, &mut context, Some(name))?;
+    Ok((declaration, context.traces))
+}
+
+pub fn elaborate_example(
+    syntax: &Syntax,
+    name: Name,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_example_with_traces(syntax, name, env, kernel, scope).map(|(decl, _)| decl)
 }
 
 /// Recognize the canonical command shape; elaboration still validates its body.

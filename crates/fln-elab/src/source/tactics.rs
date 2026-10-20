@@ -241,9 +241,60 @@ fn error(reason: TacticError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Tactic(reason))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TracePayload {
+    Goals(Vec<inspect::ObservedGoal>),
+    Message(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceRecord {
+    pub pos: (usize, usize),
+    pub scope: crate::source::scope::SourceScope,
+    pub payload: TracePayload,
+}
+
+pub(super) fn sanitize_goal_tag(name: &Name) -> Name {
+    let erased = name.erase_macro_scopes();
+    if erased.to_display_string().starts_with("_fln") {
+        Name::anonymous()
+    } else {
+        erased
+    }
+}
+
+pub(super) fn append_goal_tag(tag: &Name, suffix: &Name) -> Name {
+    let base = sanitize_goal_tag(tag);
+    let rest = sanitize_goal_tag(suffix);
+    if base.is_anonymous() {
+        rest
+    } else if rest.is_anonymous() {
+        base
+    } else {
+        base.append_core(&rest)
+    }
+}
+
+pub(super) fn syntax_pos(syntax: &Syntax) -> (usize, usize) {
+    let mut range: Option<(usize, usize)> = None;
+    let mut stack = vec![syntax];
+    while let Some(node) = stack.pop() {
+        if let Syntax::Node { args, .. } = node {
+            stack.extend(args);
+        } else if let Some((a, b)) = node.info().pos(false).zip(node.info().end_pos(false)) {
+            range = Some(match range {
+                None => (a.0, b.0),
+                Some((start, end)) => (start.min(a.0), end.max(b.0)),
+            });
+        }
+    }
+    range.unwrap_or((0, 0))
+}
+
 #[derive(Clone)]
 pub(super) struct ProofGoal {
     pub(in crate::source) id: MVarId,
+    pub(super) tag: Name,
     pub(super) target: Expr,
     pub(super) lctx: LocalContext,
     pub(in crate::source) introduced: Vec<LocalDecl>,
@@ -346,6 +397,7 @@ impl Context {
         };
         let goal = ProofGoal {
             id: id.clone(),
+            tag: Name::anonymous(),
             target,
             lctx: self.txn.lctx.clone(),
             introduced: Vec::new(),
@@ -624,6 +676,48 @@ impl Context {
         Ok(())
     }
 
+    fn decode_trace_message(&mut self, args: &[Syntax]) -> Result<String, NatDefinitionElabError> {
+        let [keyword, message] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "trace", "trace keyword")?;
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceMessage"])?;
+        let [Syntax::Atom { val, .. }] =
+            expect_node(message, &Name::from_components(["str"]), 1, "trace string")?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        for _ in val.as_bytes() {
+            self.tick()?;
+        }
+        let Literal::Str(text) = decode_string(val)? else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        Ok(text)
+    }
+
+    fn visible_goals(
+        &mut self,
+        goal: &ProofGoal,
+        proof: &ProofState<'_>,
+    ) -> Result<Vec<(Name, Expr, LocalContext)>, NatDefinitionElabError> {
+        let mut visible = vec![(goal.tag.clone(), goal.target.clone(), goal.lctx.clone())];
+        for pending in proof.work.iter().rev() {
+            self.tick()?;
+            match pending {
+                Work::EndScript(..)
+                | Work::EndControl(_)
+                | Work::EndAttempt(_)
+                | Work::EndOptions(_) => break,
+                Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
+                    visible.push((other.tag.clone(), other.target.clone(), other.lctx.clone()));
+                }
+                _ => {}
+            }
+        }
+        Ok(visible)
+    }
+
     pub(super) fn advance_proof<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -650,6 +744,34 @@ impl Context {
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "skip"]))
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "done"]))
                     {
+                        proof.cursor += 1;
+                        continue;
+                    }
+                    if let Syntax::Node { kind, args, .. } = instruction
+                        && kind == &parser_kind(&["Tactic", "traceState"])
+                    {
+                        let [keyword] = args.as_slice() else {
+                            return Err(error(TacticError::MalformedScript));
+                        };
+                        expect_atom(keyword, "trace_state", "trace_state keyword")?;
+                        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceState"])?;
+                        self.traces.push(TraceRecord {
+                            pos: syntax_pos(keyword),
+                            scope: self.source_scope.clone(),
+                            payload: TracePayload::Goals(Vec::new()),
+                        });
+                        proof.cursor += 1;
+                        continue;
+                    }
+                    if let Syntax::Node { kind, args, .. } = instruction
+                        && kind == &parser_kind(&["Tactic", "traceMessage"])
+                    {
+                        let text = self.decode_trace_message(args)?;
+                        self.traces.push(TraceRecord {
+                            pos: syntax_pos(&args[0]),
+                            scope: self.source_scope.clone(),
+                            payload: TracePayload::Message(text),
+                        });
                         proof.cursor += 1;
                         continue;
                     }
@@ -745,20 +867,7 @@ impl Context {
             goal.target = self.instantiate(&goal.target)?;
             let instruction = proof.instructions.get(proof.cursor).copied();
             if self.observes_goal(instruction, proof.extent.as_deref())? {
-                let mut visible = vec![(goal.target.clone(), goal.lctx.clone())];
-                for pending in proof.work.iter().rev() {
-                    self.tick()?;
-                    match pending {
-                        Work::EndScript(..)
-                        | Work::EndControl(_)
-                        | Work::EndAttempt(_)
-                        | Work::EndOptions(_) => break,
-                        Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
-                            visible.push((other.target.clone(), other.lctx.clone()));
-                        }
-                        _ => {}
-                    }
-                }
+                let visible = self.visible_goals(&goal, proof)?;
                 self.observe_goals(&visible)?;
             }
             let Some(instruction) = instruction else {
@@ -791,6 +900,28 @@ impl Context {
                 proof.work.push(Work::Goal(goal));
                 return Ok(ProofAction::Attempt(spec));
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "traceState"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "trace_state", "trace_state keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceState"])?;
+                let visible = self.visible_goals(&goal, proof)?;
+                let observed = self.snapshot_goals(&visible)?;
+                self.traces.push(TraceRecord {
+                    pos: syntax_pos(keyword),
+                    scope: self.source_scope.clone(),
+                    payload: TracePayload::Goals(observed),
+                });
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "traceMessage"]) {
+                let text = self.decode_trace_message(args)?;
+                self.traces.push(TraceRecord {
+                    pos: syntax_pos(&args[0]),
+                    scope: self.source_scope.clone(),
+                    payload: TracePayload::Message(text),
+                });
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {
                 let [keyword, relation, expected] = args.as_slice() else {
@@ -928,9 +1059,8 @@ impl Context {
                 expect_atom(keyword, "by_cases", "decidable case split")?;
                 let name = match expect_null_args(binder, "case evidence name")? {
                     // The pin's unnamed `by_cases p` binds a hygienic `h✝`: usable by
-                    // `assumption`, never by a source `h` ("Unknown identifier `h`"). A
-                    // generated name, as unnamed `intro` binders get, no identifier spells.
-                    [] => self.fresh_name()?,
+                    // `assumption`, never by a source `h` ("Unknown identifier `h`").
+                    [] => self.fresh_inaccessible(&Name::from_components(["h"]))?,
                     [Syntax::Ident { val, .. }, colon]
                         if !val.is_anonymous() && val.parent().is_anonymous() =>
                     {
@@ -1002,7 +1132,7 @@ impl Context {
                 let equation = match binder {
                     None => None,
                     Some(Syntax::Ident { val, .. }) => Some(val.clone()),
-                    Some(_) => Some(self.fresh_name()?),
+                    Some(_) => Some(self.fresh_inaccessible(&Name::from_components(["h"]))?),
                 };
                 return Ok(ProofAction::Eliminate {
                     goal,
@@ -1057,9 +1187,9 @@ impl Context {
                             if kind == &parser_kind(&["Term", "hole"])
                                 && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
                         {
-                            self.fresh_name()?
+                            Name::anonymous()
                         }
-                        None => self.fresh_name()?,
+                        None => Name::anonymous(),
                         _ => return Err(error(TacticError::MalformedScript)),
                     };
                     self.introduce_proof_binder(&mut goal, name)?;
@@ -1327,20 +1457,22 @@ impl Context {
             }
             term.type_ = self.whnf(&term.type_)?;
             let ExprNode::ForallE {
+                binder_name,
                 binder_type,
                 body,
                 binder_info,
-                ..
             } = term.type_.node()
             else {
                 return Err(error(TacticError::ApplyMismatch));
             };
+            let binder_name = binder_name.clone();
             let domain = binder_type.clone();
             let body = body.clone();
             let argument = if *binder_info == BinderInfo::InstImplicit {
                 self.instance_hole(domain)?
             } else {
-                let (argument, subgoal) = self.proof_goal(domain)?;
+                let (argument, mut subgoal) = self.proof_goal(domain)?;
+                subgoal.tag = sanitize_goal_tag(&binder_name);
                 arguments.push(subgoal);
                 argument
             };
@@ -1357,6 +1489,23 @@ impl Context {
             .any(|id| !self.txn.mvars.is_assigned(id))
         {
             return Err(error(TacticError::ApplyMismatch));
+        }
+        let unassigned_count = arguments
+            .iter()
+            .filter(|subgoal| !self.txn.mvars.is_assigned(&subgoal.id))
+            .count();
+        if unassigned_count == 1 {
+            for subgoal in &mut arguments {
+                if !self.txn.mvars.is_assigned(&subgoal.id) {
+                    subgoal.tag = goal.tag.clone();
+                }
+            }
+        } else if !goal.tag.is_anonymous() {
+            for subgoal in &mut arguments {
+                if !self.txn.mvars.is_assigned(&subgoal.id) {
+                    subgoal.tag = append_goal_tag(&goal.tag, &subgoal.tag);
+                }
+            }
         }
         proof.work.push(Work::Close(goal, term.value));
         // The pin's apply returns its new goals non-dependent-first

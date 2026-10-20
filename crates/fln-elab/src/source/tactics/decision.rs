@@ -305,9 +305,11 @@ impl Context {
             value: goal.target.clone(),
             type_: target_type,
         })?;
-        let (yes, yes_goal) = self.decision_branch(&name, proposition.clone(), &goal.target)?;
+        let (yes, mut yes_goal) = self.decision_branch(&name, proposition.clone(), &goal.target)?;
+        yes_goal.tag = append_goal_tag(&goal.tag, &Name::from_components(["pos"]));
         let negative = Expr::app(constant("Not", vec![]), proposition.clone());
-        let (no, no_goal) = self.decision_branch(&name, negative, &goal.target)?;
+        let (no, mut no_goal) = self.decision_branch(&name, negative, &goal.target)?;
+        no_goal.tag = append_goal_tag(&goal.tag, &Name::from_components(["neg"]));
         let value = apps(
             constant("dite", vec![universe]),
             [goal.target.clone(), proposition, dictionary, yes, no],

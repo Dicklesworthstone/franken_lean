@@ -32,7 +32,8 @@ impl Context {
             }
         }
         let target = self.instantiate(&annotation.value)?;
-        let (witness, child) = self.proof_goal(target.clone())?;
+        let (witness, mut child) = self.proof_goal(target.clone())?;
+        child.tag = goal.tag.clone();
 
         // Retain the full written target as a checked annotation. Erasing it
         // after the conversion probe could erase an invalid subterm that the
