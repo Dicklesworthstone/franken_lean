@@ -217,7 +217,7 @@ impl Context {
             .filter(|name| !self.source_scope.frontier_recursors && !compiles(name))
             .cloned()
             .collect();
-        let dependencies = dependencies::Dependencies::read(self)?;
+        let mut dependencies = dependencies::Dependencies::read(self)?;
         // Untagged axioms can still lack executable code. An empty registry
         // must not bypass the typed walk of a computational declaration.
         // Proof declarations and type formers have no runtime body. This is
@@ -233,7 +233,7 @@ impl Context {
             }
         }
         let saved = self.txn.lctx.clone();
-        let result = self.check_compiled_value(&term.value, &named, &dependencies);
+        let result = self.check_compiled_value(&term.value, &named, &mut dependencies);
         // A refusal may unwind past pending Restore tasks. Temporary binders
         // are analysis only and must never escape, including on budget stops.
         self.txn.lctx = saved;
@@ -261,7 +261,7 @@ impl Context {
         &mut self,
         value: &Expr,
         named: &[Name],
-        dependencies: &dependencies::Dependencies,
+        dependencies: &mut dependencies::Dependencies,
     ) -> Result<(), NatDefinitionElabError> {
         enum Work {
             Visit(Expr),
@@ -306,7 +306,7 @@ impl Context {
                     args.reverse();
                     let mut erased_params = 0;
                     if let ExprNode::Const { name, levels } = head.node() {
-                        dependencies.check(name)?;
+                        dependencies.check_compiled(self, name)?;
                         // Datatype parameters are static in both construction
                         // and elimination. Source match/cases lower to Rec here,
                         // so a data-valued parameter must not regain an executable

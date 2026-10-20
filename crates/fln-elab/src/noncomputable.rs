@@ -27,6 +27,12 @@ pub enum NoncomputableError {
     Limit,
     UnknownDeclaration(Name),
     Duplicate(Name),
+    /// A compiler equation could not justify an executable dependency.
+    /// This is invalid computability evidence, never a suppressible compiler failure.
+    CompilerEquation {
+        theorem: Name,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for NoncomputableError {
@@ -34,6 +40,11 @@ impl std::fmt::Display for NoncomputableError {
         match self {
             Self::Malformed => f.write_str("malformed native noncomputable journal"),
             Self::Limit => f.write_str("native noncomputable journal resource limit"),
+            Self::CompilerEquation { theorem, reason } => write!(
+                f,
+                "compiler equation `{}` is unavailable: {reason}",
+                theorem.to_display_string()
+            ),
             Self::UnknownDeclaration(name) => write!(
                 f,
                 "a noncomputable tag names {}, which is not admitted",

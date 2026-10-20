@@ -6,12 +6,15 @@ use super::*;
 use crate::externs::{ExternReadError, ExternTable};
 use crate::implemented_by::{ImplementedByReadError, ImplementedByTable};
 
+mod well_founded;
+
 #[derive(Default)]
 pub(super) struct Dependencies {
     environment: fln_env::environment::Environment,
     names: BTreeSet<Name>,
     implemented_by: ImplementedByTable,
     externs: ExternTable,
+    well_founded: well_founded::Cache,
 }
 
 impl Dependencies {
@@ -65,7 +68,34 @@ impl Dependencies {
             names,
             implemented_by,
             externs,
+            well_founded: well_founded::Cache::default(),
         })
+    }
+
+    /// Check the terminal executable dependency without rewriting the checked term.
+    /// Ordinary heads retain their existing fast path and metadata semantics.
+    pub(super) fn check_compiled(
+        &mut self,
+        context: &mut Context,
+        declaration: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        let requested = self
+            .implemented_by
+            .implementation(declaration)
+            .unwrap_or(declaration);
+        if !well_founded::recognizes(requested) {
+            return self.check(declaration);
+        }
+        let (selected, staged) = self.well_founded.resolve(
+            context,
+            &self.environment,
+            &self.implemented_by,
+            &self.externs,
+            requested,
+        )?;
+        self.check(&selected)?;
+        self.well_founded = staged;
+        Ok(())
     }
 
     pub(super) fn check(&self, declaration: &Name) -> Result<(), NatDefinitionElabError> {
