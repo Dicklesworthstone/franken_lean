@@ -120,8 +120,9 @@ const REFUSALS: &[&str] = &[
     "def bad (n : Nat) (xs : List Nat) : Nat := if h : 0 < n then bad 0 (0 :: xs) else 0\ndecreasing_by\n  have copied : List Nat := xs\n  exact h",
     // This bounded supplied-script path cannot skip earlier non-Nat SizeOf candidates.
     "def unsupportedLeadingSizeOf (xs : List Nat) (n : Nat) : Nat := if h : 0 < n then unsupportedLeadingSizeOf (0 :: xs) 0 else 0\ndecreasing_by exact h",
-    // General lexicographic inference remains a separate capability.
-    "def lexicographic (a b : Nat) : Nat := if h : 0 < b then lexicographic a (b - 1) else if h : 0 < a then lexicographic (a - 1) 10 else 0",
+    // The pin's search also tries `n - i` for the hypothesis `i < n` (accepted there,
+    // `termination_by (b, n - i)`); this one does not.
+    "def needsDifference (i n b : Nat) : Nat := if hb : 0 < b then needsDifference i n (b - 1) else if h : i < n then needsDifference (i + 1) n b else 0",
     // Both measure selection and the final relation honor instance shadowing.
     "def bad [SizeOf Nat] (n : Nat) : Nat := if h : 0 < n then bad 0 else 0\ndecreasing_by exact h",
     "local instance : SizeOf Nat := ⟨fun _ => 0⟩\ndef bad (n : Nat) : Nat := if h : 0 < n then bad 0 else 0\ndecreasing_by exact h",

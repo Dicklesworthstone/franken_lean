@@ -432,12 +432,31 @@ fn native_automatic_well_founded_termination() {
                 import_closure_for(&lib, &["Init.WFTactics", "Init.Omega", "Init.WFComputable"]);
             well_founded_inference::assert_automatic_termination(&base);
             well_founded_inference::assert_search_stops(&base);
-            well_founded_lex::assert_automatic_lexicographic_proofs(&base);
-            well_founded_lex::assert_automatic_lexicographic_refusals(&base);
         })
         .expect("spawn native inference checking thread")
         .join()
         .expect("native well-founded inference checks finish");
+}
+
+/// Product measures, supplied or inferred, in the same closure. A separate test, so a
+/// failure among the single-measure programs above does not hide these.
+#[test]
+fn native_lexicographic_well_founded_termination() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base =
+                import_closure_for(&lib, &["Init.WFTactics", "Init.Omega", "Init.WFComputable"]);
+            well_founded_lex::assert_automatic_lexicographic_proofs(&base);
+            well_founded_lex::assert_automatic_lexicographic_refusals(&base);
+        })
+        .expect("spawn native lexicographic checking thread")
+        .join()
+        .expect("native lexicographic checks finish");
 }
 
 #[test]
