@@ -910,7 +910,7 @@ impl Engine {
                     .map_err(EngineExecutionError::Frontend)?
             {
                 let elaborated = match elaboration_outcome(
-                    fln_elab::source::scope::elaborate_definition_with_effects(
+                    fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                         parsed.syntax(),
                         self.environment(),
                         limits.kernel,
