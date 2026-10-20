@@ -569,12 +569,18 @@ impl Preparation<'_> {
                             expr: receiver,
                         } => {
                             let mut selector = struct_name.clone();
-                            if let Some(type_) = self.projection_receiver_type(receiver, &locals)?
-                                && let Some((shape, _)) =
-                                    self.projection_slot(&type_, struct_name, *idx)?
-                                && self.value_type(&shape.source)? == Some(ValueType::Constructor)
-                            {
-                                selector = shape.name;
+                            if let Some(type_) = self.projection_receiver_type(receiver, &locals)? {
+                                // Inlining can introduce a projection whose receiver's
+                                // parameters still refer to an existential type field.
+                                // Select the uniform layout before discarding that context.
+                                let runtime_type = self.erase_hidden_types(&type_, &locals)?;
+                                if let Some((shape, _)) =
+                                    self.projection_slot(&runtime_type, struct_name, *idx)?
+                                    && self.value_type(&shape.source)?
+                                        == Some(ValueType::Constructor)
+                                {
+                                    selector = shape.name;
+                                }
                             }
                             tasks.push(ProjectionFrame::Projection(selector, *idx));
                             tasks.push(ProjectionFrame::Visit(receiver.clone()));

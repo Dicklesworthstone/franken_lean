@@ -161,3 +161,108 @@ fn definitions_using_generated_fields_are_compiled_without_mutating_the_base() {
     );
     assert_eq!(engine().logical_root(&KVMap::new()), root);
 }
+
+const HIDDEN_LAYOUTS: &str = r#"
+structure LayoutCell (A : Type) where
+  value : A
+structure LayoutSlot (A : Type) where
+  value : Option A
+structure LayoutPacket where
+  carrier : Type
+  value : carrier
+  handler : LayoutSlot (carrier -> Nat)
+"#;
+
+#[test]
+fn projection_only_functions_discover_hidden_container_layouts() {
+    returns(
+        &format!(
+            r#"{HIDDEN_LAYOUTS}
+def read (p : LayoutPacket) : Nat := match p.handler.value with
+  | .none => 0
+  | .some f => f p.value
+def packet : LayoutPacket :=
+  {{ carrier := Nat, value := 17,
+     handler := LayoutSlot.mk (Option.some (fun n => n + 25)) }}
+#eval read packet"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn nested_parameterized_fields_preserve_hidden_callback_signatures() {
+    returns(
+        &format!(
+            r#"{HIDDEN_LAYOUTS}
+structure NestedLayouts where
+  carrier : Type
+  value : carrier
+  handler : LayoutCell (LayoutCell (carrier -> Nat))
+def read (p : NestedLayouts) : Nat := p.handler.value.value p.value
+def packet : NestedLayouts :=
+  {{ carrier := String, value := "abcd",
+     handler := LayoutCell.mk (LayoutCell.mk (fun s => s.length + 38)) }}
+#eval read packet"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn layout_selection_keeps_distinct_specializations_of_the_same_family() {
+    returns(
+        &format!(
+            r#"{HIDDEN_LAYOUTS}
+structure MixedLayouts where
+  carrier : Type
+  value : carrier
+  direct : LayoutCell Nat
+  indirect : LayoutCell (carrier -> Nat)
+def read (p : MixedLayouts) : Nat := p.direct.value + p.indirect.value p.value
+def packet : MixedLayouts :=
+  {{ carrier := String, value := "abcd", direct := LayoutCell.mk 30,
+     indirect := LayoutCell.mk (fun s => s.length + 8) }}
+#eval read packet"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn hidden_layouts_survive_let_and_captured_lambda_telescope() {
+    returns(
+        &format!(
+            r#"{HIDDEN_LAYOUTS}
+def read (p : LayoutPacket) : Nat :=
+  let slot : LayoutSlot (p.carrier -> Nat) := p.handler
+  (fun (s : LayoutSlot (p.carrier -> Nat)) =>
+    match s.value with
+    | .none => 0
+    | .some f => f p.value) slot
+def packet : LayoutPacket :=
+  {{ carrier := Nat, value := 17,
+     handler := LayoutSlot.mk (Option.some (fun n => n + 25)) }}
+#eval read packet"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn hidden_layouts_keep_dependent_proof_slots_erased() {
+    returns(
+        r#"structure CheckedCell (A : Type) where
+  value : A
+  evidence : value = value
+  measure : A -> Nat
+structure CheckedLayout where
+  carrier : Type
+  cell : CheckedCell carrier
+def read (p : CheckedLayout) : Nat := p.cell.measure p.cell.value
+def packet : CheckedLayout :=
+  { carrier := Nat, cell := { value := 40, evidence := rfl, measure := fun n => n + 2 } }
+#eval read packet"#,
+        42,
+    );
+}
