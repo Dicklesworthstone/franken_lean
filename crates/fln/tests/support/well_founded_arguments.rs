@@ -141,6 +141,18 @@ termination_by b
 decreasing_by exact h"#,
         "packedCalls 0 1 42",
     ),
+    (
+        // Unitlike eta at types that differ only in a proof: the pin fixes both
+        // `p` and `q` and recurses on `n` alone (no `_unary`).
+        "unitTypeProofs",
+        r#"structure Ghost (p : True) : Type where
+
+def unitTypeProofs (h : True) (p : Ghost h) (q : Ghost True.intro) (n : Nat) : Nat :=
+  if hn : 0 < n then unitTypeProofs h q q (n - 1) + 1 else 0
+termination_by n
+decreasing_by exact Nat.sub_lt hn (Nat.succ_pos 0)"#,
+        "unitTypeProofs True.intro Ghost.mk Ghost.mk 42",
+    ),
 ];
 
 const DEPENDENT_PROGRAMS: &[(&str, &str, &str)] = &[
@@ -232,6 +244,7 @@ const REFUSALS: &[&str] = &[
     // Reducible record eta and unitlike equality also remove fixed parameters.
     "def bad (p : Nat × Nat) (n : Nat) : Nat := if h : 0 < n then bad (p.1, p.2) (n - 1) + 1 else 0\ntermination_by n\ndecreasing_by\n  have unused : Nat × Nat := p\n  exact Nat.sub_lt h (Nat.succ_pos 0)",
     "def bad (p : True) (n : Nat) : Nat := if h : 0 < n then bad True.intro (n - 1) + 1 else 0\ntermination_by n\ndecreasing_by\n  have unused : True := p\n  exact Nat.sub_lt h (Nat.succ_pos 0)",
+    "structure Ghost (p : True) : Type where\n\ndef bad (h : True) (p : Ghost h) (q : Ghost True.intro) (n : Nat) : Nat :=\n  if hn : 0 < n then bad h q q (n - 1) + 1 else 0\ntermination_by n\ndecreasing_by\n  have unused : Ghost True.intro := q\n  exact Nat.sub_lt hn (Nat.succ_pos 0)",
     // Only identical complete recursive applications share an obligation.
     "def bad (a b : Nat) : Nat := if h : 0 < b then bad b 0 + bad (b + 1) 0 + 42 else 0\ntermination_by b\ndecreasing_by exact h",
     "def bad (a b : Nat) : Nat := if h : 0 < b then bad b 0 + bad b 0 + 42 else 0\ntermination_by b\ndecreasing_by\n  exact h\n  exact h",
@@ -274,15 +287,6 @@ decreasing_by
   have retained : P := p
   exact Nat.sub_lt h (Nat.succ_pos 0)"#;
 
-// Unitlike eta must establish equality of parameterized types too. Missing
-// proof conversion in that comparison cannot justify treating p as varying.
-const UNIT_PROOF_CONVERSION: &str = r#"structure Ghost (p : True) : Type where
-
-def unitTypeProofs (h : True) (p : Ghost h) (q : Ghost True.intro) (n : Nat) : Nat :=
-  if hn : 0 < n then unitTypeProofs h q q (n - 1) + 1 else 0
-termination_by n
-decreasing_by exact Nat.sub_lt hn (Nat.succ_pos 0)"#;
-
 pub(super) fn assert_argument_programs(base: &Engine) {
     let mut failures = Vec::new();
     // Every accepted source computes 42 on the live v4.32.0 pin; each refusal
@@ -324,18 +328,15 @@ pub(super) fn assert_argument_programs(base: &Engine) {
             failures.push(format!("incorrectly accepted: {source}"));
         }
     }
-    for (source, diagnostic) in [
-        (PROOF_CONVERSION, "FixedArgumentConversionUnsupported"),
-        (UNIT_PROOF_CONVERSION, "FixedArgumentConversionUnsupported"),
-    ] {
-        match base.check_source_files(
-            &[source.as_bytes()],
-            &KVMap::new(),
-            SourceCheckLimits::new(super::limits()),
-        ) {
-            Err(error) if format!("{error:?}").contains(diagnostic) => {}
-            result => failures.push(format!("{diagnostic} refusal: {result:?}")),
-        }
+    match base.check_source_files(
+        &[PROOF_CONVERSION.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(super::limits()),
+    ) {
+        Err(error) if format!("{error:?}").contains("FixedArgumentConversionUnsupported") => {}
+        result => failures.push(format!(
+            "FixedArgumentConversionUnsupported refusal: {result:?}"
+        )),
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
