@@ -504,6 +504,54 @@ mod tests {
         Expr::forall_e(Name::anonymous(), domain, range, BinderInfo::Default)
     }
 
+    /// `apply` compares a lemma's `∀`-prefixes only with a target that could be a `∀`,
+    /// as the pin's `MVarId.apply` tries only argument counts from `numArgs` less the
+    /// target's own. Against the proposition `q`, `p₀ → … → p₂₃ → q` is compared once, at
+    /// its full application, and leaves its 24 premises as goals.
+    #[test]
+    fn apply_compares_only_the_full_application_with_a_rigid_target() {
+        let mut context = context();
+        let q = proposition(&mut context, "q");
+        let premises: Vec<Expr> = (0..24)
+            .map(|index| proposition(&mut context, &format!("p{index}")))
+            .collect();
+        let statement = premises
+            .iter()
+            .rev()
+            .fold(q.clone(), |body, premise| arrow(premise.clone(), body));
+        let lemma = local(&mut context, "lemma", statement.clone());
+        let (_, goal) = context.proof_goal(q).unwrap();
+        let mut proof = ProofState {
+            extent: None,
+            saved: goal.lctx.clone(),
+            target: goal.target.clone(),
+            root: Expr::mvar(goal.id.clone()),
+            instructions: Vec::new(),
+            cursor: 0,
+            work: Vec::new(),
+            controls: Vec::new(),
+        };
+        let instance_start = context.instance_goals.len();
+        let before = context.txn.budget.heartbeats_consumed;
+        context
+            .apply_proof_term(
+                &mut proof,
+                goal,
+                Typed {
+                    value: lemma,
+                    type_: statement,
+                },
+                instance_start,
+            )
+            .unwrap();
+        // Comparing each of the 25 prefixes cost 8,347 heartbeats; the full application
+        // alone costs about 400.
+        let spent = context.txn.budget.heartbeats_consumed - before;
+        assert!(spent < 1_000, "{spent} heartbeats");
+        // The close and the 24 premise goals.
+        assert_eq!(proof.work.len(), 25);
+    }
+
     #[test]
     fn search_constructs_a_chain_of_local_applications() {
         let mut context = context();

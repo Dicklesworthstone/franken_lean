@@ -1399,6 +1399,22 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         let mut arguments = Vec::new();
         let mut binder_infos = Vec::new();
+        // The pin's `MVarId.apply` tries only the argument counts from `numArgs` less the
+        // target's own (`Lean/Meta/Tactic/Apply.lean`). So a conclusion that is still a `∀` is
+        // never compared with a target whose head normal form is neither a `∀` nor headed by
+        // a metavariable: no assignment makes such a target a `∀`. Each failed
+        // `apply PSigma.Lex.right` of the default `decreasing_by` compared every `∀`-prefix of
+        // the lemma with `x < x + 1`, unfolding the target each time.
+        let target = self.whnf(&goal.target)?;
+        let mut target_head = &target;
+        while let ExprNode::App { f, .. } = target_head.node() {
+            self.tick()?;
+            target_head = f;
+        }
+        let rigid_target = !matches!(
+            target_head.node(),
+            ExprNode::ForallE { .. } | ExprNode::MVar { .. }
+        );
         loop {
             self.tick()?;
             let mut budget = UnificationBudget::new(self.kernel);
@@ -1412,7 +1428,11 @@ impl Context {
                 // conclusions without opening irreducible definitions.
                 budget.transparency = UnificationTransparency::Default;
             }
-            if self.proof_types_match_with_budget(&term.type_, &goal.target, budget)? {
+            let premise_left =
+                rigid_target && matches!(term.type_.node(), ExprNode::ForallE { .. });
+            if !premise_left
+                && self.proof_types_match_with_budget(&term.type_, &goal.target, budget)?
+            {
                 break;
             }
             term.type_ = self.whnf(&term.type_)?;
