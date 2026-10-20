@@ -126,6 +126,41 @@ fn constructor_goals_keep_their_case_tags_and_focus_boundaries() {
     );
 }
 
+/// The pinned lean prints exactly these states. `apply` leaves the goal `?s a b` with
+/// `?s := fun a b => a = b`, which `instantiateMVars` beta-reduces; its only unassigned
+/// new goal inherits the untagged parent's tag, so no `case h`. Under the tagged `left`,
+/// `appendParentTag` prefixes each unassigned goal, but reads the binder info by the
+/// goal's position among them: `three`'s leading instance binder leaves `h` unprefixed.
+#[test]
+fn apply_goals_are_beta_reduced_and_tagged_as_the_pin_tags_them() {
+    let base = engine();
+    assert_eq!(
+        texts(&run(
+            &base,
+            "inductive Rel (s : Nat → Nat → Prop) : Nat → Nat → Prop where\n  | intro {a b : Nat} : s a b → Rel s a b\n\nexample (y : Nat) : Rel (fun a b => a = b) y y := by\n  apply Rel.intro\n  trace_state\n  rfl\n"
+        )),
+        ["y : Nat\n⊢ y = y"]
+    );
+    let pair = "theorem two {p : Prop} (h : p) (k : p) : p ∧ p := ⟨h, k⟩\ntheorem three [Inhabited Nat] {p : Prop} (h : p) (k : p) : p ∧ p := ⟨h, k⟩\n";
+    let goal = "example (y : Nat) : (y = y ∧ y = y) ∧ True := by\n  constructor\n  · apply NAME\n    trace_state\n    all_goals rfl\n  · exact True.intro\n";
+    let state =
+        |first: &str| format!("case {first}\ny : Nat\n⊢ y = y\n\ncase left.k\ny : Nat\n⊢ y = y");
+    assert_eq!(
+        texts(&run(
+            &base,
+            &format!("{pair}{}", goal.replace("NAME", "two"))
+        )),
+        [state("left.h")]
+    );
+    assert_eq!(
+        texts(&run(
+            &base,
+            &format!("{pair}{}", goal.replace("NAME", "three"))
+        )),
+        [state("h")]
+    );
+}
+
 #[test]
 fn automatic_and_shadowed_introductions_have_distinct_readable_names() {
     let base = engine();

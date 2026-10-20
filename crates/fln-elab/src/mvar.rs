@@ -147,6 +147,59 @@ fn expression_children(expr: &Expr) -> [Option<&Expr>; 3] {
     }
 }
 
+/// `f a₁ … aₙ`'s arguments, in order, when its head `f` is an assigned metavariable.
+fn assigned_head<'a>(
+    assignments: &'a HashMap<MVarId, MetavarAssignment>,
+    expr: &'a Expr,
+) -> Option<(&'a MetavarAssignment, Vec<&'a Expr>)> {
+    let mut arguments = Vec::new();
+    let mut head = expr;
+    while let ExprNode::App { f, a } = head.node() {
+        arguments.push(a);
+        head = f;
+    }
+    let ExprNode::MVar { id } = head.node() else {
+        return None;
+    };
+    if arguments.is_empty() {
+        return None;
+    }
+    arguments.reverse();
+    Some((assignments.get(id)?, arguments))
+}
+
+/// The pin's `apply_beta` (`kernel/instantiate.cpp`) with `preserve_data = false` and
+/// `zeta = true`: each leading lambda of `f` consumes one argument, a `let` or metadata
+/// on that spine is removed while arguments remain, and the arguments left over are
+/// applied to the result. The result is not reduced further.
+fn apply_beta(f: &Expr, arguments: &[Expr]) -> Result<Expr, fln_core::expr::TooManyBoundVars> {
+    let mut term = f.clone();
+    let mut consumed = 0;
+    loop {
+        match term.node() {
+            ExprNode::Lam { body, .. } => {
+                consumed += 1;
+                if consumed == arguments.len() {
+                    return body.subst_loose(0, arguments);
+                }
+                term = body.clone();
+            }
+            ExprNode::LetE { value, body, .. } => {
+                term = body.subst_loose(0, std::slice::from_ref(value))?;
+            }
+            ExprNode::MData { expr, .. } => term = expr.clone(),
+            _ => {
+                let head = term.subst_loose(0, &arguments[..consumed])?;
+                return Ok(arguments[consumed..]
+                    .iter()
+                    .fold(head, |function, argument| {
+                        Expr::app(function, argument.clone())
+                    }));
+            }
+        }
+    }
+}
+
 impl MetavarStore {
     pub fn new() -> Self {
         Self::default()
@@ -324,6 +377,12 @@ impl MetavarStore {
     /// Node addresses are local memo keys only, never ordering or persisted
     /// identity. Input roots and assignments stay borrowed for the whole walk,
     /// so an input allocation cannot disappear and have its address reused.
+    ///
+    /// An application whose head is an assigned metavariable is beta-reduced
+    /// against its instantiated arguments, as the pin's `instantiateMVars`
+    /// (`instantiate_direct_fn::visit_app`): after `apply Prod.Lex.right`, the
+    /// goal `?s y (y + 1)` with `?s := fun a b => a < b` is `y < y + 1`, not a
+    /// beta redex that `omega` and the goal display then see.
     #[allow(clippy::too_many_lines)]
     pub fn instantiate(&self, expr: &Expr) -> Expr {
         if self.assignments.is_empty() || !expr.has_expr_mvar() {
@@ -365,6 +424,20 @@ impl MetavarStore {
                 self.assignments
                     .get(id)
                     .map_or_else(|| current.clone(), |assignment| child(&assignment.expr))
+            } else if let Some((assignment, arguments)) =
+                assigned_head(&self.assignments, current)
+                // Any other head is the structural rebuild below, which keeps sharing.
+                && matches!(
+                    child(&assignment.expr).node(),
+                    ExprNode::Lam { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
+                )
+            {
+                let head = child(&assignment.expr);
+                let arguments: Vec<Expr> = arguments.into_iter().map(child).collect();
+                // A bound-variable index past `u32` cannot be substituted; the
+                // application itself is definitionally the same term.
+                apply_beta(&head, &arguments)
+                    .unwrap_or_else(|_| arguments.into_iter().fold(head, Expr::app))
             } else if expression_children(current)
                 .into_iter()
                 .flatten()
@@ -577,6 +650,101 @@ mod tests {
             .assign(id, value.clone(), AssignmentJustification::DirectDefEq)
             .unwrap();
         assert_eq!(store.instantiate(&input), build(value));
+    }
+
+    /// The pin's `instantiateMVars` beta-reduces an assigned head (`apply_beta` with
+    /// `preserve_data = false`, `zeta = true`), and only that head.
+    #[test]
+    fn an_assigned_head_is_beta_reduced_against_its_arguments() {
+        let constant = |name: &str| Expr::const_(Name::from_components([name]), Vec::new());
+        let bvar = |index: u32| Expr::bvar(index).unwrap();
+        let lam = |body: Expr| {
+            Expr::lam(
+                Name::from_components(["x"]),
+                constant("T"),
+                body,
+                BinderInfo::Default,
+            )
+        };
+        let apps = |head: Expr, arguments: &[Expr]| {
+            arguments.iter().fold(head, |function, argument| {
+                Expr::app(function, argument.clone())
+            })
+        };
+        let (a, b, c) = (constant("a"), constant("b"), constant("c"));
+        let reduce = |value: Expr, arguments: &[Expr]| {
+            let mut store = MetavarStore::new();
+            let id = declare(&mut store, "f");
+            store
+                .assign(id.clone(), value, AssignmentJustification::DirectDefEq)
+                .unwrap();
+            store.instantiate(&apps(Expr::mvar(id), arguments))
+        };
+        // Each lambda consumes one argument, in order.
+        assert_eq!(
+            reduce(
+                lam(lam(apps(constant("g"), &[bvar(0), bvar(1)]))),
+                &[a.clone(), b.clone()]
+            ),
+            apps(constant("g"), &[b.clone(), a.clone()]),
+        );
+        // Arguments left over are applied to the result.
+        assert_eq!(
+            reduce(
+                lam(Expr::app(constant("g"), bvar(0))),
+                &[a.clone(), b.clone()]
+            ),
+            apps(constant("g"), &[a.clone(), b.clone()]),
+        );
+        // A `let` and metadata on the spine are removed while arguments remain.
+        let spine = metadata(Expr::let_e(
+            Name::from_components(["z"]),
+            constant("T"),
+            c.clone(),
+            lam(apps(constant("h"), &[bvar(1), bvar(0)])),
+            false,
+        ));
+        assert_eq!(
+            reduce(spine, std::slice::from_ref(&a)),
+            apps(constant("h"), &[c, a.clone()]),
+        );
+        // The result is not reduced further.
+        let inner = Expr::app(lam(bvar(0)), bvar(0));
+        assert_eq!(
+            reduce(lam(inner), std::slice::from_ref(&a)),
+            Expr::app(lam(bvar(0)), a.clone()),
+        );
+        // A non-lambda assignment is applied as it is.
+        assert_eq!(
+            reduce(constant("g"), std::slice::from_ref(&a)),
+            Expr::app(constant("g"), a.clone()),
+        );
+        // An assignment chain is followed before reducing; an unassigned head is kept.
+        let mut store = MetavarStore::new();
+        let f = declare(&mut store, "f");
+        let g = declare(&mut store, "g");
+        let open = declare(&mut store, "open");
+        store
+            .assign(
+                f.clone(),
+                Expr::mvar(g.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        store
+            .assign(g, lam(bvar(0)), AssignmentJustification::DirectDefEq)
+            .unwrap();
+        assert_eq!(
+            store.instantiate(&Expr::app(Expr::mvar(f.clone()), a.clone())),
+            a
+        );
+        assert_eq!(
+            store.instantiate(&Expr::app(
+                Expr::mvar(open.clone()),
+                Expr::app(Expr::mvar(f), b.clone())
+            )),
+            Expr::app(Expr::mvar(open), b),
+        );
     }
 
     #[test]

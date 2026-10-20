@@ -1398,7 +1398,7 @@ impl Context {
         order: ApplyGoalOrder,
     ) -> Result<(), NatDefinitionElabError> {
         let mut arguments = Vec::new();
-        let mut new_arguments = 0usize;
+        let mut binder_infos = Vec::new();
         loop {
             self.tick()?;
             let mut budget = UnificationBudget::new(self.kernel);
@@ -1429,7 +1429,7 @@ impl Context {
             let domain = binder_type.clone();
             let body = body.clone();
             let tag = binder_name.clone();
-            new_arguments += 1;
+            binder_infos.push(*binder_info);
             let argument = if *binder_info == BinderInfo::InstImplicit {
                 self.instance_hole(domain)?
             } else {
@@ -1460,20 +1460,32 @@ impl Context {
                 .get(&goal.id)
                 .cloned()
                 .unwrap_or_else(Name::anonymous);
-            for subgoal in &arguments {
-                let child = self
-                    .goal_tags
-                    .get(&subgoal.id)
-                    .cloned()
-                    .unwrap_or_else(Name::anonymous);
-                self.goal_tags.insert(
-                    subgoal.id.clone(),
-                    if new_arguments == 1 {
-                        parent.clone()
-                    } else {
-                        super::trace::append_tag(&parent, &child)
-                    },
-                );
+            // The pin's `appendParentTag` (Lean/Meta/Tactic/Apply.lean) reads only the new
+            // goals unification left unassigned: a single one inherits the parent's tag, so
+            // `apply Prod.Lex.right` on an untagged goal leaves no `case h`; otherwise, under
+            // a tagged parent, each is suffixed. Instance holes are all assigned here (above).
+            // The pin indexes the binder infos by position among the unassigned goals, not by
+            // each goal's own binder; that is kept.
+            let unassigned: Vec<MVarId> = arguments
+                .iter()
+                .filter(|subgoal| !self.txn.mvars.is_assigned(&subgoal.id))
+                .map(|subgoal| subgoal.id.clone())
+                .collect();
+            if let [only] = unassigned.as_slice() {
+                self.goal_tags.insert(only.clone(), parent);
+            } else if !parent.is_anonymous() {
+                for (index, id) in unassigned.iter().enumerate() {
+                    if binder_infos.get(index) == Some(&BinderInfo::InstImplicit) {
+                        continue;
+                    }
+                    let child = self
+                        .goal_tags
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(Name::anonymous);
+                    self.goal_tags
+                        .insert(id.clone(), super::trace::append_tag(&parent, &child));
+                }
             }
         }
         proof.work.push(Work::Close(goal, term.value));
