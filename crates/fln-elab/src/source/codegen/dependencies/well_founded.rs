@@ -9,11 +9,19 @@ use fln_env::environment::Environment;
 mod tests;
 
 const EQUATIONS: [(&str, &str, &str); 5] = [
-    ("WellFounded.fix", "WellFounded.fixC", "WellFounded.fix_eq_fixC"),
+    (
+        "WellFounded.fix",
+        "WellFounded.fixC",
+        "WellFounded.fix_eq_fixC",
+    ),
     ("Acc.rec", "Acc.recC", "Acc.rec_eq_recC"),
     ("Acc.ndrec", "Acc.ndrecC", "Acc.ndrec_eq_ndrecC"),
     ("Acc.ndrecOn", "Acc.ndrecOnC", "Acc.ndrecOn_eq_ndrecOnC"),
-    ("WellFounded.fixF", "WellFounded.fixFC", "WellFounded.fixF_eq_fixFC"),
+    (
+        "WellFounded.fixF",
+        "WellFounded.fixFC",
+        "WellFounded.fixF_eq_fixFC",
+    ),
 ];
 
 #[derive(Clone, Default)]
@@ -31,8 +39,10 @@ fn n(text: &str) -> Name {
 
 fn equation_index(source: &Name) -> Option<usize> {
     static SOURCES: std::sync::OnceLock<[Name; EQUATIONS.len()]> = std::sync::OnceLock::new();
-    SOURCES.get_or_init(|| EQUATIONS.map(|(from, _, _)| n(from)))
-        .iter().position(|candidate| source == candidate)
+    SOURCES
+        .get_or_init(|| EQUATIONS.map(|(from, _, _)| n(from)))
+        .iter()
+        .position(|candidate| source == candidate)
 }
 
 pub(super) fn recognizes(source: &Name) -> bool {
@@ -153,11 +163,17 @@ fn validate_equation(
     arguments.reverse();
     let (
         ExprNode::Const { name: from, levels },
-        ExprNode::Const { name: to, levels: other },
-    ) = (arguments[1].node(), arguments[2].node()) else {
+        ExprNode::Const {
+            name: to,
+            levels: other,
+        },
+    ) = (arguments[1].node(), arguments[2].node())
+    else {
         return Err(invalid(&theorem.name, "the endpoints are not constants"));
     };
-    if from != source || to != target || levels != other
+    if from != source
+        || to != target
+        || levels != other
         || levels.len() != theorem.level_params.len()
     {
         return Err(invalid(&theorem.name, "different endpoints or universes"));
@@ -165,7 +181,8 @@ fn validate_equation(
     let mut parameters = HashSet::new();
     for parameter in &theorem.level_params {
         context.tick()?;
-        parameters.try_reserve(1)
+        parameters
+            .try_reserve(1)
             .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
         if !parameters.insert(Level::param(parameter.clone())) {
             return Err(invalid(&theorem.name, "a universe parameter is repeated"));
@@ -174,7 +191,10 @@ fn validate_equation(
     for level in levels {
         context.tick()?;
         if !parameters.remove(level) {
-            return Err(invalid(&theorem.name, "universes are not a parameter bijection"));
+            return Err(invalid(
+                &theorem.name,
+                "universes are not a parameter bijection",
+            ));
         }
     }
     for endpoint in [source, target] {
@@ -191,7 +211,10 @@ fn validate_equation(
         };
         let base = info.constant_val();
         if !safe || base.level_params.len() != levels.len() {
-            return Err(invalid(&theorem.name, "unsupported endpoint safety or universe arity"));
+            return Err(invalid(
+                &theorem.name,
+                "unsupported endpoint safety or universe arity",
+            ));
         }
         let signature = crate::universe::parameters::instantiate(
             || context.tick(),
@@ -231,16 +254,44 @@ fn same_expression(
             (_, ExprNode::MData { expr, .. }) => pending.push((a, expr)),
             (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
             (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) if a == b => {}
-            (ExprNode::Const { name: a, levels: al }, ExprNode::Const { name: b, levels: bl })
-                if a == b && al == bl => {}
+            (
+                ExprNode::Const {
+                    name: a,
+                    levels: al,
+                },
+                ExprNode::Const {
+                    name: b,
+                    levels: bl,
+                },
+            ) if a == b && al == bl => {}
             (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
                 pending.push((aa, ba));
                 pending.push((af, bf));
             }
-            (ExprNode::ForallE { binder_type: at, body: ab, .. },
-             ExprNode::ForallE { binder_type: bt, body: bb, .. })
-            | (ExprNode::Lam { binder_type: at, body: ab, .. },
-               ExprNode::Lam { binder_type: bt, body: bb, .. }) => {
+            (
+                ExprNode::ForallE {
+                    binder_type: at,
+                    body: ab,
+                    ..
+                },
+                ExprNode::ForallE {
+                    binder_type: bt,
+                    body: bb,
+                    ..
+                },
+            )
+            | (
+                ExprNode::Lam {
+                    binder_type: at,
+                    body: ab,
+                    ..
+                },
+                ExprNode::Lam {
+                    binder_type: bt,
+                    body: bb,
+                    ..
+                },
+            ) => {
                 pending.push((ab, bb));
                 pending.push((at, bt));
             }
@@ -256,7 +307,8 @@ fn same_base(
     expected: &ConstantVal,
 ) -> Result<bool, NatDefinitionElabError> {
     context.tick()?;
-    Ok(actual.name == expected.name && actual.level_params == expected.level_params
+    Ok(actual.name == expected.name
+        && actual.level_params == expected.level_params
         && same_expression(context, &actual.type_, &expected.type_)?)
 }
 
@@ -274,10 +326,14 @@ fn canonical_equality(
         let Some(ConstantInfo::Induct(actual)) = environment.find(&expected.base.name) else {
             return Ok(false);
         };
-        if actual.num_params != expected.num_params || actual.num_indices != expected.num_indices
-            || actual.all != expected.all || actual.ctors != expected.ctors
-            || actual.num_nested != expected.num_nested || actual.is_rec != expected.is_rec
-            || actual.is_unsafe != expected.is_unsafe || actual.is_reflexive != expected.is_reflexive
+        if actual.num_params != expected.num_params
+            || actual.num_indices != expected.num_indices
+            || actual.all != expected.all
+            || actual.ctors != expected.ctors
+            || actual.num_nested != expected.num_nested
+            || actual.is_rec != expected.is_rec
+            || actual.is_unsafe != expected.is_unsafe
+            || actual.is_reflexive != expected.is_reflexive
             || !same_base(context, &actual.base, &expected.base)?
         {
             return Ok(false);
@@ -288,8 +344,10 @@ fn canonical_equality(
         let Some(ConstantInfo::Ctor(actual)) = environment.find(&expected.base.name) else {
             return Ok(false);
         };
-        if actual.induct != expected.induct || actual.cidx != expected.cidx
-            || actual.num_params != expected.num_params || actual.num_fields != expected.num_fields
+        if actual.induct != expected.induct
+            || actual.cidx != expected.cidx
+            || actual.num_params != expected.num_params
+            || actual.num_fields != expected.num_fields
             || actual.is_unsafe != expected.is_unsafe
             || !same_base(context, &actual.base, &expected.base)?
         {
@@ -301,17 +359,24 @@ fn canonical_equality(
         let Some(ConstantInfo::Rec(actual)) = environment.find(&expected.base.name) else {
             return Ok(false);
         };
-        if actual.all != expected.all || actual.num_params != expected.num_params
-            || actual.num_indices != expected.num_indices || actual.num_motives != expected.num_motives
-            || actual.num_minors != expected.num_minors || actual.k != expected.k
-            || actual.is_unsafe != expected.is_unsafe || actual.rules.len() != expected.rules.len()
+        if actual.all != expected.all
+            || actual.num_params != expected.num_params
+            || actual.num_indices != expected.num_indices
+            || actual.num_motives != expected.num_motives
+            || actual.num_minors != expected.num_minors
+            || actual.k != expected.k
+            || actual.is_unsafe != expected.is_unsafe
+            || actual.rules.len() != expected.rules.len()
             || !same_base(context, &actual.base, &expected.base)?
         {
             return Ok(false);
         }
         for (a, b) in actual.rules.iter().zip(&expected.rules) {
             context.tick()?;
-            if a.ctor != b.ctor || a.nfields != b.nfields || !same_expression(context, &a.rhs, &b.rhs)? {
+            if a.ctor != b.ctor
+                || a.nfields != b.nfields
+                || !same_expression(context, &a.rhs, &b.rhs)?
+            {
                 return Ok(false);
             }
         }
