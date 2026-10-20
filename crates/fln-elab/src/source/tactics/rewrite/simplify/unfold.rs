@@ -295,7 +295,7 @@ impl Context {
         }
     }
 
-    fn simp_unfold_selected(
+    pub(super) fn simp_unfold_selected(
         &mut self,
         root: &Expr,
         selection: Option<&Selection>,

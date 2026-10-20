@@ -542,7 +542,7 @@ impl Context {
 
     /// The index of `node`'s own application, for a rule that must match at `node` itself
     /// (dsimp rewrites one node at a time). `None` (no filtering) where the pin's key path
-    /// may reduce the node: a non-constant or reducible head.
+    /// may reduce the node: a let-bound local, a projection or a beta redex at the head.
     pub(super) fn simp_root_index(
         &mut self,
         node: &Expr,
@@ -558,7 +558,21 @@ impl Context {
         // A raw numeral (the `2` inside `OfNat.ofNat Nat 2 _`) is a literal key at the pin,
         // which no constant-rooted rule retrieves. Matching `Nat.succ ?n` there rewrote it
         // to `1 + 1`, building `OfNat.ofNat Nat (1 + 1) _`, which the pin never does.
-        if matches!(head.node(), ExprNode::Lit { .. }) && args.is_empty() {
+        // A local without a value is the pin's `.fvar` key and a sort its `.other` key, so
+        // there too only a rule the pin keys as a star (unkeyed here) is retrieved. Every
+        // registered rule was tried at every local and sort: under `Init`'s default set,
+        // `dsimp` on `P (eval x f)` classified and unified thousands of rules at `P`, `x`,
+        // `f` and at `eval x f` itself, whose key is its unfolding `f x`.
+        let rigid = match head.node() {
+            ExprNode::Lit { .. } | ExprNode::Sort { .. } => args.is_empty(),
+            ExprNode::FVar { id } => self
+                .txn
+                .lctx
+                .find(id)
+                .is_some_and(|local| local.value.is_none()),
+            _ => false,
+        };
+        if rigid {
             return Ok(Some(SimpTargetIndex {
                 applications: HashMap::new(),
                 environment: simp_key_environment(env),
@@ -580,14 +594,25 @@ impl Context {
         let ExprNode::Const { name, .. } = head.node() else {
             return Ok(None);
         };
-        if simp_key_unfolds(env, &table, name) {
+        let reduced;
+        let (name, args) = if simp_key_unfolds(env, &table, name) {
             // Keyed as the pin's `whnfR` keys it, by the unfolding at the node's own
             // arguments: `Ne Nat x y` is the arrow `x = y → False`, not every `Eq`.
-            let Some(reduced) = simp_key_unfold_reducible(env, &table, node) else {
+            let Some(unfolded) = simp_key_unfold_reducible(env, &table, node) else {
                 return Ok(None);
             };
-            return self.simp_root_index(&reduced);
-        }
+            reduced = unfolded;
+            let (head, args) = simp_key_spine(&reduced);
+            match head.node() {
+                // An application too short to unfold keeps its own reducible head, as the
+                // pin's key does. `dsimp` on the bare `eval` of `P (eval x f)` admitted, and
+                // classified, every registered rule there.
+                ExprNode::Const { name, .. } if simp_key_unfolds(env, &table, name) => (name, args),
+                _ => return self.simp_root_index(&reduced),
+            }
+        } else {
+            (name, args)
+        };
         let keys = args
             .iter()
             .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg, 0))
@@ -923,10 +948,33 @@ impl Context {
             .collect();
         for _ in 0..MAX_SIMPLIFICATION_STEPS {
             let mut changed = false;
+            // A registered definition that occurs nowhere in `target` unfolds nothing, and its
+            // walk only beta- and zeta-normalizes, as every walk does. Under the default set
+            // each one walked every rule statement at every trial: simp on a `Prod.Lex` goal,
+            // which the pin leaves unchanged at once, spent the whole work limit here.
+            let index = self.simp_target_index(&target)?;
+            let (mut walked, mut skipped) = (false, false);
             for rule in &unfoldable {
+                if self.simp_definition_absent(rule, index.as_ref()) {
+                    skipped = true;
+                    continue;
+                }
                 self.tick()?;
-                if let UnfoldResult::Changed(next) = self.unfold_simp_rule(rule, &target)? {
-                    target = next;
+                match self.unfold_simp_rule(rule, &target)? {
+                    UnfoldResult::Changed(next) => {
+                        target = next;
+                        changed = true;
+                        walked = true;
+                    }
+                    UnfoldResult::Unchanged => walked = true,
+                    UnfoldResult::NotDefinition => {}
+                }
+            }
+            if skipped && !walked {
+                // The normalization the first skipped definition's walk performed.
+                let normalized = self.simp_unfold_selected(&target, None)?;
+                if !self.simp_same_up_to_ascriptions(&normalized, &target)? {
+                    target = normalized;
                     changed = true;
                 }
             }
@@ -1443,7 +1491,13 @@ fn simp_pattern_key(
 /// `term`, an application of a reducible head, unfolded with its actual arguments and
 /// beta-reduced through at most 8 reducible heads, as the pin's `whnfR` reduces a target node
 /// before keying it. `None` where the result may still reduce in ways this does not
-/// perform: a recursor, quotient or matcher head, a projection, a partial application.
+/// perform: a recursor, quotient or matcher head, a projection. An application too short
+/// to unfold is returned as it stands, its head still reducible: unfolding it would give a
+/// lambda, which the pin's `reduceUntilBadKey` does not key, so the pin keys this term.
+/// A local head is returned for the caller to key: only one without a value is rigid. A
+/// sort head is returned too. The pin stops one unfolding short of a sort (a "bad key")
+/// and keys the reducible head itself, but no rule key here is rooted at a reducible
+/// constant, so both admit exactly the unkeyed rules.
 fn simp_key_unfold_reducible(
     env: &Environment,
     table: &crate::reducibility::ReducibilityTable,
@@ -1465,7 +1519,9 @@ fn simp_key_unfold_reducible(
         let mut parameters = 0usize;
         while let ExprNode::Lam { body: next, .. } = body.node() {
             if parameters == args.len() {
-                return None;
+                // A partial application unfolds to a lambda, which the pin's
+                // `reduceUntilBadKey` refuses as a key: it keeps this term.
+                return Some(term);
             }
             body = next;
             parameters += 1;
@@ -1492,7 +1548,10 @@ fn simp_key_unfold_reducible(
                 || env.find(name).is_none();
             (!stuck).then_some(term)
         }
-        ExprNode::ForallE { .. } | ExprNode::Lit { .. } => Some(term),
+        ExprNode::ForallE { .. }
+        | ExprNode::Lit { .. }
+        | ExprNode::FVar { .. }
+        | ExprNode::Sort { .. } => Some(term),
         _ => None,
     }
 }
@@ -2345,6 +2404,18 @@ mod tests {
                 .lctx
                 .add_param(FVarId(n(name)), n(name), c("Nat"), BinderInfo::Default);
         }
+        context.txn.lctx.add_param(
+            FVarId(n("g")),
+            n("g"),
+            pi(c("Nat"), c("Nat"), BinderInfo::Default),
+            BinderInfo::Default,
+        );
+        context.txn.lctx.add_let(
+            FVarId(n("z")),
+            n("z"),
+            c("Nat"),
+            Expr::app(c("f"), Expr::fvar(FVarId(n("x")))),
+        );
         let rule = |name: &str| {
             SimpRule::Global(scope::simp::SimpEntry {
                 declaration: n(name),
@@ -2366,9 +2437,14 @@ mod tests {
             (f_x, true, false),
             (equation, false, true),
             (succ, false, false),
-            // A parameter has no constant head: never filtered. A binder admits only a
-            // rule rooted at a binder.
-            (local("x"), true, true),
+            // A parameter, alone or applied, is the pin's `.fvar` key and a sort its
+            // `.other` key: no constant-rooted rule is retrieved there. A let-bound local
+            // may reduce to its value, so it is never filtered. A binder admits only a rule
+            // rooted at a binder.
+            (local("x"), false, false),
+            (Expr::app(local("g"), local("x")), false, false),
+            (Expr::sort(Level::zero()), false, false),
+            (local("z"), true, true),
             (binder, false, false),
             // A raw literal is a literal key: no constant-rooted rule matches it.
             (
@@ -2576,12 +2652,39 @@ mod tests {
                     BinderInfo::Default,
                 ),
             ))
+            .unwrap()
+            // `apply g a := g a` unfolds to an application of a local, as `dsimp2`'s `eval`.
+            .add_decl(abbrev(
+                "apply",
+                pi(
+                    pi(nat.clone(), nat.clone(), BinderInfo::Default),
+                    pi(nat.clone(), nat.clone(), BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+                Expr::lam(
+                    Name::anonymous(),
+                    pi(nat.clone(), nat.clone(), BinderInfo::Default),
+                    Expr::lam(
+                        Name::anonymous(),
+                        nat.clone(),
+                        Expr::app(bvar(1), bvar(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            ))
             .unwrap();
         let mut context = Context::new(&env, Budget::DEFAULT);
         context
             .txn
             .lctx
             .add_param(FVarId(n("x")), n("x"), nat.clone(), BinderInfo::Default);
+        context.txn.lctx.add_param(
+            FVarId(n("g")),
+            n("g"),
+            pi(nat.clone(), nat.clone(), BinderInfo::Default),
+            BinderInfo::Default,
+        );
         for name in ["p", "q"] {
             context
                 .txn
@@ -2607,5 +2710,30 @@ mod tests {
         assert!(!context.simp_node_admits(&binder, &wrapped).unwrap());
         assert!(!context.simp_node_admits(&key, &implication).unwrap());
         assert!(context.simp_node_admits(&binder, &implication).unwrap());
+        // `apply g x` is keyed as `g x`, the pin's `.fvar g 1`: neither rule is retrieved.
+        let applied = apps(c("apply"), &[local("g"), local("x")]);
+        assert!(!context.simp_node_admits(&key, &applied).unwrap());
+        assert!(!context.simp_node_admits(&binder, &applied).unwrap());
+        // `apply` and `apply g` unfold to lambdas, which the pin does not key: it keys them
+        // by `apply` itself, where no rule key here is rooted.
+        for short in [c("apply"), Expr::app(c("apply"), local("g"))] {
+            assert!(!context.simp_node_admits(&key, &short).unwrap());
+            assert!(!context.simp_node_admits(&binder, &short).unwrap());
+            assert!(context.simp_root_index(&short).unwrap().is_some());
+        }
+        // Unfolding into `f x` still admits `f`'s rule: the filter follows the unfolding.
+        let unfolds_to_f = apps(
+            c("apply"),
+            &[
+                Expr::lam(
+                    Name::anonymous(),
+                    nat.clone(),
+                    Expr::app(c("f"), bvar(0)),
+                    BinderInfo::Default,
+                ),
+                local("x"),
+            ],
+        );
+        assert!(context.simp_node_admits(&key, &unfolds_to_f).unwrap());
     }
 }
