@@ -5,6 +5,17 @@
 use super::*;
 use std::collections::HashSet;
 
+/// Where a rule instantiation looks for its occurrence.
+#[derive(Clone, Copy)]
+enum Occurrences<'a> {
+    /// Every subterm, in the traversal order of the caller.
+    Every,
+    /// The target itself only (dsimp's per-node lookup).
+    Root,
+    /// Every subterm whose own key the rule's key admits (simp's per-node retrieval).
+    Admitted(&'a super::simplify::SimpKey),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RigidTypeHead {
     Sort,
@@ -354,7 +365,28 @@ impl Context {
             reverse,
             inside_out,
             selected_rules,
-            false,
+            Occurrences::Every,
+        )
+    }
+
+    /// Simplification's instantiation: inside-out, trying `rule` only at the nodes
+    /// its rewrite key admits (`simp_rule_node_key`), as the pin's discrimination
+    /// tree retrieves it.
+    pub(super) fn instantiate_simp_rule(
+        &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+        selected_rules: &[SimpRule<'_>],
+        node_key: Option<&super::simplify::SimpKey>,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            true,
+            selected_rules,
+            node_key.map_or(Occurrences::Every, Occurrences::Admitted),
         )
     }
 
@@ -364,7 +396,14 @@ impl Context {
         target: &Expr,
         reverse: bool,
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
-        self.instantiate_rewrite_rule_with_scope(rule, target, reverse, true, &[], true)
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            true,
+            &[],
+            Occurrences::Root,
+        )
     }
 
     fn instantiate_rewrite_rule_with_scope(
@@ -374,8 +413,9 @@ impl Context {
         reverse: bool,
         inside_out: bool,
         selected_rules: &[SimpRule<'_>],
-        root_only: bool,
+        occurrences: Occurrences<'_>,
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        let root_only = matches!(occurrences, Occurrences::Root);
         self.flush(false)?;
         let mut template = self.rewrite_trial();
         // Preparing a rule is speculative too. Charge its private context on
@@ -568,6 +608,11 @@ impl Context {
                 }
             }
             if term.has_loose_bvars() {
+                continue;
+            }
+            if let Occurrences::Admitted(key) = occurrences
+                && !self.simp_node_admits(key, term)?
+            {
                 continue;
             }
             let mut trial = template.rewrite_trial();

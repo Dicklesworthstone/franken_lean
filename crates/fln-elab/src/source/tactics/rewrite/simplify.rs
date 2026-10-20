@@ -366,11 +366,27 @@ impl Context {
         let (Some(index), SimpRule::Global(entry)) = (index, rule) else {
             return true;
         };
+        self.with_simp_key(entry, index.environment, &index.table, side, |key| {
+            key.is_none_or(|key| index.admits(key))
+        })
+    }
+
+    /// Read a registered rule's memoized key in the environment `environment`
+    /// identifies, computing it on first use. Borrowed, not cloned: admission
+    /// reads one key per registered rule at every step.
+    fn with_simp_key<R>(
+        &self,
+        entry: &scope::simp::SimpEntry,
+        environment: SimpKeyEnvironment,
+        table: &crate::reducibility::ReducibilityTable,
+        side: SimpKeySide,
+        read: impl FnOnce(Option<&SimpKey>) -> R,
+    ) -> R {
         let cache = Arc::clone(&self.simp_key_cache.0);
         let mut memo = cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if memo.environment.as_ref() != Some(&index.environment) {
+        if memo.environment.as_ref() != Some(&environment) {
             *memo = SimpKeyMemo {
-                environment: Some(index.environment),
+                environment: Some(environment),
                 ..SimpKeyMemo::default()
             };
         }
@@ -382,10 +398,48 @@ impl Context {
         let keys = memo
             .rules
             .entry(identity)
-            .or_insert_with(|| simp_rule_keys(&self.txn.env, &index.table, entry));
-        keys[side as usize]
-            .as_ref()
-            .is_none_or(|key| index.admits(key))
+            .or_insert_with(|| simp_rule_keys(&self.txn.env, table, entry));
+        read(keys[side as usize].as_ref())
+    }
+
+    /// The key `rule` rewrites at. The pin's simp retrieves a rule at a node only when
+    /// the node's own key matches, so the occurrence search tries no other node: before
+    /// this, every admitted rule inferred the type of, and unified against, every
+    /// subterm of the target. `None` (every node) for explicit and local rules,
+    /// unfolded definitions and every shape not keyed here.
+    pub(super) fn simp_rule_node_key(
+        &mut self,
+        rule: &SimpRule<'_>,
+    ) -> Result<Option<SimpKey>, NatDefinitionElabError> {
+        let SimpRule::Global(entry) = rule else {
+            return Ok(None);
+        };
+        self.tick()?;
+        let table = crate::reducibility::table(&self.txn.env).map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        let environment = simp_key_environment(&self.txn.env);
+        Ok(
+            self.with_simp_key(entry, environment, &table, SimpKeySide::Rewrite, |key| {
+                key.cloned()
+            }),
+        )
+    }
+
+    /// Whether a rule keyed `key` may match at `node` itself. A node whose head the pin's
+    /// key path may reduce (a reducible or non-constant head, a projection, a binder) is
+    /// not filtered, so this skips only nodes the pin's retrieval cannot return the rule
+    /// for.
+    pub(super) fn simp_node_admits(
+        &mut self,
+        key: &SimpKey,
+        node: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(self
+            .simp_root_index(node)?
+            .is_none_or(|index| index.admits(key)))
     }
 
     /// Every application a candidate rule's key may need to find in `target`: the
@@ -426,14 +480,17 @@ impl Context {
                 ExprNode::Const { name, .. } => {
                     let keys = args
                         .iter()
-                        .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg))
+                        .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg, 0))
                         .collect();
                     applications.entry(name.clone()).or_default().push(keys);
-                    if simp_key_unfolds(env, &table, name)
-                        && unfolded.insert(name.clone())
-                        && let Some(ConstantInfo::Defn(definition)) = env.find(name)
-                    {
-                        pending.push(definition.value.clone());
+                    if simp_key_unfolds(env, &table, name) {
+                        if let Some(reduced) = simp_key_unfold_reducible(env, &table, &term) {
+                            pending.push(reduced);
+                        } else if unfolded.insert(name.clone())
+                            && let Some(ConstantInfo::Defn(definition)) = env.find(name)
+                        {
+                            pending.push(definition.value.clone());
+                        }
                     }
                 }
                 ExprNode::Proj {
@@ -480,15 +537,42 @@ impl Context {
         })?;
         let env = &self.txn.env;
         let (head, args) = simp_key_spine(node);
+        // A raw numeral (the `2` inside `OfNat.ofNat Nat 2 _`) is a literal key at the pin,
+        // which no constant-rooted rule retrieves. Matching `Nat.succ ?n` there rewrote it
+        // to `1 + 1`, building `OfNat.ofNat Nat (1 + 1) _`, which the pin never does.
+        if matches!(head.node(), ExprNode::Lit { .. }) && args.is_empty() {
+            return Ok(Some(SimpTargetIndex {
+                applications: HashMap::new(),
+                environment: simp_key_environment(env),
+                table,
+            }));
+        }
+        // A binder is the pin's `.arrow` or `.other` key: only a rule rooted at a binder.
+        if matches!(
+            head.node(),
+            ExprNode::ForallE { .. } | ExprNode::Lam { .. } | ExprNode::LetE { .. }
+        ) && args.is_empty()
+        {
+            return Ok(Some(SimpTargetIndex {
+                applications: HashMap::from([(simp_binder_key(), vec![Vec::new()])]),
+                environment: simp_key_environment(env),
+                table,
+            }));
+        }
         let ExprNode::Const { name, .. } = head.node() else {
             return Ok(None);
         };
         if simp_key_unfolds(env, &table, name) {
-            return Ok(None);
+            // Keyed as the pin's `whnfR` keys it, by the unfolding at the node's own
+            // arguments: `Ne Nat x y` is the arrow `x = y → False`, not every `Eq`.
+            let Some(reduced) = simp_key_unfold_reducible(env, &table, node) else {
+                return Ok(None);
+            };
+            return self.simp_root_index(&reduced);
         }
         let keys = args
             .iter()
-            .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg))
+            .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg, 0))
             .collect();
         Ok(Some(SimpTargetIndex {
             applications: HashMap::from([(name.clone(), vec![keys])]),
@@ -1160,16 +1244,32 @@ enum SimpKeySide {
 enum SimpArgKey {
     Any,
     Const(Name),
+    /// A constant with keyed arguments of its own, compared position by position: the
+    /// pin's key path continues into an argument's arguments (`List.length (List.filterMap
+    /// f l)` is not `List.length (xs ++ [])`). Bounded at [`SIMP_KEY_LEVELS`].
+    App(Name, Vec<SimpArgKey>),
     /// A numeral, keyed by its value as the pin's `toNatLit?` keys it.
     Lit(fln_core::expr::NatLit),
     Other,
 }
 
+/// How many argument levels below a key's head are keyed. The pin's path has no bound;
+/// two levels separate the candidates whose heads and argument heads agree.
+const SIMP_KEY_LEVELS: usize = 2;
+
 impl SimpArgKey {
     fn admits(&self, target: &Self) -> bool {
         match (self, target) {
             (Self::Any, _) | (_, Self::Any) => true,
-            (Self::Const(rule), Self::Const(target)) => rule == target,
+            (Self::Const(rule) | Self::App(rule, _), Self::Const(target))
+            | (Self::Const(rule), Self::App(target, _)) => rule == target,
+            (Self::App(rule, rule_args), Self::App(target, target_args)) => {
+                rule == target
+                    && rule_args
+                        .iter()
+                        .zip(target_args)
+                        .all(|(rule, target)| rule.admits(target))
+            }
             (Self::Lit(rule), Self::Lit(target)) => rule == target,
             _ => false,
         }
@@ -1179,7 +1279,7 @@ impl SimpArgKey {
 /// A rule's key: its pattern's rigid head and the keys of that head's keyed
 /// arguments, in order; positions the pin's key ignores are `Any`.
 #[derive(Clone, Debug)]
-struct SimpKey {
+pub(super) struct SimpKey {
     head: Name,
     args: Vec<SimpArgKey>,
 }
@@ -1286,7 +1386,8 @@ fn simp_pattern_key(
     table: &crate::reducibility::ReducibilityTable,
     pattern: &Expr,
 ) -> Option<SimpKey> {
-    let (head, args) = simp_key_spine(pattern);
+    let pattern = simp_key_head_beta(pattern);
+    let (head, args) = simp_key_spine(&pattern);
     match head.node() {
         // The pin keys a binder as `.arrow` or `.other`: only a binder in the target matches.
         ExprNode::ForallE { .. } | ExprNode::Lam { .. } if args.is_empty() => {
@@ -1300,6 +1401,87 @@ fn simp_pattern_key(
     }
     let args: Vec<Expr> = args.into_iter().cloned().collect();
     simp_constant_key(env, table, head, &args, 0)
+}
+
+/// `term`, an application of a reducible head, unfolded with its actual arguments and
+/// beta-reduced through at most 8 reducible heads, as the pin's `whnfR` reduces a target node
+/// before keying it. `None` where the result may still reduce in ways this does not
+/// perform: a recursor, quotient or matcher head, a projection, a partial application.
+fn simp_key_unfold_reducible(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    term: &Expr,
+) -> Option<Expr> {
+    let mut term = term.clone();
+    for _ in 0..8 {
+        let (head, args) = simp_key_spine(&term);
+        let ExprNode::Const { name, .. } = head.node() else {
+            break;
+        };
+        if !simp_key_unfolds(env, table, name) {
+            break;
+        }
+        let Some(ConstantInfo::Defn(definition)) = env.find(name) else {
+            return None;
+        };
+        let mut body = &definition.value;
+        let mut parameters = 0usize;
+        while let ExprNode::Lam { body: next, .. } = body.node() {
+            if parameters == args.len() {
+                return None;
+            }
+            body = next;
+            parameters += 1;
+        }
+        let substituted: Vec<Expr> = args[..parameters]
+            .iter()
+            .map(|arg| (*arg).clone())
+            .collect();
+        let reduced = body.subst_loose(0, &substituted).ok()?;
+        term = args[parameters..]
+            .iter()
+            .fold(reduced, |function, arg| Expr::app(function, (*arg).clone()));
+        term = simp_key_head_beta(&term);
+    }
+    let (head, _) = simp_key_spine(&term);
+    match head.node() {
+        ExprNode::Const { name, .. } => {
+            let stuck = matches!(
+                env.find(name),
+                Some(ConstantInfo::Rec(_) | ConstantInfo::Quot(_))
+            ) || simp_key_unfolds(env, table, name)
+                || matches!(name.leaf_view(), LeafView::Str(text)
+                    if text.starts_with("match_") || text == "casesOn" || text == "rec")
+                || env.find(name).is_none();
+            (!stuck).then_some(term)
+        }
+        ExprNode::ForallE { .. } | ExprNode::Lit { .. } => Some(term),
+        _ => None,
+    }
+}
+
+/// `pattern` with a head beta redex reduced, as the pin's `DiscrTree.mkPath` reduces it before
+/// keying: `Fin.induction_zero` states `(fun i => Fin.induction zero hs i) 0 = zero`, and was
+/// unkeyed and tried at every node of every target. At most 8 redexes; a substitution this
+/// cannot perform leaves the pattern as it is (unkeyed).
+fn simp_key_head_beta(pattern: &Expr) -> Expr {
+    let mut pattern = pattern.clone();
+    for _ in 0..8 {
+        let (head, args) = simp_key_spine(&pattern);
+        let ExprNode::Lam { body, .. } = head.node() else {
+            break;
+        };
+        let Some((first, rest)) = args.split_first() else {
+            break;
+        };
+        let Ok(reduced) = body.subst_loose(0, std::slice::from_ref(*first)) else {
+            break;
+        };
+        pattern = rest
+            .iter()
+            .fold(reduced, |function, arg| Expr::app(function, (*arg).clone()));
+    }
+    pattern
 }
 
 /// The pseudo head every binder (`∀`, `fun`, `let`) of a target is indexed under, and a
@@ -1331,7 +1513,7 @@ fn simp_constant_key(
     }
     if !simp_key_unfolds(env, table, name) {
         let arguments: Vec<&Expr> = args.iter().collect();
-        let mut keys = simp_key_arguments(env, table, name, &arguments);
+        let mut keys = simp_key_arguments(env, table, name, &arguments, 0);
         while keys.last() == Some(&SimpArgKey::Any) {
             keys.pop();
         }
@@ -1393,6 +1575,7 @@ fn simp_key_arguments(
     table: &crate::reducibility::ReducibilityTable,
     head: &Name,
     args: &[&Expr],
+    level: usize,
 ) -> Vec<SimpArgKey> {
     let Some(info) = env.find(head) else {
         return Vec::new();
@@ -1414,13 +1597,11 @@ fn simp_key_arguments(
                         simp_key_is_sort(binder_type)
                     }
                     BinderInfo::Default => {
-                        simp_key_is_sort(binder_type)
-                            || simp_key_is_data_type(env, binder_type, &binders, args)
-                            || simp_key_arg_is_data(env, args[keys.len()])
+                        !simp_key_arg_is_proof(env, binder_type, &binders, args, args[keys.len()])
                     }
                 };
                 keys.push(if keyed {
-                    simp_rule_arg_key(env, table, args[keys.len()])
+                    simp_rule_arg_key(env, table, args[keys.len()], level)
                 } else {
                     SimpArgKey::Any
                 });
@@ -1432,6 +1613,72 @@ fn simp_key_arguments(
         }
     }
     keys
+}
+
+/// Whether an explicit argument is certainly a proof, which the pin's key never reads
+/// (`DiscrTree.ignoreArg` asks `isProof`): its binder type, read at the actual type
+/// arguments, is a proposition, or its own head is a theorem or returns one's statement.
+/// Undecided is not a proof, as the pin's `isProof` answers false for a type it cannot yet
+/// see: `ite c a b` at `Eq`'s side is keyed, so `ite_eq_left_iff` is never tried at
+/// `List.length xs = List.length ys`.
+fn simp_key_arg_is_proof(
+    env: &Environment,
+    binder_type: &Expr,
+    binders: &[&Expr],
+    args: &[&Expr],
+    arg: &Expr,
+) -> bool {
+    let returns_prop = |name: &Name| {
+        env.find(name).is_some_and(|info| {
+            let mut result = &info.constant_val().type_;
+            loop {
+                match result.node() {
+                    ExprNode::ForallE { body, .. } => result = body,
+                    ExprNode::MData { expr, .. } => result = expr,
+                    _ => break matches!(result.node(), ExprNode::Sort { level } if level.is_zero()),
+                }
+            }
+        })
+    };
+    // A type is a proposition when its head returns `Prop`; a `∀` is one when its body is.
+    let is_proposition = |type_: &Expr| {
+        let mut type_ = type_;
+        while let ExprNode::ForallE { body, .. } | ExprNode::MData { expr: body, .. } = type_.node()
+        {
+            type_ = body;
+        }
+        match simp_key_spine(type_).0.node() {
+            ExprNode::Const { name, .. } => returns_prop(name),
+            ExprNode::BVar { idx } => usize::try_from(*idx)
+                .ok()
+                .and_then(|idx| binders.len().checked_sub(idx + 1))
+                .and_then(|binder| args.get(binder))
+                .is_some_and(|actual| match simp_key_spine(actual).0.node() {
+                    ExprNode::Const { name, .. } => returns_prop(name),
+                    _ => false,
+                }),
+            _ => false,
+        }
+    };
+    if is_proposition(binder_type) {
+        return true;
+    }
+    let ExprNode::Const { name, .. } = simp_key_spine(arg).0.node() else {
+        return false;
+    };
+    match env.find(name) {
+        Some(ConstantInfo::Thm(_)) => true,
+        Some(info) => {
+            let mut result = &info.constant_val().type_;
+            while let ExprNode::ForallE { body, .. } | ExprNode::MData { expr: body, .. } =
+                result.node()
+            {
+                result = body;
+            }
+            matches!(simp_key_spine(result).0.node(), ExprNode::Const { name, .. } if returns_prop(name))
+        }
+        None => false,
+    }
 }
 
 fn simp_key_is_sort(type_: &Expr) -> bool {
@@ -1456,98 +1703,6 @@ fn simp_key_without_out_param(type_: &Expr) -> &Expr {
     }
 }
 
-/// Whether an argument is data by its own head, as the pin's `isProof` reads it: the head
-/// constant's result is a sort (the argument is a type), a type in a nonzero universe, or one
-/// of the head's own type parameters ranging over one.
-fn simp_key_arg_is_data(env: &Environment, arg: &Expr) -> bool {
-    let ExprNode::Const { name, .. } = simp_key_spine(arg).0.node() else {
-        return false;
-    };
-    let Some(info) = env.find(name) else {
-        return false;
-    };
-    let mut binders: Vec<&Expr> = Vec::new();
-    let mut result = &info.constant_val().type_;
-    loop {
-        match result.node() {
-            ExprNode::ForallE {
-                binder_type, body, ..
-            } => {
-                binders.push(binder_type);
-                result = body;
-            }
-            ExprNode::MData { expr, .. } => result = expr,
-            _ => break,
-        }
-    }
-    let sort_is_not_zero = |type_: &Expr| {
-        matches!(simp_key_spine(simp_key_without_out_param(type_)).0.node(),
-            ExprNode::Sort { level } if level.is_not_zero())
-    };
-    match simp_key_spine(result).0.node() {
-        ExprNode::Sort { .. } => true,
-        ExprNode::BVar { idx } => usize::try_from(*idx)
-            .ok()
-            .and_then(|idx| binders.len().checked_sub(idx + 1))
-            .is_some_and(|binder| sort_is_not_zero(binders[binder])),
-        ExprNode::Const { name, .. } => env.find(name).is_some_and(|info| {
-            let mut codomain = &info.constant_val().type_;
-            loop {
-                match codomain.node() {
-                    ExprNode::ForallE { body, .. } => codomain = body,
-                    ExprNode::MData { expr, .. } => codomain = expr,
-                    _ => break sort_is_not_zero(codomain),
-                }
-            }
-        }),
-        _ => false,
-    }
-}
-
-/// Whether every inhabitant of the binder type `type_` is data, never a proof: its
-/// head is a constant whose type ends in a nonzero universe, or an earlier binder
-/// whose actual argument is such a type (or, failing that, ranges over one).
-fn simp_key_is_data_type(
-    env: &Environment,
-    type_: &Expr,
-    binders: &[&Expr],
-    args: &[&Expr],
-) -> bool {
-    let sort_is_not_zero = |type_: &Expr| {
-        matches!(simp_key_spine(simp_key_without_out_param(type_)).0.node(),
-            ExprNode::Sort { level } if level.is_not_zero())
-    };
-    let constant_is_data_type = |name: &Name| {
-        env.find(name).is_some_and(|info| {
-            let mut result = &info.constant_val().type_;
-            loop {
-                match result.node() {
-                    ExprNode::ForallE { body, .. } => result = body,
-                    ExprNode::MData { expr, .. } => result = expr,
-                    _ => break sort_is_not_zero(result),
-                }
-            }
-        })
-    };
-    match simp_key_spine(type_).0.node() {
-        ExprNode::BVar { idx } => {
-            let Some(binder) = usize::try_from(*idx)
-                .ok()
-                .and_then(|idx| binders.len().checked_sub(idx + 1))
-            else {
-                return false;
-            };
-            match simp_key_spine(args[binder]).0.node() {
-                ExprNode::Const { name, .. } => constant_is_data_type(name),
-                ExprNode::Sort { .. } => true,
-                _ => sort_is_not_zero(binders[binder]),
-            }
-        }
-        ExprNode::Const { name, .. } => constant_is_data_type(name),
-        _ => false,
-    }
-}
-
 /// A rule's argument key: a numeral's value, the rigid constant the pin's key fixes
 /// there, or `Any` for a pattern variable, a reducible head, and the `Nat` offsets
 /// (`n + 1`, `Nat.succ n`) the pin leaves open as stars.
@@ -1555,6 +1710,7 @@ fn simp_rule_arg_key(
     env: &Environment,
     table: &crate::reducibility::ReducibilityTable,
     arg: &Expr,
+    level: usize,
 ) -> SimpArgKey {
     if let Some(value) = simp_key_numeral(arg) {
         return SimpArgKey::Lit(value);
@@ -1565,7 +1721,18 @@ fn simp_rule_arg_key(
             if !simp_key_is_numeral_or_offset(name, &args)
                 && !simp_key_unfolds(env, table, name) =>
         {
-            SimpArgKey::Const(name.clone())
+            if level + 1 >= SIMP_KEY_LEVELS {
+                return SimpArgKey::Const(name.clone());
+            }
+            let mut keys = simp_key_arguments(env, table, name, &args, level + 1);
+            while keys.last() == Some(&SimpArgKey::Any) {
+                keys.pop();
+            }
+            if keys.is_empty() {
+                SimpArgKey::Const(name.clone())
+            } else {
+                SimpArgKey::App(name.clone(), keys)
+            }
         }
         _ => SimpArgKey::Any,
     }
@@ -1622,11 +1789,12 @@ fn simp_target_arg_key(
     table: &crate::reducibility::ReducibilityTable,
     lctx: &LocalContext,
     arg: &Expr,
+    level: usize,
 ) -> SimpArgKey {
     if let Some(value) = simp_key_numeral(arg) {
         return SimpArgKey::Lit(value);
     }
-    let (head, _) = simp_key_spine(arg);
+    let (head, args) = simp_key_spine(arg);
     match head.node() {
         ExprNode::Const { name, .. } => {
             // A `Nat.succ` whose value is not read here may still be a numeral.
@@ -1635,8 +1803,16 @@ fn simp_target_arg_key(
                 || simp_key_unfolds(env, table, name)
             {
                 SimpArgKey::Any
-            } else {
+            } else if level + 1 >= SIMP_KEY_LEVELS || args.is_empty() {
                 SimpArgKey::Const(name.clone())
+            } else {
+                // Every position: the rule's key leaves open the ones the pin ignores.
+                SimpArgKey::App(
+                    name.clone(),
+                    args.iter()
+                        .map(|arg| simp_target_arg_key(env, table, lctx, arg, level + 1))
+                        .collect(),
+                )
             }
         }
         ExprNode::FVar { id } => match lctx.find(id) {
@@ -1826,6 +2002,19 @@ mod tests {
             open.args,
             [SimpArgKey::Any, SimpArgKey::Any, SimpArgKey::Const(n("f"))]
         );
+        // A head beta redex is keyed as the head it reduces to (`(fun i => f i) a` as `f`),
+        // and its argument stays open.
+        let redex = key(Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                c("Nat"),
+                Expr::app(c("f"), bvar(0)),
+                BinderInfo::Default,
+            ),
+            bvar(0),
+        ));
+        assert_eq!(redex.head, n("f"));
+        assert!(redex.args.is_empty());
         // An instance argument is never keyed; a `Nat` offset is left open.
         let operation = key(apps(
             c("op"),
@@ -2107,5 +2296,279 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(with_binder.admits(&binder_rule));
+    }
+
+    #[test]
+    fn a_rule_is_tried_only_at_the_nodes_its_key_admits() {
+        let env = environment();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        for name in ["x", "y"] {
+            context
+                .txn
+                .lctx
+                .add_param(FVarId(n(name)), n(name), c("Nat"), BinderInfo::Default);
+        }
+        let rule = |name: &str| {
+            SimpRule::Global(scope::simp::SimpEntry {
+                declaration: n(name),
+                proof: None,
+                priority: 1000,
+                reverse: false,
+                order: 0,
+            })
+        };
+        let local = |name: &str| Expr::fvar(FVarId(n(name)));
+        let f_x = Expr::app(c("f"), local("x"));
+        let equation = eq(c("Nat"), f_x.clone(), local("y"));
+        let succ = Expr::app(c("Nat.succ"), local("x"));
+        let binder = Expr::lam(Name::anonymous(), c("Nat"), bvar(0), BinderInfo::Default);
+        // `fx : f a = b` rewrites at `f x` only; `fne : ¬ f a = b` at the equation only.
+        let rewrite = context.simp_rule_node_key(&rule("fx")).unwrap().unwrap();
+        let refutation = context.simp_rule_node_key(&rule("fne")).unwrap().unwrap();
+        for (node, rewrites, refutes) in [
+            (f_x, true, false),
+            (equation, false, true),
+            (succ, false, false),
+            // A parameter has no constant head: never filtered. A binder admits only a
+            // rule rooted at a binder.
+            (local("x"), true, true),
+            (binder, false, false),
+            // A raw literal is a literal key: no constant-rooted rule matches it.
+            (
+                Expr::lit(fln_core::expr::Literal::Nat(
+                    fln_core::expr::NatLit::from_u64(2),
+                )),
+                false,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                context.simp_node_admits(&rewrite, &node).unwrap(),
+                rewrites,
+                "{node:?}"
+            );
+            assert_eq!(
+                context.simp_node_admits(&refutation, &node).unwrap(),
+                refutes,
+                "{node:?}"
+            );
+        }
+        // Explicit and local rules are unkeyed and try every node.
+        assert!(
+            context
+                .simp_rule_node_key(&SimpRule::Local(FVarId(n("x"))))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn keys_compare_the_heads_of_an_arguments_own_arguments() {
+        use fln_env::constants::{AxiomVal, ConstantVal};
+        let nat = c("Nat");
+        let f = |arg: Expr| Expr::app(c("f"), arg);
+        // `fff : ∀ a b : Nat, f (f (f a)) = b` rewrites at `f (f (f _))`.
+        let env = environment()
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n("fff"),
+                    level_params: Vec::new(),
+                    type_: pi(
+                        nat.clone(),
+                        pi(
+                            nat.clone(),
+                            eq(nat.clone(), f(f(f(bvar(1)))), bvar(0)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                },
+                is_unsafe: false,
+            }))
+            .unwrap();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        for name in ["x", "y"] {
+            context
+                .txn
+                .lctx
+                .add_param(FVarId(n(name)), n(name), nat.clone(), BinderInfo::Default);
+        }
+        let rule = SimpRule::Global(scope::simp::SimpEntry {
+            declaration: n("fff"),
+            proof: None,
+            priority: 1000,
+            reverse: false,
+            order: 0,
+        });
+        let key = context.simp_rule_node_key(&rule).unwrap().unwrap();
+        assert_eq!(key.head, n("f"));
+        assert_eq!(
+            key.args,
+            [SimpArgKey::App(n("f"), vec![SimpArgKey::Const(n("f"))])]
+        );
+        let local = |name: &str| Expr::fvar(FVarId(n(name)));
+        for (node, admitted) in [
+            (f(f(f(local("x")))), true),
+            // The argument's head agrees and its own argument is a parameter.
+            (f(f(local("x"))), false),
+            (f(local("x")), false),
+        ] {
+            let target = eq(nat.clone(), node.clone(), local("y"));
+            let index = context.simp_target_index(&target).unwrap();
+            assert_eq!(
+                context.simp_rule_admitted(&rule, index.as_ref(), SimpKeySide::Rewrite),
+                admitted,
+                "{target:?}"
+            );
+            assert_eq!(
+                context.simp_node_admits(&key, &node).unwrap(),
+                admitted,
+                "{node:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_argument_is_keyed_unless_it_is_certainly_a_proof() {
+        use fln_env::constants::{AxiomVal, ConstantVal};
+        let nat = c("Nat");
+        let u = Level::param(n("u"));
+        // `g {α : Sort u} (x : α) : α` returns data or a proof depending on `α`;
+        // `k (m : Nat) (h : m = m) : Nat` takes a proof.
+        let env = [
+            (
+                "g",
+                vec![n("u")],
+                pi(
+                    Expr::sort(u.clone()),
+                    pi(bvar(0), bvar(1), BinderInfo::Default),
+                    BinderInfo::Implicit,
+                ),
+            ),
+            (
+                "k",
+                Vec::new(),
+                pi(
+                    nat.clone(),
+                    pi(
+                        eq(nat.clone(), bvar(0), bvar(0)),
+                        nat.clone(),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            ),
+        ]
+        .into_iter()
+        .fold(environment(), |env, (name, level_params, type_)| {
+            env.add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n(name),
+                    level_params,
+                    type_,
+                },
+                is_unsafe: false,
+            }))
+            .unwrap()
+        });
+        let table = crate::reducibility::table(&env).unwrap();
+        let key = |pattern: Expr| simp_pattern_key(&env, &table, &pattern).unwrap();
+        let sort_eq = |type_: Expr, left: Expr, right: Expr| {
+            apps(
+                Expr::const_(n("Eq"), vec![u.clone()]),
+                &[type_, left, right],
+            )
+        };
+        let g = |type_: Expr, arg: Expr| apps(Expr::const_(n("g"), vec![u.clone()]), &[type_, arg]);
+        // At a `Sort u` the pin's `isProof` cannot see a proposition, so `g α x` is keyed.
+        let undecided = key(sort_eq(bvar(2), g(bvar(2), bvar(1)), bvar(1)));
+        assert_eq!(undecided.args, [SimpArgKey::Any, SimpArgKey::Const(n("g"))]);
+        // A proof argument (`h : m = m`) is never keyed, even when it is a constant.
+        let proof = key(apps(c("k"), &[bvar(1), c("fx")]));
+        assert_eq!(proof.head, n("k"));
+        assert!(proof.args.is_empty(), "{proof:?}");
+    }
+
+    #[test]
+    fn a_reducible_target_node_is_keyed_by_its_unfolding() {
+        use fln_env::constants::{DefinitionSafety, DefinitionVal};
+        let nat = c("Nat");
+        let prop = Expr::sort(Level::zero());
+        let abbrev = |name: &str, type_: Expr, value: Expr| {
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: n(name),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                value,
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![n(name)],
+            })
+        };
+        // `wrap a := f a` unfolds to an application of `f`; `imp p q := p → q` to an arrow.
+        let env = environment()
+            .add_decl(abbrev(
+                "wrap",
+                pi(nat.clone(), nat.clone(), BinderInfo::Default),
+                Expr::lam(
+                    Name::anonymous(),
+                    nat.clone(),
+                    Expr::app(c("f"), bvar(0)),
+                    BinderInfo::Default,
+                ),
+            ))
+            .unwrap()
+            .add_decl(abbrev(
+                "imp",
+                pi(
+                    prop.clone(),
+                    pi(prop.clone(), prop.clone(), BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+                Expr::lam(
+                    Name::anonymous(),
+                    prop.clone(),
+                    Expr::lam(
+                        Name::anonymous(),
+                        prop.clone(),
+                        pi(bvar(1), bvar(1), BinderInfo::Default),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            ))
+            .unwrap();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        context
+            .txn
+            .lctx
+            .add_param(FVarId(n("x")), n("x"), nat.clone(), BinderInfo::Default);
+        for name in ["p", "q"] {
+            context
+                .txn
+                .lctx
+                .add_param(FVarId(n(name)), n(name), prop.clone(), BinderInfo::Default);
+        }
+        let rule = SimpRule::Global(scope::simp::SimpEntry {
+            declaration: n("fx"),
+            proof: None,
+            priority: 1000,
+            reverse: false,
+            order: 0,
+        });
+        let key = context.simp_rule_node_key(&rule).unwrap().unwrap();
+        let local = |name: &str| Expr::fvar(FVarId(n(name)));
+        let binder = SimpKey {
+            head: simp_binder_key(),
+            args: Vec::new(),
+        };
+        let wrapped = Expr::app(c("wrap"), local("x"));
+        let implication = apps(c("imp"), &[local("p"), local("q")]);
+        assert!(context.simp_node_admits(&key, &wrapped).unwrap());
+        assert!(!context.simp_node_admits(&binder, &wrapped).unwrap());
+        assert!(!context.simp_node_admits(&key, &implication).unwrap());
+        assert!(context.simp_node_admits(&binder, &implication).unwrap());
     }
 }

@@ -33,8 +33,9 @@ impl Context {
     ) -> Result<Option<(Typed, Expr, bool)>, NatDefinitionElabError> {
         let mut term = self.selected_simp_term(rule)?;
         term.type_ = self.simp_premise_target(&term.type_, premises)?;
+        let key = self.simp_rule_node_key(rule)?;
         if let Some(found) =
-            self.instantiate_rewrite_rule(term, target, rule.reverse(), true, premises)?
+            self.instantiate_simp_rule(term, target, rule.reverse(), premises, key.as_ref())?
         {
             assert!(
                 found.premises.is_empty(),
@@ -115,8 +116,9 @@ impl Context {
     ) -> Result<Option<(Expr, Typed)>, NatDefinitionElabError> {
         let mut term = self.selected_simp_term(rule)?;
         term.type_ = self.simp_premise_target(&term.type_, premises)?;
+        let key = self.simp_rule_node_key(rule)?;
         let Some(found) =
-            self.instantiate_rewrite_rule(term, body, rule.reverse(), true, premises)?
+            self.instantiate_simp_rule(term, body, rule.reverse(), premises, key.as_ref())?
         else {
             return Ok(None);
         };
