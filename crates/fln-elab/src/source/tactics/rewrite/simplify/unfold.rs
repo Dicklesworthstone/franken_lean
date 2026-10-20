@@ -162,11 +162,121 @@ impl Context {
         selection: &Selection,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
         let result = self.simp_unfold_selected(target, selection)?;
-        if self.rewrite_same(&result, target)? {
+        // Unfolding normalizes every node it rebuilds, as the pin's simp beta- and
+        // zeta-reduces. Removing a source ascription's `let` is not progress: the pin's
+        // term has none, so `simp` on `(10 : USize) + 2 = x` makes no progress there.
+        if self.simp_same_up_to_ascriptions(&result, target)? {
             Ok(UnfoldResult::Unchanged)
         } else {
             Ok(UnfoldResult::Changed(result))
         }
+    }
+
+    /// Equality after removing source ascriptions. This elaborator keeps `(e : T)` as
+    /// `let _ : T := e; _` so the kernel checks the annotation; the pin's term has no `let`
+    /// there. Its zeta reduction is therefore not progress: `dsimp only` on
+    /// `(x : Nat) + 2 = 7`, or `simp` on `(10 : USize) + 2 = x`, makes none at the pin.
+    pub(super) fn simp_same_up_to_ascriptions(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.rewrite_same(left, right)? {
+            return Ok(true);
+        }
+        let left = self.without_source_ascriptions(left)?;
+        let right = self.without_source_ascriptions(right)?;
+        self.rewrite_same(&left, &right)
+    }
+
+    /// `expr` with every `let _ : T := e; _` that a non-`show` ascription elaborates to
+    /// replaced by `e`.
+    pub(super) fn without_source_ascriptions(
+        &mut self,
+        root: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut retained = Vec::new();
+        let mut work = vec![(root.clone(), false)];
+        while let Some((term, exit)) = work.pop() {
+            self.tick()?;
+            let key = term.allocation_identity();
+            if done.contains_key(&key) {
+                continue;
+            }
+            if !exit {
+                work.push((term.clone(), true));
+                work.extend(
+                    children(&term)
+                        .into_iter()
+                        .rev()
+                        .flatten()
+                        .map(|child| (child.clone(), false)),
+                );
+                continue;
+            }
+            let child = |term: &Expr| done[&term.allocation_identity()].clone();
+            let rebuilt = match term.node() {
+                ExprNode::LetE {
+                    decl_name,
+                    value,
+                    body,
+                    non_dep: false,
+                    ..
+                } if decl_name.is_anonymous()
+                    && matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
+                {
+                    child(value)
+                }
+                ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::lam(
+                    binder_name.clone(),
+                    child(binder_type),
+                    child(body),
+                    *binder_info,
+                ),
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::forall_e(
+                    binder_name.clone(),
+                    child(binder_type),
+                    child(body),
+                    *binder_info,
+                ),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => Expr::let_e(
+                    decl_name.clone(),
+                    child(type_),
+                    child(value),
+                    child(body),
+                    *non_dep,
+                ),
+                ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => Expr::proj(struct_name.clone(), *idx, child(expr)),
+                _ => term.clone(),
+            };
+            done.insert(key, rebuilt);
+            // Keep every visited term alive: an allocation identity must not be reused.
+            retained.push(term);
+        }
+        Ok(done[&root.allocation_identity()].clone())
     }
 
     fn simp_unfold_selected(

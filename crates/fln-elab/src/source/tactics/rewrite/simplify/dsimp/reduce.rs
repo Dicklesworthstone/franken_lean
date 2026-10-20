@@ -403,6 +403,10 @@ impl Context {
                     self.tick()
                 })?
                 && let Some(receiver) = arguments.get(projection.parameters)
+                // The pin's `Simp.reduceProjFn?` reduces a class's projection only when it
+                // was selected for unfolding (handled above): `dsimp only` left `x + y`
+                // alone at the pin and rewrote it to `x.add y` here, then claimed progress.
+                && !self.instance_registry()?.is_class(&projection.structure)
             {
                 let receiver = self.whnf_with_transparency(
                     receiver,

@@ -771,3 +771,26 @@ fn simp_only_unfolds_local_lets_in_tactic_generated_subgoals() {
         "theorem use (x : Nat) : x = x := let y := x; by apply step y; simp only [y]",
     );
 }
+
+#[test]
+fn removing_a_source_ascription_is_not_simplification_progress() {
+    // Both judged by the pinned lean. The pin's term keeps no trace of `(x : Nat)`, so
+    // `simp only [g]` makes no progress and the first theorem is refused there; this
+    // elaborator keeps the ascription as a `let` the kernel checks, and simplification
+    // once counted removing it as progress. A real beta redex is progress at the pin.
+    let base = admit(&engine(), "def g (n : Nat) : Nat := n");
+    let refused = "theorem bad (x y : Nat) (h : (x : Nat) + 2 = y) : (x : Nat) + 2 = y := by\n  simp only [g]\n  exact h";
+    let Err(error) = base.admit_source_declaration(refused.as_bytes(), &KVMap::new(), limits())
+    else {
+        panic!("removing an ascription was simplification progress: {refused}");
+    };
+    assert!(
+        error.to_string().contains("simp only made no progress"),
+        "{error}"
+    );
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    admit(
+        &base,
+        "theorem beta (x y : Nat) (h : x + 2 = y) : (fun z => z) x + 2 = y := by\n  simp only [g]\n  exact h",
+    );
+}

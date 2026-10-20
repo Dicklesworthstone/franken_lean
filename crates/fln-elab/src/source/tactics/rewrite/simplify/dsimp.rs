@@ -105,7 +105,7 @@ impl Context {
                 .ok_or_else(|| error(TacticError::RewriteLocation))?;
             let original = self.instantiate(&local.type_)?;
             let next = self.dsimp_expression(&original, &set)?;
-            if !self.rewrite_same(&original, &next)? {
+            if !self.simp_same_up_to_ascriptions(&original, &next)? {
                 // Identity is preserved only for definitional equality. In
                 // particular, this path never calls replace_rewritten_local.
                 let mut context = LocalContext::new();
@@ -144,7 +144,7 @@ impl Context {
         if target {
             let original = self.instantiate(&goal.target)?;
             let next = self.dsimp_expression(&original, &set)?;
-            changed |= !self.rewrite_same(&original, &next)?;
+            changed |= !self.simp_same_up_to_ascriptions(&original, &next)?;
             goal.target = next;
             if let Some(value) = self.dsimp_reflexivity(&goal.target)? {
                 self.close_proof_goal(goal, value)?;

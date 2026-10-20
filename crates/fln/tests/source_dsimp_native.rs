@@ -63,6 +63,8 @@ accepted_fixture!(local_equality);
 accepted_fixture!(erasure);
 accepted_fixture!(local_definition);
 accepted_fixture!(repeat_no_progress);
+accepted_fixture!(structure_projection);
+accepted_fixture!(ascription_beta);
 
 #[test]
 fn refusals_never_publish_a_false_or_partial_declaration() {
@@ -90,6 +92,14 @@ fn refusals_never_publish_a_false_or_partial_declaration() {
         (
             "late_invalid_location",
             include_str!("source_dsimp/refuse/late_invalid_location.lean"),
+        ),
+        (
+            "class_projection",
+            include_str!("source_dsimp/refuse/class_projection.lean"),
+        ),
+        (
+            "ascription_no_progress",
+            include_str!("source_dsimp/refuse/ascription_no_progress.lean"),
         ),
     ] {
         assert!(

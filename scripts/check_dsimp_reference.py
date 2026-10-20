@@ -19,11 +19,13 @@ ACCEPTED = {
     "wildcard", "data_location", "closure", "default_rules",
     "explicit_rfl_rule", "untagged_rfl_rule", "default_transparency_rule",
     "partial_application", "rollback", "projection_eta", "local_equality",
-    "erasure", "local_definition", "repeat_no_progress",
+    "erasure", "local_definition", "repeat_no_progress", "structure_projection",
+    "ascription_beta",
 }
 REFUSED = {
     "false", "nonreflexive", "no_progress", "unknown_rule", "unknown_location",
-    "late_invalid_location",
+    "late_invalid_location", "class_projection",
+    "ascription_no_progress",
 }
 
 
