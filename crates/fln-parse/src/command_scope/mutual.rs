@@ -1,8 +1,8 @@
-//! Atomic source groups for native mutual inductives, partial and unsafe definitions.
+//! Atomic source groups for native mutual declarations.
 //!
 //! The pin's Command.mutual encloses commands between `mutual` and `end`.
-//! This door accepts one to eight uniformly inductive, partial or unsafe declarations;
-//! mixed groups, nested groups and scope changes are never sequentialized.
+//! This door accepts one to eight uniformly inductive, theorem, ordinary,
+//! partial or unsafe members. Mixed kinds and scope changes are never sequentialized.
 //! Members use the ordinary declaration parser over their exact source bytes.
 use super::*;
 
@@ -104,6 +104,8 @@ enum MemberKind {
     Inductive,
     PartialDefinition,
     UnsafeDefinition,
+    OrdinaryDefinition,
+    Theorem,
 }
 
 /// This is only group classification. Preserve the complete declaration and
@@ -127,14 +129,12 @@ fn member_kind(syntax: &Syntax) -> Option<MemberKind> {
     {
         return Some(MemberKind::Inductive);
     }
-    if args[1].kind()
-        != Some(&Name::from_components([
-            "Lean",
-            "Parser",
-            "Command",
-            "definition",
-        ]))
-    {
+    let kind = args[1].kind()?;
+    let theorem = kind == &parser_kind(&["Command", "theorem"]);
+    let ordinary = theorem
+        || kind == &parser_kind(&["Command", "definition"])
+        || kind == &parser_kind(&["Command", "abbrev"]);
+    if !ordinary {
         return None;
     }
     let Syntax::Node { kind, args, .. } = &args[0] else {
@@ -157,8 +157,10 @@ fn member_kind(syntax: &Syntax) -> Option<MemberKind> {
         Some(MemberKind::PartialDefinition)
     } else if has_modifier(5, "unsafe") {
         Some(MemberKind::UnsafeDefinition)
+    } else if theorem {
+        Some(MemberKind::Theorem)
     } else {
-        None
+        Some(MemberKind::OrdinaryDefinition)
     }
 }
 
@@ -255,7 +257,7 @@ mod tests {
             "mutual inductive A where | mk",
             "mutual inductive A where | mk (x : Nat] end",
             "mutual inductive A where | mk end A",
-            "mutual def x := 1 def y := x end",
+            "mutual def x : Nat := 1 theorem y : True := True.intro end",
             "mutual inductive A where | mk def x := 1 end",
             "mutual namespace N inductive A where | mk end end",
             "mutual inductive A where | mk mutual inductive B where end end",

@@ -65,6 +65,14 @@ fn escaped_member_names_and_trivia_do_not_end_or_forge_groups() {
     for source in [
         "mutual\n/-- partial -/\ndef left : Nat := 7\nend",
         "mutual\nprivate def «partial» : Nat := 7\nend",
+    ] {
+        // Ordinary groups now parse. A comment or escaped name still cannot
+        // forge a partial modifier; the exact syntax keeps that slot empty.
+        let members = mutual::parse(source.as_bytes()).unwrap().unwrap();
+        assert_eq!(members.len(), 1);
+        assert!(args(&args(&args(&members[0])[0])[6]).is_empty());
+    }
+    for source in [
         "mutual\npartial def left : String := \"partial def\"\nprivate def right : Nat := 1\nend",
         "mutual\nprivate partial def left : Nat := 1\naxiom right : Nat\nend",
         "mutual\nprivate partial def left : Nat := 1\nend\npartial def escaped : Nat := 2",
