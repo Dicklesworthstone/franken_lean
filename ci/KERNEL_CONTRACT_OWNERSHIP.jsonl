@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":652,"projection_hash":"bc2438cab8286c11cbd98a2a2ed34100d90c9105977c8e17f2b42a2d69cb8af8"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":657,"projection_hash":"c90bd4f3495c70f87b5331fe7a35dd4a3e3d566a9eae83e136c0d2ccc35589af"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -104,6 +104,7 @@
 {"id":"fln-checker-free-binding-cycle-false-reject-u1vk"}
 {"id":"fln-checker-mathlib-shapes-qne9"}
 {"id":"fln-ci-fixture-root-dev-host-path-8gdb"}
+{"id":"fln-ci-tests-need-pin-d3ci"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
 {"id":"fln-d18-product-half-rgsg"}
@@ -128,6 +129,7 @@
 {"id":"fln-eq4k"}
 {"id":"fln-ersf"}
 {"id":"fln-euo"}
+{"id":"fln-eval-stderr-capture-ay5r"}
 {"id":"fln-evidence-runner-bootstrap-btk"}
 {"id":"fln-ew20"}
 {"id":"fln-export-aliases-ub7i"}
@@ -224,6 +226,7 @@
 {"id":"fln-l8f"}
 {"id":"fln-lake-clean-symlink-comments-vlp1"}
 {"id":"fln-laxj"}
+{"id":"fln-layout-column-false-accepts-cbfm"}
 {"id":"fln-library-elab-inconclusive-typing-yj3w"}
 {"id":"fln-lld"}
 {"id":"fln-llg3"}
@@ -268,6 +271,7 @@
 {"id":"fln-path-classification-coverage-unbound-9teu"}
 {"id":"fln-peer-header-incremental-4t82"}
 {"id":"fln-pin-syntax-corpus-7b5b"}
+{"id":"fln-prelude-list-literal-false-accept-uvga"}
 {"id":"fln-private-index-worktree-sync-mbh9"}
 {"id":"fln-provisional-frontier-vf32"}
 {"id":"fln-pu6i"}
@@ -288,6 +292,7 @@
 {"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-registry-batch-preflight-sszd"}
+{"id":"fln-repr-ingress-lambda-application-xchs"}
 {"id":"fln-rfl-for-step-limit-63a9"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}
