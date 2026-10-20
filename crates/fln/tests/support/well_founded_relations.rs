@@ -412,8 +412,11 @@ pub(super) fn assert_relation_execution_budget(base: &Engine) {
 
 pub(super) fn assert_relation_requires_computability(base: &Engine) {
     // With only Init.WFTactics, the Reference refuses to compile this same
-    // direct application of WellFounded.fix. The checked fix_eq_fixC theorem
-    // and its executable implementation must be present before native lowering.
+    // direct application of WellFounded.fix (pinned lean v4.32.0, `prelude`,
+    // `import Init.WFTactics`): "failed to compile definition, consider marking
+    // it as 'noncomputable' because it depends on 'WellFounded.fix', which is
+    // 'noncomputable'". The checked fix_eq_fixC theorem and its executable
+    // implementation must be present before native lowering.
     let (_, definition, application, _) = PROGRAMS[11];
     let source = format!("{definition}\ndef answer : Nat := {application}");
     let root = base.logical_root(&KVMap::new());
@@ -424,13 +427,12 @@ pub(super) fn assert_relation_requires_computability(base: &Engine) {
             EngineExecutionLimits::new(super::limits().kernel),
         )
         .expect_err("generic fix execution requires its imported checked computability rule");
-    let mut cause = &error;
-    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
-        cause = error;
-    }
     assert!(
-        matches!(cause, fln::EngineExecutionError::Ingress(reason) if !reason.is_resource_exhaustion()),
-        "the missing checked executable rule is a capability refusal: {error:?}"
+        error.to_string().contains(
+            "failed to compile definition, consider marking it as 'noncomputable' because it \
+             depends on 'WellFounded.fix', which is 'noncomputable'"
+        ),
+        "the missing checked executable rule is refused as the pin refuses it: {error}"
     );
     assert_eq!(base.logical_root(&KVMap::new()), root);
 }

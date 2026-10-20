@@ -382,7 +382,7 @@ impl std::fmt::Display for SourceInferenceError {
             ),
             Self::NoncomputableDependency(name) => write!(
                 f,
-                "failed to compile definition, consider marking it as 'noncomputable' because it depends on '{}'",
+                "failed to compile definition, consider marking it as 'noncomputable' because it depends on '{}', which is 'noncomputable'",
                 name.to_display_string()
             ),
             Self::NoncomputableJournal(error) => write!(f, "{error}"),
