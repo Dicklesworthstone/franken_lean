@@ -3,6 +3,7 @@
 //! the compiler's constructor tag/shape test selects that particular branch.
 use super::*;
 use fln_core::level::Level;
+mod nonrecursive;
 
 pub(super) struct Case {
     pub name: Name,
@@ -42,9 +43,17 @@ impl Preparation<'_> {
         };
         let family = shape.source.clone();
         let args = &args[rec.num_params as usize..];
-        if shape.recursive || shape.constructors.len() != rec.rules.len() {
+        if shape.constructors.len() != rec.rules.len() {
             return Ok(None);
         }
+        let minors = if shape.recursive {
+            let Some(minors) = self.case_only_minors(&shape, &args[1..rec.rules.len() + 1])? else {
+                return Ok(None);
+            };
+            minors
+        } else {
+            args[1..rec.rules.len() + 1].to_vec()
+        };
         // A branch can return a function whose later domains contain proofs
         // about the major or preceding fields. Keep every runtime argument,
         // erase only its checked proof representation, and remove the motive's
@@ -79,7 +88,7 @@ impl Preparation<'_> {
             if rule.ctor != ctor.original || rule.nfields as usize != ctor.fields.len() {
                 return Ok(None);
             }
-            let mut body = args[index + 1]
+            let mut body = minors[index]
                 .lift_loose(0, 1)
                 .map_err(|_| unsupported("variant minor scope"))?;
             for field in 0..ctor.fields.len() {
@@ -206,9 +215,19 @@ impl Preparation<'_> {
         {
             return Ok(false);
         }
+        let Some(shape) = self.recursor_shape(rec, levels, &args)? else {
+            return Ok(false);
+        };
+        if shape.constructors.len() != rec.rules.len() {
+            return Ok(false);
+        }
+        if !shape.recursive {
+            return Ok(true);
+        }
+        let offset = rec.num_params as usize + 1;
         Ok(self
-            .recursor_shape(rec, levels, &args)?
-            .is_some_and(|shape| !shape.recursive && shape.constructors.len() == rec.rules.len()))
+            .case_only_minors(&shape, &args[offset..offset + rec.rules.len()])?
+            .is_some())
     }
 
     pub(super) fn register_constructor_branch(

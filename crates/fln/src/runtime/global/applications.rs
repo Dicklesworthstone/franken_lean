@@ -16,6 +16,40 @@ impl Preparation<'_> {
         args: &[Expr],
         outer_depth: usize,
     ) -> Result<Option<Expr>, IngressError> {
+        // Already evaluated operands cannot cross a strict stage by being
+        // passed together. Keep a fully supplied case at its data-result join,
+        // instead of introducing a premature shared callback interface.
+        let mut inert = !args.is_empty();
+        let mut staged = false;
+        let mut signature = type_.clone();
+        for argument in args {
+            let normal = self.type_head(&signature)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                break;
+            };
+            if !staged {
+                staged = self.staged_callback(argument, binder_type)?;
+            }
+            signature = self.substitution(body, argument)?;
+            self.tick()?;
+            inert &= matches!(
+                argument.node(),
+                ExprNode::BVar { .. } | ExprNode::FVar { .. } | ExprNode::Lit { .. }
+            ) || self.inert_callable(argument)?.is_some()
+                || self.instance_factory_value(argument)?.is_some();
+        }
+        if staged && inert && self.saturated_variant_result(&type_, args.len())?.is_some() {
+            let depth = self.producer_depth(outer_depth)?;
+            let mut lifted = Vec::new();
+            for argument in args {
+                reserve(&mut lifted, self.limits.max_application_args)?;
+                lifted.push(self.lift(argument, depth)?);
+            }
+            return Ok(Some(lifted.into_iter().fold(value, Expr::app)));
+        }
         let mut stages = Vec::new();
         let mut result_type = type_.clone();
         let mut depth = outer_depth

@@ -359,7 +359,11 @@ impl Preparation<'_> {
         Ok(used)
     }
 
-    fn staged_callback(&mut self, input: &Expr, type_: &Expr) -> Result<bool, IngressError> {
+    pub(in crate::runtime) fn staged_callback(
+        &mut self,
+        input: &Expr,
+        type_: &Expr,
+    ) -> Result<bool, IngressError> {
         let Some(mut value) = self.inert_callable(input)? else {
             return Ok(false);
         };

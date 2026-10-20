@@ -192,6 +192,17 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let family = shape.source.clone();
+        // Nonrecursive matches on recursive data need no fixpoint or flattened
+        // result-argument ABI. The later variant path retains lazy branches.
+        if rec.num_indices == 0 && rec.num_minors >= 2 {
+            let offset = rec.num_params as usize + 1;
+            if self
+                .case_only_minors(&shape, &args[offset..offset + rec.rules.len()])?
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
         let parameter_arguments = &args[..rec.num_params as usize];
         let args = &args[rec.num_params as usize..];
         let (family_head, family_parameters) = self.spine(&family)?;
