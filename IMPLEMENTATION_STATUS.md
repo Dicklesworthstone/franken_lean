@@ -23,7 +23,91 @@ The evidence matrix and Beads tracker remain authoritative where they carry stro
 
 ---
 
-## Measured state, 2026-10-17
+## Reality check, 2026-10-20
+
+**The independent checker and bounded native source toolchain are real. The complete drop-in toolchain and its architectural performance claims are not delivered.** This review read AGENTS.md and README.md in full, the complete comprehensive plan, the live work graph, subsystem implementations and their consumers, retained frontier receipts, and current GitHub gate results. It separates a source review from an executed binary observation.
+
+Initial source anchor: `2eebf7cdf9f27b8506c08e0f3d4ac825131fd50f`. During the review, `5857c23b4` added bounded error-expecting `#guard_msgs` for `example`/`#check`, and `a79b2a8c0` added inferred lexicographic Nat measures. Their source and tests were inspected; they extend real source support without changing the architectural gaps below. Final inspected HEAD `84d99146f3d19e3d0bcdacf859fb705310e5662f` adds tracker/verification records. Initial graph snapshot: 659 beads, 200 open, 59 in progress, 400 closed; final graph: 661 beads, 202 open, 59 in progress, 400 closed. Both have 998 blocking dependency edges, 80 other links and no blocking cycles. These counts measure work records, not compatibility or completion.
+
+Remote `main` subsequently advanced to `f8445758fe56c35820cc54f6664426346091b4c1`. Its source patch was inspected: it adds explicit-header acyclic ordinary mutual declarations through the existing checking batch; recursive components still refuse. This follow-up extends the source subset and does not change the gap map. Its reported tests were not re-executed by this review.
+
+### What this review executed
+
+The runtime probes used existing release binaries on `sensedemobox`, not a fresh build of the source anchor. Their source commit was not independently established. Exact SHA-256 identities are `lean` = `4ce7085770acdf61699a37f89d081742c0d8d097f61d58a6b92ec0ae305f590d`, `fln` = `60487cd913fc1b40854789cc7d1ccecc70319c96adca7857cb098e4a25804c53`, and `lake` = `fed77744b82cb0b9183a4ed3439f5ff8a1ca603596f5c804a1d5a4c70141e0bc`. The live v4.32.0 oracle hash was `e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550`. These are bounded observations about those binaries; they do not qualify HEAD.
+
+| Probe | Observed result | Boundary |
+|---|---|---|
+| Ordinary `lean --stdin` | `#eval 6 * 7` prints `42`; a reflexive Nat theorem completes silently; both match the live pin | Two ordinary programs, warm existing admission state; no performance comparison |
+| Core proof and negative controls | A `prelude` hypothesis theorem succeeds in both; a wrong return type and an unproved arbitrary proposition fail in both | Diagnostic text differs; no kernel soundness proof |
+| Empty-prelude executable definitions | Three identity/lambda/let definitions succeed natively while the pin refuses missing `lcAny` | A compiler-environment compatibility divergence, not acceptance of an ill-typed proof. The same missing-helper confound was already recorded in `fln-4mv` comment 3616 |
+| Native package build | Two local proof modules built with `lake build +Proofs:olean`; both were admitted by K1 and the independent checker | TOML library and explicit `.olean` facet |
+| No-op package rebuild | Two cached modules, zero elaborations | Module reuse; does not demonstrate declaration-granular invalidation |
+| Mixed-producer proof import | A separate consumer of those native artifacts succeeds in both the native binary and pinned Reference | Theorem-only, import-free core library; executable/LCNF compatibility remains separate |
+| Named-module check | `fln check-module Proofs ROOT` rechecks both generated modules: two declarations, zero axioms | Small real artifact closure, not a stdlib or Mathlib run |
+| Live stdio editor session | Initialize, open an unsaved proof, publish zero diagnostics, query the real local goal `P : Prop; h : P; ⊢ P`, shutdown and exit all succeed | Real `lean --server` process and source-backed goal; no VS Code client, shared-import or concurrent-cancellation claim |
+| Prelude codec | `olean verify-rebuild` reports byte identity for all three parts, 4,787,088 bytes, zero findings | Rebuild of existing artifacts, not fresh-source output identity |
+| Missing front doors | `serve-mcp`, `cache`, and `replay` each exit 5 with their capability notice | Explicit unavailable capabilities |
+| Bare package build | Default facets refuse instead of reporting success | The README quick-start `lake build` is still a target workflow |
+
+The source review also verified that the current RPC dispatcher supports interactive diagnostics in addition to interactive goals and term goals. The older two-of-ten description below is historical. Its transcript correlation classifier still treats RPC connect/call as unsupported; dispatcher progress and validator coverage remain different facts.
+
+Local checks executed: the four Python timeline-builder regressions pass, and the AGENTS enforcement census passes. UBS produced no scanner output and was stopped; this supplies no scan verdict. No Rust workspace green is claimed. Final recheck finds the pinned Rust toolchain installed, correcting the earlier environment note; the pinned Reference is absent locally, and `sbh check --need 20G` still returns nonzero. Existing remote binaries were used without compiling around that gate. Scripts and raw probe output are retained under `/tmp/fln-reality-20261020.cwoOG1`; remote package inputs, outputs and results are under `/data/tmp/fln-reality-lake-20261020-77ol8bfs`. Those scratch paths are reproduction aids, not durable release evidence.
+
+### Vision-to-implementation checklist
+
+`PARTIAL` means a real subset exists. `SHELL` means types/charter exist without an operational product. `UNPROVEN` means the target evidence has not been established by this review. Every row below has existing work coverage; a parent bead's existence is not an executable completion plan by itself.
+
+| Vision / acceptance target | Current reality and source | State | Existing work |
+|---|---|---|---|
+| Every pinned module independently judged | Real decoder, reconstruction, K1 and independent veto in `crates/fln/src/lib.rs`; newest retained combined run is still S25 | PARTIAL | `fln-r0yh`, `fln-ob6`, `fln-kernel-reject-side-at-scale-bemc`, `franken_lean-t6r7` |
+| Small dual-engine kernel with foreign witnesses | K1 and a separate checker exist; K2 is not on the product path. Corpus acceptance alone cannot detect false acceptance | PARTIAL | `franken_lean-g3k`, `franken_lean-3j8` |
+| Certificate judgment replay, receipts and public log | Certificate/cartridge codecs and bounded checking machinery exist; `verify_capsule_bytes` explicitly reports certificate replay unimplemented. No transparency log product | PARTIAL | `fln-dcv`, `franken_lean-d2h5`, `franken_lean-nix9`, `franken_lean-eb3` |
+| General Lean source and T2/T3 identity | Substantial native proofs/programs, implicit imports, instances, matches, records, recursion and tactics; many unsupported forms and recorded false accepts remain. Stdlib source closure is not demonstrated | PARTIAL | `franken_lean-z8j.1.10`, `.11`, `.12`, `fln-file-scale-t2-differential-5f1b`, `fln-upstream-suite-scoreboard-n04o` |
+| Extensible syntax, hygiene and imported macros | File-local template syntax/macros are live through `fln-parse::extensions`. Production still uses the bounded hand parser and `own_syntax_only`; imported executable macros are a separate missing rung | PARTIAL | `fln-generated-builtin-grammar-spike-kcvj`, `fln-pin-syntax-corpus-7b5b`, `fln-macro-rung-e1rk` |
+| Native Mirror running unchanged ecosystem tactics | Native services and intrinsics exist, but no demonstrated complete native façade or executed Mathlib tactic through it | PARTIAL | `fln-l8f`, `fln-mirror-price-cszo`, `franken_lean-epx`, `franken_lean-26y` |
+| General compiler/VM and imported user-code execution | Real FIR/FLBC, ABI-valued execution, source compilation and imported-definition execution; general user metaprograms and a shared native/VM/plugin calling convention remain incomplete | PARTIAL | `fln-y55`, `fln-52k`, `franken_lean-z8j.1.9`, `.24` |
+| Runtime ABI and bidirectional native plugins | Real object membrane, reference counting, allocator, exported symbols and task slices. Runtime documentation still assigns plugin loading/outbound linking to open doors | PARTIAL | `franken_lean-83r`, `franken_lean-sno`, `fln-kok`, `fln-3gv` |
+| Read, rebuild and freshly write compatible artifacts | Real pinned-format decoder, three-part rebuild, module writer and bounded downstream proof use. Full fresh-write identity, extensions and executable companions are not established | PARTIAL | `franken_lean-iwu`, `fln-4mv`, `fln-zp28` |
+| Production deterministic parallel elaboration | `fln-elab::scheduler` has executable scheduling/validation logic; no source front door invokes `DeterministicScheduler`. Parallel import admission is a different operation | PARTIAL | `franken_lean-feo`, `fln-otk7` |
+| Declaration-granular durable Ledger and true-cone rebuilds | `fln-ledger` contains record/demand types and formatting, no storage/query engine, and has no product consumer. Lake's current reuse is module-level | SHELL | `franken_lean-xy6`, `fln-oavg`, `franken_lean-5h8`, `franken_lean-e7rb` |
+| Full Lake configuration, facets and resolution | Real bounded TOML and native Lean configuration plus explicit `.olean` builds. Default artifacts, executables and full dependency DSL/fetching remain unavailable | PARTIAL | `fln-4mv`, `franken_lean-92f` |
+| Federated cache and conservative epoch reuse | No operational Ledger/atp path; `fln cache` refuses | SHELL | `franken_lean-bp6x`, `franken_lean-kna`, `franken_lean-832i` |
+| Single daemon, shared imports, resumable O(1) proof branches | Long-lived bounded proof worker and document state exist. It is not the planned asupersync daemon; RPC presentation references are not resumable elaboration snapshots | PARTIAL | `franken_lean-v2p`, `franken_lean-uv6`, `fln-zddn` |
+| Unmodified editor and full Lean wire parity | Real framing, document lifecycle, diagnostics and semantic queries. Seven builtin RPC procedures remain unsupported; full editor smoke, cancellation and publication architecture remain open | PARTIAL | `fln-infoview-rpc-procedures-my8l`, `franken_lean-k18`, `franken_lean-sk0` |
+| Rewriting and owned decision engines | Proof-producing source simplification and native omega/Verdict integration exist. This does not supply complete simp/grind or compiled per-library CAS indexes | PARTIAL | `franken_lean-jxw`, `fln-w0b`, `fln-hqn`, `fln-publish-rewrite-indexes-gca`, `franken_lean-engine-backed-tactic-integration-c90` |
+| Capability-first embedded API | Real `Engine` library with typed budgets and dual checking; no asupersync `Cx` integration | PARTIAL | `franken_lean-7kc`, `fln-otk7` |
+| MCP service with fork/apply/search/check | `fln-mcp` is an unconsumed type-only module; no MCP server behind `serve-mcp` | SHELL | `franken_lean-806`, `franken_lean-87av`, `fln-bz4h` |
+| Causal provenance, replay, semantic diff/merge, SQL | Trust inventory and decoded-artifact diff are useful bounded tools. `fln-trace` has no product consumer; no causal journal/replay or build SQL service | SHELL | `franken_lean-0tn`, `franken_lean-05g`, `franken_lean-hn0t` |
+| Semantic discovery and proof repair | `fln-hound` is an unconsumed type-only module | SHELL | `franken_lean-xqb` |
+| Native documentation and terminal InfoView | `fln-doc` and `fln-tui` have no product consumers. Current source-goal inspection is not the daemon-connected TUI | SHELL | `franken_lean-8de`, `franken_lean-terminal-infoview-client-9q6`, `fln-in1` |
+| Offline browser Judge | `fln-wasm` is a type-only module, with no kernel/checker dependency or browser artifact | SHELL | `fln-wasm-judge-browser-kvj`, `franken_lean-wasm-judge-packaging-contract-xte` |
+| Sovereign native executables | `fln-unsafe-jit` is a 15-line charter with no emitter. A host-C driver does not provide Iron | SHELL | `fln-o0j`, `franken_lean-htn` |
+| Owned numerics with certified performance/bit stability | Real bignum and libm implementations; cross-platform certified accuracy and PG-K/VM targets are not established here | PARTIAL / UNPROVEN | `franken_lean-8nts`, `fln-544`, `franken_lean-zoe` |
+| Suite-backed architecture | `Cargo.lock` has exactly 33 local packages and no external source entries; no FrankenSuite package is linked despite admission policy | NOT INTEGRATED | `fln-g1mc`, `fln-883f`, `fln-otk7` |
+| Every public claim evidence-gated, fresh and safely demoted | Real Witness ratchet: 24 rows, three concept censuses and 27 evidence citations. Its `GOVERNED_SCOPE` excludes most public claims and lacks the full freshness predicate. Passing the verification manifest does not adopt durable artifact references | PARTIAL | `franken_lean-1gf`, `franken_lean-n8hw`, `franken_lean-claim-matrix-doc-ci-mhew`, `franken_lean-parity-ledger-l2-definition-split-kl4h` |
+| Installed R4 toolchain, epochs and performance gates | No published GitHub releases. No Cargo bench target is declared or auto-discovered. No new PG result or certified platform/release matrix is established | UNPROVEN / NOT SHIPPED | `fln-86m`, `franken_lean-fy2x`, `franken_lean-skmi`, `franken_lean-j5w`, `fln-544` |
+
+### Current blockers and bridge order
+
+1. **Make changes verifiable before enlarging claims.** GitHub's `main` branch was unprotected at inspection. Latest completed non-cancelled product-gate run [39465871053](https://github.com/Dicklesworthstone/franken_lean/actions/runs/39465871053), source `75dce78c6c3409083b9bfd1ddb707314fc7444b4`, passed rustfmt and workspace Clippy but reported 939 test binaries, 12,552 passed and 160 failed. At final inspection the initial-anchor run was in progress, the `84d99146` run cancelled, and the `f8445758` run pending. Classify failures with pin-present controls before assigning causes; required landing checks remain the existing `fln-publisher-landing-contract-czyx` decision. Do not convert environment failures into silent success.
+2. **Close the Judge on the actual corpus.** The retained S25 receipt names binary source `0a44e720`: 8,973/11,083 accepted modules, zero failed, 11 inconclusive and 2,099 blocked. It is not a HEAD verdict or PG-1 result. Both corpus locations checked on the measurement host were absent; the canonical root holds a relocation note. Materialize into a new authorized path, bind source/binary/corpus/limits, run a new frontier, and test rejected mutated declarations with the full council. Never promote the blocked remainder into checked declarations.
+3. **Build the source path around shared semantic inputs.** Complete the generated grammar and pin-syntax corpus, then feed those same trees into imported macro execution and syntax-kind elaboration. Diff declared statements at file/module scale; stdout agreement alone is insufficient. Resolve the recorded D8/OQ-3 execution question before adopting imported IR as a general metaprogram path; no oracle fallback is authorized by this audit.
+4. **Connect the implementations before adding more shells.** Bind real source commands and effects to the existing scheduler; bind those products to durable Ledger storage; prove early cutoff and perturbation-based invalidation; then reuse the same checked environments for Lake, editor sessions and resumable proof forks. `fln-oavg` owns the full G3 producer handoff. A smaller integration experiment may establish a rung without closing that full handoff or any parent gate.
+5. **Finish the ecosystem execution path.** Native façade rows, ABI/VM calling conventions, initializers and effects must culminate in an unchanged user macro/tactic running on Golem, compared against the oracle. Existing compiler, Mirror, ABI and tactic beads own this work together with their positive, negative and resource tests.
+6. **Ship the remaining products from those shared primitives.** Real snapshot-backed MCP, provenance/search/docs/TUI, offline capsule judgment verification and WASM, native code generation, cache federation and installed release matrices remain full obligations. They cannot close on type definitions, decoded certificates, JSON response shapes or an isolated fixture.
+7. **Measure performance once the corresponding workflow exists.** Run the incumbent live in the same invocation, with corpus/host/cache/thread identity, raw samples and profiles. Current reuse observations and old loaded-host frontier times are not substitutes for PG-1 through PG-M.
+
+Completing the *full acceptance semantics* of the existing gate and workstream beads would address the major documented goals. Merely completing today's bounded implementation slices would not. Every checklist row has coverage; the gaps are operational handoffs, evidence freshness, large undecomposed work units and unmade decisions. No new top-level feature epic is justified by this review. Existing work should be refined at those joins instead of duplicating the roadmap.
+
+### Plan-space review
+
+Three ambition passes strengthened the bridge without narrowing the target: (1) require unchanged downstream consumers, not only native self-round-trips; (2) use one syntax/environment/snapshot representation across source, VM, scheduler, build and services; (3) connect performance wins to removed production work and conservative dependency facts, rather than accumulating independent accelerators.
+
+Five refinement passes checked coverage, architecture/dependency order, negative and recovery tests, evidence attribution, and duplication/operability. Material corrections were to separate certificate decoding from judgment verification, retained proof presentations from resumable states, module reuse from true-cone invalidation, current code from existing-binary observations, and historical scoreboards from a new measurement. Final coverage review gave B8 its own row, bringing the checklist to 27; the bounded Witness implementation earns credit without inheriting the full documentation promise. Seven additive comments refine the existing assessment, front-door, scheduler, Ledger, MCP and Witness beads and correct final environment/CI attribution (3755–3761); no status, dependency, prior comment or unrelated record changed. Final `bv --robot-triage` reports 119 actionable and 142 blocked active records, with no graph cycles; `br dep cycles` agrees. The verification-manifest validator passes, while explicitly reporting artifact-reference validation as not adopted. The stale/conflicted shared tracker DB was not force-imported, rebuilt or flushed over authoritative JSONL; only exact `br`-authored comment additions were published from an isolated tracker. Final review found no additional top-level goal needing a new epic. Product implementation and release qualification remain open; this assessment does not close their beads.
+
+---
+
+## Measured state, 2026-10-17 (historical)
 
 Collected by the reality check `fln-reality-check-1017-9l76` at origin/main `0e9d4c64`, with release binaries built from it and the pinned v4.32.0 `lean` as the oracle. One host under load from the check's own jobs. Re-run before citing.
 
@@ -57,7 +141,7 @@ Collected for bead `franken_lean-z8j.1.19`. Rows marked **re-run** were executed
 
 ---
 
-## Current frontier summary
+## Earlier subsystem notes (historical; see the 2026-10-20 checklist first)
 
 ### Crucible / independent checker
 
