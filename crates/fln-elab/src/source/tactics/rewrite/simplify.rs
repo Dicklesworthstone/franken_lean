@@ -520,9 +520,26 @@ impl Context {
                         applications.entry(projection).or_default().push(Vec::new());
                     }
                 }
+                // A `let` is keyed as both: the pin keys what its zeta reduction leaves.
                 ExprNode::ForallE { .. } | ExprNode::Lam { .. } | ExprNode::LetE { .. } => {
+                    for (key, keyed) in [
+                        (
+                            simp_arrow_key(),
+                            !matches!(head.node(), ExprNode::Lam { .. }),
+                        ),
+                        (
+                            simp_other_key(),
+                            !matches!(head.node(), ExprNode::ForallE { .. }),
+                        ),
+                    ] {
+                        if keyed {
+                            applications.entry(key).or_default().push(Vec::new());
+                        }
+                    }
+                }
+                ExprNode::MVar { .. } => {
                     applications
-                        .entry(simp_binder_key())
+                        .entry(simp_other_key())
                         .or_default()
                         .push(Vec::new());
                 }
@@ -579,14 +596,23 @@ impl Context {
                 table,
             }));
         }
-        // A binder is the pin's `.arrow` or `.other` key: only a rule rooted at a binder.
-        if matches!(
-            head.node(),
-            ExprNode::ForallE { .. } | ExprNode::Lam { .. } | ExprNode::LetE { .. }
-        ) && args.is_empty()
-        {
+        // A `∀` is the pin's `.arrow` key and a `fun` its `.other` key: only a rule rooted at
+        // the same binder. An application headed by a metavariable is `.other` too: there
+        // every rule was tried, at a pending decreasing proof `?h x y …` some 8,000 to 14,000
+        // heartbeats each, which stopped `ackermann`'s default `decreasing_by` at the limit.
+        let keys = match head.node() {
+            ExprNode::ForallE { .. } if args.is_empty() => vec![simp_arrow_key()],
+            ExprNode::Lam { .. } if args.is_empty() => vec![simp_other_key()],
+            ExprNode::LetE { .. } if args.is_empty() => vec![simp_arrow_key(), simp_other_key()],
+            ExprNode::MVar { id } if !self.txn.mvars.is_assigned(id) => vec![simp_other_key()],
+            _ => Vec::new(),
+        };
+        if !keys.is_empty() {
             return Ok(Some(SimpTargetIndex {
-                applications: HashMap::from([(simp_binder_key(), vec![Vec::new()])]),
+                applications: keys
+                    .into_iter()
+                    .map(|key| (key, vec![Vec::new()]))
+                    .collect(),
                 environment: simp_key_environment(env),
                 table,
             }));
@@ -1474,10 +1500,17 @@ fn simp_pattern_key(
     let pattern = simp_key_head_beta(pattern);
     let (head, args) = simp_key_spine(&pattern);
     match head.node() {
-        // The pin keys a binder as `.arrow` or `.other`: only a binder in the target matches.
-        ExprNode::ForallE { .. } | ExprNode::Lam { .. } if args.is_empty() => {
+        // The pin keys a `∀` as `.arrow` and a `fun` as `.other`: only the same binder in
+        // the target matches.
+        ExprNode::ForallE { .. } if args.is_empty() => {
             return Some(SimpKey {
-                head: simp_binder_key(),
+                head: simp_arrow_key(),
+                args: Vec::new(),
+            });
+        }
+        ExprNode::Lam { .. } if args.is_empty() => {
+            return Some(SimpKey {
+                head: simp_other_key(),
                 args: Vec::new(),
             });
         }
@@ -1580,10 +1613,17 @@ fn simp_key_head_beta(pattern: &Expr) -> Expr {
     pattern
 }
 
-/// The pseudo head every binder (`∀`, `fun`, `let`) of a target is indexed under, and a
-/// rule rooted at one is keyed by.
-fn simp_binder_key() -> Name {
-    Name::from_components(["«binder»"])
+/// The pin's `.arrow` key, which every `∀` is indexed under (dependent or not), and a rule
+/// rooted at one is keyed by.
+fn simp_arrow_key() -> Name {
+    Name::from_components(["«arrow»"])
+}
+
+/// The pin's `.other` key: a `fun` in the target or a rule rooted at one, and in the target
+/// an application headed by a metavariable, which the pin's `getMatch` keys as `.other` too.
+/// An `.other` node retrieves no `.arrow` rule, and an `.arrow` node no `.other` rule.
+fn simp_other_key() -> Name {
+    Name::from_components(["«other»"])
 }
 
 /// The key of `head args` with a constant head, as the pin's `whnfR` reaches it: a
@@ -2375,23 +2415,40 @@ mod tests {
         );
         // Partially applied, the unfolding is a `fun`: left open, as the pin's `.other`.
         assert!(simp_pattern_key(&cop, &table, &Expr::app(c("cop"), bvar(0))).is_none());
-        // A rule rooted at a binder is admitted only where the target has a binder.
-        let binder_rule = SimpKey {
-            head: simp_binder_key(),
-            args: Vec::new(),
-        };
+        // A rule rooted at a `∀` is keyed `.arrow` and admitted only where the target has a
+        // `∀`; one rooted at a `fun` is keyed `.other` and admitted only where the target has
+        // a `fun` or a metavariable head.
+        let arrow_rule =
+            simp_pattern_key(&cop, &table, &pi(c("Nat"), c("Nat"), BinderInfo::Default)).unwrap();
+        assert_eq!(arrow_rule.head, simp_arrow_key());
+        let other_rule = simp_pattern_key(
+            &cop,
+            &table,
+            &Expr::lam(Name::anonymous(), c("Nat"), bvar(0), BinderInfo::Default),
+        )
+        .unwrap();
+        assert_eq!(other_rule.head, simp_other_key());
         let mut context = Context::new(&base, Budget::DEFAULT);
         let plain = context.simp_target_index(&f(numeral(1))).unwrap().unwrap();
-        assert!(!plain.admits(&binder_rule));
-        let with_binder = context
-            .simp_target_index(&eq(
-                c("Nat"),
-                f(numeral(1)),
-                Expr::lam(Name::anonymous(), c("Nat"), bvar(0), BinderInfo::Default),
-            ))
-            .unwrap()
-            .unwrap();
-        assert!(with_binder.admits(&binder_rule));
+        assert!(!plain.admits(&arrow_rule) && !plain.admits(&other_rule));
+        let index = |context: &mut Context, side: Expr| {
+            context
+                .simp_target_index(&eq(c("Nat"), f(numeral(1)), side))
+                .unwrap()
+                .unwrap()
+        };
+        let lambda = index(
+            &mut context,
+            Expr::lam(Name::anonymous(), c("Nat"), bvar(0), BinderInfo::Default),
+        );
+        assert!(lambda.admits(&other_rule) && !lambda.admits(&arrow_rule));
+        let forall = index(&mut context, pi(c("Nat"), c("Nat"), BinderInfo::Default));
+        assert!(forall.admits(&arrow_rule) && !forall.admits(&other_rule));
+        let pending = index(
+            &mut context,
+            Expr::app(Expr::mvar(MVarId(n("pending"))), numeral(1)),
+        );
+        assert!(pending.admits(&other_rule) && !pending.admits(&arrow_rule));
     }
 
     #[test]
@@ -2701,7 +2758,11 @@ mod tests {
         let key = context.simp_rule_node_key(&rule).unwrap().unwrap();
         let local = |name: &str| Expr::fvar(FVarId(n(name)));
         let binder = SimpKey {
-            head: simp_binder_key(),
+            head: simp_arrow_key(),
+            args: Vec::new(),
+        };
+        let other = SimpKey {
+            head: simp_other_key(),
             args: Vec::new(),
         };
         let wrapped = Expr::app(c("wrap"), local("x"));
@@ -2710,6 +2771,13 @@ mod tests {
         assert!(!context.simp_node_admits(&binder, &wrapped).unwrap());
         assert!(!context.simp_node_admits(&key, &implication).unwrap());
         assert!(context.simp_node_admits(&binder, &implication).unwrap());
+        assert!(!context.simp_node_admits(&other, &implication).unwrap());
+        // A pending proof `?h x` is the pin's `.other` key: neither `fx`'s rule nor a rule
+        // rooted at a `∀` is retrieved there.
+        let pending = Expr::app(Expr::mvar(MVarId(n("pending"))), local("x"));
+        assert!(!context.simp_node_admits(&key, &pending).unwrap());
+        assert!(!context.simp_node_admits(&binder, &pending).unwrap());
+        assert!(context.simp_node_admits(&other, &pending).unwrap());
         // `apply g x` is keyed as `g x`, the pin's `.fvar g 1`: neither rule is retrieved.
         let applied = apps(c("apply"), &[local("g"), local("x")]);
         assert!(!context.simp_node_admits(&key, &applied).unwrap());
