@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":659,"projection_hash":"558812876a93ebd4ea4cb9860d07b4061662d1e8ae6d0d2a3c56791c9627852f"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":661,"projection_hash":"91a88ef795c2e7015e99df3c9fe423e9e522ee45166ee9d0e6a7255455b1c7bf"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -118,6 +118,7 @@
 {"id":"fln-default-instance-commit-rule-2709"}
 {"id":"fln-default-linters-unused-variables-mtnt"}
 {"id":"fln-derived-declaration-frontier-cj7s"}
+{"id":"fln-deriving-repr-ingress-closure-2gdf"}
 {"id":"fln-dyfz"}
 {"id":"fln-e44s"}
 {"id":"fln-eae"}
@@ -144,6 +145,7 @@
 {"id":"fln-fei1"}
 {"id":"fln-ffam"}
 {"id":"fln-ffce"}
+{"id":"fln-field-notation-export-alias-zslx"}
 {"id":"fln-file-scale-t2-differential-5f1b"}
 {"id":"fln-fixture-retention-unbounded-evit"}
 {"id":"fln-fln-definition-auxiliary-names-lv0n"}
