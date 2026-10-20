@@ -7,6 +7,7 @@
 use super::*;
 use fln_core::expr::Literal;
 use fln_core::level::Level;
+mod affected;
 pub(super) mod query;
 
 // Types here are relative to the context *before* their binder was introduced.
@@ -35,6 +36,7 @@ fn type_local(index: u32, scopes: [&[Expr]; 3]) -> Option<&Expr> {
 
 enum ProjectionFrame {
     Visit(Expr),
+    Remember(Expr, usize),
     Apply,
     Lambda(Name, Expr, BinderInfo),
     LetValue(Name, Expr, Expr, bool),
@@ -485,84 +487,128 @@ impl Preparation<'_> {
         if !found {
             return Ok(input.clone());
         }
+        // Syntax absence is context-independent; projection layout selection
+        // is not. Keep one DAG summary while its borrowed input pins every
+        // source allocation. Unaffected subtrees keep all strict operations
+        // and occurrences without expanding sharing into a tree of copies.
+        let affected = affected::Affected::read(self, input)?;
         let mut tasks = vec![ProjectionFrame::Visit(input.clone())];
         let mut values = Vec::new();
         let mut locals = Vec::new();
+        // Completed closed transformations are independent of the lexical
+        // telescope. This shares analysis, never evaluation: each occurrence
+        // remains in the returned expression with its original strict work.
+        // The table cannot outlive this pass or its registered layout state.
+        let mut closed = std::collections::HashMap::<Expr, Expr>::new();
         while let Some(task) = tasks.pop() {
             self.tick()?;
-            // The largest frame expansion adds three continuations.
-            if tasks.len().saturating_add(3) > self.limits.max_nodes {
+            // A remembered application adds at most four continuations.
+            if tasks.len().saturating_add(4) > self.limits.max_nodes {
                 return Err(IngressError::ResourceLimit {
                     resource: IngressResource::PendingTasks,
                     limit: self.limits.max_nodes,
-                    observed: tasks.len().saturating_add(3),
+                    observed: tasks.len().saturating_add(4),
                 });
             }
             tasks
-                .try_reserve(3)
+                .try_reserve(4)
                 .map_err(|_| IngressError::AllocationFailure {
                     resource: IngressResource::PendingTasks,
-                    requested: tasks.len().saturating_add(3),
+                    requested: tasks.len().saturating_add(4),
                 })?;
             reserve(&mut values, self.limits.max_nodes)?;
             match task {
-                ProjectionFrame::Visit(expr) => match expr.node() {
-                    ExprNode::App { f, a } => {
-                        tasks.push(ProjectionFrame::Apply);
-                        tasks.push(ProjectionFrame::Visit(a.clone()));
-                        tasks.push(ProjectionFrame::Visit(f.clone()));
-                    }
-                    ExprNode::Lam {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    } => {
-                        reserve(&mut locals, self.limits.max_context_depth)?;
-                        locals.push(binder_type.clone());
-                        tasks.push(ProjectionFrame::Lambda(
-                            binder_name.clone(),
-                            binder_type.clone(),
-                            *binder_info,
-                        ));
-                        tasks.push(ProjectionFrame::Visit(body.clone()));
-                    }
-                    ExprNode::LetE {
-                        decl_name,
-                        type_,
-                        value,
-                        body,
-                        non_dep,
-                    } => {
-                        tasks.push(ProjectionFrame::LetValue(
-                            decl_name.clone(),
-                            type_.clone(),
-                            body.clone(),
-                            *non_dep,
-                        ));
-                        tasks.push(ProjectionFrame::Visit(value.clone()));
-                    }
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr: receiver,
-                    } => {
-                        let mut selector = struct_name.clone();
-                        if let Some(type_) = self.projection_receiver_type(receiver, &locals)?
-                            && let Some((shape, _)) =
-                                self.projection_slot(&type_, struct_name, *idx)?
-                            && self.value_type(&shape.source)? == Some(ValueType::Constructor)
-                        {
-                            selector = shape.name;
+                ProjectionFrame::Visit(expr) if !affected.contains(&expr) => values.push(expr),
+                ProjectionFrame::Visit(expr) => {
+                    if specialize::closed(&expr) {
+                        if let Some(result) = closed.get(&expr) {
+                            values.push(result.clone());
+                            continue;
                         }
-                        tasks.push(ProjectionFrame::Projection(selector, *idx));
-                        tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                        tasks.push(ProjectionFrame::Remember(expr.clone(), values.len()));
                     }
-                    ExprNode::MData { expr, .. } => {
-                        tasks.push(ProjectionFrame::Visit(expr.clone()))
+                    match expr.node() {
+                        ExprNode::App { f, a } => {
+                            tasks.push(ProjectionFrame::Apply);
+                            tasks.push(ProjectionFrame::Visit(a.clone()));
+                            tasks.push(ProjectionFrame::Visit(f.clone()));
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            reserve(&mut locals, self.limits.max_context_depth)?;
+                            locals.push(binder_type.clone());
+                            tasks.push(ProjectionFrame::Lambda(
+                                binder_name.clone(),
+                                binder_type.clone(),
+                                *binder_info,
+                            ));
+                            tasks.push(ProjectionFrame::Visit(body.clone()));
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            tasks.push(ProjectionFrame::LetValue(
+                                decl_name.clone(),
+                                type_.clone(),
+                                body.clone(),
+                                *non_dep,
+                            ));
+                            tasks.push(ProjectionFrame::Visit(value.clone()));
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr: receiver,
+                        } => {
+                            let mut selector = struct_name.clone();
+                            if let Some(type_) = self.projection_receiver_type(receiver, &locals)?
+                                && let Some((shape, _)) =
+                                    self.projection_slot(&type_, struct_name, *idx)?
+                                && self.value_type(&shape.source)? == Some(ValueType::Constructor)
+                            {
+                                selector = shape.name;
+                            }
+                            tasks.push(ProjectionFrame::Projection(selector, *idx));
+                            tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                        }
+                        ExprNode::MData { expr, .. } => {
+                            tasks.push(ProjectionFrame::Visit(expr.clone()))
+                        }
+                        _ => values.push(expr.clone()),
                     }
-                    _ => values.push(expr.clone()),
-                },
+                }
+                ProjectionFrame::Remember(source, position) => {
+                    if values.len() != position.saturating_add(1) {
+                        return Err(unsupported("closed projection lowering result"));
+                    }
+                    let result = &values[position];
+                    if specialize::closed(result) {
+                        self.tick()?;
+                        let observed = closed.len().saturating_add(1);
+                        if observed > self.limits.max_nodes {
+                            return Err(IngressError::ResourceLimit {
+                                resource: IngressResource::Nodes,
+                                limit: self.limits.max_nodes,
+                                observed,
+                            });
+                        }
+                        closed
+                            .try_reserve(1)
+                            .map_err(|_| IngressError::AllocationFailure {
+                                resource: IngressResource::Nodes,
+                                requested: observed,
+                            })?;
+                        closed.insert(source, result.clone());
+                    }
+                }
                 ProjectionFrame::Apply => {
                     let argument = pop(&mut values)?;
                     let function = pop(&mut values)?;
@@ -869,3 +915,6 @@ instance computed : Action computedToken := { call := fun n => n }
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod pruning_tests;
