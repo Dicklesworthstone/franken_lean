@@ -41,8 +41,10 @@ pub mod source_main;
 mod source_nat_add_binding_tests;
 mod source_records;
 pub use source_records::SourceDeclarationAdmission;
+mod linters;
 #[cfg(test)]
 mod source_seed_names;
+mod unused_variables;
 pub use fln_rt::obj::{CapturedStdout, StdoutCapture, StdoutCaptureError, flush_native_stdout};
 pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 
@@ -7286,6 +7288,9 @@ impl Engine {
         // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
         // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
         let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
+        // Each declaration command's own syntax and options, for the unused-variables linter.
+        let mut lint_sites: BTreeMap<usize, (fln_parse::BytePos, fln_syntax::tree::Syntax, KVMap)> =
+            BTreeMap::new();
         // `#exit`'s warning (`elabExit`); the partition made it the last command.
         let mut exit_warning: Option<SourceWarning> = None;
         let mut evaluation_indices = Vec::new();
@@ -7643,6 +7648,20 @@ impl Engine {
                 .options
                 .get_bool(&Name::from_components(["warn", "sorry"]), true);
             warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
+            // A command this parse does not read is not linted; its own path reports it.
+            if let Ok(parsed) = grammar.enter(|| fln_parse::parse_source_command(command_source))
+                && parsed.syntax().kind()
+                    == Some(&unused_variables::parser_kind(&["Command", "declaration"]))
+            {
+                lint_sites.insert(
+                    command_index,
+                    (
+                        original_offset,
+                        parsed.syntax().clone(),
+                        scope.options.clone(),
+                    ),
+                );
+            }
             let scoped = scope != fln_elab::source::scope::SourceScope::default();
             if scope.exports_declaration()
                 && let Some(public) = public.as_deref_mut()
@@ -8328,7 +8347,7 @@ impl Engine {
         // The pin's `warnIfUsesSorry` runs on every declaration a command adds, an `example`'s
         // included; a definition with `sorry` is admitted above, never executed.
         let mut sorry_commands = BTreeSet::new();
-        let declarations = source_admissions
+        let declarations: Vec<(usize, &Declaration)> = source_admissions
             .iter()
             .flat_map(|row| {
                 row.admission
@@ -8346,14 +8365,16 @@ impl Engine {
                         .map(|check| (*command_index, &check.declaration)),
                     _ => None,
                 }
-            }));
-        for (command, declaration) in declarations {
+            }))
+            .collect();
+        for &(command, declaration) in &declarations {
             if !sorry_commands.contains(&command) && source_execution::uses_sorry(declaration)? {
                 sorry_commands.insert(command);
             }
         }
         let mut warnings: Vec<SourceWarning> = sorry_commands
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(|command| {
                 let &(offset, source, warn) = warning_sites.get(&command)?;
                 warn.then(|| SourceWarning {
@@ -8367,6 +8388,89 @@ impl Engine {
                 })
             })
             .collect();
+        // The pin's `linter.unusedVariables` runs after each command that logged no error and
+        // contains no `sorry`. A seed world (no `sorryAx`) is this engine's own, not the pin's,
+        // and its renderings admit no warning.
+        if engine
+            .environment()
+            .find(&Name::from_components(["sorryAx"]))
+            .is_some()
+        {
+            // A definition the stream compiled and published is an execution, not an admission
+            // row; an evaluation's execution declares nothing the user wrote.
+            let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
+            let linted: Vec<(usize, &Declaration)> = declarations
+                .iter()
+                .copied()
+                .chain(
+                    executions
+                        .iter()
+                        .zip(&execution_command_indices)
+                        .enumerate()
+                        .filter(|(index, _)| !evaluated.contains(index))
+                        .map(|(_, (execution, &command))| (command, &execution.declaration)),
+                )
+                .collect();
+            // Every constructor spelling, for telling a pattern variable from a constructor.
+            let constructors: std::collections::HashSet<String> = engine
+                .environment()
+                .constants()
+                .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
+                .filter_map(|(name, _)| match name.leaf_view() {
+                    fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
+                    _ => None,
+                })
+                .collect();
+            for (&command, (offset, syntax, options)) in &lint_sites {
+                // In the pin's order: the `:=` note while the command elaborates (`sorry` does
+                // not suppress it), then the unused-variables linter (skipped with `sorry`),
+                // then `linter.defProp`.
+                let declared = linted_declaration(syntax, &linted, command);
+                let mut lints: Vec<linters::Lint> =
+                    linters::deprecated_assignment_syntax(syntax, options)
+                        .into_iter()
+                        .collect();
+                if !sorry_commands.contains(&command) {
+                    let mut unused =
+                        unused_variables::unused_pattern_variables(syntax, options, &constructors);
+                    unused.extend(unused_variables::unused_fun_binders(
+                        syntax,
+                        options,
+                        &constructors,
+                    ));
+                    unused.extend(unused_variables::unused_type_binders(syntax, options));
+                    if let Some((_, type_, value, _)) = declared {
+                        unused.extend(unused_variables::unused_signature_binders(
+                            syntax, type_, value, options,
+                        ));
+                    }
+                    unused.sort_by_key(|unused| unused.at);
+                    lints.extend(unused.into_iter().map(|unused| linters::Lint {
+                        at: unused.at,
+                        message: unused_variables::message(&unused.name),
+                    }));
+                }
+                if let Some((name, type_, _, abbreviation)) = declared {
+                    lints.extend(linters::definition_is_proposition(
+                        syntax,
+                        name,
+                        type_,
+                        abbreviation,
+                        engine.environment(),
+                        options,
+                    ));
+                }
+                for lint in lints {
+                    warnings.push(SourceWarning {
+                        command_index: command,
+                        at: fln_parse::BytePos(offset.0 + lint.at),
+                        message: lint.message,
+                    });
+                }
+            }
+            // A command's lint warnings follow its other warnings, in source order.
+            warnings.sort_by_key(|warning| warning.command_index);
+        }
         // The last command, so the order by command stays.
         warnings.extend(exit_warning);
         Ok(Outcome::Complete(SourceCommandBatchExecution {
@@ -11969,6 +12073,62 @@ pub struct SourceWarning {
     pub command_index: usize,
     pub at: fln_parse::BytePos,
     pub message: String,
+}
+
+/// The admitted type and value `command` declares: the declaration named by its `declId`
+/// (an `example` has one declaration), or `None` when that is not determined.
+fn linted_declaration<'a>(
+    command: &fln_syntax::tree::Syntax,
+    declarations: &[(usize, &'a Declaration)],
+    command_index: usize,
+) -> Option<(&'a Name, &'a Expr, &'a Expr, bool)> {
+    let ends_with = |name: &Name, suffix: &Name| {
+        let (mut name, mut suffix) = (name.clone(), suffix.clone());
+        while !suffix.is_anonymous() {
+            if name.is_anonymous() || name.leaf_view() != suffix.leaf_view() {
+                return false;
+            }
+            (name, suffix) = (name.parent(), suffix.parent());
+        }
+        true
+    };
+    let fln_syntax::tree::Syntax::Node { args, .. } = command else {
+        return None;
+    };
+    let fln_syntax::tree::Syntax::Node { args: parts, .. } = args.get(1)? else {
+        return None;
+    };
+    let declared = parts.iter().find_map(|part| match part {
+        fln_syntax::tree::Syntax::Node { kind, args, .. }
+            if kind == &unused_variables::parser_kind(&["Command", "declId"]) =>
+        {
+            match args.first()? {
+                fln_syntax::tree::Syntax::Ident { val, .. } => Some(val.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    let mut own = declarations
+        .iter()
+        .filter(|(index, _)| *index == command_index)
+        .filter_map(|(_, declaration)| match declaration {
+            Declaration::Defn(value) => Some((
+                &value.base,
+                &value.value,
+                value.hints == ReducibilityHints::Abbrev,
+            )),
+            Declaration::Thm(value) => Some((&value.base, &value.value, false)),
+            _ => None,
+        });
+    let (base, value, abbreviation) = match declared {
+        Some(declared) => own.find(|(base, _, _)| ends_with(&base.name, &declared))?,
+        None => {
+            let first = own.next()?;
+            own.next().is_none().then_some(first)?
+        }
+    };
+    Some((&base.name, &base.type_, value, abbreviation))
 }
 
 /// Whether a constant's type or value mentions `sorryAx`, the pin's `hasSorry`

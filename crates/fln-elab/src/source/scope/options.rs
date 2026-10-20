@@ -82,6 +82,9 @@ pub enum Policy {
     /// Read by this engine, but only at or above `floor`, or `0` when `zero` is set: a ceiling
     /// below the floor would stop the pin where this engine does not stop.
     HonoredAtLeast { floor: u64, zero: bool },
+    /// Read by this engine, at its default or `false` only: switching it on would make the pin
+    /// print output this engine does not produce.
+    HonoredOff,
     /// Controls output this engine never produces (a linter or a warning). Switching it off,
     /// or leaving it at the default, changes nothing here; switching on what is off by
     /// default would make the pin print what this engine does not.
@@ -193,17 +196,20 @@ pub const ROWS: &[Row] = &[
         "Lean/Elab/GuardMsgs.lean:25",
         Inert("it formats `#guard_msgs` failures, and `#guard_msgs` is not implemented"),
     ),
+    // `linter.all` is the default of every linter option left unset (`getLinterAll`), so the
+    // unused-variables linter reads it; switching it on would switch on linters this engine
+    // does not have.
     row(
         "linter.all",
         Bool(false),
         "Lean/Linter/Init.lean:99",
-        Silent,
+        HonoredOff,
     ),
     row(
         "linter.unusedVariables",
         Bool(true),
         "Lean/Linter/UnusedVariables.lean:84",
-        Silent,
+        Honored,
     ),
     row(
         "linter.unusedSimpArgs",
@@ -221,7 +227,13 @@ pub const ROWS: &[Row] = &[
         "linter.deprecated",
         Bool(true),
         "Lean/Linter/Deprecated.lean:19",
-        Silent,
+        Honored,
+    ),
+    row(
+        "linter.defProp",
+        Bool(true),
+        "Lean/Linter/DefProp.lean:26",
+        Honored,
     ),
     row(
         "linter.constructorNameAsVariable",
@@ -295,7 +307,13 @@ pub const ROWS: &[Row] = &[
         "linter.unusedVariables.funArgs",
         Bool(true),
         "Lean/Linter/UnusedVariables.lean:89",
-        Silent,
+        Honored,
+    ),
+    row(
+        "linter.unusedVariables.patternVars",
+        Bool(true),
+        "Lean/Linter/UnusedVariables.lean:94",
+        Honored,
     ),
     row(
         "linter.deprecated.syntax",
@@ -451,6 +469,10 @@ pub fn admit(name: &Name, value: &DataValue) -> Result<Effect, OptionRefusal> {
             )),
         },
         Inert(_) => Ok(Effect::NoChange),
+        HonoredOff if at_default || *value == DataValue::OfBool(false) => Ok(Effect::Honored),
+        HonoredOff => Err(unsupported(
+            "it would make the pin print output this engine does not produce",
+        )),
         Silent if at_default || *value == DataValue::OfBool(false) => Ok(Effect::NoChange),
         Silent => Err(unsupported(
             "it would make the pin print output this engine does not produce",
@@ -637,14 +659,23 @@ mod tests {
             admitted("maxHeartbeats", DataValue::OfNat(1_000)),
             Err(OptionRefusal::Unsupported { .. })
         ));
-        assert_eq!(
-            admitted("linter.unusedVariables", DataValue::OfBool(false)),
-            Ok(Effect::NoChange)
-        );
-        assert_eq!(
-            admitted("linter.unusedVariables", DataValue::OfBool(true)),
-            Ok(Effect::NoChange)
-        );
+        // The unused-variables linter reads its options, and `linter.all` while it is off.
+        for (name, value) in [
+            ("linter.unusedVariables", false),
+            ("linter.unusedVariables", true),
+            ("linter.unusedVariables.funArgs", false),
+            ("linter.all", false),
+        ] {
+            assert_eq!(
+                admitted(name, DataValue::OfBool(value)),
+                Ok(Effect::Honored),
+                "{name} {value}"
+            );
+        }
+        assert!(matches!(
+            admitted("linter.all", DataValue::OfBool(true)),
+            Err(OptionRefusal::Unsupported { .. })
+        ));
         // Off by default: switching it on would print what this engine does not.
         assert!(matches!(
             admitted("linter.missingDocs", DataValue::OfBool(true)),
@@ -774,10 +805,12 @@ mod tests {
         assert_eq!(names.len(), before, "a name has two rows");
         let honored: Vec<_> = ROWS
             .iter()
-            .filter(|row| matches!(row.policy, Honored | HonoredAtLeast { .. }))
+            .filter(|row| matches!(row.policy, Honored | HonoredAtLeast { .. } | HonoredOff))
             .map(|row| row.name)
             .collect();
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
+        // `linter.*`: the unused-variables, deprecated-syntax and defProp warnings (`fln`,
+        // `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
         // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
         // `execute_source_command_stream`); `sorry_is_admitted_with_the_pins_warnings` sets it false.
         assert_eq!(
@@ -787,6 +820,12 @@ mod tests {
                 "maxHeartbeats",
                 "synthInstance.maxSize",
                 "autoImplicit",
+                "linter.all",
+                "linter.unusedVariables",
+                "linter.deprecated",
+                "linter.defProp",
+                "linter.unusedVariables.funArgs",
+                "linter.unusedVariables.patternVars",
                 "warn.sorry"
             ]
         );
