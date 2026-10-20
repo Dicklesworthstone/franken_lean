@@ -16,7 +16,14 @@ mod tests;
 #[derive(Default)]
 struct DsimpSet<'a> {
     definitions: Vec<Selection>,
-    reflexive: Vec<SimpRule<'a>>,
+    /// Theorem rules in the set's order, each with whether it is structurally reflexive.
+    /// A registered rule is classified the first time a node admits its key
+    /// (`dsimp_rewrite`), as the pin retrieves candidates per node; classifying all of
+    /// `Init`'s ~10,000 rules on every call exhausted the budget. The answer is kept for
+    /// the rest of this call.
+    rewrites: Vec<(SimpRule<'a>, std::cell::Cell<Option<bool>>)>,
+    /// The `rfl`-tagged declarations a classification reads.
+    tagged: std::collections::BTreeSet<Name>,
 }
 
 impl DsimpSet<'_> {

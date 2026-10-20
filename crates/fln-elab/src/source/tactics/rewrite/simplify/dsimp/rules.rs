@@ -10,9 +10,15 @@ impl Context {
         let tagged = scope::simp::defeq::read(&environment, || self.tick())?;
         let mut set = DsimpSet {
             definitions: Vec::new(),
-            reflexive: Vec::new(),
+            rewrites: Vec::new(),
+            tagged,
         };
         for rule in self.simp_rules(args)? {
+            // A registered theorem is classified only when a node admits its key.
+            if matches!(rule, SimpRule::Global(_)) && !self.simp_rule_may_unfold(&rule) {
+                set.rewrites.push((rule, std::cell::Cell::new(None)));
+                continue;
+            }
             self.tick()?;
             // Eligibility probes are not instance-synthesis/admission effects.
             // Resolve fully and charge each candidate without keeping its holes.
@@ -21,11 +27,7 @@ impl Context {
                 if let Some(selection) = trial.simp_unfold_selection_for_rule(&rule)? {
                     return Ok((Some(selection), false));
                 }
-                let term = trial.selected_simp_term(&rule)?;
-                if !trial.dsimp_is_proposition(&term.type_)? {
-                    return Err(error(TacticError::InvalidSimpTheorem));
-                }
-                Ok((None, trial.dsimp_rfl_proof(term, &tagged)?))
+                Ok((None, trial.dsimp_reflexive_rule(&rule, &set.tagged)?))
             })();
             self.charge_rewrite_trial(&trial);
             let (selection, reflexive) = classified?;
@@ -33,10 +35,24 @@ impl Context {
                 set.definitions.push(selection);
             }
             if reflexive {
-                set.reflexive.push(rule);
+                set.rewrites.push((rule, std::cell::Cell::new(Some(true))));
             }
         }
         Ok(set)
+    }
+
+    /// Whether a theorem rule is structurally reflexive: a proposition whose proof is
+    /// `rfl` (or carries the pin's `rfl` tag). A non-proposition is a malformed rule.
+    fn dsimp_reflexive_rule(
+        &mut self,
+        rule: &SimpRule<'_>,
+        tagged: &std::collections::BTreeSet<Name>,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let term = self.selected_simp_term(rule)?;
+        if !self.dsimp_is_proposition(&term.type_)? {
+            return Err(error(TacticError::InvalidSimpTheorem));
+        }
+        self.dsimp_rfl_proof(term, tagged)
     }
 
     pub(super) fn dsimp_spine(
@@ -167,7 +183,21 @@ impl Context {
         target: &Expr,
         set: &DsimpSet<'_>,
     ) -> Result<Expr, NatDefinitionElabError> {
-        for rule in &set.reflexive {
+        let index = self.simp_root_index(target)?;
+        for (rule, reflexive) in &set.rewrites {
+            if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
+                continue;
+            }
+            if reflexive.get().is_none() {
+                self.tick()?;
+                let mut trial = self.rewrite_trial();
+                let classified = trial.dsimp_reflexive_rule(rule, &set.tagged);
+                self.charge_rewrite_trial(&trial);
+                reflexive.set(Some(classified?));
+            }
+            if reflexive.get() != Some(true) {
+                continue;
+            }
             self.tick()?;
             let mut trial = self.rewrite_trial();
             let attempt = (|| {

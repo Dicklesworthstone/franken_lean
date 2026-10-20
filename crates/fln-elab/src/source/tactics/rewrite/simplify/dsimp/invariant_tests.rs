@@ -31,7 +31,7 @@ fn identity(domain: Expr) -> Expr {
 fn empty() -> DsimpSet<'static> {
     DsimpSet {
         definitions: Vec::new(),
-        reflexive: Vec::new(),
+        ..DsimpSet::default()
     }
 }
 fn arguments() -> Vec<Syntax> {
@@ -160,7 +160,7 @@ fn selected_local_values_do_not_override_the_instance_argument_boundary() {
     let target = Expr::app(f, selected.clone());
     let set = DsimpSet {
         definitions: vec![Selection::Local(id, x.clone())],
-        reflexive: Vec::new(),
+        ..DsimpSet::default()
     };
     assert_eq!(ctx.dsimp_expression(&target, &set).unwrap(), target);
     assert_eq!(ctx.dsimp_expression(&selected, &set).unwrap(), x);

@@ -445,6 +445,12 @@ impl Context {
                         applications.entry(projection).or_default().push(Vec::new());
                     }
                 }
+                ExprNode::ForallE { .. } | ExprNode::Lam { .. } | ExprNode::LetE { .. } => {
+                    applications
+                        .entry(simp_binder_key())
+                        .or_default()
+                        .push(Vec::new());
+                }
                 _ => {}
             }
             pending.extend(args.into_iter().cloned());
@@ -454,6 +460,38 @@ impl Context {
         }
         Ok(Some(SimpTargetIndex {
             applications,
+            environment: simp_key_environment(env),
+            table,
+        }))
+    }
+
+    /// The index of `node`'s own application, for a rule that must match at `node` itself
+    /// (dsimp rewrites one node at a time). `None` (no filtering) where the pin's key path
+    /// may reduce the node: a non-constant or reducible head.
+    pub(super) fn simp_root_index(
+        &mut self,
+        node: &Expr,
+    ) -> Result<Option<SimpTargetIndex>, NatDefinitionElabError> {
+        self.tick()?;
+        let table = crate::reducibility::table(&self.txn.env).map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        let env = &self.txn.env;
+        let (head, args) = simp_key_spine(node);
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        if simp_key_unfolds(env, &table, name) {
+            return Ok(None);
+        }
+        let keys = args
+            .iter()
+            .map(|arg| simp_target_arg_key(env, &table, &self.txn.lctx, arg))
+            .collect();
+        Ok(Some(SimpTargetIndex {
+            applications: HashMap::from([(name.clone(), vec![keys])]),
             environment: simp_key_environment(env),
             table,
         }))
@@ -1249,63 +1287,100 @@ fn simp_pattern_key(
     pattern: &Expr,
 ) -> Option<SimpKey> {
     let (head, args) = simp_key_spine(pattern);
+    match head.node() {
+        // The pin keys a binder as `.arrow` or `.other`: only a binder in the target matches.
+        ExprNode::ForallE { .. } | ExprNode::Lam { .. } if args.is_empty() => {
+            return Some(SimpKey {
+                head: simp_binder_key(),
+                args: Vec::new(),
+            });
+        }
+        ExprNode::Const { .. } => {}
+        _ => return None,
+    }
+    let args: Vec<Expr> = args.into_iter().cloned().collect();
+    simp_constant_key(env, table, head, &args, 0)
+}
+
+/// The pseudo head every binder (`∀`, `fun`, `let`) of a target is indexed under, and a
+/// rule rooted at one is keyed by.
+fn simp_binder_key() -> Name {
+    Name::from_components(["«binder»"])
+}
+
+/// The key of `head args` with a constant head, as the pin's `whnfR` reaches it: a
+/// reducible head is unfolded with the actual arguments substituted for its parameters
+/// (`Nat.Coprime m n` is keyed as `Eq Nat (Nat.gcd …) 1`, `a > b` under `LT.lt`), through at
+/// most 8 reducible heads. Only heads are substituted, never terms: a parameter used as an
+/// argument becomes that argument, and one used as the head resolves to the argument's head.
+/// `None` where the result is not keyed: a partial application (a `fun`), a numeral, or a
+/// head that is still a bound variable.
+fn simp_constant_key(
+    env: &Environment,
+    table: &crate::reducibility::ReducibilityTable,
+    head: &Expr,
+    args: &[Expr],
+    depth: usize,
+) -> Option<SimpKey> {
+    const MAX_UNFOLDINGS: usize = 8;
     let ExprNode::Const { name, .. } = head.node() else {
         return None;
     };
     if *name == Name::from_components(["OfNat", "ofNat"]) {
         return None;
     }
-    if simp_key_unfolds(env, table, name) {
-        return simp_unfolded_head_key(env, table, name);
+    if !simp_key_unfolds(env, table, name) {
+        let arguments: Vec<&Expr> = args.iter().collect();
+        let mut keys = simp_key_arguments(env, table, name, &arguments);
+        while keys.last() == Some(&SimpArgKey::Any) {
+            keys.pop();
+        }
+        return Some(SimpKey {
+            head: name.clone(),
+            args: keys,
+        });
     }
-    let mut args = simp_key_arguments(env, table, name, &args);
-    while args.last() == Some(&SimpArgKey::Any) {
-        args.pop();
+    if depth == MAX_UNFOLDINGS {
+        return None;
     }
-    Some(SimpKey {
-        head: name.clone(),
-        args,
-    })
-}
-
-/// A reducible head's key, as the pin's `whnfR` reaches it: the rigid head of its
-/// unfolding, through further reducible heads, with every argument open (`a > b` is
-/// keyed under `LT.lt`, `Array.getD` under `dite`). `None` where the unfolding's head
-/// is a bound variable or a numeral.
-fn simp_unfolded_head_key(
-    env: &Environment,
-    table: &crate::reducibility::ReducibilityTable,
-    name: &Name,
-) -> Option<SimpKey> {
-    const MAX_UNFOLDINGS: usize = 8;
-    let mut current = name.clone();
-    for _ in 0..MAX_UNFOLDINGS {
-        let Some(ConstantInfo::Defn(definition)) = env.find(&current) else {
-            return None;
-        };
-        let mut value = &definition.value;
-        loop {
-            match value.node() {
-                ExprNode::Lam { body, .. } => value = body,
-                ExprNode::MData { expr, .. } => value = expr,
-                _ => break,
+    let Some(ConstantInfo::Defn(definition)) = env.find(name) else {
+        return None;
+    };
+    let mut body = &definition.value;
+    let mut parameters = 0usize;
+    loop {
+        match body.node() {
+            ExprNode::Lam { body: next, .. } => {
+                body = next;
+                parameters += 1;
             }
+            ExprNode::MData { expr, .. } => body = expr,
+            _ => break,
         }
-        let ExprNode::Const { name: next, .. } = simp_key_spine(value).0.node() else {
-            return None;
-        };
-        if *next == Name::from_components(["OfNat", "ofNat"]) {
-            return None;
-        }
-        if !simp_key_unfolds(env, table, next) {
-            return Some(SimpKey {
-                head: next.clone(),
-                args: Vec::new(),
-            });
-        }
-        current = next.clone();
     }
-    None
+    if args.len() < parameters {
+        return None;
+    }
+    // A loose bound variable of the body is a parameter; the outermost is index 0.
+    let actual = |expr: &Expr| -> Expr {
+        match expr.node() {
+            ExprNode::BVar { idx } => usize::try_from(*idx)
+                .ok()
+                .and_then(|idx| parameters.checked_sub(idx + 1))
+                .map_or_else(|| expr.clone(), |parameter| args[parameter].clone()),
+            _ => expr.clone(),
+        }
+    };
+    let (body_head, body_args) = simp_key_spine(body);
+    let resolved_head = actual(body_head);
+    let (next_head, head_args) = simp_key_spine(&resolved_head);
+    let next_args: Vec<Expr> = head_args
+        .into_iter()
+        .cloned()
+        .chain(body_args.into_iter().map(actual))
+        .chain(args[parameters..].iter().cloned())
+        .collect();
+    simp_constant_key(env, table, next_head, &next_args, depth + 1)
 }
 
 /// The argument keys of a pattern `head args`, at the positions the pin's key
@@ -1971,5 +2046,66 @@ mod key_tests {
         assert_eq!(head(&reducible).head, n("Nat.succ"));
         assert!(head(&reducible).args.is_empty());
         assert_eq!(head(&base).head, n("wrap"));
+        // Unfolding substitutes the actual arguments, so the unfolded statement keeps its own
+        // keys: `cop m n := f m = n` (like `Nat.Coprime`) is keyed as `Eq Nat (f _) _`.
+        let cop = reducible
+            .add_decl(ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: n("cop"),
+                    level_params: Vec::new(),
+                    type_: pi(
+                        nat.clone(),
+                        pi(nat.clone(), Expr::sort(Level::zero()), BinderInfo::Default),
+                        BinderInfo::Default,
+                    ),
+                },
+                value: Expr::lam(
+                    Name::anonymous(),
+                    nat.clone(),
+                    Expr::lam(
+                        Name::anonymous(),
+                        nat.clone(),
+                        eq(nat.clone(), Expr::app(c("f"), bvar(1)), bvar(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![n("cop")],
+            }))
+            .unwrap();
+        let cop = crate::reducibility::register(
+            &cop,
+            &n("cop"),
+            crate::reducibility::Reducibility::Reducible,
+        )
+        .unwrap();
+        let table = crate::reducibility::table(&cop).unwrap();
+        let key = simp_pattern_key(&cop, &table, &apps(c("cop"), &[bvar(1), bvar(0)])).unwrap();
+        assert_eq!(key.head, n("Eq"));
+        assert_eq!(
+            key.args,
+            [SimpArgKey::Const(n("Nat")), SimpArgKey::Const(n("f"))]
+        );
+        // Partially applied, the unfolding is a `fun`: left open, as the pin's `.other`.
+        assert!(simp_pattern_key(&cop, &table, &Expr::app(c("cop"), bvar(0))).is_none());
+        // A rule rooted at a binder is admitted only where the target has a binder.
+        let binder_rule = SimpKey {
+            head: simp_binder_key(),
+            args: Vec::new(),
+        };
+        let mut context = Context::new(&base, Budget::DEFAULT);
+        let plain = context.simp_target_index(&f(numeral(1))).unwrap().unwrap();
+        assert!(!plain.admits(&binder_rule));
+        let with_binder = context
+            .simp_target_index(&eq(
+                c("Nat"),
+                f(numeral(1)),
+                Expr::lam(Name::anonymous(), c("Nat"), bvar(0), BinderInfo::Default),
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(with_binder.admits(&binder_rule));
     }
 }
