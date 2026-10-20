@@ -420,9 +420,14 @@ fn pinned_prelude_defaults_reach_source_simp_and_keep_negative_controls() {
                 "attribute [-simp] id_eq\ntheorem erased (n : Nat) : id n = n := by simp",
                 "made no progress",
             ),
+            // No default rule here reduces `0 = 1`. The pin's simp would, through a
+            // built-in literal simproc this engine lacks (under `import Init.Tactics` it
+            // then fails on `Unknown constant eq_false'`). "unsolved goals" was once read
+            // here because unfolding the absent `Eq.ndrec` normalized the `let` kept for
+            // the ascription `(0 : Nat)`; that is not progress (b59e8668).
             (
                 "theorem false_goal : (0 : Nat) = 1 := by simp",
-                "unsolved goals",
+                "made no progress",
             ),
         ] {
             let Err(crate::source_check::modules::SourceModuleCheckError::Source { error, .. }) =
