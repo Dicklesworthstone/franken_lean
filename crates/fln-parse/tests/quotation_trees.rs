@@ -397,13 +397,16 @@ fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
     for source in [
         "def f (x : Nat) : Nat := $x",
         "def f (c : Lean.Term) : Lean.MacroM Lean.Term := `(match $c with | _ => 1)",
-        "macro_rules | `(h [$xs,*]) => `([$xs,*])",
         "macro_rules | `(h $xs*) => `(g $xs*)",
         "macro_rules | `(h $$x) => `(g $x)",
         "macro_rules | `(h $x) => `(g $[$x]?)",
     ] {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
     }
+    // Whole sepBy suffix captures now have a native reader. Keep the other
+    // unsupported splices above refused, rather than dropping this boundary.
+    parse(&mut grammar, "macro_rules | `(h [$xs,*]) => `([$xs,*])")
+        .expect("a list repetition capture has the pinned suffix-splice shape");
 }
 
 #[test]

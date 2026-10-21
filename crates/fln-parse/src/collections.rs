@@ -328,6 +328,61 @@ impl Lists {
         })
     }
 
+    /// Only an element-position repetition may consume `$xs,*`. An index,
+    /// subtype predicate, nested scalar expression or existing application
+    /// cannot reinterpret its operand as a sequence.
+    pub(super) fn repetition_splice(
+        &self,
+        leaves: &Leaves,
+        view: &SourceView,
+        tokens: &[LexedToken],
+        frames: &[BoundedTermFrame],
+        at: usize,
+        end: usize,
+    ) -> Result<Option<(Syntax, usize)>, NatDefinitionParseError> {
+        if !self.current(frames)
+            || !self.active.last().is_some_and(|list| {
+                matches!(
+                    list.bracket,
+                    Bracket::List
+                        | Bracket::Array
+                        | Bracket::Vector
+                        | Bracket::AnonymousCtor
+                        | Bracket::Tuple
+                )
+            })
+            || !frames.last().is_some_and(|frame| {
+                frame.application.is_empty()
+                    && frame.operands.is_empty()
+                    && frame.operators.is_empty()
+            })
+        {
+            return Ok(None);
+        }
+        let Some((suffix_at, next)) = crate::quotations::repetition_suffix(tokens, at, end, ",*")
+        else {
+            return Ok(None);
+        };
+        let Some((capture, consumed)) = crate::quotations::antiquotation(
+            leaves,
+            view,
+            tokens,
+            at,
+            suffix_at,
+            crate::quotations::Position::Term,
+        )?
+        else {
+            return Ok(None);
+        };
+        if consumed != suffix_at {
+            return Ok(None);
+        }
+        let splice = crate::quotations::wrap_repetition_splice(
+            leaves, capture, "sepBy", ",*", suffix_at, next,
+        )?;
+        Ok(Some((splice, next)))
+    }
+
     pub(super) fn delimiter(
         &mut self,
         leaves: &Leaves,

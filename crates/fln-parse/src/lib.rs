@@ -4025,21 +4025,27 @@ fn bounded_term_token(
             if grammar == DefinitionGrammar::Scalar
                 && (quotations::opens(symbol) || (symbol == "$" && quotations::inside())) =>
         {
-            let read = match quotations::quotation(leaves, view, tokens, index, range.end)? {
-                Some(read) => read,
-                None => quotations::antiquotation(
-                    leaves,
-                    view,
-                    tokens,
-                    index,
-                    range.end,
-                    quotations::Position::Term,
-                )?
-                .ok_or_else(|| NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(view, tokens, index),
-                    expected: grammar.value_expectation(),
-                })?,
-            };
+            let read =
+                match lists.repetition_splice(leaves, view, tokens, frames, index, range.end)? {
+                    Some(read) => read,
+                    None => match quotations::quotation(leaves, view, tokens, index, range.end)? {
+                        Some(read) => read,
+                        None => quotations::antiquotation(
+                            leaves,
+                            view,
+                            tokens,
+                            index,
+                            range.end,
+                            quotations::Position::Term,
+                        )?
+                        .ok_or_else(|| {
+                            NatDefinitionParseError::OutsideSeedGrammar {
+                                at: original_position(view, tokens, index),
+                                expected: grammar.value_expectation(),
+                            }
+                        })?,
+                    },
+                };
             frames
                 .last_mut()
                 .expect("the root term frame remains live")
