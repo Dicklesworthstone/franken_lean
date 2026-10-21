@@ -33,10 +33,17 @@ variable (x : Nat) (h : x = x)
 #check fun (t : Type v) (k : t) => k
 #check fun (n : Nat) => Nat.add n x
 #check @Eq.refl Nat x
+#check let a := x
+  let b := a
+  b
+#check let a := 1
+  let b := a
+  b
 ";
 
 /// The pin's output for [`PROGRAM`]: a section variable prints by its name, an anonymous
-/// instance variable as `inst✝`, and `universe v` names a level inside a query.
+/// instance variable as `inst✝`, and `universe v` names a level inside a query. A `let` chain at
+/// the top of the line breaks after each `;`, under section variables too.
 const EXPECTED: &str = "s.bar : Nat
 s : S
 a : α
@@ -50,6 +57,12 @@ Eq.refl x : x = x
 fun t k => k : (t : Type v) → t → t
 fun n => n.add x : Nat → Nat
 Eq.refl x : x = x
+let a := x;
+let b := a;
+b : Nat
+let a := 1;
+let b := a;
+b : Nat
 ";
 
 fn pinned_lib() -> Option<PathBuf> {

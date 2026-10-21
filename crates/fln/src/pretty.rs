@@ -508,6 +508,9 @@ pub struct Printer<'a> {
     /// body extends to the right (`∃ x, p`) there, where the body would absorb it, and as
     /// an argument.
     trailing: bool,
+    /// How many binders the top of the printed term sits under: the section variables a
+    /// `#check` opens, then each `let` of a chain at the top. A `let` there breaks after its `;`.
+    top_names: usize,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -642,6 +645,7 @@ impl<'a> Printer<'a> {
             budget: 100_000,
             resolution: None,
             trailing: false,
+            top_names: 0,
         }
     }
 
@@ -1013,11 +1017,14 @@ impl<'a> Printer<'a> {
                     fun
                 })
             }
-            // `let x : T := v; x` is how a type ascription `(v : T)` elaborates here; the
-            // pin's term is `v` itself.
-            ExprNode::LetE { value, body, .. }
-                if matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
-            {
+            // An anonymous `let : T := v; ·` is how a type ascription `(v : T)` elaborates here;
+            // the pin's term is `v` itself. A written `let b := a; b` names its binder.
+            ExprNode::LetE {
+                decl_name,
+                value,
+                body,
+                ..
+            } if decl_name.is_anonymous() && matches!(body.node(), ExprNode::BVar { idx: 0 }) => {
                 self.doc(value, outer)
             }
             // At the top of the printed term the pin breaks a `let` after its `;` with no
@@ -1029,12 +1036,15 @@ impl<'a> Printer<'a> {
                 value,
                 body,
                 ..
-            } if outer == 0 && self.names.is_empty() => {
+            } if outer == 0 && self.names.len() == self.top_names => {
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
                 self.bind(shown.clone(), type_);
+                // The body continues the chain at the top.
+                let top = std::mem::replace(&mut self.top_names, self.names.len());
                 let printed = self.doc(body, 0);
+                self.top_names = top;
                 self.unbind_to(depth);
                 Ok(Format::text(format!("let {shown} := "))
                     .then(value)
