@@ -80,6 +80,28 @@ fn simple_fields(fields: &[Syntax]) -> Result<Vec<Syntax>, NatDefinitionElabErro
     Ok(output)
 }
 
+impl Context {
+    /// Whether every field's type is a proposition.
+    fn record_fields_are_proofs(
+        &mut self,
+        fields: &[LocalDecl],
+    ) -> Result<bool, NatDefinitionElabError> {
+        for field in fields {
+            self.tick()?;
+            let domain = self.instantiate(&field.type_)?;
+            let Some(sort) = self.known_type(&domain)? else {
+                return Ok(false);
+            };
+            if !matches!(self.whnf(&sort)?.node(), ExprNode::Sort { level }
+                if level.normalize_fixpoint().is_zero())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Elaborate a nonrecursive structure/class with named fields. Prop-valued
 /// records require proof fields, as in the pin's projection generator.
 /// Registration is intentionally absent here: only checked successors can own it.
@@ -452,6 +474,10 @@ pub(super) fn elaborate_record_scoped(
             };
             level.clone()
         }
+        // `isPropCandidate` (vendored `Lean/Elab/MutualInductive.lean:903-924`): with no
+        // resulting sort written, a structure with at least one field, every field a proof, is a
+        // `Prop` (`structure G where m (n : Nat) : n = n` is `G : Prop`).
+        None if !output.is_empty() && context.record_fields_are_proofs(&output)? => Level::zero(),
         None => inferred,
     };
     if result_level.normalize_fixpoint().is_zero() {
