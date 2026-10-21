@@ -68,7 +68,9 @@ impl From<RecordError> for InductiveError {
     fn from(error: RecordError) -> Self {
         match error {
             RecordError::InvalidName => Self::InvalidName,
-            RecordError::DuplicateField => Self::DuplicateConstructor,
+            RecordError::DuplicateField | RecordError::ParentFieldMismatch => {
+                Self::DuplicateConstructor
+            }
             RecordError::InvalidTelescope => Self::InvalidTelescope,
             RecordError::UnsupportedSort | RecordError::NonProofField => Self::UnsupportedSort,
             RecordError::ResourceLimit => Self::ResourceLimit,

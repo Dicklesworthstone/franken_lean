@@ -66,6 +66,8 @@ pub enum RecordError {
     UnsupportedSort,
     NonProofField,
     ResourceLimit,
+    /// Two parents share a field at types that are not definitionally equal.
+    ParentFieldMismatch,
 }
 impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,6 +82,9 @@ impl std::fmt::Display for RecordError {
             }
             Self::NonProofField => "a field of a Prop-valued record must be a proof",
             Self::ResourceLimit => "record generation resource limit reached",
+            Self::ParentFieldMismatch => {
+                "Field type mismatch: a field two parents share has different types"
+            }
         })
     }
 }

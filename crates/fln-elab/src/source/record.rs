@@ -206,6 +206,58 @@ pub(super) fn elaborate_record_scoped(
     let parent_count = output.len();
     let mut defaults = Vec::new();
     let mut helpers = Vec::new();
+    // A copied field's default is its parent's, over this record's fields before it.
+    for inherited in &inheritance.defaults {
+        context.tick()?;
+        let Some(position) = output.iter().position(|field| field.id == inherited.field) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let field = output[position].clone();
+        let mut value =
+            context.expand_record_aliases(inherited.value.clone(), &inheritance.aliases)?;
+        let mut type_ = context.expand_record_aliases(field.type_.clone(), &inheritance.aliases)?;
+        let locals = parameters
+            .iter()
+            .chain(&output[..position])
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, local) in locals.iter().enumerate().rev() {
+            context.tick()?;
+            let local_type = context.instantiate(&local.type_)?;
+            let local_type = context.expand_record_aliases(local_type, &inheritance.aliases)?;
+            let style = if index < parameters.len() && local.binder_info == BinderInfo::Default {
+                BinderInfo::Implicit
+            } else {
+                local.binder_info
+            };
+            value = value
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            type_ = type_
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            value = Expr::lam(local.user_name.clone(), local_type.clone(), value, style);
+            type_ = Expr::forall_e(local.user_name.clone(), local_type, type_, style);
+        }
+        let helper = helper_name(name, &field.user_name);
+        helpers.push(Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: helper.clone(),
+                level_params: Vec::new(),
+                type_,
+            },
+            value,
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![helper.clone()],
+        }));
+        defaults.push(RecordDefault {
+            record: name.clone(),
+            field: u32::try_from(position)
+                .map_err(|_| failure(SourceInferenceError::ResourceLimit))?,
+            helper,
+        });
+    }
     for field in fields {
         context.tick()?;
         let parts = expect_node(
@@ -524,8 +576,16 @@ pub(super) fn elaborate_record_scoped(
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
     declarations.push(context.record_flat_constructor(&spec, &inheritance.parents, budget)?);
+    let (copied, copied_instances) = context.copied_parent_projections(
+        &spec,
+        inheritance.copied,
+        &inheritance.aliases,
+        budget,
+    )?;
+    declarations.extend(copied);
     declarations.extend(helpers);
-    let parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
+    let mut parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
+    parent_instances.extend(copied_instances);
     let subobjects: std::collections::BTreeMap<_, _> = inheritance
         .parents
         .iter()
@@ -541,18 +601,25 @@ pub(super) fn elaborate_record_scoped(
             binder_info: field.binder_info,
         });
     }
-    let mut parents = Vec::with_capacity(inheritance.parents.len());
-    for parent in &inheritance.parents {
+    // The pin's `parentInfo`: the `extends` clause's parents only. A copied parent's projection
+    // is a definition, and an ancestor promoted out of it is a subobject field, not a parent.
+    let mut parents = Vec::with_capacity(inheritance.direct.len());
+    for (parent, label, subobject) in &inheritance.direct {
         context.tick()?;
-        let field = fields.get(parent.field as usize).ok_or_else(|| {
-            failure(SourceInferenceError::Record(
+        let projection = spec.name.append_core(label);
+        if *subobject
+            && !fields.iter().any(|field| {
+                field.projection == projection && field.subobject.as_ref() == Some(parent)
+            })
+        {
+            return Err(failure(SourceInferenceError::Record(
                 crate::records::RecordError::InvalidTelescope,
-            ))
-        })?;
+            )));
+        }
         parents.push(StructureParent {
-            name: parent.parent.clone(),
-            subobject: true,
-            projection: field.projection.clone(),
+            name: parent.clone(),
+            subobject: *subobject,
+            projection,
         });
     }
     let structure = StructureEntry {
