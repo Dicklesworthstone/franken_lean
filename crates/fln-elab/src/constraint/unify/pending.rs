@@ -176,7 +176,7 @@ impl Engine<'_> {
         let Some(blocker) = self.reduction_blocker(neutral, locals)? else {
             return Ok(false);
         };
-        match self.try_congruence_equations(children)? {
+        match self.try_congruence_equations(children, false)? {
             super::application_congruence::CongruenceResult::Solved => Ok(true),
             super::application_congruence::CongruenceResult::Refused {
                 made_assignments: true,

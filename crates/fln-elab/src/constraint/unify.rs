@@ -516,6 +516,10 @@ struct Engine<'a> {
     projection_registry: crate::instances::RegistryCache,
     pending: pending::PendingState<'a>,
     congruence_depth: u8,
+    // A speculative argument comparison that, like the pin's `isDefEqArgs`, answers each
+    // argument outright: the first equation it cannot solve now refuses the trial, rather
+    // than entering the worklist's retries, instance synthesis and head recovery.
+    fail_fast: bool,
 }
 
 impl Engine<'_> {
@@ -963,6 +967,23 @@ impl Engine<'_> {
                 Err(error) => return Err(error),
             }
         }
+        // At `instances` transparency the pin's `isExprDefEqExpensive` reduces
+        // both sides with `whnfCore` alone. A shared head's arguments are then
+        // compared before it is unfolded (`isDefEqDelta`'s `tryHeuristic`, or
+        // `isDefEqApp` when the head cannot unfold), and a class projection of
+        // an instance unfolds only after both (`isDefEqProjInst`). Unfolding
+        // first turned `m + n + 1 =?= ?a + ?b + ?c` into `Nat.succ (m + n) =?=
+        // Nat.add (?a + ?b) ?c`, which `rw` reported as no occurrence, and
+        // assigned `?c` an unfolded `k + x` that `rfl` could not close.
+        if self.budget.transparency == UnificationTransparency::Instances
+            && (left.has_expr_mvar() || right.has_expr_mvar())
+        {
+            let lazy_left = self.whnf_with_lazy_outer_delta(left, locals, true)?;
+            let lazy_right = self.whnf_with_lazy_outer_delta(right, locals, true)?;
+            if self.try_shared_head_congruence(&lazy_left, &lazy_right, locals)? {
+                return Ok(());
+            }
+        }
         let left = self.whnf_for_comparison(left, locals)?;
         let right = self.whnf_for_comparison(right, locals)?;
         if same_terms(&left, &right, &mut self.meter)? {
@@ -1255,6 +1276,9 @@ impl Engine<'_> {
             while let Some(equation) = pending.pop_front() {
                 match self.compare(&equation, &mut pending) {
                     Ok(()) => {}
+                    Err(UnificationError::Deferred(reason)) if self.fail_fast => {
+                        return Err(UnificationError::Deferred(reason));
+                    }
                     Err(UnificationError::Deferred(reason)) => {
                         first_reason.get_or_insert(reason);
                         postponed.push_back(equation);
@@ -1667,6 +1691,7 @@ impl ElabTxn {
             projection_registry: crate::instances::RegistryCache::default(),
             pending: pending::PendingState::new(pending, remaining),
             congruence_depth: 0,
+            fail_fast: false,
         };
         let result = engine.solve(equations, typings, delayed);
         // Synthesis spends the same heartbeats as the batch that asked for it,

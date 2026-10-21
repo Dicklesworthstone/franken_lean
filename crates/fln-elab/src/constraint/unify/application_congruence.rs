@@ -21,8 +21,22 @@ impl Engine<'_> {
         right: &Expr,
         locals: &LocalContext,
     ) -> Result<bool, UnificationError> {
-        if self.budget.transparency != UnificationTransparency::Default
-            || self.congruence_depth >= MAX_CONGRUENCE_DEPTH
+        if self.budget.transparency != UnificationTransparency::Default {
+            return Ok(false);
+        }
+        self.try_shared_head_congruence(left, right, locals)
+    }
+
+    /// The pin's same-head heuristic without its transparency gate: compare
+    /// the arguments, then the universe levels, of two applications of one
+    /// unfoldable definition, in a trial that commits only a complete solution.
+    pub(super) fn try_shared_head_congruence(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        if self.congruence_depth >= MAX_CONGRUENCE_DEPTH
             || (!left.has_expr_mvar() && !right.has_expr_mvar())
         {
             return Ok(false);
@@ -73,8 +87,11 @@ impl Engine<'_> {
                 locals.clone(),
             ));
         }
+        // At `instances` transparency this rung precedes the unfolding path it falls back
+        // to; a refused trial must cost what the pin's failing `isDefEqArgs` costs.
+        let fail_fast = self.budget.transparency == UnificationTransparency::Instances;
         Ok(matches!(
-            self.try_congruence_equations(&equations)?,
+            self.try_congruence_equations(&equations, fail_fast)?,
             CongruenceResult::Solved
         ))
     }
@@ -94,6 +111,7 @@ impl Engine<'_> {
     pub(super) fn try_congruence_equations(
         &mut self,
         equations: &[Equation],
+        fail_fast: bool,
     ) -> Result<CongruenceResult, UnificationError> {
         // Account for copying the mutable stores and per-batch identities.
         // Immutable environment/registry data are shared; syntax facts start
@@ -135,6 +153,7 @@ impl Engine<'_> {
             // outer owner and can ask it against the surviving equations.
             pending: pending::PendingState::new(None, u64::MAX),
             congruence_depth: self.congruence_depth + 1,
+            fail_fast: self.fail_fast || fail_fast,
         };
         let generation = self.generation();
         let result = trial.solve(equations, &[], &[]);

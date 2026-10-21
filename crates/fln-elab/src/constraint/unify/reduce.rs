@@ -99,7 +99,7 @@ impl Engine<'_> {
         )
     }
 
-    fn whnf_with_lazy_outer_delta(
+    pub(super) fn whnf_with_lazy_outer_delta(
         &mut self,
         expr: &Expr,
         locals: &LocalContext,
@@ -238,7 +238,8 @@ impl Engine<'_> {
                             Some(ConstantInfo::Defn(definition))
                                 if self.budget.transparency
                                     == UnificationTransparency::Instances
-                                    && definition.base.level_params.len() == levels.len() =>
+                                    && definition.base.level_params.len() == levels.len()
+                                    && (!lazy_outer_delta || !continuations.is_empty()) =>
                             {
                                 // `WHNF.unfoldProjInst?`: the class field may be
                                 // semireducible, but its receiver must project at

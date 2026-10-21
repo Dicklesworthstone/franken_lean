@@ -63,6 +63,21 @@ fn explicit_rewrite_leaves_its_goal_while_rw_tries_reflexivity() {
     );
 }
 
+/// The pin selects `n + m + k`'s occurrence in `m + n + 1` by comparing the two additions'
+/// operands before unfolding `HAdd.hAdd` (`isDefEqDelta` at `instances` transparency). A
+/// literal, a successor or an addition as the last operand matches as written, and the
+/// rewritten goal closes by reflexivity; unfolding first found no occurrence at all.
+#[test]
+fn rw_and_simp_match_an_addition_by_its_operands() {
+    for last in ["1", "(k + x)", "Nat.succ k", "(k + 2)", "k"] {
+        let goal = format!("m + n + {last} = m + (n + {last})");
+        for tactic in ["rw [assoc]", "simp only [assoc]"] {
+            prove(&format!(
+                "theorem t (assoc : (a b c : Nat) -> a + b + c = a + (b + c)) (m n k x : Nat) : {goal} := by {tactic}"
+            ));
+        }
+    }
+}
 #[test]
 fn rw_reflexivity_reduces_closed_arithmetic_through_the_kernel() {
     prove("theorem arithmetic (x : Nat) (h : x = 5) : 2 + 3 = x := by rw [h]");

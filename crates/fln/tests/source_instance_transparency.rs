@@ -24,8 +24,9 @@
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
     Budget, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
-    OleanModuleInput, Outcome, SourceCheckLimits,
+    OleanDecodeLimits, OleanModuleInput, Outcome, SourceCheckLimits, olean_module_imports,
 };
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const STACK: usize = 256 * 1024 * 1024;
@@ -131,6 +132,96 @@ fn instance_selection_unfolds_implicit_reducible_definitions_and_nothing_semired
                 "refused by instance search, not by something earlier: {rendered}"
             );
             assert_eq!(engine.logical_root(&KVMap::new()), before);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}
+
+/// `module`'s pinned import closure, admitted through the council for source checking.
+fn import_closure(lib: &Path, module: &str) -> Engine {
+    let root = Name::from_components(module.split('.'));
+    let mut pending = vec![root.clone()];
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    let mut parts = Vec::new();
+    while let Some(module) = pending.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        let base = module
+            .to_display_string()
+            .split('.')
+            .fold(lib.to_path_buf(), |path, part| path.join(part))
+            .with_extension("olean");
+        let exported = std::fs::read(&base).expect("pinned exported artifact");
+        pending.extend(
+            olean_module_imports(&exported, OleanDecodeLimits::new(exported.len()))
+                .expect("pinned module imports"),
+        );
+        parts.push([
+            exported,
+            std::fs::read(base.with_extension("olean.server")).expect("pinned server artifact"),
+            std::fs::read(base.with_extension("olean.private")).expect("pinned private artifact"),
+        ]);
+        names.push(module);
+    }
+    let inputs: Vec<_> = names
+        .iter()
+        .zip(&parts)
+        .map(|(name, [exported, server, private])| OleanModuleInput {
+            name,
+            artifact: exported,
+            server_artifact: Some(server),
+            private_artifact: Some(private),
+        })
+        .collect();
+    match Engine::from_environment(Environment::new()).import_olean_modules_for_source(
+        &inputs,
+        std::slice::from_ref(&root),
+        &KVMap::new(),
+        SourceOleanImportLimits::new(OleanCheckLimits::new(
+            256 * 1024 * 1024,
+            Budget::for_stack_bytes(STACK),
+        )),
+    ) {
+        Ok(Outcome::Complete(imported)) => imported.engine,
+        other => panic!("the pinned {module} closure passes the council: {other:?}"),
+    }
+}
+
+/// The pin accepts this under `prelude` and `import Init.GetElem`. `rw` tries `as[i]` against
+/// the rule's `(drop ?xs)[?i]` first. At `instances` transparency the shared head `getElem` has
+/// its arguments compared before it unfolds, and that comparison gives up at the first argument
+/// it cannot settle (`as =?= drop ?xs`), as the pin's `isDefEqArgs` does. Retrying it through
+/// the worklist instead exhausted the 100,000-step unification limit here.
+const SHARED_HEAD_GIVES_UP: &str = "axiom drop : Array α → Array α\n\
+axiom bound {xs : Array α} {i : Nat} (h : i < (drop xs).size) : i < xs.size\n\
+axiom getElemDrop {xs : Array α} {i : Nat} (h : i < (drop xs).size) : (drop xs)[i] = xs[i]'(bound h)\n\
+theorem ex {as : Array α} (h : i < as.size) (hlt : i < (drop as).size) : as[i] = (drop as)[i] := by\n  \
+rw [getElemDrop]";
+
+#[test]
+fn a_shared_head_argument_comparison_gives_up_at_its_first_unsettled_argument() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let engine = import_closure(&lib, "Init.GetElem");
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            let checked = engine.check_source_files(
+                &[SHARED_HEAD_GIVES_UP.as_bytes()],
+                &KVMap::new(),
+                limits,
+            );
+            assert!(
+                matches!(checked, Ok(Outcome::Complete(_))),
+                "the pin's program must be admitted: {checked:?}"
+            );
         })
         .expect("spawn the checking thread")
         .join()
