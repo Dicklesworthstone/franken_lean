@@ -91,6 +91,50 @@ loc : ℕ
 two : ℕ
 ";
 
+/// Infixes over the builtin `+`'s token at a higher priority: where one is active (`local`, in
+/// its section; `scoped`, in or after opening its namespace) `x + y` is `f x y`, and prints
+/// back through it with the atom's own spacing (`"  +  "` is `1  + 2`); elsewhere `+` is
+/// `HAdd.hAdd`.
+const PRIORITY: &str = r#"prelude
+import Init.Core
+def f (x y : Nat) := x + 2*y
+namespace Foo
+local infix:65 (priority := high) "+" => f
+theorem ex1 (x y : Nat) : x + y = f x y := rfl
+#check 1 + 2
+end Foo
+#check 1 + 2
+theorem ex2 (x y : Nat) : x + y = HAdd.hAdd x y := rfl
+section
+def g (x y : Nat) := 3*(x+y)
+local infix:65 (priority := high) "  +  " => g
+theorem ex4 (x y : Nat) : x + y = g x y := rfl
+#check 1 + 2
+end
+theorem ex5 (x y : Nat) : x + y = HAdd.hAdd x y := rfl
+#check 1 + 2
+namespace Bar
+scoped infix:65 (priority := high) "+" => f
+theorem ex6 (x y : Nat) : x + y = f x y := rfl
+#check 1 + 2
+end Bar
+#check 1 + 2
+theorem ex7 (x y : Nat) : x + y = HAdd.hAdd x y := rfl
+open Bar
+theorem ex8 (x y : Nat) : x + y = f x y := rfl
+#check 1 + 2
+"#;
+
+/// The pin's output for [`PRIORITY`].
+const PRIORITY_EXPECTED: &str = "1+2 : Nat
+1 + 2 : Nat
+1  + 2 : Nat
+1 + 2 : Nat
+1+2 : Nat
+1 + 2 : Nat
+1+2 : Nat
+";
+
 /// A notation whose right-hand side passes something other than a variable: the pin's
 /// unexpander matches only some delaborated arguments, which is not decided here, so an
 /// application it might print is refused rather than printed another way.
@@ -180,6 +224,22 @@ fn applications_print_through_the_files_notations_as_at_the_pin() {
     assert_eq!(stdout, EXPECTED);
     if let Some((code, stdout)) = pinned(&lib, &root.join("Notations.lean")) {
         assert_eq!((code, stdout.as_str()), (0, EXPECTED), "the pin moved");
+    }
+}
+
+#[test]
+fn an_infix_outranking_a_builtin_operator_reads_in_its_place() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let (code, stdout, stderr) = ours(&lib, &root, PRIORITY);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, PRIORITY_EXPECTED);
+    if let Some((code, stdout)) = pinned(&lib, &root.join("Notations.lean")) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, PRIORITY_EXPECTED),
+            "the pin moved"
+        );
     }
 }
 

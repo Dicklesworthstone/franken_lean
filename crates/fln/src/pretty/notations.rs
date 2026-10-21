@@ -8,8 +8,8 @@
 //! applied to the printed notation. An application written with `@` runs none.
 //!
 //! The notation's tokens are laid out as the pin's formatter lays out a token (`pushToken`,
-//! vendored `PrettyPrinter/Formatter.lean:366-417`): an atom's leading space is printed, its
-//! trailing space is a line, and two tokens written together are separated by a line where
+//! vendored `PrettyPrinter/Formatter.lean:366-417`): an atom's leading spaces print as written,
+//! its trailing space is a line, and two tokens written together are separated by a line where
 //! they would lex as one, read against the active tokens. Where that cannot be told, the term
 //! is refused.
 use super::*;
@@ -17,12 +17,12 @@ use fln_parse::extensions::{Notations, Unexpander, UnexpanderItem};
 use fln_syntax::token::is_id_rest;
 
 /// One printed piece of a notation: its layout, its text on one line, whether it is an atom,
-/// and the spaces its atom was declared with.
+/// and the spaces its atom was declared with: the leading ones print as written.
 struct Piece {
     doc: Format,
     text: String,
     atom: bool,
-    leading_space: bool,
+    leading_space: String,
     trailing_space: bool,
 }
 
@@ -107,7 +107,7 @@ impl<'a> Printer<'a> {
                         doc: Format::text(token),
                         text: token.to_owned(),
                         atom: true,
-                        leading_space: text.starts_with(char::is_whitespace),
+                        leading_space: text[..text.len() - text.trim_start().len()].to_owned(),
                         trailing_space: text.ends_with(char::is_whitespace),
                     }
                 }
@@ -127,7 +127,7 @@ impl<'a> Printer<'a> {
                         text: flat(&doc),
                         doc,
                         atom: false,
-                        leading_space: false,
+                        leading_space: String::new(),
                         trailing_space: false,
                     }
                 }
@@ -135,16 +135,14 @@ impl<'a> Printer<'a> {
         }
         let mut shown = Format::Nil;
         for (index, piece) in pieces.iter().enumerate() {
-            if piece.leading_space {
-                shown = shown.then(Format::text(" "));
-            } else if let Some(previous) = index.checked_sub(1).map(|at| &pieces[at]) {
-                if previous.trailing_space {
-                    shown = shown.then(Format::Line);
-                } else if joined(tokens, previous, &piece.text)
-                    .ok_or(Unsupported("a notation whose tokens may run together"))?
-                {
-                    shown = shown.then(Format::Line);
-                }
+            if !piece.leading_space.is_empty() {
+                shown = shown.then(Format::text(piece.leading_space.as_str()));
+            } else if let Some(previous) = index.checked_sub(1).map(|at| &pieces[at])
+                && (previous.trailing_space
+                    || joined(tokens, previous, &piece.text)
+                        .ok_or(Unsupported("a notation whose tokens may run together"))?)
+            {
+                shown = shown.then(Format::Line);
             }
             shown = shown.then(piece.doc.clone());
         }

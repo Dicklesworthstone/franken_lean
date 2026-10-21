@@ -755,6 +755,10 @@ pub struct ActiveGrammar {
     infix: BTreeMap<String, ExtensionInfix>,
     /// Each [`ExtensionInfix`]'s node kinds, the most recently added parser first.
     infix_kinds: Vec<Vec<Name>>,
+    /// The infix symbols every active declaration of which outranks the default priority: on a
+    /// builtin operator's token (`infix:65 (priority := high) "+" => f`), the pin's parser keeps
+    /// only the higher-priority reading of the same input, so the builtin one is not read.
+    overriding: BTreeSet<String>,
     /// Leading `tactic` declarations by the text of their first atom, highest priority first.
     tactics: BTreeMap<String, Vec<usize>>,
     /// Leading `term` declarations that read as an atom: at `lead` precedence or above, from a
@@ -810,7 +814,7 @@ pub(crate) fn doc_options() -> DocOptions {
 
 impl ActiveGrammar {
     fn new(tokens: BTreeSet<String>, decls: Vec<Arc<SyntaxDecl>>) -> ActiveGrammar {
-        let mut operators: BTreeMap<String, Vec<(ExtensionInfix, Name)>> = BTreeMap::new();
+        let mut operators: BTreeMap<String, Vec<(ExtensionInfix, Name, u32)>> = BTreeMap::new();
         let mut tactics: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut terms: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut attrs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -904,6 +908,7 @@ impl ActiveGrammar {
                                 rhs_prec: (*rhs_prec).min(u32::from(u16::MAX)) as u16,
                             },
                             kind.clone(),
+                            decl.priority,
                         ));
                     }
                 }
@@ -951,13 +956,20 @@ impl ActiveGrammar {
         // Different precedences would parse differently, which is not built here.
         let mut infix = BTreeMap::new();
         let mut infix_kinds = Vec::new();
+        let mut overriding = BTreeSet::new();
         for (symbol, entries) in operators {
-            let (first, _) = entries[0];
-            if entries.iter().any(|(entry, _)| {
+            let (first, _, _) = entries[0];
+            if entries.iter().any(|(entry, _, _)| {
                 (entry.prec, entry.lhs_prec, entry.rhs_prec)
                     != (first.prec, first.lhs_prec, first.rhs_prec)
             }) {
                 continue;
+            }
+            if entries
+                .iter()
+                .all(|(_, _, priority)| *priority > DEFAULT_PRIORITY)
+            {
+                overriding.insert(symbol.clone());
             }
             infix.insert(
                 symbol,
@@ -966,7 +978,7 @@ impl ActiveGrammar {
                     ..first
                 },
             );
-            infix_kinds.push(entries.into_iter().rev().map(|(_, kind)| kind).collect());
+            infix_kinds.push(entries.into_iter().rev().map(|(_, kind, _)| kind).collect());
         }
         let mut category_decls: BTreeMap<Name, Vec<usize>> = BTreeMap::new();
         for (index, decl) in decls.iter().enumerate() {
@@ -984,6 +996,7 @@ impl ActiveGrammar {
             decls,
             infix,
             infix_kinds,
+            overriding,
             tactics,
             terms,
             interpolated,
@@ -3464,6 +3477,17 @@ pub fn expand_active(syntax: &Syntax) -> Result<Option<Syntax>, &'static str> {
 /// The active infix declarations spelled `symbol`.
 pub(crate) fn infix(symbol: &str) -> Option<ExtensionInfix> {
     active()?.infix.get(symbol).copied()
+}
+
+/// The active infix declarations spelled `symbol` when they outrank the default priority, so
+/// that they replace a builtin operator spelled the same.
+pub(crate) fn overriding_infix(symbol: &str) -> Option<ExtensionInfix> {
+    let grammar = active()?;
+    grammar
+        .overriding
+        .contains(symbol)
+        .then(|| grammar.infix.get(symbol).copied())
+        .flatten()
 }
 
 /// The node an [`ExtensionInfix`] of the active grammar builds over its operands: its kind's, or

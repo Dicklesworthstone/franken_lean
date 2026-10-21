@@ -16,7 +16,7 @@ use super::*;
 /// One item of a notation as it prints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnexpanderItem {
-    /// An atom, as declared: a leading space is printed, a trailing one is a line.
+    /// An atom, as declared: its leading spaces print as written, a trailing space is a line.
     Atom(String),
     /// The right-hand side's `position`-th argument, bracketed below `precedence`.
     Argument { position: usize, precedence: u32 },

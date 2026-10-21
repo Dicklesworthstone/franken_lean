@@ -907,6 +907,14 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
     let Some(TokenKind::Symbol(symbol)) = kind else {
         return None;
     };
+    // An infix notation of the entered grammar that outranks the default priority on a builtin
+    // operator's token is read in its place, as the pin keeps only the higher-priority parse
+    // (`infix:65 (priority := high) "+" => f`).
+    if grammar == DefinitionGrammar::Scalar
+        && let Some(operator) = extensions::overriding_infix(symbol)
+    {
+        return Some(BoundedInfix::Extension(operator));
+    }
     match symbol.as_str() {
         "->" | "→" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Arrow),
         "∧" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::And),
