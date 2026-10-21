@@ -14,6 +14,7 @@ pub(in super::super) struct Sequence<'a> {
     suffix_node: &'a Syntax,
     kind: &'a Name,
     suffix: &'a str,
+    elementwise: bool,
 }
 
 /// A sole suffix capture binds the whole sequence. Mixed template parts are
@@ -30,11 +31,29 @@ pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'sta
     let Syntax::Node { kind, args, .. } = suffix_node else {
         return Ok(None);
     };
-    if kind.leaf_view() != LeafView::Str("antiquot_suffix_splice") {
-        return Ok(None);
-    }
-    let [capture, Syntax::Atom { val: suffix, .. }] = args.as_slice() else {
-        return Err("a malformed repetition suffix splice");
+    let leaf = kind.leaf_view();
+    let (capture, suffix, elementwise) = match leaf {
+        LeafView::Str("antiquot_suffix_splice") => {
+            let [capture, Syntax::Atom { val: suffix, .. }] = args.as_slice() else {
+                return Err("a malformed repetition suffix splice");
+            };
+            (capture, suffix.as_str(), false)
+        }
+        LeafView::Str("antiquot_scope") => {
+            let [body, Syntax::Atom { val: suffix, .. }] = args.as_slice() else {
+                return Err("a malformed bracketed repetition splice");
+            };
+            let Some([capture]) = null_args(body) else {
+                return Err(
+                    "a bracketed repetition body outside the supported single-capture subset",
+                );
+            };
+            if antiquotation_name(capture).is_none() {
+                return Err("a bracketed repetition body without a direct capture");
+            }
+            (capture, suffix.as_str(), true)
+        }
+        _ => return Ok(None),
     };
     let parent = kind.parent();
     let valid = if parent == Name::from_components(["sepBy"]) {
@@ -54,6 +73,7 @@ pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'sta
         suffix_node,
         kind,
         suffix,
+        elementwise,
     }))
 }
 
@@ -276,9 +296,14 @@ impl Sequence<'_> {
         let Syntax::Node { info, kind, args } = self.suffix_node else {
             return Err("a repetition suffix without syntax children");
         };
+        let kind = if self.elementwise {
+            Name::str(kind.parent(), "antiquot_suffix_splice")
+        } else {
+            kind.clone()
+        };
         Ok(Syntax::Node {
             info: *info,
-            kind: kind.clone(),
+            kind,
             args: vec![capture, args[1].clone()],
         })
     }
@@ -313,6 +338,20 @@ impl Sequence<'_> {
                 .any(|item| !matches!(item, Syntax::Atom { val, .. } if val == separator))
             {
                 return Ok(false);
+            }
+        }
+        if self.elementwise {
+            let values: Box<dyn Iterator<Item = &Syntax> + '_> =
+                if parent == Name::from_components(["sepBy"]) {
+                    Box::new(items.iter().step_by(2))
+                } else {
+                    Box::new(items.iter())
+                };
+            for value in values {
+                templates::charge(visited)?;
+                if !super::capture_kind_matches(self.capture, value)? {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)

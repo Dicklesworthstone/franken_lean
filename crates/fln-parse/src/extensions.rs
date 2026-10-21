@@ -4088,6 +4088,26 @@ impl Run<'_> {
         splice: (&str, &str),
     ) -> Parsed {
         let (kind, suffix) = splice;
+        if let Some((contents, _suffix_at, next)) =
+            crate::quotations::repetition_iteration(self.tokens, at, end, suffix)
+        {
+            let (items, consumed) =
+                self.parse(body, contents.start, contents.end, &Follow::End, depth)?;
+            if consumed != contents.end || items.is_empty() {
+                return None;
+            }
+            let body = null_node(items);
+            let splice = crate::quotations::wrap_repetition_iteration(
+                self.leaves,
+                body,
+                kind,
+                suffix,
+                at,
+                next,
+            )
+            .ok()?;
+            return Some((vec![splice], next));
+        }
         if let Some((suffix_at, next)) =
             crate::quotations::repetition_suffix(self.tokens, at, end, suffix)
         {

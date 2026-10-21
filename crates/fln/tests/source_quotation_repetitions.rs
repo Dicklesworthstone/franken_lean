@@ -80,7 +80,6 @@ fn bad_expansions_false_results_and_unsupported_splices_refuse() {
         "macro \"scalar!\" x:term:max : term => `([$x,*])\ndef wrong := scalar! 4",
         "macro \"unbound!\" : term => `([$xs,*])\ndef wrong := unbound!",
         "syntax \"mixed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(mixed![0, $xs,*, 1]) => `([$xs,*])\ntheorem wrong : mixed![0, 2, 1] = [42] := rfl",
-        "syntax \"bracketed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(bracketed![$[$x],*]) => `([$x,*])\ndef wrong := bracketed![1]",
         "syntax \"noFallback!\" term:max : term\nmacro_rules | `(noFallback! $x) => `((7 : Nat))\nmacro_rules | `(noFallback! $x) => `([$x,*])\ndef wrong := noFallback! 4",
     ] {
         let source = format!("{LIST}\n{tail}");
@@ -122,6 +121,44 @@ fn sequence_annotations_do_not_turn_into_scalar_kind_filters() {
         theorem wildcard : discardSequence![noSuchName] = (7 : Nat) := rfl";
     assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 3);
     assert!(check(&source.replace("= (42 : Nat)", "= (99 : Nat)")).is_err());
+}
+
+#[test]
+fn bracketed_repetition_patterns_filter_each_element_and_forward_whole_arrays() {
+    let source = "syntax \"bracketed!\" \"[\" term,* \"]\" : term\n\
+        macro_rules\n\
+        | `(bracketed![$[$x:num],*]) => `((42 : Nat))\n\
+        | `(bracketed![$[$x],*]) => `((99 : Nat))\n\
+        theorem nums : bracketed![4, 2] = (42 : Nat) := rfl\n\
+        theorem mixed : bracketed![true, 2] = (99 : Nat) := rfl\n\
+        theorem empty : bracketed![] = (42 : Nat) := rfl";
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 3);
+    assert!(check(&source.replace("bracketed![4, 2] = (42", "bracketed![4, 2] = (99")).is_err());
+}
+
+#[test]
+fn bracketed_repetition_executes_natively_and_keeps_caller_identifiers() {
+    let source = "syntax \"bracketed!\" \"[\" term,* \"]\" : term\n\
+        macro_rules | `(bracketed![$[$x],*]) => `([$[$x],*])\n\
+        def keep (x : Nat) : List Nat := bracketed![x, 2]\n\
+        theorem hygienic (x : Nat) : keep x = [x, 2] := rfl\n\
+        #eval List.foldl (fun n x => n * 10 + x) 0 (bracketed![4, 2])";
+    let checked = engine()
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(result) = &checked.batch.executions.last().unwrap().exit else {
+        panic!("expected native return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("42")
+    );
 }
 
 const SUM: &str = "syntax \"sumSeq!\" \"[\" num* \"]\" : term\n\
