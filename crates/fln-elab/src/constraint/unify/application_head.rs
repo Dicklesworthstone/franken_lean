@@ -23,6 +23,16 @@ impl Engine<'_> {
         let (left, right, locals) = equation;
         let left = self.instantiate(left)?;
         let right = self.instantiate(right)?;
+        self.meter.node()?;
+        // Head recovery can assign only an expression metavariable. Do not
+        // recompute a closed failed equation looking for an impossible hole.
+        // Free locals retain the old path when zeta may reveal a hidden one.
+        if [&left, &right]
+            .iter()
+            .all(|expr| !expr.has_expr_mvar() && (!self.budget.zeta_delta || !expr.has_fvar()))
+        {
+            return Ok(false);
+        }
         let left = self.whnf(&left, locals)?;
         let right = self.whnf(&right, locals)?;
         if self.align_application_head(&left, &right, locals, pending)? {

@@ -269,6 +269,13 @@ impl Engine<'_> {
         expr: &Expr,
         locals: &LocalContext,
     ) -> Result<Option<PruningPattern>, UnificationError> {
+        self.meter.node()?;
+        // Pruning needs an expression-metavariable head. Closed syntax cannot
+        // acquire one by computation. A local let may conceal a hole, so keep
+        // the reducing path whenever permitted zeta can expose its value.
+        if !expr.has_expr_mvar() && (!self.budget.zeta_delta || !expr.has_fvar()) {
+            return Ok(None);
+        }
         let normalized = self.pattern_whnf(expr, locals)?;
         let mut head = &normalized;
         let mut arguments = Vec::new();

@@ -330,3 +330,127 @@ fn cached_literals_do_not_confer_constructor_authority_on_a_different_environmen
     ));
     unchanged(&txn, &before);
 }
+
+#[test]
+fn structurally_colliding_demands_do_not_share_different_declared_values() {
+    use fln_elab::constraint::unify::UnificationError;
+    use fln_env::constants::{DefinitionSafety, DefinitionVal, ReducibilityHints};
+    let mut txn = transaction();
+    let names: Vec<_> = (0..2)
+        .map(|index| Name::num_overflowing(name("value"), index))
+        .collect();
+    for (label, value) in names.iter().zip([7, 9]) {
+        publish(
+            &mut txn,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: label.clone(),
+                    level_params: vec![],
+                    type_: constant("Nat"),
+                },
+                value: number(value),
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![label.clone()],
+            }),
+        );
+    }
+    let left = Expr::const_(names[0].clone(), vec![]);
+    let right = Expr::const_(names[1].clone(), vec![]);
+    assert_eq!(
+        left.hash(),
+        right.hash(),
+        "exercise a real syntax-hash collision"
+    );
+    assert_ne!(left, right);
+    let expression = add(left, right);
+    let before = txn.clone();
+    txn.unify(&expression, &number(16), budget()).unwrap();
+    unchanged(&txn, &before);
+    let before = txn.clone();
+    assert!(matches!(
+        txn.unify(&expression, &number(14), budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn separately_rebuilt_recursor_demands_preserve_trailing_function_arguments() {
+    let make = |argument| {
+        let nat = constant("Nat");
+        let function = recursor(
+            add(number(1), number(1)),
+            lam(nat.clone(), add(Expr::bvar(0).unwrap(), number(3))),
+            lam(
+                nat.clone(),
+                lam(pi(nat.clone(), nat.clone()), Expr::bvar(0).unwrap()),
+            ),
+            pi(nat.clone(), nat),
+        );
+        Expr::app(function, number(argument))
+    };
+    let mut txn = transaction();
+    let before = txn.clone();
+    // These have equal recursor demands but are not allocation-sharing clones.
+    txn.unify(&add(make(7), make(9)), &number(22), budget())
+        .unwrap();
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn hidden_local_function_holes_remain_recoverable_only_when_zeta_is_enabled() {
+    use fln_core::expr::{FVarId, MVarId};
+    use fln_elab::constraint::unify::UnificationError;
+    use fln_elab::mvar::MetavarKind;
+    let mut initial = transaction();
+    let function = pi(constant("Nat"), constant("Nat"));
+    publish(
+        &mut initial,
+        Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: name("rigid"),
+                level_params: vec![],
+                type_: function.clone(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let id = MVarId(name("hidden_function"));
+    initial.mvars.declare(
+        id.clone(),
+        id.0.clone(),
+        function.clone(),
+        initial.lctx.clone(),
+        MetavarKind::Natural,
+        0,
+        None,
+    );
+    let local = FVarId(name("alias"));
+    initial.lctx.add_let(
+        local.clone(),
+        local.0.clone(),
+        function,
+        Expr::mvar(id.clone()),
+    );
+    let left = Expr::app(Expr::fvar(local), number(3));
+    let right = Expr::app(constant("rigid"), number(3));
+    assert!(
+        !left.has_expr_mvar(),
+        "the hole is hidden behind its local binding"
+    );
+    let mut blocked = initial.clone();
+    let mut limits = budget();
+    limits.zeta_delta = false;
+    assert!(matches!(
+        blocked.unify(&left, &right, limits),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&blocked, &initial);
+    let mut permitted = initial.clone();
+    permitted.unify(&left, &right, budget()).unwrap();
+    assert_eq!(
+        permitted.mvars.get_assigned_expr(&id),
+        Some(&constant("rigid"))
+    );
+}
