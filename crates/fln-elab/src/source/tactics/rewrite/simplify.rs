@@ -201,7 +201,16 @@ impl Context {
         let Syntax::Ident { val, .. } = syntax else {
             return Ok(None);
         };
-        if self.txn.lctx.find_by_user_name(val).is_some() {
+        // A local, or a field of one (`h.symm`, `v.property`): the pin resolves a dotted name
+        // whose head is a local as a projection of that local before any global name, so it
+        // is elaborated as a term, not looked up as a constant.
+        let mut head = val.clone();
+        while !head.parent().is_anonymous() {
+            head = head.parent();
+        }
+        if self.txn.lctx.find_by_user_name(val).is_some()
+            || self.txn.lctx.find_by_user_name(&head).is_some()
+        {
             return Ok(None);
         }
         let resolved = self

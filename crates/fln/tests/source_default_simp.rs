@@ -567,6 +567,15 @@ fn default_conditional_rules_do_not_invent_their_premises() {
         &base,
         &["theorem t (x : Nat) (h : x = 0) : wrap x = 0 := by simp [h]"],
     );
+    // A field of a local is a term, as the pin resolves it, never an unknown constant (the
+    // pinned v4.32.0 accepts both, 2026-10-21).
+    checked(
+        &base,
+        &[
+            "theorem t1 (x : Nat) (h : x = 0 ∧ True) : wrap x = 0 := by simp [h.1]",
+            "theorem t2 (x : Nat) (h : x = 0 ∧ True) : wrap x = 0 := by simp [h.left]",
+        ],
+    );
     refused(&base, "theorem bad (x : Nat) : wrap x = 0 := by simp");
     refused(
         &base,
