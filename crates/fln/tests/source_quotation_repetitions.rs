@@ -79,7 +79,7 @@ fn bad_expansions_false_results_and_unsupported_splices_refuse() {
         "def wrong : List Nat := copy![true]",
         "macro \"scalar!\" x:term:max : term => `([$x,*])\ndef wrong := scalar! 4",
         "macro \"unbound!\" : term => `([$xs,*])\ndef wrong := unbound!",
-        "syntax \"mixed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(mixed![0, $xs,*]) => `([$xs,*])\ndef wrong := mixed![0, 1]",
+        "syntax \"mixed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(mixed![0, $xs,*, 1]) => `([$xs,*])\ndef wrong := mixed![0, 2, 1]",
         "syntax \"bracketed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(bracketed![$[$x],*]) => `([$x,*])\ndef wrong := bracketed![1]",
         "syntax \"noFallback!\" term:max : term\nmacro_rules | `(noFallback! $x) => `((7 : Nat))\nmacro_rules | `(noFallback! $x) => `([$x,*])\ndef wrong := noFallback! 4",
     ] {
@@ -122,4 +122,255 @@ fn sequence_annotations_do_not_turn_into_scalar_kind_filters() {
         theorem wildcard : discardSequence![noSuchName] = (7 : Nat) := rfl";
     assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 3);
     assert!(check(&source.replace("= (42 : Nat)", "= (99 : Nat)")).is_err());
+}
+
+const SUM: &str = "syntax \"sumSeq!\" \"[\" num* \"]\" : term\n\
+    macro_rules\n\
+    | `(sumSeq![]) => `((0 : Nat))\n\
+    | `(sumSeq![$n:num $tail*]) => `(Nat.add $n (sumSeq![$tail*]))\n";
+
+#[test]
+fn variadic_rules_consume_a_head_and_recurse_over_the_remaining_sequence() {
+    let source = format!(
+        "{SUM}\n\
+        theorem empty : sumSeq![] = (0 : Nat) := rfl\n\
+        theorem singleton : sumSeq![42] = (42 : Nat) := rfl\n\
+        theorem several : sumSeq![10 20 12] = (42 : Nat) := rfl"
+    );
+    assert_eq!(check(&source).unwrap_or_else(|e| panic!("{e}")).theorems, 3);
+    assert!(check(&source.replace("sumSeq![10 20 12] = (42", "sumSeq![10 20 12] = (43")).is_err());
+    let source = format!("{SUM}\n#eval sumSeq![10 20 12]");
+    let result = engine()
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(result) = &result.batch.executions.last().unwrap().exit else {
+        panic!("native return expected")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("42")
+    );
+}
+
+#[test]
+fn fixed_prefixes_are_checked_before_a_tail_rule_can_override_a_fallback() {
+    let source = "syntax \"routeSeq!\" \"[\" num* \"]\" : term\n\
+        macro_rules | `(routeSeq![$xs*]) => `((99 : Nat))\n\
+        macro_rules | `(routeSeq![1 2 $xs*]) => `((42 : Nat))\n\
+        theorem short : routeSeq![1] = (99 : Nat) := rfl\n\
+        theorem wrongPrefix : routeSeq![1 3] = (99 : Nat) := rfl\n\
+        theorem emptyTail : routeSeq![1 2] = (42 : Nat) := rfl\n\
+        theorem fullTail : routeSeq![1 2 3 4] = (42 : Nat) := rfl";
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 4);
+    assert!(check(&source.replace("routeSeq![1 3] = (99", "routeSeq![1 3] = (42")).is_err());
+}
+
+#[test]
+fn an_unused_variadic_tail_is_not_expanded_but_forwarded_recursion_still_stops() {
+    let source = "syntax \"foreverSequence\" : term\n\
+        macro_rules | `(foreverSequence) => `(foreverSequence)\n\
+        syntax \"firstSeq!\" \"[\" term:max* \"]\" : term\n\
+        macro_rules | `(firstSeq![$x:term $rest*]) => `($x)\n\
+        theorem kept : firstSeq![42 foreverSequence] = (42 : Nat) := rfl";
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 1);
+    assert!(check(&source.replace("42 foreverSequence", "foreverSequence 42")).is_err());
+    let deep = format!("{SUM}\ndef exhausted := sumSeq![{}]", "1 ".repeat(40));
+    assert!(
+        check(&deep).is_err(),
+        "the existing expansion-depth bound must still stop recursion"
+    );
+    assert!(
+        check(&format!(
+            "{SUM}\ntheorem recovered : sumSeq![40 2] = (42 : Nat) := rfl"
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn imported_tail_captures_and_scoped_rules_survive_exact_journal_reentry() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{Name, SourceModuleInput};
+    let names = ["Core", "Rules", "Main"].map(|name| Name::from_components([name]));
+    let core = SUM.replace('\n', "\r\n");
+    let extension = "import Core\nnamespace Extra\n\
+        def bias : Nat := 40\n\
+        scoped macro_rules | `(sumSeq![4 $tail*]) => `(Nat.add bias (sumSeq![$tail*]))\n\
+        end Extra\n";
+    let main = "import Rules\ndef bias : Nat := 100\n\
+        open scoped Extra in\n\
+        theorem activated : sumSeq![4 2] = (42 : Nat) := rfl\n\
+        theorem restored : sumSeq![4 2] = (6 : Nat) := rfl\n";
+    let sources = [core.as_str(), extension, main];
+    let inputs: Vec<_> = names
+        .iter()
+        .zip(sources)
+        .map(|(name, source)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    let exported = engine()
+        .check_source_modules(
+            &inputs,
+            &names[2],
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .checked
+        .engine;
+    let next = "open scoped Extra in\n\
+        theorem replayActive : sumSeq![4 2] = (42 : Nat) := rfl\n\
+        theorem replayGlobal : sumSeq![4 2] = (6 : Nat) := rfl";
+    assert_eq!(
+        exported
+            .check_source_files(
+                &[next.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .theorems,
+        2
+    );
+    assert!(
+        exported
+            .check_source_files(
+                &[next.replace("(42 : Nat)", "(102 : Nat)").as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err()
+    );
+}
+
+const SEPARATED_SUM: &str = "syntax \"sumSeparated!\" \"[\" num,* \"]\" : term\n\
+    macro_rules\n\
+    | `(sumSeparated![]) => `((0 : Nat))\n\
+    | `(sumSeparated![$n:num]) => `($n)\n\
+    | `(sumSeparated![$n:num, $tail,*]) => `(Nat.add $n (sumSeparated![$tail,*]))\n";
+
+#[test]
+fn separated_heads_recurse_over_only_the_remaining_elements() {
+    let source = format!(
+        "{SEPARATED_SUM}\n\
+        theorem zero : sumSeparated![] = (0 : Nat) := rfl\n\
+        theorem one : sumSeparated![42] = (42 : Nat) := rfl\n\
+        theorem many : sumSeparated![10, 20, 12] = (42 : Nat) := rfl"
+    );
+    assert_eq!(check(&source).unwrap_or_else(|e| panic!("{e}")).theorems, 3);
+    assert!(check(&source.replace("[10, 20, 12] = (42", "[10, 20, 12] = (43")).is_err());
+    let result = engine()
+        .execute_source_commands_with_checks(
+            format!("{SEPARATED_SUM}\n#eval sumSeparated![10, 20, 12]").as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(value) = &result.batch.executions.last().unwrap().exit else {
+        panic!("expected native return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+}
+
+#[test]
+fn separated_prefixes_preserve_caller_hygiene_and_the_empty_tail_boundary() {
+    let source = "syntax \"tailList!\" term:max : term\n\
+        macro_rules | `(tailList! $x) => `([(99 : Nat)])\n\
+        macro_rules | `(tailList! [0, $xs,*]) => `(let n := 100; [$xs,*])\n\
+        theorem caller (n : Nat) : tailList! [0, n, 2] = [n, 2] := rfl\n\
+        theorem missingSeparator : tailList! [0] = [99] := rfl\n\
+        theorem trailingSeparator : (tailList! [0,] : List Nat) = [] := rfl\n\
+        theorem otherPrefix : tailList! [1, 2] = [99] := rfl";
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 4);
+    assert!(check(&source.replace("[1, 2] = [99]", "[1, 2] = [2]")).is_err());
+    assert!(
+        check(&format!(
+            "{source}\ndef illTyped : List Nat := tailList! [0, true]"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn imported_separated_tail_paths_survive_module_journal_reentry() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{Name, SourceModuleInput};
+    let names = ["Sequences", "Main"].map(|name| Name::from_components([name]));
+    let sources = [
+        SEPARATED_SUM,
+        "import Sequences\ntheorem imported : sumSeparated![5, 37] = (42 : Nat) := rfl",
+    ];
+    let inputs: Vec<_> = names
+        .iter()
+        .zip(sources)
+        .map(|(name, source)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    let imported = engine()
+        .check_source_modules(
+            &inputs,
+            &names[1],
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .checked
+        .engine;
+    let source = "theorem replayed : sumSeparated![10, 20, 12] = (42 : Nat) := rfl";
+    assert_eq!(
+        imported
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .theorems,
+        1
+    );
+    assert!(
+        imported
+            .check_source_files(
+                &[source.replace("(42 : Nat)", "(43 : Nat)").as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn scalar_prefix_annotations_still_filter_before_the_sequence_capture() {
+    let source = "syntax \"typedHead!\" \"[\" term,* \"]\" : term\n\
+        macro_rules | `(typedHead![$xs,*]) => `((99 : Nat))\n\
+        macro_rules | `(typedHead![$n:num, $xs,*]) => `((1 : Nat))\n\
+        theorem number : typedHead![4, 2] = (1 : Nat) := rfl\n\
+        theorem identifier (n : Nat) : typedHead![n, 2] = (99 : Nat) := rfl\n\
+        theorem parenthesized : typedHead![(4), 2] = (99 : Nat) := rfl\n\
+        theorem missingComma : typedHead![4] = (99 : Nat) := rfl";
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 4);
+    assert!(check(&source.replace("typedHead![n, 2] = (99", "typedHead![n, 2] = (1")).is_err());
 }

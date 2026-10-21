@@ -14,10 +14,20 @@ pub(in super::super) struct Sequence<'a> {
     suffix: &'a str,
 }
 
-/// Only a whole sequence is supported here. A literal prefix/suffix or a
-/// bracketed `$[...]*` still reaches the ordinary explicit splice refusal.
+/// Templates substitute only whole sequences. Pattern tails are handled
+/// separately below; bracketed `$[...]*` still has no native interpreter.
 pub(in super::super) fn whole(syntax: &Syntax) -> Result<Option<Sequence<'_>>, &'static str> {
-    let Some([suffix_node @ Syntax::Node { kind, args, .. }]) = null_args(syntax) else {
+    let Some([suffix_node]) = null_args(syntax) else {
+        return Ok(None);
+    };
+    from_suffix(syntax, suffix_node)
+}
+
+fn from_suffix<'a>(
+    outer: &'a Syntax,
+    suffix_node: &'a Syntax,
+) -> Result<Option<Sequence<'a>>, &'static str> {
+    let Syntax::Node { kind, args, .. } = suffix_node else {
         return Ok(None);
     };
     if kind.leaf_view() != LeafView::Str("antiquot_suffix_splice") {
@@ -42,10 +52,77 @@ pub(in super::super) fn whole(syntax: &Syntax) -> Result<Option<Sequence<'_>>, &
     Ok(Some(Sequence {
         capture,
         suffix_node,
-        outer: syntax,
+        outer,
         kind,
         suffix,
     }))
+}
+
+pub(super) struct Tail<'a> {
+    pub(super) prefix: &'a [Syntax],
+    pub(super) sequence: Sequence<'a>,
+}
+
+/// A fixed prefix followed by one array capture. All prefix
+/// captures retain ordinary paths; only the tail's path denotes a slice.
+/// This is the pin's `slice prefix 0` match, not backtracking over partitions.
+pub(super) fn tail(syntax: &Syntax) -> Result<Option<Tail<'_>>, &'static str> {
+    let Some(items) = null_args(syntax) else {
+        return Ok(None);
+    };
+    if items.len() < 2 {
+        return Ok(None);
+    }
+    let Some((suffix, prefix)) = items.split_last() else {
+        return Ok(None);
+    };
+    let Some(sequence) = from_suffix(syntax, suffix)? else {
+        return Ok(None);
+    };
+    let parent = sequence.kind.parent();
+    if parent == Name::from_components(["sepBy"]) {
+        // The separator preceding the slice belongs to the fixed prefix.
+        // It is not an element of the TSepArray bound to the tail. An even
+        // prefix length preserves element/separator parity after projection.
+        let separator = &sequence.suffix[..sequence.suffix.len() - 1];
+        if prefix.len() % 2 != 0
+            || prefix
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .any(|item| !matches!(item, Syntax::Atom { val, .. } if val == separator))
+        {
+            return Err("a separated repetition tail with malformed prefix framing");
+        }
+    } else if parent != Name::from_components(["many"]) {
+        return Ok(None);
+    }
+    if prefix.iter().any(|p| {
+        p.kind()
+            .is_some_and(|k| k.leaf_view() == LeafView::Str("antiquot_suffix_splice"))
+    }) {
+        return Err("multiple repetition captures in one pattern sequence");
+    }
+    Ok(Some(Tail { prefix, sequence }))
+}
+
+/// Extract only after matching established the prefix. Keep the captured
+/// leaves (including source locations and hygiene) verbatim. Do not encode
+/// from-the-end indices into the journal's ordinary child paths.
+pub(in super::super) fn project<'a>(
+    pattern: Option<&Syntax>,
+    value: &'a Syntax,
+) -> Result<std::borrow::Cow<'a, Syntax>, &'static str> {
+    if let Some(pattern) = pattern
+        && let Some(tail) = tail(pattern)?
+    {
+        let items = null_args(value).ok_or("a repetition tail outside its sequence")?;
+        let suffix = items
+            .get(tail.prefix.len()..)
+            .ok_or("a repetition tail without its prefix")?;
+        return Ok(std::borrow::Cow::Owned(null_node(suffix.to_vec())));
+    }
+    Ok(std::borrow::Cow::Borrowed(value))
 }
 
 impl Sequence<'_> {
@@ -261,5 +338,110 @@ mod tests {
         );
         assert!(whole(&computation).unwrap().unwrap().name().is_err());
         assert!(whole(&sequence("unknown", "*", Syntax::Missing)).is_err());
+    }
+
+    #[test]
+    fn tail_projection_keeps_prefix_paths_separate_and_never_includes_the_head() {
+        let head = Name::from_components(["head"]);
+        let rest = Name::from_components(["rest"]);
+        let suffix = sequence("many", "*", synthetic_ident(rest.clone()));
+        let head_sequence = sequence("many", "*", synthetic_ident(head.clone()));
+        let head_capture = node_args(&null_args(&head_sequence).unwrap()[0]).unwrap()[0].clone();
+        let pattern = null_node(vec![
+            head_capture.clone(),
+            null_args(&suffix).unwrap()[0].clone(),
+        ]);
+        assert_eq!(
+            variables(std::slice::from_ref(&pattern)).unwrap(),
+            vec![
+                (vec![0], macro_variable(&rest)),
+                (vec![0, 0], macro_variable(&head)),
+            ]
+        );
+        let head_value = synthetic_ident(Name::from_components(["first"]));
+        let tail_value = synthetic_ident(Name::from_components(["remaining"]));
+        let value = null_node(vec![head_value.clone(), tail_value.clone()]);
+        let projected = project(Some(&pattern), &value).unwrap();
+        assert_eq!(null_args(&projected).unwrap(), &[tail_value]);
+        assert!(matches!(
+            project(Some(&head_capture), &head_value).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            project(Some(&pattern), &null_node(vec![head_value]))
+                .unwrap()
+                .as_ref(),
+            &null_node(vec![])
+        );
+        assert!(project(Some(&pattern), &null_node(vec![])).is_err());
+        assert!(project(Some(&pattern), &Syntax::Missing).is_err());
+    }
+
+    #[test]
+    fn ambiguous_tail_partitions_and_duplicate_variables_remain_refusals() {
+        let name = Name::from_components(["xs"]);
+        let suffix = sequence("many", "*", synthetic_ident(name.clone()));
+        let splice = null_args(&suffix).unwrap()[0].clone();
+        assert!(variables(&[null_node(vec![splice.clone(), splice.clone()])]).is_err());
+        let head = node_args(&splice).unwrap()[0].clone();
+        assert!(variables(&[null_node(vec![head, splice.clone()])]).is_err());
+        assert!(variables(&[null_node(vec![splice, Syntax::Missing])]).is_err());
+    }
+
+    #[test]
+    fn separated_tail_projection_consumes_the_prefix_separator_not_a_tail_element() {
+        let suffix = sequence(
+            "sepBy",
+            ",*",
+            synthetic_ident(Name::from_components(["xs"])),
+        );
+        let pattern = null_node(vec![
+            Syntax::Missing,
+            Syntax::atom(SourceInfo::None, ","),
+            null_args(&suffix).unwrap()[0].clone(),
+        ]);
+        let capture = tail(&pattern).unwrap().unwrap();
+        assert_eq!(capture.prefix.len(), 2);
+        let a = synthetic_ident(Name::from_components(["a"]));
+        let b = synthetic_ident(Name::from_components(["b"]));
+        let value = null_node(vec![
+            Syntax::Missing,
+            Syntax::atom(SourceInfo::None, ","),
+            a.clone(),
+            Syntax::atom(SourceInfo::None, ","),
+            b.clone(),
+        ]);
+        assert!(capture.sequence.accepts(&value, &mut 0).unwrap());
+        assert_eq!(
+            project(Some(&pattern), &value).unwrap().as_ref(),
+            &null_node(vec![a, Syntax::atom(SourceInfo::None, ","), b])
+        );
+        let prefix_only = null_node(vec![Syntax::Missing, Syntax::atom(SourceInfo::None, ",")]);
+        assert_eq!(
+            project(Some(&pattern), &prefix_only).unwrap().as_ref(),
+            &null_node(vec![])
+        );
+        assert!(project(Some(&pattern), &null_node(vec![Syntax::Missing])).is_err());
+    }
+
+    #[test]
+    fn separated_tail_patterns_cannot_change_separator_or_element_parity() {
+        let suffix = sequence(
+            "sepBy",
+            ",*",
+            synthetic_ident(Name::from_components(["xs"])),
+        );
+        let splice = null_args(&suffix).unwrap()[0].clone();
+        for pattern in [
+            null_node(vec![Syntax::Missing, splice.clone()]),
+            null_node(vec![
+                Syntax::Missing,
+                Syntax::atom(SourceInfo::None, ";"),
+                splice,
+            ]),
+        ] {
+            assert!(tail(&pattern).is_err());
+            assert!(variables(&[pattern]).is_err());
+        }
     }
 }

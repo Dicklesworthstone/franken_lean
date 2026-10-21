@@ -2517,13 +2517,18 @@ impl Expander {
             .ok_or("macro scope limit")?;
         self.expansions.set(scope);
         let context = &self.context;
-        let bound: BTreeMap<&Name, &Syntax> = rule
+        let bound: BTreeMap<&Name, std::borrow::Cow<'_, Syntax>> = rule
             .variables
             .iter()
             .map(|(path, name)| {
-                quotation::at_path(args, path)
-                    .map(|child| (name, child))
-                    .ok_or("a notation node without its operand")
+                let child =
+                    quotation::at_path(args, path).ok_or("a notation node without its operand")?;
+                let pattern = rule
+                    .pattern
+                    .as_ref()
+                    .and_then(node_args)
+                    .and_then(|args| quotation::at_path(args, path));
+                quotation::repetition::project(pattern, child).map(|child| (name, child))
             })
             .collect::<Result<_, _>>()?;
         let mut leaves = Vec::new();
@@ -2542,7 +2547,7 @@ impl Expander {
                         let name = sequence.name()?;
                         let value = bound
                             .get(&name)
-                            .copied()
+                            .map(AsRef::as_ref)
                             .ok_or("an unbound repetition capture")?;
                         if !sequence.accepts(value, &mut repetition_work)? {
                             return Err("a repetition capture with incompatible sequence framing");
@@ -2563,11 +2568,11 @@ impl Expander {
                 // rawIdent or erases macro scopes when interpreting them).
                 // Antiquoted labels still substitute their syntax.
                 Step::Raw(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
-                    leaves.push(bound[val].clone());
+                    leaves.push(bound[val].as_ref().clone());
                 }
                 Step::Raw(leaf) => leaves.push(leaf.clone()),
                 Step::Visit(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
-                    leaves.push(bound[val].clone());
+                    leaves.push(bound[val].as_ref().clone());
                 }
                 // `hygieneInfo`'s anonymous identifier (a parenthesis's) takes no scope.
                 Step::Visit(ident @ Syntax::Ident { val, .. }) if val.is_anonymous() => {

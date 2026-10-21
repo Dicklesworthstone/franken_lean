@@ -43,6 +43,22 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
             }
             continue;
         }
+        if let Some(tail) = repetition::tail(pattern)? {
+            let name = tail.sequence.name()?;
+            if name != Name::from_components(["_"]) {
+                let name = macro_variable(&name);
+                if !bound.insert(name.clone()) {
+                    return Err("a repeated quoted macro pattern variable");
+                }
+                variables.push((path.clone(), name));
+            }
+            for (index, child) in tail.prefix.iter().enumerate().rev() {
+                let mut child_path = path.clone();
+                child_path.push(index);
+                tasks.push((child, child_path));
+            }
+            continue;
+        }
         if let Some(name) = antiquotation_name(pattern) {
             if name == Name::from_components(["_"]) {
                 continue;
@@ -96,6 +112,16 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
             if !sequence.accepts(value, &mut visited)? {
                 return Ok(false);
             }
+            continue;
+        }
+        if let Some(tail) = repetition::tail(pattern)? {
+            let Some(items) = null_args(value) else {
+                return Ok(false);
+            };
+            if items.len() < tail.prefix.len() || !tail.sequence.accepts(value, &mut visited)? {
+                return Ok(false);
+            }
+            pending.extend(tail.prefix.iter().zip(items).map(|(p, a)| (p, a, false)));
             continue;
         }
         if antiquotation_name(pattern).is_some() {
