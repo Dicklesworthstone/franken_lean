@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":661,"projection_hash":"91a88ef795c2e7015e99df3c9fe423e9e522ee45166ee9d0e6a7255455b1c7bf"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":664,"projection_hash":"57c94f8567dd26a4055971226484dc0ff2983435cbcb14429a73c06ff5624527"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -250,6 +250,7 @@
 {"id":"fln-named-monad-argument-match-6egz"}
 {"id":"fln-narm"}
 {"id":"fln-nested-actions-e60c"}
+{"id":"fln-nested-inductive-source-59sb"}
 {"id":"fln-nhf5"}
 {"id":"fln-nomatch-nofun-h78u"}
 {"id":"fln-noncomputable-check-false-refusal-bhf2"}
@@ -299,6 +300,7 @@
 {"id":"fln-rfl-for-step-limit-63a9"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}
+{"id":"fln-rw-def-head-overaccept-nwvf"}
 {"id":"fln-rwz"}
 {"id":"fln-rzyk"}
 {"id":"fln-s8oo"}
@@ -340,6 +342,7 @@
 {"id":"fln-vpfi"}
 {"id":"fln-w0b"}
 {"id":"fln-wasm-judge-browser-kvj"}
+{"id":"fln-wf-omitted-result-type-wqu9"}
 {"id":"fln-wgp"}
 {"id":"fln-wgz"}
 {"id":"fln-wh2j"}
