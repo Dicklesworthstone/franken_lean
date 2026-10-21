@@ -153,7 +153,15 @@ impl Context {
     /// Remember the source stem for an inaccessible introduction. These names
     /// are display-only: tactic name resolution still uses the original local.
     pub(super) fn trace_introduced_name(&mut self, id: &FVarId, name: &Name, binder: &Name) {
-        if self.traces.enabled() && name.parent() == Name::from_components(["_fln_source"]) {
+        if name.parent() == Name::from_components(["_fln_source"]) {
+            self.trace_hygienic_name(id, binder);
+        }
+    }
+
+    /// Show a local as its binder's name made inaccessible (`n✝`, `n_ih✝`): an unnamed
+    /// elimination field, as the pin names it after the minor premise's binder.
+    pub(super) fn trace_hygienic_name(&mut self, id: &FVarId, binder: &Name) {
+        if self.traces.enabled() {
             // An arrow's binder is already hygienic (`a✝`); the stem is the name under its
             // scopes, as the pin's `mkFreshBinderNameForTactic` reads it.
             let binder = binder.erase_macro_scopes();

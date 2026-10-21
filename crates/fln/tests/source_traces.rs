@@ -308,3 +308,33 @@ fn elimination_goals_carry_the_pins_case_tags() {
         assert_eq!(texts(&run(&base, source)), expected, "{source}");
     }
 }
+
+/// A field `cases`/`induction` leaves unnamed shows as its minor premise's binder made
+/// inaccessible (`n✝`, `n_ih✝`, `left✝`), as the pin names it. Each expected text is the pinned
+/// v4.32.0's `trace_state` output (2026-10-21).
+#[test]
+fn unnamed_elimination_fields_show_the_pins_inaccessible_names() {
+    let base = engine();
+    let types = "inductive N where\n  | z\n  | s (n : N)\n\ninductive T where\n  | leaf\n  | node (l r : T)\n\n";
+    for (proof, expected) in [
+        (
+            "example (n : N) : n = n := by\n  induction n\n  trace_state\n  all_goals rfl\n",
+            "case z\n⊢ N.z = N.z\n\ncase s\nn✝ : N\nn_ih✝ : n✝ = n✝\n⊢ n✝.s = n✝.s",
+        ),
+        (
+            "example (n : N) : n = n := by\n  cases n\n  trace_state\n  all_goals rfl\n",
+            "case z\n⊢ N.z = N.z\n\ncase s\nn✝ : N\n⊢ n✝.s = n✝.s",
+        ),
+        (
+            "example (p q : Prop) (h : p ∧ q) : q := by\n  cases h\n  trace_state\n  assumption\n",
+            "case intro\np q : Prop\nleft✝ : p\nright✝ : q\n⊢ q",
+        ),
+        (
+            "example (t : T) : t = t := by\n  induction t\n  trace_state\n  all_goals rfl\n",
+            "case leaf\n⊢ T.leaf = T.leaf\n\ncase node\nl✝ r✝ : T\nl_ih✝ : l✝ = l✝\nr_ih✝ : r✝ = r✝\n⊢ l✝.node r✝ = l✝.node r✝",
+        ),
+    ] {
+        let source = format!("{types}{proof}");
+        assert_eq!(texts(&run(&base, &source)), [expected], "{proof}");
+    }
+}

@@ -294,15 +294,18 @@ impl Context {
     ) -> Result<LocalDecl, NatDefinitionElabError> {
         let target = self.whnf(&goal.target)?;
         let ExprNode::ForallE {
+            binder_name,
             binder_type,
             body,
             binder_info,
-            ..
         } = target.node()
         else {
             return Err(error(TacticError::UnsupportedEliminator));
         };
         let id = FVarId(self.fresh_name()?);
+        if name.is_anonymous() {
+            self.trace_hygienic_name(&id, binder_name);
+        }
         let type_ = self.beta_telescope_result(binder_type)?;
         let local = LocalDecl {
             id: id.clone(),
