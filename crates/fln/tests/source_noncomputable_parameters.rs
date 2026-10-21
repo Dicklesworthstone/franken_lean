@@ -207,6 +207,47 @@ end
 }
 
 #[test]
+fn propositional_functions_are_erased_before_executable_dependencies_are_checked() {
+    let engine = base();
+    for source in [
+        r#"
+def keep (_proof : False -> False) (value : Nat) : Nat := value
+#eval keep (by decide) 42
+"#,
+        r#"
+noncomputable def erasedProof : False -> False := by decide
+def keep (_proof : False -> False) (value : Nat) : Nat := value
+#eval keep erasedProof 42
+"#,
+    ] {
+        returns_42(&engine, source);
+    }
+}
+
+#[test]
+fn data_valued_functions_remain_executable_dependencies_after_sort_normalization() {
+    let engine = base()
+        .check_source_files(
+            &[b"noncomputable def hiddenFunction (value : Nat) : Nat := value"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    refuses(
+        &engine,
+        "def applyData (f : Nat -> Nat) : Nat := f 42\n#eval applyData hiddenFunction",
+        "hiddenFunction",
+    );
+    returns_42(
+        &engine,
+        "def applyData (f : Nat -> Nat) : Nat := f 42\n#eval applyData (fun value => value)",
+    );
+}
+
+#[test]
 fn static_parameters_do_not_enable_explicitly_unsupported_recursors() {
     refuses(
         &base(),

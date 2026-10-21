@@ -228,7 +228,7 @@ impl Context {
         }
         if let Some(sort) = self.known_type(&term.type_)? {
             let sort = self.whnf(&sort)?;
-            if matches!(sort.node(), ExprNode::Sort { level } if level.is_zero()) {
+            if matches!(sort.node(), ExprNode::Sort { level } if level.normalize().is_zero()) {
                 return Ok(());
             }
         }
@@ -242,7 +242,8 @@ impl Context {
 
     /// ToLCNF.visit/visitAppArg erase proofs and type formers before inspecting
     /// their executable subexpressions. Unknown types are not evidence of
-    /// erasure: retain the conservative recursor walk in that case.
+    /// erasure: retain the conservative recursor walk in that case. Inferred
+    /// universe expressions such as imax(0, 0) must normalize before testing Prop.
     fn codegen_erased(&mut self, value: &Expr) -> Result<bool, NatDefinitionElabError> {
         let Some(type_) = self.known_type(value)? else {
             return Ok(false);
@@ -254,7 +255,7 @@ impl Context {
             return Ok(false);
         };
         let sort = self.whnf(&sort)?;
-        Ok(matches!(sort.node(), ExprNode::Sort { level } if level.is_zero()))
+        Ok(matches!(sort.node(), ExprNode::Sort { level } if level.normalize().is_zero()))
     }
 
     fn check_compiled_value(
