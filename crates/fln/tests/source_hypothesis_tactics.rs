@@ -209,3 +209,13 @@ fn case_selects_a_goal_by_its_tag_and_must_close_it() {
         "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n  constructor\n  case left => skip\n  all_goals assumption\n",
     );
 }
+
+/// A structure instance's `with` source is a local this engine binds for itself, anonymous; the
+/// pin has no such hypothesis, so `rename_i` passes it over and names the instance binder
+/// (upstream `tests/elab/5176.lean`, which the pinned v4.32.0 accepts).
+#[test]
+fn rename_i_passes_over_the_engines_own_anonymous_locals() {
+    traces(
+        "set_option warn.classDefReducibility false\n\nclass Foo where\n\nclass Bar extends Foo where\n  bar : True\n\ndef foo : Foo := {}\n\nexample [Bar] : Bar := {\n  foo with bar := by {\n    rename_i inst\n    guard_hyp inst : Bar\n    trivial\n  }\n}\n",
+    );
+}

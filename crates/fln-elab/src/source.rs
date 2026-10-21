@@ -531,6 +531,9 @@ struct Context {
     traces: trace::TraceLog,
     goal_tags: std::collections::HashMap<MVarId, Name>,
     trace_local_names: std::collections::HashMap<FVarId, Name>,
+    // Elimination fields no alternative named: the pin's inaccessible `n✝`, which
+    // `rename_i`/`next`/`case` may name. Other anonymous locals are this engine's own.
+    unnamed_fields: std::collections::HashSet<FVarId>,
     // Public proof declarations fix their signatures in the exported world
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
@@ -670,6 +673,7 @@ impl Context {
             traces: trace::TraceLog::default(),
             goal_tags: std::collections::HashMap::new(),
             trace_local_names: std::collections::HashMap::new(),
+            unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
             public_theorem_signature: None,
             private_definition_body: false,

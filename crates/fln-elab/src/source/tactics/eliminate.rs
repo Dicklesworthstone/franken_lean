@@ -304,6 +304,7 @@ impl Context {
         };
         let id = FVarId(self.fresh_name()?);
         if name.is_anonymous() {
+            self.unnamed_fields.insert(id.clone());
             self.trace_hygienic_name(&id, binder_name);
         }
         let type_ = self.beta_telescope_result(binder_type)?;

@@ -425,11 +425,17 @@ impl Context {
         let mut later = HashSet::new();
         for local in goal.lctx.decls().iter().rev() {
             self.tick()?;
-            if self.is_matrix_hypothesis(local) {
+            // The pin skips implementation details. Here those are the hidden recursion
+            // locals and the anonymous locals this engine binds for itself (a structure
+            // instance's `with` source, a match discriminant); an unnamed elimination field is
+            // the pin's inaccessible `n✝` instead.
+            let unnamed_field = self.unnamed_fields.contains(&local.id);
+            if self.is_matrix_hypothesis(local)
+                || (local.user_name.is_anonymous() && !unnamed_field)
+            {
                 continue;
             }
-            // An unnamed elimination field is the pin's inaccessible `n✝`.
-            let inaccessible = local.user_name.is_anonymous()
+            let inaccessible = unnamed_field
                 || local.user_name.has_macro_scopes()
                 || local.user_name.parent() == internal;
             if inaccessible || later.contains(&local.user_name) {
