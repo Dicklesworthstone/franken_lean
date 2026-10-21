@@ -136,14 +136,17 @@ fn an_exported_method_cannot_fall_back_to_a_different_receiver_type() {
         .unwrap()
         .engine;
     let root = base.logical_root(&options);
-    let invalid = b"def prefix : Nat := 7\ndef bad (n : Alias) : Nat := n.exportedStep";
+    let invalid = b"def sentinelPrefix : Nat := 7\ndef bad (n : Alias) : Nat := n.exportedStep";
     let error = base
         .check_source_files(&[invalid], &options, limits())
         .expect_err("the exported target has no parameter of type Alias");
     assert_eq!(error.disposition().0, "elaboration", "{error}");
-    assert!(format!("{error:?}").contains("InvalidFieldReceiver"), "{error}");
+    assert!(
+        format!("{error:?}").contains("InvalidFieldReceiver"),
+        "{error}"
+    );
     assert_eq!(base.logical_root(&options), root);
-    for name in ["prefix", "bad"] {
+    for name in ["sentinelPrefix", "bad"] {
         assert!(!base.environment().contains(&Name::from_components([name])));
     }
     // Definitional equality still permits ordinary applications, and the
