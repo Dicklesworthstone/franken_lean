@@ -2,9 +2,9 @@
 //! Unsupported registrations are barriers, never permission to use an older rule.
 use super::*;
 
-pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
+pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'static str> {
     let [_, _, attr_kind, _, opt_kind, alternatives] = args else {
-        return;
+        return Ok(());
     };
     let explicit_requested = null_args(opt_kind).is_some_and(|args| !args.is_empty());
     let explicit = null_args(opt_kind).and_then(|args| match args {
@@ -87,12 +87,50 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
             }
         }
     }
-    let scoped = attr_kind_of(attr_kind) != Ok(AttrKind::Global);
-    if scoped {
-        file.native_export_refusal = Some("source module export of scoped or local macro_rules");
+    let locality = attr_kind_of(attr_kind)?;
+    let local = locality == AttrKind::Local;
+    let scoped = locality == AttrKind::Scoped;
+    let namespace = scoped.then(|| file.top().namespace.clone());
+    if namespace.as_ref().is_some_and(Name::is_anonymous) {
+        return Err("scoped macro_rules requires a named namespace");
     }
     if alternatives.is_none() || malformed {
         refused.extend(affected.iter().cloned());
+    }
+    // Unknown local code must not erase an earlier meaning and then leak that
+    // erasure outside its lexical boundary. Refuse before mutating any kind.
+    if local || scoped {
+        if alternatives.is_none() || malformed || !refused.is_empty() {
+            return Err("an unsupported local macro_rules registration");
+        }
+        // One command can register several kinds. Validate every target and
+        // complete chain before changing ANY of them, including interpolation
+        // barriers. Otherwise a later refusal could leave an earlier override
+        // installed or erase the global rule a local command meant to extend.
+        for kind in &affected {
+            let owned = file.declared.iter().any(|decl| decl.decl == *kind);
+            let native = file.native_rule_counts.contains_key(kind);
+            if (!owned && !native) || file.interpolation_kinds.contains(kind) {
+                return Err("local macro_rules requires native source syntax");
+            }
+            let added = groups.get(kind).map_or(0, Vec::len);
+            let previous = file.rules.get(kind).map_or(0, |rule| rule.cases().count());
+            if added == 0
+                || previous
+                    .checked_add(added)
+                    .is_none_or(|total| total > MAX_TEMPLATE_NODES)
+            {
+                return Err("local macro rule alternatives past the budget");
+            }
+            if file
+                .local_rule_depths
+                .get(kind)
+                .is_some_and(|depths| depths.len() != previous)
+            {
+                return Err("native macro locality does not match its clause chain");
+            }
+            file.prepended_rule_scopes(kind, previous, added, namespace.clone())?;
+        }
     }
     for kind in affected {
         let interpolation = Arc::make_mut(&mut file.interpolation_kinds).remove(&kind);
@@ -102,18 +140,16 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
             file.native_export_refusal =
                 Some("source module export of macro_rules for imported syntax");
         }
-        let rules = Arc::make_mut(&mut file.rules);
-        // Without an executable translation for a registration, a previous rule
-        // is not a sound fallback: that registration may match and do anything.
-        if (!owned && !native) || scoped || refused.contains(&kind) {
+        // A registration we cannot execute is not permission to fall back to
+        // an older rule. Native source registrations keep their existing door.
+        if (!owned && !native) || refused.contains(&kind) {
             if native {
-                // Removing an inherited rule cannot be represented as an empty
-                // export: that would resurrect it in the next module. Unknown
-                // registrations remain fail-closed until MacroM is supported.
                 file.native_export_refusal =
                     Some("source module export of unsupported imported macro_rules");
             }
-            rules.remove(&kind);
+            Arc::make_mut(&mut file.rules).remove(&kind);
+            file.local_rule_depths.remove(&kind);
+            file.rule_scopes.remove(&kind);
             file.generation += 1;
             continue;
         }
@@ -123,21 +159,34 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) {
         if cases.is_empty() {
             continue;
         }
-        if let Some(previous) = rules.get(&kind) {
+        let added = cases.len();
+        let previous_count = file.rules.get(&kind).map_or(0, |rule| rule.cases().count());
+        if let Some(previous) = file.rules.get(&kind) {
             let mut previous = previous.as_ref().clone();
             let older = std::mem::take(&mut previous.fallbacks);
             cases.push(previous);
             cases.extend(older);
         }
         if cases.len() > MAX_TEMPLATE_NODES {
-            rules.remove(&kind);
+            Arc::make_mut(&mut file.rules).remove(&kind);
+            file.local_rule_depths.remove(&kind);
+            file.rule_scopes.remove(&kind);
             file.native_export_refusal = Some("native macro rule alternatives past the budget");
             file.generation += 1;
             continue;
         }
+        let depths = file.prepended_rule_depths(&kind, previous_count, added, local)?;
+        let scopes = file.prepended_rule_scopes(&kind, previous_count, added, namespace.clone())?;
         let mut head = cases.remove(0);
         head.fallbacks = cases;
-        rules.insert(kind, Arc::new(head));
+        Arc::make_mut(&mut file.rules).insert(kind.clone(), Arc::new(head));
+        if let Some(depths) = depths {
+            file.local_rule_depths.insert(kind.clone(), depths);
+        }
+        if let Some(scopes) = scopes {
+            file.rule_scopes.insert(kind, scopes);
+        }
         file.generation += 1;
     }
+    Ok(())
 }

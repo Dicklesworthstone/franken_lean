@@ -75,9 +75,11 @@ use std::sync::{Arc, OnceLock};
 
 mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
+mod local_rules;
 mod macro_rules;
 mod modules;
 mod quotation;
+mod scoped_rules;
 pub use modules::NativeSyntaxModule;
 
 /// A `ParserDescr` (`Init/Prelude.lean`, `inductive ParserDescr`), one variant per constructor,
@@ -1103,7 +1105,7 @@ fn transparent(name: &Name) -> bool {
 enum Trail {
     /// `activateScoped ns`: the imported entries for `ns`, then the file's own declared before
     /// this activation (indices below the count).
-    Namespace(Name, usize),
+    Namespace(Name, usize, usize),
     /// A declaration of this file, added where it was declared.
     Decl(usize),
 }
@@ -1120,7 +1122,7 @@ impl FileScope {
     fn is_active(&self, namespace: &Name) -> bool {
         self.trail
             .iter()
-            .any(|entry| matches!(entry, Trail::Namespace(active, _) if active == namespace))
+            .any(|entry| matches!(entry, Trail::Namespace(active, ..) if active == namespace))
     }
 }
 
@@ -1159,6 +1161,11 @@ pub struct FileGrammar {
     generation: usize,
     /// What the file's notations expand to, by node kind.
     rules: Arc<BTreeMap<Name, Arc<NotationRule>>>,
+    /// Clause-aligned scope depths for kinds with local registrations. Global
+    /// and imported clauses have no depth and survive closing a local scope.
+    local_rule_depths: BTreeMap<Name, Vec<Option<usize>>>,
+    /// Clause-aligned namespace visibility and registration epochs.
+    rule_scopes: BTreeMap<Name, Vec<scoped_rules::RuleScope>>,
     /// Imported string interpolation whose native expansion is implemented below. The syntax
     /// still comes from the census and is available only through its declaring module.
     interpolation_kinds: Arc<BTreeSet<Name>>,
@@ -1257,6 +1264,8 @@ impl FileGrammar {
             declared_tokens: BTreeSet::new(),
             generation: 0,
             rules: Arc::new(BTreeMap::new()),
+            local_rule_depths: BTreeMap::new(),
+            rule_scopes: BTreeMap::new(),
             interpolation_kinds: Arc::new(interpolation_kinds),
             expansions: Rc::new(Cell::new(0)),
             imports_entered: true,
@@ -1315,21 +1324,46 @@ impl FileGrammar {
         &self.declared
     }
 
-    /// Whether `namespace` carries scoped syntax, imported or this file's.
-    fn has_scoped(&self, namespace: &Name) -> bool {
-        self.scoped.contains_key(namespace)
-            || self.native_scoped.contains_key(namespace)
-            || self.scoped_declared.contains_key(namespace)
+    /// Namespace lookup includes parents with no scoped entries of their own.
+    /// A simple `open Library Parser` first opens Library, then Library.Parser.
+    /// Syntax constants contribute their PARENTS, never their own names: opening
+    /// a grammar namespace does not turn a parser declaration into a namespace.
+    fn has_grammar_namespace(&self, namespace: &Name) -> bool {
+        fn contains(mut candidate: Name, namespace: &Name) -> bool {
+            while !candidate.is_anonymous() {
+                if candidate == *namespace {
+                    return true;
+                }
+                candidate = candidate.parent();
+            }
+            false
+        }
+        self.scoped
+            .keys()
+            .chain(self.native_scoped.keys())
+            .chain(self.scoped_declared.keys())
+            .chain(
+                self.rule_scopes
+                    .values()
+                    .flatten()
+                    .filter_map(|scope| scope.namespace.as_ref()),
+            )
+            .any(|name| contains(name.clone(), namespace))
+            || self
+                .constants
+                .iter()
+                .any(|name| contains(name.parent(), namespace))
     }
 
-    /// `resolveNamespace` (`Lean/ResolveName.lean`) over the namespaces with scoped syntax.
-    fn resolve(&self, name: &Name) -> Vec<Name> {
-        let top = self.top();
+    /// The grammar-relevant projection of the pin's `resolveNamespace`.
+    /// Resolve against the working scope, including every earlier simple open
+    /// from THIS command. Scoped-only activation never adds a lookup prefix.
+    fn resolve_in(&self, top: &FileScope, name: &Name) -> Vec<Name> {
         let mut out = Vec::new();
         let mut prefix = top.namespace.clone();
         loop {
             let candidate = prefix.append_core(name);
-            if self.has_scoped(&candidate) {
+            if self.has_grammar_namespace(&candidate) {
                 out.push(candidate);
                 break;
             }
@@ -1340,7 +1374,7 @@ impl FileGrammar {
         }
         for open in top.opens.iter().rev() {
             let candidate = open.append_core(name);
-            if self.has_scoped(&candidate) && !out.contains(&candidate) {
+            if self.has_grammar_namespace(&candidate) && !out.contains(&candidate) {
                 out.push(candidate);
             }
         }
@@ -1350,21 +1384,30 @@ impl FileGrammar {
     /// `activateScoped`: a namespace already active in the scope adds nothing.
     fn activate_in(&self, scope: &mut FileScope, namespace: Name) {
         if !scope.is_active(&namespace) {
-            scope
-                .trail
-                .push(Trail::Namespace(namespace, self.declared.len()));
+            scope.trail.push(Trail::Namespace(
+                namespace,
+                self.declared.len(),
+                self.generation,
+            ));
+        }
+    }
+
+    fn activate_names_in(&self, scope: &mut FileScope, names: &[Name], simple: bool) {
+        for name in names {
+            for namespace in self.resolve_in(scope, name) {
+                self.activate_in(scope, namespace.clone());
+                if simple && !scope.opens.contains(&namespace) {
+                    // Keep the resolved structural name. The original short name
+                    // loses its prefix for later opens and syntax abbreviations.
+                    scope.opens.push(namespace);
+                }
+            }
         }
     }
 
     fn activate(&mut self, names: &[Name], simple: bool) {
-        let resolved: Vec<Name> = names.iter().flat_map(|name| self.resolve(name)).collect();
         let mut top = self.top().clone();
-        for namespace in resolved {
-            self.activate_in(&mut top, namespace);
-        }
-        if simple {
-            top.opens.extend(names.iter().cloned());
-        }
+        self.activate_names_in(&mut top, names, simple);
         *self.top_mut() = top;
     }
 
@@ -1401,6 +1444,7 @@ impl FileGrammar {
                 for _ in 0..count {
                     if self.scopes.len() > 1 {
                         self.scopes.pop();
+                        self.expire_local_rules();
                     }
                 }
             }
@@ -1429,9 +1473,7 @@ impl FileGrammar {
     /// The grammar of the command after `open names in`.
     pub fn grammar_opening(&self, names: &[Name]) -> Rc<ActiveGrammar> {
         let mut scope = self.top().clone();
-        for namespace in names.iter().flat_map(|name| self.resolve(name)) {
-            self.activate_in(&mut scope, namespace);
-        }
+        self.activate_names_in(&mut scope, names, true);
         self.grammar_for(scope.trail, scope.docs)
     }
 
@@ -1462,7 +1504,7 @@ impl FileGrammar {
             };
         for entry in &key.0 {
             match entry {
-                Trail::Namespace(namespace, declared_before) => {
+                Trail::Namespace(namespace, declared_before, _) => {
                     if self.imports_entered {
                         if let Some(scoped) = self.scoped.get(namespace) {
                             decls.extend(scoped.iter().cloned());
@@ -1494,7 +1536,7 @@ impl FileGrammar {
             .source_categories
             .extend(self.declared_categories.keys().cloned());
         grammar.imports_entered = self.imports_entered;
-        grammar.expander = Some(self.expander());
+        grammar.expander = Some(self.expander_for(&key.0));
         grammar.docs = docs;
         let grammar = Rc::new(grammar);
         self.cache.borrow_mut().insert(key, Rc::clone(&grammar));
@@ -1733,7 +1775,7 @@ impl FileGrammar {
                 }
             }
             ["Lean", "Parser", "Command", "macro_rules"] => {
-                self.declare_macro_rules(args);
+                self.declare_macro_rules(args)?;
                 return Ok(None);
             }
             _ => return Ok(None),
@@ -1747,13 +1789,17 @@ impl FileGrammar {
     }
 
     /// Interpret the file's quoted macro registrations without executing MacroM.
-    fn declare_macro_rules(&mut self, args: &[Syntax]) {
-        macro_rules::declare(self, args);
+    fn declare_macro_rules(&mut self, args: &[Syntax]) -> Result<(), &'static str> {
+        macro_rules::declare(self, args)
     }
 
     fn expander(&self) -> Expander {
+        self.expander_for(&self.top().trail)
+    }
+
+    fn expander_for(&self, trail: &[Trail]) -> Expander {
         Expander {
-            rules: Arc::clone(&self.rules),
+            rules: self.active_rules(trail),
             interpolation_kinds: Arc::clone(&self.interpolation_kinds),
             expansions: Rc::clone(&self.expansions),
             context: self.module.clone().unwrap_or_else(Name::anonymous),

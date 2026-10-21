@@ -9,11 +9,16 @@ pub struct NativeSyntaxModule {
     pub declarations: Vec<Arc<SyntaxDecl>>,
     pub categories: BTreeMap<Name, IdentBehavior>,
     pub rules: BTreeMap<Name, Arc<NotationRule>>,
+    /// Optional namespace for each clause. Missing metadata means global.
+    pub rule_scopes: BTreeMap<Name, Vec<Option<Name>>>,
 }
 
 impl NativeSyntaxModule {
     pub fn is_empty(&self) -> bool {
-        self.declarations.is_empty() && self.categories.is_empty() && self.rules.is_empty()
+        self.declarations.is_empty()
+            && self.categories.is_empty()
+            && self.rules.is_empty()
+            && self.rule_scopes.is_empty()
     }
 }
 
@@ -32,24 +37,32 @@ impl FileGrammar {
             .collect();
         let exported_names: BTreeSet<_> = declarations.iter().map(|decl| &decl.decl).collect();
         let mut rules = BTreeMap::new();
+        let mut rule_scopes = BTreeMap::new();
         for (kind, rule) in self.rules.iter() {
             let inherited = self.native_rule_counts.get(kind).copied();
             if !exported_names.contains(kind) && inherited.is_none() {
                 continue;
             }
+            let Some(rule) = self.exportable_rule(kind, rule)? else {
+                continue;
+            };
             let count = rule
                 .cases()
                 .count()
                 .checked_sub(inherited.unwrap_or(0))
                 .ok_or("native macro rule inheritance exceeds its chain")?;
             if count != 0 {
-                rules.insert(kind.clone(), Arc::new(rule_prefix(rule, count)));
+                if let Some(scopes) = self.exported_rule_scopes(kind, count)? {
+                    rule_scopes.insert(kind.clone(), scopes);
+                }
+                rules.insert(kind.clone(), Arc::new(rule_prefix(&rule, count)));
             }
         }
         Ok(NativeSyntaxModule {
             declarations,
             categories: self.declared_categories.clone(),
             rules,
+            rule_scopes,
         })
     }
 
@@ -82,6 +95,17 @@ impl FileGrammar {
             .any(|kind| !names.contains(kind) && !self.native_rule_counts.contains_key(kind))
         {
             return Err("an imported macro rule has no native syntax declaration");
+        }
+        for (kind, scopes) in &module.rule_scopes {
+            let rule = module
+                .rules
+                .get(kind)
+                .ok_or("scoped macro metadata without a rule")?;
+            if scopes.len() != rule.cases().count()
+                || scopes.iter().flatten().any(Name::is_anonymous)
+            {
+                return Err("invalid imported scoped macro metadata");
+            }
         }
         for (kind, rule) in &module.rules {
             if rule.fallbacks.len() >= MAX_TEMPLATE_NODES
@@ -130,7 +154,16 @@ impl FileGrammar {
             }
             let mut head = cases.remove(0);
             head.fallbacks = cases;
-            merged_rules.push((kind.clone(), Arc::new(head), total - own));
+            let depths =
+                self.imported_rule_depths(kind, previous_count, own, total - previous_count)?;
+            let scopes = self.imported_rule_scopes(
+                kind,
+                previous_count,
+                own,
+                total - previous_count,
+                module.rule_scopes.get(kind),
+            )?;
+            merged_rules.push((kind.clone(), Arc::new(head), total - own, depths, scopes));
         }
         for (name, behavior) in &module.categories {
             self.categories.insert(name.clone(), *behavior);
@@ -161,8 +194,14 @@ impl FileGrammar {
                 self.native_imported.push(Arc::clone(decl));
             }
         }
-        for (kind, rule, inherited) in merged_rules {
+        for (kind, rule, inherited, depths, scopes) in merged_rules {
             self.native_rule_counts.insert(kind.clone(), inherited);
+            if let Some(depths) = depths {
+                self.local_rule_depths.insert(kind.clone(), depths);
+            }
+            if let Some(scopes) = scopes {
+                self.rule_scopes.insert(kind.clone(), scopes);
+            }
             Arc::make_mut(&mut self.rules).insert(kind, rule);
         }
         self.generation += 1;
@@ -179,12 +218,21 @@ impl FileGrammar {
             .chain(self.declared.iter())
             .map(|decl| decl.decl.clone())
             .chain(self.native_abbreviations.iter().cloned())
+            // Scoped rule-only modules have no syntax declaration under their
+            // activation namespace. This anchor is for namespace lookup only.
+            .chain(
+                self.rule_scopes
+                    .values()
+                    .flatten()
+                    .filter_map(|scope| scope.namespace.as_ref())
+                    .map(|namespace| Name::str(namespace.clone(), "_native_scoped_macro")),
+            )
             .collect()
     }
 }
 
 /// Clone only a clause, never its already-flat sibling list.
-fn flat_case(rule: &NotationRule) -> NotationRule {
+pub(super) fn flat_case(rule: &NotationRule) -> NotationRule {
     NotationRule {
         variables: rule.variables.clone(),
         rhs: rule.rhs.clone(),
@@ -346,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_rule_extensions_export_but_local_rules_still_refuse() {
+    fn imported_rule_extensions_export_without_local_clauses() {
         let mut library = grammar("Lib");
         declare(&mut library, "syntax \"wrap \" term:max : term");
         let mut consumer = grammar("Main");
@@ -359,6 +407,26 @@ mod tests {
         assert_eq!(exported.rules.len(), 1);
         assert!(!exported.is_empty());
         declare(&mut library, "local macro_rules | `(wrap $x) => `($x)");
-        assert!(library.export_native().is_err());
+        let local_export = library.export_native().unwrap();
+        assert_eq!(local_export.declarations.len(), 1);
+        assert!(
+            local_export.rules.is_empty(),
+            "a file-local rule cannot be replayed"
+        );
+        assert_eq!(
+            library.rules.len(),
+            1,
+            "the defining file keeps its local rule"
+        );
+        let mut fresh = grammar("Fresh");
+        fresh.import_native(&local_export).unwrap();
+        assert!(
+            fresh.rules.is_empty(),
+            "consumers do not inherit the local expansion"
+        );
+        assert!(
+            parses(&fresh, "def x := wrap 42"),
+            "only the syntax was exported"
+        );
     }
 }
