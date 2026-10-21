@@ -125,6 +125,42 @@ fn a_guarded_field_receiver_refusal_prints_the_pins_message() {
     }
 }
 
+/// A definition whose code generation fails is kept at the pin: `addAndCompile` logs "failed to
+/// compile definition, …" after kernel admission. Under a guard expecting that error, it is
+/// admitted uncompiled and the pin's message is logged; a later proof still unfolds it. The
+/// pinned v4.32.0 accepts this program and refuses its unguarded form.
+#[test]
+fn a_guarded_definition_with_a_noncomputable_dependency_is_kept_uncompiled() {
+    let execution = EngineExecutionLimits::new(limits().kernel);
+    let message = "failed to compile definition, consider marking it as 'noncomputable' because \
+                   it depends on 'a', which is 'noncomputable'";
+    let source = format!(
+        "noncomputable def a : Nat := 7\n/--\nerror: {message}\n-/\n#guard_msgs in\n\
+         def b : Nat := a\ntheorem t : b = 7 := rfl\n"
+    );
+    let completed = seed()
+        .execute_source_commands_with_checks(source.as_bytes(), &KVMap::new(), execution)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let logged: Vec<_> = completed
+        .warnings
+        .iter()
+        .filter(|warning| warning.severity == SourceSeverity::Error)
+        .map(|warning| (warning.command_index, warning.message.as_str()))
+        .collect();
+    assert_eq!(logged, [(1, message)]);
+    assert!(
+        seed()
+            .execute_source_commands_with_checks(
+                b"noncomputable def a : Nat := 7\ndef b : Nat := a\n",
+                &KVMap::new(),
+                execution
+            )
+            .is_err()
+    );
+}
+
 #[test]
 fn doors_without_a_judge_and_unjudgeable_guards_are_not_implemented() {
     let engine = seed();

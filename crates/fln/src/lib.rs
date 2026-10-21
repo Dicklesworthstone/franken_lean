@@ -7637,7 +7637,7 @@ impl Engine {
                 grammar.extend_scopes(&mut scopes);
                 continue;
             }
-            let scope = if public.is_some() {
+            let mut scope = if public.is_some() {
                 grammar
                     .enter(|| scopes.command_scope(command_source))
                     .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7814,7 +7814,33 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_empty();
+            // The pin keeps a definition whose code generation fails: `addAndCompile` logs
+            // "failed to compile definition, …" after kernel admission and the file goes on.
+            // Under a guard expecting an error, such a definition is admitted uncompiled, as a
+            // `noncomputable section` admits it, and that message is logged for the guard.
+            let mut guarded_compile_error = None;
             if guarded_error
+                && parsed.kind() == SourceCommandKind::Definition
+                && !scope.noncomputable_section
+                && !(has_inline_simp || has_inline_default)
+                && let Err(
+                    error @ fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::NoncomputableDependency(_),
+                    ),
+                ) = grammar.enter(|| {
+                    fln_elab::elaborate_definition_in_scope_with_budget(
+                        parsed.syntax(),
+                        engine.environment(),
+                        limits.kernel,
+                        &scope,
+                    )
+                })
+            {
+                guarded_compile_error = Some(error.to_string());
+                scope.noncomputable_section = true;
+            }
+            if guarded_error
+                && guarded_compile_error.is_none()
                 && !(matches!(
                     parsed.kind(),
                     SourceCommandKind::Check | SourceCommandKind::Example
@@ -8008,6 +8034,14 @@ impl Engine {
                     command_index,
                     admission,
                 });
+                if let Some(message) = guarded_compile_error.take() {
+                    guarded_errors.push(SourceWarning {
+                        command_index,
+                        at: original_offset,
+                        message,
+                        severity: SourceSeverity::Error,
+                    });
+                }
                 continue;
             }
 
