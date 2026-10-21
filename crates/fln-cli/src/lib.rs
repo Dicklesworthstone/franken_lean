@@ -11782,10 +11782,11 @@ fn render_lean_source_check_line(
     {
         return render_lean_print(form, checked, engine, printer);
     }
-    // `#check c` for a constant prints its signature (`delabConstWithSignature`);
-    // any other term prints as `term : type`.
+    // `#check c` for an identifier naming a constant prints its signature
+    // (`delabConstWithSignature`); any other term, a notation's use among them, prints as
+    // `term : type`.
     let constant = match &opened {
-        Some((value, _)) if !term.starts_with('@') => match value.node() {
+        Some((value, _)) if checked.parsed.query_is_identifier() => match value.node() {
             fln::ExprNode::Const { name, .. } => environment
                 .find(name)
                 .map(|info| (name.clone(), info.constant_val().type_.clone())),
@@ -12310,7 +12311,8 @@ fn render_lean_source_commands(
                     &mut fln::pretty::Printer::in_scope(
                         completed.batch.engine.environment(),
                         &check.scope,
-                    ),
+                    )
+                    .with_notations(&check.notations),
                 ) {
                     Ok(line) => line,
                     Err(error) => return error,

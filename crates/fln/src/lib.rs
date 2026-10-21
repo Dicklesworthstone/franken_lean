@@ -7141,6 +7141,7 @@ impl Engine {
                     checker: admission.checker,
                     scope: scope.clone(),
                     section_variables,
+                    notations: Default::default(),
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7906,7 +7907,7 @@ impl Engine {
                             )
                             .map(|outcome| outcome.map_complete(|check| (check, Vec::new())))
                     };
-                let (checked, traces) = match observed {
+                let (mut checked, traces) = match observed {
                     Ok(Outcome::Complete(checked)) => checked,
                     Ok(Outcome::Inconclusive(reason)) => {
                         return Ok(Outcome::Inconclusive(reason));
@@ -7950,6 +7951,10 @@ impl Engine {
                     command_index,
                     original_offset,
                 )?;
+                // A `#check` line prints through the notations active at its command.
+                if !is_example {
+                    checked.notations = grammar.notations();
+                }
                 let check_index = checks.len();
                 checks.push(checked);
                 outputs.push(if is_example {
@@ -12168,6 +12173,9 @@ pub struct SourceCheck {
     /// `variable` list, outermost first: `declaration`'s value and `checked_type` begin with
     /// one binder for each. The pin prints the term with these variables free.
     pub section_variables: Vec<usize>,
+    /// The notations active at the command: the pin's delaborator prints an application of a
+    /// notation's constant through the notation.
+    pub notations: fln_parse::extensions::Notations,
 }
 
 /// One completed definition-only source prefix followed by a terminal check.

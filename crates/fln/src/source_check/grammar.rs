@@ -229,6 +229,12 @@ impl SourceGrammar {
         with_grammar(&self.file.grammar(), parse)
     }
 
+    /// The notations active here, as a printer applies them
+    /// ([`fln_parse::extensions::FileGrammar::notations`]).
+    pub(crate) fn notations(&self) -> fln_parse::extensions::Notations {
+        self.file.notations()
+    }
+
     /// Advance past one scope command.
     pub(crate) fn observe(&mut self, scope: &ScopeCommand) {
         self.file.apply(scope);

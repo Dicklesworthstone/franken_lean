@@ -80,7 +80,9 @@ mod macro_rules;
 mod modules;
 mod quotation;
 mod scoped_rules;
+mod unexpanders;
 pub use modules::NativeSyntaxModule;
+pub use unexpanders::{Notations, Unexpander, UnexpanderItem};
 
 /// A `ParserDescr` (`Init/Prelude.lean`, `inductive ParserDescr`), one variant per constructor,
 /// fields in declaration order.

@@ -279,6 +279,7 @@ pub(crate) fn unread(source: &[u8]) -> Result<Option<ParsedSourceCommand>, Defin
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 

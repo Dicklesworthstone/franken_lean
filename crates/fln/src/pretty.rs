@@ -21,6 +21,7 @@ use fln_core::level::LevelView;
 
 pub mod format;
 pub mod goals;
+mod notations;
 mod print;
 use format::Format;
 
@@ -511,6 +512,8 @@ pub struct Printer<'a> {
     /// How many binders the top of the printed term sits under: the section variables a
     /// `#check` opens, then each `let` of a chain at the top. A `let` there breaks after its `;`.
     top_names: usize,
+    /// The source's own notations in force ([`notations`]).
+    notations: Option<&'a fln_parse::extensions::Notations>,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -646,6 +649,7 @@ impl<'a> Printer<'a> {
             resolution: None,
             trailing: false,
             top_names: 0,
+            notations: None,
         }
     }
 
@@ -948,7 +952,9 @@ impl<'a> Printer<'a> {
             ExprNode::Const { name, .. } if name.to_display_string() == "Unit.unit" => {
                 Ok(Format::text("()"))
             }
-            ExprNode::Const { name, .. } => Ok(Format::text(self.constant(name))),
+            ExprNode::Const { name, .. } => self
+                .notation(name, &[], outer)
+                .unwrap_or_else(|| Ok(Format::text(self.constant(name)))),
             ExprNode::Lit { literal } => Ok(Format::text(match literal {
                 Literal::Nat(value) => nat_decimal(value),
                 Literal::Str(text) => string_literal(text),
@@ -1070,6 +1076,10 @@ impl<'a> Printer<'a> {
                 } = args[1].node()
             {
                 return Ok(Format::text(nat_decimal(value)));
+            }
+            // The source's own notations: their unexpanders are the newest.
+            if let Some(printed) = self.notation(name, &args, outer) {
+                return printed;
             }
             // `notation:max "¬" p:40 => Not p`; `notation:max "!" b:40 => not b`
             // (`Init/Notation.lean`, `not` being `Bool.not`).

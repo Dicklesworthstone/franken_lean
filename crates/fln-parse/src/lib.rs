@@ -742,6 +742,8 @@ pub struct ParsedSourceCommand {
     syntax: Syntax,
     epilogue: ByteSpan,
     query_term: Option<ByteSpan>,
+    /// Whether the query term is an identifier as written, before any notation expands.
+    query_identifier: bool,
 }
 
 impl ParsedSourceCommand {
@@ -779,6 +781,12 @@ impl ParsedSourceCommand {
 
     pub fn reconstruct_original(&self) -> Vec<u8> {
         self.source_view.reconstruct_original()
+    }
+
+    /// Whether the query term was an identifier as written (`#check id`), which `#check`
+    /// prints as the constant's signature. A notation's use is not, though it expands to one.
+    pub const fn query_is_identifier(&self) -> bool {
+        self.query_identifier
     }
 
     /// Reconstruct the source-covered query term for `#eval` or `#check`.
@@ -4451,6 +4459,7 @@ fn extension_command(
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -4485,6 +4494,7 @@ fn add_decl_doc(source: &[u8]) -> Result<Option<ParsedSourceCommand>, Definition
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -4519,6 +4529,7 @@ fn source_declaration(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionPa
         syntax: parsed.syntax,
         epilogue: parsed.epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -4600,6 +4611,7 @@ fn deriving_command(
         ),
         epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -4666,6 +4678,10 @@ fn print_command(
         .get(argument)
         .map(|token| token.extent)
         .ok_or_else(|| refuse(argument))?;
+    let query_identifier = matches!(
+        tokens.get(argument).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    );
     let epilogue = leaves.attachment().epilogue();
     Ok(ParsedSourceCommand {
         kind: SourceCommandKind::Check,
@@ -4673,6 +4689,7 @@ fn print_command(
         syntax: Syntax::node(parser_kind(&["Command", form.unwrap_or("print")]), children),
         epilogue,
         query_term: Some(query_term),
+        query_identifier,
     })
 }
 
@@ -4715,6 +4732,7 @@ fn export_command(
         ),
         epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -4835,6 +4853,7 @@ fn grind_pattern_command(
         ),
         epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -5006,6 +5025,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     syntax: parsed.syntax,
                     epilogue: parsed.epilogue,
                     query_term: None,
+                    query_identifier: false,
                 })
             }
             TokenKind::Symbol(symbol)
@@ -5078,6 +5098,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         at: BytePos(source.len()),
                         expected: NatDefinitionExpectation::ScalarValue,
                     })?;
+                let query_identifier = matches!(value, Syntax::Ident { .. });
                 let syntax = if command_kind == "reduce" {
                     Syntax::node(
                         Name::from_components(["Lean", "reduceCmd"]),
@@ -5102,6 +5123,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     syntax,
                     epilogue,
                     query_term: Some(query_term),
+                    query_identifier,
                 })
             }
             TokenKind::Symbol(symbol) if symbol == "#print" => {
@@ -5185,6 +5207,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         syntax,
                         epilogue,
                         query_term: None,
+                        query_identifier: false,
                     });
                 }
                 if let Some(parsed) = extension_command(view, &tokens)? {

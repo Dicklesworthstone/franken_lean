@@ -1046,7 +1046,8 @@ fn render_commands(
                     let mut printer = fln::pretty::Printer::in_scope(
                         commands.batch.engine.environment(),
                         &check.scope,
-                    );
+                    )
+                    .with_notations(&check.notations);
                     let type_ = match &check.declaration {
                         fln::Declaration::Defn(definition) => printer
                             .open_section_variables(
