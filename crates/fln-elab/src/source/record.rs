@@ -157,7 +157,7 @@ pub(super) fn elaborate_record_scoped(
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     // Auto-bound implicits become leading parameters, as at the pin (`@Box : {α : Sort u_1} → α →
-    // Type` for `structure Box (x : α)`, 2026-10-11). A field never auto-binds: the pin refuses one.
+    // Type` for `structure Box (x : α)`, 2026-10-11). A field's stay in that field's type (below).
     let (autos, (mut parameters, explicit)) =
         context.with_auto_bound_implicits(&own, |context| {
             let parameters = context.bind_parameters(&signature[0])?;
@@ -323,10 +323,18 @@ pub(super) fn elaborate_record_scoped(
             "field signature",
         )?;
         let saved = context.txn.lctx.clone();
-        let arguments = context.bind_parameters(&sig[0])?;
-        let annotation = optional_type_syntax(&sig[1])?
-            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-        let domain = context.type_term(annotation)?;
+        // A field's own signature auto-binds as a declaration's header does: `l : x → foo x`
+        // is `l : {x : Prop} → x → foo x` (`withAutoBoundImplicit` around the field).
+        let (autos, (arguments, domain)) = context.with_auto_bound_implicits(&own, |context| {
+            let arguments = context.bind_parameters(&sig[0])?;
+            let annotation = optional_type_syntax(&sig[1])?
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            let domain = context.type_term(annotation)?;
+            Ok((arguments, domain))
+        })?;
+        context.refuse_auto_bound_dependencies(&autos, &arguments)?;
+        let mut arguments = arguments;
+        arguments.splice(0..0, autos);
         let mut domain = context.expand_record_aliases(domain, &inheritance.aliases)?;
         if let Some(syntax) = default {
             context.infer_level_params = false;

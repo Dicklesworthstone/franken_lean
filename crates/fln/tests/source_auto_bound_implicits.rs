@@ -123,6 +123,29 @@ fn the_option_the_own_name_and_later_binders_refuse_as_at_the_pin() {
     refused("def bad (A : Type) (x : A) (h : x = y) : Nat := 0\n");
 }
 
+/// A structure field's own signature binds as a header does, inside that field:
+/// `@Foo.l : ∀ {foo : Prop → Prop} [self : Foo foo] {x : Prop}, x → foo x` (the pin's `#check`,
+/// 2026-10-21). One whose universe only the field would fix is refused, as at the pin
+/// ("contains universe level metavariables").
+#[test]
+fn a_fields_unknown_names_bind_inside_that_field() {
+    let engine = checked("class Foo (foo : Prop → Prop) where\n  l : x → foo x\n");
+    assert_eq!(
+        binders(&engine, "Foo.l", 4)
+            .iter()
+            .map(|(name, style, _)| (name.as_str(), *style))
+            .take(3)
+            .collect::<Vec<_>>(),
+        [
+            ("foo", BinderInfo::Implicit),
+            ("self", BinderInfo::InstImplicit),
+            ("x", BinderInfo::Implicit)
+        ]
+    );
+    assert_eq!(binders(&engine, "Foo.l", 4)[3].1, BinderInfo::Default);
+    refused("structure S where\n  l : x → x\n");
+}
+
 /// Inductive, constructor and structure/class headers bind as the pin's `#check` shows:
 /// `@G : {n : Nat} → F n → Type`, `@V.cons : {α : Type} → {n : Nat} → α → V α n → V α (n + 1)`,
 /// `@Box : {α : Sort u_1} → α → Type`, `@OpAssoc : {α : Sort u_1} → (α → α → α) → Prop`.
@@ -343,9 +366,10 @@ fn a_sort_takes_its_level_only_in_leading_position() {
 
 /// `variable (R : α → α → Prop)` makes `α` an implicit variable, included where `R` is:
 /// `@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), R x x → R x x`; an unused section leaves
-/// `s : Nat → Nat` alone. A field never auto-binds: the pin refuses `structure P where x : α`.
+/// `s : Nat → Nat` alone. A field's auto-bound `α : Sort ?u` leaves a universe only that field
+/// would fix: the pin refuses `structure P where x : α` ("contains universe level metavariables").
 #[test]
-fn variables_bind_and_fields_do_not() {
+fn variables_bind_and_a_field_cannot_fix_its_own_universe() {
     let engine = checked(
         "section\nvariable (R : α → α → Prop)\ndef r (x : α) (h : R x x) : R x x := h\ndef s (n : Nat) : Nat := n\nend\n",
     );
