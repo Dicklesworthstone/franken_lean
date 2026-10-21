@@ -257,3 +257,99 @@ fn reference(source: &str, expected: u64) {
         expected.to_string()
     );
 }
+
+#[test]
+fn computed_arguments_after_a_staged_callback_keep_the_case_interface() {
+    for input in ["Chain.nil", "Chain.cons 7 Chain.nil"] {
+        execute(
+            &format!(
+                "{DEFINITIONS}\n#eval choose ({input}) (fun (_ : Bool) => let paid : Nat := spend 1; fun (n : Nat) => n + paid) (spend 41)"
+            ),
+            42,
+        );
+    }
+}
+
+#[test]
+fn an_additional_flat_callback_keeps_its_type_at_a_case_join() {
+    execute(
+        &format!(
+            r#"{DEFINITIONS}
+def both (xs : Chain) : (Bool -> Nat -> Nat) -> ((Nat -> Nat) -> Nat) -> Nat :=
+  match xs with
+  | .nil => fun staged use => use (fun n => staged false n)
+  | .cons head tail => fun staged use => use (fun n => n + 1)
+#eval both Chain.nil (fun (_ : Bool) => let paid : Nat := spend 1; fun n => n + paid) (fun f => f 41)
+"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn computed_operands_on_both_sides_of_a_callback_are_not_reordered_or_duplicated() {
+    for input in ["Chain.nil", "Chain.cons 9 Chain.nil"] {
+        execute(
+            &format!(
+                r#"{DEFINITIONS}
+def mixed (xs : Chain) : Nat -> (Bool -> Nat -> Nat) -> Nat -> Nat :=
+  match xs with
+  | .nil => fun before callback after => callback false (before + after)
+  | .cons head tail => fun before callback after => before + after + 1
+#eval mixed ({input}) (spend 20) (fun (_ : Bool) => let paid : Nat := spend 1; fun n => n + paid) (spend 21)
+"#
+            ),
+            42,
+        );
+    }
+}
+
+#[test]
+fn literal_producer_prefixes_and_computed_operands_stay_strict_even_when_unused() {
+    let source = |cost| {
+        format!(
+            r#"{DEFINITIONS}
+#eval (match Chain.cons 7 Chain.nil with
+  | .nil => fun (callback : Bool -> Nat -> Nat) => let prior : Nat := spend 2; fun (n : Nat) => callback false (n + prior)
+  | .cons head tail => fun (callback : Bool -> Nat -> Nat) => let prior : Nat := spend 2; fun (n : Nat) => 42)
+  (fun (_ : Bool) => let unused : Nat := spend 30; fun n => n + unused) (spend {cost})
+"#
+        )
+    };
+    let small = execute(&source(0), 42);
+    let large = execute(&source(30), 42);
+    assert!(
+        large > small + 30,
+        "unused computed argument was erased: {small} / {large}"
+    );
+    execute(
+        &format!(
+            r#"{DEFINITIONS}
+#eval (match Chain.nil with
+  | .nil => fun (callback : Bool -> Nat -> Nat) => let prior : Nat := spend 2; fun (n : Nat) => callback false (n + prior)
+  | .cons head tail => fun (callback : Bool -> Nat -> Nat) (n : Nat) => n)
+  (fun (_ : Bool) => let paid : Nat := spend 1; fun n => n + paid) (spend 39)
+"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn computed_heap_operands_keep_outer_captures_through_the_selected_branch() {
+    execute(
+        &format!(
+            r#"{DEFINITIONS}
+def strings (xs : Chain) : (Bool -> String -> Nat) -> String -> Nat :=
+  match xs with
+  | .nil => fun callback s => callback false s
+  | .cons head tail => fun callback s => String.length s
+
+def run (suffix : String) : Nat :=
+  strings Chain.nil (fun (_ : Bool) => let kept : String := suffix ++ suffix; fun s => String.length (kept ++ s)) (suffix ++ suffix)
+#eval run "abcdef"
+"#
+        ),
+        24,
+    );
+}
