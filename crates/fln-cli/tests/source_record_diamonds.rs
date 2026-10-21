@@ -34,7 +34,7 @@ example : d.w = 4 := rfl
 example : d.x = 1 := rfl
 example : d.toC.w = 4 := rfl
 example : d.toC.x = 1 := rfl
-example : d.toC = ({ x := 1, y := 2, w := 4 } : C) := rfl
+example : d.toC = { x := 1, y := 2, w := 4 } := rfl
 class P (α : Type) where
   one : α
 class Q (α : Type) extends P α where

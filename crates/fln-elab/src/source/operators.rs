@@ -57,6 +57,28 @@ pub(super) enum ExplicitOperator {
     Relation(bool),
 }
 
+/// A leaf the pin's `binop%` postpones while its type is unknown: notation whose constructor or
+/// structure only the expected type names (`⟨…⟩`, `{ x := … }` with neither a source nor a type,
+/// `.c`), whose elaborators `tryPostponeIfMVar`. The operator is built over a hole for it, and it
+/// is elaborated afterwards against the type the other leaves gave the hole.
+pub(super) fn postponed_leaf(syntax: &Syntax) -> bool {
+    let empty = |syntax: &Syntax| {
+        matches!(syntax, Syntax::Node { kind, args, .. }
+            if *kind == Name::from_components(["null"]) && args.is_empty())
+    };
+    match syntax {
+        Syntax::Node { kind, args, .. } => {
+            *kind == parser_kind(&["Term", "anonymousCtor"])
+                || *kind == parser_kind(&["Term", "dotIdent"])
+                || (*kind == parser_kind(&["Term", "structInst"])
+                    && args.len() == 6
+                    && empty(&args[1])
+                    && empty(&args[4]))
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn explicit_operator(kind: &Name) -> Option<ExplicitOperator> {
     for (name, form) in [
         ("binop", ExplicitOperator::Binary(OperatorKind::Regular)),

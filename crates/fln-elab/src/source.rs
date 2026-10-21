@@ -1809,7 +1809,10 @@ impl Context {
             Apply(Typed, Arguments<'a>, Option<Expr>, bool),
             ApplyNext(Typed, Arguments<'a>, Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
-            Operator(operators::OperatorTree<'a>, Option<Expr>),
+            Operator(operators::OperatorTree<'a>, Option<Expr>, Vec<bool>),
+            /// An operator's result and the holes of its postponed leaves, whose values are
+            /// the last ones visited.
+            PostponedLeaves(Typed, Vec<Expr>),
             Arrow(Option<Expr>),
             BinderNext(binders::Telescope<'a>),
             BinderDomain(binders::Telescope<'a>),
@@ -2576,9 +2579,16 @@ impl Context {
                                 {
                                     let tree = self.operator_tree(syntax, notation)?;
                                     let leaves = tree.leaves.clone();
-                                    tasks.push(Task::Operator(tree, expected));
-                                    for leaf in leaves.into_iter().rev() {
-                                        tasks.push(Task::Visit(leaf, None, true));
+                                    let postponed: Vec<bool> = leaves
+                                        .iter()
+                                        .map(|leaf| operators::postponed_leaf(leaf))
+                                        .collect();
+                                    tasks.push(Task::Operator(tree, expected, postponed.clone()));
+                                    for (leaf, postpone) in leaves.into_iter().zip(postponed).rev()
+                                    {
+                                        if !postpone {
+                                            tasks.push(Task::Visit(leaf, None, true));
+                                        }
                                     }
                                     continue;
                                 }
@@ -3536,17 +3546,56 @@ impl Context {
                                 explicit,
                             ));
                         }
-                        Task::Operator(tree, expected) => {
+                        Task::Operator(tree, expected, postponed) => {
+                            let visited = postponed.iter().filter(|postpone| !**postpone).count();
                             let start = values
                                 .len()
-                                .checked_sub(tree.leaves.len())
+                                .checked_sub(visited)
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            let mut visited = values.split_off(start).into_iter();
+                            let mut leaves = Vec::with_capacity(postponed.len());
+                            let mut holes = Vec::new();
+                            for (index, postpone) in postponed.iter().enumerate() {
+                                if *postpone {
+                                    // A hole of unknown type stands for the leaf meanwhile.
+                                    let level = self.level()?;
+                                    let type_ = self.hole(Expr::sort(level))?;
+                                    let value = self.hole(type_.clone())?;
+                                    holes.push((tree.leaves[index], value.clone(), type_.clone()));
+                                    leaves.push(Typed { value, type_ });
+                                } else {
+                                    leaves.push(
+                                        visited
+                                            .next()
+                                            .ok_or_else(|| failure(SourceInferenceError::Scope))?,
+                                    );
+                                }
+                            }
+                            let result =
+                                self.finish_operator_tree(tree, leaves, expected.as_ref())?;
+                            if holes.is_empty() {
+                                values.push(result);
+                            } else {
+                                tasks.push(Task::PostponedLeaves(
+                                    result,
+                                    holes.iter().map(|(_, hole, _)| hole.clone()).collect(),
+                                ));
+                                for (syntax, _, type_) in holes.into_iter().rev() {
+                                    let expected = self.instantiate(&type_)?;
+                                    tasks.push(Task::Visit(syntax, Some(expected), true));
+                                }
+                            }
+                        }
+                        Task::PostponedLeaves(result, holes) => {
+                            let start = values
+                                .len()
+                                .checked_sub(holes.len())
                                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
                             let leaves = values.split_off(start);
-                            values.push(self.finish_operator_tree(
-                                tree,
-                                leaves,
-                                expected.as_ref(),
-                            )?);
+                            for (hole, leaf) in holes.iter().zip(leaves) {
+                                self.constrain(hole, &leaf.value)?;
+                            }
+                            values.push(result);
                         }
                         Task::Infix(intrinsic, expected) => {
                             let right = values.pop().expect("infix right visit");
