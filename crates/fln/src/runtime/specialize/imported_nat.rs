@@ -1,11 +1,14 @@
 //! Lower the admitted Nat course-of-values scaffold to its observable fold.
 //!
-//! Both branches come from the actual checked functional. Only its immediate
-//! predecessor result is represented; a fresh symbol tracks every deeper or
-//! escaping history use and causes a typed refusal. The complete logical Nat,
-//! PUnit, PProd and recursion declarations must match the pinned model first.
+//! Both branches come from the actual checked functional. Immediate history
+//! retains its direct fold; deeper finite history uses a lazy callback window.
+//! An opaque older-tail symbol must disappear from every generated case.
+//! The complete logical Nat, PUnit, PProd and recursion declarations must match
+//! the pinned model before either representation is selected.
 use super::*;
 use fln_core::expr::FVarId;
+
+mod window;
 
 enum Work {
     Visit(Expr),
@@ -105,7 +108,9 @@ impl Preparation<'_> {
             &marker,
         )?;
         if first.has_fvar() || step.has_fvar() {
-            return Err(unsupported("Nat course-of-values history escapes"));
+            return self
+                .nat_history_window(args, levels, result_type, functional, first, &marker)
+                .map(Some);
         }
         let step = Expr::lam(
             Name::anonymous(),
