@@ -2516,92 +2516,7 @@ impl Expander {
             .checked_add(1)
             .ok_or("macro scope limit")?;
         self.expansions.set(scope);
-        let context = &self.context;
-        let bound: BTreeMap<&Name, std::borrow::Cow<'_, Syntax>> = rule
-            .variables
-            .iter()
-            .map(|(path, name)| {
-                let child =
-                    quotation::at_path(args, path).ok_or("a notation node without its operand")?;
-                let pattern = rule
-                    .pattern
-                    .as_ref()
-                    .and_then(node_args)
-                    .and_then(|args| quotation::at_path(args, path));
-                quotation::repetition::project(pattern, child).map(|child| (name, child))
-            })
-            .collect::<Result<_, _>>()?;
-        let mut leaves = Vec::new();
-        // Rebuild the template bottom-up with the substitutions applied.
-        enum Step<'a> {
-            Visit(&'a Syntax),
-            Raw(&'a Syntax),
-            Build(fln_syntax::source::SourceInfo, &'a Name, usize),
-        }
-        let mut steps = vec![Step::Visit(&rule.rhs)];
-        let mut repetition_work = 0;
-        while let Some(step) = steps.pop() {
-            match step {
-                Step::Visit(node @ Syntax::Node { info, kind, args }) => {
-                    if let Some(sequence) = quotation::repetition::whole(node)? {
-                        let name = sequence.name()?;
-                        let value = bound
-                            .get(&name)
-                            .map(AsRef::as_ref)
-                            .ok_or("an unbound repetition capture")?;
-                        if !sequence.accepts(value, &mut repetition_work)? {
-                            return Err("a repetition capture with incompatible sequence framing");
-                        }
-                        leaves.push(value.clone());
-                        continue;
-                    }
-                    steps.push(Step::Build(*info, kind, args.len()));
-                    steps.extend(args.iter().enumerate().rev().map(|(index, child)| {
-                        if raw_identifier_slot(kind, index) {
-                            Step::Raw(child)
-                        } else {
-                            Step::Visit(child)
-                        }
-                    }));
-                }
-                // Labels are not hygienic term identifiers (the pin uses
-                // rawIdent or erases macro scopes when interpreting them).
-                // Antiquoted labels still substitute their syntax.
-                Step::Raw(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
-                    leaves.push(bound[val].as_ref().clone());
-                }
-                Step::Raw(leaf) => leaves.push(leaf.clone()),
-                Step::Visit(Syntax::Ident { val, .. }) if bound.contains_key(val) => {
-                    leaves.push(bound[val].as_ref().clone());
-                }
-                // `hygieneInfo`'s anonymous identifier (a parenthesis's) takes no scope.
-                Step::Visit(ident @ Syntax::Ident { val, .. }) if val.is_anonymous() => {
-                    leaves.push(ident.clone());
-                }
-                Step::Visit(Syntax::Ident {
-                    info,
-                    raw_val,
-                    val,
-                    preresolved,
-                }) => leaves.push(Syntax::Ident {
-                    info: *info,
-                    raw_val: *raw_val,
-                    val: fln_syntax::hygiene::add_macro_scope(context, val, scope)
-                        .map_err(|_| "a template name that cannot take a macro scope")?,
-                    preresolved: preresolved.clone(),
-                }),
-                Step::Visit(leaf) => leaves.push(leaf.clone()),
-                Step::Build(info, kind, count) => {
-                    let args = leaves.split_off(leaves.len() - count);
-                    leaves.push(Syntax::Node {
-                        info,
-                        kind: kind.clone(),
-                        args,
-                    });
-                }
-            }
-        }
-        leaves.pop().ok_or("an empty template")
+        quotation::templates::instantiate(rule, args, &self.context, scope)
     }
 }
 
@@ -2828,7 +2743,7 @@ fn macro_template(
     if actual != *category {
         return Err("a macro whose right-hand side is not a quotation of its category");
     }
-    checked_template(contents, variables)
+    quotation::templates::checked(contents, variables)
 }
 
 /// `macro_rules` produces a raw Macro (Syntax -> MacroM Syntax), not a
@@ -2840,91 +2755,11 @@ fn macro_rule_template(
 ) -> Result<Syntax, &'static str> {
     let (_, contents) =
         quotation_contents(rhs).ok_or("a macro rule whose right-hand side is not a quotation")?;
-    checked_template(contents, variables)
-}
-
-fn checked_template(
-    contents: &Syntax,
-    variables: &[(Vec<usize>, Name)],
-) -> Result<Syntax, &'static str> {
-    let mut pending = vec![contents];
-    let mut checked = 0_usize;
-    while let Some(syntax) = pending.pop() {
-        checked += 1;
-        if checked > MAX_TEMPLATE_NODES {
-            return Err("a macro template past the node budget");
-        }
-        if let Some(sequence) = quotation::repetition::whole(syntax)? {
-            let name = macro_variable(&sequence.name()?);
-            if !variables.iter().any(|(_, variable)| *variable == name) {
-                return Err("a repetition capture of no macro variable");
-            }
-            continue;
-        }
-        if let Syntax::Node { kind, args, .. } = syntax {
-            let leaf = components(kind).last().cloned().unwrap_or_default();
-            if leaf == "antiquot" {
-                let name = antiquotation_name(syntax).ok_or("an antiquotation of an expression")?;
-                if !variables
-                    .iter()
-                    .any(|(_, variable)| *variable == macro_variable(&name))
-                {
-                    return Err("an antiquotation of no macro variable");
-                }
-                continue;
-            }
-            if leaf.contains("antiquot")
-                || matches!(leaf.as_str(), "quot" | "quotSeq" | "dynamicQuot")
-            {
-                return Err("a splice or a nested quotation in a macro template");
-            }
-            pending.extend(args);
-        }
-    }
-    replace_antiquotations(contents)
+    quotation::templates::checked(contents, variables)
 }
 
 /// Template nodes [`macro_template`] walks before refusing.
 const MAX_TEMPLATE_NODES: usize = 4096;
-
-/// `contents` with each antiquotation replaced by its variable's identifier (bottom-up, by an
-/// explicit stack).
-fn replace_antiquotations(contents: &Syntax) -> Result<Syntax, &'static str> {
-    enum Step<'a> {
-        Visit(&'a Syntax),
-        Build(&'a Syntax, usize),
-    }
-    let mut steps = vec![Step::Visit(contents)];
-    let mut built: Vec<Syntax> = Vec::new();
-    while let Some(step) = steps.pop() {
-        match step {
-            Step::Visit(syntax) => {
-                if let Some(sequence) = quotation::repetition::whole(syntax)? {
-                    built.push(sequence.template()?);
-                    continue;
-                }
-                match (antiquotation_name(syntax), syntax) {
-                    (Some(name), _) => built.push(synthetic_ident(macro_variable(&name))),
-                    (None, node @ Syntax::Node { args, .. }) => {
-                        steps.push(Step::Build(node, args.len()));
-                        steps.extend(args.iter().rev().map(Step::Visit));
-                    }
-                    (None, leaf) => built.push(leaf.clone()),
-                }
-            }
-            Step::Build(Syntax::Node { info, kind, .. }, count) => {
-                let args = built.split_off(built.len() - count);
-                built.push(Syntax::Node {
-                    info: *info,
-                    kind: kind.clone(),
-                    args,
-                });
-            }
-            Step::Build(leaf, _) => built.push(leaf.clone()),
-        }
-    }
-    built.pop().ok_or("an empty macro template")
-}
 
 /// An identifier the template itself supplies: no source position of its own.
 fn synthetic_ident(name: Name) -> Syntax {

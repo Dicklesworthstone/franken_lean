@@ -7,6 +7,7 @@
 use super::*;
 
 pub(super) mod repetition;
+pub(super) mod templates;
 
 pub(super) fn at_path<'a>(args: &'a [Syntax], path: &[usize]) -> Option<&'a Syntax> {
     let (first, rest) = path.split_first()?;

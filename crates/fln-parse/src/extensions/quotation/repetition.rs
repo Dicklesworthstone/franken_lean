@@ -9,24 +9,21 @@ use super::*;
 pub(in super::super) struct Sequence<'a> {
     capture: &'a Syntax,
     suffix_node: &'a Syntax,
-    outer: &'a Syntax,
     kind: &'a Name,
     suffix: &'a str,
 }
 
-/// Templates substitute only whole sequences. Pattern tails are handled
-/// separately below; bracketed `$[...]*` still has no native interpreter.
+/// A sole suffix capture binds the whole sequence. Mixed template parts are
+/// constructed separately; bracketed `$[...]*` has no native interpreter yet.
 pub(in super::super) fn whole(syntax: &Syntax) -> Result<Option<Sequence<'_>>, &'static str> {
     let Some([suffix_node]) = null_args(syntax) else {
         return Ok(None);
     };
-    from_suffix(syntax, suffix_node)
+    suffix(suffix_node)
 }
 
-fn from_suffix<'a>(
-    outer: &'a Syntax,
-    suffix_node: &'a Syntax,
-) -> Result<Option<Sequence<'a>>, &'static str> {
+/// Interpret only direct children of a repetition's null node as splices.
+pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'static str> {
     let Syntax::Node { kind, args, .. } = suffix_node else {
         return Ok(None);
     };
@@ -52,7 +49,6 @@ fn from_suffix<'a>(
     Ok(Some(Sequence {
         capture,
         suffix_node,
-        outer,
         kind,
         suffix,
     }))
@@ -76,7 +72,7 @@ pub(super) fn tail(syntax: &Syntax) -> Result<Option<Tail<'_>>, &'static str> {
     let Some((suffix, prefix)) = items.split_last() else {
         return Ok(None);
     };
-    let Some(sequence) = from_suffix(syntax, suffix)? else {
+    let Some(sequence) = self::suffix(suffix)? else {
         return Ok(None);
     };
     let parent = sequence.kind.parent();
@@ -152,7 +148,7 @@ impl Sequence<'_> {
 
     /// Retain the pinned splice shape in the lossless template. Only its bound
     /// identifier changes. Pre-resolution can then leave the macro variable
-    /// alone, and instantiation replaces the entire null node exactly once.
+    /// alone, and instantiation appends the capture at this sequence slot.
     pub(in super::super) fn template(&self) -> Result<Syntax, &'static str> {
         let variable = synthetic_ident(macro_variable(&self.name()?));
         let Syntax::Node { info, kind, args } = self.capture else {
@@ -174,18 +170,10 @@ impl Sequence<'_> {
         let Syntax::Node { info, kind, args } = self.suffix_node else {
             return Err("a repetition suffix without syntax children");
         };
-        let suffix = Syntax::Node {
-            info: *info,
-            kind: kind.clone(),
-            args: vec![capture, args[1].clone()],
-        };
-        let Syntax::Node { info, kind, .. } = self.outer else {
-            return Err("a repetition capture outside its sequence");
-        };
         Ok(Syntax::Node {
             info: *info,
             kind: kind.clone(),
-            args: vec![suffix],
+            args: vec![capture, args[1].clone()],
         })
     }
 
@@ -319,7 +307,7 @@ mod tests {
         );
         let captured = whole(&plain).unwrap().unwrap();
         assert_eq!(captured.name(), Ok(xs.clone()));
-        let rebound = captured.template().unwrap();
+        let rebound = null_node(vec![captured.template().unwrap()]);
         assert_eq!(
             whole(&rebound).unwrap().unwrap().name(),
             Ok(macro_variable(&xs))

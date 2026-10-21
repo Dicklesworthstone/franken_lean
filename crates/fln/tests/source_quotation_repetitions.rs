@@ -130,6 +130,148 @@ const SUM: &str = "syntax \"sumSeq!\" \"[\" num* \"]\" : term\n\
     | `(sumSeq![$n:num $tail*]) => `(Nat.add $n (sumSeq![$tail*]))\n";
 
 #[test]
+fn templates_combine_repeated_captures_with_fixed_sequence_elements() {
+    let source = format!(
+        "{SUM}\nsyntax \"combineSeq!\" \"[\" num* \"]\" \"[\" num* \"]\" : term\n\
+        macro_rules | `(combineSeq![$xs*][$ys*]) => `(sumSeq![1 $xs* 2 $ys* 3])\n\
+        theorem emptyParts : combineSeq![][] = (6 : Nat) := rfl\n\
+        theorem leftPart : combineSeq![36][] = (42 : Nat) := rfl\n\
+        theorem rightPart : combineSeq![][36] = (42 : Nat) := rfl\n\
+        theorem bothParts : combineSeq![10 14][12] = (42 : Nat) := rfl"
+    );
+    assert_eq!(check(&source).unwrap_or_else(|e| panic!("{e}")).theorems, 4);
+    assert!(
+        check(&source.replace(
+            "combineSeq![10 14][12] = (42",
+            "combineSeq![10 14][12] = (43"
+        ))
+        .is_err()
+    );
+    let result = engine()
+        .execute_source_commands_with_checks(
+            format!("{source}\n#eval combineSeq![10 14][12]").as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(result) = &result.batch.executions.last().unwrap().exit else {
+        panic!("native return expected")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("42")
+    );
+}
+
+#[test]
+fn templates_preserve_separators_while_prepending_appending_and_joining() {
+    let source = "macro \"prependSeq!\" \"[\" xs:term,* \"]\" : term => `([0, $xs,*])\n\
+        macro \"appendSeq!\" \"[\" xs:term,* \"]\" : term => `([$xs,*, 9])\n\
+        syntax \"joinSeq!\" \"[\" term,* \"]\" \"[\" term,* \"]\" : term\n\
+        macro_rules | `(joinSeq![$xs,*][$ys,*]) => `([$xs,*, $ys,*])\n\
+        theorem prepended : prependSeq![1, 2] = [0, 1, 2] := rfl\n\
+        theorem emptyTail : prependSeq![] = [0] := rfl\n\
+        theorem appended : appendSeq![1, 2] = [1, 2, 9] := rfl\n\
+        theorem joined : joinSeq![1, 2][3, 4] = [1, 2, 3, 4] := rfl\n\
+        theorem nested : joinSeq![[1]][[2, 3]] = [[1], [2, 3]] := rfl";
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 5);
+    assert!(check(&source.replace("[1, 2, 3, 4] := rfl", "[1, 3, 2, 4] := rfl")).is_err());
+}
+
+#[test]
+fn composed_templates_preserve_definition_and_caller_names_through_imports() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{Name, SourceModuleInput};
+    let library = "namespace Library\r\ndef edge : Nat := 40\r\n\
+        syntax \"frameSeq!\" \"[\" term,* \"]\" : term\r\n\
+        macro_rules | `(frameSeq![$xs,*]) => `([edge, $xs,*, edge])\r\n\
+        end Library\r\n";
+    let main = "import Library\ndef edge : Nat := 99\n\
+        theorem hygienic (edge : Nat) : frameSeq![edge] = [40, edge, 40] := rfl\n\
+        theorem nested : frameSeq![Nat.succ edge] = [40, 100, 40] := rfl";
+    let names = ["Library", "Main"].map(|n| Name::from_components([n]));
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: library.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: main.as_bytes(),
+        },
+    ];
+    let exported = engine()
+        .check_source_modules(
+            &inputs,
+            &names[1],
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .checked
+        .engine;
+    let replay = "theorem replay (edge : Nat) : frameSeq![edge, 2] = [40, edge, 2, 40] := rfl";
+    assert_eq!(
+        exported
+            .check_source_files(
+                &[replay.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .theorems,
+        1
+    );
+    assert!(
+        exported
+            .check_source_files(
+                &[replay
+                    .replace("[40, edge, 2, 40]", "[99, edge, 2, 99]")
+                    .as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn invalid_composed_capture_uses_do_not_fall_back_or_publish_partial_results() {
+    let declarations = "syntax \"badCompose!\" term:max : term\n\
+        macro_rules | `(badCompose! $x) => `((42 : Nat))\n\
+        macro_rules | `(badCompose! $x) => `([0, $x,*])\n";
+    assert!(
+        check(declarations).is_ok(),
+        "an unused translated rule is legal"
+    );
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        format!("{declarations}\ndef unpublished : Nat := 3\ndef wrong := badCompose! 4"),
+        "macro \"missingSeq!\" : term => `([0, $notBound,*])\ndef wrong := missingSeq!".into(),
+        "macro \"badTypeSeq!\" \"[\" xs:term,* \"]\" : term => `([0, $xs,*])\ndef wrong : List Nat := badTypeSeq![true]".into(),
+    ] {
+        assert!(base.check_source_files(
+            &[source.as_bytes()], &KVMap::new(), SourceCheckLimits::new(limits()),
+        ).is_err());
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    assert!(
+        check(
+            "macro \"goodCompose!\" \"[\" xs:term,* \"]\" : term => `([0, $xs,*])\n\
+        theorem recovered : goodCompose![42] = [0, 42] := rfl"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn variadic_rules_consume_a_head_and_recurse_over_the_remaining_sequence() {
     let source = format!(
         "{SUM}\n\
