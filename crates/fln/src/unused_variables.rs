@@ -11,10 +11,11 @@
 //! elaborated occurrence. So a warning printed here is one the pin prints too.
 //!
 //! A command this increment cannot decide is not linted, exactly as before this
-//! module existed: the pin's warning is missing, never invented. That covers a tactic
-//! block or `‹_›` (the pin reads the tactic's proof term, which need not match this
-//! engine's), `sorry` (the pin skips the whole command), and every binder form other
-//! than the four bracket kinds and bare identifiers.
+//! module existed: the pin's warning is missing, never invented. That covers `sorry`
+//! (the pin skips the whole command); a tactic block or `‹_›` (the pin reads the
+//! tactic's proof term, which need not match this engine's) for the signature's binders
+//! and for every local binder whose scope holds one; and every binder form other than
+//! those read here.
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
 use fln_core::options::KVMap;
@@ -187,6 +188,58 @@ fn decided(command: &Syntax) -> Option<(&Syntax, &Syntax)> {
     .then_some((modifiers, declaration))
 }
 
+/// A `def`, `theorem`, `abbrev`, `instance` or `example` whose term-level binders this module
+/// reads: [`decided`]'s, except that a tactic block or `‹_›` leaves only the scopes holding it
+/// undecided. A binder outside a tactic block has its whole scope outside it too, so the
+/// tactic cannot refer to it; the binders a tactic block holds are never read
+/// ([`term_scopes`]). `decreasing_by` is the exception: its proofs are checked in the context
+/// of each recursive call, every local around the call in scope, so none is read here.
+fn scoped(command: &Syntax) -> Option<&Syntax> {
+    if !is_kind(command, &["Command", "declaration"]) {
+        return None;
+    }
+    let [_, declaration] = args(command) else {
+        return None;
+    };
+    (["definition", "theorem", "abbrev", "instance", "example"]
+        .iter()
+        .any(|kind| is_kind(declaration, &["Command", kind]))
+        && !contains_atom(declaration, &["sorry", "admit", "decreasing_by"]))
+    .then_some(declaration)
+}
+
+/// Every node of `command`'s declaration outside tactic blocks for which `select` gives
+/// something, when the node holds no tactic block itself ([`scoped`]).
+fn term_scopes<'a, T>(
+    command: &'a Syntax,
+    mut select: impl FnMut(&'a Syntax) -> Option<T>,
+) -> Vec<(&'a Syntax, T)> {
+    let mut found = Vec::new();
+    let Some(declaration) = scoped(command) else {
+        return found;
+    };
+    let mut pending = vec![declaration];
+    while let Some(node) = pending.pop() {
+        if is_kind(node, &["Term", "byTactic"]) || contains_atom_shallow(node, "‹") {
+            continue;
+        }
+        if let Some(selected) = select(node)
+            && !contains_atom(node, &["by", "‹"])
+        {
+            found.push((node, selected));
+        }
+        pending.extend(args(node).iter());
+    }
+    found
+}
+
+/// Whether one of `node`'s own children is the atom `atom`.
+fn contains_atom_shallow(node: &Syntax, atom: &str) -> bool {
+    args(node)
+        .iter()
+        .any(|child| matches!(child, Syntax::Atom { val, .. } if val == atom))
+}
+
 /// The pattern variables a `matchAlt`'s patterns bind, with their positions, or `None`
 /// when a pattern has a form this module does not read. An identifier is a variable unless
 /// it is qualified, heads an application, or is spelled like some constructor: the pin
@@ -282,17 +335,11 @@ pub(crate) fn unused_pattern_variables(
     if !linted(options, Some("patternVars")) {
         return Vec::new();
     }
-    let mut alternatives = Vec::new();
-    if let Some((_, declaration)) = decided(command) {
-        walk(declaration, |node| {
-            if is_kind(node, &["Term", "matchAlt"]) {
-                alternatives.push(node);
-            }
-            false
-        });
-    }
+    let alternatives = term_scopes(command, |node| {
+        is_kind(node, &["Term", "matchAlt"]).then_some(())
+    });
     let mut unused = Vec::new();
-    for alternative in alternatives {
+    for (alternative, ()) in alternatives {
         let Some(patterns) = args(alternative).get(1) else {
             continue;
         };
@@ -371,17 +418,11 @@ pub(crate) fn unused_fun_binders(
     if !linted(options, Some("funArgs")) {
         return Vec::new();
     }
-    let mut functions = Vec::new();
-    if let Some((_, declaration)) = decided(command) {
-        walk(declaration, |node| {
-            if is_kind(node, &["Term", "basicFun"]) {
-                functions.push(node);
-            }
-            false
-        });
-    }
+    let functions = term_scopes(command, |node| {
+        is_kind(node, &["Term", "basicFun"]).then_some(())
+    });
     let mut unused = Vec::new();
-    for function in functions {
+    for (function, ()) in functions {
         let Some(binders) = args(function).first() else {
             continue;
         };
@@ -428,12 +469,14 @@ fn group_names(binder: &Syntax) -> Option<Vec<(Name, usize)>> {
     Some(names)
 }
 
-/// The unused binders of `command`'s `∀`s, dependent arrows, subtypes and structure-instance
-/// fields, in source order. Such a binder is in scope only in the term it binds, so the pin's
-/// whole evidence is a reference there. The pin ignores an explicit dependent arrow's binder
-/// (`(x : A) → B`), not an implicit one (`{x : A} → B`). A subtype's binder (`{x : T // p}`)
-/// and a field's (`f x := v`) sit under no `fun` in the source, so `funArgs` does not ignore
-/// them.
+/// The unused binders of `command` that sit under no `fun` or pattern in the source, in source
+/// order: those of `∀`s, dependent arrows, subtypes, structure-instance fields, `∃`, `Σ`, `Σ'`,
+/// `×` and `×'`, an `if h :`, a `let` or `have`, and a `do` block's `let`, `←`, `have` and
+/// `for`. Such a binder is in scope only in the terms it binds, so the pin's whole evidence is
+/// a reference there. The pin ignores an explicit dependent arrow's binder (`(x : A) → B`), not
+/// an implicit one (`{x : A} → B`). A subtype's binder (`{x : T // p}`) and a field's
+/// (`f x := v`) sit under no `fun` in the source, so `funArgs` does not ignore them. A `let mut`
+/// is not read: a reassignment rebinds its name.
 pub(crate) fn unused_type_binders(command: &Syntax, options: &KVMap) -> Vec<UnusedBinder> {
     if !linted(options, None) {
         return Vec::new();
@@ -445,45 +488,155 @@ pub(crate) fn unused_type_binders(command: &Syntax, options: &KVMap) -> Vec<Unus
             .collect::<Option<Vec<_>>>()
             .map(|groups| groups.concat())
     };
-    let mut scopes: Vec<(&Syntax, Vec<(Name, usize)>)> = Vec::new();
-    if let Some((_, declaration)) = decided(command) {
-        walk(declaration, |node| {
-            let names = if is_kind(node, &["Term", "forall"]) {
-                args(node).get(1).and_then(groups)
-            } else if is_kind(node, &["Term", "depArrow"]) {
-                args(node)
-                    .first()
-                    .filter(|binder| !is_kind(binder, &["Term", "explicitBinder"]))
-                    .and_then(group_names)
-            } else if node.kind() == Some(&Name::from_components(["term{_:_//_}"])) {
-                args(node).get(1).and_then(group_names)
-            } else if is_kind(node, &["Term", "structInstField"]) {
-                args(node)
-                    .get(1)
-                    .and_then(|field| args(field).first())
-                    .and_then(groups)
-            } else {
-                None
-            };
-            if let Some(names) = names {
-                scopes.push((node, names));
+    let scopes = term_scopes(command, |node| -> Option<Vec<Binding<'_>>> {
+        let whole = |names: Vec<(Name, usize)>| vec![(names, vec![node])];
+        if is_kind(node, &["Term", "forall"]) {
+            args(node).get(1).and_then(groups).map(whole)
+        } else if is_kind(node, &["Term", "depArrow"]) {
+            args(node)
+                .first()
+                .filter(|binder| !is_kind(binder, &["Term", "explicitBinder"]))
+                .and_then(group_names)
+                .map(whole)
+        } else if node.kind() == Some(&Name::from_components(["term{_:_//_}"])) {
+            args(node).get(1).and_then(group_names).map(whole)
+        } else if is_kind(node, &["Term", "structInstField"]) {
+            args(node)
+                .get(1)
+                .and_then(|field| args(field).first())
+                .and_then(groups)
+                .map(whole)
+        } else if node.kind() == Some(&Name::from_components(["termDepIfThenElse"])) {
+            // `if h : c then t else e`: `h` is bound in `t` and `e`.
+            let names = binder_idents(args(node).get(1)?);
+            Some(vec![(names, args(node).iter().skip(5).collect())])
+        } else if let Some(binders) = binder_notation(node) {
+            Some(whole(binder_idents(binders)))
+        } else if ["let", "have"]
+            .iter()
+            .any(|kind| is_kind(node, &["Term", kind]))
+        {
+            // `let x := v; b`: `x` is bound in `b`.
+            let name = let_name(args(node).get(2)?)?;
+            Some(vec![(vec![name], args(node).get(4).into_iter().collect())])
+        } else if is_kind(node, &["Term", "doSeqIndent"])
+            || is_kind(node, &["Term", "doSeqBracketed"])
+        {
+            // A `do` block's binding is in scope in the items after it.
+            let items =
+                args(args(node).get(usize::from(is_kind(node, &["Term", "doSeqBracketed"])))?);
+            let mut bindings = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                if let Some(name) = args(item).first().and_then(do_binding) {
+                    bindings.push((vec![name], items[index + 1..].iter().collect()));
+                }
             }
-            false
-        });
-    }
+            Some(bindings)
+        } else if is_kind(node, &["Term", "doFor"]) {
+            // `for x in xs do body`: `x` is bound in `body`.
+            let declaration = args(args(node).get(1)?).first()?;
+            if !is_kind(declaration, &["Term", "doForDecl"]) {
+                return None;
+            }
+            let name = args(declaration).get(1).and_then(ident)?;
+            Some(vec![(vec![name], args(node).get(3).into_iter().collect())])
+        } else {
+            None
+        }
+    });
     let mut unused = Vec::new();
-    for (scope, names) in scopes {
-        for (name, at) in names {
-            if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
-                continue;
-            }
-            if !referenced(scope, &name, at) {
-                unused.push(UnusedBinder { at, name });
+    for (_, bindings) in scopes {
+        for (names, bodies) in bindings {
+            for (name, at) in names {
+                if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
+                    continue;
+                }
+                if !bodies.iter().any(|body| referenced(body, &name, at)) {
+                    unused.push(UnusedBinder { at, name });
+                }
             }
         }
     }
     unused.sort_by_key(|binder| binder.at);
     unused
+}
+
+/// Names bound together, and the terms that are their scope.
+type Binding<'a> = (Vec<(Name, usize)>, Vec<&'a Syntax>);
+
+/// An identifier with its name and position.
+fn ident(syntax: &Syntax) -> Option<(Name, usize)> {
+    match syntax {
+        Syntax::Ident { val, .. } => Some((val.clone(), original_pos(syntax)?)),
+        _ => None,
+    }
+}
+
+/// The names `binderIdent`s anywhere in `syntax` declare (a hole declares none).
+fn binder_idents(syntax: &Syntax) -> Vec<(Name, usize)> {
+    let mut names = Vec::new();
+    walk(syntax, |node| {
+        if node.kind() == Some(&Name::from_components(["Lean", "binderIdent"]))
+            && let Some(name) = args(node).first().and_then(ident)
+        {
+            names.push(name);
+        }
+        false
+    });
+    names
+}
+
+/// The binders of an `∃`, `Σ` or `Σ'` (`∃ x y : A, p`) or of a `×`/`×'` group (`(x : A) × B`),
+/// whose scope is the whole notation.
+fn binder_notation(node: &Syntax) -> Option<&Syntax> {
+    let kind = node.kind()?;
+    if ["term∃_,_", "termΣ_,_", "termΣ'_,_"]
+        .iter()
+        .any(|notation| *kind == Name::str(Name::anonymous(), *notation))
+    {
+        args(node).get(1)
+    } else if ["term_×__1", "term_×'__1"]
+        .iter()
+        .any(|notation| *kind == Name::str(Name::anonymous(), *notation))
+    {
+        args(node).first()
+    } else {
+        None
+    }
+}
+
+/// The name a `letDecl` binds with `letIdDecl` and no function arguments.
+fn let_name(declaration: &Syntax) -> Option<(Name, usize)> {
+    if !is_kind(declaration, &["Term", "letDecl"]) {
+        return None;
+    }
+    let local = args(declaration).first()?;
+    if !is_kind(local, &["Term", "letIdDecl"]) || !args(args(local).get(1)?).is_empty() {
+        return None;
+    }
+    let id = args(local).first()?;
+    if !is_kind(id, &["Term", "letId"]) {
+        return None;
+    }
+    args(id).first().and_then(ident)
+}
+
+/// The name a `do` element binds: `let x := v`, `let x ← e` and `have x := v`, not `let mut`.
+fn do_binding(element: &Syntax) -> Option<(Name, usize)> {
+    if is_kind(element, &["Term", "doLet"]) || is_kind(element, &["Term", "doLetArrow"]) {
+        if !args(args(element).get(1)?).is_empty() {
+            return None;
+        }
+        let declaration = args(element).get(3)?;
+        if is_kind(declaration, &["Term", "doIdDecl"]) {
+            return args(declaration).first().and_then(ident);
+        }
+        return let_name(declaration);
+    }
+    if is_kind(element, &["Term", "doHave"]) {
+        return let_name(args(element).get(2)?);
+    }
+    None
 }
 
 /// The binders a `∀`/`fun` telescope introduces, by name, outermost first.

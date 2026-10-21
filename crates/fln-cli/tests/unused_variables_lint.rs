@@ -98,9 +98,26 @@ mutual
 end
 ";
 
+/// Binders under no `fun`: an `if h :`'s, a `let`'s (one shadowing a parameter of its name),
+/// and a theorem's statement's, which are linted though its proof is a tactic block (only a
+/// scope holding the block is not read). A tactic proof's signature binders stay unread.
+const LOCALS: &str = "def a (n : Nat) : Nat := if h : n = 3 then 1 else 2
+def b (n : Nat) : Nat := if h : n = 3 then n else 2
+def c (n : Nat) (k : n = 3 → Nat) : Nat := if h : n = 3 then k h else 2
+def h1 : Nat := let x := 1; 2
+def h2 : Nat := let x := 1; x
+def h3 (x : Nat) : Nat := let x := x; 2
+theorem l (x y : Nat) : (match x with | 0 => y | n+1 => y) = y := by cases x <;> rfl
+theorem m : ∀ x : Nat, x = x := by intro x; rfl
+theorem m2 : ∀ x : Nat, True := by intro; trivial
+theorem m3 (p : Prop) (hp : p) : p := by exact hp
+def o : Nat := (fun (x : Nat) => 3) 1
+";
+
 const IDENTICAL: &[(&str, &str)] = &[
     ("linted", LINTED),
     ("scopes", SCOPES),
+    ("locals", LOCALS),
     ("patterns", PATTERNS),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
