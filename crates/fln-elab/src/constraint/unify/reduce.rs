@@ -153,8 +153,23 @@ impl Engine<'_> {
                         }
                     }
                     ExprNode::Lam { body, .. } if !args.is_empty() => {
-                        let argument = args.pop().expect("nonempty application spine");
-                        head = self.substitute(body, &argument)?;
+                        // Every binder the closed arguments reach, in one substitution.
+                        let mut values = vec![args.pop().expect("nonempty application spine")];
+                        let mut body = body;
+                        while let ExprNode::Lam { body: inner, .. } = body.node()
+                            && args
+                                .last()
+                                .is_some_and(|argument| !argument.has_loose_bvars())
+                            && !values[0].has_loose_bvars()
+                        {
+                            self.meter.tick()?;
+                            values.push(args.pop().expect("checked nonempty"));
+                            body = inner;
+                        }
+                        head = match values.as_slice() {
+                            [value] => self.substitute(body, value)?,
+                            values => self.substitute_many(body, values)?,
+                        };
                     }
                     ExprNode::Const { name, levels } => {
                         if let Some(operation) = self.nat_operation(&head, &mut args)? {

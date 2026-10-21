@@ -1356,3 +1356,42 @@ fn symbolic_nat_offset_resource_stops_roll_back_prior_assignments() {
         .unify_many_with(&equations, default_budget(), &|| false)
         .unwrap();
 }
+
+/// A lambda applied to all its arguments is instantiated in one substitution, as the pin's
+/// `betaRev` does: one walk of the result, not one of every intermediate term.
+#[test]
+fn a_saturated_lambda_is_instantiated_in_one_substitution() {
+    let mut txn = transaction();
+    let function = local(&mut txn, "f", pi(nat(), pi(nat(), pi(nat(), nat()))));
+    let succ = Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new());
+    let deep = |mut value: Expr| {
+        for _ in 0..60 {
+            value = Expr::app(succ.clone(), value);
+        }
+        value
+    };
+    let call = |x: Expr, y: Expr, z: Expr| {
+        Expr::app(
+            Expr::app(Expr::app(function.clone(), deep(x)), deep(y)),
+            deep(z),
+        )
+    };
+    let lambda = [name("z"), name("y"), name("x")]
+        .into_iter()
+        .fold(call(bvar(2), bvar(1), bvar(0)), |body, binder| {
+            Expr::lam(binder, nat(), body, BinderInfo::Default)
+        });
+    let applied = Expr::app(
+        Expr::app(Expr::app(lambda, numeral(1)), numeral(2)),
+        numeral(3),
+    );
+    let report = txn
+        .unify(
+            &applied,
+            &call(numeral(1), numeral(2), numeral(3)),
+            budget(),
+        )
+        .unwrap();
+    // Measured 2026-10-20: 1364 nodes; one substitution per binder visits 2132.
+    assert!(report.visited_nodes < 1700, "{}", report.visited_nodes);
+}

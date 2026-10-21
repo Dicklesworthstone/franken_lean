@@ -3,6 +3,7 @@
 //! search infers the product over Nat parameters.
 #![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, SourceCheckLimits};
+use fln_core::outcome::{InconclusiveCause, Outcome};
 
 // Independently evaluated by the pin with prelude, Init.WFComputable and
 // Init.Omega. Init.Data.Repr serves only the oracle's #eval output.
@@ -233,17 +234,24 @@ pub(super) fn assert_automatic_lexicographic_refusals(base: &Engine) {
                 .contains(&Name::from_components(["automaticLexPrepared"]))
         );
     }
-    let error = base
-        .check_source_files(
-            &[INFERRED_OVER_BUDGET.as_bytes()],
-            &KVMap::new(),
-            SourceCheckLimits::new(super::limits()),
-        )
-        .expect_err("nestedLexInferred exceeds the default budget here");
-    assert_eq!(
-        error.disposition().0,
-        "resource",
-        "nestedLexInferred: expected a resource stop: {error:?}"
+    // Whichever budget runs out first decides the form: the elaborator's heartbeats stop
+    // the command, while omega's share returns an inconclusive check. Both are resource stops.
+    let outcome = base.check_source_files(
+        &[INFERRED_OVER_BUDGET.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(super::limits()),
+    );
+    let resource_stop = match &outcome {
+        Err(error) => error.disposition().0 == "resource",
+        Ok(Outcome::Inconclusive(reason)) => matches!(
+            &reason.cause,
+            InconclusiveCause::ResourceExhausted { usage } if usage.is_genuine_exhaustion()
+        ),
+        Ok(_) => false,
+    };
+    assert!(
+        resource_stop,
+        "nestedLexInferred: expected a resource stop: {outcome:?}"
     );
     assert_eq!(base.logical_root(&KVMap::new()), root);
 }

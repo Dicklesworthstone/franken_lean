@@ -247,14 +247,32 @@ impl Engine<'_> {
         arguments: &[Expr],
         locals: &LocalContext,
     ) -> Result<Option<Expr>, UnificationError> {
-        for argument in arguments {
+        let mut remaining = arguments;
+        while let Some((argument, rest)) = remaining.split_first() {
             self.meter.node()?;
             type_ = self.instantiate(&type_)?;
             type_ = self.whnf(&type_, locals)?;
             let ExprNode::ForallE { body, .. } = type_.node() else {
                 return Ok(None);
             };
-            type_ = self.substitute(body, argument)?;
+            // Every binder exposed syntactically, for the closed arguments, at once.
+            let mut values = vec![argument.clone()];
+            let mut body = body;
+            remaining = rest;
+            while let ExprNode::ForallE { body: inner, .. } = body.node()
+                && let Some((next, rest)) = remaining.split_first()
+                && !next.has_loose_bvars()
+                && !values[0].has_loose_bvars()
+            {
+                self.meter.node()?;
+                values.push(next.clone());
+                body = inner;
+                remaining = rest;
+            }
+            type_ = match values.as_slice() {
+                [value] => self.substitute(body, value)?,
+                values => self.substitute_many(body, values)?,
+            };
         }
         type_ = self.instantiate(&type_)?;
         Ok(Some(self.whnf(&type_, locals)?))

@@ -583,6 +583,24 @@ impl Engine<'_> {
         }
     }
 
+    /// Instantiate the loose bvars that consecutive peeled binders bound in `body`, with the
+    /// closed `values` in binder order (outermost first), in one substitution: the pin's
+    /// `instantiateRange`/`betaRev`. One substitution per binder would walk every
+    /// intermediate term; this walks the body, the values and the result once each. Callers
+    /// pass only closed values, for which this equals the binder-by-binder substitution.
+    fn substitute_many(&mut self, body: &Expr, values: &[Expr]) -> Result<Expr, UnificationError> {
+        debug_assert!(values.iter().all(|value| !value.has_loose_bvars()));
+        self.scan(body)?;
+        for value in values {
+            self.scan(value)?;
+        }
+        let result = body
+            .subst_loose(0, values)
+            .map_err(|_| UnificationError::ExpressionScope)?;
+        self.scan(&result)?;
+        Ok(result)
+    }
+
     fn substitute(&mut self, body: &Expr, value: &Expr) -> Result<Expr, UnificationError> {
         self.scan(body)?;
         self.scan(value)?;
