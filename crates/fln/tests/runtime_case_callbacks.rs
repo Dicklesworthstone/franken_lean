@@ -353,3 +353,138 @@ def run (suffix : String) : Nat :=
         24,
     );
 }
+
+#[test]
+fn partially_applied_cases_preserve_the_callback_until_its_real_return_stage() {
+    for input in ["Chain.nil", "Chain.cons 7 Chain.nil"] {
+        execute(
+            &format!(
+                "{DEFINITIONS}\n#eval let next := choose ({input}) (fun (_ : Bool) => let paid : Nat := spend 1; fun (n : Nat) => n + paid); next 41"
+            ),
+            42,
+        );
+    }
+}
+
+#[test]
+fn partially_applied_case_callbacks_retain_owned_captures() {
+    execute(
+        &format!(
+            r#"{DEFINITIONS}
+def strings (xs : Chain) : (Bool -> String -> Nat) -> String -> Nat :=
+  match xs with
+  | .nil => fun callback s => callback false s
+  | .cons head tail => fun callback s => String.length s
+def run (suffix : String) : Nat :=
+  let selected := strings Chain.nil (fun (_ : Bool) => let saved := suffix ++ suffix; fun s => String.length (saved ++ s))
+  selected (suffix ++ suffix)
+#eval run "abcdef"
+"#
+        ),
+        24,
+    );
+}
+
+#[test]
+fn unused_partial_case_results_preserve_selected_callback_prefix_work() {
+    let source = |input: &str, cost: u64| {
+        format!(
+            r#"{DEFINITIONS}
+#eval let next : Nat -> Nat := (match ({input}) with | .nil => fun (callback : Bool -> Nat -> Nat) => callback false | .cons head tail => fun (callback : Bool -> Nat -> Nat) (n : Nat) => n) (fun (_ : Bool) => let paid := spend {cost}; fun (n : Nat) => n + paid); 42
+"#
+        )
+    };
+    let idle = execute(&source("Chain.nil", 0), 42);
+    let busy = execute(&source("Chain.nil", 30), 42);
+    assert!(
+        busy > idle + 30,
+        "partial callback prefix was discarded: {idle} / {busy}"
+    );
+    let idle = execute(&source("Chain.cons 7 Chain.nil", 0), 42);
+    let busy = execute(&source("Chain.cons 7 Chain.nil", 30), 42);
+    assert_eq!(idle, busy, "unselected callback prefix executed");
+}
+
+#[test]
+fn partially_applied_cases_replay_repeated_calls_and_keep_original_captures() {
+    execute(
+        &format!(
+            r#"{DEFINITIONS}
+def run (delta : Nat) : Nat :=
+  let selected := choose Chain.nil (fun (_ : Bool) => let paid := spend delta; fun n => n + paid)
+  selected 19 + selected 21
+#eval run 1
+"#
+        ),
+        42,
+    );
+}
+
+#[test]
+fn consuming_an_argument_makes_a_mixed_stage_case_join_uniform() {
+    for (choice, expected) in [("Choice.empty", 42), ("Choice.offset 5", 47)] {
+        execute(
+            &format!(
+                r#"
+inductive Choice where
+  | empty
+  | offset (value : Nat)
+def expensive (n : Nat) : Nat := match n with | .zero => 0 | .succ k => expensive k
+def partiallySelected (choice : Choice) (stage : Nat) : Nat -> Nat :=
+  ((match choice with
+    | .empty => fun (x y : Nat) => x * 10 + y
+    | .offset value => fun (x : Nat) => by
+      let spent := expensive stage
+      exact fun (y : Nat) => x * 10 + y + value + spent) : Nat -> Nat -> Nat) 4
+#eval partiallySelected ({choice}) 0 2
+"#
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn partial_case_resource_stops_leave_deterministic_replayable_results() {
+    let source = format!(
+        "{DEFINITIONS}\n#eval let next := choose Chain.nil (fun (_ : Bool) => let paid := spend 1; fun (n : Nat) => n + paid); next 41"
+    );
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let mut low = limits();
+    low.ingress.max_nodes = 1;
+    let mut error = base
+        .execute_source_definitions(&[source.as_bytes()], &options, low)
+        .unwrap_err();
+    while let fln::EngineExecutionError::BatchCommand { error: inner, .. } = error {
+        error = *inner;
+    }
+    assert!(matches!(
+        error,
+        fln::EngineExecutionError::Ingress(fln_comp::ingress::IngressError::ResourceLimit { .. })
+    ));
+    assert_eq!(base.logical_root(&options), root);
+    let mut low = limits();
+    low.vm.max_steps = 1;
+    assert!(matches!(
+        base.execute_source_definitions(&[source.as_bytes()], &options, low)
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    let first = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let second = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let first = first.executions.last().unwrap();
+    let second = second.executions.last().unwrap();
+    assert_eq!(first.flbc_artifact, second.flbc_artifact);
+    returned(&first.exit, 42);
+    assert_eq!(base.logical_root(&options), root);
+}

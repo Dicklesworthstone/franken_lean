@@ -284,15 +284,30 @@ match choice with
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    for operation in [
-        format!(
-            "def escaped (choice : Choice) (stage : Nat) : Nat := take (({branches}) : Nat -> Nat -> Nat)\n#eval escaped (Choice.offset 5) 0"
+    for (operation, returned) in [
+        (
+            format!(
+                "def escaped (choice : Choice) (stage : Nat) : Nat := take (({branches}) : Nat -> Nat -> Nat)\n#eval escaped (Choice.offset 5) 0"
+            ),
+            None,
         ),
-        format!(
-            "def partiallySelected (choice : Choice) (stage : Nat) : Nat -> Nat := (({branches}) : Nat -> Nat -> Nat) 4\n#eval partiallySelected (Choice.offset 5) 0 2"
+        (
+            format!(
+                "def partiallySelected (choice : Choice) (stage : Nat) : Nat -> Nat := (({branches}) : Nat -> Nat -> Nat) 4\n#eval partiallySelected (Choice.offset 5) 0 2"
+            ),
+            Some("47"),
         ),
     ] {
         let source = format!("{definitions}\n{operation}");
+        if let Some(expected) = returned {
+            // The consumed first argument leaves a uniform Nat -> Nat join.
+            // The locked-reference differential also executes this source in
+            // runtime_case_callbacks; escaping the original mixed ABI below
+            // must still refuse instead of inventing a closure cast.
+            run_with(&base, &source, expected);
+            assert_eq!(base.logical_root(&options), root);
+            continue;
+        }
         let mut error = base
             .execute_source_definitions(&[source.as_bytes()], &options, limits())
             .expect_err("escaping mixed-stage branches still require one exact callable interface");

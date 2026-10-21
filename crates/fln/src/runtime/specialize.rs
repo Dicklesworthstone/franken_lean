@@ -793,12 +793,13 @@ impl Preparation<'_> {
         } = head.node()
         {
             if matches!(body.node(), ExprNode::BVar { idx: 0 })
-                && self.saturated_variant_ascription(value, type_, args.len())?
+                && self.applied_variant_ascription(value, type_, args.len())?
             {
-                // A checked identity ascription must not make a fully supplied
-                // variant join at a shared callback ABI before its operands
-                // reach the selected branch. The initializer still occurs
-                // once, before every argument; strict prefixes stay intact.
+                // Keep supplied operands with their selected branch instead
+                // of first joining at an unspecialized callback interface.
+                // Partial application retains the residual checked type;
+                // incompatible escaping stages still fail ordinary ingress.
+                // The initializer occurs once and strict prefixes stay intact.
                 return Ok(Some(application(value.clone(), args.iter().cloned())));
             }
             let mut lifted = Vec::new();

@@ -49,8 +49,9 @@ impl Preparation<'_> {
         if staged
             && (inert
                 || self.literal_producer_stages(&value, args.len())?
-                || self.saturated_variant_ascription(&value, &type_, args.len())?)
-            && self.saturated_variant_result(&type_, args.len())?.is_some()
+                || self.applied_variant_ascription(&value, &type_, args.len())?)
+            && let Some((result_type, result)) =
+                self.variant_application_type(&type_, args.len())?
         {
             let depth = self.producer_depth(outer_depth)?;
             let mut lifted = Vec::new();
@@ -58,7 +59,10 @@ impl Preparation<'_> {
                 reserve(&mut lifted, self.limits.max_application_args)?;
                 lifted.push(self.lift(argument, depth)?);
             }
-            return Ok(Some(lifted.into_iter().fold(value, Expr::app)));
+            let value = lifted.into_iter().fold(value, Expr::app);
+            return self
+                .typed_callable_result(value, result_type, result)
+                .map(Some);
         }
         let mut stages = Vec::new();
         let mut result_type = type_.clone();

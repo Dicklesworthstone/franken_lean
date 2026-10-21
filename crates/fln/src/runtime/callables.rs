@@ -161,14 +161,14 @@ impl Preparation<'_> {
             && !shape.recursive
             && shape.constructors.len() == rec.rules.len()
             && self
-                .saturated_variant_result(&type_, args.len() - arity)?
+                .variant_application_type(&type_, args.len() - arity)?
                 .is_some()
         {
-            // Keep a fully supplied variant's operands for its lazy minors.
-            // Selecting a function first would require one fixed closure ABI
-            // even when those minors return the same telescope in different
-            // stages. The variant path applies actual operands in order inside
-            // the selected branch and joins only the final data result.
+            // Keep supplied operands for the lazy minors before joining.
+            // Selecting the unspecialized function first fixes its callback
+            // ABI too early. The variant path preserves application order
+            // and joins at the exact residual interface, which may itself
+            // be a function. Incompatible residual stages remain refusals.
             return Ok(None);
         }
         let mut function = head.clone();

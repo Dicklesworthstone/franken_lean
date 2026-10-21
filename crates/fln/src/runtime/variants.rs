@@ -63,11 +63,13 @@ impl Preparation<'_> {
             .ok_or_else(|| unsupported("dependent variant recursor result"))?;
         let arity = rec.rules.len().saturating_add(2);
         let (args, applied) = args.split_at(arity);
-        let result = if applied.is_empty() {
-            self.value_type(&motive)?
-                .ok_or_else(|| unsupported("dependent variant recursor result"))?
+        let (result_type, result) = if applied.is_empty() {
+            let result = self
+                .value_type(&motive)?
+                .ok_or_else(|| unsupported("dependent variant recursor result"))?;
+            (motive.clone(), result)
         } else {
-            let Some(result) = self.saturated_variant_result(&motive, applied.len())? else {
+            let Some(result) = self.variant_application_type(&motive, applied.len())? else {
                 return Ok(None);
             };
             result
@@ -108,8 +110,10 @@ impl Preparation<'_> {
                 // operands one at a time, preserving every producer/argument
                 // stage and evaluating each operand once. The extra depth is
                 // this branch's major binder; operands still use caller scope.
-                self.apply_producer(body, motive.clone(), applied, 1)?
-                    .ok_or_else(|| unsupported("dependent variant recursor application"))?
+                let body = self
+                    .apply_producer(body, motive.clone(), applied, 1)?
+                    .ok_or_else(|| unsupported("dependent variant recursor application"))?;
+                self.typed_callable_result(body, result_type.clone(), result)?
             };
             branches.push(Expr::lam(
                 Name::num(case_name.clone(), index as u64),
@@ -134,14 +138,14 @@ impl Preparation<'_> {
         }))
     }
 
-    /// A fully supplied telescope can join at its data result without casting
-    /// different function stages to a shared callback ABI. A remaining callback
-    /// retains the existing exact-arity path instead.
-    pub(super) fn saturated_variant_result(
+    /// Recover the exact residual interface after applying supplied operands.
+    /// A residual callback remains a checked join: each prepared branch must
+    /// produce this interface, never a cast between different return stages.
+    pub(super) fn variant_application_type(
         &mut self,
         type_: &Expr,
         count: usize,
-    ) -> Result<Option<ValueType>, IngressError> {
+    ) -> Result<Option<(Expr, ValueType)>, IngressError> {
         let mut result = type_.clone();
         for _ in 0..count {
             self.tick()?;
@@ -160,22 +164,19 @@ impl Preparation<'_> {
             }
             result = body.clone();
         }
-        Ok(self
-            .value_type(&result)?
-            .filter(|result| !matches!(result, ValueType::Closure(_))))
+        Ok(self.value_type(&result)?.map(|layout| (result, layout)))
     }
 
-    /// An applied identity ascription may expose a checked variant only when
-    /// all of its remaining arguments reach a data result. Escaping callbacks
-    /// and underapplication keep their original typed anchor. Inspect strict
-    /// producer prefixes without evaluating or discarding any initializer.
-    pub(super) fn saturated_variant_ascription(
+    /// An applied identity ascription may expose a checked case when its
+    /// residual interface is known. The selected branch retains that checked
+    /// type even under partial application. Strict prefixes remain unevaluated.
+    pub(super) fn applied_variant_ascription(
         &mut self,
         value: &Expr,
         type_: &Expr,
         arguments: usize,
     ) -> Result<bool, IngressError> {
-        if self.saturated_variant_result(type_, arguments)?.is_none() {
+        if arguments == 0 || self.variant_application_type(type_, arguments)?.is_none() {
             return Ok(false);
         }
         let mut value = value.clone();
@@ -245,5 +246,89 @@ impl Preparation<'_> {
             recursion: LambdaRecursion::NonRecursive,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod application_tests {
+    use super::*;
+
+    fn engine() -> crate::Engine {
+        crate::Engine::with_source_seed(crate::EngineAdmissionLimits::new(
+            crate::Budget::for_stack_bytes(2 * 1024 * 1024),
+        ))
+        .unwrap()
+        .into_complete()
+        .unwrap()
+    }
+    fn constant(label: &str) -> Expr {
+        Expr::const_(name(label), vec![])
+    }
+    fn arrow(domain: Expr, result: Expr) -> Expr {
+        Expr::forall_e(Name::anonymous(), domain, result, BinderInfo::Default)
+    }
+
+    #[test]
+    fn partial_variant_types_keep_the_exact_remaining_telescope() {
+        let base = engine();
+        let mut preparation = Preparation::new(base.environment(), IngressLimits::default());
+        let suffix = arrow(constant("Bool"), constant("Nat"));
+        let input = arrow(constant("Nat"), suffix.clone());
+        let (type_, layout) = preparation
+            .variant_application_type(&input, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(type_, suffix);
+        let ValueType::Closure(id) = layout else {
+            panic!("residual function interface");
+        };
+        let signature = &preparation.interfaces[id.get() as usize];
+        assert_eq!(signature.parameters, vec![ValueType::Bool]);
+        assert_eq!(signature.result, ValueType::Nat);
+        assert_eq!(
+            preparation.variant_application_type(&input, 2).unwrap(),
+            Some((constant("Nat"), ValueType::Nat))
+        );
+        assert!(
+            preparation
+                .variant_application_type(&input, 3)
+                .unwrap()
+                .is_none()
+        );
+        let dependent = arrow(constant("Nat"), Expr::bvar(0).unwrap());
+        assert!(
+            preparation
+                .variant_application_type(&dependent, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn partial_variant_type_inspection_obeys_work_bounds_and_preserves_the_environment() {
+        let base = engine();
+        let root = base.logical_root(&KVMap::new());
+        let input = arrow(constant("Nat"), arrow(constant("Bool"), constant("Nat")));
+        let mut full = Preparation::new(base.environment(), IngressLimits::default());
+        let result = full.variant_application_type(&input, 1).unwrap();
+        let required = full.visited;
+        for available in [0, required - 1] {
+            let mut stopped = Preparation::new(
+                base.environment(),
+                IngressLimits {
+                    max_nodes: available,
+                    ..IngressLimits::default()
+                },
+            );
+            assert!(matches!(
+                stopped.variant_application_type(&input, 1),
+                Err(IngressError::ResourceLimit { .. })
+            ));
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+        }
+        let mut retry = Preparation::new(base.environment(), IngressLimits::default());
+        assert_eq!(retry.variant_application_type(&input, 1).unwrap(), result);
+        assert_eq!(retry.interfaces, full.interfaces);
+        assert_eq!(retry.visited, required);
     }
 }
