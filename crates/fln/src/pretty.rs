@@ -553,7 +553,28 @@ impl Resolution {
         }
         let root = Name::from_components(["_root_"]).append_core(name);
         let aliases = self.reverse.get(name).map_or(&[][..], Vec::as_slice);
-        for initial in aliases.iter().chain(std::iter::once(&root)) {
+        // Without `allowHorizAliases`, an alias counts only when its namespace
+        // encloses the declaration's own (`ResolveName.lean:656-658`): `export
+        // Nat (twice)` in `Box` never prints `Nat.twice` as `Box.twice`.
+        let namespace = scope.user_name(name).parent();
+        let vertical = |alias: &&Name| {
+            let prefix = alias.parent();
+            let mut cursor = namespace.clone();
+            loop {
+                if cursor == prefix {
+                    return true;
+                }
+                if cursor.is_anonymous() {
+                    return false;
+                }
+                cursor = cursor.parent();
+            }
+        };
+        for initial in aliases
+            .iter()
+            .filter(vertical)
+            .chain(std::iter::once(&root))
+        {
             let mut components = Vec::new();
             let mut cursor = initial.clone();
             while !cursor.is_anonymous() {
@@ -706,7 +727,7 @@ impl<'a> Printer<'a> {
     }
 
     /// A constant in a term, as the delaborator names it (`pp.fullNames false`).
-    fn display_name(&self, name: &Name) -> String {
+    pub fn display_name(&self, name: &Name) -> String {
         match (self.scope, &self.resolution) {
             (Some(scope), Some(resolution)) => {
                 escaped_name(&resolution.unresolve(self.env, scope, name))

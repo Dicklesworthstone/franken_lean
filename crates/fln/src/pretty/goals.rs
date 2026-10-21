@@ -21,6 +21,78 @@ fn close(expr: &Expr, locals: &[LocalDecl]) -> Result<Expr, Unsupported> {
     Ok(closed)
 }
 
+/// The names a goal display shows for `locals`, outermost first: a hygienic or
+/// shadowed name gains `✝` and a superscript index, as the pin's `ppGoal` shows it.
+fn shown_names(locals: &[LocalDecl]) -> Result<Vec<String>, Unsupported> {
+    let mut names = Vec::new();
+    let mut used = std::collections::HashSet::new();
+    let mut stems = std::collections::HashMap::<String, usize>::new();
+    for local in locals.iter().rev() {
+        let hygienic = local.user_name.has_macro_scopes();
+        let base = if hygienic {
+            escaped_name(&local.user_name.erase_macro_scopes())
+        } else if accessible(&local.user_name) {
+            escaped_name(&local.user_name)
+        } else {
+            return Err(Unsupported(
+                "the original inaccessible goal name is unavailable",
+            ));
+        };
+        let mut shown = base.clone();
+        if hygienic || used.contains(&local.user_name) {
+            let index = stems.entry(base.clone()).or_default();
+            let number = if *index == 0 {
+                String::new()
+            } else {
+                index
+                    .to_string()
+                    .chars()
+                    .map(|c| {
+                        SUPERSCRIPTS
+                            .chars()
+                            .nth(c.to_digit(10).unwrap() as usize)
+                            .unwrap()
+                    })
+                    .collect()
+            };
+            shown = format!("{base}✝{number}");
+            *index += 1;
+        }
+        // Hygiene does not shadow an independently accessible outer name.
+        used.insert(local.user_name.clone());
+        names.push(shown);
+    }
+    names.reverse();
+    Ok(names)
+}
+
+/// `term`, elaborated in `locals`, as a message prints it inline (`MessageData.ofExpr`).
+pub fn term_in_locals(
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    locals: &[LocalDecl],
+    term: &Expr,
+) -> Result<String, Unsupported> {
+    let names = shown_names(locals)?;
+    let mut printer = Printer::in_scope(env, scope);
+    for (index, local) in locals.iter().enumerate() {
+        printer.tick()?;
+        let type_ = close(&local.type_, &locals[..index])?;
+        printer.bind(names[index].clone(), &type_);
+    }
+    let term = close(term, locals)?;
+    printer
+        .doc(&term, 0)?
+        .try_pretty(
+            WIDTH,
+            format::FormatRenderLimits {
+                max_work: 10_000_000,
+                max_output_bytes: 1024 * 1024,
+            },
+        )
+        .map_err(|_| Unsupported("message term rendering resource limit"))
+}
+
 /// Render a raw trace without changing goals, definitions or metavariables.
 /// An unrenderable expression remains a refusal, even when a guard drops traces.
 pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsupported> {
@@ -33,45 +105,7 @@ pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsuppor
     for goal in goals {
         let locals = goal.locals.decls();
         let mut printer = Printer::in_scope(env, &event.scope);
-        let mut names = Vec::new();
-        let mut used = std::collections::HashSet::new();
-        let mut stems = std::collections::HashMap::<String, usize>::new();
-        for local in locals.iter().rev() {
-            let hygienic = local.user_name.has_macro_scopes();
-            let base = if hygienic {
-                escaped_name(&local.user_name.erase_macro_scopes())
-            } else if accessible(&local.user_name) {
-                escaped_name(&local.user_name)
-            } else {
-                return Err(Unsupported(
-                    "the original inaccessible goal name is unavailable",
-                ));
-            };
-            let mut shown = base.clone();
-            if hygienic || used.contains(&local.user_name) {
-                let index = stems.entry(base.clone()).or_default();
-                let number = if *index == 0 {
-                    String::new()
-                } else {
-                    index
-                        .to_string()
-                        .chars()
-                        .map(|c| {
-                            SUPERSCRIPTS
-                                .chars()
-                                .nth(c.to_digit(10).unwrap() as usize)
-                                .unwrap()
-                        })
-                        .collect()
-                };
-                shown = format!("{base}✝{number}");
-                *index += 1;
-            }
-            // Hygiene does not shadow an independently accessible outer name.
-            used.insert(local.user_name.clone());
-            names.push(shown);
-        }
-        names.reverse();
+        let names = shown_names(locals)?;
         let mut lines = Vec::new();
         if !goal.tag.is_anonymous() {
             lines.push(Format::text(format!("case {}", escaped_name(&goal.tag))));

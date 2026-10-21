@@ -7874,9 +7874,13 @@ impl Engine {
                         // that fails to elaborate logs its error, which the guard judges as
                         // the pin's message, and declares nothing. A resource stop, an
                         // inconclusive check or a kernel answer still ends the batch.
-                        if let Some(message) =
-                            guarded_elaboration_error(guards.last(), command_index, &error)
-                        {
+                        if let Some(message) = guarded_elaboration_error(
+                            guards.last(),
+                            command_index,
+                            &error,
+                            engine.environment(),
+                            &scope,
+                        ) {
                             guarded_errors.push(SourceWarning {
                                 command_index,
                                 at: original_offset,
@@ -12142,6 +12146,8 @@ fn guarded_elaboration_error(
     guard: Option<&SourceGuard>,
     command_index: usize,
     error: &EngineExecutionError,
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
 ) -> Option<String> {
     if !guard_checks_expected_error(guard, command_index)
         || source_check::classify(error).0 != "elaboration"
@@ -12150,10 +12156,53 @@ fn guarded_elaboration_error(
     }
     match error {
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(error)) => {
+            if let fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::InvalidFieldReceiver(refusal),
+            ) = error
+                && let Some(message) = field_receiver_message(env, scope, refusal)
+            {
+                return Some(message);
+            }
             Some(error.to_string())
         }
         _ => None,
     }
+}
+
+/// The pin's refusal of a field-notation receiver (vendored
+/// `Lean/Elab/App.lean:1786-1796`, `Lean/Message.lean:782-792`): the selected
+/// function by name, the receiver's type head with ` ...` when that head takes
+/// arguments, and the receiver inline when its display is one line of at most
+/// thirty characters, otherwise indented on the next line. `None` when a part
+/// cannot be printed as the pin prints it.
+fn field_receiver_message(
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    refusal: &fln_elab::source::FieldReceiverRefusal,
+) -> Option<String> {
+    let locals = refusal.locals.decls();
+    let printer = pretty::Printer::in_scope(env, scope);
+    let function = match refusal.function.node() {
+        ExprNode::Const { name, .. } => printer.display_name(name),
+        _ => pretty::goals::term_in_locals(env, scope, locals, &refusal.function).ok()?,
+    };
+    let takes_arguments = matches!(
+        env.find(&refusal.base)?.constant_val().type_.node(),
+        ExprNode::ForallE { .. }
+    );
+    let base = printer.display_name(&refusal.base);
+    let dots = if takes_arguments { " ..." } else { "" };
+    let receiver = pretty::goals::term_in_locals(env, scope, locals, &refusal.receiver).ok()?;
+    let receiver = if receiver.chars().count() > 30 || receiver.contains('\n') {
+        format!("\n  {}", receiver.replace('\n', "\n  "))
+    } else {
+        format!(" `{receiver}`")
+    };
+    Some(format!(
+        "Invalid field notation: Function `{function}` does not have a usable parameter of \
+         type `{base}{dots}` for which to substitute{receiver}\n\nNote: Such a parameter \
+         must be explicit, or implicit with a unique name, to be used by field notation"
+    ))
 }
 
 /// Whether `guard` is the `#guard_msgs` of `command_index`, checks errors, and expects one.

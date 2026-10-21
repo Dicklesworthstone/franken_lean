@@ -84,6 +84,47 @@ fn a_guarded_example_logs_its_elaboration_error() {
     );
 }
 
+/// A field-notation receiver whose type head no parameter has is refused with the pin's
+/// message, read from v4.32.0 for these sources: the function, the head (` ...` when it
+/// takes arguments), and the receiver inline, or on its own line when longer than thirty
+/// characters. A different message is a mismatch, a non-answer.
+#[test]
+fn a_guarded_field_receiver_refusal_prints_the_pins_message() {
+    let execution = EngineExecutionLimits::new(limits().kernel);
+    let note = "\n\nNote: Such a parameter must be explicit, or implicit with a unique name, to be used by field notation";
+    let prefix = "def Box (n : Nat) := Nat\ndef Tag := Nat\ndef Nat.twice (n m : Nat) : Nat := n\n\
+                  namespace Box\nexport Nat (twice)\nend Box\nnamespace Tag\nexport Nat (twice)\nend Tag\n";
+    for (command, message) in [
+        (
+            "example (x y : Box 1) : Nat := x.twice y",
+            "Invalid field notation: Function `Nat.twice` does not have a usable parameter of type `Box ...` for which to substitute `x`",
+        ),
+        (
+            "example (aVeryLongReceiverNameIndeedSoLong y : Box 1) : Nat := aVeryLongReceiverNameIndeedSoLong.twice y",
+            "Invalid field notation: Function `Nat.twice` does not have a usable parameter of type `Box ...` for which to substitute\n  aVeryLongReceiverNameIndeedSoLong",
+        ),
+        (
+            "example (t y : Tag) : Nat := t.twice y",
+            "Invalid field notation: Function `Nat.twice` does not have a usable parameter of type `Tag` for which to substitute `t`",
+        ),
+    ] {
+        let expected = format!("{message}{note}");
+        let source = format!("{prefix}/--\nerror: {expected}\n-/\n#guard_msgs in\n{command}\n");
+        let completed = seed()
+            .execute_source_commands_with_checks(source.as_bytes(), &KVMap::new(), execution)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let logged: Vec<_> = completed
+            .warnings
+            .iter()
+            .filter(|warning| warning.severity == SourceSeverity::Error)
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert_eq!(logged, [expected.as_str()], "{command}");
+    }
+}
+
 #[test]
 fn doors_without_a_judge_and_unjudgeable_guards_are_not_implemented() {
     let engine = seed();

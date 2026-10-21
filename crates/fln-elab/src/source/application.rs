@@ -314,13 +314,30 @@ impl Context {
         let selected = trial.field_argument_position(&state, base);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
         match selected? {
-            Ok(index) => state
+            Some(Ok(index)) => state
                 .positional
                 .insert(index, ApplicationValue::Elaborated(receiver)),
-            Err(name) => state.named.push(Named {
+            Some(Err(name)) => state.named.push(Named {
                 name,
                 value: ApplicationValue::Elaborated(receiver),
             }),
+            None => {
+                let mut function = &state.function.value;
+                while let ExprNode::App { f, .. } | ExprNode::MData { expr: f, .. } =
+                    function.node()
+                {
+                    self.tick()?;
+                    function = f;
+                }
+                return Err(failure(SourceInferenceError::InvalidFieldReceiver(
+                    Box::new(super::FieldReceiverRefusal {
+                        function: function.clone(),
+                        base: base.clone(),
+                        receiver: receiver.value,
+                        locals: state.saved.clone(),
+                    }),
+                )));
+            }
         }
         Ok(state)
     }
@@ -329,7 +346,7 @@ impl Context {
         &mut self,
         state: &NamedApplication<'_>,
         base: &Name,
-    ) -> Result<Result<usize, Name>, NatDefinitionElabError> {
+    ) -> Result<Option<Result<usize, Name>>, NatDefinitionElabError> {
         let mut cursor = state.function.type_.clone();
         let mut positional = 0;
         let mut remaining: HashSet<_> = state.named.iter().map(|arg| arg.name.clone()).collect();
@@ -344,23 +361,21 @@ impl Context {
                 binder_info,
             } = cursor.node()
             else {
-                return Err(failure(SourceInferenceError::InvalidFieldReceiver(
-                    base.clone(),
-                )));
+                return Ok(None);
             };
             let supplied = remaining.remove(binder_name);
             if !supplied && self.field_parameter_matches(binder_type, base)? {
                 if positional <= state.positional.len()
                     && (state.explicit || *binder_info == BinderInfo::Default)
                 {
-                    return Ok(Ok(positional));
+                    return Ok(Some(Ok(positional)));
                 }
                 if binder_name.is_anonymous() || unusable.contains(binder_name) {
-                    return Err(failure(SourceInferenceError::InvalidFieldReceiver(
+                    return Err(failure(SourceInferenceError::UnusableFieldParameter(
                         base.clone(),
                     )));
                 }
-                return Ok(Err(binder_name.clone()));
+                return Ok(Some(Err(binder_name.clone())));
             }
             if !supplied && (state.explicit || *binder_info == BinderInfo::Default) {
                 positional += 1;

@@ -64,6 +64,17 @@ use fln_core::expr::{FVarId, MVarId};
 use fln_core::level::{LMVarId, Level};
 use fln_core::options::KVMap;
 
+/// What the pin's refusal of a field-notation receiver prints: the head of the
+/// selected function, the receiver's type head, and the receiver in the local
+/// context it was elaborated in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldReceiverRefusal {
+    pub function: Expr,
+    pub base: Name,
+    pub receiver: Expr,
+    pub locals: crate::lctx::LocalContext,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
     NameScope(scope::ScopeError),
@@ -105,7 +116,12 @@ pub enum SourceInferenceError {
     UnknownMemberConstant(Name),
     InvalidNamedArgument(Name),
     DuplicateNamedArgument(Name),
-    InvalidFieldReceiver(Name),
+    /// Field notation found no parameter whose type has the receiver's head
+    /// (vendored `Lean/Elab/App.lean:1786-1794`). The pin's message names the
+    /// function, that head and the receiver, so the refusal keeps all three.
+    InvalidFieldReceiver(Box<FieldReceiverRefusal>),
+    /// Field notation's parameter can be passed neither by position nor by name.
+    UnusableFieldParameter(Name),
     LevelSyntax(LevelSyntaxError),
     ExpectedFunction,
     /// Argument processing exhausted a known function telescope, and the
@@ -339,7 +355,19 @@ impl std::fmt::Display for SourceInferenceError {
             Self::DuplicateNamedArgument(name) => {
                 write!(f, "duplicate named argument `{}`", name.to_display_string())
             }
-            Self::InvalidFieldReceiver(name) => write!(
+            Self::InvalidFieldReceiver(refusal) => {
+                let function = match refusal.function.node() {
+                    ExprNode::Const { name, .. } => format!("`{}`", name.to_display_string()),
+                    _ => "the selected function".to_string(),
+                };
+                write!(
+                    f,
+                    "Invalid field notation: Function {function} does not have a usable \
+                     parameter of type `{}` for which to substitute the receiver",
+                    refusal.base.to_display_string()
+                )
+            }
+            Self::UnusableFieldParameter(name) => write!(
                 f,
                 "field notation requires a usable parameter with type head `{}`",
                 name.to_display_string()

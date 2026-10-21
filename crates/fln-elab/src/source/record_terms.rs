@@ -517,11 +517,13 @@ impl Context {
                 &aliases,
                 &protected,
             ) {
-                Ok(Some(method)) => return Ok(FieldResolution::Method {
-                    function: self.constant(&method)?,
-                    receiver,
-                    base,
-                }),
+                Ok(Some(method)) => {
+                    return Ok(FieldResolution::Method {
+                        function: self.constant(&method)?,
+                        receiver,
+                        base,
+                    });
+                }
                 // resolveLValLoop retries failed lookup after one unfolding,
                 // including ambiguous exports, but never retries an unusable
                 // receiver on a method that lookup successfully selected.
