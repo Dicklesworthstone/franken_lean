@@ -88,3 +88,45 @@ fn private_signatures_applications_and_fields_use_source_names_without_changing_
         raw
     );
 }
+
+/// The pin's `unresolveNameGlobal` with `fullNames`: inside `namespace Foo`, where `x`
+/// resolves to `Foo.x`, `#check _root_.x` heads its signature `_root_.x : T` (upstream
+/// `tests/elab/root.lean`, v4.32.0), and `Foo.x` keeps its whole name.
+#[test]
+fn a_whole_name_shadowed_in_the_namespace_is_root_qualified() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let initial = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let module = n("Main");
+    let source = "prelude\naxiom T : Type\naxiom x : T\nnamespace Foo\naxiom x : T\nend Foo";
+    let result = initial
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &module,
+                source: source.as_bytes(),
+            }],
+            &module,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let environment = result.checked.engine.environment();
+    let inside = SourceScope {
+        namespace: n("Foo"),
+        ..Default::default()
+    };
+    let mut printer = fln::pretty::Printer::in_scope(environment, &inside);
+    let signature = |printer: &mut fln::pretty::Printer, name: &Name| {
+        let type_ = environment.find(name).unwrap().constant_val().type_.clone();
+        printer.signature(name, &type_).unwrap()
+    };
+    assert_eq!(signature(&mut printer, &n("x")), "_root_.x : T");
+    assert_eq!(signature(&mut printer, &n("Foo.x")), "Foo.x : T");
+    let outside = SourceScope::default();
+    let mut printer = fln::pretty::Printer::in_scope(environment, &outside);
+    assert_eq!(signature(&mut printer, &n("x")), "x : T");
+}

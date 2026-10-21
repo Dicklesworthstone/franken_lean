@@ -201,6 +201,14 @@ const INFIXES: &[Infix] = &[
         precedence: 67,
         right: true,
     },
+    // `infixr:90 " ∘ " => Function.comp` (`Init/Notation.lean:272`).
+    Infix {
+        function: "Function.comp",
+        arity: 5,
+        symbol: "∘",
+        precedence: 90,
+        right: true,
+    },
 ];
 
 /// An application's head and arguments.
@@ -273,6 +281,20 @@ fn nat_decimal(value: &NatLit) -> String {
         out.push_str(&format!("{chunk:019}"));
     }
     out
+}
+
+/// `delabOfScientific`'s literal for `OfScientific.ofScientific mantissa negative exponent`:
+/// a decimal point inside the digits, `0.` before them all, or an exponent.
+fn scientific(digits: &str, negative: bool, exponent: &str) -> String {
+    let places = exponent.parse::<usize>().ok();
+    match places {
+        Some(places) if negative && places == digits.len() => format!("0.{digits}"),
+        Some(places) if negative && places < digits.len() => {
+            let (whole, fraction) = digits.split_at(digits.len() - places);
+            format!("{whole}.{fraction}")
+        }
+        _ => format!("{digits}e{}{exponent}", if negative { "-" } else { "" }),
+    }
 }
 
 fn string_literal(text: &str) -> String {
@@ -481,6 +503,11 @@ pub struct Printer<'a> {
     /// What name unresolution reads, with a scope: `None` without one, or when a journal
     /// cannot be read, and then names print in full.
     resolution: Option<Resolution>,
+    /// Whether a trailing parser follows the term being printed at its level: an infix's
+    /// left operand, an arrow's domain. The pin's parenthesizer brackets a notation whose
+    /// body extends to the right (`∃ x, p`) there, where the body would absorb it, and as
+    /// an argument.
+    trailing: bool,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -593,7 +620,16 @@ impl<'a> Printer<'a> {
             proofs: false,
             budget: 100_000,
             resolution: None,
+            trailing: false,
         }
+    }
+
+    /// Print with [`Printer::trailing`] set to `trailing`, restoring it afterwards.
+    fn with_trailing(&mut self, trailing: bool, print: impl FnOnce(&mut Self) -> Doc) -> Doc {
+        let saved = std::mem::replace(&mut self.trailing, trailing);
+        let printed = print(self);
+        self.trailing = saved;
+        printed
     }
 
     /// Enter a binder: its shown name and its type.
@@ -619,6 +655,56 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// `∃ x y, b` for `Exists fun x => Exists fun y => b`. The parenthesizer brackets it as
+    /// an argument, and where a token follows it (see [`Printer::trailing`]).
+    fn exists(&mut self, lambda: &Expr, outer: u32) -> Doc {
+        let depth = self.names.len();
+        let mut binders = Vec::new();
+        let mut current = lambda.clone();
+        let body = loop {
+            self.tick()?;
+            let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = current.node()
+            else {
+                self.unbind_to(depth);
+                return Err(Unsupported("an `∃` without its binder"));
+            };
+            let shown = self.bound_name(binder_name, body);
+            self.bind(shown.clone(), binder_type);
+            binders.push(shown);
+            let (head, args) = spine(body);
+            match (head.node(), args.as_slice()) {
+                (ExprNode::Const { name, .. }, [_, next])
+                    if name.to_display_string() == "Exists"
+                        && matches!(
+                            next.node(),
+                            ExprNode::Lam {
+                                binder_info: BinderInfo::Default,
+                                ..
+                            }
+                        ) =>
+                {
+                    current = next.clone();
+                }
+                _ => break body.clone(),
+            }
+        };
+        let printed = self.with_trailing(false, |printer| printer.doc(&body, 0));
+        self.unbind_to(depth);
+        let shown = Format::text(format!("∃ {},", binders.join(" ")))
+            .then(Format::Line)
+            .then(printed?);
+        Ok(if outer >= MAX_PREC || self.trailing {
+            node(Format::text("(").then(shown).then(Format::text(")")))
+        } else {
+            node(shown)
+        })
+    }
+
     /// A constant in a term, as the delaborator names it (`pp.fullNames false`).
     fn display_name(&self, name: &Name) -> String {
         match (self.scope, &self.resolution) {
@@ -629,12 +715,29 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// A constant by its whole name, as `#check c`'s signature heads it.
+    /// A constant by its whole name, as `#check c`'s signature heads it. The pin's
+    /// `unresolveNameGlobal` with `fullNames` (vendored `Lean/ResolveName.lean`): a whole
+    /// name that resolves to another declaration in this scope is `_root_.`-qualified.
     fn full_name(&self, name: &Name) -> String {
-        self.scope.map_or_else(
-            || escaped_name(name),
-            |scope| escaped_name(&scope.user_name(name)),
-        )
+        let Some(scope) = self.scope else {
+            return escaped_name(name);
+        };
+        let shown = scope.user_name(name);
+        if let Some(resolution) = &self.resolution
+            && !name.has_macro_scopes()
+            && matches!(
+                scope.resolve_with_aliases(
+                    &shown,
+                    |declaration| self.env.contains(declaration),
+                    &resolution.aliases,
+                    &resolution.protected,
+                ),
+                Ok(Some(found)) if found != *name
+            )
+        {
+            return escaped_name(&Name::from_components(["_root_"]).append_core(&shown));
+        }
+        escaped_name(&shown)
     }
 
     fn tick(&mut self) -> Result<(), Unsupported> {
@@ -816,6 +919,10 @@ impl<'a> Printer<'a> {
                     paren_doc(doc, MAX_PREC - 1, outer)
                 })
             }
+            // `unexpandUnit` (`Init/NotationExtra.lean:149`).
+            ExprNode::Const { name, .. } if name.to_display_string() == "Unit.unit" => {
+                Ok(Format::text("()"))
+            }
             ExprNode::Const { name, .. } => Ok(Format::text(self.constant(name))),
             ExprNode::Lit { literal } => Ok(Format::text(match literal {
                 Literal::Nat(value) => nat_decimal(value),
@@ -872,7 +979,8 @@ impl<'a> Printer<'a> {
                             .then(Format::text(format!("{open}{names}{close}")));
                     }
                 }
-                let printed = self.doc(body, 0);
+                let trailing = self.trailing && outer == 0;
+                let printed = self.with_trailing(trailing, |printer| printer.doc(body, 0));
                 self.unbind_to(depth);
                 let fun = Format::text("fun")
                     .then(node(binders.then(Format::text(" =>"))))
@@ -942,6 +1050,53 @@ impl<'a> Printer<'a> {
                     outer,
                 ));
             }
+            // `unexpandExists` (`Init/NotationExtra.lean:185-189`): `Exists fun x => b` is
+            // `∃ x, b`, nested ones sharing one binder list. A `fun` binder that is not
+            // explicit does not match the unexpander and is not reproduced.
+            if text == "Exists"
+                && args.len() == 2
+                && matches!(
+                    args[1].node(),
+                    ExprNode::Lam {
+                        binder_info: BinderInfo::Default,
+                        ..
+                    }
+                )
+            {
+                return self.exists(&args[1], outer);
+            }
+            // `prefix:75 "-" => Neg.neg` (`Init/Notation.lean:293`).
+            if text == "Neg.neg" && args.len() == 3 {
+                let trailing = self.trailing && 75 >= outer;
+                let operand = self.with_trailing(trailing, |printer| printer.doc(&args[2], 75))?;
+                // `--` would begin a comment: the pin separates the tokens, not reproduced.
+                if flat(&operand).starts_with('-') {
+                    return Err(Unsupported("a negated negation"));
+                }
+                return Ok(paren_doc(node(Format::text("-").then(operand)), 75, outer));
+            }
+            // `delabOfScientific` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1190-1207`).
+            if text == "OfScientific.ofScientific"
+                && args.len() == 5
+                && let ExprNode::Lit {
+                    literal: Literal::Nat(mantissa),
+                } = args[2].node()
+                && let ExprNode::Lit {
+                    literal: Literal::Nat(exponent),
+                } = args[4].node()
+                && let ExprNode::Const { name: sign, .. } = args[3].node()
+                && let Some(negative) = match sign.to_display_string().as_str() {
+                    "Bool.true" => Some(true),
+                    "Bool.false" => Some(false),
+                    _ => None,
+                }
+            {
+                return Ok(Format::text(scientific(
+                    &nat_decimal(mantissa),
+                    negative,
+                    &nat_decimal(exponent),
+                )));
+            }
             // `[a, b, …]` (the `List.cons`/`List.nil` unexpanders); an open tail is `::`.
             if text == "List.cons" && args.len() == 3 {
                 let mut elements = vec![args[1].clone()];
@@ -988,8 +1143,12 @@ impl<'a> Printer<'a> {
                     (infix.precedence, infix.precedence + 1)
                 };
                 // `infixl:65 " + "`: the token's trailing space is a line.
-                let lhs = self.doc(&args[args.len() - 2], lhs_prec)?;
-                let rhs = self.doc(&args[args.len() - 1], rhs_prec)?;
+                let lhs = self
+                    .with_trailing(true, |printer| printer.doc(&args[args.len() - 2], lhs_prec))?;
+                let trailing = self.trailing && infix.precedence >= outer;
+                let rhs = self.with_trailing(trailing, |printer| {
+                    printer.doc(&args[args.len() - 1], rhs_prec)
+                })?;
                 return Ok(paren_doc(
                     node(
                         lhs.then(Format::text(format!(" {}", infix.symbol)))
@@ -1309,11 +1468,13 @@ impl<'a> Printer<'a> {
         // A non-dependent explicit binder is an arrow (or an implication): `arrow` is
         // `term " → " term`, the token's trailing space a line.
         if !dependent && *binder_info == BinderInfo::Default {
-            let domain = self.doc(binder_type, ARROW_PREC + 1)?;
+            let domain =
+                self.with_trailing(true, |printer| printer.doc(binder_type, ARROW_PREC + 1))?;
             let shown = self.bound_name(name, body);
             let depth = self.names.len();
             self.bind(shown, binder_type);
-            let codomain = self.doc(body, ARROW_PREC);
+            let trailing = self.trailing && ARROW_PREC >= outer;
+            let codomain = self.with_trailing(trailing, |printer| printer.doc(body, ARROW_PREC));
             self.unbind_to(depth);
             return Ok(paren_doc(
                 node(
@@ -1659,5 +1820,108 @@ mod tests {
             printer.expr(&omitted, 0).unwrap(),
             "{motive : Nat → Prop} → (f : ∀ (n : Nat), motive n) → R ⋯"
         );
+    }
+
+    /// Notations in the pin's `#check` output (v4.32.0, measured 2026-10-20 on the upstream
+    /// `1571`, `binder_predicates`, `decimals`, `negFloat`, `fun` and `mathport_issue16`
+    /// tests): `∃` with merged binders, bracketed only as an argument or where an operator
+    /// follows it; `-`; scientific literals; `∘`; and `()`.
+    #[test]
+    fn exists_negation_literals_composition_and_unit_print_as_the_pins_notations() {
+        let env = Environment::new();
+        let constant = |parts: &[&str]| Expr::const_(name(parts), Vec::new());
+        let nat = || constant(&["Nat"]);
+        let var = |i| Expr::bvar(i).unwrap();
+        let apply = |head: Expr, args: Vec<Expr>| args.into_iter().fold(head, Expr::app);
+        let literal = |n| Expr::lit(Literal::Nat(NatLit::from_u64(n)));
+        let eq = |a, b| apply(constant(&["Eq"]), vec![nat(), a, b]);
+        let exists = |binder: &str, body| {
+            apply(
+                constant(&["Exists"]),
+                vec![
+                    nat(),
+                    Expr::lam(name(&[binder]), nat(), body, BinderInfo::Default),
+                ],
+            )
+        };
+        let arrow =
+            |domain, body| Expr::forall_e(Name::anonymous(), domain, body, BinderInfo::Default);
+        let truth = || constant(&["True"]);
+        let mut printer = Printer::new(&env);
+        let mut shown = |e: &Expr| printer.expr(e, 0).unwrap();
+        let reflexive = exists("a", eq(var(0), var(0)));
+        assert_eq!(shown(&reflexive), "∃ a, a = a");
+        assert_eq!(
+            shown(&exists("x", exists("y", eq(var(1), var(0))))),
+            "∃ x y, x = y"
+        );
+        assert_eq!(
+            shown(&arrow(truth(), reflexive.clone())),
+            "True → ∃ a, a = a"
+        );
+        assert_eq!(
+            shown(&arrow(reflexive.clone(), truth())),
+            "(∃ a, a = a) → True"
+        );
+        let and = |a, b| apply(constant(&["And"]), vec![a, b]);
+        assert_eq!(
+            shown(&and(reflexive.clone(), truth())),
+            "(∃ a, a = a) ∧ True"
+        );
+        assert_eq!(shown(&and(truth(), reflexive.clone())), "True ∧ ∃ a, a = a");
+        assert_eq!(
+            shown(&Expr::app(constant(&["P"]), reflexive)),
+            "P (∃ a, a = a)"
+        );
+        let scientific = |mantissa, negative: bool, exponent| {
+            let sign = if negative { "true" } else { "false" };
+            apply(
+                constant(&["OfScientific", "ofScientific"]),
+                vec![
+                    constant(&["Float"]),
+                    constant(&["instOfScientificFloat"]),
+                    literal(mantissa),
+                    constant(&["Bool", sign]),
+                    literal(exponent),
+                ],
+            )
+        };
+        for (mantissa, negative, exponent, expected) in [
+            (12, true, 1, "1.2"),
+            (10, true, 1, "1.0"),
+            (1, true, 0, "1."),
+            (31416, true, 4, "3.1416"),
+            (12, true, 2, "0.12"),
+            (12, true, 3, "12e-3"),
+            (12, false, 3, "12e3"),
+        ] {
+            assert_eq!(shown(&scientific(mantissa, negative, exponent)), expected);
+        }
+        let negate = |operand| {
+            apply(
+                constant(&["Neg", "neg"]),
+                vec![
+                    constant(&["Int"]),
+                    constant(&["Int", "instNegInt"]),
+                    operand,
+                ],
+            )
+        };
+        assert_eq!(shown(&negate(literal(42))), "-42");
+        assert_eq!(shown(&negate(scientific(420, true, 1))), "-42.0");
+        let compose = |f, g| {
+            apply(
+                constant(&["Function", "comp"]),
+                vec![nat(), nat(), constant(&["Bool"]), f, g],
+            )
+        };
+        assert_eq!(
+            shown(&compose(
+                constant(&["f"]),
+                compose(constant(&["g"]), constant(&["g"]))
+            )),
+            "f ∘ g ∘ g"
+        );
+        assert_eq!(shown(&constant(&["Unit", "unit"])), "()");
     }
 }
