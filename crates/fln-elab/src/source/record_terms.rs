@@ -251,6 +251,63 @@ impl Context {
         Ok(Some(self.field_value(field, expected)?))
     }
 
+    /// A template's dotted name reading a field of a local the same template bound
+    /// (`` `(let xs := $x; xs.succ) ``): each prefix takes the name's macro scopes before it is
+    /// looked up among the locals, as the pin's `resolveLocalName` does. `None` when no prefix
+    /// names such a local.
+    pub(super) fn hygienic_record_field(
+        &mut self,
+        name: &Name,
+        expected: Option<&Expr>,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Ok(view) = fln_syntax::hygiene::extract_macro_scopes(name) else {
+            return Ok(None);
+        };
+        let mut prefix = view.name.clone();
+        let mut suffix = Vec::new();
+        while !prefix.is_anonymous() {
+            self.tick()?;
+            let LeafView::Str(part) = prefix.leaf_view() else {
+                return Ok(None);
+            };
+            suffix.push(Name::from_components([part]));
+            prefix = prefix.parent().clone();
+            if prefix.is_anonymous() {
+                break;
+            }
+            let scoped = fln_syntax::hygiene::MacroScopesView {
+                name: prefix.clone(),
+                ..view.clone()
+            }
+            .review();
+            let Some(local) = self
+                .txn
+                .lctx
+                .decls()
+                .iter()
+                .rev()
+                .find(|local| local.user_name == scoped)
+            else {
+                continue;
+            };
+            let receiver = Typed {
+                value: self
+                    .matrix_aliases
+                    .get(&local.id)
+                    .cloned()
+                    .unwrap_or_else(|| Expr::fvar(local.id.clone())),
+                type_: local.type_.clone(),
+            };
+            let path = suffix
+                .iter()
+                .rev()
+                .fold(Name::anonymous(), |path, part| path.append_core(part));
+            let field = self.resolve_field_path(receiver, &path, false)?;
+            return Ok(Some(self.field_value(field, expected)?));
+        }
+        Ok(None)
+    }
+
     /// Splitting is reserved for identifiers that did not resolve as a whole.
     /// This preserves exact constants, local shadowing and escaped components.
     pub(super) fn qualified_field_receiver(

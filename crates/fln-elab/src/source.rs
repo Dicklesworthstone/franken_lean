@@ -1040,9 +1040,12 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
-            // A template's name (macro-scoped) is a global once its scopes are erased; the
-            // exact local scan above was its only local match (`resolve_source_candidates`).
+            // A template's name (macro-scoped) is a global once its scopes are erased, unless a
+            // prefix of it, with its scopes, names a local the template bound.
             let hygienic = name.has_macro_scopes();
+            if hygienic && let Some(term) = self.hygienic_record_field(name, expected)? {
+                return Ok(term);
+            }
             let resolved = self
                 .resolve_source_name(name)?
                 .unwrap_or_else(|| name.erase_macro_scopes());

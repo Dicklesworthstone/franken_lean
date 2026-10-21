@@ -57,6 +57,21 @@ fn substituted_notation_arguments_cannot_be_captured_by_template_binders() {
     );
 }
 
+/// A template's dotted name reading a field of a local the same template bound: `xs.succ`, with
+/// the template's scopes, is that `xs` and then `.succ` (the pin's `resolveLocalName`), also where
+/// the macro's argument is the caller's own `xs`.
+#[test]
+fn template_dotted_names_read_fields_of_template_locals() {
+    accepted(
+        "macro \"foo!\" x:term : term => `(let xs := $x; xs.succ + xs)\n\
+         def f1 (x : Nat) : Nat := foo! x+1\n\
+         theorem ex1 (x : Nat) : f1 x = Nat.succ (x+1) + (x + 1) := rfl\n\
+         def f2 (xs : Nat) : Nat := foo! xs\n\
+         theorem ex2 (xs : Nat) : f2 xs = Nat.succ xs + xs := rfl\n",
+        2,
+    );
+}
+
 #[test]
 fn quantified_templates_build_real_proofs_and_reject_false_ones() {
     accepted(
