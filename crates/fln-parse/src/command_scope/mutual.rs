@@ -59,6 +59,15 @@ pub(super) fn block_end(
 /// original group's offsets survive parser errors inside every member. None
 /// means this is an ordinary command, not an empty or malformed mutual group.
 pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError> {
+    Ok(parse_with_offsets(source)?
+        .map(|members| members.into_iter().map(|(_, syntax)| syntax).collect()))
+}
+
+/// [`parse`], with each member's byte offset in `source`: a member's own positions are
+/// relative to its start, so this offset places them in the group.
+pub fn parse_with_offsets(
+    source: &[u8],
+) -> Result<Option<Vec<(BytePos, Syntax)>>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let tokens = super::tokens(&view)?;
@@ -94,7 +103,7 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
             return Err(refusal(&view, &tokens, end));
         }
         group_kind = Some(kind);
-        members.push(parsed.syntax);
+        members.push((BytePos(start.0 + offset.0), parsed.syntax));
     }
     Ok(Some(members))
 }

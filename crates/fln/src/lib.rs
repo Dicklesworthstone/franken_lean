@@ -7290,9 +7290,12 @@ impl Engine {
         // Where each declaration command would warn, and whether `warn.sorry` is on for it. A
         // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
         let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
-        // Each declaration command's own syntax and options, for the unused-variables linter.
-        let mut lint_sites: BTreeMap<usize, (fln_parse::BytePos, fln_syntax::tree::Syntax, KVMap)> =
-            BTreeMap::new();
+        // Each declaration's own syntax, offset and options, for the unused-variables linter, by
+        // command and, within a `mutual` block, by member.
+        let mut lint_sites: BTreeMap<
+            (usize, usize),
+            (fln_parse::BytePos, fln_syntax::tree::Syntax, KVMap),
+        > = BTreeMap::new();
         // `#exit`'s warning (`elabExit`); the partition made it the last command.
         let mut exit_warning: Option<SourceWarning> = None;
         let mut evaluation_indices = Vec::new();
@@ -7652,16 +7655,27 @@ impl Engine {
                 .options
                 .get_bool(&Name::from_components(["warn", "sorry"]), true);
             warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
-            // A command this parse does not read is not linted; its own path reports it.
-            if let Ok(parsed) = grammar.enter(|| fln_parse::parse_source_command(command_source))
-                && parsed.syntax().kind()
-                    == Some(&unused_variables::parser_kind(&["Command", "declaration"]))
-            {
+            // A command this parse does not read is not linted; its own path reports it. A
+            // `mutual` block is linted member by member, each at its own offset in the block.
+            let members = match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
+                Ok(parsed)
+                    if parsed.syntax().kind()
+                        == Some(&unused_variables::parser_kind(&["Command", "declaration"])) =>
+                {
+                    vec![(fln_parse::BytePos(0), parsed.syntax().clone())]
+                }
+                _ => grammar
+                    .enter(|| fln_parse::command_scope::mutual::parse_with_offsets(command_source))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            };
+            for (member, (at, syntax)) in members.into_iter().enumerate() {
                 lint_sites.insert(
-                    command_index,
+                    (command_index, member),
                     (
-                        original_offset,
-                        parsed.syntax().clone(),
+                        fln_parse::BytePos(original_offset.0 + at.0),
+                        syntax,
                         scope.options.clone(),
                     ),
                 );
@@ -8505,7 +8519,7 @@ impl Engine {
                     _ => None,
                 })
                 .collect();
-            for (&command, (offset, syntax, options)) in &lint_sites {
+            for (&(command, _), (offset, syntax, options)) in &lint_sites {
                 // In the pin's order: the `:=` note while the command elaborates (`sorry` does
                 // not suppress it), then the unused-variables linter (skipped with `sorry`),
                 // then `linter.defProp`.

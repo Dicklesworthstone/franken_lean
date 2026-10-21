@@ -116,6 +116,28 @@ fn root(name: &Name) -> Name {
     current
 }
 
+/// Whether an identifier in `scope`, other than the binder at `at` itself, may refer to
+/// `name`. A named argument's name (`f (y := 5)`) names a parameter of `f`, never a local, so
+/// it is not one.
+fn referenced(scope: &Syntax, name: &Name, at: usize) -> bool {
+    let mut pending = vec![scope];
+    while let Some(node) = pending.pop() {
+        match node {
+            Syntax::Ident { val, .. } => {
+                if root(val) == *name && original_pos(node) != Some(at) {
+                    return true;
+                }
+            }
+            Syntax::Node { args, .. } if is_kind(node, &["Term", "namedArgument"]) => {
+                pending.extend(args.iter().skip(2));
+            }
+            Syntax::Node { args, .. } => pending.extend(args.iter()),
+            Syntax::Atom { .. } | Syntax::Missing => {}
+        }
+    }
+    false
+}
+
 /// One telescope slot per binder the signature declares, named where it names one
 /// with original syntax. `None` when the signature has a form this increment does not read.
 fn signature_slots(binders: &[Syntax]) -> Option<Vec<Option<(Name, usize)>>> {
@@ -232,19 +254,18 @@ pub(crate) fn unused_pattern_variables(
     options: &KVMap,
     constructors: &HashSet<String>,
 ) -> Vec<UnusedBinder> {
-    let Some((_, declaration)) = decided(command) else {
-        return Vec::new();
-    };
     if !linted(options, Some("patternVars")) {
         return Vec::new();
     }
     let mut alternatives = Vec::new();
-    walk(declaration, |node| {
-        if is_kind(node, &["Term", "matchAlt"]) {
-            alternatives.push(node);
-        }
-        false
-    });
+    if let Some((_, declaration)) = decided(command) {
+        walk(declaration, |node| {
+            if is_kind(node, &["Term", "matchAlt"]) {
+                alternatives.push(node);
+            }
+            false
+        });
+    }
     let mut unused = Vec::new();
     for alternative in alternatives {
         let Some(patterns) = args(alternative).get(1) else {
@@ -257,11 +278,7 @@ pub(crate) fn unused_pattern_variables(
             if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
                 continue;
             }
-            let referenced = walk(alternative, |node| {
-                matches!(node, Syntax::Ident { val, .. }
-                    if root(val) == name && original_pos(node) != Some(at))
-            });
-            if !referenced {
+            if !referenced(alternative, &name, at) {
                 unused.push(UnusedBinder { at, name });
             }
         }
@@ -325,20 +342,19 @@ pub(crate) fn unused_fun_binders(
     options: &KVMap,
     constructors: &HashSet<String>,
 ) -> Vec<UnusedBinder> {
-    let Some((_, declaration)) = decided(command) else {
-        return Vec::new();
-    };
     // The pin's ignore functions for function arguments (`basicFun`) when `funArgs` is off.
     if !linted(options, Some("funArgs")) {
         return Vec::new();
     }
     let mut functions = Vec::new();
-    walk(declaration, |node| {
-        if is_kind(node, &["Term", "basicFun"]) {
-            functions.push(node);
-        }
-        false
-    });
+    if let Some((_, declaration)) = decided(command) {
+        walk(declaration, |node| {
+            if is_kind(node, &["Term", "basicFun"]) {
+                functions.push(node);
+            }
+            false
+        });
+    }
     let mut unused = Vec::new();
     for function in functions {
         let Some(binders) = args(function).first() else {
@@ -351,11 +367,7 @@ pub(crate) fn unused_fun_binders(
             if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
                 continue;
             }
-            let referenced = walk(function, |node| {
-                matches!(node, Syntax::Ident { val, .. }
-                    if root(val) == name && original_pos(node) != Some(at))
-            });
-            if !referenced {
+            if !referenced(function, &name, at) {
                 unused.push(UnusedBinder { at, name });
             }
         }
@@ -391,51 +403,56 @@ fn group_names(binder: &Syntax) -> Option<Vec<(Name, usize)>> {
     Some(names)
 }
 
-/// The unused binders of `command`'s `∀` and dependent arrows, in source order. Such a
-/// binder is in scope only in the term it binds, so the pin's whole evidence is a reference
-/// there. The pin ignores an explicit dependent arrow's binder (`(x : A) → B`), not an
-/// implicit one (`{x : A} → B`).
+/// The unused binders of `command`'s `∀`s, dependent arrows, subtypes and structure-instance
+/// fields, in source order. Such a binder is in scope only in the term it binds, so the pin's
+/// whole evidence is a reference there. The pin ignores an explicit dependent arrow's binder
+/// (`(x : A) → B`), not an implicit one (`{x : A} → B`). A subtype's binder (`{x : T // p}`)
+/// and a field's (`f x := v`) sit under no `fun` in the source, so `funArgs` does not ignore
+/// them.
 pub(crate) fn unused_type_binders(command: &Syntax, options: &KVMap) -> Vec<UnusedBinder> {
-    let Some((_, declaration)) = decided(command) else {
-        return Vec::new();
-    };
     if !linted(options, None) {
         return Vec::new();
     }
+    let groups = |binders: &Syntax| {
+        args(binders)
+            .iter()
+            .map(group_names)
+            .collect::<Option<Vec<_>>>()
+            .map(|groups| groups.concat())
+    };
     let mut scopes: Vec<(&Syntax, Vec<(Name, usize)>)> = Vec::new();
-    walk(declaration, |node| {
-        let names = if is_kind(node, &["Term", "forall"]) {
-            args(node).get(1).and_then(|binders| {
-                args(binders)
-                    .iter()
-                    .map(group_names)
-                    .collect::<Option<Vec<_>>>()
-                    .map(|groups| groups.concat())
-            })
-        } else if is_kind(node, &["Term", "depArrow"]) {
-            args(node)
-                .first()
-                .filter(|binder| !is_kind(binder, &["Term", "explicitBinder"]))
-                .and_then(group_names)
-        } else {
-            None
-        };
-        if let Some(names) = names {
-            scopes.push((node, names));
-        }
-        false
-    });
+    if let Some((_, declaration)) = decided(command) {
+        walk(declaration, |node| {
+            let names = if is_kind(node, &["Term", "forall"]) {
+                args(node).get(1).and_then(groups)
+            } else if is_kind(node, &["Term", "depArrow"]) {
+                args(node)
+                    .first()
+                    .filter(|binder| !is_kind(binder, &["Term", "explicitBinder"]))
+                    .and_then(group_names)
+            } else if node.kind() == Some(&Name::from_components(["term{_:_//_}"])) {
+                args(node).get(1).and_then(group_names)
+            } else if is_kind(node, &["Term", "structInstField"]) {
+                args(node)
+                    .get(1)
+                    .and_then(|field| args(field).first())
+                    .and_then(groups)
+            } else {
+                None
+            };
+            if let Some(names) = names {
+                scopes.push((node, names));
+            }
+            false
+        });
+    }
     let mut unused = Vec::new();
     for (scope, names) in scopes {
         for (name, at) in names {
             if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
                 continue;
             }
-            let referenced = walk(scope, |node| {
-                matches!(node, Syntax::Ident { val, .. }
-                    if root(val) == name && original_pos(node) != Some(at))
-            });
-            if !referenced {
+            if !referenced(scope, &name, at) {
                 unused.push(UnusedBinder { at, name });
             }
         }
@@ -520,12 +537,11 @@ pub(crate) fn unused_signature_binders(
         if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
             continue;
         }
-        let referenced = walk(declaration, |node| {
-            matches!(node, Syntax::Ident { val, .. }
-                if root(val) == *name && original_pos(node) != Some(*at))
-        });
         let index = start + offset;
-        if referenced || pis[index].1.has_loose_bvar(0) || lambdas[index].1.has_loose_bvar(0) {
+        if referenced(declaration, name, *at)
+            || pis[index].1.has_loose_bvar(0)
+            || lambdas[index].1.has_loose_bvar(0)
+        {
             continue;
         }
         unused.push(UnusedBinder {

@@ -75,8 +75,32 @@ structure D :=
   y : Nat
 ";
 
+/// Binders under no `fun` in the source: a subtype's and a structure-instance field's, linted
+/// even with `funArgs` off; a named argument's name, which is no reference to a local of that
+/// name; and the `fun` binders of a `mutual` block's members.
+const SCOPES: &str = "def sub1 := { x : Nat // True }
+def sub2 := { x : Nat // x = x }
+structure CF where
+  f : Nat → Nat
+  h : ∀ a b : Nat, f a = f b
+def cf : CF where
+  f x := 0
+  h a b := rfl
+def cg : CF where
+  f x := x
+  h a b := sorry
+def nf (a : Nat) (b : Nat := 2) : Nat := a
+theorem na (b : Nat) : nf 1 (b := 5) = nf 1 5 := rfl
+theorem nb (b : Nat) : nf 1 (b := b) = nf 1 b := rfl
+mutual
+  partial def pe (u : Unit) : Nat → Nat := fun i => po u 0
+  partial def po (u : Unit) : Nat → Nat := fun j => pe u j
+end
+";
+
 const IDENTICAL: &[(&str, &str)] = &[
     ("linted", LINTED),
+    ("scopes", SCOPES),
     ("patterns", PATTERNS),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
@@ -203,6 +227,7 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
         ("linted", LINTED, 4),
         ("patterns", PATTERNS, 6),
         ("functions", FUNCTIONS, 8),
+        ("scopes", SCOPES, 7),
     ] {
         let (ours, _) = outputs(&lib, &root, name, program);
         assert_eq!(
