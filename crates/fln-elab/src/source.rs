@@ -1377,6 +1377,26 @@ impl Context {
         }
     }
 
+    /// Whether a pending equation mentions the local `id`, its metavariables instantiated.
+    fn equations_mention(&mut self, id: &FVarId) -> Result<bool, NatDefinitionElabError> {
+        for index in 0..self.equations.len() {
+            self.tick()?;
+            let (left, right) = self.equations[index].sides.clone();
+            for side in [left, right] {
+                let side = self.instantiate(&side)?;
+                if side.has_fvar()
+                    && side
+                        .abstract_fvar(id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?
+                        .has_loose_bvar(0)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
         if !final_pass && self.flush_is_stalled() {
             return Ok(());
@@ -3871,9 +3891,14 @@ impl Context {
                         }
                         Task::LetBody(saved, id, name, value, opaque, inline) => {
                             if opaque {
-                                // Do not postpone equations past the context that
-                                // gives this assertion its opaque interpretation.
-                                self.flush(true)?;
+                                // Do not postpone equations over the assertion past the
+                                // context that gives it its opaque interpretation. The
+                                // others stay pending, as at the pin: a numeral's type may
+                                // still be defaulted (`have h : 1 = 1 := rfl`).
+                                self.flush(false)?;
+                                if self.equations_mention(&id)? {
+                                    self.flush(true)?;
+                                }
                                 self.opaque_locals.remove(&id);
                             }
                             self.matrix_aliases.remove(&id);

@@ -7,7 +7,7 @@
 //! closes, as `Decidable (a ≥ 0)` in `(fun a => ite (a ≥ 0) 1 0) (3 : Nat)`, is solved once the
 //! argument fixes `a`'s type, and its answer stays under the binder (the pin's `elimMVarDeps`).
 //! Every program here was run through the pinned `lean` v4.32.0 with the same header first
-//! (2026-10-11; the `fun` cases 2026-10-21), with the same verdict.
+//! (2026-10-11; the `fun` and `have` cases 2026-10-21), with the same verdict.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -115,6 +115,13 @@ fn default_instances_leave_their_arguments_to_later_synthesis() {
             "decide_under_fun",
             "theorem t : (fun a b => decide (a < b)) (1 : Nat) 2 = true := rfl\n",
         ),
+        // A `have`'s numerals are defaulted after its body: only equations over the
+        // assertion itself are settled where it closes.
+        ("have_numeral", "def k : Nat := have h : 1 = 1 := rfl; 3\n"),
+        (
+            "have_numeral_example",
+            "example : True := have h : 1 = 1 := rfl; trivial\n",
+        ),
     ] {
         let (code, stdout, stderr) = check(&lib, &root, name, program);
         assert_eq!(code, 0, "{name}: {program}\n{stdout}\n{stderr}");
@@ -175,6 +182,11 @@ fn default_instance_refusals_match_the_pin() {
         (
             "power_lambda_wrong",
             "example : (fun x => x ^ 2) 3 = 8 := rfl\n",
+            "Type mismatch",
+        ),
+        (
+            "have_numeral_wrong",
+            "example : True := have h : 1 = 2 := rfl; trivial\n",
             "Type mismatch",
         ),
     ] {
