@@ -419,7 +419,11 @@ pub const ROWS: &[Row] = &[
         "pp.mvars",
         Bool(true),
         "Lean/PrettyPrinter/Delaborator/Options.lean:109",
-        DefaultOnly,
+        Inert(
+            "it names metavariables in output, and this engine prints none: the printer \
+             refuses them, and the one message that shows one spells it `?_`, the pin's \
+             spelling with this option off",
+        ),
     ),
     row(
         "pp.explicit",
@@ -714,6 +718,11 @@ mod tests {
             admitted("pp.all", DataValue::OfBool(true)),
             Err(OptionRefusal::Unsupported { .. })
         ));
+        // No metavariable name is ever printed here, so either spelling is the pin's.
+        assert_eq!(
+            admitted("pp.mvars", DataValue::OfBool(false)),
+            Ok(Effect::NoChange)
+        );
         assert_eq!(
             admitted("maxRecDepth", DataValue::OfNat(10_000)),
             Ok(Effect::NoChange)
