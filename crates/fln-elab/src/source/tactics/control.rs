@@ -40,6 +40,22 @@ pub(super) fn is_scope(kind: &Name) -> bool {
         || kind == &parser_kind(&["Tactic", "classical"])
 }
 
+/// A name's components, root first, each as a one-component name.
+fn components(name: &Name) -> Vec<Name> {
+    let mut parts = Vec::new();
+    let mut current = name.clone();
+    while !current.is_anonymous() {
+        parts.push(match current.leaf_view() {
+            LeafView::Str(s) => Name::str(Name::anonymous(), s),
+            LeafView::Num(n) => Name::num(Name::anonymous(), n),
+            LeafView::Anonymous => break,
+        });
+        current = current.parent();
+    }
+    parts.reverse();
+    parts
+}
+
 #[derive(Clone)]
 pub(super) struct Frame<'a> {
     mode: Mode,
@@ -54,6 +70,76 @@ pub(super) struct Frame<'a> {
     after: Option<Vec<&'a Syntax>>,
 }
 impl Context {
+    /// The goal `case tag` selects (`getCaseGoals` and `findTag?`, vendored
+    /// src/Lean/Elab/Tactic/BuiltinTactic.lean): among the visible goals in order, the first
+    /// whose tag, macro scopes erased, is `tag`, else ends with it, else starts with it. `_`
+    /// selects the main goal. The other goals keep their order.
+    pub(super) fn case_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        tag: &Syntax,
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        let [tag] = expect_node(
+            tag,
+            &Name::from_components(["Lean", "binderIdent"]),
+            1,
+            "case tag",
+        )?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        let tag = match tag {
+            Syntax::Ident { val, .. } => val.erase_macro_scopes(),
+            hole if hole.kind() == Some(&parser_kind(&["Term", "hole"])) => return Ok(goal),
+            _ => return Err(error(TacticError::MalformedScript)),
+        };
+        let tag_of = |this: &Self, id: &MVarId| {
+            components(
+                &this
+                    .goal_tags
+                    .get(id)
+                    .map(Name::erase_macro_scopes)
+                    .unwrap_or_else(Name::anonymous),
+            )
+        };
+        // The main goal, then the frontier down to the first barrier; `None` is the main goal.
+        let mut visible = vec![(None, tag_of(self, &goal.id))];
+        for (index, work) in proof.work.iter().enumerate().rev() {
+            self.tick()?;
+            match work {
+                Work::EndScript(..)
+                | Work::EndControl(_)
+                | Work::EndAttempt(_)
+                | Work::EndOptions(_) => break,
+                Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
+                    visible.push((Some(index), tag_of(self, &other.id)));
+                }
+                _ => {}
+            }
+        }
+        let wanted = components(&tag);
+        let found = visible
+            .iter()
+            .position(|(_, tags)| *tags == wanted)
+            .or_else(|| visible.iter().position(|(_, tags)| tags.ends_with(&wanted)))
+            .or_else(|| {
+                visible
+                    .iter()
+                    .position(|(_, tags)| tags.starts_with(&wanted))
+            })
+            .ok_or_else(|| error(TacticError::CaseTagNotFound(tag)))?;
+        let Some(index) = visible[found].0 else {
+            return Ok(goal);
+        };
+        let Work::Goal(selected) = proof.work.remove(index) else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        // The main goal stays first among the goals that remain.
+        proof.work.push(Work::Goal(goal));
+        Ok(selected)
+    }
+
     /// Lexical scopes wrap the whole visible frontier, not just its main goal.
     /// In particular an enclosed all_goals still sees the caller's siblings,
     /// and an unfinished body returns its goals to the outer sequence.

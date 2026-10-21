@@ -123,6 +123,9 @@ pub enum TacticError {
     /// `specialize e` whose head is not a local hypothesis (`evalSpecialize`, vendored
     /// src/Lean/Elab/Tactic/ElabTerm.lean).
     SpecializeRequiresLocal,
+    /// `case t => …` with no goal tagged `t` (`getCaseGoals`, vendored
+    /// src/Lean/Elab/Tactic/BuiltinTactic.lean).
+    CaseTagNotFound(Name),
     ConstructorEquality,
     NoContradiction,
     ArithmeticUnsupported,
@@ -271,6 +274,9 @@ impl std::fmt::Display for TacticError {
                 "Tactic `clear` failed: target depends on '{}'",
                 local.to_display_string()
             ),
+            Self::CaseTagNotFound(tag) => {
+                write!(f, "Case tag `{}` not found.", tag.to_display_string())
+            }
             Self::SpecializeRequiresLocal => write!(
                 f,
                 "'specialize' requires a term of the form `h x_1 .. x_n` where `h` appears in the local context"
@@ -1298,6 +1304,34 @@ impl Context {
                 let goal = self.renamed_proof_goal(proof, goal, names)?;
                 self.goal_tags.remove(&goal.id);
                 self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
+            } else if kind == &parser_kind(&["Tactic", "case"]) {
+                // `"case " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase`, vendored
+                // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal the tag selects, renamed and
+                // untagged, must be closed by the body; the others keep their order.
+                let [keyword, cases, arrow, body] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "case", "case keyword")?;
+                expect_atom(arrow, "=>", "case arrow")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case"])?;
+                // The body runs once per `tag | tag`; only one tag is run here.
+                let [case] = expect_null_args(cases, "case arguments")? else {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                };
+                let [tag, names] = expect_node(
+                    case,
+                    &parser_kind(&["Tactic", "caseArg"]),
+                    2,
+                    "case argument",
+                )?
+                else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let names = expect_null_args(names, "case names")?;
+                let goal = self.case_goal(proof, goal, tag)?;
+                let goal = self.renamed_proof_goal(proof, goal, names)?;
+                self.goal_tags.remove(&goal.id);
+                self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "generalize"]) {
@@ -1709,9 +1743,8 @@ impl Context {
                 self.instance_hole(domain)?
             } else {
                 let (argument, subgoal) = self.proof_goal(domain)?;
-                if self.traces.enabled() {
-                    self.goal_tags.insert(subgoal.id.clone(), tag);
-                }
+                // Tags are kept whether or not traces are recorded: `case` selects by them.
+                self.goal_tags.insert(subgoal.id.clone(), tag);
                 arguments.push(subgoal);
                 argument
             };
@@ -1729,38 +1762,36 @@ impl Context {
         {
             return Err(error(TacticError::ApplyMismatch));
         }
-        if self.traces.enabled() {
-            let parent = self
-                .goal_tags
-                .get(&goal.id)
-                .cloned()
-                .unwrap_or_else(Name::anonymous);
-            // The pin's `appendParentTag` (Lean/Meta/Tactic/Apply.lean) reads only the new
-            // goals unification left unassigned: a single one inherits the parent's tag, so
-            // `apply Prod.Lex.right` on an untagged goal leaves no `case h`; otherwise, under
-            // a tagged parent, each is suffixed. Instance holes are all assigned here (above).
-            // The pin indexes the binder infos by position among the unassigned goals, not by
-            // each goal's own binder; that is kept.
-            let unassigned: Vec<MVarId> = arguments
-                .iter()
-                .filter(|subgoal| !self.txn.mvars.is_assigned(&subgoal.id))
-                .map(|subgoal| subgoal.id.clone())
-                .collect();
-            if let [only] = unassigned.as_slice() {
-                self.goal_tags.insert(only.clone(), parent);
-            } else if !parent.is_anonymous() {
-                for (index, id) in unassigned.iter().enumerate() {
-                    if binder_infos.get(index) == Some(&BinderInfo::InstImplicit) {
-                        continue;
-                    }
-                    let child = self
-                        .goal_tags
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(Name::anonymous);
-                    self.goal_tags
-                        .insert(id.clone(), super::trace::append_tag(&parent, &child));
+        let parent = self
+            .goal_tags
+            .get(&goal.id)
+            .cloned()
+            .unwrap_or_else(Name::anonymous);
+        // The pin's `appendParentTag` (Lean/Meta/Tactic/Apply.lean) reads only the new
+        // goals unification left unassigned: a single one inherits the parent's tag, so
+        // `apply Prod.Lex.right` on an untagged goal leaves no `case h`; otherwise, under
+        // a tagged parent, each is suffixed. Instance holes are all assigned here (above).
+        // The pin indexes the binder infos by position among the unassigned goals, not by
+        // each goal's own binder; that is kept.
+        let unassigned: Vec<MVarId> = arguments
+            .iter()
+            .filter(|subgoal| !self.txn.mvars.is_assigned(&subgoal.id))
+            .map(|subgoal| subgoal.id.clone())
+            .collect();
+        if let [only] = unassigned.as_slice() {
+            self.goal_tags.insert(only.clone(), parent);
+        } else if !parent.is_anonymous() {
+            for (index, id) in unassigned.iter().enumerate() {
+                if binder_infos.get(index) == Some(&BinderInfo::InstImplicit) {
+                    continue;
                 }
+                let child = self
+                    .goal_tags
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(Name::anonymous);
+                self.goal_tags
+                    .insert(id.clone(), super::trace::append_tag(&parent, &child));
             }
         }
         proof.work.push(Work::Close(goal, term.value));

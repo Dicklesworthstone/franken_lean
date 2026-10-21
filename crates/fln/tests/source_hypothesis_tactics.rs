@@ -1,4 +1,5 @@
-//! `intros`, `rename_i`, `clear`, `specialize`, `replace`, `suffices`, `trivial` and `next`.
+//! `intros`, `rename_i`, `clear`, `specialize`, `replace`, `suffices`, `trivial`, `next` and
+//! `case`.
 //! Every program here was run through the pinned `lean` v4.32.0 first (2026-10-21), with its full
 //! `Init`: each traced goal is the pin's `trace_state` output verbatim, and each refusal is one
 //! the pin makes, quoting its message where this engine words it the same.
@@ -176,5 +177,35 @@ fn next_focuses_on_the_main_goal_and_must_close_it() {
     // The pin: "unsolved goals" at `next`.
     refusal(
         "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n  constructor\n  next => skip\n  exact hq\n",
+    );
+}
+
+#[test]
+fn case_selects_a_goal_by_its_tag_and_must_close_it() {
+    // `constructor`'s goals are tagged by `And.intro`'s binders; the second is selected first.
+    assert_eq!(
+        traces(
+            "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n  constructor\n  case right => trace_state; exact hq\n  case left => exact hp\n"
+        ),
+        ["p q : Prop\nhp : p\nhq : q\n⊢ q"]
+    );
+    // `induction`'s goals are tagged by the minor premises; `case` names their fields. (Over
+    // `Nat`, the pin's full `Init` has its own `induction_eliminator`, printing `0` and `n + 1`.)
+    assert_eq!(
+        traces(
+            "inductive N where\n  | z\n  | s (n : N)\n\nexample (n : N) : n = n := by\n  induction n\n  case s k ih =>\n    trace_state\n    rfl\n  case z => rfl\n"
+        ),
+        ["k : N\nih : k = k\n⊢ k.s = k.s"]
+    );
+    traces(
+        "example (p q : Prop) (h : p ∨ q) : q ∨ p := by\n  cases h\n  case inl hp => exact Or.inr hp\n  case inr hq => exact Or.inl hq\n",
+    );
+    assert!(
+        refusal("example (n : Nat) : n = n := by\n  cases n\n  case foo => rfl\n")
+            .contains("Case tag `foo` not found.")
+    );
+    // The body must close the selected goal.
+    refusal(
+        "example (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n  constructor\n  case left => skip\n  all_goals assumption\n",
     );
 }

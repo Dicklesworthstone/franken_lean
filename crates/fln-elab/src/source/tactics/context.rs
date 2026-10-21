@@ -102,6 +102,7 @@ impl Context {
             .map_err(|reason| failure(SourceInferenceError::Unification(Box::new(reason))))?;
         assert!(report.awakened.is_empty(), "private source queue");
         let (root, mut child) = self.proof_goal(target.clone())?;
+        self.inherit_goal_tag(&goal, &child);
         self.introduce_proof_binder(&mut child, name)?;
         let discriminant = child
             .introduced
@@ -245,6 +246,7 @@ impl Context {
         }
         self.txn.lctx = retained;
         let (mut value, child) = self.proof_goal(target)?;
+        self.inherit_goal_tag(&goal, &child);
         for local in reverted {
             self.tick()?;
             if local.value.is_none() {
@@ -426,8 +428,10 @@ impl Context {
             if self.is_matrix_hypothesis(local) {
                 continue;
             }
-            let inaccessible =
-                local.user_name.has_macro_scopes() || local.user_name.parent() == internal;
+            // An unnamed elimination field is the pin's inaccessible `n✝`.
+            let inaccessible = local.user_name.is_anonymous()
+                || local.user_name.has_macro_scopes()
+                || local.user_name.parent() == internal;
             if inaccessible || later.contains(&local.user_name) {
                 if let Some(Some(name)) = pending.pop() {
                     renamed.insert(local.id.clone(), name);

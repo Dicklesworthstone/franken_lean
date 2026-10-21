@@ -1203,6 +1203,22 @@ impl Context {
         let mut branches = Vec::new();
         let mut fallback_used = false;
         let mut seen = HashSet::new();
+        // The pin's `cases`/`induction` tag each branch `appendTag tag minor` with the minor
+        // premise's binder name (`ElimApp.mkElimApp`, vendored
+        // src/Lean/Elab/Tactic/Induction.lean). `rcases` goes through `MVarId.cases`, which
+        // appends only when there is more than one minor (vendored
+        // src/Lean/Meta/Tactic/Induction.lean). A source `match` tags nothing.
+        let parent_tag = match input {
+            EliminationSyntax::Tactic(_) => true,
+            EliminationSyntax::RCases(_) => rec.num_minors > 1,
+            _ => false,
+        }
+        .then(|| {
+            self.goal_tags
+                .get(&goal.id)
+                .cloned()
+                .unwrap_or_else(Name::anonymous)
+        });
         for rule in &rec.rules {
             self.tick()?;
             if !family.ctors.contains(&rule.ctor) || !seen.insert(rule.ctor.clone()) {
@@ -1222,7 +1238,9 @@ impl Context {
             }
             let rec_type = self.whnf(&recursor.type_)?;
             let ExprNode::ForallE {
-                binder_type: minor, ..
+                binder_name: minor_name,
+                binder_type: minor,
+                ..
             } = rec_type.node()
             else {
                 return Err(error(TacticError::UnsupportedEliminator));
@@ -1292,6 +1310,12 @@ impl Context {
                 }
                 if script.is_none() && fallback.is_some() {
                     fallback_used = true;
+                }
+                if let Some(parent) = &parent_tag {
+                    self.goal_tags.insert(
+                        branch.id.clone(),
+                        super::super::trace::append_tag(parent, minor_name),
+                    );
                 }
                 proof.work.push(match alternative.map(|alt| alt.body) {
                     Some(AlternativeBody::Script(syntax)) => {

@@ -274,3 +274,37 @@ fn pinned_trace_state_backtracking_fixture_matches_its_unchanged_expected_output
         .collect::<String>();
     assert_eq!(actual, expected);
 }
+
+/// `cases` and `induction` tag each branch with its minor premise (`appendTag`), inside `with`
+/// alternatives too; `rcases` only where there is more than one constructor; `·` keeps the tag
+/// it focuses and `constructor` extends it. Each expected text is the pinned v4.32.0's
+/// `trace_state` output (2026-10-21).
+#[test]
+fn elimination_goals_carry_the_pins_case_tags() {
+    let base = engine();
+    for (source, expected) in [
+        (
+            "inductive N where\n  | z\n  | s (n : N)\n\nexample (n : N) : n = n := by\n  induction n with\n  | z => trace_state; rfl\n  | s m ih => trace_state; rfl\n",
+            vec![
+                "case z\n⊢ N.z = N.z",
+                "case s\nm : N\nih : m = m\n⊢ m.s = m.s",
+            ],
+        ),
+        (
+            "example (p q : Prop) (h : p ∨ q) : q ∨ p := by\n  rcases h with hp | hq\n  trace_state\n  · exact Or.inr hp\n  · exact Or.inl hq\n",
+            vec!["case inl\np q : Prop\nhp : p\n⊢ q ∨ p\n\ncase inr\np q : Prop\nhq : q\n⊢ q ∨ p"],
+        ),
+        (
+            "example (p q : Prop) (h : p ∧ q) : q := by\n  rcases h with ⟨hp, hq⟩\n  trace_state\n  exact hq\n",
+            vec!["p q : Prop\nhp : p\nhq : q\n⊢ q"],
+        ),
+        (
+            "example (p q r : Prop) (hp : p) (hq : q) (hr : r) : p ∧ q ∧ r := by\n  constructor\n  · exact hp\n  · constructor\n    trace_state\n    case left => exact hq\n    case right => exact hr\n",
+            vec![
+                "case right.left\np q r : Prop\nhp : p\nhq : q\nhr : r\n⊢ q\n\ncase right.right\np q r : Prop\nhp : p\nhq : q\nhr : r\n⊢ r",
+            ],
+        ),
+    ] {
+        assert_eq!(texts(&run(&base, source)), expected, "{source}");
+    }
+}
