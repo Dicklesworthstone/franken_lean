@@ -236,11 +236,10 @@ fn data_valued_functions_remain_executable_dependencies_after_sort_normalization
         .into_complete()
         .unwrap()
         .engine;
-    refuses(
-        &engine,
-        "def applyData (f : Nat -> Nat) : Nat := f 42\n#eval applyData hiddenFunction",
-        "hiddenFunction",
-    );
+    let source = "def applyData (f : Nat -> Nat) : Nat := f 42\n#eval applyData hiddenFunction";
+    for reason in ["noncomputable", "hiddenFunction"] {
+        refuses(&engine, source, reason);
+    }
     returns_42(
         &engine,
         "def applyData (f : Nat -> Nat) : Nat := f 42\n#eval applyData (fun value => value)",
