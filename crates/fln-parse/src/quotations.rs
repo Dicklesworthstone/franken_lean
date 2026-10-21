@@ -71,6 +71,92 @@ fn touching(tokens: &[LexedToken], left: usize, right: usize) -> bool {
 /// The owning repetition parses the prefix with its own item parser and a
 /// bounded end, then wraps that exact syntax as Basic.withAntiquotSuffixSplice
 /// does. A scalar parser never calls this door.
+/// Find `$[p]suffix` without letting the item parser consume the brackets.
+/// The brackets and suffix must be adjacent exactly as in the pin's atomic
+/// `mkAntiquotSplice`; the returned range is the contents of the brackets.
+pub(crate) fn repetition_iteration(
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+    suffix: &str,
+) -> Option<(std::ops::Range<usize>, usize, usize)> {
+    if !inside() || text(tokens, start) != Some("$") || start + 3 >= end {
+        return None;
+    }
+    if text(tokens, start + 1) != Some("[") || !touching(tokens, start, start + 1) {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut close = None;
+    for at in start + 2..end {
+        match text(tokens, at) {
+            Some("[") => depth = depth.checked_add(1)?,
+            Some("]") => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    close = Some(at);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    if close == start + 2 || close + 1 >= end || !touching(tokens, close, close + 1) {
+        return None;
+    }
+    let first = close + 1;
+    let mut next = first;
+    let mut spelled = String::new();
+    while next < end {
+        if next > first && !touching(tokens, next - 1, next) {
+            return None;
+        }
+        spelled.push_str(text(tokens, next)?);
+        next += 1;
+        if spelled == suffix {
+            return Some((start + 2..close, first, next));
+        }
+        if !suffix.starts_with(&spelled) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Preserve a compact native equivalent of the pin's `<kind>.antiquot_scope`
+/// node. Its first child is the parsed repetition body and its second is the
+/// exact suffix token; source information spans the original `$[...]suffix`.
+pub(crate) fn wrap_repetition_iteration(
+    leaves: &Leaves,
+    body: Syntax,
+    kind: &str,
+    suffix: &str,
+    start: usize,
+    end: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let head = leaves.leaf(start)?;
+    let tail = leaves.leaf(end - 1)?;
+    let info = match (head.info(), tail.info()) {
+        (
+            SourceInfo::Original { leading, pos, .. },
+            SourceInfo::Original {
+                trailing, end_pos, ..
+            },
+        ) => SourceInfo::Original {
+            leading,
+            pos,
+            trailing,
+            end_pos,
+        },
+        (info, _) => info,
+    };
+    Ok(Syntax::node(
+        Name::from_components([kind, "antiquot_scope"]),
+        vec![body, Syntax::atom(info, suffix)],
+    ))
+}
+
 pub(crate) fn repetition_suffix(
     tokens: &[LexedToken],
     start: usize,
