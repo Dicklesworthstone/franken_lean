@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 mod descriptions;
 
-const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x04";
+const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x05";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
@@ -232,11 +232,15 @@ fn decode_case(row: &Syntax) -> Result<NotationRule, EngineExecutionError> {
 fn encode_rules(
     rule: Option<&Arc<NotationRule>>,
     source: Option<&Arc<[u8]>>,
+    scopes: Option<&Vec<Option<Name>>>,
 ) -> Result<Syntax, EngineExecutionError> {
     let mut rules = Vec::new();
     let mut total = 0usize;
+    if scopes.is_some_and(|scopes| scopes.len() != rule.map_or(0, |rule| rule.cases().count())) {
+        return Err(malformed());
+    }
     if let Some(rule) = rule {
-        for case in rule.cases() {
+        for (index, case) in rule.cases().enumerate() {
             let source = case
                 .source
                 .as_deref()
@@ -247,23 +251,36 @@ fn encode_rules(
                 .checked_add(bytes)
                 .filter(|bytes| *bytes <= MAX_ROW_BYTES)
                 .ok_or_else(|| limit("native grammar rule bytes", MAX_ROW_BYTES))?;
-            rules.push(row);
+            rules.push(node(
+                "scopedRule",
+                vec![
+                    optional_name(scopes.and_then(|scopes| scopes[index].as_ref())),
+                    row,
+                ],
+            ));
         }
     }
     Ok(node("rules", rules))
 }
 
-fn decode_rules(rules: &Syntax) -> Result<Option<Arc<NotationRule>>, EngineExecutionError> {
-    let mut cases = children(rules, "rules")?
-        .iter()
-        .map(decode_case)
-        .collect::<Result<Vec<_>, _>>()?;
+type DecodedRules = (Option<Arc<NotationRule>>, Vec<Option<Name>>);
+
+fn decode_rules(rules: &Syntax) -> Result<DecodedRules, EngineExecutionError> {
+    let mut cases = Vec::new();
+    let mut scopes = Vec::new();
+    for row in children(rules, "rules")? {
+        let [scope, rule] = children(row, "scopedRule")? else {
+            return Err(malformed());
+        };
+        scopes.push(as_optional_name(scope)?);
+        cases.push(decode_case(rule)?);
+    }
     if cases.is_empty() {
-        return Ok(None);
+        return Ok((None, scopes));
     }
     let mut head = cases.remove(0);
     head.fallbacks = cases;
-    Ok(Some(Arc::new(head)))
+    Ok((Some(Arc::new(head)), scopes))
 }
 
 pub(super) fn publish(
@@ -309,7 +326,11 @@ pub(super) fn publish(
     }
     for decl in &module.declarations {
         let descr = descriptions::encode(&decl.descr)?;
-        let rules = encode_rules(module.rules.get(&decl.decl), sources.get(&decl.decl))?;
+        let rules = encode_rules(
+            module.rules.get(&decl.decl),
+            sources.get(&decl.decl),
+            module.rule_scopes.get(&decl.decl),
+        )?;
         let header = node(
             "declaration",
             vec![
@@ -331,7 +352,7 @@ pub(super) fn publish(
         if module.declarations.iter().any(|decl| decl.decl == *kind) {
             continue;
         }
-        let rules = encode_rules(Some(rule), sources.get(kind))?;
+        let rules = encode_rules(Some(rule), sources.get(kind), module.rule_scopes.get(kind))?;
         payloads.push(encode(
             node("macroRules", vec![ident(kind), rules]),
             &[],
@@ -427,8 +448,14 @@ pub(super) fn load(
             if !trees.commands.is_empty() {
                 return Err(malformed());
             }
-            let rule = decode_rules(rules)?.ok_or_else(malformed)?;
-            module.rules.insert(as_name(kind)?, rule);
+            let (rule, scopes) = decode_rules(rules)?;
+            let kind = as_name(kind)?;
+            module
+                .rules
+                .insert(kind.clone(), rule.ok_or_else(malformed)?);
+            if scopes.iter().any(Option::is_some) {
+                module.rule_scopes.insert(kind, scopes);
+            }
         } else {
             let [
                 owner,
@@ -456,8 +483,12 @@ pub(super) fn load(
             if !trees.commands.is_empty() {
                 return Err(malformed());
             }
-            if let Some(rule) = decode_rules(rules)? {
-                module.rules.insert(name, rule);
+            let (rule, scopes) = decode_rules(rules)?;
+            if let Some(rule) = rule {
+                module.rules.insert(name.clone(), rule);
+            }
+            if scopes.iter().any(Option::is_some) {
+                module.rule_scopes.insert(name, scopes);
             }
         }
         file.import_native(&module)
@@ -527,6 +558,7 @@ mod tests {
             declarations: vec![declaration.clone()],
             categories: BTreeMap::new(),
             rules: BTreeMap::from([(kind.clone(), rule.clone())]),
+            rule_scopes: BTreeMap::new(),
         };
         let base = Environment::new();
         let recorded = publish(
