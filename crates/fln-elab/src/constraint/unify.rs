@@ -661,13 +661,45 @@ impl Engine<'_> {
         let mut distinct = HashSet::new();
         let mut binders = Vec::new();
         let mut function_type = declaration.type_.clone();
+        // The pin's `processConstApprox` for a metavariable abstracting exactly its arguments
+        // (`numScopeArgs`): past the pattern prefix, the solution is constant in the remaining
+        // arguments, `?F (n - 99) =?= Nat` giving `?F := fun _ => Nat`.
+        let mut constant_suffix = Vec::new();
         for argument in &arguments {
-            let ExprNode::FVar { id: local_id } = argument.node() else {
-                return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+            let pattern_argument = match argument.node() {
+                ExprNode::FVar { id: local_id }
+                    if constant_suffix.is_empty()
+                        && !distinct.contains(local_id)
+                        && locals.contains(local_id) =>
+                {
+                    Some(local_id.clone())
+                }
+                _ => None,
             };
-            if !distinct.insert(local_id.clone()) || !locals.contains(local_id) {
-                return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
-            }
+            let Some(local_id) = pattern_argument else {
+                if declaration.scope_args != Some(arguments.len()) {
+                    return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+                }
+                function_type = self.whnf(&function_type, locals)?;
+                let ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } = function_type.node()
+                else {
+                    return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+                };
+                // Only a nondependent binder: the pin abstracts a dependent suffix over fresh
+                // locals (`forallBoundedTelescope`), which this approximation does not do.
+                if body.has_loose_bvars() {
+                    return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+                }
+                constant_suffix.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                function_type = body.clone();
+                continue;
+            };
+            distinct.insert(local_id.clone());
             function_type = self.whnf(&function_type, locals)?;
             let ExprNode::ForallE {
                 binder_type,
@@ -682,6 +714,17 @@ impl Engine<'_> {
             function_type = self.substitute(body, argument)?;
         }
         let mut value = self.instantiate(rhs)?;
+        if !constant_suffix.is_empty() {
+            // The suffix binders' domains come from the instantiated telescope; the value
+            // mentions none of them, so it needs no lifting under them.
+            if value.has_loose_bvars() {
+                return Err(UnificationError::LooseBoundVariable);
+            }
+            for (name, domain, style) in constant_suffix.into_iter().rev() {
+                self.meter.tick()?;
+                value = Expr::lam(name, domain, value, style);
+            }
+        }
         for (local, domain, style) in binders.into_iter().rev() {
             self.scan(&value)?;
             value = value

@@ -212,3 +212,103 @@ fn contextual_execution_stops_with_a_nonanswer_and_recovers_without_publication(
     );
     execute(std::str::from_utf8(source).unwrap(), "101");
 }
+
+/// A recursive definition may omit its result type, as at the pin: it is a metavariable over the
+/// parameters that the body solves. The pinned v4.32.0 prints `count : Nat → Nat`,
+/// `pick : (α : Type) → α → Nat → α` and `sumTo : Nat → Nat → Nat`, evaluates `count 3` to 3 and
+/// `sumTo 4 0` to 6, and refuses `bad` ("Failed to infer type of definition `bad`").
+#[test]
+fn recursive_definitions_infer_an_omitted_result_type() {
+    let source = "def count (n : Nat) := match n with | .zero => 0 | .succ k => count k + 1\n\
+                  def pick (α : Type) (x : α) (n : Nat) := match n with | .zero => x | .succ k => pick α x k\n\
+                  def sumTo (n acc : Nat) := match n with | .zero => acc | .succ k => sumTo k (acc + k)\n\
+                  theorem countThree : count 3 = 3 := rfl\n";
+    let checked = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .unwrap()
+        .engine;
+    let environment = checked.environment();
+    let mut printer = fln::pretty::Printer::new(environment);
+    // `sumTo k (acc + k)` is not a pattern: the abstracted result is solved by constant
+    // approximation in its last argument, as the pin's `numScopeArgs` permits.
+    for (name, type_) in [
+        ("count", "Nat → Nat"),
+        ("pick", "(α : Type) → α → Nat → α"),
+        ("sumTo", "Nat → Nat → Nat"),
+    ] {
+        let info = environment
+            .find(&Name::from_components([name]))
+            .unwrap_or_else(|| panic!("{name} not declared"));
+        assert_eq!(
+            printer.expr(&info.constant_val().type_, 0).unwrap(),
+            type_,
+            "{name}"
+        );
+    }
+    execute(
+        "def count (n : Nat) := match n with | .zero => 0 | .succ k => count k + 1\n#eval count 3",
+        "3",
+    );
+    execute(
+        "def sumTo (n acc : Nat) := match n with | .zero => acc | .succ k => sumTo k (acc + k)\n#eval sumTo 4 0",
+        "6",
+    );
+    let error = engine()
+        .check_source_files(
+            &[b"def bad (n : Nat) := bad n".as_slice()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .expect_err("the pin cannot infer the type of `bad`");
+    // Refused because nothing determines the type, not for want of an annotation.
+    assert!(
+        !format!("{error:?}").contains("ResultTypeRequired"),
+        "{error:?}"
+    );
+}
+
+/// `where` and `let rec` locals may omit their result types too. The pinned v4.32.0 prints
+/// `sumList.go : Nat → Nat → Nat`, `viaLetRec.loop : Nat → Nat` and `bar.foo : Nat`, and
+/// evaluates `sumList 4`, `viaLetRec 3` and `bar` to 10, 6 and 11.
+#[test]
+fn recursive_locals_infer_an_omitted_result_type() {
+    let declarations = "def sumList (n : Nat) : Nat := go n 0\n\
+                        where go (i acc : Nat) := match i with | .zero => acc | .succ k => go k (acc + i)\n\
+                        def viaLetRec (n : Nat) : Nat :=\n  let rec loop (i : Nat) := match i with | .zero => 0 | .succ k => loop k + 2\n  loop n\n\
+                        def bar : Nat :=\n  let rec foo := 10\n  foo + 1\n";
+    let checked = engine()
+        .check_source_files(
+            &[declarations.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap_or_else(|error| panic!("{declarations}\n{error:?}"))
+        .into_complete()
+        .unwrap()
+        .engine;
+    let environment = checked.environment();
+    let mut printer = fln::pretty::Printer::new(environment);
+    for (name, type_) in [
+        ("sumList.go", "Nat → Nat → Nat"),
+        ("viaLetRec.loop", "Nat → Nat"),
+        ("bar.foo", "Nat"),
+    ] {
+        let info = environment
+            .find(&Name::from_components(name.split('.')))
+            .unwrap_or_else(|| panic!("{name} not declared"));
+        assert_eq!(
+            printer.expr(&info.constant_val().type_, 0).unwrap(),
+            type_,
+            "{name}"
+        );
+    }
+    for (call, value) in [("sumList 4", "10"), ("viaLetRec 3", "6"), ("bar", "11")] {
+        execute(&format!("{declarations}#eval {call}"), value);
+    }
+}

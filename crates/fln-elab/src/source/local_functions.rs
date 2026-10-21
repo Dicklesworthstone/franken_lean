@@ -48,6 +48,8 @@ pub(super) struct Build<'a> {
     outer_recursion: Option<recursion::Recursion>,
     marker: Option<FVarId>,
     generalized_parameters: HashSet<usize>,
+    /// A recursive local whose result type is omitted (`let rec go (i : Nat) := …`).
+    pub omitted: Option<recursion::OmittedResult>,
 }
 
 /// Like tactic choices, structural candidates live on the driver's flat stack.
@@ -299,11 +301,6 @@ impl Context {
         binding: Binding<'a>,
         expected: Option<Expr>,
     ) -> Result<Build<'a>, NatDefinitionElabError> {
-        if binding.recursive && binding.annotation.is_none() {
-            return Err(failure(SourceInferenceError::Recursion(
-                recursion::RecursionError::ResultTypeRequired,
-            )));
-        }
         let lift_name = if binding.recursive {
             self.reserve_local_function_name(&binding.name)?
         } else {
@@ -313,6 +310,15 @@ impl Context {
         let saved = self.txn.lctx.clone();
         let parameters = self.bind_parameters(binding.parameters)?;
         let header_parameters = parameters.len();
+        // A recursive local may omit its result type, as a recursive definition may: its body
+        // is checked against a hole, its self reference against `?F x₁ … xₙ`.
+        let omitted = if binding.recursive && binding.annotation.is_none() {
+            let omitted = self.omitted_result_type(&parameters)?;
+            self.omitted_results.push(omitted.clone());
+            Some(omitted)
+        } else {
+            None
+        };
         // Signatures see the enclosing scope. Nonrecursive values do too;
         // recursive values introduce their self binder after this phase.
         Ok(Build {
@@ -330,6 +336,7 @@ impl Context {
             outer_recursion: None,
             marker: None,
             generalized_parameters: HashSet::new(),
+            omitted,
         })
     }
 
@@ -459,7 +466,8 @@ impl Context {
             // `let rec` is also legal without a recursive occurrence. An
             // unsupported recursive occurrence keeps this marker and fails
             // the complete-term escape check below, including unused values.
-            let mut type_ = self.instantiate(expected)?;
+            let reference = self.reference_result(expected);
+            let mut type_ = self.instantiate(&reference)?;
             for parameter in build.parameters.iter().rev() {
                 self.tick()?;
                 type_ = Expr::forall_e(
@@ -618,6 +626,7 @@ mod tests {
             outer_recursion: None,
             marker: None,
             generalized_parameters: HashSet::new(),
+            omitted: None,
         };
         let checkpoint = Checkpoint::new(&mut context, build, 3, 7).unwrap();
         let initial_next = context.next;

@@ -57,6 +57,10 @@ pub struct MetavarDecl {
     pub depth: u32,
     pub origin: Option<Name>,
     pub delayed: Option<DelayedAssignment>,
+    /// The pin's `numScopeArgs`: a metavariable that abstracts this many parameters out of
+    /// another (`elimMVarDeps`). Applied to exactly that many arguments it may be solved by
+    /// constant approximation without `constApprox` (`processConstApprox`).
+    pub scope_args: Option<usize>,
 }
 
 /// Error arising from invalid metavariable operations.
@@ -244,6 +248,14 @@ impl MetavarStore {
         Ok(())
     }
 
+    pub(crate) fn set_scope_args(&mut self, id: &MVarId, count: usize) -> Result<(), MetavarError> {
+        self.decls
+            .get_mut(id)
+            .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?
+            .scope_args = Some(count);
+        Ok(())
+    }
+
     pub fn is_declared(&self, id: &MVarId) -> bool {
         self.decls.contains_key(id)
     }
@@ -294,6 +306,7 @@ impl MetavarStore {
                 depth,
                 origin,
                 delayed: None,
+                scope_args: None,
             },
         );
         self.decls.get(&id).unwrap()

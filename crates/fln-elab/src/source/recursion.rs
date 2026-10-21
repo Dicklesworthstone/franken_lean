@@ -241,6 +241,17 @@ pub(super) fn structural_hint(
     }))
 }
 
+/// An omitted recursive result type in its two forms (`Context::omitted_result_type`).
+#[derive(Clone, Debug)]
+pub(super) struct OmittedResult {
+    /// The type hole the body is checked against, in the parameters' context.
+    pub(super) body: Expr,
+    /// The hole's type, `Sort ?u`.
+    pub(super) sort: Expr,
+    /// `?F x₁ … xₙ`, with `?F` outside the parameters: the recursive reference's result.
+    pub(super) reference: Expr,
+}
+
 #[derive(Clone)]
 pub(super) struct Recursion {
     pub(super) name: Name,
@@ -553,6 +564,89 @@ impl Context {
         Ok(matches!(body.node(), ExprNode::FVar { id } if id == &parameter.id))
     }
 
+    /// An omitted result type, as the pin elaborates one for a recursive definition: the body
+    /// is checked against a fresh type hole in the parameters' context (`elabHeaders`), and the
+    /// recursive reference's type abstracts the parameters out of it (`mkForallFVars`'
+    /// `elimMVarDeps`), as `?F x₁ … xₙ` with `?F : (x₁ : A₁) → … → Sort ?u` outside the
+    /// parameters. A recursive call `pick α x k` then has the pattern type `?F α x k`, while a
+    /// `match` alternative still sees the plain hole. The two are equated after the body; an
+    /// unsolved one is the usual unresolved-hole refusal (the pin cannot infer it either).
+    pub(super) fn omitted_result_type(
+        &mut self,
+        parameters: &[LocalDecl],
+    ) -> Result<OmittedResult, NatDefinitionElabError> {
+        let level = self.level()?;
+        let sort = Expr::sort(level.clone());
+        let body = self.hole(sort.clone())?;
+        let mut type_ = Expr::sort(level);
+        for parameter in parameters.iter().rev() {
+            self.tick()?;
+            type_ = Expr::forall_e(
+                parameter.user_name.clone(),
+                self.instantiate(&parameter.type_)?,
+                type_
+                    .abstract_fvar(&parameter.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                parameter.binder_info,
+            );
+        }
+        // `?F` lives outside the parameters, as the pin's abstracted metavariable does: its
+        // solution `fun α x n => α` may then mention them only through its own binders.
+        let first = self
+            .txn
+            .lctx
+            .decls()
+            .iter()
+            .position(|local| parameters.iter().any(|p| p.id == local.id))
+            .unwrap_or(self.txn.lctx.decls().len());
+        let inner = self.txn.lctx.clone();
+        self.txn.lctx.truncate(first);
+        let hole = self.hole(type_);
+        self.txn.lctx = inner;
+        let mut reference = hole?;
+        // It abstracts exactly the parameters, so a call such as `steps (n - 99)` may solve
+        // it by constant approximation, as the pin's `numScopeArgs` permits.
+        if let ExprNode::MVar { id } = reference.node() {
+            self.txn
+                .mvars
+                .set_scope_args(id, parameters.len())
+                .map_err(|e| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(e),
+                    )))
+                })?;
+        }
+        for parameter in parameters {
+            self.tick()?;
+            reference = Expr::app(reference, Expr::fvar(parameter.id.clone()));
+        }
+        Ok(OmittedResult {
+            body,
+            sort,
+            reference,
+        })
+    }
+
+    /// The result type a recursive reference or motive uses for `expected`: the abstracted
+    /// form when `expected` is an omitted result's body hole.
+    pub(super) fn reference_result(&self, expected: &Expr) -> Expr {
+        self.omitted_results
+            .iter()
+            .rev()
+            .find(|omitted| &omitted.body == expected)
+            .map_or_else(|| expected.clone(), |omitted| omitted.reference.clone())
+    }
+
+    /// Equate an omitted result's two forms once its body is elaborated, and retire it.
+    pub(super) fn settle_omitted_result(
+        &mut self,
+        omitted: &OmittedResult,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.omitted_results
+            .retain(|candidate| candidate.body != omitted.body);
+        self.constrain(&omitted.body, &omitted.reference)
+    }
+
     /// Retry only an actual unresolved self-reference. Candidate selection is
     /// source-ordered and transactional. Failed candidates retain spent work,
     /// but no assignments, generated identities, local facts or matrix state.
@@ -637,6 +731,22 @@ impl Context {
         let result = (|| {
             let (body, expected, lambdas) =
                 self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+            let expected = match expected {
+                Some(expected) => Some(expected),
+                None => {
+                    let omitted = self.omitted_result_type(&parameters)?;
+                    let body = omitted.body.clone();
+                    self.omitted_results.push(omitted);
+                    Some(body)
+                }
+            };
+            let omitted = expected.as_ref().and_then(|expected| {
+                self.omitted_results
+                    .iter()
+                    .rev()
+                    .find(|omitted| &omitted.body == expected)
+                    .cloned()
+            });
             let body = match hint {
                 Some(TerminationHint::WellFounded {
                     hint,
@@ -715,6 +825,13 @@ impl Context {
                     self.structural_definition_body(name, &parameters, body, expected, selected)?
                 }
             };
+            let mut body = body;
+            if let Some(omitted) = omitted {
+                self.settle_omitted_result(&omitted)?;
+                // The declared type is the hole itself, not a motive applied to the major:
+                // the latter keeps `(fun _ => Nat) n` once `?F` is solved.
+                body.type_ = omitted.body;
+            }
             self.close_recursive_lambdas(&lambdas, body)
         })();
         if result.is_err() {
@@ -958,7 +1075,8 @@ impl Context {
         if parameters[decreasing].binder_info != BinderInfo::Default {
             return Err(error(RecursionError::ExplicitParameterRequired));
         }
-        let mut full_type = self.instantiate(expected)?;
+        let reference = self.reference_result(expected);
+        let mut full_type = self.instantiate(&reference)?;
         for local in parameters.iter().rev() {
             self.tick()?;
             full_type = full_type

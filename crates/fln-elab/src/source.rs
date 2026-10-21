@@ -607,6 +607,10 @@ struct Context {
     // notation naming it (`l.size` inside `T.size`) is recognized as a recursive reference
     // before the recursion context exists, as a direct `T.size l` already is.
     defining: Option<Name>,
+    // Omitted result types of the recursive definitions being elaborated, innermost last
+    // (`recursion::omitted_result_type`): each body is checked against its `body` hole in the
+    // parameters' context, while its recursive reference uses `reference`, `?F x₁ … xₙ`.
+    omitted_results: Vec<recursion::OmittedResult>,
     recursion: Option<recursion::Recursion>,
     well_founded: Option<recursion::WellFounded>,
     // Set only after a top-level well-founded lowering succeeds. The source
@@ -702,6 +706,7 @@ impl Context {
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,
+            omitted_results: Vec::new(),
             recursion: None,
             well_founded: None,
             well_founded_definition: false,
@@ -2452,6 +2457,14 @@ impl Context {
                                                 Some(self.type_expected()?),
                                                 true,
                                             ));
+                                        } else if let Some(omitted) = build.omitted.clone() {
+                                            // The omitted result's hole stands in for the
+                                            // annotation the recursive path expects.
+                                            values.push(Typed {
+                                                value: omitted.body,
+                                                type_: omitted.sort,
+                                            });
+                                            tasks.push(Task::LocalFunctionAnnotation(build));
                                         } else {
                                             let value = build.binding.value;
                                             tasks.push(Task::LocalFunctionValue(
@@ -3656,6 +3669,9 @@ impl Context {
                                 self.require_no_postponed_recursion_since(postponed_start)?;
                             }
                             let value = values.pop().expect("local function value visit");
+                            if let Some(omitted) = &build.omitted {
+                                self.settle_omitted_result(omitted)?;
+                            }
                             let value = self.close_local_function(&build, value)?;
                             if let Some(index) = build.checkpoint {
                                 if index + 1 != attempts.len() {

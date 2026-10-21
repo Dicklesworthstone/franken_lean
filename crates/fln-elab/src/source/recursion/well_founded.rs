@@ -749,6 +749,15 @@ impl Context {
         header_parameters: usize,
     ) -> Result<Attempt, NatDefinitionElabError> {
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
+        // An omitted result type is supported for structural recursion only: the fixpoint's
+        // motive over it exhausted the unification budget, so the refusal stays typed here.
+        if self
+            .omitted_results
+            .iter()
+            .any(|omitted| omitted.body == expected)
+        {
+            return Err(error(RecursionError::ResultTypeRequired));
+        }
         if varying.is_empty() {
             return Err(error(RecursionError::WellFoundedArgumentRequired));
         }
