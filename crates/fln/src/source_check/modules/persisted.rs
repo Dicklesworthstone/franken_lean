@@ -365,6 +365,8 @@ impl SourceModuleRecord {
             fln_elab::protected_names::journal_name(),
             fln_elab::aux_recursors::journal_name(),
             fln_elab::reducibility::export::journal_name(),
+            fln_elab::noncomputable::journal_name(),
+            fln_elab::source::scope::simp::defeq::journal_name(),
         ]
         .map(|name| {
             let bytes = name.to_canonical_bytes();

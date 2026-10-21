@@ -390,6 +390,39 @@ impl PendingArtifact {
                 metadata.noncomputable.push(tagged);
             }
         }
+        // `@[defeq]` tags (a naked `:= rfl` theorem's, as the pin infers them) belong to the
+        // module that admitted the theorem, which writes them as `Lean.defeqAttr` entries;
+        // an imported module's tags stay in its own artifact.
+        let defeq = |env: &Environment, meter: &mut Meter| {
+            let journal_name = fln_elab::source::scope::simp::defeq::journal_name();
+            if let Some(journal) = env.extension(&journal_name) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::source::scope::simp::defeq::read(env, || Ok(())).map_err(|_| {
+                SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: journal_name,
+                    reason: "invalid definitional-equality journal",
+                }
+            })
+        };
+        let inherited = defeq(base, meter)?;
+        for tagged in defeq(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::defeq::journal_name(),
+                        reason: "a module cannot tag an imported theorem definitional",
+                    });
+                }
+                metadata.defeq.push(tagged);
+            }
+        }
         Ok(Self {
             name: name.clone(),
             imports,

@@ -18,6 +18,17 @@ const MAGIC: &[u8] = b"FLNDSIMP\x01";
 const MAX_ROWS: usize = 1 << 16;
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
 
+/// The journal's extension name, for a refusal that names it.
+pub fn journal_name() -> Name {
+    descriptor().name
+}
+
+/// Whether `candidate` is this journal's, which a module's `.olean` carries: its
+/// own tags become the pin's `Lean.defeqAttr` (and `backward_defeq`) entries.
+pub fn supports(candidate: &ExtensionDescriptor) -> bool {
+    *candidate == descriptor()
+}
+
 fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
         name: Name::from_components(["FrankenLean", "sourceDefEq", "v1"]),
@@ -84,7 +95,7 @@ pub fn direct_rfl(syntax: &Syntax) -> bool {
 
 /// Read once per tactic; charge bounded name-decoding work before retaining it.
 /// Corrupt, oversized or dangling metadata is an error, never an empty rule set.
-pub(in crate::source) fn read(
+pub fn read(
     environment: &Environment,
     mut tick: impl FnMut() -> Result<(), NatDefinitionElabError>,
 ) -> Result<BTreeSet<Name>, NatDefinitionElabError> {

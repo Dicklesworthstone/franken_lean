@@ -31,6 +31,7 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
         || fln_elab::aux_recursors::supports(descriptor)
         || fln_elab::noncomputable::supports(descriptor)
         || fln_elab::reducibility::export::supports(descriptor)
+        || fln_elab::source::scope::simp::defeq::supports(descriptor)
 }
 
 impl Export {

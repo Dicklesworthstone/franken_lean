@@ -370,6 +370,83 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
     );
 }
 
+/// A local module's own `@[defeq]` tag (a naked `:= rfl` theorem's) and `noncomputable` tag
+/// are written into its `.olean` and carried by its source-module record: a rebuild reuses
+/// every record rather than refusing the one whose journals it could not parse. The pinned
+/// `lean` beside the library, when present, reads the tags back from the written `.olean`.
+#[test]
+fn lake_build_writes_and_reuses_a_modules_own_defeq_and_noncomputable_tags() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    };
+    let scratch = Scratch::new("lake-tags");
+    scratch.write(
+        "pkg/lakefile.toml",
+        "name = \"tags\"\n[[lean_lib]]\nname = \"Lib\"\nroots = [\"Lib\"]\n",
+    );
+    scratch.write(
+        "pkg/Lib/A.lean",
+        "prelude\nimport Init.Prelude\ntheorem use_nat (n : Nat) : Eq n n := rfl\n\
+         theorem keep (P : Prop) (h : P) : P := h\n\
+         noncomputable def pick : Nat := Classical.choice (Nonempty.intro Nat.zero)\n",
+    );
+    scratch.write(
+        "pkg/Lib.lean",
+        "prelude\nimport Lib.A\ndef two : Nat := Nat.succ (Nat.succ Nat.zero)\n",
+    );
+    let store = scratch.0.join("records");
+    let build = || {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(scratch.0.join("pkg"))
+            .args(["--json", "build", "+Lib:olean"])
+            .env("FLN_IMPORT_REUSE_DIR", &store)
+            .output()
+            .unwrap()
+    };
+    let first = build();
+    assert!(first.status.success(), "{first:?}");
+    let second = build();
+    assert!(second.status.success(), "{second:?}");
+    let report = String::from_utf8(second.stdout).unwrap();
+    let records: Vec<&str> = report
+        .match_indices("\"record\":\"")
+        .map(|(at, _)| {
+            let value = &report[at + 10..];
+            &value[..value.find('"').unwrap()]
+        })
+        .collect();
+    assert_eq!(records, ["hit", "hit", "hit"], "{report}");
+
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    let Some(pinned) = pinned else {
+        eprintln!("SKIP: no pinned lean beside the library; the written tags were not read back");
+        return;
+    };
+    let probe = scratch.write(
+        "Probe.lean",
+        "import Lib.A\nimport Lean\nopen Lean in\n#eval show CoreM Unit from do\n  \
+         let env ← getEnv\n  IO.println s!\"{defeqAttr.hasTag env `use_nat} \
+         {defeqAttr.hasTag env `keep} {isNoncomputable env `pick}\"\n",
+    );
+    let built = scratch.0.join("pkg/.lake/build/lib/lean");
+    let read = Command::new(pinned)
+        .arg(&probe)
+        .env(
+            "LEAN_PATH",
+            format!("{}:{}", built.display(), lib.display()),
+        )
+        .output()
+        .unwrap();
+    assert!(read.status.success(), "{read:?}");
+    assert_eq!(String::from_utf8(read.stdout).unwrap(), "true false true\n");
+}
+
 /// The G1 door has no posture: `check-olean` refuses the option outright and reports
 /// `recheck`, and `trust-producer` is refused at the doors that do take one.
 #[test]
