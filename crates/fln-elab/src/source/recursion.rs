@@ -11,6 +11,7 @@
 use super::*;
 mod constrained;
 mod context;
+mod course;
 mod lambdas;
 mod matrix;
 mod obligation;
@@ -276,6 +277,7 @@ pub(super) struct Recursion {
     varying: Vec<usize>,
     family: Option<(Name, usize)>,
     contextual_capture: Option<context::Capture>,
+    course_name: Option<Name>,
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
@@ -566,7 +568,7 @@ impl Context {
 
     /// An omitted result type, as the pin elaborates one for a recursive definition: the body
     /// is checked against a fresh type hole in the parameters' context (`elabHeaders`), and the
-    /// recursive reference's type abstracts the parameters out of it (`mkForallFVars`'
+    /// recursive reference's type abstracts the parameters out of it (`mkForallFVars`
     /// `elimMVarDeps`), as `?F x₁ … xₙ` with `?F : (x₁ : A₁) → … → Sort ?u` outside the
     /// parameters. A recursive call `pick α x k` then has the pattern type `?F α x k`, while a
     /// `match` alternative still sees the plain hole. The two are equated after the body; an
@@ -863,6 +865,7 @@ impl Context {
                 continue;
             }
             let mut generalized = HashSet::new();
+            let mut course = false;
             loop {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = snapshot.clone();
@@ -881,7 +884,9 @@ impl Context {
                             .as_mut()
                             .expect("prepared structural candidate")
                             .generalized_parameters = generalized.clone();
-                        if context.is_empty() {
+                        if course {
+                            self.course_of_values_body(syntax, expected.clone())
+                        } else if context.is_empty() {
                             let obligation =
                                 self.original_recursive_body_obligation(syntax, expected.clone())?;
                             let mut value = self.term(syntax, expected.clone())?;
@@ -931,6 +936,9 @@ impl Context {
                     });
                 match result {
                     Ok(value) => return Ok(value),
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                        RecursionError::NotDecreasing,
+                    ))) if !course => course = true,
                     Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
                         RecursionError::GeneralizeParameter { owner, position },
                     ))) if owner == parameters[decreasing].id
@@ -1116,6 +1124,7 @@ impl Context {
             varying: (decreasing + 1..parameters.len()).collect(),
             family: None,
             contextual_capture: None,
+            course_name: None,
             equation_goals: HashMap::new(),
         });
         Ok(())

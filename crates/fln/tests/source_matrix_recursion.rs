@@ -206,15 +206,17 @@ fn malformed_matrix_branches_and_false_proofs_still_refuse() {
 }
 
 #[test]
-fn matrix_recursion_does_not_assume_an_arbitrary_smaller_input() {
-    reject(
-        "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => bad (k + 0) b",
+fn matrix_recursion_requires_a_reachable_course_of_values_entry() {
+    // Definitional children and exposed grandchildren now use the checked
+    // below dictionary. An arbitrary zero is not available under an unknown k.
+    check(
+        "def same (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => same (k + 0) b\ntermination_by structural n\ntheorem same_step (n : Nat) (b : Bool) : same (n+1) b = same n b := rfl",
     );
     reject(
-        "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => bad 0 b",
+        "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ k, _ => bad 0 b\ntermination_by structural n",
     );
-    reject(
-        "def bad (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ (.succ k), _ => bad k b | .succ .zero, _ => 0",
+    check(
+        "def skip (n : Nat) (b : Bool) : Nat := match n, b with | .zero, _ => 0 | .succ (.succ k), _ => skip k b | .succ .zero, _ => 0\ntermination_by structural n\ntheorem skip_step (n : Nat) (b : Bool) : skip (n+2) b = skip n b := rfl",
     );
 }
 

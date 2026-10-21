@@ -85,7 +85,7 @@ impl Context {
             .find(|recursion| &recursion.marker == id)
             .filter(|recursion| {
                 !recursion.pending
-                    && !recursion.matrix_hypotheses.is_empty()
+                    && (!recursion.matrix_hypotheses.is_empty() || recursion.course_name.is_some())
                     && arguments.len() > recursion.decreasing
             })
             .cloned()
@@ -93,6 +93,13 @@ impl Context {
             return Ok(value.clone());
         };
         let marker = recursion.marker.clone();
+        if recursion.course_name.is_some() {
+            arguments.reverse();
+            let active = self.recursion.replace(recursion);
+            let result = self.lower_course_call(&arguments);
+            self.recursion = active;
+            return result;
+        }
         let pairs = recursion.matrix_hypotheses.clone();
         let mut hypotheses = Vec::new();
         for (child, hypothesis) in pairs {
