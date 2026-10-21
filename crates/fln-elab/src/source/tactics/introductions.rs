@@ -59,6 +59,50 @@ impl Context {
         }
     }
 
+    /// `intros` (`evalIntros`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean). With no
+    /// names it introduces every binder `getIntrosSize` counts — the leading `∀` and `let`
+    /// binders, through metadata, without unfolding — each under an inaccessible name;
+    /// otherwise one binder per name (`introN`), a `_` leaving that one inaccessible.
+    pub(super) fn intros_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        names: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "intros"])?;
+        self.txn.lctx = goal.lctx.clone();
+        let count = if names.is_empty() {
+            let mut target = self.instantiate(&goal.target)?;
+            let mut count = 0usize;
+            loop {
+                self.tick()?;
+                target = match target.node() {
+                    ExprNode::ForallE { body, .. } | ExprNode::LetE { body, .. } => {
+                        count += 1;
+                        body.clone()
+                    }
+                    ExprNode::MData { expr, .. } => expr.clone(),
+                    _ => break,
+                };
+            }
+            count
+        } else {
+            names.len()
+        };
+        for index in 0..count {
+            self.tick()?;
+            let name = match names.get(index).map(simple) {
+                None | Some(Some(None)) => self.fresh_name()?,
+                Some(Some(Some(name))) => name,
+                Some(None) => return Err(error(TacticError::MalformedScript)),
+            };
+            self.introduce_proof_binder(&mut goal, name)?;
+        }
+        goal.lctx = self.txn.lctx.clone();
+        proof.work.push(Work::Goal(goal));
+        Ok(())
+    }
+
     fn intro_pattern_frontier(
         &mut self,
         goal: ProofGoal,

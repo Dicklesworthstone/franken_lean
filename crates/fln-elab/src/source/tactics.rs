@@ -31,6 +31,7 @@ mod relations;
 mod rewrite;
 mod search;
 mod trace;
+mod trivial;
 mod unfold;
 pub(in crate::source) use refine::RefinementFrame;
 pub(in crate::source) use rewrite::SimpKeyCache;
@@ -110,6 +111,18 @@ pub enum TacticError {
     InjectionUnusedNames {
         unused: Vec<Name>,
     },
+    /// `rename_i` named more hypotheses than are inaccessible or shadowed
+    /// (`renameInaccessibles`, vendored src/Lean/Elab/Tactic/RenameInaccessibles.lean).
+    RenameTooManyNames,
+    /// `clear` of a local that a later local, or the target, still reads (`MVarId.clear`,
+    /// vendored src/Lean/Meta/Tactic/Clear.lean); `dependent: None` is the target.
+    ClearDependency {
+        local: Name,
+        dependent: Option<Name>,
+    },
+    /// `specialize e` whose head is not a local hypothesis (`evalSpecialize`, vendored
+    /// src/Lean/Elab/Tactic/ElabTerm.lean).
+    SpecializeRequiresLocal,
     ConstructorEquality,
     NoContradiction,
     ArithmeticUnsupported,
@@ -239,6 +252,29 @@ impl std::fmt::Display for TacticError {
                 "Tactic `subst` failed: did not find equation for eliminating '{}'",
                 local.to_display_string()
             ),
+            // The pin's words.
+            Self::RenameTooManyNames => write!(f, "too many variable names provided"),
+            Self::ClearDependency {
+                local,
+                dependent: Some(dependent),
+            } => write!(
+                f,
+                "Tactic `clear` failed: variable '{}' depends on '{}'",
+                dependent.to_display_string(),
+                local.to_display_string()
+            ),
+            Self::ClearDependency {
+                local,
+                dependent: None,
+            } => write!(
+                f,
+                "Tactic `clear` failed: target depends on '{}'",
+                local.to_display_string()
+            ),
+            Self::SpecializeRequiresLocal => write!(
+                f,
+                "'specialize' requires a term of the form `h x_1 .. x_n` where `h` appears in the local context"
+            ),
             Self::ConstructorEquality => write!(
                 f,
                 "constructor equality has no supported injective fields or contradiction"
@@ -307,6 +343,57 @@ pub(super) struct ProofState<'a> {
     work: Vec<Work<'a>>,
     controls: Vec<control::Frame<'a>>,
 }
+/// A local a tactic adds: a hypothesis (`have`) or a definition with its value (`let`).
+/// `replaces` is the hypothesis `replace` supersedes, cleared once the new one is in place
+/// unless something still reads it.
+#[derive(Clone)]
+pub(super) struct LocalBinding {
+    pub(super) name: Name,
+    pub(super) opaque: bool,
+    pub(super) replaces: Option<FVarId>,
+}
+
+/// A `have`/`let`/`replace` declaration's single `letIdDecl`, with no binders: its name
+/// (`this` for an anonymous `have`), its optional type and its value.
+fn local_declaration(
+    declaration: &Syntax,
+    opaque: bool,
+) -> Result<(Name, Option<&Syntax>, &Syntax), NatDefinitionElabError> {
+    let [declaration] = expect_node(
+        declaration,
+        &parser_kind(&["Term", "letDecl"]),
+        1,
+        "local tactic declaration",
+    )?
+    else {
+        return Err(error(TacticError::MalformedScript));
+    };
+    let [id, binders, annotation, assign, value] = expect_node(
+        declaration,
+        &parser_kind(&["Term", "letIdDecl"]),
+        5,
+        "local tactic declaration",
+    )?
+    else {
+        return Err(error(TacticError::MalformedScript));
+    };
+    expect_empty_null(binders, "local tactic without binders")?;
+    expect_atom(assign, ":=", "local tactic assignment")?;
+    let [id] = expect_node(id, &parser_kind(&["Term", "letId"]), 1, "local tactic name")? else {
+        return Err(error(TacticError::MalformedScript));
+    };
+    let name = match id {
+        Syntax::Node { kind, .. } if opaque && kind == &Name::from_components(["hygieneInfo"]) => {
+            Name::from_components(["this"])
+        }
+        Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous() => {
+            val.clone()
+        }
+        _ => return Err(error(TacticError::MalformedScript)),
+    };
+    Ok((name, optional_type_syntax(annotation)?, value))
+}
+
 #[derive(Clone)]
 pub(super) struct RewriteRule<'a> {
     pub(super) syntax: &'a Syntax,
@@ -349,10 +436,14 @@ pub(super) enum ProofAction<'a> {
     },
     Binding {
         goal: ProofGoal,
-        name: Name,
+        binding: LocalBinding,
         annotation: Option<&'a Syntax>,
         value: &'a Syntax,
-        opaque: bool,
+    },
+    /// `specialize e`: `e` is elaborated, then replaces its head hypothesis in place.
+    Specialize {
+        goal: ProofGoal,
+        term: &'a Syntax,
     },
     Rewrite {
         goal: ProofGoal,
@@ -600,6 +691,31 @@ impl Context {
             }
         }
         Ok(None)
+    }
+
+    /// `rfl` on an `Eq` or `HEq` goal: both sides, and for `HEq` both types, are unified.
+    pub(super) fn rfl_proof_goal(&mut self, goal: ProofGoal) -> Result<(), NatDefinitionElabError> {
+        let target = self.whnf(&goal.target)?;
+        if let Some((level, alpha, left, beta, right)) = equality::heterogeneous_target(&target) {
+            self.constrain(&alpha, &beta)?;
+            self.constrain(&left, &right)?;
+            let value = [alpha, left].into_iter().fold(
+                Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+                Expr::app,
+            );
+            return self.close_proof_goal(goal, value);
+        }
+        let (level, alpha, left, right) =
+            equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
+        self.constrain(&left, &right)?;
+        let value = Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
+                alpha,
+            ),
+            left,
+        );
+        self.close_proof_goal(goal, value)
     }
 
     pub(super) fn close_proof_goal(
@@ -911,51 +1027,55 @@ impl Context {
                     "local tactic configuration",
                 )?;
                 expect_empty_null(&config[0], "default local configuration")?;
-                let [declaration] = expect_node(
-                    declaration,
-                    &parser_kind(&["Term", "letDecl"]),
-                    1,
-                    "local tactic declaration",
-                )?
-                else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                let [id, binders, annotation, assign, value] = expect_node(
-                    declaration,
-                    &parser_kind(&["Term", "letIdDecl"]),
-                    5,
-                    "local tactic declaration",
-                )?
-                else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_empty_null(binders, "local tactic without binders")?;
-                expect_atom(assign, ":=", "local tactic assignment")?;
-                let [id] =
-                    expect_node(id, &parser_kind(&["Term", "letId"]), 1, "local tactic name")?
-                else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                let name = match id {
-                    Syntax::Node { kind, .. }
-                        if opaque && kind == &Name::from_components(["hygieneInfo"]) =>
-                    {
-                        Name::from_components(["this"])
-                    }
-                    Syntax::Ident { val, .. }
-                        if !val.is_anonymous() && val.parent().is_anonymous() =>
-                    {
-                        val.clone()
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
-                };
+                let (name, annotation, value) = local_declaration(declaration, opaque)?;
                 return Ok(ProofAction::Binding {
                     goal,
-                    name,
-                    annotation: optional_type_syntax(annotation)?,
+                    binding: LocalBinding {
+                        name,
+                        opaque,
+                        replaces: None,
+                    },
+                    annotation,
                     value,
-                    opaque,
                 });
+            } else if kind == &parser_kind(&["Tactic", "replace"]) {
+                // `replace decl` (`evalReplace`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean)
+                // is `have decl`, after which the hypothesis that had the name is cleared when
+                // nothing still reads it (`tryClearMany`).
+                let [keyword, declaration] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "replace", "replace keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "replace"])?;
+                let (name, annotation, value) = local_declaration(declaration, true)?;
+                let replaces = goal
+                    .lctx
+                    .find_by_user_name(&name)
+                    .map(|local| local.id.clone());
+                return Ok(ProofAction::Binding {
+                    goal,
+                    binding: LocalBinding {
+                        name,
+                        opaque: true,
+                        replaces,
+                    },
+                    annotation,
+                    value,
+                });
+            } else if kind == &parser_kind(&["Tactic", "tacticSuffices_"]) {
+                let [keyword, declaration] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "suffices", "suffices keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticSuffices_"])?;
+                self.suffices_proof_goal(proof, goal, keyword, declaration)?;
+            } else if kind == &parser_kind(&["Tactic", "specialize"]) {
+                let [keyword, term] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "specialize", "specialize keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "specialize"])?;
+                return Ok(ProofAction::Specialize { goal, term });
             } else if kind == &parser_kind(&["Tactic", "rintro"]) {
                 self.rintro_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "obtain"]) {
@@ -1142,6 +1262,42 @@ impl Context {
                 expect_atom(keyword, "intro", "intro keyword")?;
                 let names = expect_null_args(names, "intro names")?;
                 self.intro_proof_patterns(proof, goal, names)?;
+            } else if kind == &parser_kind(&["Tactic", "intros"]) {
+                let [keyword, names] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "intros", "intros keyword")?;
+                let names = expect_null_args(names, "intros names")?;
+                self.intros_proof_goal(proof, goal, names)?;
+            } else if kind == &parser_kind(&["Tactic", "renameI"]) {
+                let [keyword, names] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "rename_i", "rename_i keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "renameI"])?;
+                let names = expect_null_args(names, "renamed hypotheses")?;
+                if names.is_empty() {
+                    return Err(error(TacticError::MalformedScript));
+                }
+                let goal = self.renamed_proof_goal(proof, goal, names)?;
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "clear"]) {
+                self.clear_proof_locals(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {
+                // `macro "next " args:(ppSpace binderIdent)* " => " tac:tacticSeq : tactic` is
+                // `case _ args* => tac` (vendored src/Init/Tactics.lean): the main goal, its
+                // inaccessible hypotheses renamed and its tag cleared, must be closed by `tac`
+                // (`evalCase`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean), as `·` does.
+                let [keyword, names, arrow, body] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "next", "next keyword")?;
+                expect_atom(arrow, "=>", "next arrow")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticNext_=>_"])?;
+                let names = expect_null_args(names, "next names")?;
+                let goal = self.renamed_proof_goal(proof, goal, names)?;
+                self.goal_tags.remove(&goal.id);
+                self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "generalize"]) {
@@ -1238,30 +1394,13 @@ impl Context {
                     return Err(error(TacticError::MalformedScript));
                 };
                 expect_atom(keyword, "rfl", "reflexivity tactic")?;
-                let target = self.whnf(&goal.target)?;
-                if let Some((level, alpha, left, beta, right)) =
-                    equality::heterogeneous_target(&target)
-                {
-                    self.constrain(&alpha, &beta)?;
-                    self.constrain(&left, &right)?;
-                    let value = [alpha, left].into_iter().fold(
-                        Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
-                        Expr::app,
-                    );
-                    self.close_proof_goal(goal, value)?;
-                    continue;
-                }
-                let (level, alpha, left, right) =
-                    equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
-                self.constrain(&left, &right)?;
-                let value = Expr::app(
-                    Expr::app(
-                        Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
-                        alpha,
-                    ),
-                    left,
-                );
-                self.close_proof_goal(goal, value)?;
+                self.rfl_proof_goal(goal)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticTrivial"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "trivial", "trivial tactic")?;
+                self.trivial_proof_goal(goal)?;
             } else if kind == &Name::from_components(["Lean", "calcTactic"]) {
                 // The tactic's steps are read as the term's (`start_calculation`).
                 return Ok(ProofAction::Term {
@@ -1327,15 +1466,74 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
-        name: Name,
+        binding: LocalBinding,
         value: Typed,
-        opaque: bool,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
-        // The pin elaborates a tactic `have`/`let` value with `Tactic.elabTerm`,
-        // whose `synthesizeSyntheticMVars (postpone := .no)` applies default
-        // instances and refuses what stays unsynthesized (`have h : String := 1`
-        // fails there, so `first`/`repeat` move on instead of binding it).
+        let value = self.completed_local_value(value)?;
+        self.add_proof_local(&mut goal, binding.name, value, binding.opaque, None)?;
+        match binding.replaces {
+            Some(replaced) => self.try_clear_proof_local(proof, goal, replaced),
+            None => {
+                proof.work.push(Work::Goal(goal));
+                Ok(())
+            }
+        }
+    }
+
+    /// `specialize e` (`evalSpecialize`, vendored src/Lean/Elab/Tactic/ElabTerm.lean): `e`'s
+    /// head, under its lambdas, must be a local hypothesis `h`. `MVarId.replace` (vendored
+    /// src/Lean/Meta/Tactic/Replace.lean) adds `h : type of e`, head-beta reduced, right after
+    /// the old `h` or after the latest local that type reads, then clears the old `h` unless
+    /// something still reads it.
+    pub(in crate::source) fn specialize_proof_term(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        term: Typed,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        let value = self.completed_local_value(term)?;
+        let mut head = &value.value;
+        while let ExprNode::Lam { body, .. } = head.node() {
+            head = body;
+        }
+        while let ExprNode::App { f, .. } = head.node() {
+            head = f;
+        }
+        let ExprNode::FVar { id } = head.node() else {
+            return Err(error(TacticError::SpecializeRequiresLocal));
+        };
+        let Some(position) = goal.lctx.decls().iter().position(|local| &local.id == id) else {
+            return Err(error(TacticError::SpecializeRequiresLocal));
+        };
+        let replaced = goal.lctx.decls()[position].clone();
+        if self.is_matrix_hypothesis(&replaced) {
+            return Err(error(TacticError::SpecializeRequiresLocal));
+        }
+        let type_ = self.head_beta(value.type_)?;
+        let reads = self.elimination_reads(&type_)?;
+        let after = goal
+            .lctx
+            .decls()
+            .iter()
+            .enumerate()
+            .filter(|(_, local)| reads.contains(&local.id))
+            .map(|(index, _)| index)
+            .fold(position, usize::max);
+        let value = Typed {
+            value: value.value,
+            type_,
+        };
+        self.add_proof_local(&mut goal, replaced.user_name, value, true, Some(after))?;
+        self.try_clear_proof_local(proof, goal, replaced.id)
+    }
+
+    /// The pin elaborates a tactic `have`/`let` value with `Tactic.elabTerm`,
+    /// whose `synthesizeSyntheticMVars (postpone := .no)` applies default
+    /// instances and refuses what stays unsynthesized (`have h : String := 1`
+    /// fails there, so `first`/`repeat` move on instead of binding it).
+    fn completed_local_value(&mut self, value: Typed) -> Result<Typed, NatDefinitionElabError> {
         self.resolve_instances_with_defaults()?;
         self.flush(false)?;
         let value = Typed {
@@ -1351,26 +1549,83 @@ impl Context {
                 count: holes.len(),
             }));
         }
+        Ok(value)
+    }
+
+    /// Add a completed local to `goal`: at the end of its context, or right after the local at
+    /// position `after`. Its value stays in the final term either way.
+    fn add_proof_local(
+        &mut self,
+        goal: &mut ProofGoal,
+        name: Name,
+        value: Typed,
+        opaque: bool,
+        after: Option<usize>,
+    ) -> Result<(), NatDefinitionElabError> {
         let id = FVarId(self.fresh_name()?);
-        let local = LocalDecl {
-            id: id.clone(),
-            user_name: name.clone(),
-            type_: value.type_.clone(),
-            value: Some(value.value.clone()),
-            binder_info: BinderInfo::Default,
-            index: self.txn.lctx.len(),
+        let add = |context: &mut LocalContext| {
+            if opaque {
+                context.add_param(
+                    id.clone(),
+                    name.clone(),
+                    value.type_.clone(),
+                    BinderInfo::Default,
+                );
+            } else {
+                context.add_let(
+                    id.clone(),
+                    name.clone(),
+                    value.type_.clone(),
+                    value.value.clone(),
+                );
+            }
         };
-        if opaque {
-            self.txn
-                .lctx
-                .add_param(id, name, value.type_, BinderInfo::Default);
-        } else {
-            self.txn.lctx.add_let(id, name, value.type_, value.value);
-        }
+        let context = match after {
+            None => {
+                let mut context = self.txn.lctx.clone();
+                add(&mut context);
+                context
+            }
+            Some(after) => {
+                let mut context = LocalContext::new();
+                for (index, local) in self.txn.lctx.clone().decls().iter().enumerate() {
+                    self.tick()?;
+                    eliminate::add_local(&mut context, local);
+                    if index == after {
+                        add(&mut context);
+                    }
+                }
+                context
+            }
+        };
+        let mut local = context.find(&id).expect("added local").clone();
+        local.value = Some(value.value.clone());
+        self.txn.lctx = context;
         goal.introduced.push(local);
         goal.lctx = self.txn.lctx.clone();
-        proof.work.push(Work::Goal(goal));
         Ok(())
+    }
+
+    /// `Expr.headBeta`: `(fun x => b) a …` reduced at the head until it is no such redex.
+    fn head_beta(&mut self, mut expr: Expr) -> Result<Expr, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            let mut arguments = Vec::new();
+            let mut head = expr.clone();
+            while let ExprNode::App { f, a } = head.node() {
+                let (f, a) = (f.clone(), a.clone());
+                arguments.push(a);
+                head = f;
+            }
+            let ExprNode::Lam { body, .. } = head.node() else {
+                return Ok(expr);
+            };
+            let Some(argument) = arguments.pop() else {
+                return Ok(expr);
+            };
+            let reduced = self.substitute(body, &argument)?;
+            expr = arguments.into_iter().rev().fold(reduced, Expr::app);
+        }
     }
 
     pub(super) fn apply_proof_term(

@@ -154,10 +154,13 @@ impl Context {
     /// are display-only: tactic name resolution still uses the original local.
     pub(super) fn trace_introduced_name(&mut self, id: &FVarId, name: &Name, binder: &Name) {
         if self.traces.enabled() && name.parent() == Name::from_components(["_fln_source"]) {
+            // An arrow's binder is already hygienic (`a✝`); the stem is the name under its
+            // scopes, as the pin's `mkFreshBinderNameForTactic` reads it.
+            let binder = binder.erase_macro_scopes();
             let stem = if binder.is_anonymous() {
                 Name::from_components(["a"])
             } else {
-                binder.clone()
+                binder
             };
             // The existing printer uses the normal Name hygiene grammar, with
             // the exact generated identity as the scope (not a shared counter).

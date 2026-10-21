@@ -103,7 +103,16 @@ impl Context {
         };
         self.validate_simpa_evidence(&term)?;
         let name = self.fresh_name()?;
-        self.bind_proof_value(proof, goal, name.clone(), term, true)?;
+        self.bind_proof_value(
+            proof,
+            goal,
+            LocalBinding {
+                name: name.clone(),
+                opaque: true,
+                replaces: None,
+            },
+            term,
+        )?;
         let Some(Work::Goal(bound)) = proof.work.pop() else {
             return Err(failure(SourceInferenceError::Scope));
         };

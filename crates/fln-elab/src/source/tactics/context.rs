@@ -257,4 +257,206 @@ impl Context {
         proof.work.push(Work::Goal(child));
         Ok(())
     }
+
+    /// `clear h₁ … hₙ` (`evalClear`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean): the
+    /// named locals leave the goal, the latest first, as `MVarId.clear` removes each.
+    pub(super) fn clear_proof_locals(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        args: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let [keyword, names] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "clear", "clear keyword")?;
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "clear"])?;
+        let names = expect_null_args(names, "cleared names")?;
+        if names.is_empty() {
+            return Err(error(TacticError::MalformedScript));
+        }
+        let mut removed = HashSet::new();
+        for name in names {
+            self.tick()?;
+            let Syntax::Ident { val, .. } = name else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            // The pin elaborates each name to a free variable; a hidden recursion local is
+            // not one the source can name, and naming a local twice clears a missing one.
+            let local = goal
+                .lctx
+                .find_by_user_name(val)
+                .filter(|local| !self.is_matrix_hypothesis(local))
+                .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
+            if !removed.insert(local.id.clone()) {
+                return Err(failure(SourceInferenceError::UnknownConstant(val.clone())));
+            }
+        }
+        if let Some(blocked) = self.clear_blocker(&goal, &removed)? {
+            return Err(error(blocked));
+        }
+        self.push_cleared_goal(proof, goal, &removed)
+    }
+
+    /// The pin's `tryClear`: `local` leaves the goal unless something still reads it, in which
+    /// case the goal is kept as it is.
+    pub(super) fn try_clear_proof_local(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        local: FVarId,
+    ) -> Result<(), NatDefinitionElabError> {
+        let removed = HashSet::from([local]);
+        if self.clear_blocker(&goal, &removed)?.is_some() {
+            proof.work.push(Work::Goal(goal));
+            return Ok(());
+        }
+        self.push_cleared_goal(proof, goal, &removed)
+    }
+
+    /// Why `removed` cannot leave the goal. `MVarId.clear` (vendored
+    /// src/Lean/Meta/Tactic/Clear.lean), applied to the latest local first, refuses one that
+    /// a remaining local reads (the first in context order) or that the target reads.
+    fn clear_blocker(
+        &mut self,
+        goal: &ProofGoal,
+        removed: &HashSet<FVarId>,
+    ) -> Result<Option<TacticError>, NatDefinitionElabError> {
+        let mut reads = Vec::with_capacity(goal.lctx.len());
+        for local in goal.lctx.decls() {
+            self.tick()?;
+            let mut read = self.elimination_reads(&local.type_)?;
+            if let Some(value) = &local.value {
+                read.extend(self.elimination_reads(value)?);
+            }
+            reads.push(read);
+        }
+        let target = self.elimination_reads(&goal.target)?;
+        for cleared in goal.lctx.decls().iter().rev() {
+            if !removed.contains(&cleared.id) {
+                continue;
+            }
+            for (local, read) in goal.lctx.decls().iter().zip(&reads) {
+                self.tick()?;
+                if !removed.contains(&local.id) && read.contains(&cleared.id) {
+                    return Ok(Some(TacticError::ClearDependency {
+                        local: cleared.user_name.clone(),
+                        dependent: Some(local.user_name.clone()),
+                    }));
+                }
+            }
+            if target.contains(&cleared.id) {
+                return Ok(Some(TacticError::ClearDependency {
+                    local: cleared.user_name.clone(),
+                    dependent: None,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A fresh goal over the context without `removed`, which closes `goal`. Like the pin's
+    /// new metavariable, it keeps the goal's tag.
+    fn push_cleared_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        removed: &HashSet<FVarId>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut retained = LocalContext::new();
+        for local in goal.lctx.decls() {
+            self.tick()?;
+            if !removed.contains(&local.id) {
+                eliminate::add_local(&mut retained, local);
+            }
+        }
+        let target = self.instantiate(&goal.target)?;
+        self.txn.lctx = retained;
+        let (value, child) = self.proof_goal(target)?;
+        self.inherit_goal_tag(&goal, &child);
+        proof.work.push(Work::Close(goal, value));
+        proof.work.push(Work::Goal(child));
+        Ok(())
+    }
+
+    fn inherit_goal_tag(&mut self, parent: &ProofGoal, child: &ProofGoal) {
+        if let Some(tag) = self.goal_tags.get(&parent.id).cloned() {
+            self.goal_tags.insert(child.id.clone(), tag);
+        }
+    }
+
+    /// `rename_i x₁ … xₙ` and `next x₁ … xₙ =>` (`renameInaccessibles`, vendored
+    /// src/Lean/Elab/Tactic/RenameInaccessibles.lean): from the end of the context, each
+    /// inaccessible or shadowed hypothesis takes the next name from the right, a `_` leaving
+    /// it as it is. With no name at all the goal is returned unchanged; otherwise the renamed
+    /// goal is a fresh one that closes `goal`. Names left over are refused, as the pin
+    /// reports them.
+    pub(super) fn renamed_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        names: &[Syntax],
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        let mut pending = Vec::with_capacity(names.len());
+        for name in names {
+            self.tick()?;
+            let [inner] = expect_node(
+                name,
+                &Name::from_components(["Lean", "binderIdent"]),
+                1,
+                "renamed hypothesis",
+            )?
+            else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            pending.push(match inner {
+                Syntax::Ident { val, .. } => Some(val.clone()),
+                hole if hole.kind() == Some(&parser_kind(&["Term", "hole"])) => None,
+                _ => return Err(error(TacticError::MalformedScript)),
+            });
+        }
+        if pending.iter().all(Option::is_none) {
+            return Ok(goal);
+        }
+        let internal = Name::from_components(["_fln_source"]);
+        let mut renamed = std::collections::HashMap::new();
+        let mut later = HashSet::new();
+        for local in goal.lctx.decls().iter().rev() {
+            self.tick()?;
+            if self.is_matrix_hypothesis(local) {
+                continue;
+            }
+            let inaccessible =
+                local.user_name.has_macro_scopes() || local.user_name.parent() == internal;
+            if inaccessible || later.contains(&local.user_name) {
+                if let Some(Some(name)) = pending.pop() {
+                    renamed.insert(local.id.clone(), name);
+                }
+                if pending.is_empty() {
+                    break;
+                }
+            }
+            later.insert(local.user_name.clone());
+        }
+        if !pending.is_empty() {
+            return Err(error(TacticError::RenameTooManyNames));
+        }
+        let mut context = LocalContext::new();
+        for local in goal.lctx.decls() {
+            self.tick()?;
+            let mut updated = local.clone();
+            if let Some(name) = renamed.get(&local.id) {
+                updated.user_name = name.clone();
+                // A trace shows the new name, not the hygienic one it replaced.
+                self.trace_local_names.remove(&local.id);
+            }
+            eliminate::add_local(&mut context, &updated);
+        }
+        let target = self.instantiate(&goal.target)?;
+        self.txn.lctx = context;
+        let (value, child) = self.proof_goal(target)?;
+        self.inherit_goal_tag(&goal, &child);
+        proof.work.push(Work::Close(goal, value));
+        Ok(child)
+    }
 }

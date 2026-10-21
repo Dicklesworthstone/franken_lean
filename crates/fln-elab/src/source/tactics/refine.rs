@@ -108,6 +108,35 @@ impl Context {
         Ok(Typed { value, type_ })
     }
 
+    /// Tactic `suffices d` is `refine_lift suffices d; ?_` (vendored src/Init/Tactics.lean):
+    /// term-mode `suffices` whose witness is a fresh goal. Its continuation (`by …` or
+    /// `from …`) proves the original goal from the stated fact, which becomes the main goal.
+    pub(super) fn suffices_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        keyword: &Syntax,
+        declaration: &Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+        let syntax = Syntax::node(
+            parser_kind(&["Term", "suffices"]),
+            vec![
+                keyword.clone(),
+                declaration.clone(),
+                Syntax::node(Name::from_components(["null"]), Vec::new()),
+                Syntax::node(
+                    parser_kind(&["Term", "syntheticHole"]),
+                    vec![atom("?"), atom("_")],
+                ),
+            ],
+        );
+        self.txn.lctx = goal.lctx.clone();
+        let depth = self.begin_refinement();
+        let term = self.term(&syntax, Some(goal.target.clone()))?;
+        self.finish_refinement(proof, goal, term, depth)
+    }
+
     pub(in crate::source) fn finish_refinement(
         &mut self,
         proof: &mut ProofState<'_>,

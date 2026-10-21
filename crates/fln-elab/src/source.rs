@@ -1804,17 +1804,16 @@ impl Context {
             ProofBindingType(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
-                Name,
+                tactics::LocalBinding,
                 &'a Syntax,
-                bool,
             ),
             ProofBindingValue(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
-                Name,
+                tactics::LocalBinding,
                 Option<Expr>,
-                bool,
             ),
+            ProofSpecialize(tactics::ProofState<'a>, tactics::ProofGoal),
             ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, Option<usize>),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
@@ -3059,27 +3058,27 @@ impl Context {
                             }
                             tactics::ProofAction::Binding {
                                 goal,
-                                name,
+                                binding,
                                 annotation,
                                 value,
-                                opaque,
                             } => {
                                 self.txn.lctx = goal.lctx.clone();
                                 if let Some(annotation) = annotation {
-                                    tasks.push(Task::ProofBindingType(
-                                        proof, goal, name, value, opaque,
-                                    ));
+                                    tasks.push(Task::ProofBindingType(proof, goal, binding, value));
                                     tasks.push(Task::Visit(
                                         annotation,
                                         Some(self.type_expected()?),
                                         true,
                                     ));
                                 } else {
-                                    tasks.push(Task::ProofBindingValue(
-                                        proof, goal, name, None, opaque,
-                                    ));
+                                    tasks.push(Task::ProofBindingValue(proof, goal, binding, None));
                                     tasks.push(Task::Visit(value, None, true));
                                 }
+                            }
+                            tactics::ProofAction::Specialize { goal, term } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::ProofSpecialize(proof, goal));
+                                tasks.push(Task::Visit(term, None, true));
                             }
                             tactics::ProofAction::Generalize {
                                 goal,
@@ -3153,24 +3152,28 @@ impl Context {
                             self.generalize_proof_term(&mut proof, goal, name, equality, term)?;
                             tasks.push(Task::Proof(proof));
                         }
-                        Task::ProofBindingType(proof, goal, name, value, opaque) => {
+                        Task::ProofBindingType(proof, goal, binding, value) => {
                             let annotation = values.pop().expect("local proof annotation visit");
                             self.sort_level(&annotation)?;
                             tasks.push(Task::ProofBindingValue(
                                 proof,
                                 goal,
-                                name,
+                                binding,
                                 Some(annotation.value.clone()),
-                                opaque,
                             ));
                             tasks.push(Task::Visit(value, Some(annotation.value), true));
                         }
-                        Task::ProofBindingValue(mut proof, goal, name, annotation, opaque) => {
+                        Task::ProofBindingValue(mut proof, goal, binding, annotation) => {
                             let mut value = values.pop().expect("local proof value visit");
                             if let Some(annotation) = annotation {
                                 value.type_ = annotation;
                             }
-                            self.bind_proof_value(&mut proof, goal, name, value, opaque)?;
+                            self.bind_proof_value(&mut proof, goal, binding, value)?;
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::ProofSpecialize(mut proof, goal) => {
+                            let term = values.pop().expect("specialized term visit");
+                            self.specialize_proof_term(&mut proof, goal, term)?;
                             tasks.push(Task::Proof(proof));
                         }
                         Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
