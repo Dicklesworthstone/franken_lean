@@ -9,15 +9,6 @@ use super::*;
 pub(super) mod repetition;
 pub(super) mod templates;
 
-pub(super) fn at_path<'a>(args: &'a [Syntax], path: &[usize]) -> Option<&'a Syntax> {
-    let (first, rest) = path.split_first()?;
-    let mut current = args.get(*first)?;
-    for index in rest {
-        current = node_args(current)?.get(*index)?;
-    }
-    Some(current)
-}
-
 pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, &'static str> {
     let mut tasks: Vec<_> = children
         .iter()
@@ -44,7 +35,7 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
             }
             continue;
         }
-        if let Some(tail) = repetition::tail(pattern)? {
+        if let Some(tail) = repetition::slice(pattern)? {
             let name = tail.sequence.name()?;
             if name != Name::from_components(["_"]) {
                 let name = macro_variable(&name);
@@ -52,6 +43,11 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
                     return Err("a repeated quoted macro pattern variable");
                 }
                 variables.push((path.clone(), name));
+            }
+            for (offset, child) in tail.fixed_suffix.iter().enumerate().rev() {
+                let mut child_path = path.clone();
+                child_path.push(tail.prefix.len() + 1 + offset);
+                tasks.push((child, child_path));
             }
             for (index, child) in tail.prefix.iter().enumerate().rev() {
                 let mut child_path = path.clone();
@@ -115,14 +111,23 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
             }
             continue;
         }
-        if let Some(tail) = repetition::tail(pattern)? {
+        if let Some(tail) = repetition::slice(pattern)? {
             let Some(items) = null_args(value) else {
                 return Ok(false);
             };
-            if items.len() < tail.prefix.len() || !tail.sequence.accepts(value, &mut visited)? {
+            if items.len() < tail.prefix.len() + tail.fixed_suffix.len()
+                || !tail.sequence.accepts(value, &mut visited)?
+            {
                 return Ok(false);
             }
             pending.extend(tail.prefix.iter().zip(items).map(|(p, a)| (p, a, false)));
+            let suffix_start = items.len() - tail.fixed_suffix.len();
+            pending.extend(
+                tail.fixed_suffix
+                    .iter()
+                    .zip(&items[suffix_start..])
+                    .map(|(p, a)| (p, a, false)),
+            );
             continue;
         }
         if antiquotation_name(pattern).is_some() {

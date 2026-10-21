@@ -6,6 +6,9 @@
 //! (including separator source information) as the captured sequence.
 use super::*;
 
+#[cfg(test)]
+mod slice_tests;
+
 pub(in super::super) struct Sequence<'a> {
     capture: &'a Syntax,
     suffix_node: &'a Syntax,
@@ -54,27 +57,36 @@ pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'sta
     }))
 }
 
-pub(super) struct Tail<'a> {
+pub(super) struct Slice<'a> {
     pub(super) prefix: &'a [Syntax],
+    pub(super) fixed_suffix: &'a [Syntax],
     pub(super) sequence: Sequence<'a>,
 }
 
-/// A fixed prefix followed by one array capture. All prefix
-/// captures retain ordinary paths; only the tail's path denotes a slice.
-/// This is the pin's `slice prefix 0` match, not backtracking over partitions.
-pub(super) fn tail(syntax: &Syntax) -> Result<Option<Tail<'_>>, &'static str> {
+/// One array capture between fixed prefix/suffix syntax. The pin's `slice p s`
+/// rule fixes both ends without trying partitions. Stored capture paths still
+/// describe the pattern; `resolve` translates suffix paths against each value.
+pub(super) fn slice(syntax: &Syntax) -> Result<Option<Slice<'_>>, &'static str> {
     let Some(items) = null_args(syntax) else {
         return Ok(None);
     };
     if items.len() < 2 {
         return Ok(None);
     }
-    let Some((suffix, prefix)) = items.split_last() else {
+    let mut found = None;
+    for (index, item) in items.iter().enumerate() {
+        if let Some(sequence) = suffix(item)? {
+            if found.is_some() {
+                return Err("multiple repetition captures in one pattern sequence");
+            }
+            found = Some((index, sequence));
+        }
+    }
+    let Some((index, sequence)) = found else {
         return Ok(None);
     };
-    let Some(sequence) = self::suffix(suffix)? else {
-        return Ok(None);
-    };
+    let prefix = &items[..index];
+    let fixed_suffix = &items[index + 1..];
     let parent = sequence.kind.parent();
     if parent == Name::from_components(["sepBy"]) {
         // The separator preceding the slice belongs to the fixed prefix.
@@ -90,35 +102,129 @@ pub(super) fn tail(syntax: &Syntax) -> Result<Option<Tail<'_>>, &'static str> {
         {
             return Err("a separated repetition tail with malformed prefix framing");
         }
+        if fixed_suffix
+            .iter()
+            .step_by(2)
+            .any(|item| !matches!(item, Syntax::Atom { val, .. } if val == separator))
+        {
+            return Err("a separated repetition slice with malformed suffix framing");
+        }
     } else if parent != Name::from_components(["many"]) {
-        return Ok(None);
+        return Err("an optional capture mixed with fixed pattern syntax");
     }
-    if prefix.iter().any(|p| {
-        p.kind()
-            .is_some_and(|k| k.leaf_view() == LeafView::Str("antiquot_suffix_splice"))
-    }) {
-        return Err("multiple repetition captures in one pattern sequence");
-    }
-    Ok(Some(Tail { prefix, sequence }))
+    Ok(Some(Slice {
+        prefix,
+        fixed_suffix,
+        sequence,
+    }))
 }
 
-/// Extract only after matching established the prefix. Keep the captured
-/// leaves (including source locations and hygiene) verbatim. Do not encode
-/// from-the-end indices into the journal's ordinary child paths.
-pub(in super::super) fn project<'a>(
+impl Slice<'_> {
+    fn range(&self, len: usize) -> Option<std::ops::Range<usize>> {
+        let end = len.checked_sub(self.fixed_suffix.len())?;
+        (end >= self.prefix.len()).then_some(self.prefix.len()..end)
+    }
+}
+
+/// Resolve a structural pattern path, translating every suffix offset against
+/// the corresponding matched value. This also covers nested patterns inside a
+/// suffix and keeps serialized paths independent of the number of arguments.
+pub(super) fn resolve<'a>(
+    pattern: Option<&Syntax>,
+    args: &'a [Syntax],
+    path: &[usize],
+    visited: &mut usize,
+) -> Result<std::borrow::Cow<'a, Syntax>, &'static str> {
+    if path.len() > MAX_DESCR_DEPTH {
+        return Err("a capture path past the depth budget");
+    }
+    templates::charge(visited)?;
+    let (first, rest) = path.split_first().ok_or("an empty capture path")?;
+    let mut value = args.get(*first).ok_or("a capture without its operand")?;
+    let mut pattern = match pattern {
+        Some(p) => Some(
+            node_args(p)
+                .and_then(|p| p.get(*first))
+                .ok_or("a capture outside its pattern")?,
+        ),
+        None => None,
+    };
+    for index in rest {
+        templates::charge(visited)?;
+        let value_args = node_args(value).ok_or("a capture through a syntax leaf")?;
+        let mut actual = *index;
+        if let Some(p) = pattern {
+            // Scanning the same pattern for several suffix captures is real
+            // work too. Charge it before allocating a projected capture.
+            for _ in node_args(p).unwrap_or(&[]) {
+                templates::charge(visited)?;
+            }
+            if let Some(slice) = slice(p)? {
+                let range = slice
+                    .range(value_args.len())
+                    .ok_or("a capture without fixed ends")?;
+                if *index == slice.prefix.len() {
+                    return Err("a capture path into a repetition marker");
+                }
+                if *index > slice.prefix.len() {
+                    let offset = *index - slice.prefix.len() - 1;
+                    if offset >= slice.fixed_suffix.len() {
+                        return Err("a capture beyond its pattern suffix");
+                    }
+                    actual = range.end + offset;
+                }
+            }
+        }
+        value = value_args
+            .get(actual)
+            .ok_or("a capture without its matched child")?;
+        pattern = match pattern {
+            Some(p) => Some(
+                node_args(p)
+                    .and_then(|p| p.get(*index))
+                    .ok_or("a capture outside its pattern")?,
+            ),
+            None => None,
+        };
+    }
+    project_metered(pattern, value, visited)
+}
+
+/// Match first, then extract the exact middle, including original source
+/// leaves and hygiene. Account for projected subtrees before copying them.
+fn project_metered<'a>(
+    pattern: Option<&Syntax>,
+    value: &'a Syntax,
+    visited: &mut usize,
+) -> Result<std::borrow::Cow<'a, Syntax>, &'static str> {
+    if let Some(pattern) = pattern {
+        for _ in node_args(pattern).unwrap_or(&[]) {
+            templates::charge(visited)?;
+        }
+    }
+    if let Some(pattern) = pattern
+        && let Some(slice) = slice(pattern)?
+    {
+        let items = null_args(value).ok_or("a repetition slice outside its sequence")?;
+        let range = slice
+            .range(items.len())
+            .ok_or("a repetition slice without its fixed ends")?;
+        templates::charge(visited)?;
+        let captured = items[range]
+            .iter()
+            .map(|item| templates::copy_capture(item, visited))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(std::borrow::Cow::Owned(null_node(captured)));
+    }
+    Ok(std::borrow::Cow::Borrowed(value))
+}
+
+#[cfg(test)]
+fn project<'a>(
     pattern: Option<&Syntax>,
     value: &'a Syntax,
 ) -> Result<std::borrow::Cow<'a, Syntax>, &'static str> {
-    if let Some(pattern) = pattern
-        && let Some(tail) = tail(pattern)?
-    {
-        let items = null_args(value).ok_or("a repetition tail outside its sequence")?;
-        let suffix = items
-            .get(tail.prefix.len()..)
-            .ok_or("a repetition tail without its prefix")?;
-        return Ok(std::borrow::Cow::Owned(null_node(suffix.to_vec())));
-    }
-    Ok(std::borrow::Cow::Borrowed(value))
+    project_metered(pattern, value, &mut 0)
 }
 
 impl Sequence<'_> {
@@ -366,14 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_tail_partitions_and_duplicate_variables_remain_refusals() {
+    fn fixed_suffixes_bind_but_ambiguous_partitions_and_duplicate_variables_refuse() {
         let name = Name::from_components(["xs"]);
         let suffix = sequence("many", "*", synthetic_ident(name.clone()));
         let splice = null_args(&suffix).unwrap()[0].clone();
         assert!(variables(&[null_node(vec![splice.clone(), splice.clone()])]).is_err());
         let head = node_args(&splice).unwrap()[0].clone();
         assert!(variables(&[null_node(vec![head, splice.clone()])]).is_err());
-        assert!(variables(&[null_node(vec![splice, Syntax::Missing])]).is_err());
+        assert!(variables(&[null_node(vec![splice, Syntax::Missing])]).is_ok());
     }
 
     #[test]
@@ -388,7 +494,7 @@ mod tests {
             Syntax::atom(SourceInfo::None, ","),
             null_args(&suffix).unwrap()[0].clone(),
         ]);
-        let capture = tail(&pattern).unwrap().unwrap();
+        let capture = slice(&pattern).unwrap().unwrap();
         assert_eq!(capture.prefix.len(), 2);
         let a = synthetic_ident(Name::from_components(["a"]));
         let b = synthetic_ident(Name::from_components(["b"]));
@@ -428,7 +534,7 @@ mod tests {
                 splice,
             ]),
         ] {
-            assert!(tail(&pattern).is_err());
+            assert!(slice(&pattern).is_err());
             assert!(variables(&[pattern]).is_err());
         }
     }

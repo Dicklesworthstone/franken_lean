@@ -48,7 +48,7 @@ pub(in crate::extensions) fn checked(
     replace_antiquotations(contents)
 }
 
-fn charge(visited: &mut usize) -> Result<(), &'static str> {
+pub(super) fn charge(visited: &mut usize) -> Result<(), &'static str> {
     *visited = visited
         .checked_add(1)
         .ok_or("macro template work overflow")?;
@@ -60,7 +60,7 @@ fn charge(visited: &mut usize) -> Result<(), &'static str> {
 
 /// Multiple splices may duplicate large subtrees, not merely many top-level
 /// elements. Charge their expanded node weight before allocating each copy.
-fn copy_capture(value: &Syntax, visited: &mut usize) -> Result<Syntax, &'static str> {
+pub(super) fn copy_capture(value: &Syntax, visited: &mut usize) -> Result<Syntax, &'static str> {
     let mut pending = vec![value];
     while let Some(node) = pending.pop() {
         charge(visited)?;
@@ -122,17 +122,13 @@ pub(in crate::extensions) fn instantiate(
     context: &Name,
     scope: u64,
 ) -> Result<Syntax, &'static str> {
+    let mut visited = 0;
     let bound: BTreeMap<&Name, Cow<'_, Syntax>> = rule
         .variables
         .iter()
         .map(|(path, name)| {
-            let child = at_path(args, path).ok_or("a notation node without its operand")?;
-            let pattern = rule
-                .pattern
-                .as_ref()
-                .and_then(node_args)
-                .and_then(|args| at_path(args, path));
-            repetition::project(pattern, child).map(|child| (name, child))
+            repetition::resolve(rule.pattern.as_ref(), args, path, &mut visited)
+                .map(|child| (name, child))
         })
         .collect::<Result<_, _>>()?;
     enum Step<'a> {
@@ -143,7 +139,6 @@ pub(in crate::extensions) fn instantiate(
     }
     let mut steps = vec![Step::Visit(&rule.rhs)];
     let mut built = Vec::new();
-    let mut visited = 0;
     while let Some(step) = steps.pop() {
         match step {
             Step::Visit(syntax @ Syntax::Node { info, kind, args }) => {

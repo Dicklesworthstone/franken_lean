@@ -79,7 +79,7 @@ fn bad_expansions_false_results_and_unsupported_splices_refuse() {
         "def wrong : List Nat := copy![true]",
         "macro \"scalar!\" x:term:max : term => `([$x,*])\ndef wrong := scalar! 4",
         "macro \"unbound!\" : term => `([$xs,*])\ndef wrong := unbound!",
-        "syntax \"mixed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(mixed![0, $xs,*, 1]) => `([$xs,*])\ndef wrong := mixed![0, 2, 1]",
+        "syntax \"mixed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(mixed![0, $xs,*, 1]) => `([$xs,*])\ntheorem wrong : mixed![0, 2, 1] = [42] := rfl",
         "syntax \"bracketed!\" \"[\" term,* \"]\" : term\nmacro_rules | `(bracketed![$[$x],*]) => `([$x,*])\ndef wrong := bracketed![1]",
         "syntax \"noFallback!\" term:max : term\nmacro_rules | `(noFallback! $x) => `((7 : Nat))\nmacro_rules | `(noFallback! $x) => `([$x,*])\ndef wrong := noFallback! 4",
     ] {
