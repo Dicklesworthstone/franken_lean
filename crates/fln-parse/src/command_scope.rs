@@ -496,6 +496,7 @@ fn declaration(s: &str) -> bool {
             | "#eval"
             | "#guard"
             | "#synth"
+            | "#reduce"
             | "#print"
     )
 }

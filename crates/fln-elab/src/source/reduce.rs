@@ -5,6 +5,8 @@
 //! resubmitted in an unproductive loop. Neither reduction nor transparency can
 //! publish a declaration or eliminate an original source typing obligation.
 mod imported_smart;
+mod meta;
+pub(in crate::source) use meta::ReduceConfig;
 #[cfg(test)]
 mod projection_tests;
 mod quotient;

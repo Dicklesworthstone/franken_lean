@@ -11749,8 +11749,12 @@ fn render_lean_source_check_line(
         ),
         _ => None,
     };
-    // `#synth C` prints the instance it found and nothing else (`logInfo val`).
-    if kind.as_deref() == Some("Lean.Parser.Command.synth") {
+    // `#synth C` prints the instance it found and nothing else (`logInfo val`), and `#reduce e`
+    // its normal form (`logInfoAt tk e`).
+    if matches!(
+        kind.as_deref(),
+        Some("Lean.Parser.Command.synth" | "Lean.reduceCmd")
+    ) {
         let Some((value, _)) = &opened else {
             return Err(source_failure(
                 "internal-fault",

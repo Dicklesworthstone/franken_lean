@@ -1628,6 +1628,73 @@ impl Engine<'_> {
 }
 
 impl ElabTxn {
+    /// The heartbeats this transaction may still spend; unbounded without a limit.
+    fn remaining_heartbeats(&self) -> u64 {
+        if self.budget.max_heartbeats == 0 {
+            u64::MAX
+        } else {
+            self.budget
+                .max_heartbeats
+                .saturating_sub(self.budget.heartbeats_consumed)
+        }
+    }
+
+    /// A solver over a copy of this transaction, metered by `budget` and the heartbeats left.
+    fn engine<'a>(
+        &self,
+        budget: UnificationBudget,
+        cancelled: &'a dyn Fn() -> bool,
+        pending: Option<&'a mut dyn PendingSynthesis>,
+    ) -> Engine<'a> {
+        let remaining = self.remaining_heartbeats();
+        Engine {
+            work: self.clone(),
+            budget,
+            meter: Meter {
+                steps: 0,
+                nodes: 0,
+                max_steps: budget.max_steps.min(remaining),
+                max_nodes: budget.max_visited_nodes,
+                heartbeat_bound: remaining <= budget.max_steps,
+                cancelled,
+            },
+            reserved: HashSet::new(),
+            next_local: self.mvars.unify_locals(),
+            assigned: Vec::new(),
+            assigned_levels: Vec::new(),
+            residuals: Vec::new(),
+            awakened: Vec::new(),
+            kernel_checks: 0,
+            fact_cache: HashMap::new(),
+            local_facts: local_facts::Cache::default(),
+            nat_literals_valid: None,
+            projection_registry: crate::instances::RegistryCache::default(),
+            pending: pending::PendingState::new(pending, remaining),
+            congruence_depth: 0,
+            fail_fast: false,
+        }
+    }
+
+    /// `expr` in weak-head normal form under `locals`, by this solver's reducer at `budget`'s
+    /// transparency: beta, zeta, projection, iota, quotient, delta and the pin's `reduceNat?`
+    /// rung before delta (`Lean/Meta/WHNF.lean`, `whnfImp`). Nothing is assigned; the work is
+    /// charged to this transaction's heartbeats.
+    pub fn whnf_with(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+        budget: UnificationBudget,
+    ) -> Result<Expr, UnificationError> {
+        let mut engine = self.engine(budget, &|| false, None);
+        let result = engine.whnf(expr, locals);
+        self.budget.heartbeats_consumed = self
+            .budget
+            .heartbeats_consumed
+            .checked_add(engine.meter.steps)
+            .ok_or(UnificationError::HeartbeatLimit)?;
+        result
+    }
+
     pub fn unify(
         &mut self,
         lhs: &Expr,
@@ -1726,39 +1793,7 @@ impl ElabTxn {
                 limit: budget.max_visited_nodes,
             });
         }
-        let remaining = if self.budget.max_heartbeats == 0 {
-            u64::MAX
-        } else {
-            self.budget
-                .max_heartbeats
-                .saturating_sub(self.budget.heartbeats_consumed)
-        };
-        let mut engine = Engine {
-            work: self.clone(),
-            budget,
-            meter: Meter {
-                steps: 0,
-                nodes: 0,
-                max_steps: budget.max_steps.min(remaining),
-                max_nodes: budget.max_visited_nodes,
-                heartbeat_bound: remaining <= budget.max_steps,
-                cancelled,
-            },
-            reserved: HashSet::new(),
-            next_local: self.mvars.unify_locals(),
-            assigned: Vec::new(),
-            assigned_levels: Vec::new(),
-            residuals: Vec::new(),
-            awakened: Vec::new(),
-            kernel_checks: 0,
-            fact_cache: HashMap::new(),
-            local_facts: local_facts::Cache::default(),
-            nat_literals_valid: None,
-            projection_registry: crate::instances::RegistryCache::default(),
-            pending: pending::PendingState::new(pending, remaining),
-            congruence_depth: 0,
-            fail_fast: false,
-        };
+        let mut engine = self.engine(budget, cancelled, pending);
         let result = engine.solve(equations, typings, delayed);
         // Synthesis spends the same heartbeats as the batch that asked for it,
         // including when it, or the batch, stops without an answer.

@@ -5768,6 +5768,27 @@ fn query_term(
         })?;
         return context.close_query_section(term, Vec::new());
     }
+    // `#reduce e` (`elabReduce`, Lean/Elab/BuiltinCommand.lean:459): `e` elaborated with no
+    // expected type, its universe holes made parameters, then its normal form
+    // (`Meta.reduce`), which the candidate states at `e`'s type and the caller prints alone.
+    let reduce = Name::from_components(["Lean", "reduceCmd"]);
+    if !evaluate && syntax.kind() == Some(&reduce) {
+        let parts = expect_node(syntax, &reduce, 3, "Lean.reduceCmd")?;
+        expect_atom(&parts[0], "#reduce", "reduce keyword")?;
+        let config = reduce_config(&parts[1])?;
+        let term = context.term(&parts[2], None)?;
+        context.complete_local_functions()?;
+        let level_params = context.generalize_level_mvars(&term)?;
+        let term = context.finish(term)?;
+        let value = context.meta_reduce(&term.value, config)?;
+        return context.close_query_section(
+            Typed {
+                value,
+                type_: term.type_,
+            },
+            level_params,
+        );
+    }
     // `#print` (`Lean/Elab/Print.lean`): its identifier or string is elaborated as `#check`
     // elaborates a term, and the caller prints from the constant or literal the candidate is.
     let printed = (!evaluate)
@@ -5897,6 +5918,56 @@ impl Context {
         }
         Ok((term, level_params, positions))
     }
+}
+
+/// `#reduce`'s options (`reduceConfig := many(colGt atomic(" (" ident " := ") term ")")`), each a
+/// boolean written `true` or `false`. Every other option keeps the pin's default, and naming one is
+/// refused, as is a value this engine does not read.
+fn reduce_config(syntax: &Syntax) -> Result<reduce::ReduceConfig, NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &Name::from_components(["Lean", "reduceConfig"]),
+        1,
+        "Lean.reduceConfig",
+    )?;
+    let mut config = reduce::ReduceConfig::default();
+    for item in expect_null_args(&parts[0], "reduce options")? {
+        let [
+            open,
+            Syntax::Ident { val: name, .. },
+            assign,
+            Syntax::Ident { val: value, .. },
+            close,
+        ] = expect_null_args(item, "reduce option")?
+        else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a #reduce option written `(name := true)` or `(name := false)`",
+            });
+        };
+        expect_atom(open, "(", "reduce option bracket")?;
+        expect_atom(assign, ":=", "reduce option assignment")?;
+        expect_atom(close, ")", "reduce option bracket")?;
+        let value = match value.to_display_string().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "a #reduce option written `(name := true)` or `(name := false)`",
+                });
+            }
+        };
+        match name.to_display_string().as_str() {
+            "types" => config.types = value,
+            "proofs" => config.proofs = value,
+            "implicits" => config.implicits = value,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "a #reduce option among `types`, `proofs` and `implicits`",
+                });
+            }
+        }
+    }
+    Ok(config)
 }
 
 fn query_declaration(

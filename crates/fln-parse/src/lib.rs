@@ -5012,16 +5012,20 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                 if symbol == "#eval"
                     || symbol == "#check"
                     || symbol == "#guard"
-                    || symbol == "#synth" =>
+                    || symbol == "#synth"
+                    || symbol == "#reduce" =>
             {
                 // `#guard e` (`syntax (name := guardCmd) "#guard " term : command`,
                 // `Init/Guard.lean:127`) is an evaluation whose result must be `true`.
                 // `#synth C` (`Lean.Parser.Command.synth`) is a scratch query, as `#check` is:
-                // the instance it finds is printed, nothing is published.
+                // the instance it finds is printed, nothing is published. So is `#reduce e`
+                // (`syntax (name := reduceCmd) "#reduce" reduceConfig term : command`,
+                // `Init/Notation.lean:766`), which prints its term's normal form.
                 let (kind, command_kind) = match symbol.as_str() {
                     "#eval" => (SourceCommandKind::Evaluation, "eval"),
                     "#guard" => (SourceCommandKind::Evaluation, "guardCmd"),
                     "#synth" => (SourceCommandKind::Check, "synth"),
+                    "#reduce" => (SourceCommandKind::Check, "reduce"),
                     _ => (SourceCommandKind::Check, "check"),
                 };
                 let tokens = run
@@ -5032,8 +5036,29 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         Event::Trivia(_) | Event::Refused { .. } => None,
                     })
                     .collect::<Vec<_>>();
-                let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, 1)?;
                 let leaves = Leaves::build(view.normalized(), &tokens)?;
+                // `#reduce`'s configuration, `reduceConfig := many(colGt atomic(" (" ident " := ")
+                // term ")")` (`Init/Notation.lean:750`): each `(name := value)` here has a
+                // one-token value, as `true`; a longer one is left to the term parser to refuse.
+                let mut term_start = 1;
+                let mut config = Vec::new();
+                if command_kind == "reduce" {
+                    while term_locals::word(&tokens, term_start, "(")
+                        && matches!(
+                            tokens.get(term_start + 1).map(|token| &token.kind),
+                            Some(TokenKind::Ident(_))
+                        )
+                        && term_locals::word(&tokens, term_start + 2, ":=")
+                        && term_locals::word(&tokens, term_start + 4, ")")
+                    {
+                        let item = (term_start..term_start + 5)
+                            .map(|at| leaves.leaf(at))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        config.push(null_node(item));
+                        term_start += 5;
+                    }
+                }
+                let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, term_start)?;
                 let epilogue = leaves.attachment().epilogue();
                 let value = bounded_value_syntax(
                     &leaves,
@@ -5044,7 +5069,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     DefinitionGrammar::Scalar,
                 )?;
                 let query_term = tokens
-                    .get(1)
+                    .get(term_start)
                     .zip(tokens.last())
                     .and_then(|(first, last)| {
                         ByteSpan::new(first.extent.start(), last.extent.end())
@@ -5053,13 +5078,28 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         at: BytePos(source.len()),
                         expected: NatDefinitionExpectation::ScalarValue,
                     })?;
+                let syntax = if command_kind == "reduce" {
+                    Syntax::node(
+                        Name::from_components(["Lean", "reduceCmd"]),
+                        vec![
+                            leaves.leaf(0)?,
+                            Syntax::node(
+                                Name::from_components(["Lean", "reduceConfig"]),
+                                vec![null_node(config)],
+                            ),
+                            value,
+                        ],
+                    )
+                } else {
+                    Syntax::node(
+                        parser_kind(&["Command", command_kind]),
+                        vec![leaves.leaf(0)?, value],
+                    )
+                };
                 Ok(ParsedSourceCommand {
                     kind,
                     source_view: view,
-                    syntax: Syntax::node(
-                        parser_kind(&["Command", command_kind]),
-                        vec![leaves.leaf(0)?, value],
-                    ),
+                    syntax,
                     epilogue,
                     query_term: Some(query_term),
                 })
@@ -6774,15 +6814,17 @@ mod nat_definition_tests {
         assert!(empty.imports.is_empty());
         assert!(empty.commands.is_empty());
 
-        // `#reduce` parses at the pin and not here.
-        let unsupported = partition_source_module(b"#reduce answer")
-            .expect("the header parser leaves an unsupported body to the command parser");
-        assert!(unsupported.imports.is_empty());
-        assert_eq!(unsupported.commands.len(), 1);
-        assert!(matches!(
-            parse_source_command(unsupported.commands[0].1),
-            Err(NatDefinitionParseError::OutsideSeedGrammar { .. })
-        ));
+        // `#reduce` is the pin's `Lean.reduceCmd`: keyword, options, term.
+        let reduce = partition_source_module(b"#reduce answer")
+            .expect("the header parser leaves the body to the command parser");
+        assert!(reduce.imports.is_empty());
+        assert_eq!(reduce.commands.len(), 1);
+        let parsed = parse_source_command(reduce.commands[0].1).expect("`#reduce` parses");
+        assert_eq!(parsed.kind(), SourceCommandKind::Check);
+        assert_eq!(
+            parsed.syntax().kind(),
+            Some(&Name::from_components(["Lean", "reduceCmd"]))
+        );
     }
 
     #[test]
