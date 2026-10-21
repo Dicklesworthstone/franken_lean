@@ -138,7 +138,9 @@ impl Context {
             let sort = self
                 .known_type(&type_)?
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-            let completed = self.finish(Typed {
+            // `extends Inhabited α` under `α : Type _` keeps the parameter's universe hole;
+            // the record generalizes it with its own telescope.
+            let completed = self.finish_open_universes(Typed {
                 value: type_,
                 type_: sort,
             })?;

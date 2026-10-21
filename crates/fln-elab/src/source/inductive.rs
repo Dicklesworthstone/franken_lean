@@ -28,7 +28,9 @@ pub(super) fn checked_type(
     budget: RecordBudget,
 ) -> Result<Expr, NatDefinitionElabError> {
     let type_ = context.known_type(&value)?.ok_or_else(invalid)?;
-    let term = context.finish(Typed { value, type_ })?;
+    // `α → Prop` under an auto-bound `α : Sort ?u` lives in `Sort (imax ?u 0)`; that hole is
+    // the family's to generalize, like the locals' below.
+    let term = context.finish_open_universes(Typed { value, type_ })?;
     let mut locals = context.txn.lctx.decls().to_vec();
     for local in &mut locals {
         local.type_ = context.instantiate(&local.type_)?;
@@ -563,8 +565,43 @@ pub(super) fn elaborate_inductive_scoped(
         mut constructors,
         mut field_universes,
         annotations,
-        inferred,
+        mut inferred,
     } = bodies(&mut context, &parameters, &indices, &self_id, ctors, budget)?;
+    // An auto-bound implicit or a written `Type _` leaves a universe hole in the family's
+    // parameters or indices. Once the constructors have constrained it, it becomes a level
+    // parameter `u_1`, `u_2`, … in order of first occurrence (the pin's
+    // `levelMVarToParamAtInductives`): `inductive T (α : Type _)` is `T.{u_1} (α : Type u_1)
+    // : Type u_1`. A hole only a constructor mentions is not generalized at the pin (it is
+    // fitted to the family's universe, or defaulted), so it stays refused here.
+    let universe_roots: Vec<Expr> = parameters
+        .iter()
+        .chain(&indices)
+        .map(|local| local.type_.clone())
+        .collect();
+    context.generalize_declaration_universes(&universe_roots)?;
+    let instantiate_level =
+        |context: &mut Context, level: &Level| -> Result<Level, NatDefinitionElabError> {
+            match context.instantiate(&Expr::sort(level.clone()))?.node() {
+                ExprNode::Sort { level } if !level.has_mvar() => Ok(level.clone()),
+                ExprNode::Sort { .. } => Err(failure(SourceInferenceError::UnresolvedUniverses)),
+                _ => Err(failure(SourceInferenceError::ExpectedType)),
+            }
+        };
+    inferred = instantiate_level(&mut context, &inferred)?;
+    for universes in &mut field_universes {
+        for level in universes {
+            *level = instantiate_level(&mut context, level)?;
+        }
+    }
+    for ctor in &mut constructors {
+        for field in &mut ctor.fields {
+            field.type_ = context.instantiate(&field.type_)?;
+            context.require_resolved(std::slice::from_ref(&field.type_))?;
+        }
+        for index in &mut ctor.result_indices {
+            *index = context.instantiate(index)?;
+        }
+    }
     for parameter in &mut parameters {
         parameter.type_ = context.instantiate(&parameter.type_)?;
         context.require_resolved(std::slice::from_ref(&parameter.type_))?;
@@ -879,7 +916,9 @@ fn bodies(
         for field in &mut fields {
             let domain = context.instantiate(&field.type_)?;
             let ty = context.known_type(&domain)?.ok_or_else(invalid)?;
-            let completed = context.finish(Typed {
+            // A field's universe may still be a hole that the family's parameters
+            // determine (`α : Type ?u`); the family generalizes it afterwards.
+            let completed = context.finish_open_universes(Typed {
                 value: domain,
                 type_: ty,
             })?;

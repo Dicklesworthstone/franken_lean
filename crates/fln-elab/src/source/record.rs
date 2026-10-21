@@ -196,6 +196,7 @@ pub(super) fn elaborate_record_scoped(
         )));
     }
     let mut output = inheritance.fields;
+    let parent_count = output.len();
     let mut defaults = Vec::new();
     let mut helpers = Vec::new();
     for field in fields {
@@ -437,8 +438,25 @@ pub(super) fn elaborate_record_scoped(
     }
     // An auto-bound implicit (or a written `Sort _`) leaves a universe hole in the telescope:
     // generalize it into a level parameter as a definition does (the pin's
-    // `@Box : {α : Sort u_1} → α → Type` for `structure Box (x : α)`, 2026-10-11).
-    context.generalize_declaration_universes(&roots)?;
+    // `@Box : {α : Sort u_1} → α → Type` for `structure Box (x : α)`, 2026-10-11). Only the
+    // header's holes, in the parameters and the parents, become parameters, as at the pin
+    // (`collectExtraHeaderLMVars`; `levelMVarToParamAtInductives` skips a constructor hole no
+    // header mentions). A hole only a field mentions is fitted or defaulted there, never
+    // generalized: generalizing it accepted `structure S where β : Type _` with `⟨Type⟩`,
+    // which the pin rejects. It stays refused here.
+    let header: Vec<Expr> = parameters
+        .iter()
+        .chain(&section)
+        .chain(&output[..parent_count])
+        .map(|local| local.type_.clone())
+        .collect();
+    context.generalize_declaration_universes(&header)?;
+    for root in &roots {
+        context.tick()?;
+        if context.instantiate(root)?.has_level_mvar() {
+            return Err(failure(SourceInferenceError::UnresolvedUniverses));
+        }
+    }
     for local in parameters
         .iter_mut()
         .chain(section.iter_mut())

@@ -97,6 +97,19 @@ pub(in crate::source) fn elaborate_mutual(
             }));
         }
     }
+    // A universe hole in a member's parameters or indices (`α : Type _`, an auto-bound
+    // implicit) becomes a level parameter `u_1`, … as in a single family. Members generalize
+    // separately, before their parameters are compared, so equal headers name the same
+    // parameter; a constructor can no longer constrain the hole, which only refuses more.
+    for h in &mut headers {
+        let roots: Vec<Expr> = h
+            .parameters
+            .iter()
+            .chain(&h.indices)
+            .map(|local| local.type_.clone())
+            .collect();
+        h.context.generalize_declaration_universes(&roots)?;
+    }
     // Every member declares the same names (checked above).
     let declared_levels =
         headers[0].context.level_params[..headers[0].context.explicit_levels].to_vec();
@@ -238,7 +251,7 @@ pub(in crate::source) fn elaborate_mutual(
         if i == 0 {
             base = h.context.txn.lctx.clone();
         }
-        let result = bodies(
+        let mut result = bodies(
             &mut h.context,
             &h.parameters,
             &h.indices,
@@ -246,6 +259,20 @@ pub(in crate::source) fn elaborate_mutual(
             h.ctors,
             budget,
         )?;
+        // A universe hole only a constructor mentions stays refused, as in a single family.
+        for ctor in &mut result.constructors {
+            for field in &mut ctor.fields {
+                field.type_ = h.context.instantiate(&field.type_)?;
+                h.context
+                    .require_resolved(std::slice::from_ref(&field.type_))?;
+            }
+        }
+        if h.context
+            .instantiate(&Expr::sort(result.inferred.clone()))?
+            .has_level_mvar()
+        {
+            return Err(failure(SourceInferenceError::UnresolvedUniverses));
+        }
         inferred = Level::max(inferred, result.inferred.clone()).map_err(|_| invalid())?;
         for name in &h.context.level_params {
             if !levels.contains(name) {

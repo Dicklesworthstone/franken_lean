@@ -150,6 +150,132 @@ fn inductive_constructor_and_structure_headers_bind_leading_implicits() {
     assert_eq!(styles("OpAssoc", 1), [implicit("α")]);
 }
 
+/// A universe hole in an inductive family's telescope, from `Type _`, `Sort _` or an auto-bound
+/// implicit, becomes a level parameter once the constructors are elaborated, as the pin's
+/// `levelMVarToParamAtInductives` makes it. Each expectation is the pinned v4.32.0's
+/// `#check @c` under `pp.universes`.
+#[test]
+fn inductive_universe_holes_become_level_parameters() {
+    let engine = checked(
+        "inductive T (α : Type _) where\n  | mk : α → T α\n\
+         inductive Mem (a : α) : α → Prop where\n  | refl : Mem a a\n\
+         inductive Opt (α : Sort _) where\n  | none\n  | some (x : α)\n\
+         inductive Two (α : Type _) (β : Sort _) where\n  | mk (x : α) (y : β)\n\
+         inductive L (α : Type u) where\n  | nil\n  | cons (a : α) (t : L α)\n\
+         inductive V (α : Sort _) where\n  | mk (xs : L α) : V α\n\
+         mutual\ninductive Ev (α : Type _) where\n  | nil : Ev α\n  | cons : α → Od α → Ev α\n\
+         inductive Od (α : Type _) where\n  | cons : α → Ev α → Od α\nend\n",
+    );
+    let environment = engine.environment();
+    let mut printer = fln::pretty::Printer::new(environment);
+    for (name, levels, type_) in [
+        ("T", "u_1", "Type u_1 → Type u_1"),
+        ("T.mk", "u_1", "{α : Type u_1} → α → T α"),
+        ("Mem", "u_1", "{α : Sort u_1} → α → α → Prop"),
+        ("Mem.refl", "u_1", "∀ {α : Sort u_1} {a : α}, Mem a a"),
+        ("Opt", "u_1", "Sort u_1 → Sort (max 1 u_1)"),
+        ("Opt.some", "u_1", "{α : Sort u_1} → α → Opt α"),
+        (
+            "Two",
+            "u_1 u_2",
+            "Type u_1 → Sort u_2 → Sort (max (u_1 + 1) u_2)",
+        ),
+        (
+            "Two.mk",
+            "u_1 u_2",
+            "{α : Type u_1} → {β : Sort u_2} → α → β → Two α β",
+        ),
+        // A constructor may constrain the hole first: `L α` makes `α : Sort ?u` a `Type`.
+        ("V", "u_1", "Type u_1 → Type u_1"),
+        ("V.mk", "u_1", "{α : Type u_1} → L α → V α"),
+        // Members of a mutual block generalize their equal headers to the same parameter.
+        ("Ev", "u_1", "Type u_1 → Type u_1"),
+        ("Ev.cons", "u_1", "{α : Type u_1} → α → Od α → Ev α"),
+        ("Od.cons", "u_1", "{α : Type u_1} → α → Ev α → Od α"),
+    ] {
+        let info = environment
+            .find(&Name::from_components(name.split('.')))
+            .unwrap_or_else(|| panic!("{name} not declared"));
+        let declared: Vec<_> = info
+            .constant_val()
+            .level_params
+            .iter()
+            .map(Name::to_display_string)
+            .collect();
+        assert_eq!(declared.join(" "), levels, "{name}");
+        assert_eq!(
+            printer.expr(&info.constant_val().type_, 0).unwrap(),
+            type_,
+            "{name}"
+        );
+    }
+}
+
+/// A universe hole only a constructor or a field mentions is not a parameter at the pin: it is
+/// fitted to the family's universe or defaulted (`inductive T | mk (β : Type _)` is `T : Type 1`,
+/// and `structure S where β : Type _` rejects `⟨Type⟩`). Generalizing it would accept that
+/// program, so it stays refused.
+#[test]
+fn a_universe_hole_no_header_mentions_is_refused() {
+    for source in [
+        "inductive T where\n  | mk (β : Type _) : T\n",
+        "inductive U (α : Type _) where\n  | mk (β : Sort _) (x : α) : U α\n",
+        "mutual\ninductive A where\n  | mk (β : Type _) : A\ninductive B where\n  | mk : A → B\nend\n",
+        "structure S where\n  β : Type _\n",
+        "structure S where\n  β : Type _\nexample : S := ⟨Type⟩\n",
+    ] {
+        let error = refused(source);
+        assert!(error.contains("UnresolvedUniverses"), "{source}\n{error}");
+    }
+}
+
+/// A structure or class parent keeps its parameters' universe holes until the record
+/// generalizes its whole telescope, as for its own fields. Expectations are the pinned
+/// v4.32.0's `#check @c` under `pp.universes`.
+#[test]
+fn structure_parents_keep_universe_holes_for_the_record_to_generalize() {
+    let engine = checked(
+        "class Pointed (α : Sort u) where\n  point : α\n\
+         class Foo (α : Type _) extends Pointed α\n\
+         structure S (α : Type _) extends Pointed α where\n  y : α\n\
+         class F (α : Sort _) extends Pointed α\n",
+    );
+    let environment = engine.environment();
+    let mut printer = fln::pretty::Printer::new(environment);
+    for (name, levels, type_) in [
+        ("Foo", "u_1", "Type u_1 → Type u_1"),
+        (
+            "Foo.toPointed",
+            "u_1",
+            "{α : Type u_1} → [self : Foo α] → Pointed α",
+        ),
+        ("S", "u_1", "Type u_1 → Type u_1"),
+        ("S.mk", "u_1", "{α : Type u_1} → Pointed α → α → S α"),
+        ("F", "u_1", "Sort u_1 → Sort (max 1 u_1)"),
+        (
+            "F.toPointed",
+            "u_1",
+            "{α : Sort u_1} → [self : F α] → Pointed α",
+        ),
+    ] {
+        let info = environment
+            .find(&Name::from_components(name.split('.')))
+            .unwrap_or_else(|| panic!("{name} not declared"));
+        let declared: Vec<_> = info
+            .constant_val()
+            .level_params
+            .iter()
+            .map(Name::to_display_string)
+            .collect();
+        assert_eq!(declared.join(" "), levels, "{name}");
+        assert_eq!(
+            printer.expr(&info.constant_val().type_, 0).unwrap(),
+            type_,
+            "{name}"
+        );
+    }
+}
+
 /// `variable (R : α → α → Prop)` makes `α` an implicit variable, included where `R` is:
 /// `@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), R x x → R x x`; an unused section leaves
 /// `s : Nat → Nat` alone. A field never auto-binds: the pin refuses `structure P where x : α`.
