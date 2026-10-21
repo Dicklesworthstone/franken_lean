@@ -17,7 +17,9 @@
 //! whole tactic sequence is one), and a named one the parser its name selects (`$x:ident` is
 //! `ident.antiquot`). Its children: the `$`, the escaping `$`s (none read here), the expression,
 //! and the `antiquotName` node or nothing. Antiquotations are read only inside a quotation; a
-//! splice (`$xs,*`, `$[…]?`, `$x*`) and an escaped `$$x` are refused.
+//! Repetition parsers own suffix splices (`$xs,*`, `$x*`, `$(xs)?`); a scalar
+//! parser still refuses them. Bracketed iteration splices and escaped `$$x`
+//! remain unsupported.
 use super::*;
 use std::ops::Range;
 
@@ -63,6 +65,91 @@ fn touching(tokens: &[LexedToken], left: usize, right: usize) -> bool {
         (Some(left), Some(right)) => left.extent.end() == right.extent.start(),
         _ => false,
     }
+}
+
+/// Find a suffix splice without parsing its antiquotation in the wrong slot.
+/// The owning repetition parses the prefix with its own item parser and a
+/// bounded end, then wraps that exact syntax as Basic.withAntiquotSuffixSplice
+/// does. A scalar parser never calls this door.
+pub(crate) fn repetition_suffix(
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+    suffix: &str,
+) -> Option<(usize, usize)> {
+    if !inside() || text(tokens, start) != Some("$") || start + 1 >= end {
+        return None;
+    }
+    if !touching(tokens, start, start + 1) {
+        return None;
+    }
+    let mut next = match &tokens[start + 1].kind {
+        TokenKind::Ident(_) => start + 2,
+        TokenKind::Symbol(s) if s == "_" => start + 2,
+        TokenKind::Symbol(s) if s == "(" => closing(tokens, start + 1, end)? + 1,
+        _ => return None,
+    };
+    if next + 1 < end
+        && text(tokens, next) == Some(":")
+        && touching(tokens, next - 1, next)
+        && touching(tokens, next, next + 1)
+        && matches!(tokens[next + 1].kind, TokenKind::Ident(_))
+    {
+        next += 2;
+    }
+    if next >= end {
+        return None;
+    }
+    // The suffix is a parser symbol, not part of the antiquotation's name.
+    // It may be lexed as a registered compound token or adjacent tokens.
+    let first = next;
+    let mut spelled = String::new();
+    while next < end {
+        if next > first && !touching(tokens, next - 1, next) {
+            return None;
+        }
+        spelled.push_str(text(tokens, next)?);
+        next += 1;
+        if spelled == suffix {
+            return Some((first, next));
+        }
+        if !suffix.starts_with(&spelled) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Preserve the pin's two-child suffix node and the original source extent,
+/// including when the lexer emitted the suffix as multiple adjacent tokens.
+pub(crate) fn wrap_repetition_splice(
+    leaves: &Leaves,
+    item: Syntax,
+    kind: &str,
+    suffix: &str,
+    first: usize,
+    end: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let head = leaves.leaf(first)?;
+    let tail = leaves.leaf(end - 1)?;
+    let info = match (head.info(), tail.info()) {
+        (
+            SourceInfo::Original { leading, pos, .. },
+            SourceInfo::Original {
+                trailing, end_pos, ..
+            },
+        ) => SourceInfo::Original {
+            leading,
+            pos,
+            trailing,
+            end_pos,
+        },
+        (info, _) => info,
+    };
+    Ok(Syntax::node(
+        Name::from_components([kind, "antiquot_suffix_splice"]),
+        vec![item, Syntax::atom(info, suffix)],
+    ))
 }
 
 fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {

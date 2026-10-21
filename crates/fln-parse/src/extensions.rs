@@ -2510,7 +2510,11 @@ impl Expander {
     /// One use of `rule`: its template with `args` (the node's children) in place of the
     /// variables, under a fresh macro scope.
     fn instantiate(&self, rule: &NotationRule, args: &[Syntax]) -> Result<Syntax, &'static str> {
-        let scope = self.expansions.get() + 1;
+        let scope = self
+            .expansions
+            .get()
+            .checked_add(1)
+            .ok_or("macro scope limit")?;
         self.expansions.set(scope);
         let context = &self.context;
         let bound: BTreeMap<&Name, &Syntax> = rule
@@ -2530,9 +2534,22 @@ impl Expander {
             Build(fln_syntax::source::SourceInfo, &'a Name, usize),
         }
         let mut steps = vec![Step::Visit(&rule.rhs)];
+        let mut repetition_work = 0;
         while let Some(step) = steps.pop() {
             match step {
-                Step::Visit(Syntax::Node { info, kind, args }) => {
+                Step::Visit(node @ Syntax::Node { info, kind, args }) => {
+                    if let Some(sequence) = quotation::repetition::whole(node)? {
+                        let name = sequence.name()?;
+                        let value = bound
+                            .get(&name)
+                            .copied()
+                            .ok_or("an unbound repetition capture")?;
+                        if !sequence.accepts(value, &mut repetition_work)? {
+                            return Err("a repetition capture with incompatible sequence framing");
+                        }
+                        leaves.push(value.clone());
+                        continue;
+                    }
                     steps.push(Step::Build(*info, kind, args.len()));
                     steps.extend(args.iter().enumerate().rev().map(|(index, child)| {
                         if raw_identifier_slot(kind, index) {
@@ -2832,6 +2849,13 @@ fn checked_template(
         if checked > MAX_TEMPLATE_NODES {
             return Err("a macro template past the node budget");
         }
+        if let Some(sequence) = quotation::repetition::whole(syntax)? {
+            let name = macro_variable(&sequence.name()?);
+            if !variables.iter().any(|(_, variable)| *variable == name) {
+                return Err("a repetition capture of no macro variable");
+            }
+            continue;
+        }
         if let Syntax::Node { kind, args, .. } = syntax {
             let leaf = components(kind).last().cloned().unwrap_or_default();
             if leaf == "antiquot" {
@@ -2852,7 +2876,7 @@ fn checked_template(
             pending.extend(args);
         }
     }
-    Ok(replace_antiquotations(contents))
+    replace_antiquotations(contents)
 }
 
 /// Template nodes [`macro_template`] walks before refusing.
@@ -2860,7 +2884,7 @@ const MAX_TEMPLATE_NODES: usize = 4096;
 
 /// `contents` with each antiquotation replaced by its variable's identifier (bottom-up, by an
 /// explicit stack).
-fn replace_antiquotations(contents: &Syntax) -> Syntax {
+fn replace_antiquotations(contents: &Syntax) -> Result<Syntax, &'static str> {
     enum Step<'a> {
         Visit(&'a Syntax),
         Build(&'a Syntax, usize),
@@ -2869,14 +2893,20 @@ fn replace_antiquotations(contents: &Syntax) -> Syntax {
     let mut built: Vec<Syntax> = Vec::new();
     while let Some(step) = steps.pop() {
         match step {
-            Step::Visit(syntax) => match (antiquotation_name(syntax), syntax) {
-                (Some(name), _) => built.push(synthetic_ident(macro_variable(&name))),
-                (None, node @ Syntax::Node { args, .. }) => {
-                    steps.push(Step::Build(node, args.len()));
-                    steps.extend(args.iter().rev().map(Step::Visit));
+            Step::Visit(syntax) => {
+                if let Some(sequence) = quotation::repetition::whole(syntax)? {
+                    built.push(sequence.template()?);
+                    continue;
                 }
-                (None, leaf) => built.push(leaf.clone()),
-            },
+                match (antiquotation_name(syntax), syntax) {
+                    (Some(name), _) => built.push(synthetic_ident(macro_variable(&name))),
+                    (None, node @ Syntax::Node { args, .. }) => {
+                        steps.push(Step::Build(node, args.len()));
+                        steps.extend(args.iter().rev().map(Step::Visit));
+                    }
+                    (None, leaf) => built.push(leaf.clone()),
+                }
+            }
             Step::Build(Syntax::Node { info, kind, .. }, count) => {
                 let args = built.split_off(built.len() - count);
                 built.push(Syntax::Node {
@@ -2888,7 +2918,7 @@ fn replace_antiquotations(contents: &Syntax) -> Syntax {
             Step::Build(leaf, _) => built.push(leaf.clone()),
         }
     }
-    built.pop().unwrap_or(Syntax::Missing)
+    built.pop().ok_or("an empty macro template")
 }
 
 /// An identifier the template itself supplies: no source position of its own.
@@ -4071,18 +4101,24 @@ impl Run<'_> {
             },
             Descr::SepBy {
                 item,
+                separator,
                 parser,
                 trailing,
                 at_least_one,
-                ..
             } => {
                 let item_follow = self.first(parser, depth + 1).then(follow);
+                let suffix = format!("{}*", separator.trim());
                 let mut items = Vec::new();
                 let mut next = at;
                 loop {
-                    let Some((parsed, after)) =
-                        self.parse(item, next, end, &item_follow, depth + 1)
-                    else {
+                    let Some((parsed, after)) = self.repeated_item(
+                        item,
+                        next,
+                        end,
+                        &item_follow,
+                        depth + 1,
+                        ("sepBy", &suffix),
+                    ) else {
                         if items.is_empty() || *trailing {
                             break;
                         }
@@ -4155,16 +4191,20 @@ impl Run<'_> {
         depth: usize,
     ) -> Parsed {
         match simple(name).as_deref() {
-            Some("optional") => Some(match self.parse(body, at, end, follow, depth + 1) {
-                Some((items, next)) => (vec![null_node(items)], next),
-                None => (vec![null_node(Vec::new())], at),
-            }),
+            Some("optional") => Some(
+                match self.repeated_item(body, at, end, follow, depth + 1, ("optional", "?")) {
+                    Some((items, next)) => (vec![null_node(items)], next),
+                    None => (vec![null_node(Vec::new())], at),
+                },
+            ),
             Some(alias @ ("many" | "many1")) => {
                 let repeat = self.first(body, depth + 1).then(follow);
                 let mut items = Vec::new();
                 let mut next = at;
                 let mut count = 0;
-                while let Some((parsed, after)) = self.parse(body, next, end, &repeat, depth + 1) {
+                while let Some((parsed, after)) =
+                    self.repeated_item(body, next, end, &repeat, depth + 1, ("many", "*"))
+                {
                     if after == next {
                         break;
                     }
@@ -4193,6 +4233,47 @@ impl Run<'_> {
             _ if transparent(name) => self.parse(body, at, end, follow, depth + 1),
             _ => None,
         }
+    }
+
+    /// Read the exact antiquotation the operand parser owns before wrapping a
+    /// repetition suffix. Bounding the operand before that suffix prevents a
+    /// scalar term parser from mistaking `*` for multiplication.
+    fn repeated_item(
+        &self,
+        body: &Descr,
+        at: usize,
+        end: usize,
+        follow: &Follow,
+        depth: usize,
+        splice: (&str, &str),
+    ) -> Parsed {
+        let (kind, suffix) = splice;
+        if let Some((suffix_at, next)) =
+            crate::quotations::repetition_suffix(self.tokens, at, end, suffix)
+        {
+            let (items, consumed) = self.parse(body, at, suffix_at, &Follow::End, depth)?;
+            let [capture] = items.as_slice() else {
+                return None;
+            };
+            if consumed != suffix_at
+                || !capture
+                    .kind()
+                    .is_some_and(|kind| kind.leaf_view() == LeafView::Str("antiquot"))
+            {
+                return None;
+            }
+            let splice = crate::quotations::wrap_repetition_splice(
+                self.leaves,
+                capture.clone(),
+                kind,
+                suffix,
+                suffix_at,
+                next,
+            )
+            .ok()?;
+            return Some((vec![splice], next));
+        }
+        self.parse(body, at, end, follow, depth)
     }
 
     /// `interpolatedStr(p)` over the chunks [`interpolate`] made: `interpolatedStrKind` holding

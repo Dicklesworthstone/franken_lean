@@ -6,6 +6,8 @@
 //! This is a bounded quotation interpreter, not execution of arbitrary MacroM.
 use super::*;
 
+pub(super) mod repetition;
+
 pub(super) fn at_path<'a>(args: &'a [Syntax], path: &[usize]) -> Option<&'a Syntax> {
     let (first, rest) = path.split_first()?;
     let mut current = args.get(*first)?;
@@ -29,6 +31,17 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
         visited += 1;
         if visited > MAX_TEMPLATE_NODES || path.len() > MAX_DESCR_DEPTH {
             return Err("a quoted macro pattern past the node or depth budget");
+        }
+        if let Some(sequence) = repetition::whole(pattern)? {
+            let name = sequence.name()?;
+            if name != Name::from_components(["_"]) {
+                let name = macro_variable(&name);
+                if !bound.insert(name.clone()) {
+                    return Err("a repeated quoted macro pattern variable");
+                }
+                variables.push((path, name));
+            }
+            continue;
         }
         if let Some(name) = antiquotation_name(pattern) {
             if name == Name::from_components(["_"]) {
@@ -78,6 +91,12 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
         visited += 1;
         if visited > MAX_TEMPLATE_NODES {
             return Err("quoted macro matching past the node budget");
+        }
+        if let Some(sequence) = repetition::whole(pattern)? {
+            if !sequence.accepts(value, &mut visited)? {
+                return Ok(false);
+            }
+            continue;
         }
         if antiquotation_name(pattern).is_some() {
             // The pin's getHeadInfo checks explicit concrete kinds, even for
