@@ -162,3 +162,13 @@ fn imported_reflexivity_tags_follow_module_edits_and_cache_invalidation() {
         recovered.checked.checked.result_logical_root
     );
 }
+
+#[test]
+fn large_default_set_ignores_unkeyed_nondefeq_theorems_without_elaborating_them() {
+    let mut source = String::new();
+    for index in 0..2000 {
+        source.push_str(&format!("@[simp] theorem noise_{index} (f : Nat -> Nat) (h : forall n, f n = n) (n : Nat) : f n = n := h n\n"));
+    }
+    source.push_str("@[reducible, simp] def eval {A : Type} {B : A -> Type} (x : A) (f : (x : A) -> B x) : B x := f x\ntheorem t (A B : Type) (x : A) (f : A -> B) (P : B -> Prop) (h : P (f x)) : P (eval x f) := by\n  dsimp\n  guard_target =ₛ P (f x)\n  exact h\n");
+    accepted("large_default_set", &source);
+}
