@@ -325,6 +325,22 @@ fn a_header_binder_group_elaborates_its_type_for_each_name() {
     }
 }
 
+/// `Type` takes a level only at leading precedence, as the pin's `checkPrec leadPrec` in
+/// `Lean.Parser.Term.type`: `pair Nat Type 1 Nat` passes `Type` and `1` as two arguments, while
+/// `Type 1` heading a term, after `:=`, before `→` or in parentheses takes it. The pinned v4.32.0
+/// accepts all of this program.
+#[test]
+fn a_sort_takes_its_level_only_in_leading_position() {
+    checked(
+        "def pair (A B : Type _) (a : A) (b : B) : A := a\n\
+         example : Nat := pair Nat Type 1 Nat\n\
+         example : Type 2 := Type 1\n\
+         example : Type 1 → Type 1 := fun x => x\n\
+         def wrap (A : Type 2) := A\n\
+         example : Type 2 := wrap (Type 1)\n",
+    );
+}
+
 /// `variable (R : α → α → Prop)` makes `α` an implicit variable, included where `R` is:
 /// `@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), R x x → R x x`; an unused section leaves
 /// `s : Nat → Nat` alone. A field never auto-binds: the pin refuses `structure P where x : α`.

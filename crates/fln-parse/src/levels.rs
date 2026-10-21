@@ -70,15 +70,20 @@ pub(super) fn declaration_syntax(
     ]))
 }
 
+/// `Type`/`Sort` with its optional level. The pin reads the level only at leading precedence
+/// (`checkPrec leadPrec` in `Lean.Parser.Term.type`): in argument position `f Type 1` is
+/// `f Type 1`, two arguments, while `Type 1 → Type` and `(Type 1)` take it.
 pub(super) fn sort(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     start: usize,
     end: usize,
+    leading: bool,
 ) -> Result<(Syntax, usize), NatDefinitionParseError> {
     let mut cursor = start + 1;
-    let level = if starts(tokens, cursor, end)
+    let level = if leading
+        && starts(tokens, cursor, end)
         && tokens[start].extent.end() < tokens[cursor].extent.start()
     {
         null_node(vec![expression(

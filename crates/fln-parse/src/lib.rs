@@ -3971,7 +3971,10 @@ fn bounded_term_token(
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && (symbol == "Type" || symbol == "Sort") =>
         {
-            let (term, end) = levels::sort(leaves, view, tokens, index, range.end)?;
+            let leading = frames
+                .last()
+                .is_some_and(|frame| frame.application.is_empty());
+            let (term, end) = levels::sort(leaves, view, tokens, index, range.end, leading)?;
             frames
                 .last_mut()
                 .expect("root term frame")
