@@ -3,6 +3,7 @@
 use super::*;
 
 pub(in crate::dispatch) mod diagnostics;
+pub(in crate::dispatch) mod highlight;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::dispatch) enum WireFormat {

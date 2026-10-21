@@ -330,3 +330,89 @@ fn rpc_term_goal_before_crlf_keeps_the_original_half_open_range() {
     );
     client.finish();
 }
+
+#[test]
+fn diagnostic_highlighting_uses_the_live_pinned_wire_shape_and_session_guards() {
+    // These results were compared with the locked Lean server in both wire
+    // formats. In particular, the reference does not merge overlapping hits.
+    let fixtures = [
+        (
+            "ana",
+            r#"{"text":"banana"}"#,
+            r#"{"append":[{"text":"b"},{"tag":["highlighted",{"text":"ana"}]},{"tag":["highlighted",{"text":"ana"}]}]}"#,
+        ),
+        (
+            "βγ😀",
+            r#"{"append":[{"text":"alphaβ"},{"text":"γ😀tail"}]}"#,
+            r#"{"append":[{"append":[{"text":"alpha"},{"tag":["highlighted",{"text":"β"}]}]},{"append":[{"tag":["highlighted",{"text":"γ😀"}]},{"text":"tail"}]}]}"#,
+        ),
+        (
+            "aaa",
+            r#"{"append":[{"text":"aaa"},{"text":"a"}]}"#,
+            r#"{"append":[{"tag":["highlighted",{"text":"aaa"}]},{"tag":["highlighted",{"text":"a"}]}]}"#,
+        ),
+        (
+            "",
+            r#"{"append":[{"text":""},{"append":[]},{"text":"😀"}]}"#,
+            r#"{"append":[{"text":""},{"append":[]},{"text":"😀"}]}"#,
+        ),
+        ("a", r#"{"text":"A"}"#, r#"{"text":"A"}"#),
+    ];
+    let search = |id: &str, session: &str, query: &str, message: &str| {
+        request(
+            id,
+            "$/lean/rpc/call",
+            &format!(
+                r#"{{"sessionId":{},"method":"Lean.Widget.highlightMatches","params":{{"query":{},"msg":{message}}},"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}}}}"#,
+                quote(session),
+                quote(query)
+            ),
+        )
+    };
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        for format in ["v0", "v1"] {
+            let mut client = Client::start(binary, args, format);
+            client.open("prelude\n");
+            let session = client.connect("connect");
+            for (index, (query, message, expected)) in fixtures.iter().enumerate() {
+                let id = format!("highlight-{index}");
+                let result = client.exchange(&id, &search(&id, &session, query, message));
+                assert!(
+                    result.contains(&format!("\"result\":{expected}")),
+                    "{result}"
+                );
+            }
+            let unsupported = client.exchange(
+                "embedded",
+                &search(
+                    "embedded",
+                    &session,
+                    "x",
+                    r#"{"tag":[{"expr":{"text":"x"}},{"text":""}]}"#,
+                ),
+            );
+            assert!(unsupported.contains("\"code\":-32803"), "{unsupported}");
+            client.send(&notification(
+                "textDocument/didClose",
+                &format!(r#"{{"textDocument":{{"uri":"{URI}"}}}}"#),
+            ));
+            client.open("prelude\n");
+            let stale =
+                client.exchange("stale", &search("stale", &session, "x", r#"{"text":"x"}"#));
+            assert!(stale.contains("\"code\":-32900"), "{stale}");
+            let session = client.connect("reconnect");
+            let recovered = client.exchange(
+                "recovered",
+                &search("recovered", &session, "x", r#"{"text":"x"}"#),
+            );
+            assert!(
+                recovered.contains(r#""result":{"tag":["highlighted",{"text":"x"}]}"#),
+                "{recovered}"
+            );
+            client.finish();
+        }
+    }
+}

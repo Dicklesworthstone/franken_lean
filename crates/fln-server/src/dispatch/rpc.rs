@@ -261,6 +261,23 @@ impl Sessions {
             return Ok(result);
         }
         json::byte_offset(text, call.position).map_err(invalid)?;
+        if call.method == "Lean.Widget.highlightMatches" {
+            // Search the presentation already held by the client. This is not
+            // another semantic query and must not elaborate the document or
+            // allocate references to fictitious expression/trace objects.
+            let result =
+                params::highlight::response(call.params, MAX_RESPONSE_BYTES).map_err(|error| {
+                    match error {
+                        params::highlight::Error::Invalid(message) => invalid(message),
+                        params::highlight::Error::Unsupported(message)
+                        | params::highlight::Error::Limit(message) => failed(message),
+                    }
+                })?;
+            // As with goals, bounded processing cannot revive an expired
+            // session. Nothing has been published if this final check fails.
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok(result);
+        }
         let kind = match call.method.as_str() {
             "Lean.Widget.getInteractiveGoals" => QueryKind::InteractiveGoals,
             "Lean.Widget.getInteractiveTermGoal" => QueryKind::InteractiveTermGoal,

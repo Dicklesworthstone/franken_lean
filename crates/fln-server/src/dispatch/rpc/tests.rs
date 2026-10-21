@@ -366,3 +366,193 @@ fn invalid_release_is_atomic_and_keepalive_does_not_revive_expired_sessions() {
     ));
     assert!(sessions.sessions.is_empty());
 }
+
+fn highlight_call(session: u64, uri: &str, params: &str) -> String {
+    format!(
+        r#"{{"textDocument":{{"uri":{}}},"position":{{"line":0,"character":0}},"sessionId":"{session}","method":"Lean.Widget.highlightMatches","params":{params}}}"#,
+        crate::json_string(uri)
+    )
+}
+
+#[test]
+fn message_search_uses_client_presentations_without_querying_or_retaining_objects() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let docs = documents();
+        let mut provider = Provider::new();
+        execute(&mut sessions, id, &docs, &mut provider).unwrap();
+        let before = &sessions.sessions[&id];
+        let retained = (before.references.len(), before.bytes, before.next_reference);
+        let input = highlight_call(id, URI, r#"{"query":"β","msg":{"text":"aβb"}}"#);
+        let result = sessions
+            .execute(
+                "$/lean/rpc/call",
+                RawField::Value(&input),
+                &docs,
+                &mut provider,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"append":[{"text":"a"},{"tag":["highlighted",{"text":"β"}]},{"text":"b"}]}"#
+        );
+        assert_eq!(
+            provider.calls, 1,
+            "search must not trigger another native elaboration"
+        );
+        let after = &sessions.sessions[&id];
+        assert_eq!(
+            (after.references.len(), after.bytes, after.next_reference),
+            retained
+        );
+        assert_eq!(after.references[&0].count, 1);
+    }
+}
+
+#[test]
+fn message_search_reports_invalid_params_separately_from_unsupported_embeddings() {
+    let mut sessions = Sessions::default();
+    let id = sessions.create(URI.into(), Instant::now()).unwrap();
+    let mut provider = Provider::new();
+    let docs = documents();
+    for (params, expected) in [
+        (r#"{"query":false,"msg":{"text":"x"}}"#, -32602),
+        (r#"{"query":"x","msg":{"text":"x","text":"y"}}"#, -32602),
+        (
+            r#"{"query":"x","msg":{"tag":[{"expr":{"text":"x"}},{"text":""}]}}"#,
+            REQUEST_FAILED_CODE,
+        ),
+    ] {
+        let input = highlight_call(id, URI, params);
+        let error = sessions
+            .execute(
+                "$/lean/rpc/call",
+                RawField::Value(&input),
+                &docs,
+                &mut provider,
+            )
+            .unwrap_err();
+        assert_eq!(error.0, expected);
+        assert!(sessions.sessions[&id].references.is_empty());
+    }
+    assert_eq!(provider.calls, 0);
+}
+
+#[test]
+fn message_search_output_exhaustion_is_atomic_and_does_not_poison_a_later_request() {
+    let mut sessions = Sessions::default();
+    let id = sessions.create(URI.into(), Instant::now()).unwrap();
+    let mut provider = Provider::new();
+    let docs = documents();
+    let params = format!(
+        r#"{{"query":"x","msg":{{"text":"{}"}}}}"#,
+        "x".repeat(30000)
+    );
+    let input = highlight_call(id, URI, &params);
+    let error = sessions
+        .execute(
+            "$/lean/rpc/call",
+            RawField::Value(&input),
+            &docs,
+            &mut provider,
+        )
+        .unwrap_err();
+    assert_eq!(error.0, REQUEST_FAILED_CODE);
+    assert!(error.1.contains("wire budget"));
+    assert!(sessions.sessions[&id].references.is_empty());
+    assert_eq!(sessions.sessions[&id].bytes, 0);
+    let input = highlight_call(id, URI, r#"{"query":"x","msg":{"text":"x"}}"#);
+    let expected = r#"{"tag":["highlighted",{"text":"x"}]}"#;
+    for _ in 0..2 {
+        assert_eq!(
+            sessions
+                .execute(
+                    "$/lean/rpc/call",
+                    RawField::Value(&input),
+                    &docs,
+                    &mut provider
+                )
+                .unwrap(),
+            expected
+        );
+    }
+    assert_eq!(provider.calls, 0);
+}
+
+#[test]
+fn message_search_keeps_session_uri_expiry_and_current_document_guards() {
+    let mut sessions = Sessions::default();
+    let id = sessions.create(URI.into(), Instant::now()).unwrap();
+    let mut provider = Provider::new();
+    let mut docs = documents();
+    let params = r#"{"query":"x","msg":{"text":"x"}}"#;
+    let cross_document = highlight_call(id, "file:///Other.lean", params);
+    assert!(matches!(
+        sessions.execute(
+            "$/lean/rpc/call",
+            RawField::Value(&cross_document),
+            &docs,
+            &mut provider
+        ),
+        Err((RECONNECT, _))
+    ));
+    let input = highlight_call(id, URI, params);
+    docs.reject_change(URI, 2).unwrap();
+    assert!(matches!(
+        sessions.execute(
+            "$/lean/rpc/call",
+            RawField::Value(&input),
+            &docs,
+            &mut provider
+        ),
+        Err((REQUEST_FAILED_CODE, _))
+    ));
+    docs.change(URI, 3, "recovered".into()).unwrap();
+    assert!(
+        sessions
+            .execute(
+                "$/lean/rpc/call",
+                RawField::Value(&input),
+                &docs,
+                &mut provider
+            )
+            .is_ok()
+    );
+    sessions.sessions.get_mut(&id).unwrap().expires = Instant::now();
+    assert!(matches!(
+        sessions.execute(
+            "$/lean/rpc/call",
+            RawField::Value(&input),
+            &docs,
+            &mut provider
+        ),
+        Err((RECONNECT, _))
+    ));
+    assert_eq!(provider.calls, 0);
+}
+
+#[test]
+fn message_search_cannot_hide_invalid_outer_utf16_positions() {
+    let mut sessions = Sessions::default();
+    let id = sessions.create(URI.into(), Instant::now()).unwrap();
+    let mut provider = Provider::new();
+    let mut docs = DocumentSession::new();
+    docs.open(URI.into(), 1, "😀".into()).unwrap();
+    let input = highlight_call(id, URI, r#"{"query":"x","msg":{"text":"x"}}"#)
+        .replace("\"character\":0", "\"character\":1");
+    assert!(matches!(
+        sessions.execute(
+            "$/lean/rpc/call",
+            RawField::Value(&input),
+            &docs,
+            &mut provider
+        ),
+        Err((-32602, _))
+    ));
+    assert_eq!(provider.calls, 0);
+    assert!(sessions.sessions[&id].references.is_empty());
+}
