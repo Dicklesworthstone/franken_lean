@@ -362,23 +362,16 @@ impl Lists {
         if let Some((contents, _suffix_at, next)) =
             crate::quotations::repetition_iteration(tokens, at, end, ",*")
         {
-            let Some((capture, consumed)) = crate::quotations::antiquotation(
+            let body = bounded_term(
                 leaves,
                 view,
                 tokens,
-                contents.start,
-                contents.end,
-                crate::quotations::Position::Term,
-            )?
-            else {
-                return Ok(None);
-            };
-            if consumed != contents.end {
-                return Ok(None);
-            }
+                contents.clone(),
+                DefinitionGrammar::Scalar,
+            )?;
             let splice = crate::quotations::wrap_repetition_iteration(
                 leaves,
-                null_node(vec![capture]),
+                null_node(vec![body]),
                 "sepBy",
                 ",*",
                 at,

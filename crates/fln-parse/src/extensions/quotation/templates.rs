@@ -14,6 +14,15 @@ pub(in crate::extensions) fn checked(
     let mut visited = 0;
     while let Some((syntax, sequence_slot)) = pending.pop() {
         charge(&mut visited)?;
+        if let Some(iteration) = repetition::iteration(syntax)?
+            && repetition::suffix(syntax)?.is_none()
+        {
+            if !sequence_slot {
+                return Err("a bracketed repetition splice outside its sequence");
+            }
+            pending.push((iteration.body, false));
+            continue;
+        }
         if let Some(sequence) = repetition::suffix(syntax)? {
             if !sequence_slot {
                 return Err("a repetition splice outside its sequence");
@@ -116,6 +125,55 @@ fn replace_antiquotations(contents: &Syntax) -> Result<Syntax, &'static str> {
     built.pop().ok_or("an empty macro template")
 }
 
+fn instantiate_iteration_body(
+    syntax: &Syntax,
+    variable: &Name,
+    element: &Syntax,
+    context: &Name,
+    scope: u64,
+    visited: &mut usize,
+    raw: bool,
+) -> Result<Syntax, &'static str> {
+    charge(visited)?;
+    match syntax {
+        Syntax::Ident { val, .. } if val == variable => copy_capture(element, visited),
+        Syntax::Ident { .. } if raw => Ok(syntax.clone()),
+        ident @ Syntax::Ident { val, .. } if val.is_anonymous() => Ok(ident.clone()),
+        Syntax::Ident {
+            info,
+            raw_val,
+            val,
+            preresolved,
+        } => Ok(Syntax::Ident {
+            info: *info,
+            raw_val: *raw_val,
+            val: fln_syntax::hygiene::add_macro_scope(context, val, scope)
+                .map_err(|_| "a template name that cannot take a macro scope")?,
+            preresolved: preresolved.clone(),
+        }),
+        Syntax::Node { info, kind, args } => {
+            let mut built = Vec::with_capacity(args.len());
+            for (index, child) in args.iter().enumerate() {
+                built.push(instantiate_iteration_body(
+                    child,
+                    variable,
+                    element,
+                    context,
+                    scope,
+                    visited,
+                    raw_identifier_slot(kind, index),
+                )?);
+            }
+            Ok(Syntax::Node {
+                info: *info,
+                kind: kind.clone(),
+                args: built,
+            })
+        }
+        leaf => Ok(leaf.clone()),
+    }
+}
+
 pub(in crate::extensions) fn instantiate(
     rule: &NotationRule,
     args: &[Syntax],
@@ -135,6 +193,7 @@ pub(in crate::extensions) fn instantiate(
         Visit(&'a Syntax),
         Raw(&'a Syntax),
         Splice(repetition::Sequence<'a>),
+        Iteration(repetition::Iteration<'a>),
         Build(SourceInfo, &'a Name, &'a [Syntax]),
     }
     let mut steps = vec![Step::Visit(&rule.rhs)];
@@ -143,13 +202,19 @@ pub(in crate::extensions) fn instantiate(
         match step {
             Step::Visit(syntax @ Syntax::Node { info, kind, args }) => {
                 charge(&mut visited)?;
-                if repetition::suffix(syntax)?.is_some() {
+                if repetition::iteration(syntax)?.is_some() || repetition::suffix(syntax)?.is_some()
+                {
                     return Err("a repetition splice outside its sequence");
                 }
                 steps.push(Step::Build(*info, kind, args));
                 let sequence = null_args(syntax).is_some();
                 for (index, child) in args.iter().enumerate().rev() {
-                    if sequence && let Some(part) = repetition::suffix(child)? {
+                    if sequence
+                        && let Some(part) = repetition::iteration(child)?
+                        && repetition::suffix(child)?.is_none()
+                    {
+                        steps.push(Step::Iteration(part));
+                    } else if sequence && let Some(part) = repetition::suffix(child)? {
                         steps.push(Step::Splice(part));
                     } else if raw_identifier_slot(kind, index) {
                         steps.push(Step::Raw(child));
@@ -157,6 +222,45 @@ pub(in crate::extensions) fn instantiate(
                         steps.push(Step::Visit(child));
                     }
                 }
+            }
+            Step::Iteration(iteration) => {
+                let variable = iteration.body_variable(&bound)?;
+                let value = bound
+                    .get(&variable)
+                    .map(AsRef::as_ref)
+                    .ok_or("an unbound bracketed repetition capture")?;
+                let values = iteration.values(value, &mut visited)?;
+                let Some([body]) = null_args(iteration.body) else {
+                    return Err("a bracketed template iteration outside the single-body subset");
+                };
+                let mut elements = Vec::new();
+                for (index, element) in values.into_iter().enumerate() {
+                    if index > 0
+                        && let Some(separator) = iteration.separator()
+                    {
+                        let info = match iteration.suffix_node {
+                            Syntax::Node { args, .. } => args
+                                .get(1)
+                                .and_then(|syntax| match syntax {
+                                    Syntax::Atom { info, .. } => Some(*info),
+                                    _ => None,
+                                })
+                                .unwrap_or(SourceInfo::None),
+                            _ => SourceInfo::None,
+                        };
+                        elements.push(Syntax::atom(info, separator));
+                    }
+                    elements.push(instantiate_iteration_body(
+                        body,
+                        &variable,
+                        element,
+                        context,
+                        scope,
+                        &mut visited,
+                        false,
+                    )?);
+                }
+                built.push(null_node(elements));
             }
             Step::Splice(sequence) => {
                 let name = sequence.name()?;
@@ -213,7 +317,8 @@ pub(in crate::extensions) fn instantiate(
                 let mut args = Vec::new();
                 for (part, mut value) in original.iter().zip(values) {
                     if *kind == Name::from_components(["null"])
-                        && repetition::suffix(part)?.is_some()
+                        && (repetition::suffix(part)?.is_some()
+                            || repetition::iteration(part)?.is_some())
                     {
                         let Syntax::Node { args: elements, .. } = &mut value else {
                             return Err("a splice value without sequence children");

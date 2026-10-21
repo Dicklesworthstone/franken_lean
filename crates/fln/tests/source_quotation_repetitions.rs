@@ -161,6 +161,35 @@ fn bracketed_repetition_executes_natively_and_keeps_caller_identifiers() {
     );
 }
 
+#[test]
+fn bracketed_repetition_templates_map_fixed_syntax_over_captured_elements() {
+    let source = concat!(
+        "syntax \"mapped!\" \"[\" term,* \"]\" : term\n",
+        "macro_rules | `(mapped![$[$x],*]) => `([$[Nat.succ $x],*])\n",
+        "theorem mapped : mapped![0, 1, 2] = [1, 2, 3] := rfl\n",
+        "theorem empty : mapped![] = ([] : List Nat) := rfl",
+    );
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 2);
+    let executable =
+        format!("{source}\n#eval List.foldl (fun n x => n * 10 + x) 0 (mapped![0, 1, 2])");
+    let checked = engine()
+        .execute_source_commands_with_checks(
+            executable.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(result) = &checked.batch.executions.last().unwrap().exit else {
+        panic!("expected native return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("123")
+    );
+}
+
 const SUM: &str = "syntax \"sumSeq!\" \"[\" num* \"]\" : term\n\
     macro_rules\n\
     | `(sumSeq![]) => `((0 : Nat))\n\

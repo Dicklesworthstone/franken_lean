@@ -9,6 +9,43 @@ use super::*;
 #[cfg(test)]
 mod slice_tests;
 
+#[derive(Clone, Copy)]
+pub(super) struct Iteration<'a> {
+    pub(super) body: &'a Syntax,
+    pub(super) suffix_node: &'a Syntax,
+    pub(super) kind: &'a Name,
+    pub(super) suffix: &'a str,
+}
+
+pub(super) fn iteration(syntax: &Syntax) -> Result<Option<Iteration<'_>>, &'static str> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Ok(None);
+    };
+    if kind.leaf_view() != LeafView::Str("antiquot_scope") {
+        return Ok(None);
+    }
+    let [body, Syntax::Atom { val: suffix, .. }] = args.as_slice() else {
+        return Err("a malformed bracketed repetition splice");
+    };
+    let parent = kind.parent();
+    let valid = if parent == Name::from_components(["sepBy"]) {
+        suffix
+            .strip_suffix('*')
+            .is_some_and(|separator| !separator.is_empty())
+    } else {
+        parent == Name::from_components(["many"]) && suffix == "*"
+    };
+    if !valid {
+        return Err("an unsupported bracketed repetition splice");
+    }
+    Ok(Some(Iteration {
+        body,
+        suffix_node: syntax,
+        kind,
+        suffix,
+    }))
+}
+
 pub(in super::super) struct Sequence<'a> {
     capture: &'a Syntax,
     suffix_node: &'a Syntax,
@@ -44,12 +81,10 @@ pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'sta
                 return Err("a malformed bracketed repetition splice");
             };
             let Some([capture]) = null_args(body) else {
-                return Err(
-                    "a bracketed repetition body outside the supported single-capture subset",
-                );
+                return Ok(None);
             };
             if antiquotation_name(capture).is_none() {
-                return Err("a bracketed repetition body without a direct capture");
+                return Ok(None);
             }
             (capture, suffix.as_str(), true)
         }
@@ -75,6 +110,64 @@ pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'sta
         suffix,
         elementwise,
     }))
+}
+
+impl Iteration<'_> {
+    pub(super) fn separator(&self) -> Option<&str> {
+        (self.kind.parent() == Name::from_components(["sepBy"]))
+            .then(|| &self.suffix[..self.suffix.len() - 1])
+    }
+
+    pub(super) fn values<'b>(
+        &self,
+        value: &'b Syntax,
+        visited: &mut usize,
+    ) -> Result<Vec<&'b Syntax>, &'static str> {
+        let Some(items) = null_args(value) else {
+            return Err("a bracketed repetition binding outside a sequence");
+        };
+        *visited = visited
+            .checked_add(items.len() + 1)
+            .ok_or("repetition work overflow")?;
+        if *visited > MAX_TEMPLATE_NODES {
+            return Err("quoted repetition past the node budget");
+        }
+        if let Some(separator) = self.separator() {
+            if items
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .any(|item| !matches!(item, Syntax::Atom { val, .. } if val == separator))
+            {
+                return Err("a bracketed repetition binding with incompatible separators");
+            }
+            Ok(items.iter().step_by(2).collect())
+        } else {
+            Ok(items.iter().collect())
+        }
+    }
+
+    pub(super) fn body_variable(
+        &self,
+        bound: &BTreeMap<&Name, std::borrow::Cow<'_, Syntax>>,
+    ) -> Result<Name, &'static str> {
+        let mut pending = vec![self.body];
+        let mut found = None;
+        let mut visited = 0;
+        while let Some(syntax) = pending.pop() {
+            templates::charge(&mut visited)?;
+            match syntax {
+                Syntax::Ident { val, .. } if bound.contains_key(val) => match &found {
+                    None => found = Some(val.clone()),
+                    Some(name) if *name == *val => {}
+                    Some(_) => return Err("multiple captures in one bracketed template iteration"),
+                },
+                Syntax::Node { args, .. } => pending.extend(args.iter()),
+                _ => {}
+            }
+        }
+        found.ok_or("a bracketed template iteration without a bound capture")
+    }
 }
 
 pub(super) struct Slice<'a> {
