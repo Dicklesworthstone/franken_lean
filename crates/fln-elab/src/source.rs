@@ -4441,10 +4441,13 @@ impl Context {
                 return Err(failure(SourceInferenceError::Scope));
             }
             let type_parts = expect_null_args(&parts[2], "binder type")?;
-            let domain = match type_parts {
+            // `toBinderViews` gives every name its own copy of the type, elaborated after the
+            // preceding names are bound: `(A B : Type _)` has two universe holes, and `{α β}`
+            // two type holes, not one shared between them.
+            let domain_of = |context: &mut Self| match type_parts {
                 [colon, type_syntax] => {
                     expect_atom(colon, ":", "binder type ascription")?;
-                    self.type_term(type_syntax)?
+                    context.type_term(type_syntax)
                 }
                 // `{α}`: the pin elaborates an omitted binder type as a hole
                 // (`Lean/Elab/Binders.lean`, `mkHole`), which unification must fill.
@@ -4453,26 +4456,12 @@ impl Context {
                         parser_kind(&["Term", "hole"]),
                         vec![Syntax::atom(fln_syntax::source::SourceInfo::None, "_")],
                     );
-                    self.type_term(&hole)?
+                    context.type_term(&hole)
                 }
-                _ => return Err(failure(SourceInferenceError::ExpectedType)),
+                _ => Err(failure(SourceInferenceError::ExpectedType)),
             };
-            // Local function binders may already have been expanded by the
-            // enclosing term worklist. Observe the annotation, not whether
-            // this invocation happened to rewrite the original syntax.
-            let defaulted = optional::default_value(&domain).is_some();
-            for (position, name) in names.iter().enumerate() {
-                // `toBinderViews` expands each defaulted name separately.
-                // A later name sees the preceding local, including when that
-                // local shadows a name used by the original default syntax.
-                let domain = if defaulted && position != 0 {
-                    let [_, type_syntax] = type_parts else {
-                        unreachable!("expanded default has a type annotation");
-                    };
-                    self.type_term(type_syntax)?
-                } else {
-                    domain.clone()
-                };
+            for name in names {
+                let domain = domain_of(self)?;
                 let name = match name {
                     Syntax::Ident { val, .. } => val.clone(),
                     // `_` binds a name no source identifier spells, as an unnamed instance
@@ -4486,9 +4475,7 @@ impl Context {
                     _ => return Err(failure(SourceInferenceError::Scope)),
                 };
                 let id = FVarId(self.fresh_name()?);
-                self.txn
-                    .lctx
-                    .add_param(id.clone(), name, domain.clone(), style);
+                self.txn.lctx.add_param(id.clone(), name, domain, style);
                 parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
             }
         }

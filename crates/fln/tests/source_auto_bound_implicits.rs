@@ -276,6 +276,55 @@ fn structure_parents_keep_universe_holes_for_the_record_to_generalize() {
     }
 }
 
+/// A header's binder group gives each name its own copy of the type, as the pin's `toBinderViews`
+/// does: two universe holes for `(A B : Type _)`, two type holes for `{α β}`. One shared hole
+/// refused `pair Nat (Type)`, which the pinned v4.32.0 accepts. Each expectation is its `#check @c`
+/// under `pp.universes`.
+#[test]
+fn a_header_binder_group_elaborates_its_type_for_each_name() {
+    let engine = checked(
+        "def pair (A B : Type _) (a : A) (b : B) : A := a\n\
+         example : Nat := pair Nat (Type) 1 Nat\n\
+         class Funny (F : Type _) (A B : outParam (Type _)) where\n  toFun : F → A → B\n\
+         def keep {α β} (a : α) (b : β) : α := a\n",
+    );
+    let environment = engine.environment();
+    let mut printer = fln::pretty::Printer::new(environment);
+    for (name, levels, type_) in [
+        (
+            "pair",
+            "u_1 u_2",
+            "(A : Type u_1) → (B : Type u_2) → A → B → A",
+        ),
+        (
+            "Funny.toFun",
+            "u_1 u_2 u_3",
+            "{F : Type u_1} → {A : outParam (Type u_2)} → {B : outParam (Type u_3)} → [self : Funny F A B] → F → A → B",
+        ),
+        (
+            "keep",
+            "u_1 u_2",
+            "{α : Sort u_1} → {β : Sort u_2} → α → β → α",
+        ),
+    ] {
+        let info = environment
+            .find(&Name::from_components(name.split('.')))
+            .unwrap_or_else(|| panic!("{name} not declared"));
+        let declared: Vec<_> = info
+            .constant_val()
+            .level_params
+            .iter()
+            .map(Name::to_display_string)
+            .collect();
+        assert_eq!(declared.join(" "), levels, "{name}");
+        assert_eq!(
+            printer.expr(&info.constant_val().type_, 0).unwrap(),
+            type_,
+            "{name}"
+        );
+    }
+}
+
 /// `variable (R : α → α → Prop)` makes `α` an implicit variable, included where `R` is:
 /// `@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), R x x → R x x`; an unused section leaves
 /// `s : Nat → Nat` alone. A field never auto-binds: the pin refuses `structure P where x : α`.
