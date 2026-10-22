@@ -61,6 +61,11 @@ impl Failure {
                 json_string(detail.text()),
                 detail.truncated()
             )
+        } else if self.class == "missing-configuration" {
+            format!(
+                "error: [root]: no configuration file with a supported extension:\n{}\n",
+                detail.text()
+            )
         } else {
             format!("{command}: {}: {}\n", self.class, detail.text())
         };
@@ -606,6 +611,20 @@ fn build(
     let (config, configuration_imports) = if root.join("lakefile.toml").is_file() {
         (config(&root)?, None)
     } else {
+        let lean = root.join("lakefile.lean");
+        let toml = root.join("lakefile.toml");
+        if !lean
+            .try_exists()
+            .map_err(|error| Failure::io(&lean, error))?
+            && !toml
+                .try_exists()
+                .map_err(|error| Failure::io(&toml, error))?
+        {
+            return Err(Failure::new(
+                "missing-configuration",
+                format!("{}\n{}", lean.display(), toml.display()),
+            ));
+        }
         let loaded = lean_config::load(&root, jobs, posture)?;
         (loaded.config, Some(loaded.imports))
     };

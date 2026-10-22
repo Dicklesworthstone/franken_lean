@@ -1226,7 +1226,17 @@ fn lake_personality_build_and_check_build() {
         .expect("run lake build empty");
     assert_eq!(build_empty.status.code(), Some(1));
     let build_empty_stderr = String::from_utf8(build_empty.stderr).expect("utf8 stderr");
-    assert!(build_empty_stderr.contains("error: no such file or directory"));
+    let root = empty_dir.canonicalize().unwrap();
+    assert_eq!(
+        build_empty_stderr,
+        format!(
+            "error: [root]: no configuration file with a supported extension:\n{}\n{}\n",
+            root.join("lakefile.lean").display(),
+            root.join("lakefile.toml").display()
+        )
+    );
+    assert!(build_empty.stdout.is_empty());
+    assert!(empty_dir.read_dir().unwrap().next().is_none());
 }
 
 #[test]
