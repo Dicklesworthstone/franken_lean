@@ -1328,9 +1328,12 @@ impl<'a> Printer<'a> {
             if text == "List.nil" && args.len() == 1 && self.registered("List.nil") {
                 return Ok(Format::text("[]"));
             }
+            // Each operator is an `infixl`/`infixr`/`notation` of `Init.Notation`, which registers
+            // its unexpander: without that import the pin prints the application.
             if let Some(infix) = INFIXES
                 .iter()
                 .find(|infix| infix.function == text && infix.arity == args.len())
+                .filter(|infix| self.registered(infix.function))
             {
                 let (lhs_prec, rhs_prec) = if infix.right {
                     (infix.precedence + 1, infix.precedence)

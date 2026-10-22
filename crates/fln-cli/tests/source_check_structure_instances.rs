@@ -122,6 +122,23 @@ const NOTATION_EXTRA_EXPECTED: &str = "Unit.unit : Unit
 Nat × (n : Nat) × Fin n : Type
 ";
 
+/// `+`, `::`, `∧` and `=` are `infixl`/`infixr` notations of `Init.Notation`, which registers
+/// their unexpanders. With only `Init.Prelude` imported the pin prints the applications.
+const PRELUDE_OPERATORS: &str = r#"prelude
+import Init.Prelude
+#check fun (a b : Nat) => HAdd.hAdd a b
+#check fun (a : Nat) (l : List Nat) => List.cons a l
+#check fun (p q : Prop) => And p q
+#check fun (a b : Nat) => Eq a b
+"#;
+
+/// The pin's output for [`PRELUDE_OPERATORS`].
+const PRELUDE_OPERATORS_EXPECTED: &str = "fun a b => HAdd.hAdd a b : Nat → Nat → Nat
+fun a l => List.cons a l : Nat → List Nat → List Nat
+fun p q => And p q : Prop → Prop → Prop
+fun a b => Eq a b : Nat → Nat → Prop
+";
+
 /// A `scoped` unexpander is in force only where its namespace is active. `Int.negSucc`'s
 /// `-[n+1]` (`scoped notation` in `Init/Data/Int/Basic.lean:74`) is scoped to `Int`, so the pin
 /// prints `Int.negSucc 9` outside it, and in another namespace.
@@ -281,6 +298,26 @@ fn registered_unexpanders_print_tuples_lists_and_unit_as_the_pin_does() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, NOTATION_EXTRA_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn operators_print_as_applications_where_their_notation_is_not_imported() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Operators.lean");
+    std::fs::write(&entry, PRELUDE_OPERATORS).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, PRELUDE_OPERATORS_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, PRELUDE_OPERATORS_EXPECTED, "{stderr}");
 }
 
 #[test]
