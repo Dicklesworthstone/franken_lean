@@ -1,9 +1,11 @@
 //! `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`), expanded as the pin's
 //! `expandExplicitBinders ``Sigma` and `expandExplicitBinders ``PSigma`: one `Sigma fun x : T => …`
-//! per bound name, innermost last. As at the pin, they exist only where `Init.NotationExtra` is
-//! imported. Over `prelude` + `import Init.Core` every program here is refused, as the pin refuses it
-//! ("expected token"). Every program was run through the pinned `lean` v4.32.0 with both headers
-//! first (2026-10-11), with the same verdicts.
+//! per bound name, innermost last. `(x y : T) × b` and `(x y : T) ×' b` are the same expansion
+//! from one bracketed group (`expandBracketedBinders`). As at the pin, they exist only where
+//! `Init.NotationExtra` is imported. Over `prelude` + `import Init.Core` every program here is
+//! refused, as the pin refuses it ("expected token", or for `×` an unknown identifier). Every
+//! program was run through the pinned `lean` v4.32.0 with both headers first (2026-10-11; the `×`
+//! forms 2026-10-21), with the same verdicts.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,7 +73,7 @@ fn check(
     )
 }
 
-const ACCEPTED: [(&str, &str); 8] = [
+const ACCEPTED: [(&str, &str); 13] = [
     ("type", "def s1 : Type := Σ n : Nat, Fin (n + 1)\n"),
     (
         "brackets",
@@ -95,6 +97,17 @@ const ACCEPTED: [(&str, &str); 8] = [
         "unfolds_to_psigma",
         "theorem t3 : (Σ' n : Nat, n = n) = PSigma (fun n : Nat => n = n) := rfl\n",
     ),
+    ("pair", "def s5 : Type := (n : Nat) × Fin (n + 1)\n"),
+    (
+        "pair_two",
+        "def s6 : Type := (a b : Nat) × Fin (a + b + 1)\n",
+    ),
+    ("pair_psigma", "def s7 := (x : Nat) ×' x = 1\n"),
+    (
+        "pair_unfolds",
+        "theorem t4 : ((n : Nat) × Fin n) = Sigma (fun n : Nat => Fin n) := rfl\n",
+    ),
+    ("pair_hole", "def s8 := (_ : Nat) × Nat\n"),
 ];
 
 #[test]
@@ -135,6 +148,11 @@ fn sigma_binder_refusals_match_the_pin() {
         (
             "not_exists",
             "theorem bad5 : (Σ n : Nat, Fin n) = Exists (fun n : Nat => n = n) := rfl\n",
+            "Type mismatch",
+        ),
+        (
+            "pair_prop",
+            "def bad6 : Prop := (x : Nat) ×' x = 1\n",
             "Type mismatch",
         ),
     ] {

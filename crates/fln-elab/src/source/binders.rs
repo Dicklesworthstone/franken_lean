@@ -566,6 +566,9 @@ fn exists_kind() -> Name {
 /// `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`): the same macro over `Sigma` and
 /// `PSigma`, `expandExplicitBinders ``Sigma` and `expandExplicitBinders ``PSigma`. Each node kind with
 /// its keyword and the head its expansion applies, resolved where the notation is defined.
+/// `(x y : A) × b` and `(x y : A) ×' b` are the same expansion from one bracketed group
+/// (`macro:35 xs:bracketedExplicitBinders " × " b:term:35`, `expandBracketedBinders`), keyed by
+/// their operator.
 fn binder_notation(kind: &Name) -> Option<(&'static str, Name)> {
     if kind == &exists_kind() {
         Some(("∃", Name::from_components(["Exists"])))
@@ -573,12 +576,17 @@ fn binder_notation(kind: &Name) -> Option<(&'static str, Name)> {
         Some(("Σ", Name::from_components(["_root_", "Sigma"])))
     } else if kind == &Name::str(Name::anonymous(), "termΣ'_,_") {
         Some(("Σ'", Name::from_components(["_root_", "PSigma"])))
+    } else if kind == &Name::str(Name::anonymous(), "term_×__1") {
+        Some(("×", Name::from_components(["_root_", "Sigma"])))
+    } else if kind == &Name::str(Name::anonymous(), "term_×'__1") {
+        Some(("×'", Name::from_components(["_root_", "PSigma"])))
     } else {
         None
     }
 }
 
-/// Whether a node is an `∃`, `Σ` or `Σ'` the expansion pass must rewrite.
+/// Whether a node is an `∃`, `Σ`, `Σ'`, `×` or `×'` binder notation the expansion pass must
+/// rewrite.
 pub(super) fn is_exists(syntax: &Syntax) -> bool {
     syntax.kind().and_then(binder_notation).is_some()
 }
@@ -642,12 +650,23 @@ impl Context {
         let Ok((_, parts)) = node_parts(syntax) else {
             return Err(invalid());
         };
-        let Ok([keyword, binders, separator, body]) = <[Syntax; 4]>::try_from(parts) else {
-            return Err(invalid());
-        };
-        expect_atom(&keyword, word, "existential keyword")?;
-        expect_atom(&separator, ",", "existential separator")?;
         let lean = |name: &str| Name::from_components(["Lean", name]);
+        let (binders, body) = if matches!(word, "×" | "×'") {
+            // One bracketed group before the operator: the same shape as one group of `Σ`'s.
+            let Ok([group, operator, body]) = <[Syntax; 3]>::try_from(parts) else {
+                return Err(invalid());
+            };
+            expect_atom(&operator, word, "dependent pair operator")?;
+            let groups = Syntax::node(Name::from_components(["null"]), vec![group]);
+            (Syntax::node(lean("explicitBinders"), vec![groups]), body)
+        } else {
+            let Ok([keyword, binders, separator, body]) = <[Syntax; 4]>::try_from(parts) else {
+                return Err(invalid());
+            };
+            expect_atom(&keyword, word, "existential keyword")?;
+            expect_atom(&separator, ",", "existential separator")?;
+            (binders, body)
+        };
         let binder_ident = |syntax: Syntax| -> Result<Syntax, NatDefinitionElabError> {
             match node_parts(syntax) {
                 Ok((kind, args)) if kind == lean("binderIdent") => {
