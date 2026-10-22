@@ -101,6 +101,11 @@ import Init.NotationExtra
 #check ((1, 2), 3)
 #check [1, 2]
 #check ∃ x : Nat, x = 1
+#check Sigma fun (n : Nat) => Fin n
+#check PSigma fun (n : Nat) => n = n
+#check Sigma fun (_ : Nat) => Nat
+#check (Sigma fun (n : Nat) => Fin n) → Nat
+#check Nat × Sigma fun (n : Nat) => Fin n
 "#;
 
 /// The pin's output for [`NOTATION_EXTRA`].
@@ -110,11 +115,19 @@ const NOTATION_EXTRA_EXPECTED: &str = "Unit.unit : Unit
 ((1, 2), 3) : (Nat × Nat) × Nat
 [1, 2] : List Nat
 ∃ x, x = 1 : Prop
+(n : Nat) × Fin n : Type
+(n : Nat) ×' n = n : Type
+(_ : Nat) × Nat : Type
+(n : Nat) × Fin n → Nat : Type
+Nat × (n : Nat) × Fin n : Type
 ";
 
 /// What this door refuses rather than print another way: a local type without fields (the pin
 /// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field with a default
 /// value (which the pin omits when the value equals it).
+///
+/// Without `Init.NotationExtra`, whose macro the `Σ` notation is, the pin fails to print a `Sigma`
+/// at all ("failed to pretty print expression"); this door refuses it there.
 ///
 /// With `Init.NotationExtra` imported, an application another registered unexpander prints
 /// (`Subtype` as `{ n // n = 1 }`) is refused too, and so is a term holding binders this engine's
@@ -124,6 +137,7 @@ const REFUSED: &[&str] = &[
     "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 4 } : D)\n",
     "prelude\nimport Init.NotationExtra\n#check (⟨1, rfl⟩ : Subtype (fun n : Nat => n = 1))\n",
     "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n",
+    "prelude\nimport Init.Core\n#check Sigma fun (n : Nat) => Fin n\n",
 ];
 
 fn pinned_lib() -> Option<PathBuf> {

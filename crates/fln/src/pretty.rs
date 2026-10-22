@@ -1207,6 +1207,42 @@ impl<'a> Printer<'a> {
                     outer,
                 ));
             }
+            // `delabSigma`/`delabPSigma` (vendored `PrettyPrinter/Delaborator/Builtins.lean:
+            // 1300-1317`): `Sigma fun (x : α) => b` is `(x : α) × b`, `(_ : α) × b` when `b` does
+            // not use `x`. The notation (`macro:35 … " × " b:term:35`) is declared in
+            // `Init.NotationExtra`; without it the pin fails to print the term at all.
+            if (text == "Sigma" || text == "PSigma")
+                && args.len() == 2
+                && let ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                } = args[1].node()
+            {
+                if !self.registered(&text) {
+                    return Err(Unsupported("a `Σ` type without `Init.NotationExtra`"));
+                }
+                let domain = self.with_trailing(false, |printer| printer.doc(binder_type, 0))?;
+                let shown = if body.has_loose_bvar(0) {
+                    self.bound_name(binder_name, body)
+                } else {
+                    "_".to_owned()
+                };
+                let depth = self.names.len();
+                self.bind(shown.clone(), binder_type);
+                let trailing = self.trailing && 35 >= outer;
+                let printed = self.with_trailing(trailing, |printer| printer.doc(body, 35));
+                self.unbind_to(depth);
+                let symbol = if text == "Sigma" { " ×" } else { " ×'" };
+                let doc = Format::text(format!("({shown} : "))
+                    .then(domain)
+                    .then(Format::text(")"))
+                    .then(Format::text(symbol))
+                    .then(Format::Line)
+                    .then(printed?);
+                return Ok(paren_doc(node(doc), 35, outer));
+            }
             // `unexpandExists` (`Init/NotationExtra.lean:185-189`): `Exists fun x => b` is
             // `∃ x, b`, nested ones sharing one binder list. A `fun` binder that is not
             // explicit does not match the unexpander and is not reproduced.
