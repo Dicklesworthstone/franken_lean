@@ -12204,10 +12204,14 @@ fn render_lean_source_commands(
                     );
                 }
                 evaluation_output_position += 1;
-                // The source adapter refuses guarded IO before execution.
-                // Keep this defensive boundary for externally retained batches:
-                // an IO result's Format does not capture its stdout effects.
-                if guarded.contains_key(&command_index)
+                // The pin logs what an action wrote as a message of its own, ahead of the
+                // result's. Only a captured action has its output here to place; anything else
+                // wrote while it ran, so a guard over it stays refused (the source adapter
+                // refuses such a batch before execution; this keeps the boundary for retained
+                // ones).
+                let captured = execution.captured_stdout();
+                if captured.is_none()
+                    && guarded.contains_key(&command_index)
                     && matches!(
                         execution.evaluation_presentation(),
                         Some(
@@ -12218,9 +12222,36 @@ fn render_lean_source_commands(
                 {
                     return io_guard_refusal(command_index);
                 }
+                if let Some(bytes) = captured.filter(|bytes| !bytes.is_empty()) {
+                    let Ok(text) = std::str::from_utf8(bytes) else {
+                        return source_failure(
+                            "internal-fault",
+                            "an evaluation's captured output was not UTF-8",
+                            false,
+                            SourcePresentation::Lean,
+                            4,
+                        );
+                    };
+                    let mut discarded = Vec::new();
+                    let messages = match guarded.get_mut(&command_index) {
+                        Some(guard) => guard.evaluation_target(&mut discarded),
+                        None => None,
+                    };
+                    if let Err(error) = formatted_output.append(text, &mut stdout, messages) {
+                        return error.failure(command_index, SourcePresentation::Lean);
+                    }
+                }
                 let formatted = match source_evaluation::formatted(execution) {
                     Ok(formatted) => formatted,
-                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
+                    Err(error) => {
+                        let mut failed = error.failure(command_index, SourcePresentation::Lean);
+                        // A captured action that then raised keeps what was printed before it,
+                        // its own output included, as the pin's earlier messages stay printed.
+                        if captured.is_some() {
+                            failed.stdout.insert_str(0, &stdout);
+                        }
+                        return failed;
+                    }
                 };
                 match formatted {
                     Some(source_evaluation::PresentedEvaluation::Text(text)) => {
@@ -12255,8 +12286,11 @@ fn render_lean_source_commands(
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
                 if let Some(guard) = guarded.get_mut(&command_index) {
-                    // An IO action's output was written while it ran, not returned here.
+                    // An uncaptured IO action's output was written while it ran, not returned here.
                     if matches!(value, SourceFinalValue::IoUnit) {
+                        if captured.is_some() {
+                            continue;
+                        }
                         return io_guard_refusal(command_index);
                     }
                     match lean_evaluation_line(command_index, &value) {

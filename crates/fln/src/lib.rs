@@ -8221,18 +8221,20 @@ impl Engine {
             } else {
                 None
             };
-            if matches!(
-                evaluation_presentation,
-                Some(
-                    EvaluationResultPresentation::IoFormat { .. }
-                        | EvaluationResultPresentation::IoUnit
+            if presentation != EvaluationPresentation::Lean
+                && matches!(
+                    evaluation_presentation,
+                    Some(
+                        EvaluationResultPresentation::IoFormat { .. }
+                            | EvaluationResultPresentation::IoUnit
+                    )
                 )
-            ) && guards
-                .last()
-                .is_some_and(|guard| guard.command_index == command_index)
+                && guards
+                    .last()
+                    .is_some_and(|guard| guard.command_index == command_index)
             {
-                // IO effects are not isolated into guard messages. Refuse
-                // before executing the action, never after its stdout or
+                // Only the `lean` presentation isolates an action's stdout into its messages.
+                // Elsewhere refuse before executing the action, never after its stdout or
                 // filesystem effects have already escaped the guard.
                 return Err(EngineExecutionError::BatchCommand {
                     index: command_index,
@@ -8358,13 +8360,60 @@ impl Engine {
                 }
                 merged
             });
-            let mut execution = match engine.execute_definition_entry_with_helpers(
+            // The pin's `#eval` runs an action inside `IO.FS.withIsolatedStreams` and logs what
+            // it wrote as a message of its own, ahead of the result's. The `lean` presentation
+            // keeps those bytes for the door to print at this command's position.
+            let capture = if presentation == EvaluationPresentation::Lean
+                && matches!(
+                    evaluation_presentation,
+                    Some(
+                        EvaluationResultPresentation::IoFormat { .. }
+                            | EvaluationResultPresentation::IoUnit
+                    )
+                ) {
+                match StdoutCapture::begin(LEAN_EVALUATION_STDOUT_LIMIT) {
+                    Ok(capture) => Some(capture),
+                    Err(error) => {
+                        return Ok(Outcome::InternalFault(InternalFault::new(
+                            "lean evaluation stdout capture",
+                            format!(
+                                "command {command_index}: the capture did not begin: {error:?}"
+                            ),
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            let executed = engine.execute_definition_entry_with_helpers(
                 declaration,
                 &local_functions,
                 scoped_options.as_ref().unwrap_or(options),
                 limits,
                 entry,
-            ) {
+            );
+            let captured = capture.map(StdoutCapture::finish);
+            if let Some(error) = captured.as_ref().and_then(|captured| captured.error) {
+                return Ok(match error {
+                    StdoutCaptureError::Limit { limit, requested } => {
+                        let to_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+                        Outcome::Inconclusive(Inconclusive::resource(
+                            fln_core::outcome::ResourceUsage {
+                                reason: fln_core::diag::ResourceReason::Memory {
+                                    limit_bytes: to_u64(limit),
+                                },
+                                allowed: to_u64(limit),
+                                observed: to_u64(requested),
+                            },
+                        ))
+                    }
+                    error => Outcome::InternalFault(InternalFault::new(
+                        "lean evaluation stdout capture",
+                        format!("command {command_index}: the capture failed: {error:?}"),
+                    )),
+                });
+            }
+            let mut execution = match executed {
                 Ok(Outcome::Complete(execution)) => execution,
                 Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
                 Ok(Outcome::InternalFault(fault)) => {
@@ -8405,6 +8454,7 @@ impl Engine {
                 scopes.admitted(&execution.declaration);
             }
             execution.evaluation_presentation = evaluation_presentation;
+            execution.io_stdout = captured.map(|captured| captured.bytes);
             if !is_evaluation {
                 for helper in &execution.local_functions {
                     scopes.admitted(&helper.declaration);
@@ -9912,6 +9962,7 @@ impl Engine {
             runtime_type,
             io_result_types,
             evaluation_presentation: None,
+            io_stdout: None,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -9950,6 +10001,10 @@ pub fn execute_golem_with_options(
 /// The cache is direct-mapped by call site and holds only immutable validation
 /// metadata, so this bounds its memory, not what can execute.
 const ENGINE_INLINE_CACHE_SLOTS: usize = 4096;
+
+/// What one `#eval` action may write under the `lean` presentation, which holds the bytes
+/// until the door prints them at the command's position: that door's own output bound.
+const LEAN_EVALUATION_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Execute an engine-compiled program through Golem's inline caches.
 ///
@@ -12132,6 +12187,9 @@ pub struct DefinitionExecution {
     /// Set only by the opt-in source command adapter after executing a checked
     /// printer or a checked silent Unit action. Raw APIs never set this marker.
     evaluation_presentation: Option<EvaluationResultPresentation>,
+    /// What an IO evaluation wrote to stdout while it ran, retained only under the `lean`
+    /// presentation, which prints it where the pin's `withIsolatedStreams` logs it.
+    io_stdout: Option<Vec<u8>>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.

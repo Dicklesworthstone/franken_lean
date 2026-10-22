@@ -98,6 +98,12 @@ impl DefinitionExecution {
         self.evaluation_presentation
     }
 
+    /// What an IO evaluation wrote to stdout, when the `lean` presentation captured it
+    /// (`None` elsewhere: other presentations let an action write while it runs).
+    pub fn captured_stdout(&self) -> Option<&[u8]> {
+        self.io_stdout.as_deref()
+    }
+
     /// Read the typed result of explicit `#eval` IO execution. Ordinary
     /// definitions and pure evaluations return `None`; this never runs a
     /// deferred action or changes the retained environment.

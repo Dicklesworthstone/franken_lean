@@ -40,7 +40,7 @@ fn lean_io(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
 }
 
 #[test]
-fn checked_io_results_print_once_and_refuse_unprintable_or_guarded_actions_before_effects() {
+fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_output() {
     let Some(lib) = pinned_lib() else { return };
     let workspace = Workspace::new("lean-door-checked-io");
     let sentinel = workspace.write("sentinel.txt", "preserved");
@@ -117,34 +117,59 @@ fn checked_io_results_print_once_and_refuse_unprintable_or_guarded_actions_befor
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");
 
-    // IO stdout is not a guard message. Both selected result modes retain the
-    // explicit capability boundary, now reached before either action executes.
-    for (file, type_, result) in [
-        ("GuardUnit.lean", "Unit", "()"),
-        (
-            "GuardFormat.lean",
-            "PrintedIO",
-            "PrintedIO.mk \"must not render\"",
-        ),
-    ] {
-        let guarded = workspace.write(
-            file,
-            format!(
-                r#"{DEFINITIONS}#guard_msgs in
-#eval (show IO {type_} from do
-  IO.FS.writeFile {source_path} "must not write"
-  let stream ← IO.getStdout
-  stream.putStr "must not print\n"
-  pure ({result}))
+    // An action's output is a message of its own, as the pin's `#eval` logs it from inside
+    // `withIsolatedStreams`: printed where the command is (after an earlier command's
+    // warning), judged by a guard over it, and dropped with `drop info`, while the action's
+    // other effects happen. The expected bytes are the pinned v4.32.0's on this file
+    // (measured 2026-10-21).
+    let guarded = workspace.write(
+        "Guarded.lean",
+        format!(
+            r#"{DEFINITIONS}def warned : Nat := sorry
+#eval IO.println "first"
+/-- info: guarded λ -/
+#guard_msgs in
+#eval (show IO Unit from do
+  IO.FS.writeFile {source_path} "written"
+  IO.println "guarded λ")
+/--
+info: y
+---
+info: printed record
+-/
+#guard_msgs in
+#eval (show IO PrintedIO from do
+  IO.print "y"
+  pure (PrintedIO.mk "printed record"))
+#guard_msgs (drop info) in
+#eval IO.println "dropped"
+#eval (show IO PrintedIO from do
+  IO.print "no newline"
+  pure (PrintedIO.mk "record"))
+#eval IO.println "last"
 "#
-            ),
-        );
-        let refused = lean_io(&workspace, &guarded, &lib);
-        assert_capability(&refused);
-        assert!(
-            refused.stderr.contains("`#guard_msgs` over an IO action"),
-            "{refused:?}"
-        );
-        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");
-    }
+        ),
+    );
+    let ran = lean_io(&workspace, &guarded, &lib);
+    let expected = format!(
+        "{}:8:4: warning: declaration uses `sorry`\nfirst\nno newline\nrecord\nlast\n",
+        guarded.display()
+    );
+    assert_eq!(
+        (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+        (0, expected.as_str(), ""),
+        "{ran:?}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"written");
+
+    // A guard whose expectation the output does not match is an error, as at the pin.
+    let mismatch = workspace.write(
+        "Mismatch.lean",
+        format!(
+            "{DEFINITIONS}/-- info: expected -/\n#guard_msgs in\n#eval IO.println \"actual\"\n"
+        ),
+    );
+    let failed = lean_io(&workspace, &mismatch, &lib);
+    assert_eq!(failed.code, 1, "{failed:?}");
+    assert!(failed.stderr.contains("info: actual"), "{failed:?}");
 }

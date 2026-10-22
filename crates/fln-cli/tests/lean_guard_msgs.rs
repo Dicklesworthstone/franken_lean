@@ -12,7 +12,6 @@
 //! What this engine does not reproduce is refused with exit 5, never judged:
 //! - an expectation with `error:`, `warning:` or `trace:` (their text is not the pin's here);
 //! - `drop error`, which needs command-error recovery, and position reporting;
-//! - a guard over an IO action;
 //! - a mismatch over `#check`. Its rendering is not proven to be the pin's in general, so a
 //!   difference may be this door's; the pin would report an error.
 #![forbid(unsafe_code)]
