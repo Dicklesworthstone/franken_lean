@@ -12337,14 +12337,14 @@ fn render_lean_source_commands(
                 4,
             );
         };
-        // Only goal-display traces are reproduced. An expected `trace:` line from any other
-        // trace class has no producer here, so a mismatch against it is a non-answer too. So
-        // is one against an expected `error:` line: this engine may word the error otherwise,
-        // or accept the command the pin rejects.
+        // Literal traces are exact; goal displays retain their printer uncertainty.
+        // An expected trace without a checked producer may name an unsupported trace
+        // class, so its mismatch remains a non-answer. Expected errors do too: this
+        // engine may word the error otherwise, or accept the command the pin rejects.
         let from_check = messages.from_check
             || guard.expected.lines().any(|line| {
                 let line = line.trim_start();
-                line.starts_with("trace:") || line.starts_with("error:")
+                (line.starts_with("trace:") && !messages.has_trace) || line.starts_with("error:")
             });
         let produced = guard.spec.combine(messages.checked);
         if !guard.spec.matches(&guard.expected, &produced) {

@@ -5,6 +5,8 @@ pub(super) struct Buffer<'a> {
     pub spec: &'a GuardSpec,
     pub checked: Vec<String>,
     pub from_check: bool,
+    /// A checked trace has an actual producer; an expected trace alone does not.
+    pub has_trace: bool,
 }
 
 pub(super) type Guards<'a> = std::collections::BTreeMap<usize, Buffer<'a>>;
@@ -15,6 +17,7 @@ impl<'a> Buffer<'a> {
             spec,
             checked: Vec::new(),
             from_check: false,
+            has_trace: false,
         }
     }
 

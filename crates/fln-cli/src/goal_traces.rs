@@ -32,6 +32,7 @@ impl Message<'_> {
                             // As with #check, a goal-display mismatch may be
                             // our partial printer, not a Reference rejection.
                             guard.from_check |= trace.is_goal_state;
+                            guard.has_trace = true;
                             Some(&mut guard.checked)
                         }
                         // Dropping a trace still traverses the bounded formatter.

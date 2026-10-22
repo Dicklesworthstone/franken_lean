@@ -288,12 +288,12 @@ fn trace_state_and_trace_message_match_pinned_lean_cases() {
         "g : Nat → Nat\nh : f 1 = g\n⊢ g 2 = f 2 1\n1235.lean:2:0: warning: declaration uses `sorry`\n"
     );
 
-    // 5. Guarded `trace_state`, `trace "msg"`, `no goals`, case tags, and filter policies.
+    // 5. Guarded `trace_state`, literal messages, closed goals and filter policies.
     let guarded = concat!(
         "/--\ntrace: x : Nat\n⊢ x = x\n-/\n",
         "#guard_msgs in\n",
         "theorem t1 (x : Nat) : x = x := by\n  trace_state\n  rfl\n\n",
-        "/-- trace: no goals -/\n",
+        "/-- trace: -/\n",
         "#guard_msgs in\n",
         "theorem t2 : True := by\n  trivial\n  trace_state\n\n",
         "/-- trace: hello -/\n",
@@ -314,6 +314,23 @@ fn trace_state_and_trace_message_match_pinned_lean_cases() {
         "/-- trace: wrong -/\n#guard_msgs in\ntheorem m1 : True := by\n  trace_state\n  trivial\n",
     );
     assert_eq!(mismatch_goal.exit_code, CAPABILITY_NOT_IMPLEMENTED_EXIT);
+    // The pin prints an empty trace after proof closure, not `no goals`.
+    // A mismatch there still carries raw-goal printer uncertainty.
+    let mismatch_closed_goal = render(
+        "/-- trace: no goals -/\n#guard_msgs in\ntheorem closed : True := by\n  trivial\n  trace_state\n",
+    );
+    assert_eq!(
+        mismatch_closed_goal.exit_code,
+        CAPABILITY_NOT_IMPLEMENTED_EXIT
+    );
+    let missing_trace = render(
+        "/-- trace: unknown class -/\n#guard_msgs in\ntheorem silent : True := by trivial\n",
+    );
+    assert_eq!(missing_trace.exit_code, CAPABILITY_NOT_IMPLEMENTED_EXIT);
+    let mixed_goal = render(
+        "/-- trace: wrong -/\n#guard_msgs in\ntheorem mixed : True := by\n  trace \"literal\"\n  trace_state\n  trivial\n",
+    );
+    assert_eq!(mixed_goal.exit_code, CAPABILITY_NOT_IMPLEMENTED_EXIT);
 
     let mismatch_msg = render(
         "/-- trace: wrong -/\n#guard_msgs in\ntheorem m2 : True := by\n  trace \"actual\"\n  trivial\n",
