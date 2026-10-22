@@ -103,6 +103,12 @@ pub struct SourceMetadataReport {
     pub simps: usize,
     /// Supported global forward post-phase entries replayed natively.
     pub activated_simps: usize,
+    /// The pin's delaborator tags on this module's own declarations
+    /// (`pp_using_anonymous_constructor`, `pp_nodot`), and its `app_unexpander`
+    /// registrations, which the printer reads.
+    pub pp_anonymous_constructor: usize,
+    pub pp_nodot: usize,
+    pub app_unexpanders: usize,
     /// Unsupported scope, phase or proof forms; also named in `uninterpreted`.
     pub deferred_simps: usize,
     pub uninterpreted: Vec<Name>,
@@ -340,6 +346,9 @@ impl Engine {
                 Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
                 Name::from_components(metadata::SIMP_EXTENSION.split('.')),
                 Name::from_components(metadata::DEFEQ_EXTENSION.split('.')),
+                Name::from_components(metadata::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION.split('.')),
+                Name::from_components(metadata::PP_NODOT_EXTENSION.split('.')),
+                Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -384,6 +393,9 @@ impl Engine {
                 simps: 0,
                 activated_simps: 0,
                 deferred_simps: 0,
+                pp_anonymous_constructor: 0,
+                pp_nodot: 0,
+                app_unexpanders: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -428,6 +440,9 @@ impl Engine {
                         12 => report.noncomputable = entries.len(),
                         13 => report.simps = entries.len(),
                         14 => report.defeq = entries.len(),
+                        15 => report.pp_anonymous_constructor = entries.len(),
+                        16 => report.pp_nodot = entries.len(),
+                        17 => report.app_unexpanders = entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -463,6 +478,9 @@ impl Engine {
         let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut defeq = decoded.defeq.into_iter();
+        let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
+        let mut pp_nodot = decoded.pp_nodot.into_iter();
+        let mut app_unexpanders = decoded.app_unexpanders.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
@@ -656,6 +674,72 @@ impl Engine {
                     .register_aux_recursors(&tagged)
                     .map_err(|error| auxiliary_error(&report.module, error))?;
             }
+            if report.pp_anonymous_constructor + report.pp_nodot + report.app_unexpanders != 0 {
+                cancelled!("source-olean/delaborator-tags");
+                let anonymous: Vec<Name> = pp_anonymous_constructor
+                    .by_ref()
+                    .take(report.pp_anonymous_constructor)
+                    .collect();
+                let nodot: Vec<Name> = pp_nodot.by_ref().take(report.pp_nodot).collect();
+                let unexpanders: Vec<_> = app_unexpanders
+                    .by_ref()
+                    .take(report.app_unexpanders)
+                    .collect();
+                if anonymous.len() != report.pp_anonymous_constructor
+                    || nodot.len() != report.pp_nodot
+                    || unexpanders.len() != report.app_unexpanders
+                {
+                    return Err(SourceOleanImportError::Internal(
+                        "delaborator tag count changed during decode",
+                    ));
+                }
+                // A tag attribute names this module's own declaration; an unexpander's key
+                // may be any admitted constant.
+                for tagged in [&anonymous, &nodot] {
+                    let mut owners = AttributeOwners::new(
+                        &checked.modules[index].decoded.constants,
+                        tagged.len(),
+                        limits.check.max_declarations,
+                        limits.metadata.max_entries,
+                    )?;
+                    for declaration in tagged {
+                        cancelled!("source-olean/delaborator-tag-owner");
+                        owners.validate(activation.environment(), &report.module, declaration)?;
+                    }
+                }
+                use fln_elab::delaborator_tags::DelaboratorTag;
+                let tags: Vec<DelaboratorTag> = anonymous
+                    .into_iter()
+                    .map(DelaboratorTag::AnonymousConstructor)
+                    .chain(nodot.into_iter().map(DelaboratorTag::NoDot))
+                    .chain(
+                        unexpanders
+                            .into_iter()
+                            .map(|entry| DelaboratorTag::Unexpander {
+                                key: entry.key,
+                                scope: entry.scope,
+                            }),
+                    )
+                    .collect();
+                activation =
+                    activation
+                        .register_delaborator_tags(&tags)
+                        .map_err(|error| {
+                            let declaration = match &error {
+                        fln_elab::delaborator_tags::DelaboratorTagError::UnknownDeclaration(name)
+                        | fln_elab::delaborator_tags::DelaboratorTagError::NotInductive(name)
+                        | fln_elab::delaborator_tags::DelaboratorTagError::Duplicate(name) => {
+                            name.clone()
+                        }
+                        _ => report.module.clone(),
+                    };
+                            SourceOleanImportError::Metadata {
+                                module: report.module.clone(),
+                                declaration,
+                                reason: "a delaborator tag cannot be recorded",
+                            }
+                        })?;
+            }
             if report.noncomputable != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -838,6 +922,13 @@ impl Engine {
         fln_elab::noncomputable::read(&engine.environment).map_err(|error| {
             noncomputable_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
+        fln_elab::delaborator_tags::DelaboratorTags::read(&engine.environment).map_err(|_| {
+            SourceOleanImportError::Metadata {
+                module: roots.first().cloned().unwrap_or_default(),
+                declaration: roots.first().cloned().unwrap_or_default(),
+                reason: "the delaborator tag journal cannot be read back",
+            }
+        })?;
         fln_elab::records::imported::ImportedStructures::read(&engine.environment).map_err(
             |problem| {
                 structures::error(
@@ -856,6 +947,9 @@ impl Engine {
             || aux_recursors.next().is_some()
             || noncomputable.next().is_some()
             || defeq.next().is_some()
+            || pp_anonymous_constructor.next().is_some()
+            || pp_nodot.next().is_some()
+            || app_unexpanders.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
@@ -1000,6 +1094,10 @@ trait Registrar: Sized {
         self,
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError>;
+    fn register_delaborator_tags(
+        self,
+        tags: &[fln_elab::delaborator_tags::DelaboratorTag],
+    ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError>;
     fn register_noncomputable(
         self,
         declaration: &Name,
@@ -1076,6 +1174,12 @@ impl Registrar for instances::imported::ImportActivation {
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
         self.register_aux_recursors(declarations)
+    }
+    fn register_delaborator_tags(
+        self,
+        tags: &[fln_elab::delaborator_tags::DelaboratorTag],
+    ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
+        self.register_delaborator_tags(tags)
     }
     fn register_noncomputable(
         self,
@@ -1761,6 +1865,12 @@ pub(super) mod tests {
             declarations: &[Name],
         ) -> std::result::Result<Self, fln_elab::aux_recursors::AuxRecursorError> {
             fln_elab::aux_recursors::register_module(&self.0, declarations).map(Sequential)
+        }
+        fn register_delaborator_tags(
+            self,
+            tags: &[fln_elab::delaborator_tags::DelaboratorTag],
+        ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
+            fln_elab::delaborator_tags::register_module(&self.0, tags).map(Sequential)
         }
         fn register_noncomputable(
             self,

@@ -601,6 +601,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record one imported module's delaborator tags. This journal, which the printer
+    /// reads, does not affect the kept class or instance state.
+    pub fn register_delaborator_tags(
+        mut self,
+        tags: &[crate::delaborator_tags::DelaboratorTag],
+    ) -> Result<Self, crate::delaborator_tags::DelaboratorTagError> {
+        self.env = crate::delaborator_tags::register_module(&self.env, tags)?;
+        Ok(self)
+    }
+
     /// Record a checked owning module's noncomputable tag. This changes no
     /// instance candidate or cached typeclass metadata.
     pub fn register_noncomputable(
