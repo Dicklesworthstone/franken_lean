@@ -11725,9 +11725,33 @@ fn render_lean_source_check_line(
         .syntax()
         .kind()
         .map(fln::Name::to_display_string);
+    let unprintable = |what: &str| {
+        source_failure(
+            "capability",
+            &format!("#check cannot print {what} the way the pin does"),
+            false,
+            SourcePresentation::Lean,
+            CAPABILITY_NOT_IMPLEMENTED_EXIT,
+        )
+    };
+    // The candidate is closed over the section variables its term uses; the pin prints the
+    // term with them free, so their binders are entered first.
+    let opened = match &checked.declaration {
+        fln::Declaration::Defn(definition) => Some(
+            printer
+                .open_section_variables(
+                    checked.scope.variables.declared(),
+                    &checked.section_variables,
+                    &definition.value,
+                    &checked.checked_type,
+                )
+                .map_err(|fln::pretty::Unsupported(what)| unprintable(what))?,
+        ),
+        _ => None,
+    };
     // `#synth C` prints the instance it found and nothing else (`logInfo val`).
     if kind.as_deref() == Some("Lean.Parser.Command.synth") {
-        let fln::Declaration::Defn(definition) = &checked.declaration else {
+        let Some((value, _)) = &opened else {
             return Err(source_failure(
                 "internal-fault",
                 "a #synth query did not produce a definition candidate",
@@ -11736,7 +11760,7 @@ fn render_lean_source_check_line(
                 4,
             ));
         };
-        return match printer.expr(&definition.value, 0) {
+        return match printer.expr(value, 0) {
             Ok(line) => Ok(format!("{line}\n")),
             Err(fln::pretty::Unsupported(what)) => Err(source_failure(
                 "capability",
@@ -11756,38 +11780,26 @@ fn render_lean_source_check_line(
     }
     // `#check c` for a constant prints its signature (`delabConstWithSignature`);
     // any other term prints as `term : type`.
-    let constant = match &checked.declaration {
-        fln::Declaration::Defn(definition) if !term.starts_with('@') => {
-            match definition.value.node() {
-                fln::ExprNode::Const { name, .. } => environment
-                    .find(name)
-                    .map(|info| (name.clone(), info.constant_val().type_.clone())),
-                _ => None,
-            }
-        }
+    let constant = match &opened {
+        Some((value, _)) if !term.starts_with('@') => match value.node() {
+            fln::ExprNode::Const { name, .. } => environment
+                .find(name)
+                .map(|info| (name.clone(), info.constant_val().type_.clone())),
+            _ => None,
+        },
         _ => None,
     };
-    let rendered = match &constant {
-        Some((name, type_)) => printer.signature(name, type_),
+    let rendered = match (&constant, &opened) {
+        (Some((name, type_)), _) => printer.signature(name, type_),
         // The pin prints the elaborated term, not its source spelling.
         // The pin lays out the whole `e : type` line at its width, so the two are composed
         // before rendering.
-        None => match &checked.declaration {
-            fln::Declaration::Defn(definition) => {
-                printer.typed(&definition.value, &checked.checked_type)
-            }
-            _ => printer.typed_text(term, &checked.checked_type),
-        },
+        (None, Some((value, type_))) => printer.typed(value, type_),
+        (None, None) => printer.typed_text(term, &checked.checked_type),
     };
     match rendered {
         Ok(line) => Ok(format!("{line}\n")),
-        Err(fln::pretty::Unsupported(what)) => Err(source_failure(
-            "capability",
-            &format!("#check cannot print {what} the way the pin does"),
-            false,
-            SourcePresentation::Lean,
-            CAPABILITY_NOT_IMPLEMENTED_EXIT,
-        )),
+        Err(fln::pretty::Unsupported(what)) => Err(unprintable(what)),
     }
 }
 

@@ -7096,7 +7096,8 @@ impl Engine {
                 self.environment(),
                 limits.kernel,
                 scope,
-            ),
+            )
+            .map(|declaration| (declaration, Vec::new())),
             SourceCommandKind::Check
                 if scope != &fln_elab::source::scope::SourceScope::default() =>
             {
@@ -7113,10 +7114,11 @@ impl Engine {
                 name,
                 self.environment(),
                 limits.kernel,
-            ),
+            )
+            .map(|declaration| (declaration, Vec::new())),
             _ => return Err(EngineExecutionError::StandaloneCheckRequired),
         })?;
-        let declaration = match declaration {
+        let (declaration, section_variables) = match declaration {
             Outcome::Complete(declaration) => declaration,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -7138,6 +7140,7 @@ impl Engine {
                     environment_root: admission.base_logical_root,
                     checker: admission.checker,
                     scope: scope.clone(),
+                    section_variables,
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -12102,6 +12105,10 @@ pub struct SourceCheck {
     /// The scope in force at the command (namespace, `open`s): its output names constants
     /// the way they resolve there, as the pin's delaborator does.
     pub scope: fln_elab::source::scope::SourceScope,
+    /// The section variables the candidate is closed over, as positions in the scope's
+    /// `variable` list, outermost first: `declaration`'s value and `checked_type` begin with
+    /// one binder for each. The pin prints the term with these variables free.
+    pub section_variables: Vec<usize>,
 }
 
 /// One completed definition-only source prefix followed by a terminal check.

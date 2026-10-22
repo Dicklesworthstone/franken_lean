@@ -653,16 +653,20 @@ pub fn elaborate_evaluation(
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     super::query_scoped(syntax, generated_name, env, kernel, true, scope)
+        .map(|(declaration, _)| declaration)
 }
 
-/// A `#check` candidate with names resolved in `scope`.
+/// A `#check` candidate with names resolved in `scope`, closed over the section variables its
+/// term uses, and their positions in [`variables::SectionVariables::declared`], outermost first. The
+/// candidate's value and type begin with one binder per position; a printer opens them again
+/// to show the term as the pin does, with those variables free.
 pub fn elaborate_check(
     syntax: &Syntax,
     generated_name: Name,
     env: &Environment,
     kernel: Budget,
     scope: &SourceScope,
-) -> Result<Declaration, NatDefinitionElabError> {
+) -> Result<(Declaration, Vec<usize>), NatDefinitionElabError> {
     super::query_scoped(syntax, generated_name, env, kernel, false, scope)
 }
 

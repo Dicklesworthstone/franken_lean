@@ -66,6 +66,53 @@ fn shown_names(locals: &[LocalDecl]) -> Result<Vec<String>, Unsupported> {
     Ok(names)
 }
 
+impl Printer<'_> {
+    /// Enter the leading binders of a `#check` candidate closed over section variables
+    /// (`fln_elab::source::scope::elaborate_check`): one per entry of `positions`, which index
+    /// `variables`, the scope's whole `variable` list. Each is shown as the pin's message shows
+    /// that variable, free in its local context: a variable a later one shadows shows as `x✝`
+    /// (`LocalContext.sanitizeNames`), whether or not the later one is used. Returns the value
+    /// and type under the binders.
+    pub fn open_section_variables(
+        &mut self,
+        variables: &[LocalDecl],
+        positions: &[usize],
+        value: &Expr,
+        type_: &Expr,
+    ) -> Result<(Expr, Expr), Unsupported> {
+        let mut value = value.clone();
+        let mut type_ = type_.clone();
+        if positions.is_empty() {
+            return Ok((value, type_));
+        }
+        let names = shown_names(variables)?;
+        for &position in positions {
+            self.tick()?;
+            let shown = names
+                .get(position)
+                .ok_or(Unsupported("a section variable outside its scope"))?;
+            let (
+                ExprNode::Lam {
+                    binder_type,
+                    body: value_body,
+                    ..
+                },
+                ExprNode::ForallE {
+                    body: type_body, ..
+                },
+            ) = (value.node(), type_.node())
+            else {
+                return Err(Unsupported(
+                    "a #check candidate without its section binders",
+                ));
+            };
+            self.bind(shown.clone(), binder_type);
+            (value, type_) = (value_body.clone(), type_body.clone());
+        }
+        Ok((value, type_))
+    }
+}
+
 /// `term`, elaborated in `locals`, as a message prints it inline (`MessageData.ofExpr`).
 pub fn term_in_locals(
     env: &Environment,

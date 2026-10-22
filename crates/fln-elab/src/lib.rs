@@ -550,14 +550,15 @@ pub fn elaborate_definition_with_effects_in_scope_with_budget(
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
 }
 
-/// A `#check` candidate with names resolved in a source scope.
+/// A `#check` candidate with names resolved in a source scope, and the positions of the section
+/// variables it is closed over (see [`source::scope::elaborate_check`]).
 pub fn elaborate_check_in_scope_with_budget(
     syntax: &Syntax,
     generated_name: Name,
     environment: &Environment,
     budget: Budget,
     scope: &source::scope::SourceScope,
-) -> Result<Declaration, NatDefinitionElabError> {
+) -> Result<(Declaration, Vec<usize>), NatDefinitionElabError> {
     // An unknown name is the pin's "Unknown identifier `x`" here too, as for a definition.
     source::scope::elaborate_check(syntax, generated_name, environment, budget, scope)
         .map_err(|error| with_pin_unknown_name_wording(error, environment))
@@ -2619,7 +2620,8 @@ mod tests {
                 &environment,
                 Budget::DEFAULT,
                 &scope,
-            ),
+            )
+            .map(|(declaration, _)| declaration),
         ] {
             assert_eq!(
                 refused.map(|_| ()).map_err(|error| error.to_string()),

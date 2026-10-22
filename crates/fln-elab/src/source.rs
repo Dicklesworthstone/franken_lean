@@ -5667,9 +5667,12 @@ pub(super) fn query(
     evaluate: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
     query_in(syntax, name, Context::new(environment, kernel), evaluate)
+        .map(|(declaration, _)| declaration)
 }
 
-/// [`query`] with names resolved in a source scope (namespaces, `open`).
+/// [`query`] with names resolved in a source scope (namespaces, `open`). With the candidate
+/// come the positions, in the scope's `variable` list, of the section variables it is closed
+/// over, outermost first (see [`Context::close_query_section`]).
 pub(super) fn query_scoped(
     syntax: &Syntax,
     name: Name,
@@ -5677,7 +5680,7 @@ pub(super) fn query_scoped(
     kernel: Budget,
     evaluate: bool,
     scope: &scope::SourceScope,
-) -> Result<Declaration, NatDefinitionElabError> {
+) -> Result<(Declaration, Vec<usize>), NatDefinitionElabError> {
     query_in(
         syntax,
         name,
@@ -5691,17 +5694,20 @@ fn query_in(
     name: Name,
     mut context: Context,
     evaluate: bool,
-) -> Result<Declaration, NatDefinitionElabError> {
-    let (term, level_params) = query_term(syntax, &name, &mut context, evaluate)?;
-    Ok(query_declaration(
-        name,
-        term,
-        level_params,
-        if evaluate {
-            DefinitionSafety::Unsafe
-        } else {
-            DefinitionSafety::Safe
-        },
+) -> Result<(Declaration, Vec<usize>), NatDefinitionElabError> {
+    let (term, level_params, section) = query_term(syntax, &name, &mut context, evaluate)?;
+    Ok((
+        query_declaration(
+            name,
+            term,
+            level_params,
+            if evaluate {
+                DefinitionSafety::Unsafe
+            } else {
+                DefinitionSafety::Safe
+            },
+        ),
+        section,
     ))
 }
 
@@ -5710,7 +5716,7 @@ fn query_term(
     name: &Name,
     context: &mut Context,
     evaluate: bool,
-) -> Result<(Typed, Vec<Name>), NatDefinitionElabError> {
+) -> Result<(Typed, Vec<Name>, Vec<usize>), NatDefinitionElabError> {
     let expanded = context.expand_match_alternatives(syntax)?;
     let syntax = expanded.as_ref();
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
@@ -5719,6 +5725,11 @@ fn query_term(
         } else {
             NatDefinitionElabError::InvalidGeneratedCheckName
         });
+    }
+    // The scope's universes (`universe u`) and those its `variable`s bound name levels in a
+    // query, as in a declaration header without explicit universe parameters.
+    if !evaluate {
+        context.declare_levels(&Syntax::node(Name::from_components(["null"]), vec![]))?;
     }
     // `#synth C` (`elabSynth`, Lean/Elab/BuiltinCommand.lean:506): `C` elaborated with no
     // expected type, its pending instances synthesized, then an instance of `C` synthesized.
@@ -5737,7 +5748,7 @@ fn query_term(
             value: hole,
             type_: class,
         })?;
-        return Ok((term, Vec::new()));
+        return context.close_query_section(term, Vec::new());
     }
     // `#print` (`Lean/Elab/Print.lean`): its identifier or string is elaborated as `#check`
     // elaborates a term, and the caller prints from the constant or literal the candidate is.
@@ -5808,8 +5819,66 @@ fn query_term(
     // `#eval` compiles its term (`codegen.rs`); `#check` does not.
     if evaluate {
         context.check_compiled_recursors(&term)?;
+        return Ok((term, level_params, Vec::new()));
     }
-    Ok((term, level_params))
+    context.close_query_section(term, level_params)
+}
+
+impl Context {
+    /// The pin elaborates `#check` and `#synth` with every section variable in the local
+    /// context (`runTermElabM`, vendored `Lean/Elab/Command.lean`) and prints the term with
+    /// those variables as they are named there. The candidate here is closed over the variables
+    /// its term uses, outermost first, as a definition's value is, so the kernel can check it;
+    /// the caller opens the binders again to print. `level_params` gains the scope universes
+    /// (`universe u`) the closed term uses. Returns the closed variables' positions in the
+    /// scope's `variable` list.
+    fn close_query_section(
+        &mut self,
+        mut term: Typed,
+        mut level_params: Vec<Name>,
+    ) -> Result<(Typed, Vec<Name>, Vec<usize>), NatDefinitionElabError> {
+        let section = self.section_parameters(&[term.value.clone(), term.type_.clone()], false)?;
+        let declared = self.source_scope.variables.locals().decls();
+        let positions = section
+            .iter()
+            .map(|local| {
+                declared
+                    .iter()
+                    .position(|declared| declared.id == local.id)
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for local in section.into_iter().rev() {
+            let LocalDecl {
+                id,
+                user_name: name,
+                type_: domain,
+                binder_info: style,
+                ..
+            } = local;
+            let domain = self.instantiate(&domain)?;
+            term.value = term
+                .value
+                .abstract_fvar(&id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            term.type_ = term
+                .type_
+                .abstract_fvar(&id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            term.value = Expr::lam(name.clone(), domain.clone(), term.value, style);
+            term.type_ = Expr::forall_e(name, domain, term.type_, style);
+        }
+        let term = self.finish(term)?;
+        if term.value.has_fvar() || term.type_.has_fvar() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        for level in self.declaration_levels(&[term.type_.clone(), term.value.clone()])? {
+            if !level_params.contains(&level) {
+                level_params.push(level);
+            }
+        }
+        Ok((term, level_params, positions))
+    }
 }
 
 fn query_declaration(

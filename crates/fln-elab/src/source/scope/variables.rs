@@ -30,6 +30,12 @@ impl SectionVariables {
         self.locals.is_empty()
     }
 
+    /// Every section variable in declaration order, as a term elaborated in this scope may
+    /// name it; a later one with an earlier one's name shadows it.
+    pub fn declared(&self) -> &[LocalDecl] {
+        self.locals.decls()
+    }
+
     /// Selection refers to declared identities, not namespace lookup or future
     /// binders. Resolve the entire command before changing either set.
     pub fn select(&mut self, names: &[Name], include: bool) -> Result<(), ScopeError> {

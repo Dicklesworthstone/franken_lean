@@ -1041,12 +1041,28 @@ fn render_commands(
                         .parsed
                         .query_term_normalized()
                         .ok_or_else(|| internal("source program check has no query term"))?;
-                    let type_ = fln::pretty::Printer::in_scope(commands.batch.engine.environment(), &check.scope)
-                        .expr(&check.checked_type, 0)
-                        .map_err(|fln::pretty::Unsupported(what)| Failure::new(
-                            "capability", &format!("module `{module}`, command {command}: cannot print checked type {what}"),
-                            false, CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                        ))?;
+                    // The type is printed with the section variables the candidate is closed
+                    // over free, as the pin prints it.
+                    let mut printer = fln::pretty::Printer::in_scope(
+                        commands.batch.engine.environment(),
+                        &check.scope,
+                    );
+                    let type_ = match &check.declaration {
+                        fln::Declaration::Defn(definition) => printer
+                            .open_section_variables(
+                                check.scope.variables.declared(),
+                                &check.section_variables,
+                                &definition.value,
+                                &check.checked_type,
+                            )
+                            .map(|(_, type_)| type_),
+                        _ => Ok(check.checked_type.clone()),
+                    }
+                    .and_then(|type_| printer.expr(&type_, 0))
+                    .map_err(|fln::pretty::Unsupported(what)| Failure::new(
+                        "capability", &format!("module `{module}`, command {command}: cannot print checked type {what}"),
+                        false, CAPABILITY_NOT_IMPLEMENTED_EXIT,
+                    ))?;
                     if json {
                         format!(
                             ",\"term\":{},\"type\":{}",

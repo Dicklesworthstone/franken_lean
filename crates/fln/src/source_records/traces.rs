@@ -170,6 +170,7 @@ impl Engine {
                         environment_root: admission.base_logical_root,
                         checker: admission.checker,
                         scope: scope.clone(),
+                        section_variables: Vec::new(),
                     },
                     traces,
                 )

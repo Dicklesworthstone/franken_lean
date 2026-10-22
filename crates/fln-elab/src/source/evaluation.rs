@@ -110,7 +110,7 @@ impl PreparedEvaluation {
         let term = if guard {
             guard_term(syntax, &mut context)
         } else {
-            query_term(syntax, &generated_name, &mut context, true).map(|(term, _)| term)
+            query_term(syntax, &generated_name, &mut context, true).map(|(term, _, _)| term)
         }
         .map_err(|error| with_pin_unknown_name_wording(error, environment))?;
         Ok(Self {
