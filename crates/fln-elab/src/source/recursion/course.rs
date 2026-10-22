@@ -1,4 +1,4 @@
-//! Course-of-values fallback for a single, unindexed inductive family.
+//! Course-of-values fallback for a single inductive family with local indices.
 //!
 //! Use the admitted family's below/brecOn definitions, not an unchecked self
 //! declaration. A private below parameter is generalized by ordinary dependent
@@ -57,11 +57,24 @@ impl Context {
             return Err(error(RecursionError::NotDecreasing));
         };
         if family.all.len() != 1
-            || family.num_indices != 0
-            || parameters.len() != family.num_params as usize
+            || parameters.len() != family.num_params as usize + family.num_indices as usize
         {
             return Err(error(RecursionError::NotDecreasing));
         }
+        // Only independent source index binders can be generalized here.
+        // Fixed/repeated indices keep the ordinary refinement boundary.
+        let (parameters, index_values) = parameters.split_at(family.num_params as usize);
+        let indices = match self.elimination_index_locals(index_values) {
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                matching::MatchError::UnrefinedIndices,
+            ))) => {
+                // This fallback has not changed the fixed-index boundary.
+                // Keep other structural candidates and automatic well-founded
+                // fallback eligible; resource and typing errors still escape.
+                return Err(error(RecursionError::NotDecreasing));
+            }
+            result => result?,
+        };
         let brec = Name::str(name.clone(), "brecOn");
         if !self.is_auxiliary_recursor(&brec)? {
             return Err(error(RecursionError::NotDecreasing));
@@ -75,7 +88,7 @@ impl Context {
         // Preserve the original source obligation before adding any induction
         // dictionary. It must not make invalid original typing disappear.
         let obligation = self.original_recursive_body_obligation(syntax, Some(expected.clone()))?;
-        self.recursive_indices(name, &parameters, &[])?;
+        self.recursive_indices(name, parameters, &indices)?;
         let recursion = self
             .recursion
             .clone()
@@ -88,7 +101,7 @@ impl Context {
             value: target.clone(),
             type_,
         })?;
-        let motive = Expr::lam(
+        let mut motive = Expr::lam(
             major.user_name.clone(),
             family_type.clone(),
             target
@@ -96,6 +109,19 @@ impl Context {
                 .map_err(|_| failure(SourceInferenceError::Scope))?,
             BinderInfo::Default,
         );
+        // Family order is not necessarily the source telescope order. Keep
+        // each index's real dependent domain, followed by the major premise.
+        for index in indices.iter().rev() {
+            self.tick()?;
+            motive = Expr::lam(
+                index.user_name.clone(),
+                self.instantiate(&index.type_)?,
+                motive
+                    .abstract_fvar(&index.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            );
+        }
         let mut universes = if definition.base.level_params.len() == levels.len() {
             Vec::new()
         } else {
@@ -114,9 +140,12 @@ impl Context {
             )?,
         };
         for parameter in parameters {
-            recursor = self.course_apply(recursor, parameter)?;
+            recursor = self.course_apply(recursor, parameter.clone())?;
         }
         recursor = self.course_apply(recursor, motive)?;
+        for index in &indices {
+            recursor = self.course_apply(recursor, Expr::fvar(index.id.clone()))?;
+        }
         recursor = self.course_apply(recursor, Expr::fvar(major.id.clone()))?;
         let remaining = self.whnf(&recursor.type_)?;
         let ExprNode::ForallE {
@@ -126,7 +155,16 @@ impl Context {
         else {
             return Err(error(RecursionError::NotDecreasing));
         };
-        let function = self.whnf(functional_type)?;
+        let mut function = functional_type.clone();
+        for index in &indices {
+            self.tick()?;
+            function = self.whnf(&function)?;
+            let ExprNode::ForallE { body, .. } = function.node() else {
+                return Err(error(RecursionError::NotDecreasing));
+            };
+            function = self.substitute(body, &Expr::fvar(index.id.clone()))?;
+        }
+        let function = self.whnf(&function)?;
         let ExprNode::ForallE { body, .. } = function.node() else {
             return Err(error(RecursionError::NotDecreasing));
         };
@@ -189,6 +227,17 @@ impl Context {
                 .map_err(|_| failure(SourceInferenceError::Scope))?,
             BinderInfo::Default,
         );
+        for index in indices.iter().rev() {
+            self.tick()?;
+            value = Expr::lam(
+                index.user_name.clone(),
+                self.instantiate(&index.type_)?,
+                value
+                    .abstract_fvar(&index.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            );
+        }
         self.txn.lctx = saved;
         self.recursion = Some(recursion.clone());
         let mut result = self.match_apply(
@@ -241,6 +290,7 @@ impl Context {
         {
             self.tick()?;
             if !recursion.varying.contains(&position)
+                && !recursion.indices.contains(&position)
                 && !self.fixed_recursive_argument(&arguments[position], parameter)?
             {
                 return Err(error(RecursionError::GeneralizeParameter {
@@ -267,10 +317,23 @@ impl Context {
             .cloned()
             .ok_or_else(|| error(RecursionError::NotDecreasing))?;
         let parameters = recursion.family.as_ref().expect("course family").1;
+        // A history entry is identified by every index AND its smaller major.
+        // Equal result types never license selecting another child's entry.
+        let mut requested = Vec::new();
+        for position in &recursion.indices {
+            self.tick()?;
+            requested.push(
+                arguments
+                    .get(*position)
+                    .cloned()
+                    .ok_or_else(|| error(RecursionError::NotDecreasing))?,
+            );
+        }
+        requested.push(argument);
         let (head, mut args) = self.course_spine(&below.type_)?;
         let expected_head = Name::str(recursion.family.as_ref().unwrap().0.clone(), "below");
         if !matches!(head.node(), ExprNode::Const { name, .. } if name == &expected_head)
-            || args.len() != parameters + 2
+            || args.len() != parameters + recursion.indices.len() + 2
         {
             return Err(error(RecursionError::NotDecreasing));
         }
@@ -288,7 +351,7 @@ impl Context {
         args[parameters] = Expr::fvar(canary.clone());
         let dictionary = args.into_iter().fold(head, Expr::app);
         let selected =
-            self.search_course_dictionary(dictionary, Expr::fvar(below.id), &canary, &argument);
+            self.search_course_dictionary(dictionary, Expr::fvar(below.id), &canary, &requested);
         self.txn.lctx = saved;
         let mut result = selected?.ok_or_else(|| error(RecursionError::NotDecreasing))?;
         for position in &recursion.varying {
@@ -309,15 +372,25 @@ impl Context {
         dictionary: Expr,
         value: Expr,
         canary: &FVarId,
-        argument: &Expr,
+        requested: &[Expr],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let mut pending = vec![(dictionary, value)];
         while let Some((type_, value)) = pending.pop() {
             self.tick()?;
             let type_ = self.whnf(&type_)?;
             let (head, args) = self.course_spine(&type_)?;
-            if matches!(head.node(), ExprNode::FVar { id } if id == canary) && args.len() == 1 {
-                if self.coercion_kernel_eq(args[0].clone(), argument.clone())? {
+            if matches!(head.node(), ExprNode::FVar { id } if id == canary)
+                && args.len() == requested.len()
+            {
+                let mut equal = true;
+                for (actual, expected) in args.iter().zip(requested) {
+                    self.tick()?;
+                    if !self.coercion_kernel_eq(actual.clone(), expected.clone())? {
+                        equal = false;
+                        break;
+                    }
+                }
+                if equal {
                     return Ok(Some(value));
                 }
             } else if matches!(head.node(), ExprNode::Const { name, .. }
