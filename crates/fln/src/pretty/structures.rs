@@ -174,6 +174,76 @@ impl<'a> Printer<'a> {
         Ok(subobjects)
     }
 
+    /// `stripParentProjections` (vendored `PrettyPrinter/Delaborator/Builtins.lean:260-270`): a
+    /// field-notation object printed `x.toP` by a projection to a parent's subobject is `x`, so
+    /// `B.toA (D.toB self)` prints `self.toA`. `parentProj? false` (`FieldNotation.lean:145-153`)
+    /// takes only a subobject field's projection applied to its parameters and the structure.
+    /// A projection a notation may print instead is refused: the pin strips only `x.toP`.
+    pub(super) fn without_parent_projections(
+        &mut self,
+        object: &Expr,
+    ) -> Result<Expr, Unsupported> {
+        let mut object = object.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = spine(&object);
+            let ExprNode::Const { name, .. } = head.node() else {
+                return Ok(object);
+            };
+            let Some(params) = self.parent_projection(name, args.len())? else {
+                return Ok(object);
+            };
+            let infos = self.binder_infos(name);
+            let Some((receiver, _)) = self.field_receiver(name, &infos, &args) else {
+                return Ok(object);
+            };
+            if receiver != params {
+                return Ok(object);
+            }
+            if self.notation_prints(name) || (self.imported_tags && self.unexpander_in_force(name))
+            {
+                return Err(Unsupported("a parent projection a notation may print"));
+            }
+            object = args[params].clone();
+        }
+    }
+
+    /// The parameter count of `name`'s structure when `name` projects a parent's subobject field
+    /// and `arity` arguments are its parameters and the structure.
+    fn parent_projection(
+        &mut self,
+        name: &Name,
+        arity: usize,
+    ) -> Result<Option<usize>, Unsupported> {
+        let LeafView::Str(field) = name.leaf_view() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Induct(record)) = self.env.find(&name.parent()) else {
+            return Ok(None);
+        };
+        let ([ctor], 0) = (record.ctors.as_slice(), record.num_indices) else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Ctor(ctor)) = self.env.find(ctor) else {
+            return Ok(None);
+        };
+        if arity != ctor.num_params as usize + 1 {
+            return Ok(None);
+        }
+        let ctor = ctor.clone();
+        let names = field_names(self.env, &ctor)?;
+        let Some(index) = names
+            .iter()
+            .position(|candidate| candidate.leaf_view() == LeafView::Str(field))
+        else {
+            return Ok(None);
+        };
+        let subobjects = self.subobjects(&ctor.induct, names.len())?;
+        Ok(subobjects[index]
+            .is_some()
+            .then_some(ctor.num_params as usize))
+    }
+
     /// Whether a notation of this file prints applications of `constant`: it declares an
     /// unexpander for it, which withholds the structure instance whether or not it applies.
     fn notation_prints(&self, constant: &Name) -> bool {

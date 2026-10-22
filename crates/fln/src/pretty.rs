@@ -1418,8 +1418,9 @@ impl<'a> Printer<'a> {
             // Generalized field notation: `C.f r …` is `r.f …` when `r` is `C.f`'s first
             // explicit argument and has type `C …` (never on a numeric literal).
             if let Some((receiver, field)) = self.field_receiver(name, &infos, &args) {
+                let object = self.without_parent_projections(&args[receiver])?;
                 let projection = node(
-                    self.doc(&args[receiver], MAX_PREC)?
+                    self.doc(&object, MAX_PREC)?
                         .then(Format::text(format!(".{field}"))),
                 );
                 let mut shown = projection;

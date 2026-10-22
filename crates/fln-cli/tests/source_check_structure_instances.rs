@@ -157,6 +157,41 @@ Int.negSucc 9
 { fst := Int.ofNat 3, snd := Int.negSucc 2 }
 ";
 
+/// The object of field notation drops projections to a parent's subobject
+/// (`stripParentProjections`, vendored `PrettyPrinter/Delaborator/Builtins.lean:260-270`):
+/// `B.toA (D.toB d)` prints `d.toA`. `D.toC` is no subobject, since `C` shares `A` with `B`. It is
+/// a definition, so `d.toC` stays. An object outside field notation keeps its projection.
+const PARENT_PROJECTIONS: &str = r#"prelude
+import Init.Core
+structure A where
+  x : Nat
+structure B extends A where
+  z : Nat
+structure C extends A where
+  w : Nat
+structure D extends B, C where
+  a : Nat
+def B.double (b : B) : Nat := b.z
+#print D.toC
+#check fun (d : D) => d.x
+#check fun (d : D) => d.toB
+#check fun (d : D) => d.toB.toA
+#check fun (d : D) => B.double d.toB
+#check fun (d : D) => (D.toC d).w
+#check fun (b : B) => b.toA.x
+"#;
+
+/// The pin's output for [`PARENT_PROJECTIONS`].
+const PARENT_PROJECTIONS_EXPECTED: &str = "@[reducible] def D.toC : D → C :=
+fun self => { toA := self.toA, w := self.w }
+fun d => d.x : D → Nat
+fun d => d.toB : D → B
+fun d => d.toA : D → A
+fun d => d.double : D → Nat
+fun d => d.toC.w : D → Nat
+fun b => b.x : B → Nat
+";
+
 /// What this door refuses rather than print another way: a local type without fields (the pin
 /// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field with a default
 /// value (which the pin omits when the value equals it).
@@ -338,6 +373,26 @@ fn a_scoped_unexpander_is_in_force_only_where_its_namespace_is_active() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, SCOPED_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn a_field_notation_object_drops_parent_projections_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Parents.lean");
+    std::fs::write(&entry, PARENT_PROJECTIONS).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, PARENT_PROJECTIONS_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, PARENT_PROJECTIONS_EXPECTED, "{stderr}");
 }
 
 #[test]
