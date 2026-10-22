@@ -90,6 +90,35 @@ const EXPECTED: &str = "@Tree.rec : {motive_1 : Tree → Sort u_1} →
                     (t : List Cmd) → motive_4 t
 ";
 
+/// A non-recursive `match` over a nested family, in a proof and a noncomputable definition, and
+/// reduction through its recursor: `rfl` and `#reduce` unfold `Term.width` by iota on `Term.rec`,
+/// whose motives and minors include the auxiliary `List Term`'s. Over `prelude` +
+/// `import Init.Core`, as the pin was run (2026-10-22).
+const MATCHES: &str = r#"prelude
+import Init.Core
+inductive Term where
+  | var : Nat → Term
+  | app : List Term → Term
+theorem Term.cases (t : Term) : Or (t = t) (t = t) :=
+  match t with
+  | .var _ => Or.inl rfl
+  | .app _ => Or.inr rfl
+noncomputable def Term.width : Term → Nat
+  | .var _ => 1
+  | .app as => as.length
+theorem Term.width_var (n : Nat) : (Term.var n).width = 1 := rfl
+theorem Term.width_app (t : Term) : (Term.app (List.cons t List.nil)).width = 1 := rfl
+#check @Term.cases
+#reduce (Term.var 0).width
+#reduce (Term.app (List.cons (Term.var 1) (List.cons (Term.var 2) List.nil))).width
+"#;
+
+/// The pin's output for [`MATCHES`].
+const MATCHES_EXPECTED: &str = "Term.cases : ∀ (t : Term), t = t ∨ t = t
+1
+2
+";
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
@@ -101,7 +130,7 @@ fn pinned_lib() -> Option<PathBuf> {
                     .join("lib/lean")
             })
         })
-        .filter(|lib| lib.join("Init/Prelude.olean").is_file());
+        .filter(|lib| lib.join("Init/Core.olean").is_file());
     assert!(
         lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
         "the pinned Reference library is required"
@@ -171,4 +200,24 @@ fn nested_families_are_admitted_with_the_pins_recursors() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, EXPECTED, "{stderr}");
+}
+
+#[test]
+fn matches_over_a_nested_family_elaborate_and_reduce_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Matches.lean");
+    std::fs::write(&entry, MATCHES).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, MATCHES_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, MATCHES_EXPECTED, "{stderr}");
 }

@@ -560,7 +560,6 @@ impl Context {
             return Err(error(MatchError::ExpectedInductive));
         };
         if family.is_unsafe
-            || family.num_nested != 0
             || family.all.is_empty()
             || family.all.len() > 8
             || !family.all.contains(name)
@@ -579,8 +578,8 @@ impl Context {
         if rec.is_unsafe
             || rec.num_indices != family.num_indices
             || rec.num_params != family.num_params
-            || rec.num_motives as usize != family.all.len()
-            || (family.all.len() == 1 && rec.num_minors as usize != family.ctors.len())
+            || rec.num_motives as usize != family.all.len() + family.num_nested as usize
+            || (rec.num_motives == 1 && rec.num_minors as usize != family.ctors.len())
             || rec.rules.len() != family.ctors.len()
             || rec.all != family.all
             || !(rec.base.level_params == family.base.level_params
@@ -599,8 +598,9 @@ impl Context {
         };
         let recursive = self.recursive_match(&major.value);
         // A match is a single-family case split, not mutual function recursion.
-        // The latter needs a separate call-graph and decreasing-argument proof.
-        if recursive && family.all.len() > 1 {
+        // The latter needs a separate call-graph and decreasing-argument proof,
+        // and so does recursion through a nested occurrence.
+        if recursive && rec.num_motives > 1 {
             return Err(error(MatchError::UnsupportedFamily));
         }
         // A sole variable/wildcard pattern does not refine any index. Lower it
@@ -788,7 +788,7 @@ impl Context {
             value: motive,
             type_: motive_type,
         };
-        recursor = if family.all.len() == 1 {
+        recursor = if rec.num_motives == 1 {
             self.match_apply(recursor, motive)?
         } else {
             self.specialize_mutual_match(recursor, &family, &rec, motive, &motive_target, universe)?
@@ -1092,6 +1092,9 @@ impl Context {
             return Err(error(MatchError::UnsupportedFamily));
         };
         let families = family.all.clone();
+        // In a nested family a field that mentions the family other than at its head is a
+        // nested occurrence (`List T`): the recursor gives it an auxiliary hypothesis too.
+        let nested = family.num_nested != 0;
         let mut telescope = constructor.base.type_.clone();
         for _ in 0..constructor.num_params {
             self.tick()?;
@@ -1121,7 +1124,7 @@ impl Context {
                 self.tick()?;
                 head = f;
             }
-            let recursive =
+            let mut recursive =
                 matches!(head.node(), ExprNode::Const { name, .. } if families.contains(name));
             if !recursive {
                 let mut pending = vec![&domain];
@@ -1132,6 +1135,10 @@ impl Context {
                         continue;
                     }
                     match expr.node() {
+                        ExprNode::Const { name, .. } if families.contains(name) && nested => {
+                            recursive = true;
+                            break;
+                        }
                         ExprNode::Const { name, .. } if families.contains(name) => {
                             return Err(error(MatchError::UnsupportedFamily));
                         }

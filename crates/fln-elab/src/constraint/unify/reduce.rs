@@ -301,10 +301,12 @@ impl Engine<'_> {
                             }
                             Some(ConstantInfo::Rec(recursor)) => {
                                 // Iota is independent of delta transparency. Do not
-                                // guess the layout of unsupported recursor families.
+                                // guess the layout of unsupported recursor families. A
+                                // nested block's recursor has a motive per auxiliary
+                                // family too, in the same layout; `iota` checks the family.
                                 if recursor.is_unsafe
                                     || recursor.all.is_empty()
-                                    || count(recursor.num_motives)? != recursor.all.len()
+                                    || count(recursor.num_motives)? < recursor.all.len()
                                     || recursor.base.level_params.len() != levels.len()
                                 {
                                     break;
@@ -788,13 +790,15 @@ impl Engine<'_> {
         };
         if family.is_unsafe
             || family.num_indices != recursor.num_indices
-            || family.num_nested != 0
             || family.num_params != recursor.num_params
             || family.all != recursor.all
             || recursor.rules.len() != family.ctors.len()
         {
             return Ok(None);
         }
+        // A nested block's recursor also takes a motive per auxiliary family, and minors for
+        // the auxiliaries' constructors, which are not constants of their own.
+        let nested = count(family.num_nested)?;
         for (rule, constructor) in recursor.rules.iter().zip(&family.ctors) {
             self.meter.node()?;
             if &rule.ctor != constructor {
@@ -814,7 +818,7 @@ impl Engine<'_> {
             if !members.insert(member)
                 || &info.base.name != member
                 || info.is_unsafe
-                || info.num_nested != 0
+                || info.num_nested != family.num_nested
                 || info.all != recursor.all
                 || info.num_params != recursor.num_params
                 || info.base.level_params != family.base.level_params
@@ -825,9 +829,11 @@ impl Engine<'_> {
                 .checked_add(info.ctors.len())
                 .ok_or(UnificationError::ExpressionScope)?;
         }
+        let all_minors = count(recursor.num_minors)?;
         if !members.contains(family_name)
-            || count(recursor.num_motives)? != members.len()
-            || count(recursor.num_minors)? != minors
+            || Some(count(recursor.num_motives)?) != members.len().checked_add(nested)
+            || (nested == 0 && all_minors != minors)
+            || (nested != 0 && all_minors <= minors)
         {
             return Ok(None);
         }
