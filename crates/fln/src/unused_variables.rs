@@ -191,10 +191,17 @@ fn decided(command: &Syntax) -> Option<(&Syntax, &Syntax)> {
 /// when a pattern has a form this module does not read. An identifier is a variable unless
 /// it is qualified, heads an application, or is spelled like some constructor: the pin
 /// resolves it against the open namespaces, so any constructor spelling may be one.
-fn pattern_variables(
-    patterns: &Syntax,
-    constructors: &HashSet<String>,
-) -> Option<Vec<(Name, usize)>> {
+/// The environment's constructor spellings (the last component of each name), for telling a
+/// pattern variable from a constructor, and those of an indexed family's constructors.
+pub(crate) struct Constructors {
+    pub(crate) names: HashSet<String>,
+    /// A pattern headed by one of these is not read: the pin elaborates it by unifying the
+    /// family's indices, which can make a pattern variable occur in an assignment and so count
+    /// as used (`| .cons k x tail => x` over `Vec A (n + 1)` warns about none of them).
+    pub(crate) indexed: HashSet<String>,
+}
+
+fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<Vec<(Name, usize)>> {
     let mut variables = Vec::new();
     let mut pending = vec![patterns];
     while let Some(pattern) = pending.pop() {
@@ -202,7 +209,7 @@ fn pattern_variables(
             Syntax::Ident { val, .. } => {
                 if let LeafView::Str(text) = val.leaf_view()
                     && val.parent().is_anonymous()
-                    && !constructors.contains(text)
+                    && !constructors.names.contains(text)
                 {
                     variables.push((val.clone(), original_pos(pattern)?));
                 }
@@ -221,7 +228,25 @@ fn pattern_variables(
                         pending.extend(args.iter());
                     }
                     // The head is a constructor or a `match_pattern` function, never bound.
-                    "Lean.Parser.Term.app" => pending.extend(args.get(1)),
+                    "Lean.Parser.Term.app" => {
+                        let head = match args.first() {
+                            Some(Syntax::Ident { val, .. }) => Some(val.clone()),
+                            Some(head) if is_kind(head, &["Term", "dotIdent"]) => {
+                                match self::args(head).get(1) {
+                                    Some(Syntax::Ident { val, .. }) => Some(val.clone()),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if head.is_some_and(|head| {
+                            matches!(head.leaf_view(),
+                                LeafView::Str(text) if constructors.indexed.contains(text))
+                        }) {
+                            return None;
+                        }
+                        pending.extend(args.get(1));
+                    }
                     "Lean.Parser.Term.namedPattern" => {
                         pending.extend(args.first());
                         pending.extend(args.get(3));
@@ -252,7 +277,7 @@ fn pattern_variables(
 pub(crate) fn unused_pattern_variables(
     command: &Syntax,
     options: &KVMap,
-    constructors: &HashSet<String>,
+    constructors: &Constructors,
 ) -> Vec<UnusedBinder> {
     if !linted(options, Some("patternVars")) {
         return Vec::new();
@@ -289,7 +314,7 @@ pub(crate) fn unused_pattern_variables(
 
 /// The binders a `fun`'s binder list names, or `None` when one has a form not read here.
 /// An instance binder is left unread: the pin may count resolution as its use.
-fn fun_binders(binders: &[Syntax], constructors: &HashSet<String>) -> Option<Vec<(Name, usize)>> {
+fn fun_binders(binders: &[Syntax], constructors: &Constructors) -> Option<Vec<(Name, usize)>> {
     // A binder name, a hole, or `x y` written as an application of names.
     fn idents(syntax: &Syntax) -> Option<Vec<(Name, usize)>> {
         let parts: Vec<&Syntax> = if is_kind(syntax, &["Term", "app"]) {
@@ -340,7 +365,7 @@ fn fun_binders(binders: &[Syntax], constructors: &HashSet<String>) -> Option<Vec
 pub(crate) fn unused_fun_binders(
     command: &Syntax,
     options: &KVMap,
-    constructors: &HashSet<String>,
+    constructors: &Constructors,
 ) -> Vec<UnusedBinder> {
     // The pin's ignore functions for function arguments (`basicFun`) when `funArgs` is off.
     if !linted(options, Some("funArgs")) {

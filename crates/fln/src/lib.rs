@@ -8514,16 +8514,31 @@ impl Engine {
                         .map(|(_, (execution, &command))| (command, &execution.declaration)),
                 )
                 .collect();
-            // Every constructor spelling, for telling a pattern variable from a constructor.
-            let constructors: std::collections::HashSet<String> = engine
-                .environment()
-                .constants()
-                .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
-                .filter_map(|(name, _)| match name.leaf_view() {
-                    fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
-                    _ => None,
-                })
-                .collect();
+            // Every constructor spelling, for telling a pattern variable from a constructor, and
+            // the spellings of indexed families' constructors.
+            let spelling = |name: &Name| match name.leaf_view() {
+                fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
+                _ => None,
+            };
+            let constructors = unused_variables::Constructors {
+                names: engine
+                    .environment()
+                    .constants()
+                    .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
+                    .filter_map(|(name, _)| spelling(name))
+                    .collect(),
+                indexed: engine
+                    .environment()
+                    .constants()
+                    .filter_map(|(_, info)| match info {
+                        ConstantInfo::Induct(family) if family.num_indices > 0 => {
+                            Some(family.ctors.iter().filter_map(spelling).collect::<Vec<_>>())
+                        }
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect(),
+            };
             for (&(command, _), (offset, syntax, options)) in &lint_sites {
                 // In the pin's order: the `:=` note while the command elaborates (`sorry` does
                 // not suppress it), then the unused-variables linter (skipped with `sorry`),
