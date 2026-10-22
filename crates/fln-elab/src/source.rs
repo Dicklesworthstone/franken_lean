@@ -5839,10 +5839,46 @@ fn query_term(
         let hole = context.instance_hole(class.clone())?;
         context.resolve_instances(true)?;
         context.complete_local_functions()?;
-        let term = context.finish(Typed {
+        let mut term = context.finish(Typed {
             value: hole,
             type_: class,
         })?;
+        // `synthInstance` enters the class's telescope first (`forallTelescopeReducing`): for a
+        // class that unfolds to a function type (`DecidableEq (Nat × Nat)`), the instance found
+        // is applied to the telescope's locals and abstracted again,
+        // `fun a b => instDecidableEqProd a b`.
+        let unfolded = context.whnf_with_transparency(
+            &term.type_,
+            UnificationTransparency::Abbreviations,
+            false,
+        )?;
+        let mut binders = Vec::new();
+        let mut cursor = &unfolded;
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = cursor.node()
+        {
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            cursor = body;
+        }
+        if !binders.is_empty() {
+            let count =
+                u32::try_from(binders.len()).map_err(|_| failure(SourceInferenceError::Scope))?;
+            let mut value = term.value.clone();
+            for index in (0..count).rev() {
+                value = Expr::app(
+                    value,
+                    Expr::bvar(index).map_err(|_| failure(SourceInferenceError::Scope))?,
+                );
+            }
+            for (name, domain, info) in binders.into_iter().rev() {
+                value = Expr::lam(name, domain, value, info);
+            }
+            term.value = value;
+        }
         return context.close_query_section(term, Vec::new());
     }
     // `#reduce e` (`elabReduce`, Lean/Elab/BuiltinCommand.lean:459): `e` elaborated with no
