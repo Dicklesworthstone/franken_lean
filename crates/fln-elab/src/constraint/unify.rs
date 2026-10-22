@@ -280,6 +280,20 @@ fn facts(expr: &Expr, meter: &mut Meter<'_>) -> Result<Facts, UnificationError> 
             continue;
         }
         meter.node()?;
+        // The immutable syntax flags certify that this subtree contributes
+        // no free locals or universe identities. Require binding-closed,
+        // hole-free syntax as well: core substitution and instantiation skip
+        // these subtrees, while open templates and expression holes still
+        // need their structural work charged here. Reduction, equality and
+        // kernel submission retain their own independent work accounting.
+        if !current.has_fvar()
+            && !current.has_expr_mvar()
+            && !current.has_level_param()
+            && !current.has_level_mvar()
+            && !current.has_loose_bvars()
+        {
+            continue;
+        }
         match current.node() {
             ExprNode::FVar { id } => {
                 result.fvars.insert(id.clone());
@@ -1765,3 +1779,6 @@ impl ElabTxn {
         })
     }
 }
+
+#[cfg(test)]
+mod facts_tests;

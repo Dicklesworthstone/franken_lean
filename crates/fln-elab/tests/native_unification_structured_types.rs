@@ -431,16 +431,51 @@ fn deep_structured_candidates_stop_under_explicit_resource_limits() {
         candidate = lam(nat(), candidate);
     }
     let before = txn.clone();
-    let mut limited = budget();
-    limited.max_visited_nodes = 5_000;
-    limited.max_steps = 10_000;
-    assert!(matches!(
-        txn.unify(&Expr::mvar(value), &candidate, limited),
-        Err(UnificationError::NodeLimit { .. }
-            | UnificationError::StepLimit { .. }
-            | UnificationError::HeartbeatLimit)
-    ));
-    unchanged(&txn, &before);
+    let requested = Expr::mvar(value);
+    // Empty ground metadata is now constant-time. This candidate legitimately
+    // fits the former 5,000-node/10,000-step cutoff (4,629/8,789 when measured).
+    // Exercise real exhaustion, including the last unit, rather than require
+    // an obsolete amount of redundant analysis to remain in the algorithm.
+    let report = txn.unify(&requested, &candidate, budget()).unwrap();
+    assert!(report.visited_nodes > 0 && report.unifier_steps > 0);
+    for node_limit in [0, 1, 1_000, report.visited_nodes - 1] {
+        let mut retry = before.clone();
+        let mut limited = budget();
+        limited.max_visited_nodes = node_limit;
+        assert!(
+            matches!(
+                retry.unify(&requested, &candidate, limited),
+                Err(UnificationError::NodeLimit { .. })
+            ),
+            "node limit {node_limit}"
+        );
+        unchanged(&retry, &before);
+    }
+    for step_limit in [0, 1, 1_000, report.unifier_steps - 1] {
+        let mut retry = before.clone();
+        let mut limited = budget();
+        limited.max_steps = step_limit;
+        assert!(
+            matches!(
+                retry.unify(&requested, &candidate, limited),
+                Err(UnificationError::StepLimit { .. })
+            ),
+            "step limit {step_limit}"
+        );
+        unchanged(&retry, &before);
+    }
+    let mut exact = budget();
+    exact.max_steps = report.unifier_steps;
+    exact.max_visited_nodes = report.visited_nodes;
+    let mut retry = before.clone();
+    let repeated = retry.unify(&requested, &candidate, exact).unwrap();
+    assert_eq!(report.visited_nodes, repeated.visited_nodes);
+    assert_eq!(report.unifier_steps, repeated.unifier_steps);
+    assert_eq!(
+        report.expression_assignments,
+        repeated.expression_assignments
+    );
+    assert_eq!(retry.mvars.assignments(), txn.mvars.assignments());
 }
 
 #[test]
