@@ -1006,9 +1006,11 @@ impl Engine<'_> {
         // `instances` transparency an instance subgoal then carries the unfolded
         // form, which no stored instance path matches (bead fln-eeew). Only a
         // constant-headed side is assigned here, the case where reducing first
-        // would unfold a definition. Other shapes keep the reducing path below:
-        // the pin also keeps an in-scope beta redex, but this elaborator does not
-        // yet accept every assignment of one. A refusal here mutates nothing.
+        // would unfold a definition, and so is a `let`/`have`, which reducing would
+        // zeta-reduce (`apply` assigned `?x := instHAdd.1 0 1` where the pin assigns
+        // `have x := 0; x + 1`, elab/consumePPHint). Other shapes keep the reducing
+        // path below: the pin also keeps an in-scope beta redex, but this elaborator
+        // does not yet accept every assignment of one. A refusal here mutates nothing.
         let left_flex = self.flexible_head(left)?;
         let right_flex = self.flexible_head(right)?;
         let constant_headed = |expr: &Expr| {
@@ -1016,7 +1018,7 @@ impl Engine<'_> {
             while let ExprNode::App { f, .. } | ExprNode::MData { expr: f, .. } = head.node() {
                 head = f;
             }
-            matches!(head.node(), ExprNode::Const { .. })
+            matches!(head.node(), ExprNode::Const { .. } | ExprNode::LetE { .. })
         };
         let quick = match (left_flex, right_flex) {
             (true, false) if constant_headed(right) => Some((left, right)),

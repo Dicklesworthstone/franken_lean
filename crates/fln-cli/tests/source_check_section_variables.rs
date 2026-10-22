@@ -143,7 +143,9 @@ fn queries_over_section_variables_print_as_at_the_pin() {
 }
 
 /// A `let` (`have` when nondependent) inside another term prints in parentheses, broken after
-/// its `;` at the enclosing indentation, and its hard line breaks every group around it.
+/// its `;` at the enclosing indentation, and its hard line breaks every group around it. In a
+/// goal too: `apply` assigns the `have` term itself, unreduced, as the pin's
+/// `isDefEqQuickOther` assigns it.
 const NESTED_LETS: &str = "prelude
 import Init.Core
 opaque q : Nat → Prop
@@ -155,6 +157,13 @@ opaque f : Nat → Nat → Nat
 #check q (let x := 0; let y := x; x + y)
 #check have x := 0; x + 1
 #check let x := 0; x + 1
+opaque p : Nat → Prop
+axiom p_of_q : q x → p x
+axiom pq : q (have x := 0; x + 1)
+theorem pletfun : p (have x := 0; x + 1) := by
+  apply p_of_q
+  trace_state
+  exact pq
 ";
 
 /// The pinned v4.32.0's output for [`NESTED_LETS`] (measured 2026-10-22).
@@ -180,6 +189,9 @@ have x := 0;
 x + 1 : Nat
 let x := 0;
 x + 1 : Nat
+⊢ q
+    (have x := 0;
+    x + 1)
 ";
 
 #[test]
