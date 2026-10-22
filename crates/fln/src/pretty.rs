@@ -234,6 +234,19 @@ const WIDTH: usize = 120;
 /// A term node as the pin's formatter groups it: `fill (nest 2 …)`
 /// (`categoryParser.formatter`, vendored `PrettyPrinter/Formatter.lean`).
 /// `let`, or `have` for a nondependent binding (`let +nondep`), as the pin prints each.
+/// How a dependent `let` prints: as itself, or as `#print` shows a definition's value after the
+/// pin's `letToHave` cleanup (vendored `Lean/Elab/PreDefinition/Basic.lean:96-108`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LetMode {
+    AsIs,
+    /// The value is a safe definition's whose type is not a proposition: the pin has turned
+    /// each nondependent `let` into `have`. One whose body never uses its variable is
+    /// certainly nondependent; for any other this door does not decide dependence.
+    ToHave,
+    /// The value may have had `letToHave` applied or not: no `let` prints.
+    Refuse,
+}
+
 fn let_keyword(non_dep: bool) -> &'static str {
     if non_dep { "have" } else { "let" }
 }
@@ -519,6 +532,8 @@ pub struct Printer<'a> {
     top_names: usize,
     /// The source's own notations in force ([`notations`]).
     notations: Option<&'a fln_parse::extensions::Notations>,
+    /// How a dependent `let` prints ([`LetMode`]).
+    lets: LetMode,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -655,6 +670,7 @@ impl<'a> Printer<'a> {
             trailing: false,
             top_names: 0,
             notations: None,
+            lets: LetMode::AsIs,
         }
     }
 
@@ -1048,6 +1064,7 @@ impl<'a> Printer<'a> {
                 body,
                 non_dep,
             } if outer == 0 && self.names.len() == self.top_names => {
+                let non_dep = &self.nondependent(body, *non_dep)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
@@ -1075,6 +1092,7 @@ impl<'a> Printer<'a> {
                 body,
                 non_dep,
             } => {
+                let non_dep = &self.nondependent(body, *non_dep)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
@@ -1090,6 +1108,18 @@ impl<'a> Printer<'a> {
             ExprNode::Proj { idx, expr, .. } => Ok(node(
                 self.doc(expr, MAX_PREC)?
                     .then(Format::text(format!(".{}", idx + 1))),
+            )),
+        }
+    }
+
+    /// Whether a `let` with this body prints as `have`, under [`Printer::lets`].
+    fn nondependent(&self, body: &Expr, non_dep: bool) -> Result<bool, Unsupported> {
+        match self.lets {
+            _ if non_dep => Ok(true),
+            LetMode::AsIs => Ok(false),
+            LetMode::ToHave if !body.has_loose_bvar(0) => Ok(true),
+            LetMode::ToHave | LetMode::Refuse => Err(Unsupported(
+                "a `let` the pin's `letToHave` may make a `have`",
             )),
         }
     }

@@ -8,6 +8,71 @@
 use super::*;
 use fln_elab::reducibility::{Reducibility, ReducibilityTable};
 
+/// Whether `value` shows how this engine compiles a `match` or a recursive definition, which
+/// the pin's value does not: its matchers, `brecOn` and `WellFounded.fix` print as `match`
+/// and recursion where this door would print recursors and elaboration's own binders. Those
+/// binders are named `_fln_…` or by a number; a recursor is one too in a definition's value
+/// (`recursors`), while a theorem's proof may reach it as the pin's would, by `induction`.
+fn compiled_artifact(env: &Environment, value: &Expr, recursors: bool) -> bool {
+    // The first component decides: a hygienic `x._@.M._hyg.4` is the user's `x`.
+    fn internal(name: &Name) -> bool {
+        let mut first = name.clone();
+        while !first.parent().is_anonymous() {
+            first = first.parent();
+        }
+        match first.leaf_view() {
+            LeafView::Str(text) => text.starts_with("_fln"),
+            LeafView::Num(_) => true,
+            LeafView::Anonymous => false,
+        }
+    }
+    let mut pending = vec![value];
+    while let Some(expr) = pending.pop() {
+        match expr.node() {
+            ExprNode::Const { name, .. } => {
+                if internal(name)
+                    || (recursors && matches!(env.find(name), Some(ConstantInfo::Rec(_))))
+                {
+                    return true;
+                }
+            }
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            }
+            | ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } => {
+                if internal(binder_name) {
+                    return true;
+                }
+                pending.extend([binder_type, body]);
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                ..
+            } => {
+                if internal(decl_name) {
+                    return true;
+                }
+                pending.extend([type_, value, body]);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            _ => {}
+        }
+    }
+    false
+}
+
 impl<'a> Printer<'a> {
     /// `#print c` (`signature_only` false) or `#print sig c` (true) for a constant this
     /// source declared (`printIdCore`, vendored `Lean/Elab/Print.lean:198-217`).
@@ -63,11 +128,52 @@ impl<'a> Printer<'a> {
         if signature_only {
             return Ok(header);
         }
-        let value = self.doc(value, 0)?;
+        if compiled_artifact(self.env, value, kind == "def") {
+            return Err(Unsupported("a compiled `match` or recursion"));
+        }
+        // The pin's `letToHaveValue` cleans a safe definition's value unless its type is a
+        // proposition; a theorem's it leaves alone.
+        let lets = match kind {
+            "def" if safety.is_empty() => match self.proposition(name) {
+                Some(false) => LetMode::ToHave,
+                Some(true) => LetMode::AsIs,
+                None => LetMode::Refuse,
+            },
+            "def" => LetMode::Refuse,
+            _ => LetMode::AsIs,
+        };
+        let outer = std::mem::replace(&mut self.lets, lets);
+        let value = self.doc(value, 0);
+        self.lets = outer;
         Ok(header
             .then(Format::text(" :="))
             .then(Format::Line)
-            .then(value))
+            .then(value?))
+    }
+
+    /// Whether `name`'s type is a proposition: its result is an application of a constant
+    /// whose own type ends in `Prop` (`Some(true)`) or in a nonzero sort (`Some(false)`); a
+    /// sort is never one. `None` when that cannot be read off the types.
+    fn proposition(&self, name: &Name) -> Option<bool> {
+        fn result(mut expr: &Expr) -> &Expr {
+            while let ExprNode::ForallE { body, .. } = expr.node() {
+                expr = body;
+            }
+            expr
+        }
+        let type_ = result(&self.env.find(name)?.constant_val().type_);
+        let (head, _) = spine(type_);
+        match head.node() {
+            ExprNode::Sort { .. } => Some(false),
+            ExprNode::Const { name, .. } => {
+                match result(&self.env.find(name)?.constant_val().type_).node() {
+                    ExprNode::Sort { level } if level.is_zero() => Some(true),
+                    ExprNode::Sort { level } if level.is_never_zero() => Some(false),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// `printInduct` (vendored `Lean/Elab/Print.lean:88-96`): the header, the number of
