@@ -196,3 +196,94 @@ fn stopped_ground_proofs_leave_the_environment_unchanged_and_can_retry() {
     }
     checked_source(&source);
 }
+
+#[test]
+fn generic_two_index_equations_complete_under_the_ordinary_budget() {
+    checked_source(&format!(
+        r#"{SOURCE}
+theorem weight_step (b a : Nat) (tail : CoursePair a b) :
+ weight (Nat.succ (Nat.succ b)) (Nat.succ (Nat.succ a)) (.step (Nat.succ a) (Nat.succ b) (.step a b tail)) = weight b a tail := rfl
+"#
+    ));
+}
+
+#[test]
+fn generic_two_index_arithmetic_equations_remain_definitional() {
+    checked_source(
+        r#"
+inductive CoursePair : Nat -> Nat -> Type where
+ | leaf (a b : Nat) : CoursePair a b
+ | step (a b : Nat) : CoursePair a b -> CoursePair (Nat.succ a) (Nat.succ b)
+def total (b a : Nat) (xs : CoursePair a b) : Nat := match xs with
+ | .leaf x y => x + y
+ | .step _ _ (.leaf x y) => x + y + 1
+ | .step _ _ (.step x y tail) => total y x tail + 2
+termination_by structural xs
+theorem total_step (b a : Nat) (tail : CoursePair a b) :
+ total (b+2) (a+2) (.step (a+1) (b+1) (.step a b tail)) = total b a tail + 2 := rfl
+"#,
+    );
+}
+
+#[test]
+fn false_generic_equations_cannot_publish_a_valid_definition_prefix() {
+    let base = base();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let text = format!(
+        r#"{SOURCE}
+theorem wrong_step (b a : Nat) (tail : CoursePair a b) :
+ weight (b+2) (a+2) (.step (a+1) (b+1) (.step a b tail)) = weight b a tail + 1 := rfl
+"#
+    );
+    reference(&text, false);
+    match base.check_source_files(&[text.as_bytes()], &options, limits()) {
+        Err(error) => assert!(
+            matches!(
+                error.disposition().0,
+                "elaboration" | "kernel-rejection" | "resource" | "inconclusive"
+            ),
+            "{error:?}"
+        ),
+        Ok(fln::Outcome::Inconclusive(_)) => {}
+        other => panic!("false generic proof cannot be admitted: {other:?}"),
+    }
+    assert_eq!(base.logical_root(&options), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["weight"]))
+    );
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["wrong_step"]))
+    );
+}
+
+#[test]
+fn generic_proofs_stopped_by_admission_limits_retry_without_publishing() {
+    let base = base();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = format!(
+        r#"{SOURCE}
+theorem weight_step (b a : Nat) (tail : CoursePair a b) :
+ weight (b+2) (a+2) (.step (a+1) (b+1) (.step a b tail)) = weight b a tail := rfl
+"#
+    );
+    for allowance in [0, 1, 32] {
+        let mut low = limits();
+        low.admission.kernel = low.admission.kernel.narrowed(allowance, 32);
+        match base.check_source_files(&[source.as_bytes()], &options, low) {
+            Ok(fln::Outcome::Inconclusive(_)) => {}
+            Err(error) => assert!(
+                matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+                "{error:?}"
+            ),
+            other => panic!("expected typed resource stop: {other:?}"),
+        }
+        assert_eq!(base.logical_root(&options), root);
+    }
+    checked_source(&source);
+}

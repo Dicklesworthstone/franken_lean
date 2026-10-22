@@ -18,6 +18,7 @@ mod assignment_types;
 mod assignment_universes;
 mod delayed;
 mod flex_flex;
+mod local_facts;
 mod normalize;
 mod pattern_spine;
 mod pending;
@@ -526,6 +527,7 @@ struct Engine<'a> {
     // or a local context. Pin every key's allocation until this batch ends so a
     // freed temporary cannot donate its address to an unrelated expression.
     fact_cache: HashMap<usize, (Expr, Facts)>,
+    local_facts: local_facts::Cache,
     nat_literals_valid: Option<bool>,
     projection_registry: crate::instances::RegistryCache,
     pending: pending::PendingState<'a>,
@@ -554,7 +556,13 @@ impl Engine<'_> {
             }
             return Ok(found.clone());
         }
-        let found = facts(expr, &mut self.meter)?;
+        let found = match self.local_facts.scan(expr, &mut self.meter)? {
+            Some(fvars) => Facts {
+                fvars,
+                ..Facts::default()
+            },
+            None => facts(expr, &mut self.meter)?,
+        };
         self.reserved.extend(found.fvars.iter().cloned());
         for _ in 0..found.fvars.len() + found.params.len() + found.uvars.len() {
             self.meter.node()?;
@@ -1744,6 +1752,7 @@ impl ElabTxn {
             awakened: Vec::new(),
             kernel_checks: 0,
             fact_cache: HashMap::new(),
+            local_facts: local_facts::Cache::default(),
             nat_literals_valid: None,
             projection_registry: crate::instances::RegistryCache::default(),
             pending: pending::PendingState::new(pending, remaining),

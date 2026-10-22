@@ -145,6 +145,7 @@ impl Engine<'_> {
             awakened: self.awakened.clone(),
             kernel_checks: self.kernel_checks,
             fact_cache: HashMap::new(),
+            local_facts: local_facts::Cache::default(),
             nat_literals_valid: self.nat_literals_valid,
             projection_registry: self.projection_registry.clone(),
             // A speculative argument guess cannot invoke an external owner:
@@ -172,6 +173,7 @@ impl Engine<'_> {
                 self.residuals = trial.residuals;
                 self.awakened = trial.awakened;
                 self.fact_cache = trial.fact_cache;
+                self.local_facts = trial.local_facts;
                 self.nat_literals_valid = trial.nat_literals_valid;
                 self.projection_registry = trial.projection_registry;
                 Ok(CongruenceResult::Solved)
