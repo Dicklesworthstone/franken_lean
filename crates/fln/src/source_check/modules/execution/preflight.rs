@@ -82,7 +82,12 @@ pub(super) fn check(
             }
             let module = modules[index];
             let header = &headers[index];
-            let mut grammar = SourceGrammar::for_module(Some(module.name), header.module_system);
+            let mut grammar = SourceGrammar::for_header(
+                Some(module.name),
+                header.module_system,
+                header.prelude,
+                &header.imports,
+            );
             let mut seen = BTreeSet::new();
             for &dependency in &dependencies[index] {
                 for predecessor in graph::postorder(dependency, &dependencies, modules, &mut meter)?

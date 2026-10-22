@@ -132,3 +132,34 @@ fn guard_syntax_exists_where_its_module_is_imported() {
         assert_eq!(code == 0, accepted, "{name}: {header}{program}");
     }
 }
+
+/// Operators and `∃` are notations of `Init.Notation` and `Init.NotationExtra`, whose tokens a
+/// `prelude` file sees only through its imports: where they are not imported the pin reads `+`
+/// as "unexpected token '+'" and `∃` as "expected token". Each program was run through the
+/// pinned `lean` v4.32.0 with the same header first (2026-10-22), with the same verdict.
+#[test]
+fn a_prelude_file_reads_only_the_notation_its_imports_declare() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let plus = "theorem two_plus_two : 2 + 2 = 4 := rfl\n";
+    let exists = "theorem t : ∃ n : Nat, n = n := ⟨0, rfl⟩\n";
+    for (name, header, program, accepted) in [
+        (
+            "plus_prelude",
+            "prelude\nimport Init.Prelude\n",
+            plus,
+            false,
+        ),
+        ("plus_core", "prelude\nimport Init.Core\n", plus, true),
+        ("exists_core", "prelude\nimport Init.Core\n", exists, false),
+        (
+            "exists_extra",
+            "prelude\nimport Init.NotationExtra\n",
+            exists,
+            true,
+        ),
+    ] {
+        let code = lean(&lib, &root, name, header, program);
+        assert_eq!(code == 0, accepted, "{name}: {header}{program}");
+    }
+}
