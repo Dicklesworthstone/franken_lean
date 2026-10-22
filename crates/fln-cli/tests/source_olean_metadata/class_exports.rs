@@ -89,7 +89,8 @@ fn an_unsupported_registration_cannot_replace_a_previously_published_class_libra
     success(build(&project, &["+Lib:olean"]));
     let artifact = project.0.join(".lake/build/lib/lean/Lib.olean");
     let original = std::fs::read(&artifact).unwrap();
-    project.write("Lib.lean", "prelude\nclass Mapper (A : Type) where\n  apply : A -> A\ninstance mapperId (A : Type) : Mapper A := Mapper.mk (fun x => x)\n");
+    // Instance rows are exported now; a scoped one still has no `.olean` writer.
+    project.write("Lib.lean", "prelude\nclass Mapper (A : Type) where\n  apply : A -> A\nnamespace Scope\nscoped instance mapperId (A : Type) : Mapper A := Mapper.mk (fun x => x)\nend Scope\n");
     let failed = build(&project, &["+Lib:olean"]);
     assert!(!failed.status.success(), "{failed:?}");
     assert!(failed.stdout.is_empty(), "{failed:?}");

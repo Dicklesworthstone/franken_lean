@@ -116,8 +116,10 @@ def total : (n : Nat) -> Vec Nat n -> Nat
 def head : (n : Nat) -> Vec Nat (Nat.succ n) -> Nat
   | _, .cons _ x _ => x
 
+-- The motive's binders are `_`: the pinned `lean` warns on unused named ones, and
+-- this program's output is exactly `42`.
 def transport (a b : Nat) (h : a = b) (x : Nat) : Nat :=
-  Eq.rec (motive := fun k proof => Nat) x h
+  Eq.rec (motive := fun _ _ => Nat) x h
 
 #eval transport 1 1 (by rfl) (head 1 (Vec.cons 1 10 (Vec.cons 0 22 Vec.nil)) + total 2 (copy 2 (Vec.cons 1 10 (Vec.cons 0 22 Vec.nil))))
 "#;

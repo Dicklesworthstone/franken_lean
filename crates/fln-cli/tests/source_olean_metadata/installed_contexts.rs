@@ -15,9 +15,9 @@ fn lake(project: &Project, targets: &[&str]) -> Output {
 }
 
 fn separate_sources(project: &Project) {
-    project.write("Left.lean", "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n");
-    project.write("Right.lean", "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n");
-    project.write("Main.lean", "prelude\nimport Left\nimport Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n");
+    project.write("Left.lean", "prelude\nimport A\ndef leftUse [d : Class] : Class := d\nnoncomputable def left : Family leftUse := valueA\n");
+    project.write("Right.lean", "prelude\nimport B\ndef rightUse [d : Class] : Class := d\nnoncomputable def right : Family rightUse := valueB\n");
+    project.write("Main.lean", "prelude\nimport Left\nimport Right\nnoncomputable def checkLeft : Family a := left\nnoncomputable def checkRight : Family b := right\n");
 }
 
 #[test]
@@ -34,9 +34,9 @@ fn installed_distinct_sibling_contexts_check_without_lending_names_or_instances(
     assert!(report.contains("\"commands\":6"), "{report}");
     assert!(report.contains("\"files\":3"), "{report}");
     for source in [
-        "prelude\nimport B\ndef bad : Class := onlyA\n",
+        "prelude\nimport B\nnoncomputable def bad : Class := onlyA\n",
         "prelude\nimport Core\ndef use [d : Class] : Class := d\ndef bad : Class := use\n",
-        "prelude\nimport B\ndef use [d : Class] : Class := d\ndef bad : Family use := valueA\n",
+        "prelude\nimport B\ndef use [d : Class] : Class := d\nnoncomputable def bad : Family use := valueA\n",
     ] {
         project.write("Right.lean", source);
         let refused = project.run();
@@ -52,7 +52,7 @@ fn installed_source_and_artifact_journals_preserve_interleaved_import_order() {
     let project = fixture();
     project.write(
         "Local.lean",
-        "prelude\nimport A\ninstance localChoice : Class := a\n",
+        "prelude\nimport A\nnoncomputable instance localChoice : Class := a\n",
     );
     for (order, value) in [("Local\nimport B", "valueB"), ("B\nimport Local", "valueA")] {
         project.write("Main.lean", source(order, value));
@@ -97,7 +97,7 @@ fn installed_lake_builds_distinct_contexts_reimports_and_preserves_prior_outputs
     for (path, prior) in files.iter().zip(&prior) {
         assert_eq!(std::fs::read(path).unwrap(), *prior);
     }
-    project.write("Consumer.lean", "prelude\nimport Main\ndef useLeft : Family a := checkLeft\ndef useRight : Family b := checkRight\n");
+    project.write("Consumer.lean", "prelude\nimport Main\nnoncomputable def useLeft : Family a := checkLeft\nnoncomputable def useRight : Family b := checkRight\n");
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .arg(project.0.join("Consumer.lean"))
@@ -115,7 +115,7 @@ fn installed_lake_builds_distinct_contexts_reimports_and_preserves_prior_outputs
     // This constant exists in the complete closure but is not imported by Right.
     project.write(
         "Right.lean",
-        "prelude\nimport B\ndef right : Class := onlyA\n",
+        "prelude\nimport B\nnoncomputable def right : Class := onlyA\n",
     );
     let refused = lake(&project, &["+Main:olean"]);
     assert!(!refused.status.success(), "{refused:?}");
@@ -141,7 +141,7 @@ fn installed_distinct_contexts_keep_shared_dependency_reuse_across_targets() {
     ] {
         let project = fixture();
         separate_sources(&project);
-        project.write("Second.lean", "prelude\nimport Left\nimport Right\ndef secondLeft : Family a := left\ndef secondRight : Family b := right\n");
+        project.write("Second.lean", "prelude\nimport Left\nimport Right\nnoncomputable def secondLeft : Family a := left\nnoncomputable def secondRight : Family b := right\n");
         project.write("lakefile.toml", "name = \"contexts\"\n[[lean_lib]]\nname = \"Main\"\nroots = [\"Main\", \"Second\", \"Left\", \"Right\"]\n");
         let report = success(lake(&project, &targets));
         assert!(report.contains("\"modules_built\":4"), "{report}");
