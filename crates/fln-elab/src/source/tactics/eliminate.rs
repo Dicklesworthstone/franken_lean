@@ -776,19 +776,20 @@ impl Context {
         if induction && matches!(input, EliminationSyntax::Tactic(_)) {
             self.note_source_recursor(&rec_name);
         }
+        // `cases` on a nested family takes the mutual specialization, its auxiliaries' motives
+        // included. The pin's `induction` refuses one: its recursor has several motives.
         if family.is_unsafe
-            || family.num_nested != 0
             || family.all.is_empty()
             || family.all.len() > 8
             || !family.all.contains(name)
-            || (induction && family.all.len() > 1)
+            || (induction && (family.all.len() > 1 || family.num_nested != 0))
             || parameters.len() != family.num_params as usize + family.num_indices as usize
             || levels.len() != family.base.level_params.len()
             || rec.is_unsafe
             || rec.num_params != family.num_params
             || rec.num_indices != family.num_indices
-            || rec.num_motives as usize != family.all.len()
-            || (family.all.len() == 1 && rec.num_minors as usize != family.ctors.len())
+            || rec.num_motives as usize != family.all.len() + family.num_nested as usize
+            || (rec.num_motives == 1 && rec.num_minors as usize != family.ctors.len())
             || rec.rules.len() != family.ctors.len()
             || rec.all != family.all
         {
@@ -984,8 +985,7 @@ impl Context {
         for local in goal.lctx.decls() {
             if !removed.contains(&local.id) {
                 add_local(&mut retained, local);
-            } else if family.all.len() > 1
-                && (local.id == major.id || index_ids.contains(&local.id))
+            } else if rec.num_motives > 1 && (local.id == major.id || index_ids.contains(&local.id))
             {
                 // Sibling motives may mention the original input in R -> R.
                 // Keep those outer identities available for typing hidden IHs,
@@ -1082,7 +1082,7 @@ impl Context {
             value: motive,
             type_: motive_type,
         };
-        recursor = if family.all.len() == 1 {
+        recursor = if rec.num_motives == 1 {
             self.match_apply(recursor, motive)?
         } else {
             self.specialize_mutual_match(recursor, &family, &rec, motive, &generalized, universe)?

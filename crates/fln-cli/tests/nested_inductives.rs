@@ -119,6 +119,28 @@ const MATCHES_EXPECTED: &str = "Term.cases : ∀ (t : Term), t = t ∨ t = t
 2
 ";
 
+/// `cases` on a nested family, with named alternatives and with `case` blocks. The pin's
+/// `induction` refuses such a family (its recursor has several motives), and so does this door.
+const CASES: &str = r#"prelude
+import Init.Core
+inductive Term where
+  | var : Nat → Term
+  | app : List Term → Term
+theorem Term.self (t : Term) : t = t := by
+  cases t with
+  | var n => rfl
+  | app as => rfl
+theorem Term.shape (t : Term) : Or (t = t) (t = t) := by
+  cases t
+  case var => exact Or.inl rfl
+  case app => exact Or.inr rfl
+#check @Term.shape
+"#;
+
+/// The pin's output for [`CASES`].
+const CASES_EXPECTED: &str = "Term.shape : ∀ (t : Term), t = t ∨ t = t
+";
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
@@ -220,4 +242,24 @@ fn matches_over_a_nested_family_elaborate_and_reduce_as_at_the_pin() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, MATCHES_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn cases_splits_a_nested_family_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Cases.lean");
+    std::fs::write(&entry, CASES).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, CASES_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, CASES_EXPECTED, "{stderr}");
 }
