@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":664,"projection_hash":"57c94f8567dd26a4055971226484dc0ff2983435cbcb14429a73c06ff5624527"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":665,"projection_hash":"30cecc976c22cf3349d0e57e23f553b5930505cf6d7e58cf046f508b37dc9791"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -227,6 +227,7 @@
 {"id":"fln-kyo0"}
 {"id":"fln-l8f"}
 {"id":"fln-lake-clean-symlink-comments-vlp1"}
+{"id":"fln-lake-door-library-journal-writers-44fg"}
 {"id":"fln-laxj"}
 {"id":"fln-layout-column-false-accepts-cbfm"}
 {"id":"fln-library-elab-inconclusive-typing-yj3w"}
