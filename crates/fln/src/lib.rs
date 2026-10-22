@@ -8788,7 +8788,7 @@ impl Engine {
                 if terminal.kind() != fln_parse::SourceCommandKind::Check {
                     return Err(EngineExecutionError::TerminalCheckRequired);
                 }
-                query_source = Some(terminal_source);
+                query_source = Some((terminal_offset, terminal_source));
                 terminal_index
             } else {
                 partitioned.commands.len()
@@ -8833,7 +8833,8 @@ impl Engine {
                 source,
             });
         }
-        let query_source = query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
+        let (query_offset, query_source) =
+            query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
         let completed = match self.execute_source_modules_internal(
             &rewritten,
             entry,
@@ -8852,7 +8853,7 @@ impl Engine {
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: query_index,
                 error: Box::new(error),
-                at: None,
+                at: Some(query_offset),
             })?;
         Ok(match checked {
             Outcome::Complete(check) => {
@@ -9128,14 +9129,19 @@ impl Engine {
             })?;
             commands.extend(partitioned);
         }
-        self.execute_batch(commands.len(), options, |engine, index| {
-            let (original_offset, source) = commands[index];
-            let parsed = fln_parse::parse_nat_definition(source)
-                .map_err(|error| error.with_original_offset(original_offset))
-                .map_err(NatDefinitionFrontendError::Parse)
-                .map_err(EngineExecutionError::Frontend)?;
-            engine.execute_parsed_nat_definition(parsed, options, limits)
-        })
+        self.execute_batch(
+            commands.len(),
+            options,
+            |index| Some(commands[index].0),
+            |engine, index| {
+                let (original_offset, source) = commands[index];
+                let parsed = fln_parse::parse_nat_definition(source)
+                    .map_err(|error| error.with_original_offset(original_offset))
+                    .map_err(NatDefinitionFrontendError::Parse)
+                    .map_err(EngineExecutionError::Frontend)?;
+                engine.execute_parsed_nat_definition(parsed, options, limits)
+            },
+        )
     }
 
     /// Execute a nonempty source-file sequence in the bounded exact Nat/String/Bool
@@ -9617,15 +9623,19 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_batch(declarations.len(), options, |engine, index| {
-            engine.execute_definition(declarations[index].clone(), options, limits)
-        })
+        self.execute_batch(
+            declarations.len(),
+            options,
+            |_| None,
+            |engine, index| engine.execute_definition(declarations[index].clone(), options, limits),
+        )
     }
 
     fn execute_batch<F>(
         &self,
         command_count: usize,
         options: &KVMap,
+        source_offset: impl Fn(usize) -> Option<fln_parse::BytePos>,
         mut execute: F,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError>
     where
@@ -9652,7 +9662,7 @@ impl Engine {
                     return Err(EngineExecutionError::BatchCommand {
                         index,
                         error: Box::new(error),
-                        at: None,
+                        at: source_offset(index),
                     });
                 }
             };
@@ -13058,13 +13068,10 @@ pub enum EngineExecutionError {
 impl EngineExecutionError {
     /// The primary source byte offset this failure points at, or `None`.
     ///
-    /// A per-command failure is unwrapped from [`EngineExecutionError::BatchCommand`],
-    /// and a frontend refusal delegates to
-    /// [`NatDefinitionFrontendError::primary_offset`], so a parse error yields the
-    /// offending byte (already in the source file's coordinate system), while an
-    /// elaboration refusal, a kernel rejection, an inconclusive/fault non-answer,
-    /// or a structural planning fault yields `None` — no user-facing source
-    /// position exists for those.
+    /// A frontend refusal delegates to [`NatDefinitionFrontendError::primary_offset`]
+    /// for a token-precise byte in the original source file. A per-command failure
+    /// retains that inner position or falls back to the command's known start.
+    /// Errors with neither a token position nor a source-command start return `None`.
     pub fn primary_source_offset(&self) -> Option<fln_parse::BytePos> {
         match self {
             // Prefer the inner error's own token-precise offset (a parse refusal
