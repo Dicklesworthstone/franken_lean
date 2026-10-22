@@ -97,6 +97,9 @@ pub enum SourceInferenceError {
         name: Name,
         interpretations: Vec<Name>,
     },
+    /// `{}` elaborated both as the empty structure instance and as `∅`; the pin's `choice`
+    /// reports the term ambiguous.
+    AmbiguousEmptyBraces,
     /// Every interpretation of an overloaded identifier definitely fails.
     OverloadFailed {
         name: Name,
@@ -328,6 +331,9 @@ impl std::fmt::Display for SourceInferenceError {
                 }
                 Ok(())
             }
+            Self::AmbiguousEmptyBraces => f.write_str(
+                "Ambiguous term `{}`; Possible interpretations: `∅` and the empty structure instance",
+            ),
             Self::OverloadFailed { name, failures } => {
                 write!(f, "overloaded `{}`, errors:", name.to_display_string())?;
                 for (index, (candidate, reason)) in failures.iter().enumerate() {
@@ -3016,7 +3022,16 @@ impl Context {
                                 self.accept_record_field(&mut state, &target, value)?;
                                 tasks.push(Task::RecordNext(state));
                             }
-                            record_terms::RecordStep::Complete(term) => values.push(term),
+                            record_terms::RecordStep::Complete(term) => {
+                                if state.empty_braces()
+                                    && self.empty_braces_ambiguous(&term.type_)?
+                                {
+                                    return Err(failure(
+                                        SourceInferenceError::AmbiguousEmptyBraces,
+                                    ));
+                                }
+                                values.push(term)
+                            }
                             record_terms::RecordStep::Continue => {
                                 tasks.push(Task::RecordNext(state))
                             }

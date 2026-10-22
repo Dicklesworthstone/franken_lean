@@ -241,3 +241,29 @@ example : d.x = 2 := rfl
         assert!(stderr.contains(refusal), "{program}\nstderr: {stderr}");
     }
 }
+
+/// `{}` is a `choice` between the empty structure instance and `∅` at the pin: with an
+/// `EmptyCollection` instance in scope both elaborate, and the pin reports the term ambiguous;
+/// before the instance exists only the structure instance does (`elab_fail/emptyc.lean`).
+#[test]
+fn empty_braces_are_ambiguous_where_an_empty_collection_exists() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let accepted = "prelude\nimport Init.Core\nstructure A where\n  x : Nat := 0\ndef foo : A := {}\n#check foo\n";
+    let (code, stdout, stderr) = ours(&lib, &root, accepted);
+    assert_eq!(
+        (code, stdout.as_str()),
+        (Some(0), "foo : A\n"),
+        "stderr: {stderr}"
+    );
+    if let Some((code, stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!((code, stdout.as_str()), (0, "foo : A\n"), "the pin moved");
+    }
+    let ambiguous = "prelude\nimport Init.Core\nstructure A where\n  x : Nat := 0\ndef foo : A := {}\ninstance : EmptyCollection A := ⟨{ x := 10 }⟩\ndef boo : A := {}\n";
+    let (code, stdout, stderr) = ours(&lib, &root, ambiguous);
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("Ambiguous term"), "{stderr}");
+    if let Some((code, _)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!(code, 1, "the pin moved");
+    }
+}

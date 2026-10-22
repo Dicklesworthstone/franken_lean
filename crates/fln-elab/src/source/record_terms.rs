@@ -68,6 +68,15 @@ pub(super) struct RecordBuild<'a> {
     // Parent subobjects use heap continuations, never recursive elaboration.
     frames: Vec<RecordFrame<'a>>,
     imported: Option<imported::ImportedRecord<'a>>,
+    // Written `{}`: no field, source or annotation ([`Context::empty_braces_ambiguous`]).
+    empty_braces: bool,
+}
+
+impl RecordBuild<'_> {
+    /// Whether the record was written `{}`, which the pin also reads as `∅`.
+    pub(super) fn empty_braces(&self) -> bool {
+        self.empty_braces
+    }
 }
 struct RecordFrame<'a> {
     parents: HashMap<Name, Vec<Name>>,
@@ -928,17 +937,50 @@ impl Context {
         expected: Option<Expr>,
         sources: Vec<Typed>,
     ) -> Result<RecordBuild<'a>, NatDefinitionElabError> {
+        let empty_braces =
+            parts.fields.is_empty() && parts.sources.is_empty() && parts.annotation.is_none();
         let frame = self.start_record_frame(parts, expected, sources)?;
         if let Some(layout) = self.imported_record_layout(&frame)? {
             return Ok(RecordBuild {
                 frames: Vec::new(),
                 imported: Some(self.start_imported_record(frame, layout)?),
+                empty_braces,
             });
         }
         Ok(RecordBuild {
             frames: vec![frame],
             imported: None,
+            empty_braces,
         })
+    }
+
+    /// Whether `{}` that elaborated as the empty structure instance of `type_` is ambiguous at
+    /// the pin. There `{}` is a `choice` between that instance and `∅`
+    /// (`EmptyCollection.emptyCollection`, vendored `Init/Core.lean`), and when both elaborate the
+    /// pin reports `Ambiguous term` rather than picking one (`elab_fail/emptyc.lean`). The
+    /// instance search is tried and rolled back; a resource stop is not read as an answer.
+    pub(super) fn empty_braces_ambiguous(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let class = Name::from_components(["EmptyCollection"]);
+        if !self.txn.env.contains(&class) {
+            return Ok(false);
+        }
+        let saved = self.clone();
+        let result = (|| -> Result<bool, NatDefinitionElabError> {
+            let target = self.instantiate(type_)?;
+            // The instance search fixes `EmptyCollection`'s universe, as elaborating `∅` does.
+            let universe = self.level()?;
+            let goal = Expr::app(Expr::const_(class, vec![universe]), target);
+            let hole = self.instance_hole(goal)?;
+            if self.resolve_instances(false).is_err() {
+                return Ok(false);
+            }
+            Ok(!self.instantiate(&hole)?.has_expr_mvar())
+        })();
+        *self = saved;
+        result
     }
 
     fn start_record_frame<'a>(
