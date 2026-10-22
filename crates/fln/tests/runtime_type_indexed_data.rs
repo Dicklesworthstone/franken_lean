@@ -245,6 +245,99 @@ def result (offset : Nat) : Nat :=
 }
 
 #[test]
+fn type_index_selected_callbacks_keep_direct_partial_and_object_interfaces() {
+    for expression in [
+        "extract (Nat -> Nat) (Selected.pack (Nat -> Nat) (fun n => n + 5)) 37",
+        r#"extract (String -> Nat) (Selected.pack (String -> Nat) (fun s => String.length s + 37)) "hello""#,
+        "extract (Nat -> Nat -> Nat) (Selected.pack (Nat -> Nat -> Nat) (fun x y => x + y)) 20 22",
+        "let add : Nat -> Nat -> Nat := extract (Nat -> Nat -> Nat) (Selected.pack (Nat -> Nat -> Nat) (fun x y => x + y)); let plus20 := add 20; plus20 22",
+        r#"let f : Nat -> String := extract (Nat -> String) (Selected.pack (Nat -> String) (fun _ => "hello")); String.length (f 0) + 37"#,
+        "extract ((Nat -> Nat) -> Nat) (Selected.pack ((Nat -> Nat) -> Nat) (fun f => f 37)) (fun n => n + 5)",
+    ] {
+        run(&format!("{SELECTED}#eval {expression}"), "42");
+    }
+}
+
+#[test]
+fn type_index_selected_callback_initializers_stay_strict_and_shared() {
+    let prefix = format!(
+        "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
+         def build (n : Nat) : Nat -> Nat := let offset := work n; fun x => offset + x\n"
+    );
+    let selected = |n| {
+        format!(
+            "{prefix}#eval let f : Nat -> Nat := extract (Nat -> Nat) (Selected.pack (Nat -> Nat) (build {n})); f 21 + f 21"
+        )
+    };
+    let direct = |n| format!("{prefix}#eval let f := build {n}; f 21 + f 21");
+    assert_eq!(
+        run(&selected(80), "42") - run(&selected(0), "42"),
+        run(&direct(80), "42") - run(&direct(0), "42"),
+        "restoring a callback interface must not duplicate its initializer"
+    );
+    let unused = |n| {
+        format!(
+            "{prefix}#eval let f : Nat -> Nat := extract (Nat -> Nat) (Selected.pack (Nat -> Nat) (build {n})); 42"
+        )
+    };
+    assert_eq!(
+        run(&unused(80), "42") - run(&unused(0), "42"),
+        run(&direct(80), "42") - run(&direct(0), "42"),
+        "a selected callback's initializer must run even when the callback is unused"
+    );
+
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = selected(80);
+    let mut bounded = limits();
+    bounded.vm.max_steps = 1;
+    assert!(matches!(
+        base.execute_source_definitions(&[source.as_bytes()], &options, bounded)
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    let first = execute(&base, &source);
+    let second = execute(&base, &source);
+    assert_eq!(
+        first.executions.last().unwrap().flbc_artifact,
+        second.executions.last().unwrap().flbc_artifact
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn selected_callback_stages_run_before_partial_results_are_discarded() {
+    let prefix = format!(
+        "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
+         def staged (cost : Nat) : Nat -> Nat -> Nat := fun x => let paid := work cost; fun y => x + y + paid\n"
+    );
+    let source = |cost, selected: bool, body: &str| {
+        let value = if selected {
+            format!(
+                "extract (Nat -> Nat -> Nat) (Selected.pack (Nat -> Nat -> Nat) (staged {cost}))"
+            )
+        } else {
+            format!("staged {cost}")
+        };
+        format!("{prefix}#eval let f : Nat -> Nat -> Nat := {value}; {body}")
+    };
+    let discarded = "let g := f 20; 42";
+    let delta = run(&source(80, false, discarded), "42") - run(&source(0, false, discarded), "42");
+    assert!(
+        delta > 80,
+        "the direct first stage must perform real runtime work"
+    );
+    for body in [discarded, "let g := f 20; g 1 + g 1"] {
+        assert_eq!(
+            run(&source(80, true, body), "42") - run(&source(0, true, body), "42"),
+            delta,
+            "selected callback stages changed strictness or sharing: {body}"
+        );
+    }
+}
+
+#[test]
 fn type_index_selected_payloads_execute_once_and_retry_after_resource_stops() {
     let prefix = format!(
         "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n"
@@ -328,11 +421,18 @@ fn wrong_type_indices_and_stopped_execution_are_atomic_and_retryable() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let invalid = format!("{TREE}#eval 42\ndef bad : TypedTree Bool := TypedTree.nat 42");
-    assert!(
-        base.execute_source_definitions(&[invalid.as_bytes()], &options, limits())
-            .is_err()
-    );
+    for invalid in [
+        format!("{TREE}#eval 42\ndef bad : TypedTree Bool := TypedTree.nat 42"),
+        format!(
+            "{SELECTED}#eval 42\n#eval extract (Nat -> Nat) (Selected.pack (String -> Nat) String.length) 0"
+        ),
+    ] {
+        assert!(
+            base.execute_source_definitions(&[invalid.as_bytes()], &options, limits())
+                .is_err()
+        );
+        assert_eq!(base.logical_root(&options), root);
+    }
     let source = format!(
         "{TREE}#eval total Nat (TypedTree.join Nat String (TypedTree.nat 37) (TypedTree.text \"hello\"))"
     );

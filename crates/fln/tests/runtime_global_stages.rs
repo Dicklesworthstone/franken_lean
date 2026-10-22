@@ -250,3 +250,67 @@ fn malformed_source_and_resource_stops_never_publish_partial_results() {
     assert_eq!(base.logical_root(&options), root);
     execute(source, "42");
 }
+
+#[test]
+fn checked_partial_producers_keep_stages_through_safe_consumers() {
+    execute(
+        "partial def reprStep (offset n : Nat) : Nat -> Nat :=\n  if n == 0 then fun state => offset + state\n  else let next := reprStep offset (n - 1); fun state => next state + 1\ndef reprBind (f : Nat -> Nat -> Nat) (n state : Nat) : Nat := f n state\n#eval reprBind (reprStep 10) 3 29",
+        "42",
+    );
+}
+
+#[test]
+fn checked_partial_callback_prefix_work_is_strict_and_shared() {
+    let declarations = r#"
+def callbackWork (n : Nat) : Nat :=
+  Nat.rec (motive := fun _ => Nat) 0 (fun _ ih => ih) n
+partial def callbackBuild (cost n : Nat) : Nat -> Nat :=
+  if n == 0 then fun world => world
+  else
+    let paid := callbackWork cost
+    let next := callbackBuild cost (n - 1)
+    fun world => next world + paid
+def callbackDiscard (f : Nat -> Nat -> Nat) (n : Nat) : Nat :=
+  let action := f n
+  42
+def callbackRepeat (f : Nat -> Nat -> Nat) (n : Nat) : Nat :=
+  let action := f n
+  action 20 + action 22
+"#;
+    let direct = |cost| format!("{declarations}#eval let action := callbackBuild {cost} 3; 42");
+    let direct_zero = execute(&direct(0), "42");
+    let direct_many = execute(&direct(80), "42");
+    assert!(
+        direct_many > direct_zero + 80,
+        "the direct producer must perform measurable work before returning its callback"
+    );
+    let prefix_work = direct_many - direct_zero;
+    for consumer in ["callbackDiscard", "callbackRepeat"] {
+        let source = |cost| format!("{declarations}#eval {consumer} (callbackBuild {cost}) 3");
+        let zero = execute(&source(0), "42");
+        let many = execute(&source(80), "42");
+        assert_eq!(
+            many - zero,
+            prefix_work,
+            "the consumer must neither defer nor duplicate callback prefix work: {consumer}"
+        );
+    }
+}
+
+#[test]
+fn checked_partial_callbacks_retain_owned_captures_through_consumers_and_replay() {
+    execute(
+        r#"
+partial def callbackSize (suffix : String) (n : Nat) : Nat -> Nat :=
+  if n == 0 then fun offset => String.length suffix + offset
+  else
+    let next := callbackSize suffix (n - 1)
+    fun offset => next offset + 1
+def callbackUseSize (f : Nat -> Nat -> Nat) : Nat :=
+  let action := f 3
+  action 17 + action 15
+#eval callbackUseSize (callbackSize "λ😀") + callbackUseSize (callbackSize "abcd")
+"#,
+        "88",
+    );
+}
