@@ -332,6 +332,57 @@ fn rpc_term_goal_before_crlf_keeps_the_original_half_open_range() {
 }
 
 #[test]
+fn native_projected_diagnostics_reach_rpc_and_clear_after_a_checked_edit() {
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let mut client = Client::start(binary, args, "v1");
+        client.open("module\nprelude\ndef broken : Prop := missing\n");
+        let session = client.connect("connect");
+        let diagnostics = client.exchange(
+            "diagnostics",
+            &call(
+                "diagnostics",
+                &session,
+                "Lean.Widget.getInteractiveDiagnostics",
+                2,
+                0,
+            ),
+        );
+        assert!(diagnostics.contains("\"result\":[{"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("\"message\":{\"text\":"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("missing"), "{diagnostics}");
+        assert!(
+            client.log.iter().any(|message| {
+                message.contains("\"method\":\"textDocument/publishDiagnostics\"")
+                    && message.contains("missing")
+            }),
+            "RPC did not use the real checked diagnostic publication"
+        );
+        client.change(
+            2,
+            "module\nprelude\ndef identity (P : Prop) (h : P) : P := h\n",
+        );
+        let clean = client.exchange(
+            "clean",
+            &call(
+                "clean",
+                &session,
+                "Lean.Widget.getInteractiveDiagnostics",
+                2,
+                0,
+            ),
+        );
+        assert!(clean.contains("\"result\":[]"), "{clean}");
+        client.finish();
+    }
+}
+
+#[test]
 fn diagnostic_highlighting_uses_the_live_pinned_wire_shape_and_session_guards() {
     // These results were compared with the locked Lean server in both wire
     // formats. In particular, the reference does not merge overlapping hits.

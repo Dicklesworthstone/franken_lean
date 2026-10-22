@@ -193,16 +193,22 @@ impl Batch {
                 CallbackMessageClass::CurrentDiagnostics => {
                     let envelope = parse_envelope(notification)
                         .map_err(|_| "invalid diagnostic notification")?;
+                    let raw = object(envelope.params)?;
                     match direct_version(envelope.params) {
                         VersionField::Missing => {}
                         VersionField::Valid(current) if current == version => {}
+                        // Native projection has no editor version and emits
+                        // null. The synchronous workspace cache binds this
+                        // batch to the exact checked source/version; null has
+                        // the same meaning as an omitted optional version.
+                        VersionField::Invalid
+                            if matches!(object_field(raw, "version"), RawField::Value("null")) => {}
                         _ => {
                             return Err(
                                 "diagnostics do not belong to the current document version",
                             );
                         }
                     }
-                    let raw = object(envelope.params)?;
                     let RawField::Value(array) = object_field(raw, "diagnostics") else {
                         return Err("diagnostic notification requires one diagnostics array");
                     };
@@ -410,6 +416,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn nullable_native_versions_retain_messages_without_admitting_invalid_versions() {
+        let message = diagnostic(2, 2, 4, "native error");
+        for version in ["", ",\"version\":null", ",\"version\":7"] {
+            let batch = Batch::from_notifications(
+                &[notification(&format!("[{message}]"), version)],
+                URI,
+                7,
+            )
+            .unwrap();
+            assert!(
+                batch
+                    .response(Some((2, 3)), 4096)
+                    .unwrap()
+                    .contains("native error")
+            );
+            assert_eq!(batch.response(Some((3, 4)), 4096).unwrap(), "[]");
+        }
+        for version in [
+            ",\"version\":6",
+            ",\"version\":\"7\"",
+            ",\"version\":false",
+            ",\"version\":null,\"version\":null",
+            ",\"version\":null,\"versi\\u006fn\":7",
+        ] {
+            assert!(
+                Batch::from_notifications(
+                    &[notification(&format!("[{message}]"), version)],
+                    URI,
+                    7,
+                )
+                .is_err(),
+                "{version}"
+            );
+        }
     }
     #[test]
     fn failed_missing_and_contradictory_terminals_are_not_empty_diagnostics() {
