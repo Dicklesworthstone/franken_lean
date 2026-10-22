@@ -3,19 +3,24 @@
 use super::*;
 
 impl Context {
+    /// One rewriting step on a located hypothesis, and whether it unfolded a definition,
+    /// which needs no proof.
     pub(super) fn simp_hypothesis_step(
         &mut self,
         local: &LocalDecl,
         rule: &SimpRule<'_>,
         rules: &[SimpRule<'_>],
-    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+    ) -> Result<Option<(Typed, bool)>, NatDefinitionElabError> {
         let target = self.instantiate(&local.type_)?;
         match self.unfold_simp_rule(rule, &target)? {
             UnfoldResult::Unchanged => Ok(None),
-            UnfoldResult::Changed(type_) => Ok(Some(Typed {
-                value: Expr::fvar(local.id.clone()),
-                type_,
-            })),
+            UnfoldResult::Changed(type_) => Ok(Some((
+                Typed {
+                    value: Expr::fvar(local.id.clone()),
+                    type_,
+                },
+                true,
+            ))),
             UnfoldResult::NotDefinition => {
                 let Some((term, occurrence, reverse)) =
                     self.simp_rule_evidence(&target, rule, rules)?
@@ -23,9 +28,42 @@ impl Context {
                     return Ok(None);
                 };
                 self.rewrite_hypothesis_value(local, term, &occurrence, reverse)
-                    .map(Some)
+                    .map(|replacement| Some((replacement, false)))
             }
         }
+    }
+
+    /// Whether a rule rewrites definitionally, as the pin's `isRflProof` classifies a simp
+    /// theorem's proof: a defeq-tagged constant or a structural `rfl`. A local hypothesis is
+    /// never one. The tags are read once per tactic, on the first step that asks.
+    fn simp_rule_reflexive(
+        &mut self,
+        rule: &SimpRule<'_>,
+        tagged: &mut Option<std::collections::BTreeSet<Name>>,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if matches!(rule, SimpRule::Local(_)) {
+            return Ok(false);
+        }
+        let tagged = match tagged {
+            Some(tagged) => &*tagged,
+            None => {
+                let environment = self.txn.env.clone();
+                &*tagged.insert(scope::simp::defeq::read(&environment, || self.tick())?)
+            }
+        };
+        if let SimpRule::Global(entry) = rule {
+            let name = entry.proof.as_ref().unwrap_or(&entry.declaration);
+            if matches!(self.txn.env.find(name), Some(ConstantInfo::Thm(_))) {
+                return Ok(tagged.contains(name));
+            }
+        }
+        let mut trial = self.rewrite_trial();
+        let reflexive = (|| {
+            let term = trial.selected_simp_term(rule)?;
+            trial.dsimp_rfl_proof(term, tagged)
+        })();
+        self.charge_rewrite_trial(&trial);
+        reflexive
     }
 
     /// `simp_all` selects the current propositional evidence and revisits
@@ -162,6 +200,7 @@ impl Context {
         }
         let mut goal = initial.clone();
         let mut steps = 0;
+        let mut tagged = None;
         // `simp_all` hypotheses it reduced to `True` and cleared, never asserted again.
         let mut cleared = HashSet::new();
         loop {
@@ -202,7 +241,8 @@ impl Context {
                         }
                         self.tick()?;
                         let original = self.rewrite_trial();
-                        let Some(replacement) = self.simp_hypothesis_step(&local, rule, &active)?
+                        let Some((replacement, unfolded)) =
+                            self.simp_hypothesis_step(&local, rule, &active)?
                         else {
                             self.restore_simp_trial(original);
                             continue;
@@ -233,8 +273,16 @@ impl Context {
                             steps += 1;
                             break;
                         }
+                        // `simpGoal` asserts a hypothesis whose simplification needs a proof
+                        // after every local, in located order, and changes one simplified only
+                        // definitionally in place (`replaceLocalDeclDefEq`). Measured at
+                        // v4.32.0: `h : 1 = 1` becomes the last local, `h : a + 0 = 1` stays.
+                        // `simp_all` re-asserts by its own rule.
+                        let at_end = !saturate
+                            && !unfolded
+                            && !self.simp_rule_reflexive(rule, &mut tagged)?;
                         let (next, parent, value) =
-                            self.replace_rewritten_hypothesis(goal, &local, replacement)?;
+                            self.replace_rewritten_hypothesis(goal, &local, replacement, at_end)?;
                         let replacement_id = next
                             .lctx
                             .find_by_user_name(name)
@@ -311,6 +359,56 @@ impl Context {
                 rules.retain(|rule| {
                     !matches!(rule, SimpRule::Local(id) if before.contains(id) && !after.contains(id))
                 });
+            }
+            // `SimpAll.main` re-asserts the first hypothesis whose type changed and every
+            // hypothesis after it, at the end of the context in their order, and clears the
+            // originals: measured at v4.32.0, `(h₁ : a + 0 = 1) (q : Prop) (h₃ : b = 2)
+            // (r : Prop)` ends as `q r : Prop`, `h₁ : a = 1`, `h₃ : b = 2`. A hypothesis left as
+            // `True` is not asserted, and one that other locals or the target read is not one
+            // of its entries.
+            let mut moving = false;
+            for (name, history) in locations.hypotheses.iter().zip(&histories) {
+                self.tick()?;
+                if cleared.contains(name) {
+                    continue;
+                }
+                let Some(local) = goal.lctx.find_by_user_name(name).cloned() else {
+                    continue;
+                };
+                if is_true(&self.instantiate(&local.type_)?) {
+                    continue;
+                }
+                moving |= history.len() > 1;
+                if !moving
+                    || self
+                        .clear_blocker(&goal, &HashSet::from([local.id.clone()]))?
+                        .is_some()
+                {
+                    continue;
+                }
+                self.txn.lctx = goal.lctx.clone();
+                let moved = Typed {
+                    value: Expr::fvar(local.id.clone()),
+                    type_: local.type_.clone(),
+                };
+                let (next, parent, value) =
+                    self.replace_rewritten_hypothesis(goal, &local, moved, true)?;
+                let moved_id = next
+                    .lctx
+                    .find_by_user_name(name)
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?
+                    .id
+                    .clone();
+                for rule in &mut rules {
+                    self.tick()?;
+                    if let SimpRule::Local(id) = rule
+                        && id == &local.id
+                    {
+                        *id = moved_id.clone();
+                    }
+                }
+                proof.work.push(Work::Close(parent, value));
+                goal = next;
             }
         }
         if locations.target {

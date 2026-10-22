@@ -143,7 +143,7 @@ impl Context {
                 }
                 self.tick()?;
                 let original = self.rewrite_trial();
-                let Some(replacement) = self.simp_hypothesis_step(&local, rule, rules)? else {
+                let Some((replacement, _)) = self.simp_hypothesis_step(&local, rule, rules)? else {
                     self.restore_simp_trial(original);
                     continue;
                 };
@@ -151,7 +151,7 @@ impl Context {
                     return Err(failure(SourceInferenceError::ResourceLimit));
                 }
                 let (next, parent, value) =
-                    self.replace_rewritten_hypothesis(goal, &local, replacement)?;
+                    self.replace_rewritten_hypothesis(goal, &local, replacement, false)?;
                 proof.work.push(Work::Close(parent, value));
                 goal = next;
                 steps += 1;
