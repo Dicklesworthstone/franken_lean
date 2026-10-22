@@ -411,3 +411,43 @@ example (a b : Nat) (h : a = b) (e : b = a) (p : Prop) (hp : p) : p := by
     );
     assert!(ours.contains("h₂ : ¬q 0\n⊢ ¬p 0\n"), "{ours}");
 }
+
+/// An unqualified head names this file's constructor first: with `Init.Data.List.Basic`
+/// imported, `cons` under `open BV` is `BV.cons`, not `List.Sublist.cons`, whose first explicit
+/// field is an index. Under a named pattern `x@(vec.cons h t)` the pin warns about every
+/// unused field, `t` included. Both are as the pinned v4.32.0 prints them (2026-10-22).
+#[test]
+fn a_local_constructor_and_a_named_pattern_are_read_as_the_pin_reads_them() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "inductive BV : Nat → Type
+| nil  : BV 0
+| cons : {n : Nat} → Bool → BV n → BV (n+1)
+open BV
+def g : {n : Nat} → BV n → Nat → Nat
+  | _, cons b v, 1000000 => g v 0
+  | _, cons b v, x       => g v (x + 1)
+  | _, nil, _            => 0
+inductive vec : Nat → Type where
+  | nil : vec 0
+  | cons : Nat → vec n → vec n.succ
+def tst2 : vec n → Option (Nat × vec n)
+  | x@(vec.cons h t) => some (h, x)
+  | _ => none
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "local_constructors",
+        "prelude\nimport Init.Data.List.Basic\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        3,
+        "{ours}"
+    );
+}

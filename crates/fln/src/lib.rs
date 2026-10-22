@@ -8580,10 +8580,21 @@ impl Engine {
                 matches!(environment.find(name),
                     Some(ConstantInfo::Induct(family)) if family.num_indices > 0)
             };
+            // A constant this source declared is absent from the imported environment.
+            let local = |name: &Name| {
+                engine
+                    .imported_environment()
+                    .is_none_or(|imported| !imported.contains(name))
+            };
             let constructors = unused_variables::Constructors {
                 names: environment
                     .constants()
                     .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
+                    .filter_map(|(name, _)| spelling(name))
+                    .collect(),
+                local: environment
+                    .constants()
+                    .filter(|(name, info)| matches!(info, ConstantInfo::Ctor(_)) && local(name))
                     .filter_map(|(name, _)| spelling(name))
                     .collect(),
                 indexed: environment
@@ -8593,6 +8604,7 @@ impl Engine {
                             Some(ConstantInfo::Induct(family)) if family.num_indices > 0 => {
                                 Some(unused_variables::IndexedConstructor {
                                     name: name.clone(),
+                                    local: local(name),
                                     unread: unused_variables::unread_fields(
                                         &ctor.base.type_,
                                         ctor.num_params,

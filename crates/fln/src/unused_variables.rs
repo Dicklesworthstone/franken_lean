@@ -293,6 +293,10 @@ fn contains_atom_shallow(node: &Syntax, atom: &str) -> bool {
 /// pattern variable from a constructor, and its indexed families' constructors.
 pub(crate) struct Constructors {
     pub(crate) names: HashSet<String>,
+    /// The spellings of the constructors this source declares, not imported: an unqualified or
+    /// dotted head spelled like one names it (`open BV` then `cons`), not an `Init` constructor
+    /// spelled alike (`List.Sublist.cons`).
+    pub(crate) local: HashSet<String>,
     pub(crate) indexed: Vec<IndexedConstructor>,
 }
 
@@ -309,6 +313,8 @@ pub(crate) struct Constructors {
 /// field (`x`, and `b : Fin (n + 1)` too) was warned about in every shape measured.
 pub(crate) struct IndexedConstructor {
     pub(crate) name: Name,
+    /// Whether this source declares it.
+    pub(crate) local: bool,
     /// One entry per explicit field, in order: `true` when the field is not read.
     pub(crate) unread: Vec<bool>,
 }
@@ -385,9 +391,10 @@ impl Constructors {
     /// the merge only ever leaves more unread.
     fn unread(&self, head: &Name) -> Option<Vec<bool>> {
         let written = components(head);
+        let local = matches!(written.as_slice(), [spelling] if self.local.contains(spelling));
         let mut merged: Option<Vec<bool>> = None;
         for constructor in &self.indexed {
-            if !components(&constructor.name).ends_with(&written) {
+            if !components(&constructor.name).ends_with(&written) || (local && !constructor.local) {
                 continue;
             }
             let merged = merged.get_or_insert_with(Vec::new);
@@ -404,8 +411,10 @@ impl Constructors {
 
 fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<Vec<(Name, usize)>> {
     let mut variables = Vec::new();
-    let mut pending = vec![patterns];
-    while let Some(pattern) = pending.pop() {
+    // Each pattern, and whether it lies under a named pattern `x@p`, where the pin warns about
+    // every unused field of an indexed constructor too (measured 2026-10-22).
+    let mut pending = vec![(patterns, false)];
+    while let Some((pattern, plain)) = pending.pop() {
         match pattern {
             Syntax::Ident { val, .. } => {
                 if let LeafView::Str(text) = val.leaf_view()
@@ -426,7 +435,7 @@ fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<V
                     | "term_+_"
                     | "term_::_"
                     | "term[_]" => {
-                        pending.extend(args.iter());
+                        pending.extend(args.iter().map(|arg| (arg, plain)));
                     }
                     // The head is a constructor or a `match_pattern` function, never bound.
                     "Lean.Parser.Term.app" => {
@@ -441,7 +450,8 @@ fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<V
                             // `@C …` writes the implicit fields too, which `unread` does not
                             // count: an indexed constructor's is not read at all.
                             Some(head) if is_kind(head, &["Term", "explicit"]) => {
-                                if let Some(Syntax::Ident { val, .. }) = self::args(head).get(1)
+                                if !plain
+                                    && let Some(Syntax::Ident { val, .. }) = self::args(head).get(1)
                                     && constructors.unread(val).is_some()
                                 {
                                     return None;
@@ -450,24 +460,29 @@ fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<V
                             }
                             _ => None,
                         };
-                        let Some(unread) = head.and_then(|head| constructors.unread(&head)) else {
-                            pending.extend(args.get(1));
+                        let unread = head
+                            .filter(|_| !plain)
+                            .and_then(|head| constructors.unread(&head));
+                        let Some(unread) = unread else {
+                            pending.extend(args.get(1).map(|arg| (arg, plain)));
                             continue;
                         };
                         let fields = args.get(1).map(self::args).unwrap_or(&[]);
                         for (index, field) in fields.iter().enumerate() {
                             // A field past the constructor's explicit ones is not read either.
                             if !unread.get(index).copied().unwrap_or(true) {
-                                pending.push(field);
+                                pending.push((field, plain));
                             }
                         }
                     }
                     "Lean.Parser.Term.namedPattern" => {
-                        pending.extend(args.first());
-                        pending.extend(args.get(3));
+                        pending.extend(args.first().map(|arg| (arg, plain)));
+                        pending.extend(args.get(3).map(|arg| (arg, true)));
                     }
                     // The ascribed type is a term the pattern's variables may appear in.
-                    "Lean.Parser.Term.typeAscription" => pending.extend(args.get(1)),
+                    "Lean.Parser.Term.typeAscription" => {
+                        pending.extend(args.get(1).map(|arg| (arg, plain)));
+                    }
                     "Lean.Parser.Term.hole"
                     | "Lean.Parser.Term.ellipsis"
                     | "Lean.Parser.Term.dotIdent"
