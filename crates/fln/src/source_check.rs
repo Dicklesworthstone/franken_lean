@@ -213,6 +213,7 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
         },
         // The `lean` front door's `CAPABILITY_NOT_IMPLEMENTED_EXIT`: not a verdict.
         EngineExecutionError::NotImplemented { .. } => ("capability", false, 5),
+        EngineExecutionError::EvaluationDependsOnSorry => ("elaboration", false, 1),
         _ => ("input", false, 1),
     }
 }

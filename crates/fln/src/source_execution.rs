@@ -125,6 +125,101 @@ pub(super) fn uses_sorry(declaration: &Declaration) -> Result<bool, EngineExecut
     Ok(found)
 }
 
+/// Whether evaluating `declarations` depends on `sorryAx`: the pin's `collectAxioms` test before
+/// `#eval` runs anything (`addAndCompileExprForEval`, vendored
+/// `Lean/Elab/BuiltinEvalCommand.lean:104-113`). That walk follows every constant reached, through
+/// an axiom's, a constructor's and a recursor's type, a definition's, theorem's and opaque's type
+/// and value, and an inductive's type and constructors (`Lean/Util/CollectAxioms.lean:52-61`).
+///
+/// An imported constant is a leaf while every imported module belongs to the pinned library
+/// (`Init`, `Std`, `Lean`, `Lake`). None of that library's 212,919 constants mentions `sorryAx`: the
+/// pinned v4.32.0 under `import Lean` and `import Lake`, opaque values included, measured
+/// 2026-10-22. Any other import is walked like this file's own constants. Unbudgeted, as
+/// [`uses_sorry`] is.
+pub(super) fn evaluation_depends_on_sorry<'a>(
+    engine: &Engine,
+    declarations: impl IntoIterator<Item = &'a Declaration>,
+) -> Result<bool, EngineExecutionError> {
+    let sorry = Name::from_components(["sorryAx"]);
+    let library_only = engine.imported_modules().iter().all(|module| {
+        let mut root = module.clone();
+        while !root.parent().is_anonymous() {
+            root = root.parent();
+        }
+        ["Init", "Std", "Lean", "Lake"]
+            .iter()
+            .any(|library| root == Name::from_components([*library]))
+    });
+    let imported = engine.imported_environment();
+    let environment = engine.environment();
+    let mut spent = 0;
+    let mut pending = Vec::new();
+    let mut references = |expr: &Expr, pending: &mut Vec<Name>| {
+        let mut found = BTreeSet::new();
+        collect_constant_references(expr, &mut found, &mut spent, usize::MAX).map_err(|error| {
+            match error {
+                ConstantReferenceCollectionError::PresentationLimit { observed, limit } => {
+                    EngineExecutionError::SourceDependencyPresentationLimit { observed, limit }
+                }
+                ConstantReferenceCollectionError::AllocationFailure { requested } => {
+                    EngineExecutionError::AllocationFailure {
+                        resource: "evaluation sorry dependency worklist",
+                        requested,
+                    }
+                }
+            }
+        })?;
+        pending.extend(found);
+        Ok::<(), EngineExecutionError>(())
+    };
+    for declaration in declarations {
+        parts(declaration, &mut |part| match part {
+            Part::Expression(expr) => references(expr, &mut pending),
+            Part::Reference(name) => {
+                pending.push(name.clone());
+                Ok(())
+            }
+            Part::Declared(_) => Ok(()),
+        })?;
+    }
+    let mut seen = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if name == sorry {
+            return Ok(true);
+        }
+        if !seen.insert(name.clone())
+            || (library_only && imported.is_some_and(|imported| imported.contains(&name)))
+        {
+            continue;
+        }
+        match environment.find(&name) {
+            Some(
+                ConstantInfo::Axiom(fln_env::constants::AxiomVal { base, .. })
+                | ConstantInfo::Ctor(fln_env::constants::ConstructorVal { base, .. })
+                | ConstantInfo::Rec(fln_env::constants::RecursorVal { base, .. }),
+            ) => references(&base.type_, &mut pending)?,
+            Some(ConstantInfo::Defn(value)) => {
+                references(&value.base.type_, &mut pending)?;
+                references(&value.value, &mut pending)?;
+            }
+            Some(ConstantInfo::Thm(value)) => {
+                references(&value.base.type_, &mut pending)?;
+                references(&value.value, &mut pending)?;
+            }
+            Some(ConstantInfo::Opaque(value)) => {
+                references(&value.base.type_, &mut pending)?;
+                references(&value.value, &mut pending)?;
+            }
+            Some(ConstantInfo::Induct(value)) => {
+                references(&value.base.type_, &mut pending)?;
+                pending.extend(value.ctors.iter().cloned());
+            }
+            Some(ConstantInfo::Quot(_)) | None => {}
+        }
+    }
+    Ok(false)
+}
+
 fn published(
     subjects: &SourceModuleVisibilitySubjects<'_>,
     visit: &mut impl FnMut(&Declaration, usize) -> Result<(), EngineExecutionError>,

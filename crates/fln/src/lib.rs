@@ -8197,6 +8197,26 @@ impl Engine {
                     detail: "a noncomputable section declaration escaped its admission-only route",
                 });
             }
+            // `#eval` refuses an expression that depends on `sorry` before compiling or running it.
+            // `#guard` evaluates through `evalExpr`, which has no such check
+            // (vendored `Lean/Meta/Eval.lean`).
+            if is_evaluation
+                && !matches!(
+                    evaluation_presentation,
+                    Some(EvaluationResultPresentation::Guard)
+                )
+                && source_execution::evaluation_depends_on_sorry(
+                    &engine,
+                    std::iter::once(&declaration).chain(&local_functions),
+                )?
+            {
+                // Under a `#guard_msgs` expecting an error, an `#eval` was refused before here.
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::EvaluationDependsOnSorry),
+                    at: Some(original_offset),
+                });
+            }
             // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
             // a later command's atomic name does not reach it through its namespace, an `open` or
             // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).
@@ -13151,6 +13171,9 @@ pub enum EngineExecutionError {
     NotImplemented {
         feature: &'static str,
     },
+    /// `#eval` of an expression that depends on `sorryAx`, which the pin refuses before running it
+    /// (`addAndCompileExprForEval`, vendored `Lean/Elab/BuiltinEvalCommand.lean:104-113`).
+    EvaluationDependsOnSorry,
     /// A `namespace`/`section`/`end`/`open` command the scope stack refused (an
     /// unmatched `end`, an unknown namespace), in the pin's words where it has them.
     ScopeTransition {
@@ -13224,6 +13247,13 @@ impl fmt::Display for EngineExecutionError {
         match self {
             Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
             Self::NotImplemented { feature } => write!(formatter, "not implemented: {feature}"),
+            // The pin's words (`addAndCompileExprForEval`, vendored
+            // `Lean/Elab/BuiltinEvalCommand.lean:110-113`).
+            Self::EvaluationDependsOnSorry => formatter.write_str(
+                "Aborting evaluation since the expression depends on the 'sorry' axiom, which can \
+                 lead to runtime instability and crashes.\n\nTo attempt to evaluate anyway \
+                 despite the risks, use the '#eval!' command.",
+            ),
             Self::ScopeTransition { message } => formatter.write_str(message),
             Self::SourceScopeLimit { resource, limit } => {
                 write!(formatter, "source command exceeds {resource} limit {limit}")

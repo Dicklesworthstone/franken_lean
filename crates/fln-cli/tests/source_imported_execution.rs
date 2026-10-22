@@ -1033,6 +1033,68 @@ fn exit_stops_the_file_with_the_pins_warning() {
     }
 }
 
+/// `#eval` refuses an expression that depends on `sorryAx` through any constant it reaches, as
+/// the pin's `collectAxioms` test does before running anything
+/// (`Lean/Elab/BuiltinEvalCommand.lean:104-113`): a definition by `sorry`, one whose
+/// `decreasing_by` is `sorry`, and one applied to a theorem proved by `sorry`. The pinned v4.32.0
+/// exits 1 on each with that error (measured 2026-10-22), and the control without `sorry` prints
+/// as it does. The pinned binary beside the library is consulted again when present.
+#[test]
+fn eval_refuses_an_expression_that_depends_on_sorry() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-eval-sorry");
+    let header = "prelude\nimport Init.Data.Repr\n";
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    let theirs = |entry: &Path| {
+        pinned.as_ref().map(|pinned| {
+            Command::new(pinned)
+                .arg(entry)
+                .env("LEAN_PATH", &lib)
+                .output()
+                .expect("run the pinned lean")
+        })
+    };
+    let refused = [
+        "def f : Nat := sorry\n#eval f + 1\n",
+        "def g (n : Nat) : Nat := if h : n = 0 then 0 else g (n - 1)\ndecreasing_by sorry\n\
+         #eval g 3\n",
+        "theorem t : 1 = 1 := sorry\ndef h : Nat := (fun (_ : 1 = 1) => 5) t\n#eval h\n",
+    ];
+    for (index, program) in refused.iter().enumerate() {
+        let entry = workspace.write(
+            &format!("Refused{index}.lean"),
+            format!("{header}{program}"),
+        );
+        if let Some(theirs) = theirs(&entry) {
+            assert_eq!(theirs.status.code(), Some(1), "the pin moved: {program}");
+        }
+        let ours = lean_door(&workspace, &entry, &lib);
+        assert_eq!(ours.code, 1, "{program}: {ours:?}");
+        assert!(
+            ours.stderr
+                .contains("Aborting evaluation since the expression depends on the 'sorry' axiom"),
+            "{program}: {ours:?}"
+        );
+    }
+    let entry = workspace.write(
+        "Control.lean",
+        format!(
+            "{header}def f (n : Nat) : Nat := n + 1\n#eval f 2\ntheorem ok : 1 = 1 := rfl\n\
+             def h : Nat := (fun (_ : 1 = 1) => 5) ok\n#eval h\n"
+        ),
+    );
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stdout.as_str()), (0, "3\n5\n"), "{ours:?}");
+    if let Some(theirs) = theirs(&entry) {
+        assert!(theirs.status.success(), "{theirs:?}");
+        assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
+    }
+}
+
 /// `sorry` elaborates to the pin's `sorryAx (Lean.Name → T) false tag` and every declaration
 /// that uses it is admitted with the pin's warning, positioned at the declared name, or at the
 /// keyword for an `example`, an anonymous instance and a structure; `warn.sorry false` silences
