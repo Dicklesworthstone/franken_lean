@@ -23,6 +23,7 @@ pub mod format;
 pub mod goals;
 mod notations;
 mod print;
+mod structures;
 use format::Format;
 
 /// Why a term could not be printed the pin's way.
@@ -495,6 +496,24 @@ fn escaped_name(name: &Name) -> String {
     text
 }
 
+/// Whether `name` is a binder this engine's elaboration introduced (`_fln…`, or named by a
+/// number), which the pin's term never has. The first component decides: a hygienic
+/// `x._@.M._hyg.4` is the user's `x`.
+pub(crate) fn internal_name(name: &Name) -> bool {
+    let mut first = name.clone();
+    while !first.parent().is_anonymous() {
+        first = first.parent();
+    }
+    match first.leaf_view() {
+        LeafView::Str(text) => text.starts_with("_fln"),
+        LeafView::Num(_) => true,
+        LeafView::Anonymous => false,
+    }
+}
+
+const INTERNAL_BINDER: Unsupported =
+    Unsupported("a binder this engine's elaboration introduced (a compiled `if` or `match`)");
+
 fn binder_name(name: &Name) -> String {
     if accessible(name) {
         escaped_name(name)
@@ -534,6 +553,15 @@ pub struct Printer<'a> {
     notations: Option<&'a fln_parse::extensions::Notations>,
     /// How a dependent `let` prints ([`LetMode`]).
     lets: LetMode,
+    /// The imported delaborator tags (`pp_using_anonymous_constructor`, `pp_nodot`,
+    /// `app_unexpander` keys), or `None` when the journal cannot be read.
+    tags: Option<fln_elab::delaborator_tags::DelaboratorTags>,
+    /// Whether the environment records imported delaborator tags at all: importing any `Init`
+    /// module does (`Init.Prelude` tags `Subtype`). Without them, as in the native source
+    /// profile, the `Init.NotationExtra` unexpanders this printer reproduces are assumed.
+    imported_tags: bool,
+    /// Structure metadata, read when a structure instance is first printed.
+    structures: Option<structures::StructureTables>,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -671,6 +699,11 @@ impl<'a> Printer<'a> {
             top_names: 0,
             notations: None,
             lets: LetMode::AsIs,
+            tags: fln_elab::delaborator_tags::DelaboratorTags::read(env).ok(),
+            imported_tags: env
+                .extension(&fln_elab::delaborator_tags::journal_name())
+                .is_some(),
+            structures: None,
         }
     }
 
@@ -970,8 +1003,22 @@ impl<'a> Printer<'a> {
                 })
             }
             // `unexpandUnit` (`Init/NotationExtra.lean:149`).
-            ExprNode::Const { name, .. } if name.to_display_string() == "Unit.unit" => {
+            ExprNode::Const { name, .. }
+                if name.to_display_string() == "Unit.unit" && self.registered("Unit.unit") =>
+            {
                 Ok(Format::text("()"))
+            }
+            // A structure's constructor without parameters or fields is a structure instance
+            // too, `{ }`.
+            ExprNode::Const { name, .. }
+                if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
+                    && ctor.num_params == 0
+                    && ctor.num_fields == 0
+                    && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
+                    && self.structure_like(inductive) =>
+            {
+                let ctor = ctor.clone();
+                self.structure_instance(&ctor, &[])
             }
             ExprNode::Const { name, .. } => self
                 .notation(name, &[], outer)
@@ -1005,6 +1052,10 @@ impl<'a> Printer<'a> {
                     if *binder_info == BinderInfo::InstImplicit {
                         self.unbind_to(depth);
                         return Err(Unsupported("an instance-implicit `fun` binder"));
+                    }
+                    if internal_name(name) {
+                        self.unbind_to(depth);
+                        return Err(INTERNAL_BINDER);
                     }
                     let shown = self.bound_name(name, inner);
                     self.bind(shown.clone(), binder_type);
@@ -1064,6 +1115,9 @@ impl<'a> Printer<'a> {
                 body,
                 non_dep,
             } if outer == 0 && self.names.len() == self.top_names => {
+                if internal_name(name) {
+                    return Err(INTERNAL_BINDER);
+                }
                 let non_dep = &self.nondependent(body, *non_dep)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
@@ -1092,6 +1146,9 @@ impl<'a> Printer<'a> {
                 body,
                 non_dep,
             } => {
+                if internal_name(name) {
+                    return Err(INTERNAL_BINDER);
+                }
                 let non_dep = &self.nondependent(body, *non_dep)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
@@ -1155,6 +1212,7 @@ impl<'a> Printer<'a> {
             // explicit does not match the unexpander and is not reproduced.
             if text == "Exists"
                 && args.len() == 2
+                && self.registered("Exists")
                 && matches!(
                     args[1].node(),
                     ExprNode::Lam {
@@ -1198,7 +1256,11 @@ impl<'a> Printer<'a> {
                 )));
             }
             // `[a, b, …]` (the `List.cons`/`List.nil` unexpanders); an open tail is `::`.
-            if text == "List.cons" && args.len() == 3 {
+            if text == "List.cons"
+                && args.len() == 3
+                && self.registered("List.cons")
+                && self.registered("List.nil")
+            {
                 let mut elements = vec![args[1].clone()];
                 let mut tail = args[2].clone();
                 loop {
@@ -1227,7 +1289,7 @@ impl<'a> Printer<'a> {
                     break;
                 }
             }
-            if text == "List.nil" && args.len() == 1 {
+            if text == "List.nil" && args.len() == 1 && self.registered("List.nil") {
                 return Ok(Format::text("[]"));
             }
             if let Some(infix) = INFIXES
@@ -1294,14 +1356,24 @@ impl<'a> Printer<'a> {
                 }
                 return Err(Unsupported("an applied sorry"));
             }
+            if text == "Prod.mk" && args.len() == 4 && self.registered("Prod.mk") {
+                return self.tuple(&args[2], &args[3]);
+            }
             // A structure's constructor, fully applied, is `{ x := a, … }` at the pin, or
-            // `⟨a, …⟩` for a type tagged `pp_using_anonymous_constructor`, which is not decoded.
+            // `⟨a, …⟩` for a type tagged `pp_using_anonymous_constructor` ([`structures`]).
             if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
                 && args.len() == (ctor.num_params + ctor.num_fields) as usize
                 && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
                 && self.structure_like(inductive)
             {
-                return Err(Unsupported("a structure instance"));
+                let ctor = ctor.clone();
+                return self.structure_instance(&ctor, &args);
+            }
+            // Any other constant an imported `@[app_unexpander]` prints (`ite` as `if … then …
+            // else …`, `GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
+            // its application is refused rather than printed as an application.
+            if self.imported_tags && self.tags.as_ref().is_some_and(|tags| tags.unexpanded(name)) {
+                return Err(Unsupported("an application an `@[app_unexpander]` prints"));
             }
             let infos = self.binder_infos(name);
             // Generalized field notation: `C.f r …` is `r.f …` when `r` is `C.f`'s first
@@ -1313,48 +1385,130 @@ impl<'a> Printer<'a> {
                 );
                 let mut shown = projection;
                 let mut applied = false;
-                for (index, arg) in args.iter().enumerate() {
-                    let explicit = infos
-                        .get(index)
-                        .is_none_or(|info| *info == BinderInfo::Default);
-                    if explicit && index != receiver {
-                        shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
-                        applied = true;
-                    }
+                let shown_args: Vec<usize> = (0..args.len())
+                    .filter(|&index| {
+                        index != receiver
+                            && infos
+                                .get(index)
+                                .is_none_or(|info| *info == BinderInfo::Default)
+                    })
+                    .collect();
+                let mut open = false;
+                for (position, &index) in shown_args.iter().enumerate() {
+                    let last = position + 1 == shown_args.len();
+                    let (printed, bare) = self.argument(&args[index], last)?;
+                    shown = shown.then(Format::Line).then(printed);
+                    open = bare;
+                    applied = true;
                 }
                 return Ok(if applied {
-                    paren_doc(node(shown), MAX_PREC - 1, outer)
+                    self.applied(node(shown), open, outer)
                 } else {
                     shown
                 });
             }
             let mut shown = Format::Nil;
             let mut applied = false;
-            for (index, arg) in args.iter().enumerate() {
-                let explicit = infos
-                    .get(index)
-                    .is_none_or(|info| *info == BinderInfo::Default);
-                if explicit {
-                    shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
-                    applied = true;
-                }
+            let shown_args: Vec<usize> = (0..args.len())
+                .filter(|&index| {
+                    infos
+                        .get(index)
+                        .is_none_or(|info| *info == BinderInfo::Default)
+                })
+                .collect();
+            let mut open = false;
+            for (position, &index) in shown_args.iter().enumerate() {
+                let last = position + 1 == shown_args.len();
+                let (printed, bare) = self.argument(&args[index], last)?;
+                shown = shown.then(Format::Line).then(printed);
+                open = bare;
+                applied = true;
             }
             let text = self.display_name(name);
             if !applied {
                 return Ok(Format::text(text));
             }
             // `app := many1 argument`, each argument after a line (`checkWsBefore`).
-            return Ok(paren_doc(
-                node(Format::text(text).then(shown)),
-                MAX_PREC - 1,
-                outer,
-            ));
+            return Ok(self.applied(node(Format::text(text).then(shown)), open, outer));
         }
         let mut shown = self.doc(&head, MAX_PREC)?;
-        for arg in &args {
-            shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
+        let mut open = false;
+        for (index, arg) in args.iter().enumerate() {
+            let last = index + 1 == args.len();
+            let (printed, bare) = self.argument(arg, last)?;
+            shown = shown.then(Format::Line).then(printed);
+            open = bare;
         }
-        Ok(paren_doc(node(shown), MAX_PREC - 1, outer))
+        Ok(self.applied(node(shown), open, outer))
+    }
+
+    /// Whether an `@[app_unexpander]` is registered for `key`, which this printer reproduces.
+    fn registered(&self, key: &str) -> bool {
+        match &self.tags {
+            Some(tags) if self.imported_tags => {
+                tags.unexpanded(&Name::from_components(key.split('.')))
+            }
+            _ => true,
+        }
+    }
+
+    /// `unexpandProdMk` (`Init/NotationExtra.lean:168-171`): `Prod.mk x y` is `(x, y)`, and a
+    /// second component that is itself a pair continues the tuple, `(x, y, z)`.
+    fn tuple(&mut self, first: &Expr, second: &Expr) -> Doc {
+        let mut elements = vec![first.clone()];
+        let mut rest = second.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = spine(&rest);
+            match head.node() {
+                ExprNode::Const { name, .. }
+                    if name.to_display_string() == "Prod.mk" && args.len() == 4 =>
+                {
+                    elements.push(args[2].clone());
+                    rest = args[3].clone();
+                }
+                _ => break,
+            }
+        }
+        elements.push(rest);
+        // `"(" term ", " sepBy1 term ", " ")"`: a line after each comma.
+        let mut shown = Format::Nil;
+        for (index, element) in elements.iter().enumerate() {
+            if index > 0 {
+                shown = shown.then(Format::text(",")).then(Format::Line);
+            }
+            shown = shown.then(self.with_trailing(false, |printer| printer.doc(element, 0))?);
+        }
+        Ok(node(Format::text("(").then(shown).then(Format::text(")"))))
+    }
+
+    /// An application's argument, at `maxPrec`, and whether it is a `fun` left bare. `fun`
+    /// parses at `maxPrec` too (`basicFun`), so the pin's parenthesizer brackets it only before a
+    /// later argument: last, it is `Subtype fun n => n = 1`, and an application ending so is
+    /// bracketed whole where a token follows it ([`Printer::applied`]).
+    fn argument(&mut self, arg: &Expr, last: bool) -> Result<(Format, bool), Unsupported> {
+        let mut bare = arg;
+        while let ExprNode::MData { expr, .. } = bare.node() {
+            bare = expr;
+        }
+        if last && matches!(bare.node(), ExprNode::Lam { .. }) {
+            Ok((
+                self.with_trailing(false, |printer| printer.doc(arg, 0))?,
+                true,
+            ))
+        } else {
+            Ok((self.doc(arg, MAX_PREC)?, false))
+        }
+    }
+
+    /// `paren_doc` for an application at `outer`, also bracketed when it ends in a bare `fun`
+    /// and a token follows it: `(ap2 1 fun x => x) + 2`, `(Subtype fun n => n = 1) → Nat`.
+    fn applied(&self, doc: Format, open: bool, outer: u32) -> Format {
+        if open && self.trailing && outer < MAX_PREC {
+            paren_doc(doc, 0, 1)
+        } else {
+            paren_doc(doc, MAX_PREC - 1, outer)
+        }
     }
 
     /// The receiver index and field name when `C.f args` prints as `receiver.f`.
@@ -1375,6 +1529,7 @@ impl<'a> Printer<'a> {
         if namespace.is_anonymous()
             || namespace.to_display_string() == "Function"
             || name.to_display_string() == "List.toArrayImpl"
+            || self.tags.as_ref().is_some_and(|tags| tags.nodot(name))
         {
             return None;
         }
@@ -1607,6 +1762,9 @@ impl<'a> Printer<'a> {
                     && !self.is_prop(binder_type));
             if !dependent && *binder_info == BinderInfo::Default {
                 break self.pi(current, ARROW_PREC);
+            }
+            if internal_name(name) {
+                break Err(INTERNAL_BINDER);
             }
             let type_doc = self.doc(binder_type, 0)?;
             let type_text = flat(&type_doc);

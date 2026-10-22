@@ -14,18 +14,7 @@ use fln_elab::reducibility::{Reducibility, ReducibilityTable};
 /// binders are named `_fln_…` or by a number; a recursor is one too in a definition's value
 /// (`recursors`), while a theorem's proof may reach it as the pin's would, by `induction`.
 fn compiled_artifact(env: &Environment, value: &Expr, recursors: bool) -> bool {
-    // The first component decides: a hygienic `x._@.M._hyg.4` is the user's `x`.
-    fn internal(name: &Name) -> bool {
-        let mut first = name.clone();
-        while !first.parent().is_anonymous() {
-            first = first.parent();
-        }
-        match first.leaf_view() {
-            LeafView::Str(text) => text.starts_with("_fln"),
-            LeafView::Num(_) => true,
-            LeafView::Anonymous => false,
-        }
-    }
+    let internal = internal_name;
     let mut pending = vec![value];
     while let Some(expr) = pending.pop() {
         match expr.node() {
