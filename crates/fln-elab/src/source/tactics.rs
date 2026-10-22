@@ -743,9 +743,16 @@ impl Context {
         for local in goal.introduced.into_iter().rev() {
             self.tick()?;
             let domain = self.instantiate(&local.type_)?;
-            value = value
+            let abstracted = value
                 .abstract_fvar(&local.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
+            if local.value.is_some()
+                && !abstracted.has_loose_bvar(0)
+                && self.discarded_lets.contains(&local.id)
+            {
+                continue;
+            }
+            value = abstracted;
             value = if let Some(local_value) = local.value {
                 Expr::let_e(
                     local.user_name,

@@ -530,6 +530,10 @@ struct Context {
     inspection: Option<inspect::Probe>,
     traces: trace::TraceLog,
     goal_tags: std::collections::HashMap<MVarId, Name>,
+    // Rewritten hypotheses: the pin asserts each and applies the new goal to its proof, which
+    // `instantiateMVars` beta-reduces away when nothing reads it, so such a binding nothing
+    // reads leaves the term (and with it every use of the hypothesis it rewrote).
+    discarded_lets: std::collections::HashSet<FVarId>,
     trace_local_names: std::collections::HashMap<FVarId, Name>,
     // Elimination fields no alternative named: the pin's inaccessible `n✝`, which
     // `rename_i`/`next`/`case` may name. Other anonymous locals are this engine's own.
@@ -674,6 +678,7 @@ impl Context {
             inspection: None,
             traces: trace::TraceLog::default(),
             goal_tags: std::collections::HashMap::new(),
+            discarded_lets: std::collections::HashSet::new(),
             trace_local_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,

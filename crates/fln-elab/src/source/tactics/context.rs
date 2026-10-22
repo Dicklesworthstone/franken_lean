@@ -319,7 +319,7 @@ impl Context {
     /// Why `removed` cannot leave the goal. `MVarId.clear` (vendored
     /// src/Lean/Meta/Tactic/Clear.lean), applied to the latest local first, refuses one that
     /// a remaining local reads (the first in context order) or that the target reads.
-    fn clear_blocker(
+    pub(super) fn clear_blocker(
         &mut self,
         goal: &ProofGoal,
         removed: &HashSet<FVarId>,
@@ -365,6 +365,43 @@ impl Context {
         goal: ProofGoal,
         removed: &HashSet<FVarId>,
     ) -> Result<(), NatDefinitionElabError> {
+        let child = self.cleared_proof_goal(proof, goal, removed)?;
+        proof.work.push(Work::Goal(child));
+        Ok(())
+    }
+
+    /// The pin's `tryClearMany`: of `candidates`, those nothing else in the goal reads leave
+    /// it, the latest first. The goal that remains closes `goal`; it is returned unchanged
+    /// when none can leave.
+    pub(super) fn try_clear_proof_locals(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        candidates: &[FVarId],
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        let mut removed = HashSet::new();
+        for candidate in candidates.iter().rev() {
+            self.tick()?;
+            let mut trial = removed.clone();
+            trial.insert(candidate.clone());
+            if self.clear_blocker(&goal, &trial)?.is_none() {
+                removed = trial;
+            }
+        }
+        if removed.is_empty() {
+            return Ok(goal);
+        }
+        self.cleared_proof_goal(proof, goal, &removed)
+    }
+
+    /// `goal` without `removed`, as a fresh goal that closes it; `removed` must be clearable
+    /// ([`Self::clear_blocker`]).
+    pub(super) fn cleared_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        removed: &HashSet<FVarId>,
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
         let mut retained = LocalContext::new();
         for local in goal.lctx.decls() {
             self.tick()?;
@@ -377,8 +414,7 @@ impl Context {
         let (value, child) = self.proof_goal(target)?;
         self.inherit_goal_tag(&goal, &child);
         proof.work.push(Work::Close(goal, value));
-        proof.work.push(Work::Goal(child));
-        Ok(())
+        Ok(child)
     }
 
     fn inherit_goal_tag(&mut self, parent: &ProofGoal, child: &ProofGoal) {

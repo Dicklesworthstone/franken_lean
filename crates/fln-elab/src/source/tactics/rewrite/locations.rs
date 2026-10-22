@@ -297,6 +297,9 @@ impl Context {
         }
         self.txn.lctx = context.clone();
         let (child, next) = self.proof_goal(target)?;
+        // The pin asserts the rewritten hypothesis and applies the new goal to its proof, which
+        // `instantiateMVars` beta-reduces away when nothing reads it; so does this binding.
+        self.discarded_lets.insert(id.clone());
         // Delay abstraction until the child and all rule premises are solved.
         // The parent retains the old variable needed by the transport's RHS.
         parent.introduced.push(binding);

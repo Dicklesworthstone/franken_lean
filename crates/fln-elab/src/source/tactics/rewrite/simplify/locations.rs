@@ -162,9 +162,14 @@ impl Context {
         }
         let mut goal = initial.clone();
         let mut steps = 0;
+        // `simp_all` hypotheses it reduced to `True` and cleared, never asserted again.
+        let mut cleared = HashSet::new();
         loop {
             let previous_steps = steps;
             for (name, history) in locations.hypotheses.iter().zip(&mut histories) {
+                if cleared.contains(name) {
+                    continue;
+                }
                 self.txn.lctx = goal.lctx.clone();
                 let local = goal
                     .lctx
@@ -213,6 +218,21 @@ impl Context {
                             }
                         }
                         history.push(target);
+                        // `SimpAll.main` asserts no hypothesis that became `True`: it leaves
+                        // the goal, and its rewriting proof never enters the term.
+                        let removed = HashSet::from([local.id.clone()]);
+                        if saturate
+                            && is_true(&self.instantiate(&replacement.type_)?)
+                            && self.clear_blocker(&goal, &removed)?.is_none()
+                        {
+                            rules.retain(
+                                |rule| !matches!(rule, SimpRule::Local(id) if id == &local.id),
+                            );
+                            goal = self.cleared_proof_goal(proof, goal, &removed)?;
+                            cleared.insert(name.clone());
+                            steps += 1;
+                            break;
+                        }
                         let (next, parent, value) =
                             self.replace_rewritten_hypothesis(goal, &local, replacement)?;
                         let replacement_id = next
@@ -258,6 +278,41 @@ impl Context {
                 break;
             }
         }
+        if saturate {
+            // `simp_all` keeps no hypothesis left as `True` (`SimpAll.main`'s `tryClearMany`),
+            // one it was given as `True` included, while `simp at h` does.
+            let mut trivial = Vec::new();
+            for name in &locations.hypotheses {
+                self.tick()?;
+                if cleared.contains(name) {
+                    continue;
+                }
+                let Some(local) = goal.lctx.find_by_user_name(name) else {
+                    continue;
+                };
+                if is_true(&self.instantiate(&local.type_)?) {
+                    trivial.push(local.id.clone());
+                }
+            }
+            if !trivial.is_empty() {
+                let before: HashSet<_> = goal
+                    .lctx
+                    .decls()
+                    .iter()
+                    .map(|local| local.id.clone())
+                    .collect();
+                goal = self.try_clear_proof_locals(proof, goal, &trivial)?;
+                let after: HashSet<_> = goal
+                    .lctx
+                    .decls()
+                    .iter()
+                    .map(|local| local.id.clone())
+                    .collect();
+                rules.retain(|rule| {
+                    !matches!(rule, SimpRule::Local(id) if before.contains(id) && !after.contains(id))
+                });
+            }
+        }
         if locations.target {
             return self.simplify_goal_with_rules(proof, goal, &rules, steps, None);
         }
@@ -267,4 +322,9 @@ impl Context {
         proof.work.push(Work::Goal(goal));
         Ok(())
     }
+}
+
+fn is_true(type_: &Expr) -> bool {
+    matches!(type_.node(), ExprNode::Const { name, levels }
+        if levels.is_empty() && *name == Name::from_components(["True"]))
 }

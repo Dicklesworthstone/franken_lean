@@ -218,8 +218,19 @@ fn workspace() -> PathBuf {
 
 /// The stdout of this crate's `lean` and of the pinned `lean` on `HEADER` + `program`.
 fn outputs(lib: &Path, root: &Path, name: &str, program: &str) -> (String, String) {
+    outputs_under(lib, root, name, HEADER, program)
+}
+
+/// [`outputs`] under another `header`.
+fn outputs_under(
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    header: &str,
+    program: &str,
+) -> (String, String) {
     let entry = format!("{name}.lean");
-    std::fs::write(root.join(&entry), format!("{HEADER}{program}")).unwrap();
+    std::fs::write(root.join(&entry), format!("{header}{program}")).unwrap();
     let run = |binary: &Path| {
         let output = Command::new(binary)
             .arg(&entry)
@@ -296,4 +307,46 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
             );
         }
     }
+}
+
+/// `simp_all` keeps no hypothesis it leaves as `True` (`SimpAll.main`), so its goal shows
+/// none, and a parameter that reached `True` is unused: its rewriting proof never enters
+/// the term. A hypothesis given as `True` is dropped too. A hypothesis `rw … at h` rewrote
+/// and nothing then reads leaves no proof either (the pin's asserted goal applied to it is
+/// beta-reduced away), so neither it nor the equation is used.
+#[test]
+fn simp_all_drops_true_hypotheses_and_their_proofs_as_the_pin_does() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "axiom q : Nat → Prop
+axiom p : Nat → Prop
+axiom q_eq_p : q = p
+example (h₁ : ¬ q 0) (h₂ : ¬ q 0) : ¬ p 0 := by
+  simp_all
+  trace_state
+  rw [← q_eq_p]
+  assumption
+example (a : Nat) (h₀ : True) (h₁ : a = 1) : a = 1 := by
+  simp_all
+example (a b : Nat) (h : a = b) (e : b = a) (p : Prop) (hp : p) : p := by
+  rw [e] at h
+  trace_state
+  exact hp
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "simp_all_true",
+        "prelude\nimport Init.SimpLemmas\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        4,
+        "{ours}"
+    );
+    assert!(ours.contains("h₂ : ¬q 0\n⊢ ¬p 0\n"), "{ours}");
 }
