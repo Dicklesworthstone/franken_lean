@@ -265,6 +265,7 @@ impl Preparation<'_> {
             major,
             branches,
             result,
+            boxed_result: false,
         }))
     }
 }

@@ -55,6 +55,92 @@ fn equality_transport_requires_every_canonical_family_object() {
 }
 
 #[test]
+fn type_index_result_refinement_requires_its_relation_and_complete_heq_family() {
+    let sort = Expr::sort(Level::one());
+    let string = Expr::const_(name("String"), vec![]);
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let callback = Expr::forall_e(Name::anonymous(), nat.clone(), nat, BinderInfo::Default);
+    let motive = |index_domain: Expr, endpoint: Expr, result: Expr| {
+        let equality = application(
+            Expr::const_(name("HEq"), vec![Level::succ(Level::one()).unwrap()]),
+            [sort.clone(), endpoint, sort.clone(), Expr::bvar(1).unwrap()],
+        );
+        Expr::lam(
+            name("index"),
+            index_domain,
+            Expr::lam(
+                name("major"),
+                proofs::erased_type(),
+                Expr::forall_e(name("proof"), equality, result, BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    for mutation in 0..7 {
+        let Declaration::Inductive(mut block) = fln_elab::seed::heq_seed_declaration() else {
+            panic!("heterogeneous equality block");
+        };
+        match mutation {
+            0 => {}
+            1 => block.types[0].num_indices += 1,
+            2 => block.ctors[0].num_fields += 1,
+            3 => block.recursors[0].rules[0].rhs = nat::literal(0),
+            4 => block.recursors[0].k = !block.recursors[0].k,
+            5 => block.recursors[0].base.type_ = Expr::sort(Level::zero()),
+            _ => block.types[0].is_unsafe = true,
+        }
+        let mut environment = Environment::new();
+        for value in block.types {
+            environment = environment.add_decl(ConstantInfo::Induct(value)).unwrap();
+        }
+        for value in block.ctors {
+            environment = environment.add_decl(ConstantInfo::Ctor(value)).unwrap();
+        }
+        for value in block.recursors {
+            environment = environment.add_decl(ConstantInfo::Rec(value)).unwrap();
+        }
+        let mut prep = Preparation::new(&environment, IngressLimits::default());
+        let scalar = motive(sort.clone(), string.clone(), string.clone());
+        if mutation == 0 {
+            assert_eq!(prep.refined_index_motive(&scalar, 1).unwrap(), Some(1));
+            assert_eq!(
+                prep.refined_index_motive(
+                    &motive(sort.clone(), callback.clone(), callback.clone()),
+                    1
+                )
+                .unwrap(),
+                Some(1)
+            );
+            for other in [
+                motive(proofs::erased_type(), string.clone(), string.clone()),
+                motive(sort.clone(), string.clone(), callback.clone()),
+                motive(sort.clone(), string.clone(), Expr::bvar(0).unwrap()),
+            ] {
+                assert_eq!(prep.refined_index_motive(&other, 1).unwrap(), None);
+            }
+            let mut bounded = Preparation::new(
+                &environment,
+                IngressLimits {
+                    max_nodes: 1,
+                    ..IngressLimits::default()
+                },
+            );
+            assert!(matches!(
+                bounded.refined_index_motive(&scalar, 1),
+                Err(IngressError::ResourceLimit { .. })
+            ));
+        } else {
+            assert!(
+                prep.refined_index_motive(&scalar, 1).is_err(),
+                "mutation {mutation}"
+            );
+            assert!(!prep.heterogeneous_equality_family_checked);
+        }
+    }
+}
+
+#[test]
 fn equal_machine_categories_do_not_authorize_a_representation_changing_cast() {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let engine = Engine::with_source_seed(limits)
@@ -227,5 +313,41 @@ fn boxed_type_refinements_keep_the_payload_interface_and_typed_result_boundary()
             )
             .is_err(),
         "a private name alone is not permission to box a value"
+    );
+}
+
+#[test]
+fn boxed_result_refinements_keep_argument_and_dependency_boundaries() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let mut prep = Preparation::new(&engine.environment, IngressLimits::default());
+    let boxed = prep.enable_boxed_type().unwrap();
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let bool_ = Expr::const_(name("Bool"), vec![]);
+    let pi = |domain, body| Expr::forall_e(Name::anonymous(), domain, body, BinderInfo::Default);
+    let source = pi(bool_.clone(), boxed.clone());
+    for target in [
+        pi(bool_.clone(), nat.clone()),
+        pi(bool_.clone(), pi(nat.clone(), nat.clone())),
+    ] {
+        assert!(prep.boxed_result_refinement(&source, &target).unwrap());
+        assert!(prep.boxed_result_refinement(&target, &source).unwrap());
+    }
+    for target in [
+        pi(nat.clone(), nat.clone()),
+        pi(bool_.clone(), Expr::bvar(0).unwrap()),
+    ] {
+        assert!(!prep.boxed_result_refinement(&source, &target).unwrap());
+        assert!(!prep.boxed_result_refinement(&target, &source).unwrap());
+    }
+    let list = |element| Expr::app(Expr::const_(name("List"), vec![Level::zero()]), element);
+    assert!(
+        !prep
+            .boxed_result_refinement(&pi(bool_.clone(), list(boxed)), &pi(bool_, list(nat)))
+            .unwrap(),
+        "a computed container result is outside the direct boxed-result bridge"
     );
 }

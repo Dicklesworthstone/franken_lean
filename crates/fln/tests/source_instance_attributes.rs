@@ -167,14 +167,13 @@ fn global_instance_attributes_survive_scope_and_source_file_boundaries() {
 }
 
 #[test]
-fn unsupported_scoped_erasure_and_inline_forms_are_not_silent_noops() {
+fn instance_updates_apply_and_invalid_attribute_forms_are_atomic() {
     let base = checked(&engine(), "def seven : Inhabited Nat := Inhabited.mk 7");
     let before = base.logical_root(&KVMap::new());
     for source in [
-        "attribute [-instance] instInhabitedNat",
         "attribute [scoped instance] seven",
-        "attribute [instance high] seven",
-        "@[instance] def unsupported : Inhabited Nat := Inhabited.mk 7",
+        "attribute [instance \"high\"] seven",
+        "@[instance] def unsupported : Nat := 7",
     ] {
         assert!(
             base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
@@ -183,9 +182,66 @@ fn unsupported_scoped_erasure_and_inline_forms_are_not_silent_noops() {
         );
         assert_eq!(before, base.logical_root(&KVMap::new()));
     }
+    let erased = checked(&base, "attribute [-instance] instInhabitedNat");
+    // Erasure changes lexical availability, not persistent registrations.
+    assert_eq!(before, erased.logical_root(&KVMap::new()));
+    let error = base
+        .check_source_files(
+            &[b"attribute [-instance] instInhabitedNat\ndef cannotSynthesize : Nat := default"],
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("the dictionary is unavailable inside the erasure's scope");
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
+    checked(
+        &base,
+        "attribute [-instance] instInhabitedNat\nattribute [instance high] seven\ntheorem recovered : default = 7 := by rfl",
+    );
+    checked(
+        &base,
+        "@[instance] def nine : Inhabited Nat := Inhabited.mk 9\ntheorem inlineSelected : default = 9 := by rfl",
+    );
+    checked(&base, "theorem original : default = 0 := by rfl");
+    assert_eq!(before, base.logical_root(&KVMap::new()));
     // A local instance attribute selects `seven` for its scope and writes nothing persistent.
     let local = checked(&base, "attribute [local instance] seven");
     assert_eq!(before, local.logical_root(&KVMap::new()));
+}
+
+#[test]
+fn inline_instances_preserve_priorities_and_declaration_reducibility() {
+    let next = checked(
+        &engine(),
+        "@[instance 2000] def seven : Inhabited Nat := Inhabited.mk 7\n\
+         @[instance 1000] def nine : Inhabited Nat := Inhabited.mk 9\n\
+         @[instance low] abbrev one : Inhabited Nat := Inhabited.mk 1\n\
+         theorem selected : (default : Nat) = 7 := by rfl",
+    );
+    let statuses = fln_elab::reducibility::table(next.environment()).unwrap();
+    assert_eq!(
+        statuses.status(&n("seven")),
+        fln_elab::reducibility::Reducibility::Semireducible
+    );
+    assert_eq!(
+        statuses.status(&n("nine")),
+        fln_elab::reducibility::Reducibility::Semireducible
+    );
+    assert_eq!(
+        statuses.status(&n("one")),
+        fln_elab::reducibility::Reducibility::Reducible
+    );
+    let registry = InstanceRegistry::read(next.environment()).unwrap();
+    let priority = |name| {
+        registry
+            .candidates(&n("Inhabited"))
+            .iter()
+            .find(|entry| entry.declaration == n(name))
+            .unwrap()
+            .priority
+    };
+    assert_eq!(priority("seven"), 2000);
+    assert_eq!(priority("nine"), 1000);
+    assert_eq!(priority("one"), 100);
 }
 
 #[test]

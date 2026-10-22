@@ -250,7 +250,7 @@ pub(super) fn is_local(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> 
 
 pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
     let Some(parts) = command_parts(syntax)? else {
-        return Ok(None);
+        return inline_registration(syntax);
     };
     // An anonymous instance is registered under the name its elaboration generates;
     // the caller takes it from the elaborated declaration.
@@ -271,6 +271,105 @@ pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDe
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
     Ok(Some((val.clone(), parts.priority)))
+}
+
+/// Inline global instances use the same checked registry as instance commands,
+/// while retaining the ordinary declaration's reducibility.
+pub(super) fn attribute_priority(
+    attribute: &Syntax,
+) -> Result<Option<u32>, NatDefinitionElabError> {
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    if instance[1].kind() != Some(&parser_kind(&["Attr", "instance"])) {
+        return Ok(None);
+    }
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "instance attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global inline instance attribute")?;
+    let parts = expect_node(
+        &instance[1],
+        &parser_kind(&["Attr", "instance"]),
+        2,
+        "instance attribute",
+    )?;
+    expect_atom(&parts[0], "instance", "instance attribute keyword")?;
+    Ok(Some(
+        match expect_null_args(&parts[1], "instance priority")? {
+            [] => 1000,
+            [priority] => scope::simp::priority_value(priority)?,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "one inline instance priority",
+                });
+            }
+        },
+    ))
+}
+
+pub(super) fn inline_registration(
+    syntax: &Syntax,
+) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    let mut priority = None;
+    for attribute in scope::visibility::attributes(&modifiers[1])? {
+        if let Some(next) = attribute_priority(attribute)?
+            && priority.replace(next).is_some()
+        {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "one inline instance attribute",
+            });
+        }
+    }
+    let Some(priority) = priority else {
+        return Ok(None);
+    };
+    if !["definition", "abbrev", "theorem"]
+        .iter()
+        .any(|kind| declaration[1].kind() == Some(&parser_kind(&["Command", kind])))
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "an inline instance on a named definition, abbreviation or theorem",
+        });
+    }
+    let Syntax::Node { args, .. } = &declaration[1] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    let id = expect_node(
+        args.get(1)
+            .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "named inline instance declaration",
+            })?,
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration identifier",
+    )?;
+    level_syntax::explicit_parameters(&id[1])?;
+    let Syntax::Ident { val, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    if val.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    }
+    Ok(Some((val.clone(), priority)))
 }
 
 pub(super) fn default_attribute(attribute: &Syntax) -> Result<Option<u32>, NatDefinitionElabError> {

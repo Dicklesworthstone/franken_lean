@@ -1225,6 +1225,15 @@ fn local_line_break(
     if at <= from || at >= tokens.len() || from >= tokens.len() {
         return false;
     }
+    // A lambda/branch arrow or block introducer still owes its first body
+    // token. Its inline column cannot turn that token into the enclosing
+    // let's continuation (`let rec f := fun x =>\n  match x with …`).
+    if ["=>", "↦", "by", "do", "then", "else", ":="]
+        .iter()
+        .any(|word| term_locals::word(tokens, at - 1, word))
+    {
+        return false;
+    }
     if matches!(&tokens[at].kind, TokenKind::Symbol(s) if matches!(crate::canonical_bracket(s.as_str()), "|" | "then" | "else" | ";" | ")" | "}" | "]" | "⦄" | "⟩"))
     {
         return false;

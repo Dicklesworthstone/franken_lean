@@ -220,10 +220,15 @@ impl Preparation<'_> {
             }
             let constructor_name = if specialized {
                 Name::num(layout_name.clone(), index as u64)
+            } else if type_fields.iter().any(|field| *field) {
+                // An erased Type slot may later be a let-bound inert value.
+                // Keep this final runtime constructor distinct from its source
+                // telescope so a second visit cannot reinterpret that slot.
+                Name::str(ctor.base.name.clone(), "_fln_runtime_erased")
             } else {
                 ctor.base.name.clone()
             };
-            if specialized && self.environment.contains(&constructor_name) {
+            if constructor_name != ctor.base.name && self.environment.contains(&constructor_name) {
                 return Err(unsupported("runtime data constructor collision"));
             }
             reserve(&mut constructors, self.limits.fir.max_constructors)?;
@@ -694,8 +699,8 @@ impl Preparation<'_> {
             return Ok(None);
         };
         let parameters = ctor.num_params as usize;
-        // A nonparametric constructor keeps its own name. It is rewritten only
-        // to erase a type-valued field argument that is still present.
+        // Nonparametric constructors need visiting only when fields are
+        // supplied. A constructor with Type fields gets a final private name.
         let specialized = parameters != 0 || !levels.is_empty();
         if !specialized && args.is_empty() || args.len() < parameters {
             return Ok(None);
@@ -736,7 +741,7 @@ impl Preparation<'_> {
         } else {
             None
         };
-        let mut rewritten = specialized;
+        let mut rewritten = specialized || binding.name != *name;
         let mut value = Expr::const_(binding.name.clone(), vec![]);
         for (index, field) in args[parameters..].iter().enumerate() {
             self.tick()?;
@@ -1196,10 +1201,17 @@ mod type_field_tests {
     }
 
     fn fields<'p>(prep: &'p Preparation<'_>, constructor: &str) -> &'p [ValueType] {
+        let runtime_name = &prep
+            .data_shapes
+            .values()
+            .flat_map(|shape| &shape.constructors)
+            .find(|binding| binding.original == name(constructor))
+            .expect("source constructor layout")
+            .name;
         &prep
             .constructors
             .iter()
-            .find(|binding| binding.name == name(constructor))
+            .find(|binding| &binding.name == runtime_name)
             .expect("constructor binding")
             .fields
     }
@@ -1294,18 +1306,36 @@ mod type_field_tests {
             .specialize_constructor(&mk, &[family("Nat"), nat::literal(7)])
             .unwrap()
             .expect("the type argument is erased");
+        let runtime_mk = Expr::const_(
+            prep.record_shape(&family("Package"))
+                .unwrap()
+                .unwrap()
+                .constructors[0]
+                .name
+                .clone(),
+            vec![],
+        );
         assert_eq!(
             rewritten,
             Expr::app(
-                Expr::app(mk.clone(), proofs::erased_value()),
+                Expr::app(runtime_mk.clone(), proofs::erased_value()),
                 nat::literal(7)
             )
         );
         // An erased application is final, so expression preparation cannot loop.
         assert!(
-            prep.specialize_constructor(&mk, &[proofs::erased_value(), nat::literal(7)])
+            prep.specialize_constructor(&runtime_mk, &[proofs::erased_value(), nat::literal(7)])
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            prep.specialize_constructor(
+                &runtime_mk,
+                &[Expr::bvar(1).unwrap(), Expr::bvar(0).unwrap()],
+            )
+            .unwrap()
+            .is_none(),
+            "let-bound inert slots are final too"
         );
         // A nonparametric constructor without a type field keeps its own path.
         assert!(

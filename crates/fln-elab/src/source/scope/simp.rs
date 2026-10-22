@@ -190,13 +190,16 @@ pub fn reducibility(
             requested.push(status);
         }
     }
-    if requested.is_empty() {
+    let inline_instance = instance_command::inline_registration(syntax)?.is_some();
+    if requested.is_empty() && !inline_instance {
         return Ok(None);
     }
     let mut status = if declaration[1].kind() == Some(&parser_kind(&["Command", "definition"])) {
         Reducibility::Semireducible
     } else if declaration[1].kind() == Some(&parser_kind(&["Command", "abbrev"])) {
         Reducibility::Reducible
+    } else if requested.is_empty() {
+        return Ok(None);
     } else {
         return Err(refuse("a reducibility attribute on a `def` or an `abbrev`"));
     };
@@ -261,11 +264,13 @@ pub fn registration(
         "declaration modifiers",
     )?;
     instance_command::default_registration(syntax)?;
+    instance_command::inline_registration(syntax)?;
     let mut simp = None;
     let mut inlining = false;
     for attribute in super::visibility::attributes(&modifiers[1])? {
         if super::visibility::exposure_attribute(attribute)?.is_some()
             || instance_command::default_attribute(attribute)?.is_some()
+            || instance_command::attribute_priority(attribute)?.is_some()
         {
             continue;
         }

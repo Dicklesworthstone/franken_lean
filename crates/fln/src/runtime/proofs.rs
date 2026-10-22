@@ -300,6 +300,17 @@ impl Preparation<'_> {
                                 },
                                 _ => 0,
                             };
+                            let recursor = match head.node() {
+                                ExprNode::Const { name, .. } => match self.environment.find(name) {
+                                    Some(ConstantInfo::Rec(rec)) => Some((
+                                        rec.num_params as usize,
+                                        rec.num_motives as usize,
+                                        rec.num_indices as usize,
+                                    )),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
                             let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
@@ -362,7 +373,13 @@ impl Preparation<'_> {
                                     // Type-valued motives still use their original
                                     // context to erase returned proof dependencies.
                                     Frame::Keep(
-                                        if arg.has_loose_bvars()
+                                        if let Some((params, motives, indices)) = recursor
+                                            && (params..params.saturating_add(motives))
+                                                .contains(&index)
+                                            && self.refined_index_motive(arg, indices)?.is_some()
+                                        {
+                                            self.erase_hidden_types(arg, &context)?
+                                        } else if arg.has_loose_bvars()
                                             && !static_sort.as_ref().is_some_and(Level::is_zero)
                                         {
                                             self.erase_type_argument(arg, &context)?

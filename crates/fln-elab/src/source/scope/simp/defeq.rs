@@ -15,27 +15,27 @@ use std::collections::BTreeSet;
 
 const MAGIC: &[u8] = b"FLNDSIMP\x01";
 // The pinned `Init` alone tags 1,559 theorems; `Std` and `Lean` add more.
-const MAX_ROWS: usize = 1 << 16;
+/// Maximum number of validated native reflexivity tags.
+pub const MAX_ROWS: usize = 1 << 16;
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
 
-/// The journal's extension name, for a refusal that names it.
+/// Native reflexivity journal name, for artifact export and typed refusals.
 pub fn journal_name() -> Name {
-    descriptor().name
-}
-
-/// Whether `candidate` is this journal's, which a module's `.olean` carries: its
-/// own tags become the pin's `Lean.defeqAttr` (and `backward_defeq`) entries.
-pub fn supports(candidate: &ExtensionDescriptor) -> bool {
-    *candidate == descriptor()
+    Name::from_components(["FrankenLean", "sourceDefEq", "v1"])
 }
 
 fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
-        name: Name::from_components(["FrankenLean", "sourceDefEq", "v1"]),
+        name: journal_name(),
         merge: MergeSemantics::AppendOrdered,
         checkpoint: CheckpointSemantics::FullJournal,
         provenance: PayloadProvenance::Understood,
     }
+}
+
+/// Exact journal whose validated tags the pinned-format writer can serialize.
+pub fn supports(candidate: &ExtensionDescriptor) -> bool {
+    *candidate == descriptor()
 }
 fn malformed() -> NatDefinitionElabError {
     failure(SourceInferenceError::SimpSet(
@@ -93,7 +93,7 @@ pub fn direct_rfl(syntax: &Syntax) -> bool {
             && args.iter().all(|arg| expect_empty_null(arg, "no termination hint").is_ok()))
 }
 
-/// Read once per tactic; charge bounded name-decoding work before retaining it.
+/// Read validated tags; charge bounded name-decoding work before retaining it.
 /// Corrupt, oversized or dangling metadata is an error, never an empty rule set.
 pub fn read(
     environment: &Environment,

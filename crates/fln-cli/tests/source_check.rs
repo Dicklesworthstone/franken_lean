@@ -1188,7 +1188,13 @@ fn failed_generic_collection_proofs_do_not_publish_a_multi_file_prefix() {
 
 #[test]
 fn installed_binary_checks_indexed_declarations_and_refuses_wrong_lengths() {
-    let prefix = file(include_str!("../../../examples/native_indexed.lean"));
+    // The original example deliberately retains the pin's postponed-family
+    // refusal in reference_differential.tsv. This positive control fixes P.
+    let source = include_str!("../../../examples/native_indexed.lean").replace(
+        "Witness.intro 7 true",
+        "Witness.intro (P := fun _ => Bool) 7 true",
+    );
+    let prefix = file(&source);
     let bad = file("def wrong : Vec Nat 0 := two");
     for success in [true, false, true] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
@@ -1399,10 +1405,30 @@ fn installed_binary_refuses_hidden_match_hypotheses_and_checks_real_assumptions(
 
 #[test]
 fn installed_binary_checks_dependent_index_recursion_and_retains_failure_isolation() {
-    let prefix = file(include_str!(
-        "../../../examples/native_dependent_indices.lean"
-    ));
-    let bad = file("theorem bad : depth 2 false trace = 0 := by rfl");
+    // Keep the original negative example/ledger unchanged. Each call in this
+    // positive variant states the family before checking its indexed value.
+    let source = include_str!("../../../examples/native_dependent_indices.lean")
+        .replace("Trace.step 1 2", "Trace.step (P := fun _ => Bool) 1 2")
+        .replace(
+            "Trace.stop 1 true",
+            "Trace.stop (P := fun _ => Bool) 1 true",
+        )
+        .replace(
+            "rebuild 2 false trace",
+            "rebuild (P := fun _ => Bool) 2 false trace",
+        )
+        .replace(
+            "copyTrace 2 false trace",
+            "copyTrace (P := fun _ => Bool) 2 false trace",
+        )
+        .replace(
+            "depth 2 false trace",
+            "depth (P := fun _ => Bool) 2 false trace",
+        );
+    let prefix = file(&source);
+    // Fix the family before testing the false equality, so the pin reaches
+    // the intended `rfl` refusal rather than an underconstrained argument.
+    let bad = file("theorem bad : depth (P := fun _ => Bool) 2 false trace = 0 := by rfl");
     for success in [true, false, true] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
         command.args(["check-source", "--json"]).arg(&prefix);

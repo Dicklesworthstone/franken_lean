@@ -175,9 +175,84 @@ fn trace_state_and_trace_message_match_pinned_lean_cases() {
         )
     );
 
+    // The following two cases need the sorry/Unit prelude and the default
+    // `ne_eq` simp rule, which the bounded source seed deliberately omits.
+    // Admit that support through the ordinary
+    // source/checker path; warnings and traces still come from real commands.
+    let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(2 * 1024 * 1024));
+    let sorry_engine = fln::Engine::with_source_seed(admission)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[b"abbrev Unit : Type := PUnit.{1}\n\
+                @[simp] theorem ne_eq.{u} {A : Sort u} (a b : A) : (Ne a b) = Not (a = b) := rfl\n\
+                inductive Lean.Name where\n\
+                  | anonymous\n\
+                  | str (pre : Lean.Name) (value : String)\n\
+                  | num (pre : Lean.Name) (value : Nat)\n\
+                axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A"],
+            &fln::KVMap::new(),
+            fln::SourceCheckLimits::new(admission),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let unbound_axiom = sorry_engine
+        .execute_source_commands_with_checks(
+            b"example : Unit := sorry",
+            &fln::KVMap::new(),
+            fln::EngineExecutionLimits::new(admission.kernel),
+        )
+        .expect_err("a data-valued axiom without an executable binding remains noncomputable");
+    assert!(
+        format!("{unbound_axiom:?}").contains("NoncomputableDependency"),
+        "{unbound_axiom:?}"
+    );
+    // Init.Prelude gives this admitted axiom @[extern "lean_sorry"]. Supply
+    // that real metadata through the same journal used by imported attributes.
+    let sorry_engine = fln::Engine::from_environment(
+        fln_elab::externs::register(
+            sorry_engine.environment(),
+            &fln::Name::from_components(["sorryAx"]),
+            vec![fln_elab::externs::ExternEntry::Standard {
+                backend: fln::Name::from_components(["all"]),
+                symbol: "lean_sorry".to_owned(),
+            }],
+        )
+        .unwrap(),
+    );
+    let unavailable_macro = sorry_engine
+        .execute_source_commands_with_checks(
+            b"example : Unit := by sorry",
+            &fln::KVMap::new(),
+            fln::EngineExecutionLimits::new(admission.kernel),
+        )
+        .expect_err("the bounded prelude does not import Init.Tactics's sorry macro");
+    assert!(
+        format!("{unavailable_macro:?}").contains("tacticSorry"),
+        "{unavailable_macro:?}"
+    );
+    let execute_sorry = |source: &str| {
+        // Init.Tactics expands `sorry` to `exact sorry`. Exercise that term
+        // expansion here; source_imported_execution covers the imported macro.
+        // Declaration positions precede the expansion and stay unchanged.
+        let source = source.replace("\n  sorry\n", "\n  exact sorry\n");
+        sorry_engine
+            .execute_source_commands_with_checks(
+                source.as_bytes(),
+                &fln::KVMap::new(),
+                fln::EngineExecutionLimits::new(admission.kernel),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+
     // 3. 1027.lean: `simp_all` followed by `trace_state` and `sorry`.
     let case_1027 = "example (h : x ≠ 0) : Unit := by\n  simp_all\n  trace_state\n  sorry\n";
-    let completed = execute(case_1027).unwrap();
+    let completed = execute_sorry(case_1027);
     let output = render_lean_source_commands(
         &completed,
         WarningSink::Print {
@@ -199,7 +274,7 @@ fn trace_state_and_trace_message_match_pinned_lean_cases() {
         "  trace_state\n",
         "  sorry\n",
     );
-    let completed = execute(case_1235).unwrap();
+    let completed = execute_sorry(case_1235);
     let output = render_lean_source_commands(
         &completed,
         WarningSink::Print {

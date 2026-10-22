@@ -233,18 +233,39 @@ end
     let defs = format!(
         "{source}def total (n : Nat) (t : Tree n) : Nat := @Tree.rec {motives} {minors} n t\ndef ignore (n : Nat) (t : Tree n) : Nat := match t with | .leaf k value => value | .node k child => 42\n"
     );
+    let unused_minors = "(fun (n : Nat) (value : Nat) => value) (fun (n : Nat) (child : Forest (work n)) (ih : Nat) => 42) (fun (n : Nat) (value : Nat) => value) (fun (n : Nat) (child : Tree (work n)) (ih : Nat) => 42)";
+    let repeated_minors = "(fun (n : Nat) (value : Nat) => value) (fun (n : Nat) (child : Forest (work n)) (ih : Nat) => ih + ih) (fun (n : Nat) (value : Nat) => value) (fun (n : Nat) (child : Tree (work n)) (ih : Nat) => ih + ih)";
     let mut used = Vec::new();
     let mut ignored = Vec::new();
+    let mut unused = Vec::new();
+    let mut repeated = Vec::new();
+    let mut direct = Vec::new();
     for n in [0, 60] {
         let value = format!("Tree.node {n} (Forest.leaf (work {n}) 42)");
         used.push(run(&format!("{defs}#eval total {n} ({value})"), "42"));
         ignored.push(run(&format!("{defs}#eval ignore {n} ({value})"), "42"));
+        unused.push(run(
+            &format!("{source}def unused (n : Nat) (t : Tree n) : Nat := @Tree.rec {motives} {unused_minors} n t\n#eval unused {n} ({value})"),
+            "42",
+        ));
+        repeated.push(run(
+            &format!("{source}def repeated (n : Nat) (t : Tree n) : Nat := @Tree.rec {motives} {repeated_minors} n t\n#eval repeated {n} ({value})"),
+            "84",
+        ));
+        direct.push(run(
+            &format!("{source}#eval let index : Nat := work {n}; 42"),
+            "42",
+        ));
     }
-    // Constructor evaluation computes its index once in either program.
-    // Only the used hypothesis also computes the recovered peer-call index.
-    // Fixed dispatch costs cancel, detecting dropped or duplicated work.
-    assert!(ignored[1] > ignored[0]);
-    assert_eq!(used[1] - used[0], 2 * (ignored[1] - ignored[0]));
+    // Calibrate one strict index computation rather than assuming the source
+    // match is an unused-IH recursor: its generated matcher also computes the
+    // child index. Keep that match as a separate strictness control.
+    assert!(direct[1] > direct[0]);
+    let index_work = direct[1] - direct[0];
+    assert_eq!(unused[1] - unused[0], index_work);
+    assert_eq!(used[1] - used[0], 2 * index_work);
+    assert_eq!(repeated[1] - repeated[0], 2 * index_work);
+    assert_eq!(ignored[1] - ignored[0], 2 * index_work);
 }
 
 #[test]

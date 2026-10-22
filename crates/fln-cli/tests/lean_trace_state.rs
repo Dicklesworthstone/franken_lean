@@ -40,18 +40,27 @@ fn raw_trace_prints_goals_and_empty_state_in_original_command_order() {
 #[test]
 fn guard_captures_traces_from_failed_choices_and_leaves_neighbours_visible() {
     success(
-        "#check Fact\n/-- info: h : Fact\n⊢ Fact -/\n#guard_msgs in\nexample (h : Fact) : Fact := by\n  first | (trace_state; fail) | exact h\n#check Fact.mk",
+        "#check Fact\n/-- trace: h : Fact\n⊢ Fact -/\n#guard_msgs in\nexample (h : Fact) : Fact := by\n  first | (trace_state; fail) | exact h\n#check Fact.mk",
         "Fact : Prop\nFact.mk : Fact\n",
     );
+    let wrong_category = lean(
+        "/-- info: h : Fact\n⊢ Fact -/\n#guard_msgs in\nexample (h : Fact) : Fact := by trace_state; exact h",
+    );
+    assert_eq!(wrong_category.status.code(), Some(5), "{wrong_category:?}");
+    assert!(wrong_category.stdout.is_empty());
 }
 #[test]
 fn guard_filter_drops_trace_without_disabling_proof_checking() {
     success(
-        "#guard_msgs (drop info) in\nexample : Fact := by trace_state; constructor\n#check Fact.mk",
+        "#guard_msgs (drop trace) in\nexample : Fact := by trace_state; constructor\n#check Fact.mk",
         "Fact.mk : Fact\n",
     );
+    success(
+        "#guard_msgs (drop info) in\nexample : Fact := by trace_state; constructor\n#check Fact.mk",
+        "⊢ Fact\nFact.mk : Fact\n",
+    );
     let rejected =
-        lean("#guard_msgs (drop info) in\nexample (P : Prop) : P := by trace_state; constructor");
+        lean("#guard_msgs (drop trace) in\nexample (P : Prop) : P := by trace_state; constructor");
     assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
     assert!(rejected.stdout.is_empty());
 }
@@ -75,12 +84,17 @@ fn literal_trace_reaches_the_installed_binary_before_and_after_proof_closure() {
 #[test]
 fn literal_message_guards_check_exact_text_and_preserve_failed_choice_order() {
     success(
-        "/-- info: first branch\n---\ninfo: after proof -/\n#guard_msgs in\nexample : Fact := by\n  first | (trace \"first branch\"; fail) | constructor\n  trace \"after proof\"",
+        "/-- trace: first branch\n---\ntrace: after proof -/\n#guard_msgs in\nexample : Fact := by\n  first | (trace \"first branch\"; fail) | constructor\n  trace \"after proof\"",
         "",
     );
     let mismatch = lean(
-        "/-- info: wrong -/\n#guard_msgs in\nexample : Fact := by trace \"right\"; constructor",
+        "/-- trace: wrong -/\n#guard_msgs in\nexample : Fact := by trace \"right\"; constructor",
     );
     assert_eq!(mismatch.status.code(), Some(1), "{mismatch:?}");
     assert!(mismatch.stdout.is_empty());
+    let wrong_category = lean(
+        "/-- info: right -/\n#guard_msgs in\nexample : Fact := by trace \"right\"; constructor",
+    );
+    assert_eq!(wrong_category.status.code(), Some(1), "{wrong_category:?}");
+    assert!(wrong_category.stdout.is_empty());
 }

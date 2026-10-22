@@ -83,6 +83,13 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
+        // A native diagnostic applied only to its static result type is an
+        // inert callable too, but its logical continuation body is not its
+        // executable implementation. Retain the checked effectful bridge
+        // before specialization can copy that logical body into an alias.
+        if let Some(diagnostic) = self.diagnostic_call(head, arguments)? {
+            return Ok(Some(diagnostic));
+        }
         let Some(specialized) = self.specialize_call(head, arguments)? else {
             return Ok(None);
         };

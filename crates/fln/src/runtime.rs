@@ -70,6 +70,7 @@ pub(super) struct Preparation<'a> {
     bool_recursor_checked: bool,
     io_world_checked: bool,
     equality_family_checked: bool,
+    heterogeneous_equality_family_checked: bool,
     well_founded_fix_checked: bool,
     quotient_family_checked: bool,
     conditional_contracts: [bool; 2],
@@ -110,6 +111,14 @@ enum Task {
         parameters: Vec<ValueType>,
         result: ValueType,
     },
+    AdaptRecursion {
+        type_: Expr,
+        adapter: Expr,
+    },
+    BindRecursionAdapter {
+        type_: Expr,
+        value: Expr,
+    },
     MutualLambdas {
         group: u32,
         selected: usize,
@@ -119,6 +128,7 @@ enum Task {
     VisitFixedLambdas {
         value: Expr,
         remaining: usize,
+        boxed_result: bool,
     },
     Callee(Expr),
     Apply(usize),
@@ -167,6 +177,7 @@ impl<'a> Preparation<'a> {
             bool_recursor_checked: false,
             io_world_checked: false,
             equality_family_checked: false,
+            heterogeneous_equality_family_checked: false,
             well_founded_fix_checked: false,
             quotient_family_checked: false,
             conditional_contracts: [false; 2],
@@ -528,10 +539,12 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::VisitFixedLambdas {
                                 value: self.thunk(&args[2], ValueType::Nat)?,
                                 remaining: 1,
+                                boxed_result: false,
                             });
                             tasks.push(Task::VisitFixedLambdas {
                                 value: self.thunk(&args[1], ValueType::Nat)?,
                                 remaining: 1,
+                                boxed_result: false,
                             });
                             tasks.push(Task::Visit(args[0].clone()));
                             continue;
@@ -658,10 +671,12 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::VisitFixedLambdas {
                                 value: self.thunk(&yes, ValueType::Bool)?,
                                 remaining: 1,
+                                boxed_result: false,
                             });
                             tasks.push(Task::VisitFixedLambdas {
                                 value: self.thunk(&no, ValueType::Bool)?,
                                 remaining: 1,
+                                boxed_result: false,
                             });
                             tasks.push(Task::Visit(args[3].clone()));
                             continue;
@@ -695,6 +710,7 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::VisitFixedLambdas {
                                 value: recursion.lambda,
                                 remaining: fixed,
+                                boxed_result: false,
                             });
                             continue;
                         }
@@ -721,7 +737,8 @@ impl<'a> Preparation<'a> {
                                 .arguments
                                 .len()
                                 .saturating_add(recursion.domains.len())
-                                .saturating_add(4);
+                                .saturating_add(4)
+                                .saturating_add(usize::from(recursion.adapter.is_some()));
                             if tasks.len().saturating_add(required) > limit {
                                 return Err(IngressError::ResourceLimit {
                                     resource: IngressResource::PendingTasks,
@@ -737,6 +754,12 @@ impl<'a> Preparation<'a> {
                             })?;
                             tasks.push(Task::Apply(recursion.arguments.len()));
                             tasks.extend(recursion.arguments.into_iter().rev().map(Task::Visit));
+                            if let Some(adapter) = recursion.adapter {
+                                tasks.push(Task::AdaptRecursion {
+                                    type_: recursion.self_type.clone(),
+                                    adapter,
+                                });
+                            }
                             tasks.push(Task::RecursiveLambda {
                                 parameters: recursion.parameters,
                                 result: recursion.case.result,
@@ -963,7 +986,11 @@ impl<'a> Preparation<'a> {
                         _ => values.push(expr.clone()),
                     }
                 }
-                Task::VisitFixedLambdas { value, remaining } => {
+                Task::VisitFixedLambdas {
+                    value,
+                    remaining,
+                    boxed_result,
+                } => {
                     // The scheduler, rather than source spelling, owns this
                     // exact branch/recursive prefix. Keep its return anchor
                     // and normalize only ordinary callbacks inside its body.
@@ -986,11 +1013,18 @@ impl<'a> Preparation<'a> {
                         info: *binder_info,
                     });
                     tasks.push(if remaining == 1 {
-                        Task::Visit(body.clone())
+                        let body = if boxed_result {
+                            self.boxed_equality_transport(body)?
+                                .unwrap_or_else(|| body.clone())
+                        } else {
+                            body.clone()
+                        };
+                        Task::Visit(body)
                     } else {
                         Task::VisitFixedLambdas {
                             value: body.clone(),
                             remaining: remaining - 1,
+                            boxed_result,
                         }
                     });
                 }
@@ -1020,6 +1054,18 @@ impl<'a> Preparation<'a> {
                 Task::RecursiveLambda { parameters, result } => {
                     let lambda = pop(&mut values)?;
                     values.push(self.register_recursion(lambda, parameters, result)?);
+                }
+                Task::AdaptRecursion { type_, adapter } => {
+                    let value = pop(&mut values)?;
+                    tasks.push(Task::BindRecursionAdapter { type_, value });
+                    tasks.push(Task::Visit(adapter));
+                }
+                Task::BindRecursionAdapter { type_, value } => {
+                    let body = pop(&mut values)?;
+                    // The self-binder lambda is already registered. Preserve
+                    // its exact identity instead of revisiting it as an
+                    // ordinary, nonrecursive local function.
+                    values.push(Expr::let_e(Name::anonymous(), type_, value, body, false));
                 }
                 Task::MutualLambdas {
                     group,
@@ -1208,6 +1254,7 @@ impl<'a> Preparation<'a> {
                 .map(|value| Task::VisitFixedLambdas {
                     value,
                     remaining: 1,
+                    boxed_result: case.boxed_result,
                 }),
         );
         tasks.push(Task::Visit(case.major));

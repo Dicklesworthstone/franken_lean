@@ -12,6 +12,7 @@ pub(super) struct Recursion {
     pub parameters: Vec<ValueType>,
     pub case: variants::Case,
     pub arguments: Vec<Expr>,
+    pub adapter: Option<Expr>,
 }
 
 /// A positive recursive field may return a family after taking ordinary runtime
@@ -316,6 +317,34 @@ impl Preparation<'_> {
                 BinderInfo::Default,
             );
         }
+        let boxed_result = self.value_types.boxed.as_ref() == Some(result_type);
+        let adapter = if boxed_result {
+            // The recursive engine has a uniform boxed result. Its caller
+            // still owns the checked concrete motive (including a returned
+            // callback). Recover that interface from the actual indices and
+            // major, without executing any of those runtime operands.
+            let mut caller = args[0].clone();
+            for argument in args[rec.rules.len() + 1..]
+                .iter()
+                .take(index_domains.len().saturating_add(1))
+            {
+                self.tick()?;
+                caller = self.minor_apply(caller, argument.clone())?;
+            }
+            let mut caller = self.erase_runtime_type(&caller)?;
+            for domain in domains[..first_extra].iter().rev() {
+                self.tick()?;
+                caller = Expr::forall_e(
+                    Name::anonymous(),
+                    domain.clone(),
+                    caller,
+                    BinderInfo::Default,
+                );
+            }
+            self.erased_adapter(&self_type, &caller)?
+        } else {
+            None
+        };
         let major = variable(0)?;
         // In a branch, threaded parameter `j` is the `j`th closure domain.
         let mut values = Vec::new();
@@ -453,8 +482,10 @@ impl Preparation<'_> {
                 major: variable(extra)?,
                 branches,
                 result,
+                boxed_result,
             },
             arguments,
+            adapter,
         }))
     }
 }

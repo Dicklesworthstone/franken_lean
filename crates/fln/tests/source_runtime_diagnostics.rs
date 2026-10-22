@@ -317,10 +317,27 @@ fn source_debug_trace_uses_interpolation_instances_and_linebreak_continuations()
     ) {
         return;
     }
+    let engine = native_trace();
+    let root = engine.logical_root(&KVMap::new());
+    let invalid = engine
+        .check_source_files(
+            &[br#"def invalid : Nat := dbg_trace "\{literal\}"; 42"#],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("only the opening interpolation brace has an escape at the pin");
+    assert_eq!(invalid.disposition(), ("input", false, 1));
+    assert!(matches!(
+        invalid,
+        fln::SourceCheckError::Command { error, .. }
+            if matches!(*error, fln::EngineExecutionError::Frontend(
+                fln::NatDefinitionFrontendError::Parse(_)))
+    ));
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
     let result = run(
-        &native_trace(),
+        &engine,
         r#"#eval
-  dbg_trace "λ \{literal\}: {42}"
+  dbg_trace "λ \{literal}: {42}"
   dbg_trace (40 + 2)
   42"#,
     );
@@ -467,7 +484,8 @@ fn source_debug_trace_accepts_the_checked_punit_unit_aliases() {
     }
     let source = TRACE_SOURCE.replace(
         "inductive Unit where\n  | unit",
-        "inductive PUnit : Sort u where\n  | unit\nabbrev Unit : Type := PUnit.{1}\nabbrev Unit.unit : Unit := PUnit.unit",
+        // The source seed already contains the admitted PUnit family.
+        "abbrev Unit : Type := PUnit.{1}\nabbrev Unit.unit : Unit := PUnit.unit",
     );
     let logical = checked(&base(), &source);
     let engine = decorate_trace(&logical, "lean_dbg_trace");

@@ -276,6 +276,7 @@ impl Preparation<'_> {
                     major: variable(extra)?,
                     branches,
                     result: motive.result,
+                    boxed_result: false,
                 },
             });
         }

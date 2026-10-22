@@ -390,23 +390,29 @@ impl PendingArtifact {
                 metadata.noncomputable.push(tagged);
             }
         }
-        // `@[defeq]` tags (a naked `:= rfl` theorem's, as the pin infers them) belong to the
-        // module that admitted the theorem, which writes them as `Lean.defeqAttr` entries;
-        // an imported module's tags stay in its own artifact.
+        // Reflexivity tags are selection metadata owned by the module that
+        // declared the theorem. The codec already emits both pinned tag sets;
+        // export the journal delta rather than silently losing it at this edge.
         let defeq = |env: &Environment, meter: &mut Meter| {
-            let journal_name = fln_elab::source::scope::simp::defeq::journal_name();
-            if let Some(journal) = env.extension(&journal_name) {
+            use fln_elab::source::scope::simp::{SimpSetError, defeq};
+            if let Some(journal) = env.extension(&defeq::journal_name()) {
                 for entry in journal.entries() {
-                    meter.work(1)?;
+                    meter.work(1 + entry.payload.len().div_ceil(64))?;
                     meter.bytes(entry.payload.len())?;
                 }
             }
-            fln_elab::source::scope::simp::defeq::read(env, || Ok(())).map_err(|_| {
-                SourceModuleCheckError::Extension {
+            defeq::read(env, || Ok(())).map_err(|error| match error {
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::SimpSet(SimpSetError::Limit),
+                ) => SourceModuleCheckError::Limit {
+                    resource: "native reflexivity tags",
+                    limit: defeq::MAX_ROWS,
+                },
+                _ => SourceModuleCheckError::Extension {
                     module: name.clone(),
-                    extension: journal_name,
-                    reason: "invalid definitional-equality journal",
-                }
+                    extension: defeq::journal_name(),
+                    reason: "invalid reflexivity-declaration journal",
+                },
             })
         };
         let inherited = defeq(base, meter)?;
@@ -417,7 +423,7 @@ impl PendingArtifact {
                     return Err(SourceModuleCheckError::Extension {
                         module: name.clone(),
                         extension: fln_elab::source::scope::simp::defeq::journal_name(),
-                        reason: "a module cannot tag an imported theorem definitional",
+                        reason: "a module cannot tag an imported reflexivity theorem",
                     });
                 }
                 metadata.defeq.push(tagged);

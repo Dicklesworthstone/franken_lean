@@ -61,7 +61,7 @@ impl Preparation<'_> {
     /// No recursive Rust calls follow a source type. The worklist and the
     /// memo table are bounded by the ordinary ingress quotas. Recursive data
     /// edges are represented by the admitted recursor's IHs, not expanded.
-    pub(super) fn erased_adapter(
+    pub(in crate::runtime) fn erased_adapter(
         &mut self,
         actual: &Expr,
         expected: &Expr,
@@ -122,9 +122,14 @@ impl Preparation<'_> {
                                     actual = ab.clone();
                                     expected = eb.clone();
                                 }
+                                let boxed_result =
+                                    self.value_types.boxed.as_ref().is_some_and(|boxed| {
+                                        boxed == &actual || boxed == &expected
+                                    });
                                 if parameters.is_empty()
-                                    || matches!(actual.node(), ExprNode::ForallE { .. })
-                                    || matches!(expected.node(), ExprNode::ForallE { .. })
+                                    || (!boxed_result
+                                        && (matches!(actual.node(), ExprNode::ForallE { .. })
+                                            || matches!(expected.node(), ExprNode::ForallE { .. })))
                                 {
                                     return Err(unsupported("hidden callback arity mismatch"));
                                 }

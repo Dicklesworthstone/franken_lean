@@ -150,6 +150,16 @@ pub(super) fn equality_family_matches(
     Comparison { visited, limits }.declaration(environment, fln_elab::seed::eq_seed_declaration())
 }
 
+/// Type-index refinement is recognized against the complete admitted HEq
+/// family, including its constructor and computational recursor rule.
+pub(super) fn heterogeneous_equality_family_matches(
+    environment: &Environment,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    Comparison { visited, limits }.declaration(environment, fln_elab::seed::heq_seed_declaration())
+}
+
 /// Quotient erasure requires all four primitive declarations, not just a
 /// constant named Quot or the signature of the operation being compiled.
 pub(super) fn quotient_family_matches(

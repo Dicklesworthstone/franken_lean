@@ -26,14 +26,150 @@ impl Preparation<'_> {
         Ok(())
     }
 
+    /// Preserve the supplied, nondependent argument interface of a transport
+    /// whose enclosing checked Type-index branch returns the boxed carrier.
+    fn boxed_applied_transport_type(
+        &mut self,
+        mut before: Expr,
+        mut after: Expr,
+        arguments: usize,
+    ) -> Result<Option<Expr>, IngressError> {
+        let Some(mut result) = self.value_types.boxed.clone() else {
+            return Ok(None);
+        };
+        let mut domains = Vec::new();
+        for _ in 0..arguments {
+            self.tick()?;
+            let (
+                ExprNode::ForallE {
+                    binder_type: ad,
+                    body: ab,
+                    ..
+                },
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type: ed,
+                    body: eb,
+                    binder_info,
+                },
+            ) = (before.node(), after.node())
+            else {
+                return Ok(None);
+            };
+            if ad != ed || ab.has_loose_bvar(0) || eb.has_loose_bvar(0) {
+                return Ok(None);
+            }
+            reserve(&mut domains, self.limits.max_context_depth)?;
+            domains.push((binder_name.clone(), ed.clone(), *binder_info));
+            before = ab.clone();
+            after = eb.clone();
+        }
+        if self.value_type(&before)?.is_none() || self.value_type(&after)?.is_none() {
+            return Ok(None);
+        }
+        for (name, domain, info) in domains.into_iter().rev() {
+            self.tick()?;
+            result = Expr::forall_e(name, domain, result, info);
+        }
+        Ok(Some(result))
+    }
+
+    /// Called only by a scheduler-owned boxed branch. Leading strict bindings
+    /// retain their order; no initializer is substituted or dropped.
+    pub(super) fn boxed_equality_transport(
+        &mut self,
+        value: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        let mut value = value.clone();
+        let mut prefix = Vec::new();
+        loop {
+            self.tick()?;
+            match value.node() {
+                ExprNode::MData { expr, .. } => value = expr.clone(),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value: init,
+                    body,
+                    non_dep,
+                } => {
+                    reserve(&mut prefix, self.limits.max_context_depth)?;
+                    prefix.push((decl_name.clone(), type_.clone(), init.clone(), *non_dep));
+                    value = body.clone();
+                }
+                _ => break,
+            }
+        }
+        let (head, args) = self.spine(&value)?;
+        let Some(mut value) = self.equality_transport_result(&head, &args, true)? else {
+            return Ok(None);
+        };
+        for (name, type_, init, non_dep) in prefix.into_iter().rev() {
+            self.tick()?;
+            value = Expr::let_e(name, type_, init, value, non_dep);
+        }
+        Ok(Some(value))
+    }
+
+    /// A checked Type refinement can change the result of an otherwise
+    /// identical, nondependent function telescope to or from the boxed carrier.
+    /// Argument interfaces and value-dependent result types stay unchanged.
+    fn boxed_result_refinement(
+        &mut self,
+        mut before: &Expr,
+        mut after: &Expr,
+    ) -> Result<bool, IngressError> {
+        let Some(boxed) = self.value_types.boxed.clone() else {
+            return Ok(false);
+        };
+        loop {
+            self.tick()?;
+            if before == &boxed || after == &boxed {
+                return Ok(true);
+            }
+            let (
+                ExprNode::ForallE {
+                    binder_type: before_domain,
+                    body: before_body,
+                    ..
+                },
+                ExprNode::ForallE {
+                    binder_type: after_domain,
+                    body: after_body,
+                    ..
+                },
+            ) = (before.node(), after.node())
+            else {
+                return Ok(false);
+            };
+            if before_domain != after_domain
+                || before_body.has_loose_bvar(0)
+                || after_body.has_loose_bvar(0)
+            {
+                return Ok(false);
+            }
+            before = before_body;
+            after = after_body;
+        }
+    }
+
     pub(super) fn equality_transport(
         &mut self,
         head: &Expr,
         args: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        self.equality_transport_result(head, args, false)
+    }
+
+    fn equality_transport_result(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+        boxed_result: bool,
+    ) -> Result<Option<Expr>, IngressError> {
         // Quotient construction/elimination is another post-admission
         // representation transport. Keep it before ordinary callable ingress.
-        if let Some(value) = self.quotient_operation(head, args)? {
+        if !boxed_result && let Some(value) = self.quotient_operation(head, args)? {
             return Ok(Some(value));
         }
         let ExprNode::Const {
@@ -54,12 +190,22 @@ impl Preparation<'_> {
         let before = application(args[2].clone(), [args[1].clone(), refl]);
         let after = application(args[2].clone(), [args[4].clone(), args[5].clone()]);
         let before = self.erase_runtime_type(&before)?;
-        let after = self.erase_runtime_type(&after)?;
+        let mut after = self.erase_runtime_type(&after)?;
         let carrier = self.erase_runtime_type(&args[0])?;
         let static_endpoints = self.type_parameter(&carrier)?;
-        let boxed = self.value_types.boxed.as_ref();
+        if boxed_result {
+            if !static_endpoints {
+                return Ok(None);
+            }
+            let Some(type_) =
+                self.boxed_applied_transport_type(before.clone(), after, args.len() - 6)?
+            else {
+                return Ok(None);
+            };
+            after = type_;
+        }
         let boxed_refinement =
-            static_endpoints && (boxed == Some(&before) || boxed == Some(&after));
+            before != after && static_endpoints && self.boxed_result_refinement(&before, &after)?;
         if before != after && !boxed_refinement {
             return Err(unsupported("representation-dependent equality transport"));
         }
@@ -116,7 +262,12 @@ impl Preparation<'_> {
             }
             return Ok(Some(applied));
         }
-        let payload = self.typed_callable_result(args[3].clone(), before, payload_type)?;
+        let payload = self.typed_callable_result(args[3].clone(), before.clone(), payload_type)?;
+        let payload = if boxed_refinement {
+            self.adapt_erased_field(&payload, &before, &after)?
+        } else {
+            payload
+        };
         let bindings = if static_endpoints {
             vec![(after, payload)]
         } else {

@@ -138,7 +138,9 @@ def nestedScope : Logged Nat := do
 #eval observed (nestedCleanup false)
 #eval observed nestedScope
 "#,
-        &["13007", "1323007", "4142007"],
+        // Bare `do` shares the surrounding lexical scope at the pin. Both
+        // uses in each iteration therefore see the inner `n := 4`.
+        &["13007", "1323007", "4444007"],
     );
 }
 
@@ -154,8 +156,9 @@ fn nested_cleanup_blocks_preserve_typing_and_term_do_scope_boundaries() {
         "def bad : Logged Nat := do { for n in items do { try { (do { break } : Logged PUnit) } finally { note 3 } }; return 7 }",
         // Dead branches are not permission to skip type checking.
         "def bad : Logged Nat := do { for n in items do { try { do { if false then note true else continue } } finally { note 3 } }; return 7 }",
-        // Inner local bindings cannot escape into the outer continuation.
-        "def bad : Logged Nat := do { for n in items do { try { do { let hidden := n; note hidden }; note hidden } finally { note 3 } }; return 7 }",
+        // A parenthesized term-do has its own lexical scope. Bare statement
+        // `do` deliberately shares the surrounding continuation instead.
+        "def bad : Logged Nat := do { for n in items do { try { (do { let hidden := n; note hidden } : Logged PUnit); note hidden } finally { note 3 } }; return 7 }",
     ] {
         assert!(
             engine
@@ -167,8 +170,10 @@ fn nested_cleanup_blocks_preserve_typing_and_term_do_scope_boundaries() {
     }
     execute(
         &engine,
-        "def recovered : Logged Nat := do { for n in items do { try { do { note n; continue } } finally { note 3 }; note 9 }; return 7 }\n#eval observed recovered",
-        &["1323007"],
+        "def recovered : Logged Nat := do { for n in items do { try { do { note n; continue } } finally { note 3 }; note 9 }; return 7 }\n\
+         def sharedScope : Logged Nat := do { for n in items do { try { do { let hidden := n; note hidden }; note hidden } finally { note 3 } }; return 7 }\n\
+         #eval observed recovered\n#eval observed sharedScope",
+        &["1323007", "113223007"],
     );
 }
 

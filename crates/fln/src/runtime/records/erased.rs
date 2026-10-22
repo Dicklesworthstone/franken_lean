@@ -358,7 +358,7 @@ impl Preparation<'_> {
         Ok(true)
     }
 
-    pub(super) fn adapt_erased_field(
+    pub(in crate::runtime) fn adapt_erased_field(
         &mut self,
         value: &Expr,
         actual: &Expr,
@@ -369,7 +369,18 @@ impl Preparation<'_> {
         let expected = self.normalize_type(expected)?;
         let adapter = self.erased_adapter(&actual, &expected)?;
         Ok(match adapter {
-            None => value.clone(),
+            None => {
+                if self.value_types.boxed.as_ref() == Some(&expected)
+                    && let Some(kind @ ValueType::Closure(_)) = self.value_type(&actual)?
+                {
+                    // A boxed field no longer exposes the callback's concrete
+                    // signature to ordinary argument annotation. Register that
+                    // interface before the constructor erases its carrier.
+                    self.typed_callable_result(value.clone(), actual, kind)?
+                } else {
+                    value.clone()
+                }
+            }
             Some(body) => Expr::let_e(Name::anonymous(), actual, value.clone(), body, false),
         })
     }

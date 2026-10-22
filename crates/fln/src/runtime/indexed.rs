@@ -387,6 +387,99 @@ impl Preparation<'_> {
 }
 
 impl Preparation<'_> {
+    /// Leading canonical HEq hypotheses may identify a Type-valued index with
+    /// the returned type. Retain that relation before proof erasure removes
+    /// its endpoints. A computed result such as List A is not an index itself.
+    pub(super) fn refined_index_motive(
+        &mut self,
+        motive: &Expr,
+        num_indices: usize,
+    ) -> Result<Option<usize>, IngressError> {
+        let mut result = motive.clone();
+        let mut indices = Vec::new();
+        for position in 0..=num_indices {
+            self.tick()?;
+            let normal = self.type_head(&result)?;
+            let ExprNode::Lam {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                return Ok(None);
+            };
+            if position < num_indices {
+                reserve(&mut indices, self.limits.max_context_depth)?;
+                indices.push(binder_type.clone());
+            }
+            result = body.clone();
+        }
+        let mut hypotheses = Vec::new();
+        loop {
+            self.tick()?;
+            let normal = self.type_head(&result)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                break;
+            };
+            let (head, arguments) = self.spine(binder_type)?;
+            if !matches!(head.node(), ExprNode::Const { name: n, levels }
+                if n == &name("HEq") && levels.len() == 1)
+                || arguments.len() != 4
+            {
+                break;
+            }
+            reserve(&mut hypotheses, self.limits.max_context_depth)?;
+            hypotheses.push(arguments);
+            result = body.clone();
+        }
+        let count = hypotheses.len();
+        for index in 0..count {
+            let index = u32::try_from(index).map_err(|_| unsupported("motive proof arity"))?;
+            if result.has_loose_bvar(index) {
+                return Ok(None);
+            }
+        }
+        for (proof, arguments) in hypotheses.into_iter().enumerate() {
+            for (position, domain) in indices.iter().enumerate() {
+                self.tick()?;
+                if !matches!(domain.node(), ExprNode::Sort { level } if level.is_never_zero())
+                    || arguments[0] != *domain
+                    || arguments[2] != *domain
+                {
+                    continue;
+                }
+                let index = num_indices.saturating_sub(position).saturating_add(proof);
+                let index = u32::try_from(index).map_err(|_| unsupported("motive index arity"))?;
+                let index = Expr::bvar(index).map_err(|_| unsupported("motive index scope"))?;
+                let other = if arguments[1] == index {
+                    &arguments[3]
+                } else if arguments[3] == index {
+                    &arguments[1]
+                } else {
+                    continue;
+                };
+                let depth =
+                    u32::try_from(count - proof).map_err(|_| unsupported("motive proof arity"))?;
+                if self.lift(other, depth)? != result {
+                    continue;
+                }
+                if !self.heterogeneous_equality_family_checked {
+                    if !crate::source_intrinsics::heterogeneous_equality_family_matches(
+                        self.environment,
+                        &mut self.visited,
+                        self.limits,
+                    )? {
+                        return Err(unsupported("noncanonical heterogeneous equality family"));
+                    }
+                    self.heterogeneous_equality_family_checked = true;
+                }
+                return Ok(Some(count));
+            }
+        }
+        Ok(None)
+    }
+
     /// A motive may return a checked Type index directly through the private
     /// boxed carrier. Other index dependencies must disappear after runtime
     /// erasure; a type computation over an index cannot select a layout here.
@@ -396,6 +489,7 @@ impl Preparation<'_> {
         indices: &[Expr],
         family: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
+        let refinement = self.refined_index_motive(motive, indices.len())?;
         let mut result = motive.clone();
         for domain in indices.iter().chain(std::iter::once(family)) {
             self.tick()?;
@@ -410,6 +504,41 @@ impl Preparation<'_> {
                 return Ok(None);
             }
             result = body.clone();
+        }
+        if let Some(count) = refinement {
+            // Erase proof domains while the original index/major lambda
+            // context is still available, then replace only the related
+            // returned type. The result's own function domains stay boxed
+            // inside the value, rather than becoming branch accumulators.
+            let mut erased = self.erase_type_argument(motive, &[])?;
+            for _ in 0..=indices.len() {
+                self.tick()?;
+                let ExprNode::Lam { body, .. } = erased.node() else {
+                    return Ok(None);
+                };
+                erased = body.clone();
+            }
+            let mut proofs = Vec::new();
+            for _ in 0..count {
+                self.tick()?;
+                let ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } = erased.node()
+                else {
+                    return Ok(None);
+                };
+                reserve(&mut proofs, self.limits.max_context_depth)?;
+                proofs.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                erased = body.clone();
+            }
+            result = self.enable_boxed_type()?;
+            for (name, domain, info) in proofs.into_iter().rev() {
+                self.tick()?;
+                result = Expr::forall_e(name, domain, result, info);
+            }
         }
         result = self.erase_runtime_type(&result)?;
         if let ExprNode::BVar { idx } = result.node()

@@ -574,8 +574,26 @@ fn metadata_keeps_a_bound_import_engine_usable_for_source_artifact_builds() {
     );
     let imported = import(&empty, &bytes);
     let name = n("Client");
-    let source =
+    let before = imported.engine.logical_root(&KVMap::new());
+    let computable =
         b"prelude\nimport Library\ndef use [x : Class] : Class := x\ndef selected : Class := use";
+    let error = imported
+        .engine
+        .compile_source_modules(
+            &[SourceModuleInput {
+                name: &name,
+                source: computable,
+            }],
+            &name,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),
+            OleanWriteBudget::default(),
+        )
+        .expect_err("an axiom dictionary cannot supply an executable value");
+    assert_eq!(error.disposition(), ("elaboration", false, 1));
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    let source =
+        b"prelude\nimport Library\ndef use [x : Class] : Class := x\nnoncomputable def selected : Class := use";
     let result = imported
         .engine
         .compile_source_modules(

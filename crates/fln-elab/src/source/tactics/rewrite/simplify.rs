@@ -525,8 +525,15 @@ impl Context {
                 } => {
                     if let Ok(idx) = usize::try_from(*idx)
                         && let Some(projection) = self.simp_projection_function(struct_name, idx)
+                        && let Some(ConstantInfo::Induct(structure)) = env.find(struct_name)
                     {
-                        applications.entry(projection).or_default().push(Vec::new());
+                        let mut keys = vec![SimpArgKey::Any; structure.num_params as usize + 1];
+                        keys.extend(
+                            args.iter().map(|arg| {
+                                simp_target_arg_key(env, &table, &self.txn.lctx, arg, 0)
+                            }),
+                        );
+                        applications.entry(projection).or_default().push(keys);
                     }
                 }
                 // A `let` is keyed as both: the pin keys what its zeta reduction leaves.
@@ -1424,6 +1431,9 @@ impl SimpArgKey {
 #[derive(Clone, Debug)]
 pub(super) struct SimpKey {
     head: Name,
+    /// Keep the full arity even when trailing wildcard argument keys are omitted.
+    /// A relation passed as a function is not an occurrence of its application.
+    arity: usize,
     args: Vec<SimpArgKey>,
 }
 
@@ -1435,16 +1445,20 @@ pub(super) struct SimpTargetIndex {
 }
 
 impl SimpTargetIndex {
-    /// Some application of the key's head agrees with every argument key both have.
+    /// Some application has enough arguments for the rule and agrees with its keys.
+    /// The pin's `.const name nargs` distinguishes arities exactly. Allowing extra
+    /// target arguments conservatively retains rewrites of application prefixes.
     fn admits(&self, key: &SimpKey) -> bool {
         self.applications
             .get(&key.head)
             .is_some_and(|applications| {
                 applications.iter().any(|args| {
-                    key.args
-                        .iter()
-                        .zip(args)
-                        .all(|(rule, target)| rule.admits(target))
+                    args.len() >= key.arity
+                        && key
+                            .args
+                            .iter()
+                            .zip(args)
+                            .all(|(rule, target)| rule.admits(target))
                 })
             })
     }
@@ -1537,12 +1551,14 @@ fn simp_pattern_key(
         ExprNode::ForallE { .. } if args.is_empty() => {
             return Some(SimpKey {
                 head: simp_arrow_key(),
+                arity: 0,
                 args: Vec::new(),
             });
         }
         ExprNode::Lam { .. } if args.is_empty() => {
             return Some(SimpKey {
                 head: simp_other_key(),
+                arity: 0,
                 args: Vec::new(),
             });
         }
@@ -1687,6 +1703,7 @@ fn simp_constant_key(
         }
         return Some(SimpKey {
             head: name.clone(),
+            arity: args.len(),
             args: keys,
         });
     }
@@ -2290,6 +2307,57 @@ mod tests {
     }
 
     #[test]
+    fn a_function_argument_does_not_admit_rules_for_its_application() {
+        let nat = c("Nat");
+        let env = environment()
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n("higherOrder"),
+                    level_params: Vec::new(),
+                    type_: pi(
+                        pi(nat.clone(), nat.clone(), BinderInfo::Default),
+                        Expr::sort(Level::zero()),
+                        BinderInfo::Default,
+                    ),
+                },
+                is_unsafe: false,
+            }))
+            .unwrap();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        let rule = SimpRule::Global(scope::simp::SimpEntry {
+            declaration: n("fx"),
+            proof: None,
+            priority: 1000,
+            reverse: false,
+            order: 0,
+        });
+        let key = context.simp_rule_node_key(&rule).unwrap().unwrap();
+        // `fx : ∀ a b, f a = b` has no rigid argument keys. Its omitted
+        // wildcard must still count: passing `f` is not applying `f a`.
+        assert!(key.args.is_empty());
+        let passed = Expr::app(c("higherOrder"), c("f"));
+        let index = context.simp_target_index(&passed).unwrap();
+        assert!(!context.simp_rule_admitted(&rule, index.as_ref(), SimpKeySide::Rewrite));
+        assert!(!context.simp_node_admits(&key, &c("f")).unwrap());
+        let under_lambda = Expr::app(
+            c("higherOrder"),
+            Expr::lam(
+                Name::anonymous(),
+                nat,
+                Expr::app(c("f"), bvar(0)),
+                BinderInfo::Default,
+            ),
+        );
+        let index = context.simp_target_index(&under_lambda).unwrap();
+        assert!(context.simp_rule_admitted(&rule, index.as_ref(), SimpKeySide::Rewrite));
+        assert!(
+            context
+                .simp_node_admits(&key, &Expr::app(c("f"), c("Nat.zero")))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn numerals_are_literal_keys_and_targets_unfold_only_reducible_definitions() {
         use fln_core::expr::{Literal, NatLit};
         use fln_env::constants::{DefinitionSafety, DefinitionVal};
@@ -2791,10 +2859,12 @@ mod tests {
         let local = |name: &str| Expr::fvar(FVarId(n(name)));
         let binder = SimpKey {
             head: simp_arrow_key(),
+            arity: 0,
             args: Vec::new(),
         };
         let other = SimpKey {
             head: simp_other_key(),
+            arity: 0,
             args: Vec::new(),
         };
         let wrapped = Expr::app(c("wrap"), local("x"));
@@ -2890,10 +2960,13 @@ mod tests {
         let node = Expr::proj(n("And"), 0, h);
         let rule = |head: &str| SimpKey {
             head: n(head),
+            arity: 3,
             args: Vec::new(),
         };
         assert!(context.simp_node_admits(&rule("And.left"), &node).unwrap());
         assert!(!context.simp_node_admits(&rule("Nat.succ"), &node).unwrap());
         assert!(!context.simp_node_admits(&rule("And.right"), &node).unwrap());
+        let index = context.simp_target_index(&node).unwrap().unwrap();
+        assert!(index.admits(&rule("And.left")));
     }
 }

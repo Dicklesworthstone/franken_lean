@@ -51,7 +51,7 @@ pub(super) fn parse(
     let mut at = keyword + 1;
     let mut priority = 1000;
     let mut depth = 0;
-    while is_default && is(at, "(") {
+    while is(at, "(") {
         if depth >= 16 {
             return Err(bad(at));
         }
@@ -71,7 +71,7 @@ pub(super) fn parse(
         }
         priority = text.parse::<u32>().map_err(|_| bad(at))?;
         at += 1;
-    } else if is_default && !is(at, "]") {
+    } else if !is(at, "]") {
         priority = if is(at, "default") {
             1000
         } else if is(at, "low") {
@@ -165,6 +165,9 @@ mod tests {
         );
         assert_eq!(attribute("attribute [instance] d").priority, 1000);
         assert_eq!(attribute("attribute [instance 0] d").priority, 0);
+        assert_eq!(attribute("attribute [instance high] d").priority, 10000);
+        assert_eq!(attribute("attribute [instance (low)] d").priority, 100);
+        assert_eq!(attribute("attribute [instance ((mid))] d").priority, 500);
         assert_eq!(
             attribute("attribute [instance 4294967295] d").priority,
             u32::MAX

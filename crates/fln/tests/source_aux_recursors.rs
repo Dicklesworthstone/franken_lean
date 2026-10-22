@@ -103,7 +103,9 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
              inductive Flag : Type where | off | on\n\
              structure Prod (A B : Type) where\n  fst : A\n  snd : B\n\
              inductive Tick : Type where | stop | step : Tick -> Tick\n\
-             def Fake.casesOn (A : Type) (x : A) : A := x",
+             def Fake.casesOn (A : Type) (x : A) : A := x\n\
+             def identity (A : Type) (x : A) : A := x\n\
+             theorem baseRfl (A : Type) (x : A) : identity A x = x := rfl",
         ),
         (n("Left"), "prelude\nimport Base"),
         (n("Right"), "prelude\nimport Base"),
@@ -148,9 +150,30 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
     }
     assert!(!expected.contains(&n("Fake.casesOn")));
     assert!(!expected.contains(&n("Tick.brecOn.go")));
+    let expected_defeq = [n("baseRfl"), n("recurse")].into_iter().collect();
+    assert_eq!(
+        fln_elab::source::scope::simp::defeq::read(
+            cold.checked.checked.engine.environment(),
+            || Ok(())
+        )
+        .unwrap(),
+        expected_defeq
+    );
     for artifact in &cold.artifacts {
-        let tags = metadata(&artifact.bytes).aux_recursors;
-        assert_eq!(tags.len(), if artifact.name == n("Base") { 8 } else { 0 });
+        let tags = metadata(&artifact.bytes);
+        assert_eq!(
+            tags.aux_recursors.len(),
+            if artifact.name == n("Base") { 8 } else { 0 }
+        );
+        let own_defeq = if artifact.name == n("Base") {
+            vec![n("baseRfl")]
+        } else if artifact.name == n("Main") {
+            vec![n("recurse")]
+        } else {
+            vec![]
+        };
+        assert_eq!(tags.defeq, own_defeq);
+        assert_eq!(tags.backward_defeq, own_defeq);
     }
     let warm = session
         .compile(&inputs, &n("Main"), OleanWriteBudget::default())
@@ -161,6 +184,14 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
     assert_eq!(
         AuxRecursors::read(warm.checked.checked.engine.environment()).unwrap(),
         expected
+    );
+    assert_eq!(
+        fln_elab::source::scope::simp::defeq::read(
+            warm.checked.checked.engine.environment(),
+            || Ok(())
+        )
+        .unwrap(),
+        expected_defeq
     );
     assert!(
         cold.artifacts
@@ -210,11 +241,18 @@ fn generated_tags_cross_artifact_diamonds_and_warm_replay_once() {
         AuxRecursors::read(receipt.engine.environment()).unwrap(),
         expected
     );
+    assert_eq!(receipt.modules.iter().map(|m| m.defeq).sum::<usize>(), 2);
+    assert_eq!(
+        fln_elab::source::scope::simp::defeq::read(receipt.engine.environment(), || Ok(()))
+            .unwrap(),
+        expected_defeq
+    );
     receipt
         .engine
         .check_source_files(
-            &[b"def use (A : Type) (x y : A) : A := Flag.casesOn Flag.off x y\n\
-                theorem useHistory (A : Type) (x : A) : Tick.brecOn (Tick.step Tick.stop) (fun _ _ => x) = x := rfl"],
+            &["def use (A : Type) (x y : A) : A := Flag.casesOn Flag.off x y\n\
+                theorem useHistory (A : Type) (x : A) : Tick.brecOn (Tick.step Tick.stop) (fun _ _ => x) = x := rfl\n\
+                theorem useTag (A : Type) (x : A) (P : A -> Prop) (h : P x) : P (identity A x) := by\n  fail_if_success dsimp only []\n  dsimp only [baseRfl]\n  guard_target =ₛ P x\n  exact h".as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(admission()),
         )

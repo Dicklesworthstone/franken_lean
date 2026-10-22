@@ -10,6 +10,9 @@ pub(super) struct Case {
     pub major: Expr,
     pub branches: Vec<Expr>,
     pub result: ValueType,
+    /// Set only by checked Type-index motive lowering; source syntax cannot
+    /// manufacture permission to change a branch's result representation.
+    pub boxed_result: bool,
 }
 
 impl Preparation<'_> {
@@ -135,6 +138,7 @@ impl Preparation<'_> {
             major: args.last().expect("validated recursor arity").clone(),
             branches,
             result,
+            boxed_result: false,
         }))
     }
 

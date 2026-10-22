@@ -40,6 +40,9 @@ class MonadExceptOf (E : Type) (m : Type -> Type) where
 structure Prod (A B : Type) where
   fst : A
   snd : B
+inductive Sum (α : Type u) (β : Type v) where
+  | inl (val : α)
+  | inr (val : β)
 class MonadFinally (m : Type -> Type) where
   tryFinally' : {A B : Type} -> m A -> (Option A -> m B) -> m (Prod A B)
 def tryCatchThe (E : Type) {m : Type -> Type} [inst : MonadExceptOf E m] {A : Type} (action : m A) (handler : E -> m A) : m A := @MonadExceptOf.tryCatch E m inst A action handler
@@ -397,16 +400,50 @@ fn exhaustion_cannot_be_caught_and_retry_preserves_artifacts_and_results() {
 }
 
 #[test]
-fn a_value_bearing_nested_completion_is_not_silently_discarded() {
+fn value_bearing_nested_completions_preserve_values_and_return_scopes() {
     let engine = engine();
     let options = KVMap::new();
     let root = engine.logical_root(&options);
-    // These need both a normal value and a nonlocal return payload. The first
-    // packet profile explicitly refuses that boundary instead of skipping the
-    // value continuation or moving it into the handler's dynamic extent.
+    // These are accepted at the pin. Check the value continuation and both
+    // early/normal paths instead of retaining the superseded refusal profile.
+    executed(
+        r#"
+def valueBound (early : Bool) : Logged Nat := do
+  let n : Nat ← do
+    try
+      if early then return 42
+      pureLogged (5 : Nat)
+    catch _ => pureLogged (6 : Nat)
+  return (n + 1)
+def discarded (early : Bool) : Logged Nat := do
+  do
+    try
+      if early then return 42
+      mark 1
+    catch _ => mark 2
+  mark 3
+  return 7
+def termBound (early : Bool) : Logged Nat := do
+  let n : Nat ← (do
+    if early then return 42
+    pureLogged (5 : Nat))
+  return (n + 1)
+#eval (valueBound true 0).trace
+#eval observe (valueBound true 0).result
+#eval (valueBound false 0).trace
+#eval observe (valueBound false 0).result
+#eval (discarded true 0).trace
+#eval observe (discarded true 0).result
+#eval (discarded false 0).trace
+#eval observe (discarded false 0).result
+#eval observe (termBound true 0).result
+#eval observe (termBound false 0).result
+"#,
+        &["0", "42", "0", "6", "0", "42", "13", "7", "43", "6"],
+    );
     for source in [
-        "def program (early : Bool) : Logged Nat := do\n  let n : Nat ← do\n    try\n      if early then return 42\n      pureLogged (5 : Nat)\n    catch _ => pureLogged (6 : Nat)\n  return (n + 1)",
-        "def program (early : Bool) : Logged Nat := do\n  do\n    try\n      if early then return 42\n      mark 1\n    catch _ => mark 2\n  mark 3\n  return 7",
+        "def bad : Logged Nat := do\n  let n : Nat ← do\n    try\n      if false then return true\n      pureLogged (5 : Nat)\n    catch _ => pureLogged (6 : Nat)\n  return (n + 1)",
+        "def bad : Logged Nat := do\n  let n : Nat ← do\n    try\n      if false then return 42\n      pureLogged true\n    catch _ => pureLogged (6 : Nat)\n  return (n + 1)",
     ] {
         assert!(
             engine
