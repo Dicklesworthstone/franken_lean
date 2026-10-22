@@ -1,11 +1,14 @@
 //! `pure 5 : Option Nat`: the application's type `?f ?α` meets `Option Nat` by the pin's first-order
 //! approximation (`processAssignmentFOApprox`): the arguments from the right (`?α := Nat`), then the
 //! head (`?f := Option`). Where no approximation can match (`?f ?α` against `Nat`; `?f Bool` against
-//! `Option Nat`), it stays the pin's "Type mismatch".
+//! `Option Nat`), it stays the pin's "Type mismatch". The same holds for an application with no
+//! explicit argument (`get : ?m ?σ` against `StateM Nat Nat` decides `MonadState Nat (StateM Nat)`),
+//! and for a polymorphic result (`modify f : ?m PUnit.{?u+1}` against `StateM Nat ?α`, where the
+//! pin's `checkTypesAndAssign` also settles `?u`).
 //!
 //! Through `fln check-source` over `prelude` with `Init.Control.Except`, `Init.Data.List.Control`
 //! and `Init.System.IO`. Every program here was run through the pinned `lean` v4.32.0 with the same
-//! header first (2026-10-12), with the same verdict, and is compared with the pinned binary again
+//! header first (2026-10-12; the `StateM` cases 2026-10-21), with the same verdict, and is compared with the pinned binary again
 //! when it is present.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
@@ -36,6 +39,16 @@ const ACCEPTED: &[(&str, &str)] = &[
         "def f (b : Bool) : Except String Nat := do\n  if b then\n    pure 1\n  else\n    pure 0\nexample : f false = Except.ok 0 := rfl\n",
     ),
     ("io", "def g : IO Nat := pure 5\n"),
+    ("state_get", "def x : StateM Nat Nat := get\n"),
+    ("state_get_the", "def k : StateM Nat Nat := getThe Nat\n"),
+    (
+        "state_do",
+        "def inc : StateM Nat Nat := do\n  let s ← get\n  modify (fun s => s + 1)\n  return s\n",
+    ),
+    (
+        "state_modify_argument",
+        "def c {α} (_x : StateM Nat α) : StateM Nat Nat := pure 0\ndef b : StateM Nat Nat := c (modify (fun s => s + 1))\n",
+    ),
 ];
 
 const REFUSED: &[(&str, &str)] = &[
@@ -50,6 +63,7 @@ const REFUSED: &[(&str, &str)] = &[
         "except_wrong_value",
         "def g : Except String Nat := pure 5\nexample : g = Except.error \"x\" := rfl\n",
     ),
+    ("state_get_wrong_state", "def x : StateM Nat Bool := get\n"),
 ];
 
 fn pinned_lib() -> Option<PathBuf> {

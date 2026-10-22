@@ -1624,6 +1624,13 @@ impl Context {
         // unification. Unknown class inputs still wait for the expected type.
         self.resolve_instances(false)?;
         if let Some(expected) = expected {
+            // The pin elaborates with first-order approximation on (`foApprox`): a result
+            // `?m ?σ` that is no pattern meets `StateM Nat Nat` as `?m := StateM Nat`, `?σ := Nat`
+            // (`processAssignmentFOApprox`), so `get`'s instance goal is known. The ordinary
+            // unifier suspends such an equation; the hint publishes only a whole solution.
+            if self.flexible_non_pattern(&term.type_)? {
+                self.first_order_result_hint(&term.type_, expected)?;
+            }
             term = self.coerce_expected(term, expected)?;
         }
         self.resolve_instances(false)?;

@@ -9,7 +9,7 @@
 use super::*;
 
 impl Context {
-    pub(super) fn first_order_result_hint(
+    pub(in crate::source) fn first_order_result_hint(
         &mut self,
         actual: &Expr,
         expected: &Expr,
@@ -26,6 +26,39 @@ impl Context {
             Err(error) if nonmatch(&error) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether `type_` is an unassigned metavariable applied to arguments that are not distinct
+    /// local variables: an equation it meets is no Miller pattern, and the pin solves it by
+    /// first-order approximation where this unifier suspends it.
+    pub(in crate::source) fn flexible_non_pattern(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let type_ = self.instantiate(type_)?;
+        let mut head = &type_;
+        let mut arguments = Vec::new();
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::MData { expr, .. } => head = expr,
+                ExprNode::App { f, a } => {
+                    arguments.push(a);
+                    head = f;
+                }
+                _ => break,
+            }
+        }
+        let ExprNode::MVar { id } = head.node() else {
+            return Ok(false);
+        };
+        if arguments.is_empty() || self.txn.mvars.is_assigned(id) {
+            return Ok(false);
+        }
+        let mut locals = std::collections::HashSet::new();
+        Ok(!arguments.iter().all(|argument| {
+            matches!(argument.node(), ExprNode::FVar { id } if locals.insert(id.clone()))
+        }))
     }
 
     fn first_order_result_hint_trial(

@@ -91,7 +91,14 @@ impl Engine<'_> {
         locals: &LocalContext,
     ) -> Result<Option<Equation>, UnificationError> {
         let expected = self.instantiate(expected)?;
-        if !expected.has_expr_mvar() && !expected.has_level_mvar() {
+        // A closed type with a value holding no universe hole needs no type synthesis: the K1
+        // verdict stands. A value with one (`?α : Type := PUnit.{?u+1}`) is checked with that
+        // hole generalized, which no closed type survives; the pin's `checkTypesAndAssign`
+        // unifies the two types first (`Type =?= Sort (?u+1)` assigns `?u := 0`).
+        if !expected.has_expr_mvar()
+            && !expected.has_level_mvar()
+            && !self.instantiate(value)?.has_level_mvar()
+        {
             // Preserve the existing K1 verdict for a closed ill-typed value.
             // Do not make every ordinary assignment pay for type synthesis.
             return Ok(None);
