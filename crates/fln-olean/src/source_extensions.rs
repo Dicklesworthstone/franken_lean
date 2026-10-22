@@ -16,10 +16,11 @@ use fln_rt::region::{RegionFault, audit, materialize};
 use std::collections::BTreeSet;
 
 pub use format::{
-    ALIAS_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION, CLASS_EXTENSION,
-    DEFAULT_EXTENSION, DEFEQ_EXTENSION, EXTERN_EXTENSION, IMPLEMENTED_BY_EXTENSION,
-    INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION, PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION,
-    SIMP_EXTENSION, STRUCTURE_EXTENSION,
+    ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
+    CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, EXTERN_EXTENSION,
+    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
+    PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
+    REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
@@ -93,6 +94,16 @@ pub struct AliasEntry {
     pub declaration: Name,
 }
 
+/// An `@[app_unexpander key] declaration` registration (the pin's
+/// `appUnexpanderAttribute`): applications of `key` print through `declaration`, compiled
+/// code this door does not run. `scope` names the namespace of a `scoped` registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppUnexpanderEntry {
+    pub key: Name,
+    pub declaration: Name,
+    pub scope: Option<Name>,
+}
+
 /// The pin's `implementedByAttr`: an explicit executable replacement. Both
 /// names still need checked ownership/type validation before source activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +164,12 @@ pub struct SourceExtensions {
     /// Ordered initialization journals. A named initializer replaces a stored
     /// body at runtime; an anonymous parameter denotes a standalone IO action.
     pub initializers: crate::initializers::InitJournals,
+    /// Structures tagged `@[pp_using_anonymous_constructor]`, which print as `⟨…⟩`.
+    pub pp_anonymous_constructor: Vec<Name>,
+    /// Functions tagged `@[pp_nodot]`, never printed with field notation.
+    pub pp_nodot: Vec<Name>,
+    /// `@[app_unexpander]` registrations, in journal order.
+    pub app_unexpanders: Vec<AppUnexpanderEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -415,6 +432,35 @@ impl Reader {
             status,
         })
     }
+    /// A scope-wrapped `KeyedDeclsAttribute.OLeanEntry` (the same `ScopedEnvExtension.Entry`
+    /// wrapper as an instance's).
+    fn app_unexpander(&mut self, obj: &Obj) -> Result<AppUnexpanderEntry, DecodeError> {
+        if obj.is_scalar() {
+            return Err(shape("unexpander entry lacks its scope wrapper"));
+        }
+        let (scope, entry) = match obj.obj_tag() as u8 {
+            format::SCOPE_GLOBAL => {
+                constructor(obj, format::SCOPE_GLOBAL, 1)?;
+                (None, field(obj, 0)?)
+            }
+            format::SCOPE_SCOPED => {
+                constructor(obj, format::SCOPE_SCOPED, 2)?;
+                (Some(self.name(&field(obj, 0)?)?), field(obj, 1)?)
+            }
+            _ => return Err(shape("unknown unexpander scope tag")),
+        };
+        constructor(&entry, 0, format::KEYED_ENTRY_POINTERS)?;
+        let key = self.name(&field(&entry, format::KEYED_ENTRY_KEY)?)?;
+        let declaration = self.name(&field(&entry, format::KEYED_ENTRY_DECL_NAME)?)?;
+        if key.is_anonymous() || declaration.is_anonymous() {
+            return Err(shape("anonymous unexpander key or declaration"));
+        }
+        Ok(AppUnexpanderEntry {
+            key,
+            declaration,
+            scope,
+        })
+    }
     fn alias(&mut self, obj: &Obj) -> Result<AliasEntry, DecodeError> {
         constructor(obj, 0, format::PROD_POINTERS)?;
         Ok(AliasEntry {
@@ -457,6 +503,9 @@ pub fn decode(
         name(format::NONCOMPUTABLE_EXTENSION),
         name(format::DEFEQ_EXTENSION),
         name(format::BACKWARD_DEFEQ_EXTENSION),
+        name(format::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION),
+        name(format::PP_NODOT_EXTENSION),
+        name(format::APP_UNEXPANDER_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -473,6 +522,8 @@ pub fn decode(
     let mut noncomputable = BTreeSet::new();
     let mut defeq = BTreeSet::new();
     let mut backward_defeq = BTreeSet::new();
+    let mut pp_anonymous_constructor = BTreeSet::new();
+    let mut pp_nodot = BTreeSet::new();
     let mut structures = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
@@ -571,7 +622,23 @@ pub fn decode(
                     }
                     names.push(declaration);
                 }
-                _ => unreachable!("sixteen selected extension families"),
+                16 | 17 => {
+                    let declaration = reader.name(&obj)?;
+                    let (seen, names) = if kind == 16 {
+                        (
+                            &mut pp_anonymous_constructor,
+                            &mut out.pp_anonymous_constructor,
+                        )
+                    } else {
+                        (&mut pp_nodot, &mut out.pp_nodot)
+                    };
+                    if declaration.is_anonymous() || !seen.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated delaborator tag"));
+                    }
+                    names.push(declaration);
+                }
+                18 => out.app_unexpanders.push(reader.app_unexpander(&obj)?),
+                _ => unreachable!("nineteen selected extension families"),
             }
         }
     }

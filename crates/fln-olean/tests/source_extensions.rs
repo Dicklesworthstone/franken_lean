@@ -595,3 +595,70 @@ fn every_key_kind_decodes_and_forged_keys_refuse() {
         assert!(read(&with_keys(forged)).is_err(), "{why} must refuse");
     }
 }
+
+/// `@[pp_using_anonymous_constructor]` (vendored `src/Init/Prelude.lean`) tags `And`, `Subtype`
+/// and `Fin` in the pinned Prelude, and nothing there is `@[pp_nodot]` or an
+/// `@[app_unexpander]`.
+#[test]
+fn real_prelude_decodes_the_delaborator_tags() {
+    let decoded = read(blocks()).unwrap();
+    let mut tagged: Vec<String> = decoded
+        .pp_anonymous_constructor
+        .iter()
+        .map(Name::to_display_string)
+        .collect();
+    tagged.sort();
+    assert_eq!(tagged, ["And", "Fin", "Subtype"]);
+    assert!(decoded.pp_nodot.is_empty());
+    assert!(decoded.app_unexpanders.is_empty());
+}
+
+/// The pinned `Init.NotationExtra` registers its unexpanders globally, `(a, b)` for
+/// `Prod.mk` among them (vendored `src/Init/NotationExtra.lean`).
+#[test]
+fn real_notation_extra_decodes_its_app_unexpanders() {
+    let lib = match std::env::var("FLN_REFERENCE_LIB") {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => match std::env::var("HOME") {
+            Ok(home) => std::path::PathBuf::from(home)
+                .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean"),
+            Err(_) => return,
+        },
+    };
+    let path = lib.join("Init/NotationExtra.olean");
+    let Ok(public) = std::fs::read(&path) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference library is required"
+        );
+        eprintln!("SKIP: pinned Reference lib/lean absent");
+        return;
+    };
+    let server = std::fs::read(path.with_extension("olean.server")).unwrap();
+    let private = std::fs::read(path.with_extension("olean.private")).unwrap();
+    let blocks = OleanView::parse_with_dependencies(&private, &[&public, &server])
+        .unwrap()
+        .extension_payloads(WalkBudget::default(), 32 << 20)
+        .unwrap();
+    let decoded = read(&blocks).unwrap();
+    let keys: std::collections::BTreeSet<String> = decoded
+        .app_unexpanders
+        .iter()
+        .map(|entry| entry.key.to_display_string())
+        .collect();
+    for key in ["Prod.mk", "List.cons", "Unit.unit"] {
+        assert!(keys.contains(key), "{key}: {keys:?}");
+    }
+    assert!(
+        decoded
+            .app_unexpanders
+            .iter()
+            .all(|entry| entry.scope.is_none())
+    );
+    let prod = decoded
+        .app_unexpanders
+        .iter()
+        .find(|entry| entry.key == n("Prod.mk"))
+        .unwrap();
+    assert_eq!(prod.declaration, n("unexpandProdMk"));
+}
