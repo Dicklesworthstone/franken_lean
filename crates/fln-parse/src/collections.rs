@@ -590,7 +590,8 @@ fn index_proof(
         .map(|token| &token.kind)
     {
         Some(TokenKind::Ident(_)) => at + 1,
-        Some(TokenKind::Symbol(s)) if s == "_" => at + 1,
+        // `sorry` is a keyword term at `maxPrec` (`Lean.Parser.Term.sorry`).
+        Some(TokenKind::Symbol(s)) if s == "_" || s == "sorry" => at + 1,
         Some(TokenKind::Symbol(s)) if matches!(canonical_bracket(s), "(" | "⟨") => {
             let mut depth = 0usize;
             let mut close = None;
