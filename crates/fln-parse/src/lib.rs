@@ -2192,10 +2192,43 @@ fn push_bounded_operand(
     empty_at: usize,
 ) -> Result<(), NatDefinitionParseError> {
     let application = std::mem::take(&mut frame.application);
+    // `Term.argument := checkWsBefore >> checkColGt >> …` (vendored `Lean/Parser/Term.lean:885`):
+    // an argument starts right of the saved position. A command saves its own start
+    // (`withPosition`, `Lean/Parser/Module.lean:133`), and a bracket clears it
+    // (`withoutPosition`). So outside every bracket an argument at or left of the command's first
+    // token is no argument at the pin: the term ends before it, and what follows is no command
+    // (`def g : Nat := f` with `2` at column 0 on the next line). Later positions a construct saves
+    // lie right of the command's, so this checks the weakest of them.
+    if frame.open.is_none() {
+        for (_, at) in application.iter().skip(1) {
+            if !right_of_command_start(view, tokens, *at) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, *at),
+                    expected: NatDefinitionExpectation::EndOfCommand,
+                });
+            }
+        }
+    }
     let first_at = application.first().map_or(empty_at, |(_, at)| *at);
     let term = finish_bounded_application(view, tokens, application, grammar, empty_at)?;
     frame.operands.push((term, first_at));
     Ok(())
+}
+
+/// Whether token `at` starts right of the command's first token, in codepoint columns as the
+/// pin's `FileMap` counts them. A token the view cannot place is taken to pass.
+fn right_of_command_start(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
+    let text = view.normalized();
+    let column = |index: usize| {
+        tokens
+            .get(index)
+            .and_then(|token| text.position_of(token.extent.start()))
+            .map(|position| position.scalar_column)
+    };
+    match (column(at), column(0)) {
+        (Some(argument), Some(command)) => argument > command,
+        _ => true,
+    }
 }
 
 fn push_bounded_infix(
