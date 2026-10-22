@@ -698,3 +698,100 @@ theorem wrong : imported! 0 = 8 := rfl
             .is_err()
     );
 }
+
+#[test]
+fn terminal_module_errors_keep_the_query_offset_and_inner_parse_position() {
+    let base = engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let execution = EngineExecutionLimits::new(limits().source.admission.kernel);
+    let library = "def libValue : Nat := 7";
+    let invalid = "-- 😀\r\nimport Lib\r\n\r\n#check unknownTerminal\r\n";
+    let error = with_modules(&[("Main", invalid), ("Lib", library)], |inputs| {
+        base.check_terminal_source_modules(inputs, &name("Main"), &options, execution)
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("unknownTerminal"), "{error:?}");
+    assert_eq!(
+        error.primary_source_offset().map(|offset| offset.0),
+        invalid.find("#check"),
+        "an elaboration failure must retain the terminal command's file offset: {error:?}"
+    );
+    assert_eq!(base.logical_root(&options), before);
+    assert!(!base.environment().contains(&name("libValue")));
+
+    let malformed = "-- 😀\r\nimport Lib\r\n\r\n#check (7 : )\r\n";
+    let error = with_modules(&[("Main", malformed), ("Lib", library)], |inputs| {
+        base.check_terminal_source_modules(inputs, &name("Main"), &options, execution)
+    })
+    .unwrap_err();
+    assert_eq!(
+        error.primary_source_offset().map(|offset| offset.0),
+        malformed.find(')'),
+        "a token-precise parse failure must outrank the command fallback: {error:?}"
+    );
+    assert_eq!(base.logical_root(&options), before);
+
+    let checked = with_modules(
+        &[("Main", "import Lib\n#check libValue"), ("Lib", library)],
+        |inputs| base.check_terminal_source_modules(inputs, &name("Main"), &options, execution),
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    assert_eq!(
+        checked.check.checked_type,
+        fln::Expr::const_(name("Nat"), Vec::new())
+    );
+    assert!(
+        checked
+            .definition_prefix
+            .unwrap()
+            .engine
+            .environment()
+            .contains(&name("libValue"))
+    );
+    assert_eq!(base.logical_root(&options), before);
+}
+
+#[test]
+fn flat_nat_batch_errors_keep_file_offsets_without_publishing_the_prefix() {
+    let base = engine();
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    let execution = EngineExecutionLimits::new(limits().source.admission.kernel);
+    let first = "-- a longer first file\r\ndef firstValue : Nat := 7\r\n";
+    let invalid = "-- 😀\r\ndef secondValue : Nat := unknownBatch\r\n";
+    let error = base
+        .execute_nat_definitions(&[first.as_bytes(), invalid.as_bytes()], &options, execution)
+        .unwrap_err();
+    assert!(error.to_string().contains("unknownBatch"), "{error:?}");
+    assert!(matches!(
+        &error,
+        fln::EngineExecutionError::BatchCommand { index: 1, .. }
+    ));
+    assert_eq!(
+        error.primary_source_offset().map(|offset| offset.0),
+        invalid.find("def"),
+        "a flattened command index must not erase its per-file offset: {error:?}"
+    );
+    assert_eq!(base.logical_root(&options), before);
+    assert!(!base.environment().contains(&name("firstValue")));
+    assert!(!base.environment().contains(&name("secondValue")));
+
+    let checked = base
+        .execute_nat_definitions(
+            &[first.as_bytes(), b"def secondValue : Nat := firstValue + 1"],
+            &options,
+            execution,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.executions.len(), 2);
+    assert_eq!(
+        fln::closed_vm_value(&checked.executions.last().unwrap().exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(8))
+    );
+    assert_eq!(base.logical_root(&options), before);
+}
