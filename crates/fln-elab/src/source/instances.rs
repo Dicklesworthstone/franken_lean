@@ -370,18 +370,8 @@ impl Context {
             if captured.is_empty() {
                 continue;
             }
-            let mut type_ = self.instantiate(&declaration.type_)?;
-            for local in captured.iter().rev() {
-                let domain = self.instantiate(&local.type_)?;
-                type_ = Expr::forall_e(
-                    local.user_name.clone(),
-                    domain,
-                    type_
-                        .abstract_fvar(&local.id, 0)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?,
-                    local.binder_info,
-                );
-            }
+            let type_ = self.instantiate(&declaration.type_)?;
+            let type_ = self.forall_captured(&captured, type_)?;
             let name = self.fresh_name()?;
             let abstracted = MVarId(name.clone());
             self.txn.mvars.declare(
@@ -430,6 +420,27 @@ impl Context {
             body.type_ = replacements.instantiate(&body.type_);
         }
         Ok(())
+    }
+
+    /// `∀ x₁ … xₖ, type_` over `captured`, outermost first: the type of a metavariable standing
+    /// outside their binders for one inside them.
+    pub(super) fn forall_captured(
+        &mut self,
+        captured: &[LocalDecl],
+        mut type_: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        for local in captured.iter().rev() {
+            let domain = self.instantiate(&local.type_)?;
+            type_ = Expr::forall_e(
+                local.user_name.clone(),
+                domain,
+                type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
+        Ok(type_)
     }
 
     /// Assign each captured goal's `?n := fun x₁ … xₖ => v` once the goal is solved by `v` and

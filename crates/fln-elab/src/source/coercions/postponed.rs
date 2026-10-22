@@ -56,6 +56,83 @@ impl Context {
         }))
     }
 
+    /// Before a `fun` or `∀` closes over `locals`, give each postponed coercion's hole that `body`
+    /// holds, and whose context holds one of them, the value `?n x₁ … xₖ`, with `?n` outside the
+    /// binders, in `outer`: the pin's `elimMVarDeps` (`MetavarContext.elimMVar`) for a natural
+    /// metavariable. The coercion resumed later then solves `?n` as a pattern
+    /// (`?n a b =?= decide (a < b)`), and its value stays under the binders. True when a hole was
+    /// assigned, so the caller instantiates `body` again.
+    pub(in crate::source) fn capture_bound_coercions(
+        &mut self,
+        locals: &[LocalDecl],
+        outer: &LocalContext,
+        body: &Typed,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if locals.is_empty() || self.postponed_coercions.is_empty() {
+            return Ok(false);
+        }
+        let mut present = self.txn.mvars.collect_mvars(&body.value);
+        present.extend(self.txn.mvars.collect_mvars(&body.type_));
+        let holes: Vec<Expr> = self
+            .postponed_coercions
+            .iter()
+            .map(|record| record.hole.clone())
+            .collect();
+        let mut assigned = false;
+        for hole in holes {
+            self.tick()?;
+            let ExprNode::MVar { id } = hole.node() else {
+                continue;
+            };
+            if !present.contains(id) {
+                continue;
+            }
+            let declaration = self
+                .txn
+                .mvars
+                .get_decl(id)
+                .cloned()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let captured: Vec<LocalDecl> = locals
+                .iter()
+                .filter(|local| declaration.lctx.find(&local.id).is_some())
+                .cloned()
+                .collect();
+            if captured.is_empty() {
+                continue;
+            }
+            let type_ = self.instantiate(&declaration.type_)?;
+            let type_ = self.forall_captured(&captured, type_)?;
+            let name = self.fresh_name()?;
+            let abstracted = MVarId(name.clone());
+            self.txn.mvars.declare(
+                abstracted.clone(),
+                name,
+                type_,
+                outer.clone(),
+                MetavarKind::Natural,
+                0,
+                None,
+            );
+            let application = captured.iter().fold(Expr::mvar(abstracted), |head, local| {
+                Expr::app(head, Expr::fvar(local.id.clone()))
+            });
+            self.txn
+                .assign_mvar(
+                    id.clone(),
+                    application,
+                    AssignmentJustification::SyntheticHole,
+                )
+                .map_err(|error| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(error),
+                    )))
+                })?;
+            assigned = true;
+        }
+        Ok(assigned)
+    }
+
     /// Retry every postponed coercion once, in its own local context. True
     /// when one completed, so synthesis has new work to resume.
     pub(in crate::source) fn resume_postponed_coercions(
