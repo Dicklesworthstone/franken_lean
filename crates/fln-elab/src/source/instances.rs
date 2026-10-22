@@ -21,6 +21,15 @@ const DEFAULT_MAX_RESULT_SIZE: u64 = 128;
 /// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
 pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
 
+/// An instance goal a `fun` or `∀` closed over before it was solved: `abstracted` stands in the
+/// closed term for the goal over `locals` ([`Context::capture_bound_instances`]).
+#[derive(Clone, Debug)]
+pub(super) struct BoundInstance {
+    abstracted: MVarId,
+    goal: MVarId,
+    locals: Vec<LocalDecl>,
+}
+
 /// The pin distinguishes a failed search from a goal whose inputs are still
 /// unknown (`Meta.trySynthInstance`). Only the latter remains pending for
 /// default instances; a concrete failure must never be rescued by broader
@@ -320,6 +329,169 @@ impl Context {
         self.whnf_with_transparency(type_, UnificationTransparency::Abbreviations, false)
     }
 
+    /// Before a `fun` or `∀` closes over `locals`, take its unsolved instance goals whose context
+    /// holds one of them out of `body`: each becomes `?n x₁ … xₖ` over the locals it may use,
+    /// with `?n` outside the binders, in `outer`. A goal solved after the binders close may then
+    /// mention them without escaping its scope. The pin's `mkLambdaFVars` does this through
+    /// `elimMVarDeps`, delaying `?n`'s assignment until the goal is solved
+    /// (`MetavarContext.elimMVar`); [`Context::settle_bound_instances`] assigns it then.
+    pub(super) fn capture_bound_instances(
+        &mut self,
+        locals: &[LocalDecl],
+        outer: &LocalContext,
+        body: &mut Typed,
+    ) -> Result<(), NatDefinitionElabError> {
+        if locals.is_empty()
+            || self.instance_goals.is_empty()
+            || !(body.value.has_expr_mvar() || body.type_.has_expr_mvar())
+        {
+            return Ok(());
+        }
+        let mut present = self.txn.mvars.collect_mvars(&body.value);
+        present.extend(self.txn.mvars.collect_mvars(&body.type_));
+        let mut replacements = crate::mvar::MetavarStore::new();
+        let mut captured_any = false;
+        for goal in self.instance_goals.clone() {
+            self.tick()?;
+            if !present.contains(&goal) {
+                continue;
+            }
+            let declaration = self
+                .txn
+                .mvars
+                .get_decl(&goal)
+                .cloned()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let captured: Vec<LocalDecl> = locals
+                .iter()
+                .filter(|local| declaration.lctx.find(&local.id).is_some())
+                .cloned()
+                .collect();
+            if captured.is_empty() {
+                continue;
+            }
+            let mut type_ = self.instantiate(&declaration.type_)?;
+            for local in captured.iter().rev() {
+                let domain = self.instantiate(&local.type_)?;
+                type_ = Expr::forall_e(
+                    local.user_name.clone(),
+                    domain,
+                    type_
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+            let name = self.fresh_name()?;
+            let abstracted = MVarId(name.clone());
+            self.txn.mvars.declare(
+                abstracted.clone(),
+                name,
+                type_,
+                outer.clone(),
+                MetavarKind::SyntheticOpaque,
+                0,
+                None,
+            );
+            let application = captured
+                .iter()
+                .fold(Expr::mvar(abstracted.clone()), |head, local| {
+                    Expr::app(head, Expr::fvar(local.id.clone()))
+                });
+            replacements.declare(
+                goal.clone(),
+                goal.0.clone(),
+                declaration.type_,
+                LocalContext::new(),
+                MetavarKind::Natural,
+                0,
+                None,
+            );
+            replacements
+                .assign(
+                    goal.clone(),
+                    application,
+                    AssignmentJustification::SyntheticHole,
+                )
+                .map_err(|error| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(error),
+                    )))
+                })?;
+            self.bound_instances.push(BoundInstance {
+                abstracted,
+                goal,
+                locals: captured,
+            });
+            captured_any = true;
+        }
+        if captured_any {
+            body.value = replacements.instantiate(&body.value);
+            body.type_ = replacements.instantiate(&body.type_);
+        }
+        Ok(())
+    }
+
+    /// Assign each captured goal's `?n := fun x₁ … xₖ => v` once the goal is solved by `v` and
+    /// `v` holds no unsolved hole that could still mention the locals (the pin instantiates a
+    /// delayed assignment only then, `instantiateMVars`' `delayed` case).
+    pub(super) fn settle_bound_instances(&mut self) -> Result<(), NatDefinitionElabError> {
+        loop {
+            let mut settled = None;
+            for (index, bound) in self.bound_instances.iter().enumerate() {
+                if !self.txn.mvars.is_assigned(&bound.goal) {
+                    continue;
+                }
+                let value = self
+                    .txn
+                    .instantiate_expr(&Expr::mvar(bound.goal.clone()))
+                    .map_err(|error| failure(SourceInferenceError::Universe(error)))?;
+                let open = self.txn.mvars.collect_mvars(&value).into_iter().any(|id| {
+                    self.txn.mvars.get_decl(&id).is_none_or(|declaration| {
+                        bound
+                            .locals
+                            .iter()
+                            .any(|local| declaration.lctx.find(&local.id).is_some())
+                    })
+                });
+                if !open {
+                    settled = Some((index, value));
+                    break;
+                }
+            }
+            let Some((index, mut value)) = settled else {
+                return Ok(());
+            };
+            let bound = self.bound_instances.remove(index);
+            for local in bound.locals.iter().rev() {
+                self.tick()?;
+                let domain = self
+                    .txn
+                    .instantiate_expr(&local.type_)
+                    .map_err(|error| failure(SourceInferenceError::Universe(error)))?;
+                value = Expr::lam(
+                    local.user_name.clone(),
+                    domain,
+                    value
+                        .abstract_fvar(&local.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    local.binder_info,
+                );
+            }
+            self.txn
+                .assign_mvar(
+                    bound.abstracted,
+                    value,
+                    AssignmentJustification::SyntheticHole,
+                )
+                .map_err(|error| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(error),
+                    )))
+                })?;
+        }
+    }
+
     pub(super) fn instance_hole(&mut self, type_: Expr) -> Result<Expr, NatDefinitionElabError> {
         let name = self.fresh_name()?;
         let id = MVarId(name.clone());
@@ -430,6 +602,9 @@ impl Context {
                             trial.equations.push(equation);
                         }
                         *self = trial;
+                        if !self.bound_instances.is_empty() {
+                            self.settle_bound_instances()?;
+                        }
                     }
                     Ok(SearchResult::Stuck) => {}
                     Ok(SearchResult::Failed) => {

@@ -567,6 +567,8 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
+    // Instance goals a `fun` or `∀` closed over before they were solved (`instances.rs`).
+    bound_instances: Vec<instances::BoundInstance>,
     // Nesting of pending instance synthesis started by unification, the pin's
     // `synthPendingDepth`. Bounded by `MAX_SYNTH_PENDING_DEPTH`.
     synth_pending_depth: u8,
@@ -692,6 +694,7 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
+            bound_instances: Vec::new(),
             synth_pending_depth: 0,
             overload_depth: 0,
             level_params: Vec::new(),
@@ -790,6 +793,9 @@ impl Context {
 
     fn instantiate(&mut self, value: &Expr) -> Result<Expr, NatDefinitionElabError> {
         self.tick()?;
+        if !self.bound_instances.is_empty() {
+            self.settle_bound_instances()?;
+        }
         self.txn
             .instantiate_expr(value)
             .map_err(|error| failure(SourceInferenceError::Universe(error)))
@@ -1374,6 +1380,11 @@ impl Context {
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
         if !final_pass && self.flush_is_stalled() {
             return Ok(());
+        }
+        // The unifier instantiates the equations itself, so a goal solved under a closed binder
+        // is put back into place before it reads them.
+        if !self.bound_instances.is_empty() {
+            self.settle_bound_instances()?;
         }
         loop {
             if self.equations.is_empty() {

@@ -3,9 +3,11 @@
 //! default instance applied to fresh holes. It registers the instance arguments as new goals, for
 //! later synthesis or another default to solve. Synthesis then resumes over everything the
 //! assignment decided. So `v + k`, over the pattern variables of a `match` on a numeral, is
-//! `instHAdd` with `Add ?α` open until `instOfNatNat` fixes `?α`. Every program here was run
-//! through the pinned `lean` v4.32.0 with the same header first (2026-10-11), with the same
-//! verdict.
+//! `instHAdd` with `Add ?α` open until `instOfNatNat` fixes `?α`. A goal still open when its `fun`
+//! closes, as `Decidable (a ≥ 0)` in `(fun a => ite (a ≥ 0) 1 0) (3 : Nat)`, is solved once the
+//! argument fixes `a`'s type, and its answer stays under the binder (the pin's `elimMVarDeps`).
+//! Every program here was run through the pinned `lean` v4.32.0 with the same header first
+//! (2026-10-11; the `fun` cases 2026-10-21), with the same verdict.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,6 +107,14 @@ fn default_instances_leave_their_arguments_to_later_synthesis() {
             "def f (n : Nat) := n ^ 2 + 1\ntheorem t : f 3 = 10 := rfl\n",
         ),
         ("power_lambda", "example : (fun x => x ^ 2) 3 = 9 := rfl\n"),
+        (
+            "decidable_under_fun",
+            "def f : Nat := (fun a => ite (GE.ge a 0) 1 0) (3 : Nat)\ntheorem t : f = 1 := rfl\n",
+        ),
+        (
+            "decide_under_fun",
+            "theorem t : (fun a b => decide (a < b)) (1 : Nat) 2 = true := rfl\n",
+        ),
     ] {
         let (code, stdout, stderr) = check(&lib, &root, name, program);
         assert_eq!(code, 0, "{name}: {program}\n{stdout}\n{stderr}");
@@ -145,6 +155,11 @@ fn default_instance_refusals_match_the_pin() {
         (
             "power_wrong",
             "theorem t : 2 ^ 10 = 1023 := rfl\n",
+            "Not a definitional equality",
+        ),
+        (
+            "decidable_under_fun_wrong",
+            "def f : Nat := (fun a => ite (GE.ge a 5) 1 0) (3 : Nat)\ntheorem t : f = 1 := rfl\n",
             "Not a definitional equality",
         ),
         (
