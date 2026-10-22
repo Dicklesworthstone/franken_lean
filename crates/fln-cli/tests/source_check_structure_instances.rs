@@ -122,6 +122,24 @@ const NOTATION_EXTRA_EXPECTED: &str = "Unit.unit : Unit
 Nat × (n : Nat) × Fin n : Type
 ";
 
+/// A `scoped` unexpander is in force only where its namespace is active. `Int.negSucc`'s
+/// `-[n+1]` (`scoped notation` in `Init/Data/Int/Basic.lean:74`) is scoped to `Int`, so the pin
+/// prints `Int.negSucc 9` outside it, and in another namespace.
+const SCOPED: &str = r#"prelude
+import Init.Data.Int.Basic
+#reduce Int.negSucc 9
+namespace Foo
+#reduce Int.negSucc 9
+end Foo
+#reduce (Int.ofNat 3, Int.negSucc 2)
+"#;
+
+/// The pin's output for [`SCOPED`].
+const SCOPED_EXPECTED: &str = "Int.negSucc 9
+Int.negSucc 9
+{ fst := Int.ofNat 3, snd := Int.negSucc 2 }
+";
+
 /// What this door refuses rather than print another way: a local type without fields (the pin
 /// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field with a default
 /// value (which the pin omits when the value equals it).
@@ -132,12 +150,14 @@ Nat × (n : Nat) × Fin n : Type
 /// With `Init.NotationExtra` imported, an application another registered unexpander prints
 /// (`Subtype` as `{ n // n = 1 }`) is refused too, and so is a term holding binders this engine's
 /// elaboration introduced (an `if` it compiles to `Decidable.rec`, where the pin has `ite`).
+/// Inside `open Int`, the pin prints `Int.negSucc 9` as `-[9+1]`, which is refused here too.
 const REFUSED: &[&str] = &[
     "prelude\nimport Init.Core\nstructure E\n#check ({ } : E)\n",
     "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 4 } : D)\n",
     "prelude\nimport Init.NotationExtra\n#check (⟨1, rfl⟩ : Subtype (fun n : Nat => n = 1))\n",
     "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n",
     "prelude\nimport Init.Core\n#check Sigma fun (n : Nat) => Fin n\n",
+    "prelude\nimport Init.Data.Int.Basic\nopen Int in\n#reduce Int.negSucc 9\n",
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -261,6 +281,26 @@ fn registered_unexpanders_print_tuples_lists_and_unit_as_the_pin_does() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, NOTATION_EXTRA_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn a_scoped_unexpander_is_in_force_only_where_its_namespace_is_active() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Scoped.lean");
+    std::fs::write(&entry, SCOPED).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, SCOPED_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, SCOPED_EXPECTED, "{stderr}");
 }
 
 #[test]

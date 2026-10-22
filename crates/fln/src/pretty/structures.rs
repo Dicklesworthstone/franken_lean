@@ -28,7 +28,7 @@ impl<'a> Printer<'a> {
             .as_ref()
             .ok_or(Unsupported("an unreadable delaborator tag journal"))?;
         // `(appUnexpanderAttribute.getValues env s.name).isEmpty`.
-        if tags.unexpanded(&ctor.base.name) || self.notation_prints(&ctor.base.name) {
+        if self.unexpander_in_force(&ctor.base.name) || self.notation_prints(&ctor.base.name) {
             return Err(Unsupported("a constructor an unexpander prints"));
         }
         if tags.anonymous_constructor(&ctor.induct) {

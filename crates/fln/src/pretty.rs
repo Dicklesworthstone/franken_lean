@@ -1408,7 +1408,7 @@ impl<'a> Printer<'a> {
             // Any other constant an imported `@[app_unexpander]` prints (`ite` as `if … then …
             // else …`, `GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
             // its application is refused rather than printed as an application.
-            if self.imported_tags && self.tags.as_ref().is_some_and(|tags| tags.unexpanded(name)) {
+            if self.imported_tags && self.unexpander_in_force(name) {
                 return Err(Unsupported("an application an `@[app_unexpander]` prints"));
             }
             let infos = self.binder_infos(name);
@@ -1481,11 +1481,23 @@ impl<'a> Printer<'a> {
     /// Whether an `@[app_unexpander]` is registered for `key`, which this printer reproduces.
     fn registered(&self, key: &str) -> bool {
         match &self.tags {
-            Some(tags) if self.imported_tags => {
-                tags.unexpanded(&Name::from_components(key.split('.')))
+            Some(_) if self.imported_tags => {
+                self.unexpander_in_force(&Name::from_components(key.split('.')))
             }
             _ => true,
         }
+    }
+
+    /// Whether an imported `@[app_unexpander]` for `constant` is in force here. A `scoped` one
+    /// is in force where its namespace is active in this command's scope. Without a scope,
+    /// every registered one is taken to be in force.
+    fn unexpander_in_force(&self, constant: &Name) -> bool {
+        self.tags.as_ref().is_some_and(|tags| {
+            tags.unexpanded(constant, |namespace| {
+                self.scope
+                    .is_none_or(|scope| scope.instance_scopes.is_active(namespace))
+            })
+        })
     }
 
     /// `unexpandProdMk` (`Init/NotationExtra.lean:168-171`): `Prod.mk x y` is `(x, y)`, and a

@@ -16,7 +16,7 @@ use fln_env::environment::Environment;
 use fln_env::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8] = b"FLNDLBT\x01";
 const MAX_ROWS: usize = 65_536;
@@ -213,12 +213,13 @@ pub fn register_module(
 pub struct DelaboratorTags {
     anonymous_constructor: BTreeSet<Name>,
     nodot: BTreeSet<Name>,
-    unexpanded: BTreeSet<Name>,
+    /// Each constant's `@[app_unexpander]` registrations: `None` for a global one, and the
+    /// namespace of a `scoped` one.
+    unexpanded: BTreeMap<Name, BTreeSet<Option<Name>>>,
 }
 
 impl DelaboratorTags {
-    /// Validate and read every recorded tag. A `scoped` unexpander counts as registered
-    /// whatever namespace is open, which only ever withholds a structure instance.
+    /// Validate and read every recorded tag, keeping each unexpander's scope.
     pub fn read(env: &Environment) -> Result<Self, DelaboratorTagError> {
         let Some(extension) = env.extension(&journal_name()) else {
             return Ok(Self::default());
@@ -271,8 +272,8 @@ impl DelaboratorTags {
                             return Err(DelaboratorTagError::Duplicate(name));
                         }
                     }
-                    DelaboratorTag::Unexpander { key, .. } => {
-                        tags.unexpanded.insert(key);
+                    DelaboratorTag::Unexpander { key, scope } => {
+                        tags.unexpanded.entry(key).or_default().insert(scope);
                     }
                 }
             }
@@ -293,9 +294,16 @@ impl DelaboratorTags {
         self.nodot.contains(function)
     }
 
-    /// Whether an `@[app_unexpander]` is registered for applications of `constant`.
-    pub fn unexpanded(&self, constant: &Name) -> bool {
-        self.unexpanded.contains(constant)
+    /// Whether an `@[app_unexpander]` for applications of `constant` is in force: a global
+    /// one always, and a `scoped` one where `active` holds of its namespace (`open N`, or
+    /// inside `namespace N`). `Int.negSucc`'s `-[n+1]` is scoped to `Int`, so the pin prints
+    /// `Int.negSucc 9` outside it.
+    pub fn unexpanded(&self, constant: &Name, active: impl Fn(&Name) -> bool) -> bool {
+        self.unexpanded.get(constant).is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|scope| scope.as_ref().is_none_or(&active))
+        })
     }
 }
 
