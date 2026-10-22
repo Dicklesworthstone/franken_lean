@@ -43,6 +43,45 @@ def p6 (o : Option Nat) : Nat :=
   | none => 1
 ";
 
+/// Patterns under an indexed family's constructor, where the index is a variable the match
+/// generalizes: the pin warns about the fields read here (`x`, `b : Fin (n + 1)`) and not about
+/// an index field (`k`) or one of an indexed family's type (`t`), which this door leaves
+/// unread. `Box.mk n` names no indexed constructor although `Tagged.mk` is spelled like it.
+/// Each family's constructors are spelled apart: the pin resolves a dotted head (`.cons`) by the
+/// expected type, which this door does not read, so constructors spelled alike are read together
+/// and only the fields all of them read stay decided.
+const INDEXED: &str = "inductive IVec (A : Type) : Nat → Type where
+  | inil : IVec A 0
+  | icons {n : Nat} (head : A) (tail : IVec A n) : IVec A (n + 1)
+inductive EVec (A : Type) : Nat → Type where
+  | enil : EVec A 0
+  | econs (n : Nat) (head : A) (tail : EVec A n) : EVec A (n + 1)
+inductive FVec (A : Type) : Nat → Type where
+  | fnil : FVec A 0
+  | fcons {n : Nat} (bound : Fin (n + 1)) (head : A) (tail : FVec A n) : FVec A (n + 1)
+inductive Tagged : Nat → Type where
+  | mk (n : Nat) : Tagged n
+structure Box where
+  val : Nat
+inductive Wrap (B : Type) where
+  | wrap (x : B)
+def i1 {A : Type} {m : Nat} : IVec A m → Nat
+  | .icons x t => 1
+  | .inil => 0
+def i2 {A : Type} {m : Nat} : EVec A m → Nat
+  | .econs k x t => 1
+  | .enil => 0
+def i3 {A : Type} {m : Nat} : FVec A m → Nat
+  | .fcons b x t => 1
+  | .fnil => 0
+def i4 {A : Type} {m : Nat} (v : IVec A m) : Nat :=
+  match v with
+  | .icons x t => 1
+  | .inil => 0
+def i5 : Wrap Box → Nat
+  | Wrap.wrap (Box.mk n) => 0
+";
+
 /// `fun` binders (plain, typed, grouped, a tuple pattern, `_`) and the binder of an implicit
 /// dependent arrow, which the pin lints while it ignores an explicit one.
 const FUNCTIONS: &str = "def f1 : Nat → Nat := fun x => 0
@@ -148,6 +187,7 @@ const IDENTICAL: &[(&str, &str)] = &[
     ("scopes", SCOPES),
     ("locals", LOCALS),
     ("patterns", PATTERNS),
+    ("indexed", INDEXED),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
     (
@@ -173,13 +213,33 @@ const IDENTICAL: &[(&str, &str)] = &[
 ];
 
 /// A tactic body with `where` helpers is left undecided: the pin warns about `m` here, and
-/// this door prints nothing for it rather than read a term the pin need not share.
-const SUBSET: &[(&str, &str)] = &[(
-    "tactic_where",
-    "def w (n : Nat) (m : Nat) : Nat := helper n
+/// this door prints nothing for it rather than read a term the pin need not share. Under an
+/// indexed constructor whose index the match does not generalize (an applied index, one bound
+/// by `_`) or inside a named pattern, the pin warns about `t`, `va` and `bv` too, which this
+/// door leaves unread.
+const SUBSET: &[(&str, &str)] = &[
+    (
+        "tactic_where",
+        "def w (n : Nat) (m : Nat) : Nat := helper n
 where helper (k : Nat) : Nat := by exact k
 ",
-)];
+    ),
+    (
+        "indexed_unread",
+        "inductive IVec (A : Type) : Nat → Type where
+  | nil : IVec A 0
+  | cons {n : Nat} (head : A) (tail : IVec A n) : IVec A (n + 1)
+def s1 {A : Type} {m : Nat} : IVec A (m + 1) → Nat
+  | .cons x t => 1
+def s2 {A : Type} : {n : Nat} → IVec A n → IVec A n → A → A
+  | _, .cons a va, .cons b bv, _ => a
+  | _, .nil, .nil, z => z
+def s3 {A : Type} {m : Nat} : IVec A m → Nat
+  | w@(.cons x t) => 1
+  | .nil => 0
+",
+    ),
+];
 
 fn pinned_toolchain() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
@@ -285,6 +345,7 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
     for (name, program, count) in [
         ("linted", LINTED, 4),
         ("patterns", PATTERNS, 6),
+        ("indexed", INDEXED, 6),
         ("functions", FUNCTIONS, 8),
         ("scopes", SCOPES, 7),
         ("tactics", TACTICS, 8),

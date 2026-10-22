@@ -8570,28 +8570,41 @@ impl Engine {
                 )
                 .collect();
             // Every constructor spelling, for telling a pattern variable from a constructor, and
-            // the spellings of indexed families' constructors.
+            // the indexed families' constructors with the fields a pattern leaves unread.
             let spelling = |name: &Name| match name.leaf_view() {
                 fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
                 _ => None,
             };
+            let environment = engine.environment();
+            let indexed_family = |name: &Name| {
+                matches!(environment.find(name),
+                    Some(ConstantInfo::Induct(family)) if family.num_indices > 0)
+            };
             let constructors = unused_variables::Constructors {
-                names: engine
-                    .environment()
+                names: environment
                     .constants()
                     .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
                     .filter_map(|(name, _)| spelling(name))
                     .collect(),
-                indexed: engine
-                    .environment()
+                indexed: environment
                     .constants()
-                    .filter_map(|(_, info)| match info {
-                        ConstantInfo::Induct(family) if family.num_indices > 0 => {
-                            Some(family.ctors.iter().filter_map(spelling).collect::<Vec<_>>())
-                        }
+                    .filter_map(|(name, info)| match info {
+                        ConstantInfo::Ctor(ctor) => match environment.find(&ctor.induct) {
+                            Some(ConstantInfo::Induct(family)) if family.num_indices > 0 => {
+                                Some(unused_variables::IndexedConstructor {
+                                    name: name.clone(),
+                                    unread: unused_variables::unread_fields(
+                                        &ctor.base.type_,
+                                        ctor.num_params,
+                                        family.num_indices,
+                                        indexed_family,
+                                    ),
+                                })
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     })
-                    .flatten()
                     .collect(),
             };
             for (&(command, _), (offset, syntax, options)) in &lint_sites {

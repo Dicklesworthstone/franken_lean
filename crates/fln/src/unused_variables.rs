@@ -290,13 +290,116 @@ fn contains_atom_shallow(node: &Syntax, atom: &str) -> bool {
 /// it is qualified, heads an application, or is spelled like some constructor: the pin
 /// resolves it against the open namespaces, so any constructor spelling may be one.
 /// The environment's constructor spellings (the last component of each name), for telling a
-/// pattern variable from a constructor, and those of an indexed family's constructors.
+/// pattern variable from a constructor, and its indexed families' constructors.
 pub(crate) struct Constructors {
     pub(crate) names: HashSet<String>,
-    /// A pattern headed by one of these is not read: the pin elaborates it by unifying the
-    /// family's indices, which can make a pattern variable occur in an assignment and so count
-    /// as used (`| .cons k x tail => x` over `Vec A (n + 1)` warns about none of them).
-    pub(crate) indexed: HashSet<String>,
+    pub(crate) indexed: Vec<IndexedConstructor>,
+}
+
+/// A constructor of a family with indices, and which of its explicit fields this module leaves
+/// unread in a pattern.
+///
+/// The pin's use of such a field depends on how its match elaborator treats the family's
+/// indices. Measured against the pinned v4.32.0 over `IVec A m` (`{n} (head : A)
+/// (tail : IVec A n) : IVec A (n + 1)`), with `m` a variable the match must generalize:
+/// `| .cons x t => 1` warns about `x` only. With an explicit index field (`cons (n : Nat) …`),
+/// `| .cons k x t => 1` warns about `x` only as well. Over `IVec A (m + 1)` or `IVec A 2`, or
+/// with the index bound by a `_` pattern, it warns about `x` and `t`. A field that is an
+/// index (`k`) or whose type is an indexed family (`t`) is therefore not read. Every other
+/// field (`x`, and `b : Fin (n + 1)` too) was warned about in every shape measured.
+pub(crate) struct IndexedConstructor {
+    pub(crate) name: Name,
+    /// One entry per explicit field, in order: `true` when the field is not read.
+    pub(crate) unread: Vec<bool>,
+}
+
+/// Which explicit fields of `ctor` (with `num_params` parameters, of a family with
+/// `num_indices` indices) a pattern leaves unread: those occurring in the result type's
+/// indices, and those whose type is headed by a family `indexed` names.
+pub(crate) fn unread_fields(
+    type_: &Expr,
+    num_params: u32,
+    num_indices: u32,
+    indexed: impl Fn(&Name) -> bool,
+) -> Vec<bool> {
+    fn head(mut expr: &Expr) -> &Expr {
+        while let ExprNode::App { f, .. } = expr.node() {
+            expr = f;
+        }
+        expr
+    }
+    let mut binders = Vec::new();
+    let mut result = type_;
+    while let ExprNode::ForallE {
+        binder_type,
+        body,
+        binder_info,
+        ..
+    } = result.node()
+    {
+        binders.push((*binder_info, binder_type));
+        result = body;
+    }
+    let mut args = Vec::new();
+    let mut applied = result;
+    while let ExprNode::App { f, a } = applied.node() {
+        args.push(a);
+        applied = f;
+    }
+    // `args` runs from the last argument to the first: the indices come first.
+    let indices = &args[..(num_indices as usize).min(args.len())];
+    let total = binders.len();
+    binders
+        .iter()
+        .enumerate()
+        .skip(num_params as usize)
+        .filter(|(_, (info, _))| *info == fln_core::expr::BinderInfo::Default)
+        .map(|(position, (_, field_type))| {
+            let bvar = u32::try_from(total - 1 - position).unwrap_or(u32::MAX);
+            let index = indices.iter().any(|index| index.has_loose_bvar(bvar));
+            let family = matches!(head(field_type).node(),
+                ExprNode::Const { name, .. } if indexed(name));
+            index || family
+        })
+        .collect()
+}
+
+fn components(name: &Name) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = name.clone();
+    while !current.is_anonymous() {
+        parts.push(match current.leaf_view() {
+            LeafView::Str(text) => text.to_owned(),
+            _ => String::new(),
+        });
+        current = current.parent();
+    }
+    parts.reverse();
+    parts
+}
+
+impl Constructors {
+    /// The unread fields of the indexed constructors a pattern head written `head` may name,
+    /// merged, or `None` when it names none. A qualified head names the constructors whose
+    /// names end with it, an unqualified or dotted one every constructor spelled like it, so
+    /// the merge only ever leaves more unread.
+    fn unread(&self, head: &Name) -> Option<Vec<bool>> {
+        let written = components(head);
+        let mut merged: Option<Vec<bool>> = None;
+        for constructor in &self.indexed {
+            if !components(&constructor.name).ends_with(&written) {
+                continue;
+            }
+            let merged = merged.get_or_insert_with(Vec::new);
+            for (index, &unread) in constructor.unread.iter().enumerate() {
+                match merged.get_mut(index) {
+                    Some(slot) => *slot |= unread,
+                    None => merged.push(unread),
+                }
+            }
+        }
+        merged
+    }
 }
 
 fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<Vec<(Name, usize)>> {
@@ -335,15 +438,29 @@ fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<V
                                     _ => None,
                                 }
                             }
+                            // `@C …` writes the implicit fields too, which `unread` does not
+                            // count: an indexed constructor's is not read at all.
+                            Some(head) if is_kind(head, &["Term", "explicit"]) => {
+                                if let Some(Syntax::Ident { val, .. }) = self::args(head).get(1)
+                                    && constructors.unread(val).is_some()
+                                {
+                                    return None;
+                                }
+                                None
+                            }
                             _ => None,
                         };
-                        if head.is_some_and(|head| {
-                            matches!(head.leaf_view(),
-                                LeafView::Str(text) if constructors.indexed.contains(text))
-                        }) {
-                            return None;
+                        let Some(unread) = head.and_then(|head| constructors.unread(&head)) else {
+                            pending.extend(args.get(1));
+                            continue;
+                        };
+                        let fields = args.get(1).map(self::args).unwrap_or(&[]);
+                        for (index, field) in fields.iter().enumerate() {
+                            // A field past the constructor's explicit ones is not read either.
+                            if !unread.get(index).copied().unwrap_or(true) {
+                                pending.push(field);
+                            }
                         }
-                        pending.extend(args.get(1));
                     }
                     "Lean.Parser.Term.namedPattern" => {
                         pending.extend(args.first());
