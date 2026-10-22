@@ -1746,7 +1746,7 @@ jobs:
 
   inferred-well-founded-results:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): isolate indexed result and recursive inference failures'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): cover indexed callbacks and strict staged evaluation'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -1759,11 +1759,11 @@ jobs:
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: '0067e91368773bc3fcf0d5088da2e0bd3dedc711'
+      CANDIDATE_SHA: '14a08250c78c6685348fbed91b02e72a84d94632'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: '0067e91368773bc3fcf0d5088da2e0bd3dedc711'
+          ref: '14a08250c78c6685348fbed91b02e72a84d94632'
           persist-credentials: false
       - name: Verify immutable candidate and install the exact Rust toolchain
         id: compiler
@@ -1776,7 +1776,7 @@ jobs:
         id: reference
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' --fail --location --retry 3 --output "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
           echo "fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516  $RUNNER_TEMP/lean-4.32.0-linux.tar.zst" | sha256sum --check
           tar --zstd --no-same-owner -xf "$RUNNER_TEMP/lean-4.32.0-linux.tar.zst" -C "$RUNNER_TEMP"
           test "$("$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
@@ -1798,9 +1798,9 @@ jobs:
           def inferredCountdown (n : Nat) := if h : 0 < n then inferredCountdown (n - 1) + 1 else 0
           termination_by n
           decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)
-          def inferredChoose (α : Type) (x : α) (n : Nat) := if h : 0 < n then inferredChoose α x (n - 1) else x
+          def inferredChoose (α : Type) (x : α) (n : Nat) := if h : n = 0 then x else inferredChoose α x (n - 1)
           termination_by n
-          decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)
+          decreasing_by exact Nat.sub_lt (Nat.pos_of_ne_zero h) (Nat.succ_pos 0)
           def inferredAccumulate (acc n : Nat) := if h : 0 < n then inferredAccumulate (acc + 1) (n - 1) else acc
           termination_by n
           decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)
@@ -1816,12 +1816,22 @@ jobs:
           LEAN_PATH="$FLN_REFERENCE_LIB" "$FLN_REFERENCE_LEAN" "$RUNNER_TEMP/wf-inferred-results.lean" > "$RUNNER_TEMP/wf-inferred-results.out"
           cat "$RUNNER_TEMP/wf-inferred-results.out"
           printf '52\n42\n42\n42\n' | diff -u - "$RUNNER_TEMP/wf-inferred-results.out"
+      - name: Diagnose partial producer callbacks through ordinary consumers
+        env:
+          FLN_DIAG_CLOSURE_SIGNATURES: '1'
+        run: cargo +nightly-2026-08-31 test --locked --offline -p fln --test runtime_global_stages checked_partial_producers_keep_stages_through_safe_consumers -- --exact --nocapture --test-threads=1
       - name: Check inferred recursive result types and refusal controls
+        if: always() && steps.compiler.outcome == 'success' && steps.reference.outcome == 'success'
         run: cargo +nightly-2026-08-31 test --locked --offline -p fln --test source_well_founded native_well_founded_omitted_result_types -- --exact --nocapture --test-threads=1
+      - name: Diagnose the checked Repr renderer callback interface
+        if: always() && steps.compiler.outcome == 'success' && steps.reference.outcome == 'success'
+        env:
+          FLN_DIAG_CLOSURE_SIGNATURES: '1'
+        run: cargo +nightly-2026-08-31 test --locked --offline -p fln --test source_deriving_repr recursive_repr_uses_child_hypotheses_and_executes_the_real_format_renderer -- --exact --nocapture --test-threads=1
       - name: Check existing well-founded recursion and postponed application regressions
         run: |
           set -euo pipefail
-          cargo +nightly-2026-08-31 test --locked --offline -p fln --test source_well_founded --test source_postponed_applications -- --nocapture --test-threads=1
+          cargo +nightly-2026-08-31 test --locked --offline --no-fail-fast -p fln --test source_well_founded --test source_postponed_applications -- --nocapture --test-threads=1
       - name: Check the affected code and formatting
         run: |
           set -euo pipefail
