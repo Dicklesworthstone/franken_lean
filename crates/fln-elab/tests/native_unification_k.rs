@@ -833,3 +833,243 @@ fn queued_transport_reduction_uses_the_saved_dependent_local_context() {
     assert_eq!(txn.mvars.get_assigned_expr(&out), Some(&number(23)));
     assert!(txn.lctx.is_empty());
 }
+
+#[test]
+fn convertible_indices_reduce_without_solving_the_proof() {
+    for reverse in [false, true] {
+        let mut txn = transaction();
+        let successor = Expr::app(constant("Nat.succ"), number(6));
+        let (left, right) = if reverse {
+            (number(7), successor)
+        } else {
+            (successor, number(7))
+        };
+        let proof = local(
+            &mut txn,
+            "conversionProof",
+            equality(left.clone(), right.clone()),
+        );
+        let term = transport(left, right, proof, number(23));
+        let before = txn.clone();
+        txn.unify(&term, &number(23), budget()).unwrap();
+        unchanged(&txn, &before);
+    }
+}
+
+#[test]
+fn conversion_descends_through_neutral_index_applications() {
+    let mut txn = transaction();
+    let f = local(&mut txn, "indexFunction", pi(nat(), nat()));
+    let left = Expr::app(f.clone(), Expr::app(lam(nat(), bvar(0)), number(7)));
+    let right = Expr::app(f, number(7));
+    let p = local(&mut txn, "p", equality(left.clone(), right.clone()));
+    let term = transport(left, right, p, number(23));
+    let before = txn.clone();
+    txn.unify(&term, &number(23), budget()).unwrap();
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn heterogeneous_conversion_checks_type_and_value_before_selecting_the_rule() {
+    let mut txn = transaction();
+    let type_ = Expr::app(lam(Expr::sort(Level::one()), bvar(0)), nat());
+    let value = Expr::app(constant("Nat.succ"), number(6));
+    let p = local(&mut txn, "p", heterogeneous(type_.clone(), value.clone()));
+    let term = heterogeneous_transport(type_, value, p);
+    txn.unify(&term, &number(23), budget()).unwrap();
+    let before = txn.clone();
+    let p = local(&mut txn, "wrong", heterogeneous(nat(), number(8)));
+    let wrong = heterogeneous_transport(nat(), number(8), p);
+    let retry = txn.clone();
+    assert!(matches!(
+        txn.unify(&wrong, &number(23), budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&txn, &retry);
+    assert_eq!(txn.env, before.env);
+}
+
+#[test]
+fn conversion_keeps_arguments_after_the_major_and_dependent_results() {
+    let mut txn = transaction();
+    let left = Expr::app(constant("Nat.succ"), number(6));
+    let right = number(7);
+    let p = local(&mut txn, "p", equality(left.clone(), right.clone()));
+    let term = eliminate(
+        motive(pi(nat(), nat()), left.clone()),
+        left.clone(),
+        right.clone(),
+        p.clone(),
+        lam(nat(), bvar(0)),
+    );
+    txn.unify(&Expr::app(term, number(47)), &number(47), budget())
+        .unwrap();
+    let family = local(&mut txn, "family", pi(nat(), Expr::sort(Level::one())));
+    let v = local(&mut txn, "value", Expr::app(family.clone(), left.clone()));
+    let term = eliminate(
+        motive(Expr::app(family, bvar(1)), left.clone()),
+        left,
+        right,
+        p,
+        v.clone(),
+    );
+    txn.unify(&term, &v, budget()).unwrap();
+}
+
+#[test]
+fn conversion_respects_delta_policy_and_rechecks_under_a_different_policy() {
+    let mut txn = transaction();
+    let label = name("seven");
+    let definition = Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: label.clone(),
+            level_params: vec![],
+            type_: nat(),
+        },
+        value: number(7),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![label],
+    });
+    let Outcome::Complete(admitted) = admit(&txn.env, definition, budget().kernel) else {
+        panic!("admission");
+    };
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("checker");
+    };
+    let Outcome::Complete(Published::Committed(
+        fln_env::environment::DeclarationCommitted::Published(result),
+    )) = checked.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    )
+    else {
+        panic!("publication");
+    };
+    txn.env = result.environment;
+    let p = local(&mut txn, "p", equality(constant("seven"), number(7)));
+    let term = transport(constant("seven"), number(7), p, number(23));
+    for transparency in [
+        UnificationTransparency::None,
+        UnificationTransparency::Abbreviations,
+        UnificationTransparency::Default,
+        UnificationTransparency::SafeDefinitions,
+        UnificationTransparency::None,
+    ] {
+        let before = txn.clone();
+        let mut limits = budget();
+        limits.transparency = transparency;
+        let result = txn.unify(&term, &number(23), limits);
+        if matches!(
+            transparency,
+            UnificationTransparency::Default | UnificationTransparency::SafeDefinitions
+        ) {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(UnificationError::Deferred(_))));
+        }
+        unchanged(&txn, &before);
+    }
+}
+
+#[test]
+fn conversion_never_guesses_unknown_indices_but_retries_after_an_actual_assignment() {
+    let mut txn = transaction();
+    let index = hole(&mut txn, "n", nat(), MetavarKind::Natural);
+    let successor = Expr::app(constant("Nat.succ"), Expr::mvar(index.clone()));
+    let p = local(&mut txn, "p", equality(successor.clone(), number(7)));
+    let term = transport(successor, number(7), p, number(23));
+    let before = txn.clone();
+    assert!(matches!(
+        txn.unify(&term, &number(23), budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&txn, &before);
+    assert!(!txn.mvars.is_assigned(&index));
+    txn.unify_many_with(
+        &[(term, number(23)), (Expr::mvar(index.clone()), number(6))],
+        budget(),
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&index), Some(&number(6)));
+}
+
+#[test]
+fn conversion_work_limits_and_cancellation_keep_atomic_retry() {
+    let mut base = transaction();
+    let left = Expr::app(constant("Nat.succ"), number(6));
+    let p = local(&mut base, "p", equality(left.clone(), number(7)));
+    let term = transport(left, number(7), p, number(23));
+    let report = base.clone().unify(&term, &number(23), budget()).unwrap();
+    for allowance in [0, report.unifier_steps / 2, report.unifier_steps - 1] {
+        let mut txn = base.clone();
+        let mut limits = budget();
+        limits.max_steps = allowance;
+        assert!(matches!(
+            txn.unify(&term, &number(23), limits),
+            Err(UnificationError::StepLimit { .. })
+        ));
+        unchanged(&txn, &base);
+        let retry = txn.unify(&term, &number(23), budget()).unwrap();
+        assert_eq!(report.unifier_steps, retry.unifier_steps);
+    }
+    for allowance in [0, report.visited_nodes / 2, report.visited_nodes - 1] {
+        let mut txn = base.clone();
+        let mut limits = budget();
+        limits.max_visited_nodes = allowance;
+        assert!(matches!(
+            txn.unify(&term, &number(23), limits),
+            Err(UnificationError::NodeLimit { .. })
+        ));
+        unchanged(&txn, &base);
+    }
+    let calls = Cell::new(0);
+    base.clone()
+        .unify_many_with(&[(term.clone(), number(23))], budget(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .unwrap();
+    for stop in [1, calls.get() / 2, calls.get()] {
+        let mut txn = base.clone();
+        let count = Cell::new(0);
+        assert!(matches!(
+            txn.unify_many_with(&[(term.clone(), number(23))], budget(), &|| {
+                count.set(count.get() + 1);
+                count.get() >= stop
+            }),
+            Err(UnificationError::Cancelled)
+        ));
+        unchanged(&txn, &base);
+    }
+}
+
+#[test]
+fn nested_index_conversions_use_heap_continuations_on_a_small_stack() {
+    let mut txn = transaction();
+    let p = reflexive_proof(&mut txn);
+    let mut endpoint = number(7);
+    for _ in 0..96 {
+        endpoint = transport(number(7), number(7), p.clone(), endpoint);
+    }
+    let q = local(
+        &mut txn,
+        "outerProof",
+        equality(endpoint.clone(), number(7)),
+    );
+    let term = transport(endpoint, number(7), q, number(23));
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let mut limits = budget();
+            limits.max_steps = 2_000_000;
+            limits.max_visited_nodes = 2_000_000;
+            txn.budget.max_heartbeats = 2_000_000;
+            txn.unify(&term, &number(23), limits).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

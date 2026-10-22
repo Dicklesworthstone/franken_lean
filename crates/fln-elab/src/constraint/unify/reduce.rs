@@ -25,6 +25,14 @@ struct DeltaCandidate {
 }
 
 enum Continuation {
+    KLeft {
+        comparison: Box<k::Comparison>,
+        right: Expr,
+    },
+    KRight {
+        comparison: Box<k::Comparison>,
+        left: Expr,
+    },
     Remember {
         subject: Expr,
     },
@@ -341,6 +349,65 @@ impl Engine<'_> {
             while let Some(continuation) = continuations.pop() {
                 self.meter.tick()?;
                 match continuation {
+                    Continuation::KLeft { comparison, right } => {
+                        let left = self.rebuild_application(head, args)?;
+                        continuations.push(Continuation::KRight { comparison, left });
+                        (head, args, complete) =
+                            self.demand(right, &mut memo, &mut continuations)?;
+                        continue 'reduce;
+                    }
+                    Continuation::KRight {
+                        mut comparison,
+                        left,
+                    } => {
+                        let right = self.rebuild_application(head, args)?;
+                        if !same_terms(&left, &right, &mut self.meter)? {
+                            if let Some(literal) = self
+                                .literal_constructor_equation(&left, &right)?
+                                .or(self.literal_constructor_equation(&right, &left)?)
+                            {
+                                if let LiteralStep::Compare(left, right) = literal {
+                                    comparison.candidate.pending.push((left, right));
+                                }
+                            } else {
+                                match (left.node(), right.node()) {
+                                    (
+                                        ExprNode::App { f: lf, a: la },
+                                        ExprNode::App { f: rf, a: ra },
+                                    ) => {
+                                        comparison.candidate.pending.push((la.clone(), ra.clone()));
+                                        comparison.candidate.pending.push((lf.clone(), rf.clone()));
+                                    }
+                                    (
+                                        ExprNode::Proj {
+                                            struct_name: ls,
+                                            idx: li,
+                                            expr: le,
+                                        },
+                                        ExprNode::Proj {
+                                            struct_name: rs,
+                                            idx: ri,
+                                            expr: re,
+                                        },
+                                    ) if ls == rs && li == ri => {
+                                        comparison.candidate.pending.push((le.clone(), re.clone()));
+                                    }
+                                    _ => {
+                                        // No index assignment, proof synthesis or
+                                        // retry of this blocked eliminator. Resume
+                                        // its outer consumer with the original
+                                        // arguments and already reduced major.
+                                        head = comparison.blocked_head;
+                                        args = comparison.arguments;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        (head, args, complete) =
+                            self.resume_k_comparison(comparison, &mut memo, &mut continuations)?;
+                        continue 'reduce;
+                    }
                     Continuation::Remember { subject } => {
                         memo.remember(subject, &head, &args, &mut self.meter)?;
                     }
@@ -476,10 +543,6 @@ impl Engine<'_> {
                         }
                         let reduced =
                             self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?;
-                        let reduced = match reduced {
-                            Some(value) => Some(value),
-                            None => self.k_iota(&rec_head, &recursor, &outer)?,
-                        };
                         if let Some(result) = reduced {
                             // The reversed spine starts with arguments after
                             // the major. Keep these for a function-valued result.
@@ -490,6 +553,20 @@ impl Engine<'_> {
                         }
                         let position = outer.len() - major - 1;
                         outer[position] = self.rebuild_application(head, args)?;
+                        if let Some(candidate) = self.k_candidate(&rec_head, &recursor, &outer)? {
+                            let comparison = Box::new(k::Comparison {
+                                candidate,
+                                blocked_head: rec_head,
+                                arguments: outer,
+                                major,
+                            });
+                            (head, args, complete) = self.resume_k_comparison(
+                                comparison,
+                                &mut memo,
+                                &mut continuations,
+                            )?;
+                            continue 'reduce;
+                        }
                         head = rec_head;
                         args = outer;
                     }
@@ -499,6 +576,28 @@ impl Engine<'_> {
             }
             return self.rebuild_application(head, args);
         }
+    }
+
+    fn resume_k_comparison(
+        &mut self,
+        mut comparison: Box<k::Comparison>,
+        memo: &mut memo::DemandMemo,
+        continuations: &mut Vec<Continuation>,
+    ) -> Result<(Expr, Vec<Expr>, bool), UnificationError> {
+        while let Some((left, right)) = comparison.candidate.pending.pop() {
+            self.meter.node()?;
+            if same_terms(&left, &right, &mut self.meter)? {
+                continue;
+            }
+            continuations.push(Continuation::KLeft { comparison, right });
+            return self.demand(left, memo, continuations);
+        }
+        // A conversion match licenses exactly the admitted nullary rule.
+        // Arguments after the major still apply to its result.
+        comparison
+            .arguments
+            .truncate(comparison.arguments.len() - comparison.major - 1);
+        Ok((comparison.candidate.result, comparison.arguments, false))
     }
 
     fn rebuild_application(

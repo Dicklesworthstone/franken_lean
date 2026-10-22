@@ -195,3 +195,34 @@ fn the_remaining_large_false_comparison_is_never_a_published_proof() {
     assert_eq!(base.logical_root(&options), root);
     reference(&source, false);
 }
+
+#[test]
+fn convertible_equality_transport_indices_keep_kernel_checked_rfl_proofs() {
+    checked(
+        r#"
+theorem converted (p : 4 = Nat.succ 3) :
+ @Eq.rec Nat 4 (fun _ _ => Nat) 23 (Nat.succ 3) p = 23 := rfl
+theorem betaConverted (f : Nat -> Nat) (p : f ((fun x : Nat => x) 7) = f 7) :
+ @Eq.rec Nat (f ((fun x : Nat => x) 7)) (fun _ _ => Nat) 23 (f 7) p = 23 := rfl
+"#,
+    );
+}
+
+#[test]
+fn false_equality_transport_results_cannot_publish_a_valid_prefix() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = r#"
+theorem converted (p : 4 = Nat.succ 3) :
+ @Eq.rec Nat 4 (fun _ _ => Nat) 23 (Nat.succ 3) p = 23 := rfl
+theorem wrong (p : 4 = Nat.succ 3) :
+ @Eq.rec Nat 4 (fun _ _ => Nat) 23 (Nat.succ 3) p = 24 := rfl
+"#;
+    reference(source, false);
+    let error = base
+        .check_source_files(&[source.as_bytes()], &options, limits())
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert_eq!(root, base.logical_root(&options));
+}

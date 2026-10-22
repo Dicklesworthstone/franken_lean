@@ -2,18 +2,31 @@
 //!
 //! The admitted recursor's K flag is necessary, not a substitute for matching
 //! its indices. Reconstruct the actual major domain from its telescope and
-//! compare it with the instantiated constructor result. This is a sufficient
-//! conversion rule, never an index-unification or proof-synthesis heuristic.
+//! compare it with the instantiated constructor result using the caller's
+//! reduction policy. This is a sufficient conversion rule, never an
+//! index-unification or proof-synthesis heuristic.
 //! Like beta/iota, it is a reduction aid, not an input typing judgment.
 use super::*;
 
+pub(super) struct Candidate {
+    pub(super) pending: Vec<(Expr, Expr)>,
+    pub(super) result: Expr,
+}
+
+pub(super) struct Comparison {
+    pub(super) candidate: Candidate,
+    pub(super) blocked_head: Expr,
+    pub(super) arguments: Vec<Expr>,
+    pub(super) major: usize,
+}
+
 impl Engine<'_> {
-    pub(super) fn k_iota(
+    pub(super) fn k_candidate(
         &mut self,
         rec_head: &Expr,
         recursor: &RecursorVal,
         arguments: &[Expr],
-    ) -> Result<Option<Expr>, UnificationError> {
+    ) -> Result<Option<Candidate>, UnificationError> {
         self.meter.node()?;
         if !recursor.k
             || recursor.is_unsafe
@@ -116,11 +129,9 @@ impl Engine<'_> {
             constructor_result = self.substitute(body, parameter)?;
         }
         let constructor_result = self.instantiate(&constructor_result)?;
-        // No recursive whnf here: nested transports stay on the parent's heap
-        // continuation stack. Unresolved/different indices simply stay stuck.
-        if !same_terms(&major_domain, &constructor_result, &mut self.meter)? {
-            return Ok(None);
-        }
+        // Index conversion resumes on the enclosing reduction machine's heap
+        // stack. Neither recursive whnf calls nor speculative hole assignments
+        // are needed. A failed comparison restores the blocked eliminator.
         self.scan(&rule.rhs)?;
         let mut result = crate::universe::parameters::instantiate(
             || self.meter.node(),
@@ -133,6 +144,9 @@ impl Engine<'_> {
             self.meter.node()?;
             result = Expr::app(result, argument.clone());
         }
-        Ok(Some(result))
+        Ok(Some(Candidate {
+            pending: vec![(major_domain, constructor_result)],
+            result,
+        }))
     }
 }
