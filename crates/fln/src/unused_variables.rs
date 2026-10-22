@@ -10,12 +10,17 @@
 //! pin's uses: a shadowing inner binder of the same name counts, and so does any
 //! elaborated occurrence. So a warning printed here is one the pin prints too.
 //!
+//! A body holding a tactic block or `‹_›` is read as the pin reads it with
+//! `linter.unusedVariables.analyzeTactics` off: the body's syntax is ignored, and a
+//! signature binder is used only when the signature's syntax refers to it or its variable
+//! occurs in the admitted type or the final term. This engine's tactics must then reach a
+//! term with the same variable occurrences as the pin's, which the stratum measures.
+//!
 //! A command this increment cannot decide is not linted, exactly as before this
 //! module existed: the pin's warning is missing, never invented. That covers `sorry`
-//! (the pin skips the whole command); a tactic block or `‹_›` (the pin reads the
-//! tactic's proof term, which need not match this engine's) for the signature's binders
-//! and for every local binder whose scope holds one; and every binder form other than
-//! those read here.
+//! (the pin skips the whole command); a tactic body of a recursive declaration or one with
+//! `where` helpers; every local binder whose scope holds a tactic block; and every binder
+//! form other than those read here.
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
 use fln_core::options::KVMap;
@@ -171,21 +176,49 @@ fn signature_slots(binders: &[Syntax]) -> Option<Vec<Option<(Name, usize)>>> {
     Some(slots)
 }
 
+/// How a declaration's body decides its signature binders' uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Body {
+    /// No tactic block: an identifier anywhere in the command may use a binder.
+    Terms,
+    /// A tactic block or `‹_›`: the pin ignores the body's syntax and reads only its final
+    /// term (`linter.unusedVariables.analyzeTactics` off), so only the signature's syntax and
+    /// the admitted type and value decide.
+    Tactics,
+}
+
 /// A `def`, `theorem`, `abbrev`, `instance` or `example` whose uses this module can decide:
-/// its modifiers and declaration, or `None`. A tactic block or `‹_›` makes the pin read a
-/// proof term this engine need not share, and the pin never lints a command with `sorry`.
-fn decided(command: &Syntax) -> Option<(&Syntax, &Syntax)> {
+/// its modifiers, declaration and body regime, or `None`. The pin never lints a command with
+/// `sorry`. A tactic body is decided from its proof term, so a recursive declaration (whose
+/// admitted term is compiled from the pin's pre-definition differently) or one with `where`
+/// helpers is left undecided there.
+fn decided(command: &Syntax) -> Option<(&Syntax, &Syntax, Body)> {
     if !is_kind(command, &["Command", "declaration"]) {
         return None;
     }
     let [modifiers, declaration] = args(command) else {
         return None;
     };
-    (["definition", "theorem", "abbrev", "instance", "example"]
+    if !["definition", "theorem", "abbrev", "instance", "example"]
         .iter()
         .any(|kind| is_kind(declaration, &["Command", kind]))
-        && !contains_atom(declaration, &["sorry", "admit", "by", "‹"]))
-    .then_some((modifiers, declaration))
+        || contains_atom(declaration, &["sorry", "admit"])
+    {
+        return None;
+    }
+    if !contains_atom(declaration, &["by", "‹"]) {
+        return Some((modifiers, declaration, Body::Terms));
+    }
+    (!contains_atom(
+        declaration,
+        &[
+            "decreasing_by",
+            "termination_by",
+            "where",
+            "partial_fixpoint",
+        ],
+    ))
+    .then_some((modifiers, declaration, Body::Tactics))
 }
 
 /// A `def`, `theorem`, `abbrev`, `instance` or `example` whose term-level binders this module
@@ -208,8 +241,17 @@ fn scoped(command: &Syntax) -> Option<&Syntax> {
     .then_some(declaration)
 }
 
+/// Whether `node` is a declaration's value: its body, as the pin's `BodyInfo` covers it.
+fn is_body(node: &Syntax) -> bool {
+    ["declValSimple", "declValEqns", "whereStructInst"]
+        .iter()
+        .any(|kind| is_kind(node, &["Command", kind]))
+}
+
 /// Every node of `command`'s declaration outside tactic blocks for which `select` gives
-/// something, when the node holds no tactic block itself ([`scoped`]).
+/// something, when the node holds no tactic block itself ([`scoped`]). A body holding a
+/// tactic block anywhere is not read at all: the pin then lints no binder the body
+/// introduces, only the signature's (`linter.unusedVariables.analyzeTactics` off).
 fn term_scopes<'a, T>(
     command: &'a Syntax,
     mut select: impl FnMut(&'a Syntax) -> Option<T>,
@@ -220,7 +262,10 @@ fn term_scopes<'a, T>(
     };
     let mut pending = vec![declaration];
     while let Some(node) = pending.pop() {
-        if is_kind(node, &["Term", "byTactic"]) || contains_atom_shallow(node, "‹") {
+        if is_kind(node, &["Term", "byTactic"])
+            || contains_atom_shallow(node, "‹")
+            || (is_body(node) && contains_atom(node, &["by", "‹"]))
+        {
             continue;
         }
         if let Some(selected) = select(node)
@@ -670,7 +715,7 @@ pub(crate) fn unused_signature_binders(
     value: &Expr,
     options: &KVMap,
 ) -> Vec<UnusedBinder> {
-    let Some((modifiers, declaration)) = decided(command) else {
+    let Some((modifiers, declaration, body)) = decided(command) else {
         return Vec::new();
     };
     // The pin's ignore function for foreign definitions (`@[extern]`, `implemented_by`).
@@ -716,7 +761,11 @@ pub(crate) fn unused_signature_binders(
             continue;
         }
         let index = start + offset;
-        if referenced(declaration, name, *at)
+        let syntax = match body {
+            Body::Terms => declaration,
+            Body::Tactics => signature,
+        };
+        if referenced(syntax, name, *at)
             || pis[index].1.has_loose_bvar(0)
             || lambdas[index].1.has_loose_bvar(0)
         {

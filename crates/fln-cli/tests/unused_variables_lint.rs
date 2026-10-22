@@ -1,8 +1,8 @@
 //! The pin's `linter.unusedVariables`, `linter.deprecated` and `linter.defProp` warnings, through the drop-in
 //! `lean` over `prelude` with `Init.Core` (bead `fln-default-linters-unused-variables-mtnt`).
 //! Each program runs through the pinned `lean` v4.32.0 in the same test: an `IDENTICAL` program
-//! must print exactly what the pin prints, and every warning printed for a `SUBSET` program,
-//! which this increment does not fully decide (tactic proofs), must be one the pin prints too.
+//! must print exactly what the pin prints, and every warning printed for a `SUBSET` program
+//! must be one the pin prints too.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,7 +100,7 @@ end
 
 /// Binders under no `fun`: an `if h :`'s, a `let`'s (one shadowing a parameter of its name),
 /// and a theorem's statement's, which are linted though its proof is a tactic block (only a
-/// scope holding the block is not read). A tactic proof's signature binders stay unread.
+/// scope holding the block is not read).
 const LOCALS: &str = "def a (n : Nat) : Nat := if h : n = 3 then 1 else 2
 def b (n : Nat) : Nat := if h : n = 3 then n else 2
 def c (n : Nat) (k : n = 3 → Nat) : Nat := if h : n = 3 then k h else 2
@@ -114,7 +114,36 @@ theorem m3 (p : Prop) (hp : p) : p := by exact hp
 def o : Nat := (fun (x : Nat) => 3) 1
 ";
 
+/// Tactic bodies: the pin reads only the final term, so a binder a tactic's syntax names is
+/// still unused when the term does not use it (`have h`, `clear`), `assumption` takes the
+/// last matching hypothesis, `‹_›` is a tactic block, and a binder used only in a later
+/// binder's type stays used.
+const TACTICS: &str = "theorem ta (p q : Prop) (hp : p) (hq : q) : p := by exact hp
+theorem tb (p : Prop) (hp : p) (hp2 : p) : p := by assumption
+theorem tc (x y : Nat) (h : x = y) (k : 0 = 0) : y = x := by subst h; rfl
+def td (x : Nat) (y : Subtype (fun v => v = x)) (z : Nat) : Nat := by clear y x; exact z
+theorem te (n : Nat) (h : n = n) : True := by trivial
+example (h : Nat) : Nat := by
+  have h : Nat := 0
+  exact h
+theorem tf (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, by exact hq⟩
+theorem tg (a b : Nat) (h : a = b) (h' : b = a) : b = a := by exact h'
+theorem th (p q : Prop) (hq : q) (hp : p) : p := ‹p›
+";
+
+/// A tactic block anywhere in a body silences every binder the body introduces, not only
+/// those whose scope holds it; without one they are linted.
+const TACTIC_ELSEWHERE: &str =
+    "def g8 (n : Nat) : Nat := Nat.add ((fun (x : Nat) => n) 0) (by exact 1)
+def g9 (n : Nat) : Nat := Nat.add ((fun (x : Nat) => n) 0) 1
+def g10 (n : Nat) : Nat := Nat.add (let k := 5; n) (by exact 1)
+def g11 (n : Nat) : Nat := Nat.add (let k := 5; n) 1
+theorem g13 (p : Prop) (hp : p) : p ∧ True := And.intro (have z := 3; hp) (by trivial)
+";
+
 const IDENTICAL: &[(&str, &str)] = &[
+    ("tactics", TACTICS),
+    ("tactic_elsewhere", TACTIC_ELSEWHERE),
     ("linted", LINTED),
     ("scopes", SCOPES),
     ("locals", LOCALS),
@@ -143,10 +172,12 @@ const IDENTICAL: &[(&str, &str)] = &[
     ),
 ];
 
+/// A tactic body with `where` helpers is left undecided: the pin warns about `m` here, and
+/// this door prints nothing for it rather than read a term the pin need not share.
 const SUBSET: &[(&str, &str)] = &[(
-    "tactics",
-    "theorem a (p q : Prop) (hp : p) (hq : q) : p := by exact hp
-theorem b (p : Prop) (hp : p) (n : Nat) : p := by assumption
+    "tactic_where",
+    "def w (n : Nat) (m : Nat) : Nat := helper n
+where helper (k : Nat) : Nat := by exact k
 ",
 )];
 
@@ -245,6 +276,8 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
         ("patterns", PATTERNS, 6),
         ("functions", FUNCTIONS, 8),
         ("scopes", SCOPES, 7),
+        ("tactics", TACTICS, 8),
+        ("tactic_elsewhere", TACTIC_ELSEWHERE, 2),
     ] {
         let (ours, _) = outputs(&lib, &root, name, program);
         assert_eq!(
