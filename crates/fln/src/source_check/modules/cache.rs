@@ -634,6 +634,7 @@ pub(super) fn run_collecting(
                     private_module: plan.headers[index]
                         .module_system
                         .then(|| module.name.clone()),
+                    source_module: Some(module.name.clone()),
                     ..hit.engine.base_source_scope()
                 };
                 let checked = SourceFileCheck {
@@ -729,6 +730,7 @@ pub(super) fn run_collecting(
                         result_logical_root: root,
                         scope: fln_elab::source::scope::SourceScope {
                             private_module: header.module_system.then(|| module.name.clone()),
+                            source_module: Some(module.name.clone()),
                             ..imported.base_source_scope()
                         },
                     }))

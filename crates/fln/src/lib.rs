@@ -7329,6 +7329,7 @@ impl Engine {
         let mut file_starts = file_starts.iter().copied().peekable();
         let mut scopes = source_check::scopes::Scopes::new(&engine);
         scopes.current.private_module = private_module.cloned();
+        scopes.current.source_module = source_module.cloned();
         // The syntax a file declares extends the grammar of its commands after it
         // (`source_check::grammar`). The stream was partitioned before any of it was declared.
         let mut grammar = source_check::grammar::SourceGrammar::for_engine(
@@ -7382,6 +7383,7 @@ impl Engine {
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(&engine);
                 scopes.current.private_module = private_module.cloned();
+                scopes.current.source_module = source_module.cloned();
                 grammar = source_check::grammar::SourceGrammar::for_engine(
                     &engine,
                     source_module,

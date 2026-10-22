@@ -631,6 +631,7 @@ impl Engine {
             let file_base = engine.environment.clone();
             let mut scopes = scopes::Scopes::new(&engine);
             scopes.current.private_module = private_module.cloned();
+            scopes.current.source_module = source_module.cloned();
             // The syntax this file declares extends the grammar of what follows it.
             let mut grammar = grammar::SourceGrammar::for_engine(
                 &engine,

@@ -448,6 +448,7 @@ impl imported::SourceOleanImport {
                 completed.scope.private_module = plan.headers[index]
                     .module_system
                     .then(|| module.name.clone());
+                completed.scope.source_module = Some(module.name.clone());
                 completed
             } else {
                 match engine

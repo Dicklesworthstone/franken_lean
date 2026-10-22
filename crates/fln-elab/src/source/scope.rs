@@ -18,6 +18,10 @@ pub struct SourceScope {
     /// actual source module identity, not a namespace opened by the user.
     /// Private names follow the pin's `mkPrivateNameCore` encoding.
     pub private_module: Option<Name>,
+    /// The source module's own name (the pin's `moduleNameOfFileName`), in a legacy file as in a
+    /// `module` one. A legacy file's declarations stay public by default, but an explicit
+    /// `private` one is named under this identity, as `mkPrivateName` names it.
+    pub source_module: Option<Name>,
     /// The enclosing public section's default, or the effective visibility of
     /// a single declaration after [`Self::for_declaration`]. Module identity is
     /// retained independently so private aliases still resolve locally.
@@ -204,17 +208,29 @@ impl SourceScope {
             .map(|name| self.visible_name(&name))
     }
 
-    /// Apply effective visibility to an already qualified generated name.
+    /// Apply effective visibility to an already qualified generated name. Only a `module`
+    /// file's identity names declarations here: a legacy file's explicit `private` declaration
+    /// carries its file's identity in `private_module` ([`Self::for_declaration`]), while its
+    /// other commands, which may leave `public_declarations` unset, keep their plain names.
     pub(super) fn visible_name(&self, name: &Name) -> Name {
-        if self.public_declarations {
-            name.clone()
-        } else {
-            self.private_name(name)
+        match &self.private_module {
+            Some(module) if !self.public_declarations => {
+                Name::num(Name::from_components(["_private"]).append_core(module), 0)
+                    .append_core(name)
+            }
+            _ => name.clone(),
         }
     }
 
+    /// The module a `private` declaration here is named under: the `module` file's, or else a
+    /// legacy file's own ([`Self::source_module`]). Resolution and user names read through it,
+    /// so a legacy file's private declarations resolve and print as written.
+    pub(super) fn private_identity(&self) -> Option<&Name> {
+        self.private_module.as_ref().or(self.source_module.as_ref())
+    }
+
     pub(super) fn private_name(&self, name: &Name) -> Name {
-        self.private_module.as_ref().map_or_else(
+        self.private_identity().map_or_else(
             || name.clone(),
             |module| {
                 Name::num(Name::from_components(["_private"]).append_core(module), 0)
@@ -226,7 +242,7 @@ impl SourceScope {
     /// Recover a local declaration's user-facing namespace for scope tracking.
     /// An unrelated module's private names are never aliases in this scope.
     pub fn user_name(&self, name: &Name) -> Name {
-        let Some(module) = &self.private_module else {
+        let Some(module) = self.private_identity() else {
             return name.clone();
         };
         let prefix = Name::num(Name::from_components(["_private"]).append_core(module), 0);
@@ -813,6 +829,7 @@ mod tests {
         let scope = SourceScope {
             namespace: n("Outer"),
             private_module: None,
+            source_module: None,
             public_declarations: false,
             expose_definitions: false,
             noncomputable_section: false,
@@ -1005,6 +1022,7 @@ mod tests {
         let protected = ProtectedNames::read(&env).unwrap();
         let scope = |namespace: &str, opened: &[&str]| SourceScope {
             private_module: None,
+            source_module: None,
             public_declarations: false,
             expose_definitions: false,
             noncomputable_section: false,
@@ -1081,6 +1099,7 @@ mod tests {
     fn namespace_prefixes_root_escapes_and_ambiguous_opens_have_distinct_rules() {
         let scope = SourceScope {
             private_module: None,
+            source_module: None,
             public_declarations: false,
             expose_definitions: false,
             noncomputable_section: false,

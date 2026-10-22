@@ -148,7 +148,7 @@ impl SourceScope {
             "declaration modifiers",
         )?;
         let explicit = modifier(&modifiers[2])?;
-        if explicit == Some(false) && self.private_module.is_none() {
+        if explicit == Some(false) && self.private_identity().is_none() {
             return Err(refused("a module identity for private declarations"));
         }
         let mut expose = false;
@@ -163,6 +163,10 @@ impl SourceScope {
         let mut effective = self.clone();
         effective.public_declarations =
             explicit.unwrap_or(self.public_declarations || self.private_module.is_none());
+        // A legacy file's explicit `private` declaration is named under the file's own module.
+        if explicit == Some(false) && effective.private_module.is_none() {
+            effective.private_module = self.source_module.clone();
+        }
         effective.expose_definitions = !no_expose && (expose || self.expose_definitions);
         let kind = declaration[1].kind();
         if kind == Some(&parser_kind(&["Command", "example"])) {
@@ -274,24 +278,32 @@ impl SourceScope {
             effective.public_declarations = false;
             return Ok(effective);
         };
-        if prefix.public == Some(false) && self.private_module.is_none() {
+        if prefix.public == Some(false) && self.private_identity().is_none() {
             return Err(refused("a module identity for private declarations").into());
         }
         effective.public_declarations = prefix.public.unwrap_or(
             !prefix.is_example && (self.public_declarations || self.private_module.is_none()),
         );
+        if prefix.public == Some(false) && effective.private_module.is_none() {
+            effective.private_module = self.source_module.clone();
+        }
         Ok(effective)
     }
 
     /// Check the pin's prohibition against a public declaration shadowing a local
     /// private declaration. `name` is fully qualified (also for generated bundle
     /// members). Public elaboration itself cannot see this private predecessor.
+    /// A legacy file's public declarations are checked too ("a private declaration
+    /// `bar` has already been declared").
     pub fn check_public_name(
         &self,
         name: &Name,
         full_env: &Environment,
     ) -> Result<(), NatDefinitionElabError> {
-        if self.exports_declaration() && full_env.contains(&self.private_name(name)) {
+        if self.public_declarations
+            && self.private_identity().is_some()
+            && full_env.contains(&self.private_name(name))
+        {
             return Err(error(ScopeError::PublicShadowsPrivate(name.clone())));
         }
         Ok(())
