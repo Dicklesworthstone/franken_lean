@@ -487,12 +487,12 @@ pub(super) fn elaborate(
     if info.all.len() != 1 || info.num_nested != 0 {
         return Err(unsupported(&info.base.name));
     }
-    let target_type = context
+    // A family in `Prop` is derived like any other (`mkDecEqCmds` has no sort test): its proof
+    // fields are skipped, so a structure of proofs decides `isTrue rfl`. Its recursor must
+    // still eliminate into `Decidable`, which the recursor checks below and the kernel enforce.
+    context
         .known_type(target)?
         .ok_or_else(|| unsupported(&info.base.name))?;
-    if matches!(context.whnf(&target_type)?.node(), ExprNode::Sort { level } if level.is_zero()) {
-        return Err(unsupported(&info.base.name));
-    }
     let recursor_name = Name::str(info.base.name.clone(), "rec");
     let Some(ConstantInfo::Rec(metadata)) = context.txn.env.find(&recursor_name).cloned() else {
         return Err(unsupported(&info.base.name));
