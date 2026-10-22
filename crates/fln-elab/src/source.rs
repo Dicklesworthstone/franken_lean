@@ -5865,8 +5865,36 @@ fn query_term(
         })?;
         // `synthInstance` enters the class's telescope first (`forallTelescopeReducing`): for a
         // class that unfolds to a function type (`DecidableEq (Nat × Nat)`), the instance found
-        // is applied to the telescope's locals and abstracted again,
-        // `fun a b => instDecidableEqProd a b`.
+        // is applied to the telescope's locals and abstracted again with `etaReduce := true`
+        // (`tryResolve`). That reduces back to the instance itself (`instDecidableEqI4`, elab/9541)
+        // unless the instance still had subgoals then, its instance arguments, whose holes
+        // depend on the locals: `fun a b => instDecidableEqProd a b` (elab/typeclass_easy).
+        let has_subgoals = {
+            let mut head = &term.value;
+            let mut arity = 0_usize;
+            while let ExprNode::App { f, .. } = head.node() {
+                arity += 1;
+                head = f;
+            }
+            let mut found = false;
+            if let ExprNode::Const { name, .. } = head.node()
+                && let Some(info) = context.txn.env.find(name)
+            {
+                let mut type_ = info.constant_val().type_.clone();
+                for _ in 0..arity {
+                    let ExprNode::ForallE {
+                        binder_info, body, ..
+                    } = type_.node()
+                    else {
+                        break;
+                    };
+                    found |= *binder_info == BinderInfo::InstImplicit;
+                    let body = body.clone();
+                    type_ = body;
+                }
+            }
+            found
+        };
         let unfolded = context.whnf_with_transparency(
             &term.type_,
             UnificationTransparency::Abbreviations,
@@ -5884,7 +5912,7 @@ fn query_term(
             binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
             cursor = body;
         }
-        if !binders.is_empty() {
+        if has_subgoals && !binders.is_empty() {
             let count =
                 u32::try_from(binders.len()).map_err(|_| failure(SourceInferenceError::Scope))?;
             let mut value = term.value.clone();

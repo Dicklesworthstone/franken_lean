@@ -225,3 +225,38 @@ fn nested_lets_print_as_at_the_pin() {
         );
     }
 }
+
+/// `#synth` over a class that unfolds to a function type: the pin abstracts the instance over
+/// the telescope with `etaReduce := true`, so an instance without subgoals prints as itself and
+/// one whose instance arguments were still holes prints eta-expanded (measured 2026-10-22).
+#[test]
+fn synth_eta_reduces_unless_the_instance_had_subgoals() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let entry = root.join("Synth.lean");
+    std::fs::write(
+        &entry,
+        "prelude\nimport Init.Core\n#synth DecidableEq (Nat × Nat)\n#synth DecidableEq Nat\n#synth Inhabited Nat\n",
+    )
+    .unwrap();
+    let expected = "fun a b => instDecidableEqProd a b\ninstDecidableEqNat\ninstInhabitedNat\n";
+    let ours = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&entry)
+        .current_dir(&root)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .output()
+        .expect("run the installed lean");
+    assert_eq!(
+        (
+            ours.status.code(),
+            String::from_utf8(ours.stdout).unwrap().as_str()
+        ),
+        (Some(0), expected),
+        "stderr: {}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!((code, stdout.as_str()), (0, expected), "the pin moved");
+    }
+}
