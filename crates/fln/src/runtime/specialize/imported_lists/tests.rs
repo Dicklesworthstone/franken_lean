@@ -377,7 +377,7 @@ fn an_opaque_history_consumer_is_refused_after_admission() {
 }
 
 #[test]
-fn an_admitted_functional_observing_deeper_history_is_refused() {
+fn an_admitted_functional_observing_deeper_history_executes() {
     type Local = (FVarId, Expr);
     fn local(label: &str, type_: Expr) -> Local {
         (FVarId(name(label)), type_)
@@ -417,7 +417,7 @@ fn an_admitted_functional_observing_deeper_history_is_refused() {
     // This is the checked term for two constructor matches. In the second
     // cons branch `previous.2.1` observes the result two tails below this one.
     // The Reference kernel accepts the same functional and evaluates a two
-    // element List to 1; immediate-IH erasure must not pretend to execute it.
+    // element List to 1. Its finite deeper history is now represented lazily.
     let xs = local("outer_xs", list_type());
     let previous = local("outer_previous", history(value(&xs)));
     let outer_motive = bind(
@@ -487,13 +487,28 @@ fn an_admitted_functional_observing_deeper_history_is_refused() {
         .unwrap()
         .into_complete()
         .unwrap();
-    assert!(matches!(
-        Preparation::new(engine.environment(), IngressLimits::default())
-            .imported_list_recursion(&head, &args),
-        Err(IngressError::UnsupportedNode {
-            kind: "List course-of-values history escapes"
-        })
-    ));
+    let run = engine
+        .execute_definition(
+            declaration("deeperHistory", constant("Nat"), application(head, args)),
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&run.exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(1))
+    );
+    let replay =
+        crate::execute_flbc_artifact(&run.flbc_artifact, &KVMap::new(), Default::default())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&replay).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(1))
+    );
 }
 
 #[test]

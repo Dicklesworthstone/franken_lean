@@ -4,9 +4,12 @@
 //! branches are derived from the actual functional, including its callbacks;
 //! no library operation is replaced by a seed body. A symbolic tail stands
 //! for the inaccessible rest of the history. Reduction succeeds only when all
-//! such symbols disappear, so escaping or deeper history remains unsupported.
+//! such symbols disappear. Deeper finite histories use typed lazy windows;
+//! opaque or escaping histories retain their explicit refusal.
 use super::*;
 use fln_core::expr::FVarId;
+
+mod window;
 
 enum Work {
     Visit(Expr),
@@ -118,7 +121,9 @@ impl Preparation<'_> {
         let step =
             self.list_history_reduce(&application(lifted_functional, [cons, previous]), &marker)?;
         if first.has_fvar() || step.has_fvar() {
-            return Err(unsupported("List course-of-values history escapes"));
+            return self
+                .list_history_window(args, levels, result_type, functional, first, &marker)
+                .map(Some);
         }
         let step = Expr::lam(
             Name::anonymous(),
