@@ -399,6 +399,13 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
             assert_eq!(guarded.batch.executions[0].captured_stdout(), Some("printed λ".as_bytes()));
             assert_eq!(std::fs::read(&effect).unwrap(), b"written\n");
         }
+        // An action that raises keeps what it wrote before raising: the pin logs that output
+        // ahead of the exception.
+        let raised = engine.execute_source_commands_with_presentation(
+            "#eval show IO Nat from do\n  IO.print \"before λ\"\n  throw (IO.userError \"raised\")".as_bytes(),
+            &KVMap::new(), limits(), EvaluationPresentation::Lean,
+        ).unwrap().into_complete().unwrap();
+        assert_eq!(raised.batch.executions[0].captured_stdout(), Some("before λ".as_bytes()));
         let raw = engine.execute_source_commands_with_presentation(
             format!("#guard_msgs in\n{}", action("IoBoth", "IoBoth.mk")).as_bytes(),
             &KVMap::new(), limits(), EvaluationPresentation::PreferRaw,
