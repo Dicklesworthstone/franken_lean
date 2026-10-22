@@ -1008,9 +1008,14 @@ impl Engine<'_> {
         // constant-headed side is assigned here, the case where reducing first
         // would unfold a definition, and so is a `let`/`have`, which reducing would
         // zeta-reduce (`apply` assigned `?x := instHAdd.1 0 1` where the pin assigns
-        // `have x := 0; x + 1`, elab/consumePPHint). Other shapes keep the reducing
-        // path below: the pin also keeps an in-scope beta redex, but this elaborator
-        // does not yet accept every assignment of one. A refusal here mutates nothing.
+        // `have x := 0; x + 1`, elab/consumePPHint). Only a closed `have` is taken so: the
+        // pin assigns any `let`, but this engine's instance search reads a `let`-headed
+        // argument as a star key and then zeta-reduces it while unifying, so an assigned
+        // dependent `let` type found `OfNat` instances the pin's discrimination tree never
+        // offers (source_record_literals' `nested 8`), and one still holding a hole (a
+        // `let rec` in a type) left the goal stuck. Other shapes keep the reducing path
+        // below: the pin also keeps an in-scope beta redex, but this elaborator does not yet
+        // accept every assignment of one. A refusal here mutates nothing.
         let left_flex = self.flexible_head(left)?;
         let right_flex = self.flexible_head(right)?;
         let constant_headed = |expr: &Expr| {
@@ -1018,7 +1023,11 @@ impl Engine<'_> {
             while let ExprNode::App { f, .. } | ExprNode::MData { expr: f, .. } = head.node() {
                 head = f;
             }
-            matches!(head.node(), ExprNode::Const { .. } | ExprNode::LetE { .. })
+            match head.node() {
+                ExprNode::Const { .. } => true,
+                ExprNode::LetE { non_dep, .. } => *non_dep && !expr.has_expr_mvar(),
+                _ => false,
+            }
         };
         let quick = match (left_flex, right_flex) {
             (true, false) if constant_headed(right) => Some((left, right)),
