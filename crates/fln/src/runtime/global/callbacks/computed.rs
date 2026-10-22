@@ -161,20 +161,15 @@ impl Preparation<'_> {
             let ExprNode::Const { name, levels } = head.node() else {
                 return Ok(false);
             };
-            let definition = match self.environment.find(name) {
-                Some(ConstantInfo::Defn(definition))
-                    if definition.safety == DefinitionSafety::Safe =>
-                {
-                    Some(definition.clone())
-                }
-                Some(_) => None,
-                None => self
-                    .specialized_definition(name)
-                    .filter(|definition| definition.safety == DefinitionSafety::Safe),
-            };
-            let Some(definition) = definition else {
+            let Some(definition) = self.executable_definition(name)? else {
                 return Ok(false);
             };
+            if !matches!(
+                definition.safety,
+                DefinitionSafety::Safe | DefinitionSafety::Partial
+            ) {
+                return Ok(false);
+            }
             if definition.base.level_params.len() != levels.len()
                 || levels
                     .iter()
