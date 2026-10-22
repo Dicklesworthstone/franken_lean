@@ -87,7 +87,7 @@ pub fn mutual_inductive_declaration(
     specs: &[InductiveSpec],
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
-    build_mutual(specs, budget, None)
+    build_mutual(specs, budget, None, 8)
 }
 
 /// [`mutual_inductive_declaration`] for a block whose trailing parameters were
@@ -101,15 +101,26 @@ pub(crate) fn mutual_inductive_with_promoted_parameters(
     budget: RecordBudget,
     promoted: &[Vec<Vec<LocalDecl>>],
 ) -> Result<Declaration, InductiveError> {
-    build_mutual(specs, budget, Some(promoted))
+    build_mutual(specs, budget, Some(promoted), 8)
+}
+
+/// A nested block translated to its main and auxiliary families. The pin bounds neither, so
+/// only the work budget does.
+pub(super) fn build_nested_block(
+    specs: &[InductiveSpec],
+    budget: RecordBudget,
+    promoted: &[Vec<Vec<LocalDecl>>],
+) -> Result<Declaration, InductiveError> {
+    build_mutual(specs, budget, Some(promoted), budget.max_binders)
 }
 
 fn build_mutual(
     specs: &[InductiveSpec],
     budget: RecordBudget,
     promoted: Option<&[Vec<Vec<LocalDecl>>]>,
+    max_families: usize,
 ) -> Result<Declaration, InductiveError> {
-    if !(2..=8).contains(&specs.len()) {
+    if specs.len() < 2 || specs.len() > max_families {
         return Err(InductiveError::InvalidTelescope);
     }
     let first = &specs[0];

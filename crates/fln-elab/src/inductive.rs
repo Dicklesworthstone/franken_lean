@@ -5,8 +5,10 @@
 //! infers positivity from a flag or publishes a candidate into an environment.
 pub mod auxiliaries;
 mod mutual;
+mod nested;
 pub use mutual::mutual_inductive_declaration;
 pub(crate) use mutual::mutual_inductive_with_promoted_parameters;
+pub(crate) use nested::nested_inductive_declaration;
 
 use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, app, fresh, fv};
