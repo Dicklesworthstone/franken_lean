@@ -1704,7 +1704,7 @@ jobs:
 
   indexed-callback-results:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify callable indexed results and inferred well-founded recursion'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): isolate indexed result and recursive inference failures'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
@@ -1714,12 +1714,13 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_TERM_COLOR: never
-      CANDIDATE_SHA: 'd51551b5a4d489c96708e7fae4cfc07e4b20b278'
+      CANDIDATE_SHA: '0067e91368773bc3fcf0d5088da2e0bd3dedc711'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'd51551b5a4d489c96708e7fae4cfc07e4b20b278'
+          ref: '0067e91368773bc3fcf0d5088da2e0bd3dedc711'
           persist-credentials: false
       - name: Verify immutable candidate and install the exact Rust toolchain
         id: compiler
@@ -1731,14 +1732,12 @@ jobs:
       - name: Check concrete callable results, strict evaluation and refusal boundaries
         run: cargo +nightly-2026-08-31 test --locked --offline -p fln --test runtime_type_indexed_data -- --nocapture --test-threads=1
       - name: Check indexed recursion and closure staging regressions
-        if: (success() || failure()) && steps.compiler.outcome == 'success'
         run: |
           set -euo pipefail
           cargo +nightly-2026-08-31 test --locked --offline --no-fail-fast -p fln --test runtime_indexed_data --test runtime_equality_transport --test runtime_recursive_data --test runtime_parameterized_data --test runtime_proof_data --test runtime_administrative_callbacks --test runtime_staged_closures --test runtime_captured_stages --test runtime_higher_order --test runtime_dependent_programs -- --test-threads=1
           cargo +nightly-2026-08-31 test --locked --offline -p fln --lib only_a_direct_type_index_becomes_a_boxed_motive_result
           cargo +nightly-2026-08-31 test --locked --offline -p fln --lib boxed_type_refinements_keep_the_payload_interface_and_typed_result_boundary
       - name: Check the affected code and formatting
-        if: (success() || failure()) && steps.compiler.outcome == 'success'
         run: |
           set -euo pipefail
           cargo +nightly-2026-08-31 clippy --locked --offline -p fln --lib --test runtime_type_indexed_data -- -D warnings
@@ -1747,7 +1746,7 @@ jobs:
 
   inferred-well-founded-results:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): verify callable indexed results and inferred well-founded recursion'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(runtime): isolate indexed result and recursive inference failures'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -1757,13 +1756,14 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_TERM_COLOR: never
       FLN_REQUIRE_REFERENCE: '1'
-      CANDIDATE_SHA: 'd51551b5a4d489c96708e7fae4cfc07e4b20b278'
+      CANDIDATE_SHA: '0067e91368773bc3fcf0d5088da2e0bd3dedc711'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 'd51551b5a4d489c96708e7fae4cfc07e4b20b278'
+          ref: '0067e91368773bc3fcf0d5088da2e0bd3dedc711'
           persist-credentials: false
       - name: Verify immutable candidate and install the exact Rust toolchain
         id: compiler
@@ -1787,15 +1787,42 @@ jobs:
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
           echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
+      - name: Confirm the inferred result examples against the pinned Lean oracle
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/wf-inferred-results.lean" <<'LEAN'
+          import Init.WFTactics
+          import Init.Omega
+          import Init.WFComputable
+          def inferredThreshold (n : Nat) := if h : n < 99 then n else inferredThreshold (n - 99)
+          def inferredCountdown (n : Nat) := if h : 0 < n then inferredCountdown (n - 1) + 1 else 0
+          termination_by n
+          decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)
+          def inferredChoose (α : Type) (x : α) (n : Nat) := if h : 0 < n then inferredChoose α x (n - 1) else x
+          termination_by n
+          decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)
+          def inferredAccumulate (acc n : Nat) := if h : 0 < n then inferredAccumulate (acc + 1) (n - 1) else acc
+          termination_by n
+          decreasing_by exact Nat.sub_lt h (Nat.succ_pos 0)
+          example : Nat → Nat := inferredThreshold
+          example : Nat → Nat := inferredCountdown
+          example : (α : Type) → α → Nat → α := inferredChoose
+          example : Nat → Nat → Nat := inferredAccumulate
+          #eval inferredThreshold 250
+          #eval inferredCountdown 42
+          #eval inferredChoose Nat 42 5
+          #eval inferredAccumulate 12 30
+          LEAN
+          LEAN_PATH="$FLN_REFERENCE_LIB" "$FLN_REFERENCE_LEAN" "$RUNNER_TEMP/wf-inferred-results.lean" > "$RUNNER_TEMP/wf-inferred-results.out"
+          cat "$RUNNER_TEMP/wf-inferred-results.out"
+          printf '52\n42\n42\n42\n' | diff -u - "$RUNNER_TEMP/wf-inferred-results.out"
       - name: Check inferred recursive result types and refusal controls
         run: cargo +nightly-2026-08-31 test --locked --offline -p fln --test source_well_founded native_well_founded_omitted_result_types -- --exact --nocapture --test-threads=1
       - name: Check existing well-founded recursion and postponed application regressions
-        if: (success() || failure()) && steps.reference.outcome == 'success'
         run: |
           set -euo pipefail
           cargo +nightly-2026-08-31 test --locked --offline -p fln --test source_well_founded --test source_postponed_applications -- --nocapture --test-threads=1
       - name: Check the affected code and formatting
-        if: (success() || failure()) && steps.compiler.outcome == 'success'
         run: |
           set -euo pipefail
           cargo +nightly-2026-08-31 clippy --locked --offline -p fln-elab --lib -- -D warnings
