@@ -233,6 +233,11 @@ const WIDTH: usize = 120;
 
 /// A term node as the pin's formatter groups it: `fill (nest 2 …)`
 /// (`categoryParser.formatter`, vendored `PrettyPrinter/Formatter.lean`).
+/// `let`, or `have` for a nondependent binding (`let +nondep`), as the pin prints each.
+fn let_keyword(non_dep: bool) -> &'static str {
+    if non_dep { "have" } else { "let" }
+}
+
 fn node(content: Format) -> Format {
     content.nest(2).fill()
 }
@@ -1041,7 +1046,7 @@ impl<'a> Printer<'a> {
                 type_,
                 value,
                 body,
-                ..
+                non_dep,
             } if outer == 0 && self.names.len() == self.top_names => {
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
@@ -1052,12 +1057,36 @@ impl<'a> Printer<'a> {
                 let printed = self.doc(body, 0);
                 self.top_names = top;
                 self.unbind_to(depth);
-                Ok(Format::text(format!("let {shown} := "))
+                Ok(
+                    Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
+                        .then(value)
+                        .then(Format::text(";\n"))
+                        .then(printed?),
+                )
+            }
+            // Nested, a `let` (`have` when nondependent) is `let x := v;`, the hard line of
+            // `optSemicolon`'s `ppLine`, and its body, under `ppDedent`: in parentheses below
+            // `leadPrec`, the `paren` node's dedent returns the body to the enclosing
+            // indentation, and the hard line breaks every group around it.
+            ExprNode::LetE {
+                decl_name: name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                let value = self.doc(value, 0)?;
+                let shown = binder_name(name);
+                let depth = self.names.len();
+                self.bind(shown.clone(), type_);
+                let printed = self.doc(body, 0);
+                self.unbind_to(depth);
+                let doc = Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
                     .then(value)
                     .then(Format::text(";\n"))
-                    .then(printed?))
+                    .then(printed?);
+                Ok(paren_doc(doc, MAX_PREC - 1, outer))
             }
-            ExprNode::LetE { .. } => Err(Unsupported("a nested let expression")),
             ExprNode::Proj { idx, expr, .. } => Ok(node(
                 self.doc(expr, MAX_PREC)?
                     .then(Format::text(format!(".{}", idx + 1))),

@@ -141,3 +141,75 @@ fn queries_over_section_variables_print_as_at_the_pin() {
         assert_eq!((code, stdout.as_str()), (0, EXPECTED), "the pin moved");
     }
 }
+
+/// A `let` (`have` when nondependent) inside another term prints in parentheses, broken after
+/// its `;` at the enclosing indentation, and its hard line breaks every group around it.
+const NESTED_LETS: &str = "prelude
+import Init.Core
+opaque q : Nat → Prop
+opaque f : Nat → Nat → Nat
+#check q (have x := 0; x + 1)
+#check q (let x := 0; x + 1)
+#check f (let x := 0; x + 1) 2
+#check fun (n : Nat) => q (have x := n; x + 1)
+#check q (let x := 0; let y := x; x + y)
+#check have x := 0; x + 1
+#check let x := 0; x + 1
+";
+
+/// The pinned v4.32.0's output for [`NESTED_LETS`] (measured 2026-10-22).
+const NESTED_LETS_EXPECTED: &str = "q
+  (have x := 0;
+  x + 1) : Prop
+q
+  (let x := 0;
+  x + 1) : Prop
+f
+  (let x := 0;
+  x + 1)
+  2 : Nat
+fun n =>
+  q
+    (have x := n;
+    x + 1) : Nat → Prop
+q
+  (let x := 0;
+  let y := x;
+  x + y) : Prop
+have x := 0;
+x + 1 : Nat
+let x := 0;
+x + 1 : Nat
+";
+
+#[test]
+fn nested_lets_print_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let entry = root.join("NestedLets.lean");
+    std::fs::write(&entry, NESTED_LETS).unwrap();
+    let ours = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&entry)
+        .current_dir(&root)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .output()
+        .expect("run the installed lean");
+    assert_eq!(
+        ours.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(ours.stdout).unwrap(),
+        NESTED_LETS_EXPECTED
+    );
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, NESTED_LETS_EXPECTED),
+            "the pin moved"
+        );
+    }
+}
