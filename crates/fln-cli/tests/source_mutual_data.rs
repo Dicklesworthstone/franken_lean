@@ -42,7 +42,10 @@ fn replay(artifact: &Path) {
 
 #[test]
 fn mutual_blocks_execute_through_both_personalities_and_independent_bytecode() {
-    check_source_and_replay(include_str!("../../../examples/native_mutual_data.lean"));
+    check_source_and_replay(
+        include_str!("../../../examples/native_mutual_data.lean"),
+        MUTUAL_DATA_LEAN,
+    );
 }
 
 /// `examples/native_mutual_folds.lean` applies `Forest.rec` directly. The pin refuses it at
@@ -87,9 +90,10 @@ fn direct_mutual_folds_are_refused_by_both_personalities_as_the_pin_does() {
 
 #[test]
 fn function_children_survive_mapping_and_independent_bytecode_replay() {
-    check_source_and_replay(include_str!(
-        "../../../examples/native_function_child_runtime.lean"
-    ));
+    check_source_and_replay(
+        include_str!("../../../examples/native_function_child_runtime.lean"),
+        "42\n",
+    );
 }
 
 #[test]
@@ -122,7 +126,13 @@ fn imported_function_children_preserve_closures_and_failed_runs_preserve_artifac
     assert_eq!(original, std::fs::read(&recovered).unwrap());
 }
 
-fn check_source_and_replay(source: &str) {
+/// The pinned `lean` v4.32.0's stdout on `examples/native_mutual_data.lean` (2026-10-22), with
+/// `{path}` for the file as the command line names it: both patterns leave a field unused.
+const MUTUAL_DATA_LEAN: &str = "{path}:11:12: warning: Variable name `children` is not explicitly referenced.\n\nThe binding can be removed (if unused) or named `_` (if used implicitly).\n\nNote: This linter can be disabled with `set_option linter.unusedVariables false`\n{path}:16:12: warning: Variable name `rest` is not explicitly referenced.\n\nThe binding can be removed (if unused) or named `_` (if used implicitly).\n\nNote: This linter can be disabled with `set_option linter.unusedVariables false`\n42\n";
+
+/// Run both personalities on `source`, replay the artifact, and compare the `lean` door's stdout
+/// with the pin's, `expected` (`{path}` stands for the file).
+fn check_source_and_replay(source: &str, expected: &str) {
     let path = directory().join("Main.lean");
     let artifact = path.with_extension("flbc");
     std::fs::write(&path, source).unwrap();
@@ -137,7 +147,10 @@ fn check_source_and_replay(source: &str) {
         .unwrap();
     assert!(lean.status.success(), "{lean:?}");
     assert!(lean.stderr.is_empty());
-    assert_eq!(lean.stdout, b"42\n");
+    assert_eq!(
+        String::from_utf8(lean.stdout).unwrap(),
+        expected.replace("{path}", &path.display().to_string())
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
 }
 
