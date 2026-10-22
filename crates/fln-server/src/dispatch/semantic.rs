@@ -67,10 +67,12 @@ const MAX_GOALS: usize = 256;
 
 pub(super) fn initialize_response(id: &RequestId) -> String {
     // Both constructors share the ordinary lifecycle/synchronization contract.
+    // The pin's LeanServerCapabilities live under `experimental`; `lean` is
+    // the client's offer (Lsp/Capabilities.lean and Server/Watchdog.lean).
     let response = wire::initialize_response(id);
     response.replacen(
         "\"capabilities\":{",
-        "\"capabilities\":{\"lean\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
+        "\"capabilities\":{\"experimental\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
         1,
     )
 }

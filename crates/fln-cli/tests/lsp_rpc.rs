@@ -100,7 +100,7 @@ impl Client {
             ),
         );
         assert!(
-            init.contains("\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}"),
+            init.contains("\"experimental\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}}"),
             "{init}"
         );
         client.send(&notification("initialized", "{}"));
