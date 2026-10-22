@@ -9129,19 +9129,45 @@ impl Engine {
             })?;
             commands.extend(partitioned);
         }
-        self.execute_batch(
-            commands.len(),
-            options,
-            |index| Some(commands[index].0),
-            |engine, index| {
-                let (original_offset, source) = commands[index];
-                let parsed = fln_parse::parse_nat_definition(source)
-                    .map_err(|error| error.with_original_offset(original_offset))
-                    .map_err(NatDefinitionFrontendError::Parse)
-                    .map_err(EngineExecutionError::Frontend)?;
-                engine.execute_parsed_nat_definition(parsed, options, limits)
-            },
-        )
+        self.execute_batch(commands.len(), options, |engine, index| {
+            use fln_syntax::tree::Syntax;
+
+            let (original_offset, source) = commands[index];
+            let parsed = match fln_parse::parse_nat_definition(source) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return (
+                        Some(original_offset),
+                        Err(EngineExecutionError::Frontend(
+                            NatDefinitionFrontendError::Parse(
+                                error.with_original_offset(original_offset),
+                            ),
+                        )),
+                    );
+                }
+            };
+            // The Nat grammar's canonical declaration carries its keyword's
+            // position; the partition slice itself may start with comments.
+            let keyword = match parsed.syntax() {
+                Syntax::Node { args, .. } => {
+                    args.get(1).and_then(|declaration| match declaration {
+                        Syntax::Node { args, .. } => args.first(),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            let command_offset = keyword
+                .and_then(|keyword| keyword.info().pos(true))
+                .map(|at| {
+                    fln_parse::BytePos(original_offset.0 + parsed.source_view().to_original(at).0)
+                })
+                .unwrap_or(original_offset);
+            (
+                Some(command_offset),
+                engine.execute_parsed_nat_definition(parsed, options, limits),
+            )
+        })
     }
 
     /// Execute a nonempty source-file sequence in the bounded exact Nat/String/Bool
@@ -9623,23 +9649,28 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_batch(
-            declarations.len(),
-            options,
-            |_| None,
-            |engine, index| engine.execute_definition(declarations[index].clone(), options, limits),
-        )
+        self.execute_batch(declarations.len(), options, |engine, index| {
+            (
+                None,
+                engine.execute_definition(declarations[index].clone(), options, limits),
+            )
+        })
     }
 
     fn execute_batch<F>(
         &self,
         command_count: usize,
         options: &KVMap,
-        source_offset: impl Fn(usize) -> Option<fln_parse::BytePos>,
         mut execute: F,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError>
     where
-        F: FnMut(&Engine, usize) -> Result<Outcome<DefinitionExecution>, EngineExecutionError>,
+        F: FnMut(
+            &Engine,
+            usize,
+        ) -> (
+            Option<fln_parse::BytePos>,
+            Result<Outcome<DefinitionExecution>, EngineExecutionError>,
+        ),
     {
         if command_count == 0 {
             return Err(EngineExecutionError::EmptyBatch);
@@ -9654,7 +9685,8 @@ impl Engine {
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
         for index in 0..command_count {
-            let execution = match execute(&engine, index) {
+            let (source_offset, result) = execute(&engine, index);
+            let execution = match result {
                 Ok(Outcome::Complete(execution)) => execution,
                 Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
                 Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
@@ -9662,7 +9694,7 @@ impl Engine {
                     return Err(EngineExecutionError::BatchCommand {
                         index,
                         error: Box::new(error),
-                        at: source_offset(index),
+                        at: source_offset,
                     });
                 }
             };

@@ -720,14 +720,30 @@ fn terminal_module_errors_keep_the_query_offset_and_inner_parse_position() {
     assert_eq!(base.logical_root(&options), before);
     assert!(!base.environment().contains(&name("libValue")));
 
-    let malformed = "-- 😀\r\nimport Lib\r\n\r\n#check (7 : )\r\n";
+    let unlocated = "-- 😀\r\nimport Lib\r\n\r\n#check (7 : )\r\n";
+    assert!(
+        with_modules(&[("Main", unlocated), ("Lib", library)], |inputs| {
+            base.check_terminal_source_modules(inputs, &name("Main"), &options, execution)
+        })
+        .is_err()
+    );
+    assert_eq!(base.logical_root(&options), before);
+
+    let malformed = "-- 😀\r\nimport Lib\r\n\r\n#check 1 2\r\n";
     let error = with_modules(&[("Main", malformed), ("Lib", library)], |inputs| {
         base.check_terminal_source_modules(inputs, &name("Main"), &options, execution)
     })
     .unwrap_err();
+    assert!(matches!(
+        &error,
+        fln::EngineExecutionError::BatchCommand { error, .. }
+            if matches!(error.as_ref(), fln::EngineExecutionError::Frontend(
+                fln::NatDefinitionFrontendError::Parse(_)
+            ))
+    ));
     assert_eq!(
         error.primary_source_offset().map(|offset| offset.0),
-        malformed.find(')'),
+        malformed.find('2'),
         "a token-precise parse failure must outrank the command fallback: {error:?}"
     );
     assert_eq!(base.logical_root(&options), before);
@@ -778,6 +794,22 @@ fn flat_nat_batch_errors_keep_file_offsets_without_publishing_the_prefix() {
     assert_eq!(base.logical_root(&options), before);
     assert!(!base.environment().contains(&name("firstValue")));
     assert!(!base.environment().contains(&name("secondValue")));
+
+    let malformed = "-- 😀\r\ndef secondValue : String := 7\r\n";
+    let error = base
+        .execute_nat_definitions(
+            &[first.as_bytes(), malformed.as_bytes()],
+            &options,
+            execution,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.primary_source_offset().map(|offset| offset.0),
+        malformed.find("String"),
+        "a Nat parse refusal must retain its token position instead of the command start: {error:?}"
+    );
+    assert_eq!(base.logical_root(&options), before);
+    assert!(!base.environment().contains(&name("firstValue")));
 
     let checked = base
         .execute_nat_definitions(
