@@ -62,16 +62,26 @@ pub(in crate::source) fn priority_value(
     val.parse::<u32>().map_err(|_| refuse("u32 priority"))
 }
 
-/// A code generator hint, which changes neither a verdict nor a value: `inline`, `noinline`,
-/// `always_inline` and `inline_if_reduce` (the pin's `inlineAttrs`, Lean/Compiler/InlineAttrs.lean),
-/// `Some(true)`, and `specialize` without arguments (Lean/Compiler/Specialize.lean), `Some(false)`.
-/// The `bool` says whether the pin's `checkIsDefinition` applies: the inlining kinds take only a
-/// definition or an opaque constant. These are enum and parametric attributes, so the pin refuses
-/// them `local` or `scoped`, and refuses an inlining kind with arguments. `macro_inline` evaluates
-/// arguments lazily, and `specialize f` names parameters the pin checks, so both stay refused.
+/// A code generator hint: an inlining kind (the pin's `inlineAttrs`, Lean/Compiler/InlineAttrs.lean),
+/// or `specialize` without arguments (Lean/Compiler/Specialize.lean).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompilerHint {
+    /// `inline`, `noinline`, `always_inline`, `inline_if_reduce` or, with `macro_inline: true`,
+    /// `macro_inline`. The pin's `checkIsDefinition` applies to each.
+    Inlining {
+        macro_inline: bool,
+    },
+    Specialize,
+}
+
+/// A code generator hint. Only `macro_inline` changes a value: the pin's compiler unfolds such a
+/// definition before evaluating its arguments (`fln_elab::macro_inline`); the others change neither
+/// a verdict nor a value. These are enum and parametric attributes, so the pin refuses them `local`
+/// or `scoped`, and refuses an inlining kind with arguments. `specialize f` names parameters the pin
+/// checks, so it stays refused.
 fn compiler_hint(
     attribute: &fln_syntax::tree::Syntax,
-) -> Result<Option<bool>, crate::NatDefinitionElabError> {
+) -> Result<Option<CompilerHint>, crate::NatDefinitionElabError> {
     use super::super::*;
     let instance = expect_node(
         attribute,
@@ -79,19 +89,27 @@ fn compiler_hint(
         2,
         "attribute instance",
     )?;
-    let requires_definition = match &instance[1] {
+    let hint = match &instance[1] {
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "simple"]) => {
             let [Syntax::Ident { val, .. }, argument] = args.as_slice() else {
                 return Ok(None);
             };
-            if !["inline", "noinline", "always_inline", "inline_if_reduce"]
-                .iter()
-                .any(|hint| val == &Name::from_components([*hint]))
+            if ![
+                "inline",
+                "noinline",
+                "always_inline",
+                "inline_if_reduce",
+                "macro_inline",
+            ]
+            .iter()
+            .any(|hint| val == &Name::from_components([*hint]))
             {
                 return Ok(None);
             }
             expect_empty_null(argument, "inlining attribute without arguments")?;
-            true
+            CompilerHint::Inlining {
+                macro_inline: val == &Name::from_components(["macro_inline"]),
+            }
         }
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "specialize"]) => {
             let [keyword, arguments] = args.as_slice() else {
@@ -99,7 +117,7 @@ fn compiler_hint(
             };
             expect_atom(keyword, "specialize", "specialize attribute keyword")?;
             expect_empty_null(arguments, "specialize attribute without arguments")?;
-            false
+            CompilerHint::Specialize
         }
         _ => return Ok(None),
     };
@@ -110,7 +128,52 @@ fn compiler_hint(
         "attribute scope",
     )?;
     expect_empty_null(&scope[0], "global compiler hint")?;
-    Ok(Some(requires_definition))
+    Ok(Some(hint))
+}
+
+/// A declaration's inlining attributes in order, `true` for `macro_inline`. Any other command
+/// has none.
+fn inlining_kinds(
+    syntax: &fln_syntax::tree::Syntax,
+) -> Result<Vec<bool>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Ok(Vec::new());
+    };
+    if kind != &parser_kind(&["Command", "declaration"]) || args.len() != 2 {
+        return Ok(Vec::new());
+    }
+    let modifiers = expect_node(
+        &args[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    let mut kinds = Vec::new();
+    for attribute in super::visibility::attributes(&modifiers[1])? {
+        if let Some(CompilerHint::Inlining { macro_inline }) = compiler_hint(attribute)? {
+            kinds.push(macro_inline);
+        }
+    }
+    Ok(kinds)
+}
+
+/// Whether the declaration's inlining kind is `macro_inline`. The pin keeps one kind per
+/// declaration and each attribute in order replaces it (`registerEnumAttributes`'s NameMap,
+/// vendored `Lean/Attributes.lean`), so the last inlining attribute decides. [`registration`]
+/// validates the attributes and the declaration kind; the elaborator refuses a recursive body.
+pub fn macro_inline(
+    syntax: &fln_syntax::tree::Syntax,
+) -> Result<bool, crate::NatDefinitionElabError> {
+    Ok(inlining_kinds(syntax)?.last() == Some(&true))
+}
+
+/// Whether any attribute is `macro_inline`. The pin validates each one as it is applied
+/// (`isValidMacroInline`), even when a later inlining attribute replaces its kind.
+pub fn macro_inline_requested(
+    syntax: &fln_syntax::tree::Syntax,
+) -> Result<bool, crate::NatDefinitionElabError> {
+    Ok(inlining_kinds(syntax)?.contains(&true))
 }
 
 /// A reducibility attribute: `reducible`, `irreducible`, `semireducible`, `implicit_reducible` or its
@@ -267,6 +330,7 @@ pub fn registration(
     instance_command::inline_registration(syntax)?;
     let mut simp = None;
     let mut inlining = false;
+    let mut macro_inline = false;
     for attribute in super::visibility::attributes(&modifiers[1])? {
         if super::visibility::exposure_attribute(attribute)?.is_some()
             || instance_command::default_attribute(attribute)?.is_some()
@@ -274,8 +338,14 @@ pub fn registration(
         {
             continue;
         }
-        if let Some(requires_definition) = compiler_hint(attribute)? {
-            inlining |= requires_definition;
+        if let Some(hint) = compiler_hint(attribute)? {
+            if let CompilerHint::Inlining {
+                macro_inline: requested,
+            } = hint
+            {
+                inlining = true;
+                macro_inline |= requested;
+            }
             continue;
         }
         // Read by `reducibility`.
@@ -297,6 +367,20 @@ pub fn registration(
     {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "an inlining attribute on a definition or an opaque constant",
+        });
+    }
+    // The pin validates each `macro_inline` it applies (`isValidMacroInline`, vendored
+    // `Lean/Compiler/InlineAttrs.lean:31`): a definition, so not an opaque constant or a
+    // `partial def` (an opaque at the pin), alone in its group and not recursive. The
+    // elaborator refuses a recursive body, and the journal a definition in a mutual group.
+    if macro_inline
+        && (!["definition", "abbrev", "instance"]
+            .iter()
+            .any(|kind| declaration[1].kind() == Some(&parser_kind(&["Command", kind])))
+            || super::super::partial::is_partial(syntax))
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a `macro_inline` attribute on a non-recursive definition",
         });
     }
     let Some(attribute) = simp else {

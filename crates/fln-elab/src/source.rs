@@ -634,6 +634,9 @@ struct Context {
     // Set only after a top-level well-founded lowering succeeds. The source
     // declaration result carries this status to post-admission metadata.
     well_founded_definition: bool,
+    // Set once the definition's body refers to the definition itself, so it is
+    // lowered as a recursion: the pin's `recExt` tag (`Lean/Meta/RecExt.lean`).
+    recursive_definition: bool,
     // Enabled only by the batch-only partial-definition entry point. A recursive
     // body needs its opaque logical interface AND its executable companion.
     partial: Option<partial::State>,
@@ -736,6 +739,7 @@ impl Context {
             well_founded: None,
             mutual_member: None,
             well_founded_definition: false,
+            recursive_definition: false,
             partial: None,
             noncomputable_definition: false,
             unfold_tactic: false,
@@ -5548,6 +5552,13 @@ fn definition_in_context_named(
         termination.as_ref(),
         header_parameters,
     )?;
+    // The pin's `isValidMacroInline` (vendored `Lean/Compiler/InlineAttrs.lean:31`): a
+    // recursive definition does not take `[macro_inline]`.
+    if context.recursive_definition && scope::simp::macro_inline_requested(syntax)? {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a `macro_inline` attribute on a non-recursive definition",
+        });
+    }
     if let Some(expected) = expected {
         term.type_ = expected;
     }

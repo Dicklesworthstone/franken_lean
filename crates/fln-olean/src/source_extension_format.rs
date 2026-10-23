@@ -23,6 +23,7 @@
 //! src/Lean/PrettyPrinter/Delaborator/Attributes.lean: sha256 88dd9277c39f702b241ffa8853862538baee0cf546260eb09ae19c63c3151b26
 //! src/Lean/PrettyPrinter/Delaborator/Basic.lean: sha256 f109b13153edb8c12b2bf86edf7b334b7b0a3f3d02b73a43a7a0f4d9d911544a
 //! src/Lean/KeyedDeclsAttribute.lean: sha256 1d00864816438bbe7410fe9fd3a01599391f2c7d669b35fc300a38576d5aa063
+//! src/Lean/Compiler/InlineAttrs.lean: sha256 a3599016d38e2128d6c1f3cc384a544540b33db1288221754700da42c7e7d01c
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -142,6 +143,12 @@ pub const REDUCIBILITY_IRREDUCIBLE: usize = 2;
 pub const REDUCIBILITY_IMPLICIT_REDUCIBLE: usize = 3;
 pub const EXTERN_EXTENSION: &str = "Lean.externAttr";
 pub const IMPLEMENTED_BY_EXTENSION: &str = "Lean.Compiler.implementedByAttr";
+pub const INLINE_EXTENSION: &str = "Lean.Compiler.inlineAttrs";
+pub const INLINE_INLINE: usize = 0;
+pub const INLINE_NOINLINE: usize = 1;
+pub const INLINE_MACRO_INLINE: usize = 2;
+pub const INLINE_INLINE_IF_REDUCE: usize = 3;
+pub const INLINE_ALWAYS_INLINE: usize = 4;
 pub const LIST_NIL: u8 = 0;
 pub const LIST_CONS: u8 = 1;
 pub const LIST_CONS_HEAD: usize = 0;

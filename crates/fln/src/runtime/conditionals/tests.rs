@@ -240,3 +240,113 @@ def fake.match_1 (n : Nat) : Nat := n
         );
     }
 }
+
+/// `second.{u} : {α : Sort u} → α → α → α := fun α x y => y`, tagged `@[macro_inline]` when
+/// `tagged`. A bare `Nat` stands in for the literals' type: the unfolding is syntactic.
+fn macro_inline_environment(tagged: bool) -> Environment {
+    let u = name("u");
+    let sort = Expr::sort(Level::param(u.clone()));
+    let b = |index| Expr::bvar(index).unwrap();
+    let lam = |label: &str, domain, body| Expr::lam(name(label), domain, body, BinderInfo::Default);
+    let pi =
+        |label: &str, domain, body| Expr::forall_e(name(label), domain, body, BinderInfo::Default);
+    let environment = Environment::new()
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: fln_env::constants::ConstantVal {
+                name: name("second"),
+                level_params: vec![u],
+                type_: pi("α", sort.clone(), pi("x", b(0), pi("y", b(1), b(2)))),
+            },
+            value: lam("α", sort, lam("x", b(0), lam("y", b(1), b(0)))),
+            hints: fln_env::constants::ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![name("second")],
+        }))
+        .unwrap();
+    if tagged {
+        fln_elab::macro_inline::register(&environment, &name("second")).unwrap()
+    } else {
+        environment
+    }
+}
+
+/// The pin's `macroInline` (vendored `Lean/Compiler/LCNF/ToDecl.lean:22`): a tagged constant's
+/// value at the call's universe levels, beta-reduced against the unevaluated arguments. An untagged
+/// constant is untouched, and a malformed journal is refused, never read as "nothing is tagged".
+#[test]
+fn macro_inline_unfolds_only_tagged_definitions_over_unevaluated_arguments() {
+    let head = Expr::const_(name("second"), vec![Level::one()]);
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let strict = |argument| Expr::app(Expr::const_(name("strictWork"), vec![]), argument);
+    let untagged = macro_inline_environment(false);
+    assert!(
+        Preparation::new(&untagged, IngressLimits::default())
+            .macro_inline(
+                &head,
+                &[nat.clone(), strict(nat::literal(1)), nat::literal(2)]
+            )
+            .unwrap()
+            .is_none()
+    );
+    let tagged = macro_inline_environment(true);
+    let mut preparation = Preparation::new(&tagged, IngressLimits::default());
+    // The unselected argument disappears unevaluated; the selected one is the result.
+    assert_eq!(
+        preparation
+            .macro_inline(
+                &head,
+                &[nat.clone(), strict(nat::literal(1)), nat::literal(2)]
+            )
+            .unwrap(),
+        Some(nat::literal(2))
+    );
+    // A partial application keeps the remaining lambda; extra arguments apply to the body.
+    assert_eq!(
+        preparation
+            .macro_inline(&head, &[nat.clone(), strict(nat::literal(1))])
+            .unwrap(),
+        Some(Expr::lam(
+            name("y"),
+            nat.clone(),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default
+        ))
+    );
+    let callee = Expr::const_(name("callee"), vec![]);
+    assert_eq!(
+        preparation
+            .macro_inline(
+                &head,
+                &[
+                    nat.clone(),
+                    strict(nat::literal(1)),
+                    callee.clone(),
+                    nat::literal(3)
+                ]
+            )
+            .unwrap(),
+        Some(Expr::app(callee, nat::literal(3)))
+    );
+    // A bare constant is the value at the call's levels.
+    let Some(value) = preparation.macro_inline(&head, &[]).unwrap() else {
+        panic!("a bare tagged constant unfolds");
+    };
+    let ExprNode::Lam { binder_type, .. } = value.node() else {
+        panic!("the value's telescope: {value:?}");
+    };
+    assert_eq!(binder_type, &Expr::sort(Level::one()));
+    // The universe arity is the declaration's.
+    assert!(
+        preparation
+            .macro_inline(&Expr::const_(name("second"), vec![]), &[nat::literal(0)])
+            .is_err()
+    );
+    let broken = tagged
+        .push_extension_entry(&fln_elab::macro_inline::journal_name(), b"broken".to_vec())
+        .unwrap();
+    assert!(
+        Preparation::new(&broken, IngressLimits::default())
+            .macro_inline(&head, &[nat])
+            .is_err()
+    );
+}

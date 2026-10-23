@@ -233,6 +233,23 @@ impl Engine {
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
             ScopedCommandSyntax::Mutual(members) => {
+                // The group admissions below record no compiler attribute. The pin refuses
+                // `[macro_inline]` on a member of a recursive group (`isValidMacroInline`);
+                // refuse it on any member here rather than drop it.
+                for member in &members {
+                    if fln_elab::source::scope::simp::macro_inline_requested(member)
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                    {
+                        return Err(EngineExecutionError::Frontend(
+                            DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                                    expected: "a `macro_inline` attribute on a non-recursive definition",
+                                },
+                            ),
+                        ));
+                    }
+                }
                 if members.iter().any(|member| {
                     fln_elab::source::partial::is_partial(member)
                         || fln_elab::source::partial::is_unsafe_definition(member)
@@ -590,6 +607,9 @@ impl Engine {
         let reducibility = fln_elab::source::scope::simp::reducibility(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let macro_inline = fln_elab::source::scope::simp::macro_inline(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -733,6 +753,16 @@ impl Engine {
                 }
                 if let Some(name) = protected {
                     batch.engine.environment = tag_protected(&batch.engine, &name)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if macro_inline {
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "macro_inline metadata requires one checked declaration",
+                        });
+                    };
+                    batch.engine.environment =
+                        tag_macro_inline(&batch.engine, &admitted.declaration)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 return self.finish_local_function_batch(batch, &local_functions, options, limits);
@@ -1340,6 +1370,27 @@ pub(crate) fn set_reducibility(
             ),
         ))
     })
+}
+
+/// Tag an admitted definition `@[macro_inline]` (`scope::simp::registration` validated the
+/// attribute and the elaborator a non-recursive body). The pin's `isValidMacroInline` admits only
+/// a definition alone in its group; anything else is the pin's refusal, never a dropped attribute.
+pub(crate) fn tag_macro_inline(
+    engine: &Engine,
+    declaration: &Declaration,
+) -> Result<Environment, EngineExecutionError> {
+    let refused = || {
+        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a `macro_inline` attribute on a non-recursive definition",
+            },
+        ))
+    };
+    let Declaration::Defn(definition) = declaration else {
+        return Err(refused());
+    };
+    fln_elab::macro_inline::register(engine.environment(), &definition.base.name)
+        .map_err(|_| refused())
 }
 
 #[cfg(test)]

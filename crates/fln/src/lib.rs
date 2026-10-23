@@ -6834,6 +6834,9 @@ impl Engine {
         let reducibility = fln_elab::source::scope::simp::reducibility(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let macro_inline = fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -6972,6 +6975,11 @@ impl Engine {
                 if let Some(name) = protected {
                     admitted.engine.environment =
                         source_records::tag_protected(&admitted.engine, &name)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if macro_inline {
+                    admitted.engine.environment =
+                        source_records::tag_macro_inline(&admitted.engine, &admitted.declaration)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 return self.finish_local_function_admission(
@@ -8029,12 +8037,23 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_some();
+            // A `@[macro_inline]` tag is recorded only by the admission path below.
+            let has_macro_inline = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                && fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
                 || fln_elab::source::partial::is_partial(parsed.syntax())
                 || is_instance
                 || has_inline_simp
                 || has_inline_default
+                || has_macro_inline
                 || is_noncomputable
                 || (scope.noncomputable_section
                     && parsed.kind() == fln_parse::SourceCommandKind::Definition)
@@ -9194,6 +9213,9 @@ impl Engine {
                 .map_err(DefinitionFrontendError::Elaborate)
                 .map_err(EngineExecutionError::Frontend)?
                 .is_some()
+            || fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(

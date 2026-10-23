@@ -254,6 +254,15 @@ impl Preparation<'_> {
                         values.push(erased_value());
                         continue;
                     }
+                    // A bare `@[macro_inline]` constant is the pin's unfolding with no
+                    // argument; it precedes every other compilation step, as there.
+                    if matches!(expr.node(), ExprNode::Const { .. })
+                        && let Some(inlined) = self.macro_inline(&expr, &[])?
+                    {
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Frame::Visit(inlined, expected));
+                        continue;
+                    }
                     // Proof classification and source types use the logical
                     // declaration. Only a remaining executable value may select
                     // its implemented_by replacement before any inlining.
@@ -266,6 +275,13 @@ impl Preparation<'_> {
                     match expr.node() {
                         ExprNode::App { .. } => {
                             let (head, args) = self.spine(&expr)?;
+                            // The pin unfolds `@[macro_inline]` applications over their
+                            // unevaluated arguments before anything else is compiled.
+                            if let Some(inlined) = self.macro_inline(&head, &args)? {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(inlined, expected));
+                                continue;
+                            }
                             if let Some(replacement) = self.implemented_by_call(&head, &args)? {
                                 reserve(&mut work, self.limits.max_nodes)?;
                                 work.push(Frame::Visit(replacement, expected));

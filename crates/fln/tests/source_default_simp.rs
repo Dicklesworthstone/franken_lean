@@ -619,13 +619,12 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
 
 /// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
 /// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
-/// change no checked meaning, and refuses the rest. So no attribute is dropped and none is
-/// admitted without its meaning.
+/// change no checked meaning, and `macro_inline`, recorded for the runtime, and refuses the rest.
+/// So no attribute is dropped and none is admitted without its meaning.
 #[test]
 fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     let base = engine();
     for source in [
-        "@[macro_inline] def x : Nat := 0",
         "@[simp, inline] theorem t : (0 : Nat) = 0 := by rfl",
         "@[local simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
@@ -653,8 +652,11 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
             "theorem defaultNumeral : (7 : Bool) = false := by rfl",
         ],
     );
-    // The code generator hints are admitted, on a definition and on an instance.
+    // The code generator hints are admitted, on a definition and on an instance. The pinned
+    // `lean` v4.32.0 accepts `@[macro_inline] def x : Nat := 0` (exit 0, 2026-10-23), which this
+    // test refused while `macro_inline` was unimplemented; it is recorded now.
     for source in [
+        "@[macro_inline] def x : Nat := 0",
         "@[inline] def x : Nat := 0",
         "@[specialize] def x (f : Nat → Nat) : Nat := f 0",
         "@[inline] instance : OfNat Bool 7 := ⟨false⟩",

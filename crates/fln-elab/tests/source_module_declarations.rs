@@ -313,12 +313,27 @@ fn exposure_tags_combine_with_simp_without_dropping_other_attribute_effects() {
             Some((n("identity"), 1000, false))
         );
     }
+    // `macro_inline` beside `expose` is recorded with the declaration: the pinned `lean` v4.32.0
+    // accepts this command in a `module` file (exit 0, 2026-10-23); this test refused it while
+    // `macro_inline` was unimplemented. Without `expose` the pin refuses it ("must be an exposed
+    // definition"), as the drop-in `lean` does.
+    let source = "@[expose, macro_inline] public def identity (a : Type) (x : a) : a := x";
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    assert!(scope::simp::macro_inline(parsed.syntax()).unwrap());
+    assert_eq!(scope::simp::registration(parsed.syntax()).unwrap(), None);
+    assert!(
+        fln_elab::elaborate_definition_in_scope_with_budget(
+            parsed.syntax(),
+            &Environment::new(),
+            budget(),
+            &module()
+        )
+        .is_ok(),
+        "{source}"
+    );
     for source in [
         "@[local expose] public def identity (a : Type) (x : a) : a := x",
         "@[expose 10] public def identity (a : Type) (x : a) : a := x",
-        // `inline` is a code generator hint with no effect to drop (accepted since the compiler
-        // hints landed); `macro_inline` changes evaluation and is not implemented.
-        "@[expose, macro_inline] public def identity (a : Type) (x : a) : a := x",
     ] {
         let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
         assert!(

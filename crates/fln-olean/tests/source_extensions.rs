@@ -4,7 +4,8 @@ use fln_core::expr::{Literal, NatLit};
 use fln_core::name::Name;
 use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
 use fln_olean::source_extensions::{
-    DecodeError, DecodeLimits, InstanceKey, ReducibilityStatus, SourceExtensions, decode,
+    DecodeError, DecodeLimits, InlineKind, InstanceKey, ReducibilityStatus, SourceExtensions,
+    decode,
 };
 use fln_rt::convert::inject_name;
 use fln_rt::obj::Obj;
@@ -227,6 +228,73 @@ fn real_prelude_decodes_the_reducibility_status_the_pin_reports() {
     for name in ["id", "OfNat.ofNat", "Nat.lt", "Nat.le"] {
         assert_eq!(status(name), ReducibilityStatus::Semireducible, "{name}");
     }
+}
+
+/// The Prelude's `Lean.Compiler.inlineAttrs` entries. Its written `@[macro_inline]` declarations
+/// are the twelve the vendored `src/Init/Prelude.lean` tags (`rg -n -A2 macro_inline`), the two
+/// anonymous instances under the names the pin gives them (`instDecidableAnd`,
+/// `instDecidableOr`). The pin also tags the generated `T.ctorIdx` of each one-constructor type
+/// (vendored `src/Lean/Meta/Constructions/CtorIdx.lean:92-93`): 91 in the Prelude. Other kinds
+/// are decoded, never promoted: `Nat.add` is not tagged at all.
+#[test]
+fn real_prelude_decodes_the_inline_attribute_kinds() {
+    let decoded = read(blocks()).unwrap();
+    assert!(
+        !decoded
+            .uninterpreted
+            .contains(&n("Lean.Compiler.inlineAttrs"))
+    );
+    let (constructor_indices, mut macro_inline): (Vec<_>, Vec<_>) = decoded
+        .inline
+        .iter()
+        .filter(|row| row.kind == InlineKind::MacroInline)
+        .map(|row| row.declaration.clone())
+        .partition(|name| name.to_display_string().ends_with(".ctorIdx"));
+    assert_eq!(constructor_indices.len(), 91);
+    macro_inline.sort();
+    let mut expected: Vec<_> = [
+        "False.elim",
+        "absurd",
+        "cast",
+        "dite",
+        "ite",
+        "instDecidableAnd",
+        "instDecidableOr",
+        "cond",
+        "Bool.dcond",
+        "Bool.or",
+        "Bool.and",
+        "Option.getD",
+    ]
+    .map(n)
+    .to_vec();
+    expected.sort();
+    assert_eq!(macro_inline, expected);
+    assert!(
+        decoded
+            .inline
+            .iter()
+            .any(|row| row.kind != InlineKind::MacroInline),
+        "the other inlining kinds are decoded too"
+    );
+    assert!(
+        !decoded
+            .inline
+            .iter()
+            .any(|row| row.declaration == n("Nat.add"))
+    );
+    // Each declaration has one kind: a repeated row is malformed.
+    let row = blocks()
+        .iter()
+        .find(|block| block.name == n("Lean.Compiler.inlineAttrs"))
+        .unwrap()
+        .entries[0]
+        .clone();
+    let repeated = vec![OpaqueExtensionBlock {
+        name: n("Lean.Compiler.inlineAttrs"),
+        entries: vec![row.clone(), row],
+    }];
+    assert!(read(&repeated).is_err());
 }
 
 #[test]

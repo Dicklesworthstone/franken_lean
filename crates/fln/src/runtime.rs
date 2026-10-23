@@ -52,6 +52,8 @@ pub(super) struct Preparation<'a> {
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
     noncomputable: Option<BTreeSet<Name>>,
+    /// `@[macro_inline]` definitions, read once from this immutable environment.
+    macro_inline: Option<BTreeSet<Name>>,
     /// Opaques whose values may run; see `Engine::executable_opaques`. None
     /// unless the caller names its engine's set.
     executable_opaques: Option<&'a BTreeSet<Name>>,
@@ -162,6 +164,7 @@ impl<'a> Preparation<'a> {
             externs: None,
             implementations: None,
             noncomputable: None,
+            macro_inline: None,
             executable_opaques: None,
             runtime_initializers: None,
             native_intrinsics: native_intrinsics::Store::default(),

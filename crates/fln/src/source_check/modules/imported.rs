@@ -95,6 +95,9 @@ pub struct SourceMetadataReport {
     /// Compatible executable replacements, bound to this module's own checked
     /// declarations and to targets in its actual import closure.
     pub implemented_by: usize,
+    /// Inlining attributes (the pin's `inlineAttrs`). Only the `macro_inline` ones,
+    /// which change what code computes, are recorded, for this module's own definitions.
+    pub inline: usize,
     /// Ordered initialization entries retained for executable-body classification.
     /// No initialization action is executed by importing metadata.
     pub regular_initializers: usize,
@@ -349,6 +352,7 @@ impl Engine {
                 Name::from_components(metadata::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION.split('.')),
                 Name::from_components(metadata::PP_NODOT_EXTENSION.split('.')),
                 Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
+                Name::from_components(metadata::INLINE_EXTENSION.split('.')),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -388,6 +392,7 @@ impl Engine {
                 reducibility: 0,
                 externs: 0,
                 implemented_by: 0,
+                inline: 0,
                 regular_initializers: 0,
                 builtin_initializers: 0,
                 simps: 0,
@@ -443,6 +448,7 @@ impl Engine {
                         15 => report.pp_anonymous_constructor = entries.len(),
                         16 => report.pp_nodot = entries.len(),
                         17 => report.app_unexpanders = entries.len(),
+                        18 => report.inline = entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -484,6 +490,7 @@ impl Engine {
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
+        let mut inline = decoded.inline.into_iter();
         let mut regular_initializers = decoded.initializers.regular.into_iter();
         let mut builtin_initializers = decoded.initializers.builtin.into_iter();
         let mut engine = checked.engine.clone();
@@ -859,6 +866,44 @@ impl Engine {
                         })?;
                 }
             }
+            // Enumeration attributes, like parametric ones, can be set only in the
+            // declaring module (Lean/Attributes.lean, registerEnumAttributes), so each
+            // `macro_inline` row must name this module's own checked declaration.
+            if report.inline != 0 {
+                cancelled!("source-olean/inline-owner-index");
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.inline,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.inline {
+                    cancelled!("source-olean/inline");
+                    let row = inline.next().ok_or(SourceOleanImportError::Internal(
+                        "inline attribute count changed during decode",
+                    ))?;
+                    if row.kind != metadata::InlineKind::MacroInline {
+                        continue;
+                    }
+                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
+                    use fln_elab::macro_inline::MacroInlineError;
+                    let reason = |error| match error {
+                        MacroInlineError::Limit => "macro_inline journal limit",
+                        MacroInlineError::NotADefinition(_) => {
+                            "a macro_inline tag names no non-mutual definition"
+                        }
+                        _ => "a macro_inline tag cannot be recorded",
+                    };
+                    activation =
+                        activation
+                            .register_macro_inline(&row.declaration)
+                            .map_err(|error| SourceOleanImportError::Metadata {
+                                module: report.module.clone(),
+                                declaration: row.declaration.clone(),
+                                reason: reason(error),
+                            })?;
+                }
+            }
             // Parametric attributes export their complete journal in the private
             // part (Lean/Attributes.lean, registerParametricAttribute). Capture
             // required that part for a module-system artifact, so absence here
@@ -922,6 +967,13 @@ impl Engine {
         fln_elab::noncomputable::read(&engine.environment).map_err(|error| {
             noncomputable_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
+        fln_elab::macro_inline::read(&engine.environment).map_err(|_| {
+            SourceOleanImportError::Metadata {
+                module: roots.first().cloned().unwrap_or_default(),
+                declaration: roots.first().cloned().unwrap_or_default(),
+                reason: "the macro_inline journal cannot be read back",
+            }
+        })?;
         fln_elab::delaborator_tags::DelaboratorTags::read(&engine.environment).map_err(|_| {
             SourceOleanImportError::Metadata {
                 module: roots.first().cloned().unwrap_or_default(),
@@ -953,6 +1005,7 @@ impl Engine {
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
+            || inline.next().is_some()
             || regular_initializers.next().is_some()
             || builtin_initializers.next().is_some()
         {
@@ -1121,6 +1174,10 @@ trait Registrar: Sized {
         declaration: &Name,
         implementation: &Name,
     ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError>;
+    fn register_macro_inline(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::macro_inline::MacroInlineError>;
     fn register_structures(
         self,
         rows: &[fln_elab::records::imported::StructureEntry],
@@ -1213,6 +1270,12 @@ impl Registrar for instances::imported::ImportActivation {
         implementation: &Name,
     ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
         self.register_implemented_by(declaration, implementation)
+    }
+    fn register_macro_inline(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::macro_inline::MacroInlineError> {
+        self.register_macro_inline(declaration)
     }
     fn register_structures(
         self,
@@ -1905,6 +1968,12 @@ pub(super) mod tests {
             implementation: &Name,
         ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError> {
             fln_elab::implemented_by::register(&self.0, declaration, implementation).map(Sequential)
+        }
+        fn register_macro_inline(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::macro_inline::MacroInlineError> {
+            fln_elab::macro_inline::register(&self.0, declaration).map(Sequential)
         }
         fn register_structures(
             self,

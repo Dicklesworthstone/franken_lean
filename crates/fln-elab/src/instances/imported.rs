@@ -656,6 +656,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record an imported `@[macro_inline]` tag ([`crate::macro_inline::register`]). This
+    /// separate journal does not change kept class or instance state.
+    pub fn register_macro_inline(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::macro_inline::MacroInlineError> {
+        self.env = crate::macro_inline::register(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Retain a compatible imported executable replacement. Logical constants
     /// and the kept class/instance registries remain unchanged.
     pub fn register_implemented_by(

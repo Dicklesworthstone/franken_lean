@@ -1,5 +1,6 @@
 //! Data-only decoding of pinned class, instance, default-instance, simp, export-alias
-//! protected-declaration, auxiliary-recursor, structure, extern, implemented_by and initialization journals.
+//! protected-declaration, auxiliary-recursor, structure, extern, implemented_by, inlining
+//! and initialization journals.
 //!
 //! Field offsets and enum tags are extracted from the Reference declarations.
 //! This grants no proof authority: declarations must pass the ordinary council
@@ -18,7 +19,7 @@ use std::collections::BTreeSet;
 pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
     CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, EXTERN_EXTENSION,
-    IMPLEMENTED_BY_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
+    IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
     REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
@@ -130,6 +131,27 @@ pub struct ReducibilityEntry {
     pub status: ReducibilityStatus,
 }
 
+/// The pin's `InlineAttributeKind` (vendored `src/Lean/Compiler/InlineAttrs.lean`), in
+/// constructor order. Only `MacroInline` changes what a program computes: the pin's compiler
+/// inlines such a definition before any argument is evaluated (`macroInline`, vendored
+/// `src/Lean/Compiler/LCNF/ToDecl.lean`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InlineKind {
+    Inline,
+    NoInline,
+    MacroInline,
+    InlineIfReduce,
+    AlwaysInline,
+}
+
+/// One `Lean.Compiler.inlineAttrs` entry: a module's own declaration and its kind. The pin's
+/// enumeration attribute keeps one kind per declaration and exports it once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineEntry {
+    pub declaration: Name,
+    pub kind: InlineKind,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceExtensions {
     pub classes: Vec<ClassEntry>,
@@ -161,6 +183,8 @@ pub struct SourceExtensions {
     pub externs: Vec<ExternAttribute>,
     /// Executable replacements, separate from the declarations' logical bodies.
     pub implemented_by: Vec<ImplementedByEntry>,
+    /// Inlining attributes (the pin's `inlineAttrs`), in journal order. A name appears once.
+    pub inline: Vec<InlineEntry>,
     /// Ordered initialization journals. A named initializer replaces a stored
     /// body at runtime; an anonymous parameter denotes a standalone IO action.
     pub initializers: crate::initializers::InitJournals,
@@ -414,6 +438,26 @@ impl Reader {
             keys: self.keys(&field(&entry, format::INSTANCE_KEYS)?)?,
         })
     }
+    /// `Name × InlineAttributeKind`, the same Prod as a reducibility entry.
+    fn inline(&mut self, obj: &Obj) -> Result<InlineEntry, DecodeError> {
+        constructor(obj, 0, format::PROD_POINTERS)?;
+        let kind = field(obj, format::PROD_SND)?;
+        if !kind.is_scalar() {
+            return Err(shape("inline attribute kind is not an enumeration value"));
+        }
+        let kind = match kind.unbox() {
+            format::INLINE_INLINE => InlineKind::Inline,
+            format::INLINE_NOINLINE => InlineKind::NoInline,
+            format::INLINE_MACRO_INLINE => InlineKind::MacroInline,
+            format::INLINE_INLINE_IF_REDUCE => InlineKind::InlineIfReduce,
+            format::INLINE_ALWAYS_INLINE => InlineKind::AlwaysInline,
+            _ => return Err(shape("unknown inline attribute kind")),
+        };
+        Ok(InlineEntry {
+            declaration: self.name(&field(obj, format::PROD_FST)?)?,
+            kind,
+        })
+    }
     fn reducibility(&mut self, obj: &Obj) -> Result<ReducibilityEntry, DecodeError> {
         constructor(obj, 0, format::PROD_POINTERS)?;
         let status = field(obj, format::PROD_SND)?;
@@ -506,6 +550,7 @@ pub fn decode(
         name(format::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION),
         name(format::PP_NODOT_EXTENSION),
         name(format::APP_UNEXPANDER_EXTENSION),
+        name(format::INLINE_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -525,6 +570,7 @@ pub fn decode(
     let mut pp_anonymous_constructor = BTreeSet::new();
     let mut pp_nodot = BTreeSet::new();
     let mut structures = BTreeSet::new();
+    let mut inline = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
             return Err(shape("duplicate extension block"));
@@ -638,7 +684,15 @@ pub fn decode(
                     names.push(declaration);
                 }
                 18 => out.app_unexpanders.push(reader.app_unexpander(&obj)?),
-                _ => unreachable!("nineteen selected extension families"),
+                19 => {
+                    // An enumeration attribute's NameMap exports each declaration once.
+                    let row = reader.inline(&obj)?;
+                    if !inline.insert(row.declaration.clone()) {
+                        return Err(shape("inline attribute recorded twice"));
+                    }
+                    out.inline.push(row);
+                }
+                _ => unreachable!("twenty selected extension families"),
             }
         }
     }

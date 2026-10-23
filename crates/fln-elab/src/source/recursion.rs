@@ -768,6 +768,9 @@ impl Context {
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
         self.txn.budget.heartbeats_consumed = spent;
+        // The body refers to the definition itself: whichever lowering follows,
+        // this is a recursive definition.
+        self.recursive_definition = true;
         if self.partial.is_some() {
             let result = self.partial_definition_body(name, parameters, syntax, expected);
             if result.is_err() {
