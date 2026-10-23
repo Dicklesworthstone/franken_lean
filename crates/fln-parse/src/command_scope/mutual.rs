@@ -59,12 +59,18 @@ pub(super) fn block_end(
 /// original group's offsets survive parser errors inside every member. None
 /// means this is an ordinary command, not an empty or malformed mutual group.
 pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
     Ok(parse_with_offsets(source)?.map(|members| {
         members
             .into_iter()
             .map(|(offset, mut syntax)| {
                 // The elaborator receives the whole group's source site. Keep
-                // every member's positions relative to that same original file.
+                // every member's syntax in that group's normalized coordinates.
+                // parse_with_offsets intentionally exposes raw offsets instead.
+                let offset = view
+                    .from_original(offset)
+                    .expect("a member starts at a byte retained in the source view");
                 let span = |value: ByteSpan| {
                     ByteSpan::new(
                         BytePos(value.start().0 + offset.0),
@@ -273,6 +279,33 @@ mod tests {
         assert_eq!(
             error.primary_offset().unwrap().0,
             source.rfind(')').unwrap()
+        );
+    }
+
+    #[test]
+    fn member_syntax_positions_use_the_normalized_group_view() {
+        let source = "-- π\r\nmutual\r\n  def first : Nat := panic! \"first\"\r\n  def second : Nat := panic! \"second\"\r\nend\r\n";
+        let normalized = source.replace("\r\n", "\n");
+        let members = parse(source.as_bytes()).unwrap().unwrap();
+        let mut positions = Vec::new();
+        for member in &members {
+            let mut pending = vec![member];
+            while let Some(node) = pending.pop() {
+                match node {
+                    Syntax::Node { args, .. } => pending.extend(args.iter().rev()),
+                    Syntax::Atom { info, val } if val == "panic!" => {
+                        positions.push(info.pos(false).unwrap().0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            positions,
+            normalized
+                .match_indices("panic!")
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>()
         );
     }
 
