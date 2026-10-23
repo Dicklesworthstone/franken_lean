@@ -8629,14 +8629,25 @@ impl Engine {
                         .into_iter()
                         .collect();
                 if !sorry_commands.contains(&command) {
-                    let mut unused =
-                        unused_variables::unused_pattern_variables(syntax, options, &constructors);
-                    unused.extend(unused_variables::unused_fun_binders(
-                        syntax,
-                        options,
-                        &constructors,
-                    ));
-                    unused.extend(unused_variables::unused_type_binders(syntax, options));
+                    // A field filled by its tactic ran one inside the body, so the pin reads
+                    // the body's binders only through its elaborated term.
+                    let body_ran_tactics = declared.is_some_and(|(_, _, value, _)| {
+                        unused_variables::omits_tactic_field(syntax, value, engine.environment())
+                    });
+                    let mut unused = Vec::new();
+                    if !body_ran_tactics {
+                        unused.extend(unused_variables::unused_pattern_variables(
+                            syntax,
+                            options,
+                            &constructors,
+                        ));
+                        unused.extend(unused_variables::unused_fun_binders(
+                            syntax,
+                            options,
+                            &constructors,
+                        ));
+                        unused.extend(unused_variables::unused_type_binders(syntax, options));
+                    }
                     if let Some((_, type_, value, _)) = declared {
                         unused.extend(unused_variables::unused_signature_binders(
                             syntax, type_, value, options,

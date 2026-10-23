@@ -107,6 +107,126 @@ fn walk<'a>(syntax: &'a Syntax, mut visit: impl FnMut(&'a Syntax) -> bool) -> bo
     false
 }
 
+/// Whether a structure instance in `command` leaves out a field whose default is a proof, and
+/// `value` builds that structure. A field `h : P := by tac` is the pin's `autoParam`, filled by
+/// running its tactic while the body elaborates, so the pin then reads the body only through
+/// its elaborated term ([`runs_tactics`]). Read conservatively: any default whose type is a
+/// proposition counts, a tactic's or not, which can only withhold a warning.
+pub(crate) fn omits_tactic_field(
+    command: &Syntax,
+    value: &Expr,
+    env: &fln_env::environment::Environment,
+) -> bool {
+    use fln_env::constants::ConstantInfo;
+    let mut instances: Vec<HashSet<Name>> = Vec::new();
+    walk(command, |node| {
+        if is_kind(node, &["Term", "structInst"]) {
+            let mut fields = HashSet::new();
+            walk(node, |field| {
+                if is_kind(field, &["Term", "structInstField"])
+                    && let Some(Syntax::Ident { val, .. }) =
+                        args(field).first().and_then(|lval| args(lval).first())
+                {
+                    fields.insert(root(val));
+                }
+                false
+            });
+            instances.push(fields);
+        }
+        false
+    });
+    if instances.is_empty() {
+        return false;
+    }
+    let mut pending = vec![value];
+    let mut seen = HashSet::new();
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.node())) {
+            continue;
+        }
+        if let ExprNode::Const { name, .. } = expr.node()
+            && let Some(ConstantInfo::Ctor(ctor)) = env.find(name)
+        {
+            let mut type_ = &ctor.base.type_;
+            for index in 0..(ctor.num_params + ctor.num_fields) {
+                let ExprNode::ForallE {
+                    binder_name, body, ..
+                } = type_.node()
+                else {
+                    break;
+                };
+                let default = Name::str(ctor.induct.append_core(binder_name), "_default");
+                if index >= ctor.num_params
+                    && env
+                        .find(&default)
+                        .is_some_and(|info| proof_type(&info.constant_val().type_, env))
+                    && instances
+                        .iter()
+                        .any(|fields| !fields.contains(&root(binder_name)))
+                {
+                    return true;
+                }
+                type_ = body;
+            }
+        }
+        match expr.node() {
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `type_`, under its binders, is an application of a constant whose type ends in `Prop`.
+fn proof_type(type_: &Expr, env: &fln_env::environment::Environment) -> bool {
+    let mut head = type_;
+    loop {
+        match head.node() {
+            ExprNode::ForallE { body, .. } => head = body,
+            ExprNode::MData { expr, .. } => head = expr,
+            _ => break,
+        }
+    }
+    while let ExprNode::App { f, .. } = head.node() {
+        head = f;
+    }
+    let ExprNode::Const { name, .. } = head.node() else {
+        return false;
+    };
+    env.find(name).is_some_and(|info| {
+        let mut sort = &info.constant_val().type_;
+        loop {
+            match sort.node() {
+                ExprNode::ForallE { body, .. } => sort = body,
+                ExprNode::MData { expr, .. } => sort = expr,
+                ExprNode::Sort { level } => return level.is_zero(),
+                _ => return false,
+            }
+        }
+    })
+}
+
+/// Whether elaborating `syntax` runs a tactic: a tactic block, `‹_›`, or `xs[i]` with no proof
+/// given, whose `getElem` argument is the auto-parameter `by get_elem_tactic`. With
+/// `linter.unusedVariables.analyzeTactics` off the pin then reads such a body only through its
+/// elaborated term (vendored `Lean/Linter/UnusedVariables.lean:396-413`).
+fn runs_tactics(syntax: &Syntax) -> bool {
+    contains_atom(syntax, &["by", "‹"])
+        || walk(syntax, |node| {
+            node.kind() == Some(&Name::from_components(["term__[_]"]))
+        })
+}
+
 fn contains_atom(syntax: &Syntax, atoms: &[&str]) -> bool {
     walk(
         syntax,
@@ -206,7 +326,7 @@ fn decided(command: &Syntax) -> Option<(&Syntax, &Syntax, Body)> {
     {
         return None;
     }
-    if !contains_atom(declaration, &["by", "‹"]) {
+    if !runs_tactics(declaration) {
         return Some((modifiers, declaration, Body::Terms));
     }
     (!contains_atom(
@@ -264,12 +384,12 @@ fn term_scopes<'a, T>(
     while let Some(node) = pending.pop() {
         if is_kind(node, &["Term", "byTactic"])
             || contains_atom_shallow(node, "‹")
-            || (is_body(node) && contains_atom(node, &["by", "‹"]))
+            || (is_body(node) && runs_tactics(node))
         {
             continue;
         }
         if let Some(selected) = select(node)
-            && !contains_atom(node, &["by", "‹"])
+            && !runs_tactics(node)
         {
             found.push((node, selected));
         }

@@ -451,3 +451,38 @@ def tst2 : vec n → Option (Nat × vec n)
         "{ours}"
     );
 }
+
+/// A body whose elaboration runs a tactic is read only through its elaborated term, so its own
+/// binders are never linted (`linter.unusedVariables.analyzeTactics` off): `xs[0]` runs its
+/// `get_elem_tactic` auto-parameter, and a structure instance leaving out a field `p : P := by
+/// rfl` runs that field's tactic. With the proof given (`xs[0]'h`, `proof := rfl`) no tactic runs
+/// and the binder warns. As the pinned v4.32.0 prints it (2026-10-22).
+#[test]
+fn a_body_running_an_implicit_tactic_is_not_linted_as_at_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "def g1 (xs : Array Nat) (h : 0 < xs.size) : Nat := (fun (y : Nat) => xs[0]) 5
+def g2 (xs : Array Nat) (h : 0 < xs.size) : Nat := (fun (y : Nat) => xs[0]'h) 5
+structure C where
+  value : Nat
+  proof : value = value := by rfl
+  callback : (n : Nat) → n = n → Nat
+def a1 : C := { value := 40, callback := fun n h => n + 2 }
+def a2 : C := { value := 40, proof := rfl, callback := fun n h => n + 2 }
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "implicit_tactics",
+        "prelude\nimport Init.Data.Array.Basic\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        2,
+        "{ours}"
+    );
+}
