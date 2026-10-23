@@ -135,7 +135,9 @@ fn check_source_with(
     }
 }
 
-const PRELUDE_SOURCE: &str = "prelude\nimport Init.Prelude\ntheorem keep (P : Prop) (h : P) : P := h\ntheorem use_nat (n : Nat) : n = n := rfl\n";
+// `Init.Prelude` declares `Eq` but not its `=` notation (`Init.Notation`'s), so the pin reads
+// `n = n` here as "expected token" (2026-10-23).
+const PRELUDE_SOURCE: &str = "prelude\nimport Init.Prelude\ntheorem keep (P : Prop) (h : P) : P := h\ntheorem use_nat (n : Nat) : Eq n n := rfl\n";
 
 /// The positive half at `check-source`: the first run admits the real `Init.Prelude`
 /// closure through the council and records it; the second rebuilds it from the
