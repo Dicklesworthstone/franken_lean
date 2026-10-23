@@ -8217,27 +8217,6 @@ impl Engine {
             } else {
                 None
             };
-            if matches!(
-                evaluation_presentation,
-                Some(
-                    EvaluationResultPresentation::IoFormat { .. }
-                        | EvaluationResultPresentation::IoUnit
-                )
-            ) && guards
-                .last()
-                .is_some_and(|guard| guard.command_index == command_index)
-                && presentation == EvaluationPresentation::Raw
-            {
-                // Raw callers have no isolated command messages. Refuse before
-                // the action; presented callers retain the effect transcript.
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: "`#guard_msgs` over an IO action",
-                    }),
-                    at: Some(original_offset),
-                });
-            }
             // Parametric definitions are checked templates, not standalone VM
             // entry points. Compile concrete uses on demand; never use a failed
             // compilation as a reason to silently admit an executable command.

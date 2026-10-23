@@ -382,13 +382,35 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
         let unresolved = refused(&action("Nat", "ioNeeds"));
         assert!(matches!(reason(&unresolved), SourceInferenceError::InstanceSynthesisRequired), "{unresolved:?}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
-        for (payload, returned) in [("Unit", "()"), ("Nat", "42")] {
-            let guarded = refused(&format!("#guard_msgs in\n{}", action(payload, returned)));
-            assert!(matches!(inner_error(&guarded), fln::EngineExecutionError::NotImplemented {
-                feature: "`#guard_msgs` over an IO action",
-            }));
+        let guard_effect = directory.0.join("guard-effect.txt");
+        std::fs::write(&guard_effect, b"").unwrap();
+        let guarded_action = |payload: &str, returned: &str| format!(r#"#eval show IO {payload} from do
+  let h ← IO.FS.Handle.mk {} IO.FS.Mode.append
+  h.putStr "once\n"
+  return {returned}"#, quoted(&guard_effect));
+        for (payload, returned, expected) in [("Unit", "()", ""), ("Nat", "42", "info: 42")] {
+            let batch = run(engine, &format!("/-- {expected} -/\n#guard_msgs in\n{}", guarded_action(payload, returned)));
+            assert_eq!(batch.guards.len(), 1);
+            assert_eq!(batch.batch.executions.len(), 1);
+            let execution = &batch.batch.executions[0];
+            assert_eq!(execution.evaluation_output(), Some(""));
+            if payload == "Nat" {
+                assert_format(execution, "42", None);
+            } else {
+                assert_eq!(execution.evaluation_presentation(), Some(EvaluationResultPresentation::IoUnit));
+                assert!(matches!(execution.io_evaluation_outcome().unwrap(), Some(IoEvaluationOutcome::Returned { .. })));
+            }
             assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
         }
+        assert_eq!(std::fs::read(&guard_effect).unwrap(), b"once\nonce\n");
+        // Raw execution still exposes direct effects and leaves message
+        // presentation to its caller. It acquires no isolated-output marker.
+        let raw = engine.execute_source_commands_with_checks(
+            format!("#guard_msgs in\n{}", guarded_action("Unit", "()")).as_bytes(),
+            &KVMap::new(), limits(),
+        ).unwrap().into_complete().unwrap();
+        assert_eq!(raw.batch.executions[0].evaluation_output(), None);
+        assert_eq!(std::fs::read(&guard_effect).unwrap(), b"once\nonce\nonce\n");
 
         // Silent Unit has no printer options or MessageData requirement. The
         // same inputs remain explicit refusals when a payload needs printing.
