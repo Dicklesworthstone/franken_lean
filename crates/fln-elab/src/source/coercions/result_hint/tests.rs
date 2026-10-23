@@ -173,3 +173,187 @@ fn expected_constructor_hint_does_not_discard_a_resource_stop() {
     assert_eq!(after, before);
     assert_eq!(context.next, next);
 }
+
+#[test]
+fn expected_family_keeps_a_parameter_already_in_the_holes_context() {
+    let mut context = Context::new(&reader_fixture(), budget());
+    let sigma = FVarId(name("sigma"));
+    context
+        .txn
+        .lctx
+        .add_param(sigma.clone(), name("S"), universe(), BinderInfo::Implicit);
+    let element = Expr::fvar(sigma.clone());
+    let family = context.hole(constructor_type()).unwrap();
+    let actual = Expr::app(family.clone(), element.clone());
+    let expected = Expr::app(Expr::const_(name("ReaderLike"), vec![]), element);
+    assert!(context.flexible_non_pattern(&actual).unwrap());
+    let value = context.hole(actual.clone()).unwrap();
+    context
+        .finish_explicit_term(
+            Typed {
+                value,
+                type_: actual,
+            },
+            Some(&expected),
+        )
+        .unwrap();
+    assert_eq!(
+        context.instantiate(&family).unwrap(),
+        Expr::const_(name("ReaderLike"), vec![])
+    );
+}
+
+#[test]
+fn a_local_created_after_the_hole_remains_a_genuine_pattern_argument() {
+    let mut context = Context::new(&reader_fixture(), budget());
+    let family = context.hole(constructor_type()).unwrap();
+    let sigma = FVarId(name("sigma"));
+    context
+        .txn
+        .lctx
+        .add_param(sigma.clone(), name("S"), universe(), BinderInfo::Implicit);
+    let actual = Expr::app(family, Expr::fvar(sigma));
+    assert!(!context.flexible_non_pattern(&actual).unwrap());
+}
+
+#[test]
+fn an_early_result_hint_does_not_abstract_a_captured_family_parameter() {
+    let mut context = Context::new(&reader_fixture(), budget());
+    let sigma = FVarId(name("sigma"));
+    context
+        .txn
+        .lctx
+        .add_param(sigma.clone(), name("S"), universe(), BinderInfo::Implicit);
+    let element = Expr::fvar(sigma);
+    let family = context.hole(constructor_type()).unwrap();
+    let actual = Expr::app(family.clone(), element.clone());
+    let reader = Expr::const_(name("ReaderLike"), vec![]);
+    let expected = Expr::app(reader.clone(), element);
+    context.constrain_result_hint(&actual, &expected).unwrap();
+    assert_eq!(context.instantiate(&family).unwrap(), reader);
+}
+
+fn captured_family() -> (Context, Expr, Expr, Expr, Expr) {
+    let mut context = Context::new(&fixture(), budget());
+    let carrier = FVarId(name("carrier"));
+    context.txn.lctx.add_param(
+        carrier.clone(),
+        name("C"),
+        Expr::forall_e(
+            name("S"),
+            universe(),
+            constructor_type(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let sigma = FVarId(name("sigma"));
+    context
+        .txn
+        .lctx
+        .add_param(sigma.clone(), name("S"), universe(), BinderInfo::Implicit);
+    let element = Expr::fvar(sigma);
+    let family = context.hole(constructor_type()).unwrap();
+    let actual = Expr::app(family.clone(), element.clone());
+    let selected = Expr::app(Expr::fvar(carrier), element.clone());
+    let expected = Expr::app(selected.clone(), element);
+    (context, family, actual, expected, selected)
+}
+
+#[test]
+fn both_hint_orientations_preserve_the_captured_prefix_not_just_eta_equality() {
+    for reverse in [false, true] {
+        let (mut context, family, actual, expected, selected) = captured_family();
+        let result = if reverse {
+            context.contextual_result_hint(&expected, &actual)
+        } else {
+            context.contextual_result_hint(&actual, &expected)
+        };
+        assert!(result.unwrap());
+        assert_eq!(context.instantiate(&family).unwrap(), selected);
+        assert!(context.coercion_eq(&actual, &expected).unwrap());
+    }
+}
+
+#[test]
+fn contextual_hint_resource_stops_restore_assignments_but_charge_work() {
+    let (original, family, actual, expected, selected) = captured_family();
+    let mut complete = original.clone();
+    assert!(complete.contextual_result_hint(&expected, &actual).unwrap());
+    let used = complete.txn.budget.heartbeats_consumed - original.txn.budget.heartbeats_consumed;
+    assert!(used > 16);
+    for allowance in [1, 16, used / 2, used - 1] {
+        let mut trial = original.clone();
+        trial.txn.budget.max_heartbeats = trial.txn.budget.heartbeats_consumed + allowance;
+        let before = trial.txn.clone();
+        let next = trial.next;
+        let error = trial
+            .contextual_result_hint(&expected, &actual)
+            .unwrap_err();
+        assert!(
+            match &error {
+                NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit) => true,
+                NatDefinitionElabError::Inference(SourceInferenceError::Unification(cause)) => {
+                    matches!(
+                        cause.as_ref(),
+                        UnificationError::HeartbeatLimit
+                            | UnificationError::StepLimit { .. }
+                            | UnificationError::NodeLimit { .. }
+                    )
+                }
+                _ => false,
+            },
+            "{error:?}"
+        );
+        assert!(trial.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+        trial.txn.budget = before.budget.clone();
+        assert_eq!(trial.txn, before);
+        assert_eq!(trial.next, next);
+        trial.txn.budget.max_heartbeats = 0;
+        assert!(trial.contextual_result_hint(&expected, &actual).unwrap());
+        assert_eq!(trial.instantiate(&family).unwrap(), selected);
+    }
+}
+
+#[test]
+fn contextual_hint_cannot_capture_a_later_local_or_solve_an_opaque_goal() {
+    let (original, family, actual, expected, _) = captured_family();
+    let mut escaping = original.clone();
+    let foreign = FVarId(name("foreign"));
+    escaping.txn.lctx.add_param(
+        foreign.clone(),
+        name("foreign"),
+        constructor_type(),
+        BinderInfo::Default,
+    );
+    let ExprNode::App { a, .. } = actual.node() else {
+        panic!("applied family");
+    };
+    let target = Expr::app(Expr::fvar(foreign), a.clone());
+    let before = escaping.txn.clone();
+    assert!(!escaping.contextual_result_hint(&actual, &target).unwrap());
+    escaping.txn.budget = before.budget.clone();
+    assert_eq!(escaping.txn, before);
+    let mut opaque = original;
+    let id = MVarId(name("opaque"));
+    opaque.txn.mvars.declare(
+        id.clone(),
+        name("opaque"),
+        constructor_type(),
+        opaque.txn.lctx.clone(),
+        MetavarKind::SyntheticOpaque,
+        0,
+        None,
+    );
+    let opaque_application = Expr::app(Expr::mvar(id.clone()), a.clone());
+    let before = opaque.txn.clone();
+    assert!(
+        !opaque
+            .contextual_result_hint(&opaque_application, &expected)
+            .unwrap()
+    );
+    assert!(!opaque.txn.mvars.is_assigned(&id));
+    opaque.txn.budget = before.budget.clone();
+    assert_eq!(opaque.txn, before);
+    assert_eq!(opaque.instantiate(&family).unwrap(), family);
+}

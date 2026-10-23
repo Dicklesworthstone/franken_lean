@@ -13,24 +13,45 @@ impl Context {
         &mut self,
         actual: &Expr,
         expected: &Expr,
-    ) -> Result<(), NatDefinitionElabError> {
+    ) -> Result<bool, NatDefinitionElabError> {
         let mut trial = self.clone();
         let result = trial.first_order_result_hint_trial(actual, expected);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
         match result {
             Ok(true) => {
                 *self = trial;
-                Ok(())
+                Ok(true)
             }
-            Ok(false) => Ok(()),
-            Err(error) if nonmatch(&error) => Ok(()),
+            Ok(false) => Ok(false),
+            Err(error) if nonmatch(&error) => Ok(false),
             Err(error) => Err(error),
         }
     }
 
-    /// Whether `type_` is an unassigned metavariable applied to arguments that are not distinct
-    /// local variables: an equation it meets is no Miller pattern, and the pin solves it by
-    /// first-order approximation where this unifier suspends it.
+    /// Term checking may put the unknown constructor on either side: a
+    /// polymorphic result has it on the left, an annotated argument on the
+    /// right. Try the pin's first-order choice before either carrier unfolds.
+    /// This affects source expected-type propagation, not tactic matching or
+    /// the native solver's genuine higher-order pattern rules.
+    pub(in crate::source) fn contextual_result_hint(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.flexible_non_pattern(actual)? {
+            self.first_order_result_hint(actual, expected)
+        } else if self.flexible_non_pattern(expected)? {
+            self.first_order_result_hint(expected, actual)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Whether term elaboration must try first-order approximation. Distinct
+    /// locals already in the hole's own context are not pattern variables under
+    /// the pin's `setElabConfig` (`quasiPatternApprox := false`): abstracting them
+    /// would replace a dependent carrier by a family that changes its parameters.
+    /// Genuine pattern arguments are fresh locals outside that context.
     pub(in crate::source) fn flexible_non_pattern(
         &mut self,
         type_: &Expr,
@@ -56,8 +77,12 @@ impl Context {
             return Ok(false);
         }
         let mut locals = std::collections::HashSet::new();
+        let Some(declaration) = self.txn.mvars.get_decl(id) else {
+            return Ok(false);
+        };
         Ok(!arguments.iter().all(|argument| {
-            matches!(argument.node(), ExprNode::FVar { id } if locals.insert(id.clone()))
+            matches!(argument.node(), ExprNode::FVar { id }
+                if !declaration.lctx.contains(id) && locals.insert(id.clone()))
         }))
     }
 
