@@ -197,6 +197,30 @@ fn presented_evaluations_do_not_escape_their_command_streams() {
         captured.bytes
     );
     assert_eq!(engine.logical_root(&KVMap::new()), root);
+
+    // The command-local option selects direct stderr without changing the
+    // following command's default. An enclosing owner observes only that one
+    // direct write; neither presented command leaks into process streams.
+    let capture = StdoutCapture::begin_isolated(4096, true).unwrap();
+    let scoped = engine
+        .execute_source_commands_with_presentation(
+            b"set_option stderrAsMessages false in\n#eval IO.eprintln \"direct\"\n#eval IO.eprintln \"isolated\"",
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            crate::EvaluationPresentation::PreferRaw,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(scoped.batch.executions[0].evaluation_output(), Some(""));
+    assert_eq!(
+        scoped.batch.executions[1].evaluation_output(),
+        Some("isolated\n")
+    );
+    let captured = capture.finish();
+    assert_eq!(captured.error, None);
+    assert_eq!(captured.bytes, b"direct\n");
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 
 #[test]

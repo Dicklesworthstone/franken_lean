@@ -93,6 +93,23 @@ fn checked_io_results_print_once_and_guard_isolated_effects() {
             && raised.stderr.contains("expected exception λ"),
         "{raised:?}"
     );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json"])
+        .arg(&exception)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", full_io_records(&workspace))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let json = String::from_utf8(output.stderr).unwrap();
+    assert!(json.starts_with('{') && json.ends_with("}\n"), "{json}");
+    assert!(json.contains("\"class\":\"io-exception\""), "{json}");
+    assert_eq!(json.matches("\"stdout\":").count(), 1, "{json}");
+    assert!(
+        json.contains("\"stdout\":\"before-exception\\n\""),
+        "{json}"
+    );
 
     // Printer selection happens before this otherwise valid action can
     // overwrite the sentinel or write stdout. There is no scalar fallback.
