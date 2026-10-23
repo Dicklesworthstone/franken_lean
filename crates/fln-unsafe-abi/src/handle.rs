@@ -872,6 +872,12 @@ impl Obj {
         crate::stdio::checked_get_stdin().map(Obj)
     }
 
+    /// Retain this thread's stderr only after the complete native six-method
+    /// stream and its single shared Handle have been validated under TLS borrow.
+    pub fn stdio_stderr() -> Option<Obj> {
+        crate::stdio::checked_get_stderr().map(Obj)
+    }
+
     /// Recognize exactly the native getLine callback over one live Handle.
     pub fn is_stdio_get_line_closure(&self) -> bool {
         // SAFETY: Obj is live; the observer checks category, pointer, arity
@@ -1394,6 +1400,9 @@ mod stdio_tests;
 
 #[cfg(test)]
 mod stdio_input_tests;
+
+#[cfg(test)]
+mod stderr_tests;
 
 #[cfg(test)]
 mod sarray_view_tests;

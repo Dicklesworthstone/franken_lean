@@ -1,4 +1,4 @@
-//! Bounded native stdin/stdout with ordinary logical Stream callbacks.
+//! Bounded native standard streams with ordinary logical Stream callbacks.
 //!
 //! Native Stream and packed IO.Result values never become admitted data by
 //! relabeling. The exact getter returns a private carrier; its putStr callback
@@ -20,6 +20,7 @@ const RAW_STREAM: &str = "_fln_runtime_stdout_stream";
 const TRANSPORT: &str = "_fln_runtime_stdout_result";
 const GETTER: &str = "_fln_runtime_stdout_get";
 const STDIN_GETTER: &str = "_fln_runtime_stdin_get";
+const STDERR_GETTER: &str = "_fln_runtime_stderr_get";
 const READ_TRANSPORT: &str = "_fln_runtime_stdio_read_result";
 const READ_PAYLOAD: &str = "_fln_runtime_stdio_read_payload";
 
@@ -27,6 +28,7 @@ fn getter_name(getter: stdout::Getter) -> Name {
     name(match getter {
         stdout::Getter::Stdout => GETTER,
         stdout::Getter::Stdin => STDIN_GETTER,
+        stdout::Getter::Stderr => STDERR_GETTER,
     })
 }
 
@@ -159,7 +161,7 @@ impl Preparation<'_> {
                 &mut self.visited,
                 self.limits,
             )?,
-            stdout::Getter::Stdin => stdout::getter_matches(
+            stdout::Getter::Stdin | stdout::Getter::Stderr => stdout::getter_matches(
                 self.environment,
                 getter,
                 &mut self.externs,
@@ -419,7 +421,7 @@ impl Preparation<'_> {
         }
         let layout = match getter {
             stdout::Getter::Stdout => self.stdout_layout()?,
-            stdout::Getter::Stdin => self.stdio_layout(getter)?,
+            stdout::Getter::Stdin | stdout::Getter::Stderr => self.stdio_layout(getter)?,
         };
         let Some(layout) = layout else {
             return Ok(None);

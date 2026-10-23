@@ -2013,6 +2013,10 @@ pub(crate) fn checked_get_stdin() -> Option<*mut LeanObject> {
     checked_get_current(IX_STDIN)
 }
 
+pub(crate) fn checked_get_stderr() -> Option<*mut LeanObject> {
+    checked_get_current(IX_STDERR)
+}
+
 fn checked_get_current(index: usize) -> Option<*mut LeanObject> {
     CURRENT.with(|current| {
         let mut slots = current.borrow_mut();

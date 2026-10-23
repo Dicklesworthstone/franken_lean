@@ -865,6 +865,7 @@ enum IntrinsicImplementation {
     IoInitializing,
     IoGetStdout,
     IoGetStdin,
+    IoGetStderr,
     FileHandleMk,
     FileHandlePutStr,
     FileHandleGetLine,
@@ -1231,6 +1232,7 @@ impl IntrinsicImplementation {
             "extern:IO.initializing" => Self::IoInitializing,
             "extern:IO.getStdout" => Self::IoGetStdout,
             "extern:IO.getStdin" => Self::IoGetStdin,
+            "extern:IO.getStderr" => Self::IoGetStderr,
             "extern:IO.FS.Handle.mk" => Self::FileHandleMk,
             "extern:IO.FS.Handle.putStr" => Self::FileHandlePutStr,
             "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
@@ -6684,6 +6686,15 @@ fn dispatch_intrinsic(
                 .into(),
             )
         }
+        IntrinsicImplementation::IoGetStderr => {
+            expect_arity(row, args, 0)?;
+            Obj::stdio_stderr().map(IntrinsicResult::owned).ok_or(
+                VmRefusal::NativeStdoutContract {
+                    reason: "stderr is not the exact native six-method stream over one Handle",
+                }
+                .into(),
+            )
+        }
         IntrinsicImplementation::FileHandleMk => {
             expect_arity(row, args, 2)?;
             // The generated native row erases the logical world argument.
@@ -7296,6 +7307,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::IoInitializing
         | IntrinsicImplementation::IoGetStdout
         | IntrinsicImplementation::IoGetStdin
+        | IntrinsicImplementation::IoGetStderr
         | IntrinsicImplementation::FileHandleMk
         | IntrinsicImplementation::FileHandlePutStr
         | IntrinsicImplementation::FileHandleGetLine

@@ -1,4 +1,4 @@
-//! Exact contracts for the bounded native stdout stream bridge.
+//! Exact contracts for the bounded native standard-stream bridge.
 //!
 //! The native stream stays in a compiler-private carrier. These complete
 //! declarations authorize its conversion to ordinary checked Stream fields;
@@ -19,6 +19,7 @@ pub(crate) fn source_name() -> Name {
 pub(crate) enum Getter {
     Stdout,
     Stdin,
+    Stderr,
 }
 
 impl Getter {
@@ -26,11 +27,12 @@ impl Getter {
         match self {
             Self::Stdout => source_name(),
             Self::Stdin => Name::from_components(["IO", "getStdin"]),
+            Self::Stderr => Name::from_components(["IO", "getStderr"]),
         }
     }
 
     pub(crate) fn from_name(requested: &Name) -> Option<Self> {
-        [Self::Stdout, Self::Stdin]
+        [Self::Stdout, Self::Stdin, Self::Stderr]
             .into_iter()
             .find(|getter| requested == &getter.source_name())
     }
@@ -112,7 +114,7 @@ pub(crate) fn getter_matches(
     }
     let mut models = match getter {
         Getter::Stdout => model::declarations(),
-        Getter::Stdin => model::declarations_for(getter),
+        Getter::Stdin | Getter::Stderr => model::declarations_for(getter),
     };
     models.extend(crate::source_intrinsics::string_internal::scalar_records());
     let mut comparison = Comparison { visited, limits };

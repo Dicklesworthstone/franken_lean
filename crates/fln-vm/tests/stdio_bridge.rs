@@ -18,6 +18,9 @@ use fln_vm::interpreter::{
 };
 use std::sync::Mutex;
 
+#[path = "stdio_bridge/stderr.rs"]
+mod stderr;
+
 static LOCK: Mutex<()> = Mutex::new(());
 
 const fn r(n: u16) -> Register {

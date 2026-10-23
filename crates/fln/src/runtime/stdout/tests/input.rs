@@ -9,6 +9,8 @@ use super::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+mod stderr;
+
 fn register_getter(
     environment: &Environment,
     getter: stdout::Getter,
