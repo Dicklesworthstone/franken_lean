@@ -325,10 +325,13 @@ fn generated_course_of_values_proves_a_recursive_user_function() {
     let root = base.logical_root(&KVMap::new());
     let engine = install(base.clone(), &["Chain"]);
     assert_eq!(base.logical_root(&KVMap::new()), root);
-    let source = "def sumStep (c : Chain) : @Chain.below (fun _ => Nat) c -> Nat :=\n\
-        Chain.casesOn (motive := fun c => @Chain.below (fun _ => Nat) c -> Nat) c\n\
+    // A `\` line continuation drops the next line's leading spaces, so the indentation an
+    // argument line needs (the pin's `checkColGt` against the command's column) is written
+    // before it.
+    let source = "def sumStep (c : Chain) : @Chain.below (fun _ => Nat) c -> Nat :=\n  \
+        Chain.casesOn (motive := fun c => @Chain.below (fun _ => Nat) c -> Nat) c\n  \
         (fun _ => 0) (fun head tail history => head + history.1)\n\
-        theorem total_ok : @Chain.brecOn (fun _ => Nat)\n\
+        theorem total_ok : @Chain.brecOn (fun _ => Nat)\n  \
         (Chain.cons 20 (Chain.cons 22 Chain.nil)) sumStep = 42 := rfl";
     let result = checked(&engine, source);
     assert!(result.environment().contains(&name("total_ok")));
