@@ -294,6 +294,118 @@ fn runtime_diagnostics_use_stderr_and_preserve_continuation_order() {
 }
 
 #[test]
+fn isolated_trace_exhaustion_stops_before_its_continuation() {
+    let name = "isolated_trace_exhaustion_stops_before_its_continuation";
+    if let Some(output) = subprocess(name) {
+        assert!(output.stderr.is_empty());
+        return;
+    }
+    for partial in [false, true] {
+        let parameters = if partial {
+            vec![A::Scalar, A::Scalar]
+        } else {
+            vec![A::Scalar]
+        };
+        let program = replay(
+            vec![
+                fun(
+                    0,
+                    &[],
+                    C::Erased,
+                    vec![
+                        string(0, "trace"),
+                        closure(1, 1, &[], &[]),
+                        intrinsic(2, TRACE, &[0, 1]),
+                        I::Return { src: r(2) },
+                    ],
+                ),
+                fun(
+                    1,
+                    &parameters,
+                    C::Erased,
+                    vec![
+                        string(2, "continuation reached"),
+                        I::Panic { message: r(2) },
+                    ],
+                ),
+            ],
+            true,
+        );
+        let capture = fln_rt::obj::StdoutCapture::begin_isolated(5, true).unwrap();
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Inconclusive(fln_core::outcome::Inconclusive {
+                cause: fln_core::outcome::InconclusiveCause::ResourceExhausted { .. },
+                ..
+            })
+        ));
+        let result = capture.finish();
+        assert!(result.bytes.is_empty());
+        assert_eq!(
+            result.error,
+            Some(fln_rt::obj::StdoutCaptureError::Limit {
+                limit: 5,
+                requested: 6,
+            })
+        );
+        // Changing only the allowance permits the effect and reaches the
+        // actual continuation (or returns its real partial closure).
+        let capture = fln_rt::obj::StdoutCapture::begin_isolated(6, true).unwrap();
+        let result = execute(&program, ExecutionLimits::default(), None);
+        if partial {
+            assert!(matches!(result, Outcome::Complete(VmExit::Returned(_))));
+        } else {
+            assert!(matches!(result, Outcome::Complete(VmExit::Panicked { .. })));
+        }
+        let result = capture.finish();
+        assert_eq!(result.error, None);
+        assert_eq!(result.bytes, b"trace\n");
+    }
+}
+
+#[test]
+fn isolated_panic_keeps_the_default_only_when_its_message_fits() {
+    let name = "isolated_panic_keeps_the_default_only_when_its_message_fits";
+    if let Some(output) = subprocess(name) {
+        assert!(output.stderr.is_empty());
+        return;
+    }
+    let program = replay(
+        vec![fun(
+            0,
+            &[],
+            C::Erased,
+            vec![
+                nat(0, 17),
+                string(1, "recover"),
+                intrinsic(2, PANIC, &[0, 1]),
+                I::Return { src: r(2) },
+            ],
+        )],
+        true,
+    );
+    let capture = fln_rt::obj::StdoutCapture::begin_isolated(7, true).unwrap();
+    assert!(matches!(
+        execute(&program, ExecutionLimits::default(), None),
+        Outcome::Inconclusive(_)
+    ));
+    let result = capture.finish();
+    assert!(result.bytes.is_empty());
+    assert_eq!(
+        result.error,
+        Some(fln_rt::obj::StdoutCaptureError::Limit {
+            limit: 7,
+            requested: 8,
+        })
+    );
+    let capture = fln_rt::obj::StdoutCapture::begin_isolated(8, true).unwrap();
+    assert_eq!(returned(&program).unbox(), 17);
+    let result = capture.finish();
+    assert_eq!(result.error, None);
+    assert_eq!(result.bytes, b"recover\n");
+}
+
+#[test]
 fn trace_partial_application_returns_a_real_callable_object() {
     let name = "trace_partial_application_returns_a_real_callable_object";
     if let Some(output) = subprocess(name) {

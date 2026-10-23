@@ -12199,10 +12199,10 @@ fn render_lean_source_commands(
                     );
                 }
                 evaluation_output_position += 1;
-                // The source adapter refuses guarded IO before execution.
-                // Keep this defensive boundary for externally retained batches:
-                // an IO result's Format does not capture its stdout effects.
+                // Raw retained batches have no isolated effect transcript.
+                // A formatted IO value alone cannot authorize guard messages.
                 if guarded.contains_key(&command_index)
+                    && execution.evaluation_output().is_none()
                     && matches!(
                         execution.evaluation_presentation(),
                         Some(
@@ -12213,9 +12213,30 @@ fn render_lean_source_commands(
                 {
                     return io_guard_refusal(command_index);
                 }
+                if let Some(text) = execution
+                    .evaluation_output()
+                    .filter(|text| !text.is_empty())
+                {
+                    let mut discarded = Vec::new();
+                    let messages = match guarded.get_mut(&command_index) {
+                        Some(guard) => guard.evaluation_target(&mut discarded),
+                        None => None,
+                    };
+                    if let Err(error) = formatted_output.append(text, &mut stdout, messages) {
+                        return error.failure(command_index, SourcePresentation::Lean);
+                    }
+                }
                 let formatted = match source_evaluation::formatted(execution) {
                     Ok(formatted) => formatted,
-                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
+                    Err(error) => {
+                        let mut failure = error.failure(command_index, SourcePresentation::Lean);
+                        // A checked IO exception occurs after its captured
+                        // effects. Retain those completed messages exactly once.
+                        if matches!(error, source_evaluation::Error::Raised { .. }) {
+                            failure.stdout = stdout;
+                        }
+                        return failure;
+                    }
                 };
                 match formatted {
                     Some(source_evaluation::PresentedEvaluation::Text(text)) => {
@@ -12688,7 +12709,12 @@ where
         && let Some(source) = source_refs.last().copied()
         && source_uses_mixed_lean_commands(source)
     {
-        let completed = match engine.execute_source_commands_with_checks(source, &options, limits) {
+        let completed = match engine.execute_source_commands_with_presentation(
+            source,
+            &options,
+            limits,
+            fln::EvaluationPresentation::PreferRaw,
+        ) {
             Ok(completed) => completed,
             Err(error) => {
                 let (class, authority, exit_code) = execution_error_disposition(&error);

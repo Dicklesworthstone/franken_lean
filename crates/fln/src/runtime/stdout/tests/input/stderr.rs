@@ -180,6 +180,15 @@ fn presented_evaluations_do_not_escape_their_command_streams() {
     for execution in &result.batch.executions {
         assert_unit_packet(&execution.exit);
     }
+    assert_eq!(
+        result
+            .batch
+            .executions
+            .iter()
+            .map(|execution| execution.evaluation_output())
+            .collect::<Vec<_>>(),
+        [Some("first"), Some("second\n"), Some("third")]
+    );
     let captured = capture.finish();
     assert_eq!(captured.error, None);
     assert!(
@@ -188,6 +197,61 @@ fn presented_evaluations_do_not_escape_their_command_streams() {
         captured.bytes
     );
     assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn presented_output_exhaustion_is_typed_and_restores_the_enclosing_sink() {
+    if std::env::var_os("FLN_REFERENCE_LIB").is_none() {
+        assert!(std::env::var_os("FLN_REQUIRE_REFERENCE").is_none());
+        eprintln!("SKIP: set FLN_REFERENCE_LIB to the pinned lib/lean");
+        return;
+    }
+    let raw = source_fixture();
+    let environment = register_getter(
+        &register_getter(&raw, stdout::Getter::Stdout, false),
+        stdout::Getter::Stderr,
+        false,
+    );
+    let engine = Engine::from_environment(environment);
+    let root = engine.logical_root(&KVMap::new());
+    let outer = StdoutCapture::begin(4096).unwrap();
+    for (source, allowance, observed) in [
+        ("#eval IO.print \"x\"", 0, 1),
+        ("#eval IO.print \"abc\"\n#eval IO.eprint \"de\"", 4, 2),
+    ] {
+        let mut limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        limits.max_evaluation_output_bytes = allowance;
+        let outcome = engine
+            .execute_source_commands_with_presentation(
+                source.as_bytes(),
+                &KVMap::new(),
+                limits,
+                crate::EvaluationPresentation::PreferRaw,
+            )
+            .unwrap();
+        let Outcome::Inconclusive(reason) = outcome else {
+            panic!("output exhaustion must not become acceptance or rejection")
+        };
+        let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } = reason.cause else {
+            panic!("output exhaustion must retain resource usage")
+        };
+        assert_eq!(usage.observed, observed);
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+    let retry = engine
+        .execute_source_commands_with_presentation(
+            b"#eval IO.eprintln \"ok\"",
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            crate::EvaluationPresentation::PreferRaw,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(retry.batch.executions[0].evaluation_output(), Some("ok\n"));
+    let result = outer.finish();
+    assert_eq!(result.error, None);
+    assert!(result.bytes.is_empty());
 }
 
 #[test]

@@ -8228,9 +8228,8 @@ impl Engine {
                 .is_some_and(|guard| guard.command_index == command_index)
                 && presentation == EvaluationPresentation::Raw
             {
-                // IO effects are not isolated into guard messages. Refuse
-                // before executing the action, never after its stdout or
-                // filesystem effects have already escaped the guard.
+                // Raw callers have no isolated command messages. Refuse before
+                // the action; presented callers retain the effect transcript.
                 return Err(EngineExecutionError::BatchCommand {
                     index: command_index,
                     error: Box::new(EngineExecutionError::NotImplemented {
@@ -12030,7 +12029,7 @@ pub struct EngineExecutionLimits {
     pub flbc_codec: CodecLimits,
     pub vm: VmExecutionLimits,
     pub source_modules: SourceModuleLimits,
-    /// Aggregate raw UTF-8 bytes retained from presented evaluation streams.
+    /// Aggregate raw UTF-8 bytes retained per presented source command batch.
     /// Raw evaluation APIs keep their direct effects and do not use this cap.
     pub max_evaluation_output_bytes: usize,
 }

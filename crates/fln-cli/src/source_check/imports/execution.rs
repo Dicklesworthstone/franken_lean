@@ -974,6 +974,25 @@ fn render_commands(
                         .ok_or_else(|| {
                             internal("source program evaluation escaped the execution table")
                         })?;
+                if json {
+                    crate::stdout_capture::evaluation(execution).map_err(|error| {
+                        let (class, exit) = crate::stdout_capture::error_disposition(error);
+                        Failure::new(
+                            class,
+                            format!("evaluation stream transfer: {error:?}"),
+                            false,
+                            exit,
+                        )
+                    })?;
+                } else if let Some(text) = execution
+                    .evaluation_output()
+                    .filter(|text| !text.is_empty())
+                {
+                    append(output, text)?;
+                    if !text.ends_with('\n') {
+                        append(output, "\n")?;
+                    }
+                }
                 // The printer was checked and executed with the source term.
                 // Reading its Format never re-executes a value or IO action.
                 let (kind, value, human) = match source_evaluation::formatted(execution)

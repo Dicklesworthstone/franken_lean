@@ -1,6 +1,6 @@
 //! JSON execution keeps program stdout in a bounded field of its result.
 //! The scope must be entered on the worker that runs Golem: native stdout is
-//! thread-local. Human and Lean presentations retain ordinary native writes.
+//! thread-local. Presented evaluations transfer their isolated output here.
 
 use super::{MultiplexerOutput, json_string};
 use std::cell::Cell;
@@ -41,6 +41,33 @@ const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 // Every accepted byte must still fit in a resource-error envelope if the
 // successful document's other fields leave insufficient space for stdout.
 const ERROR_ENVELOPE_BYTES: usize = 1024;
+
+/// Evaluation effects were isolated on the engine worker. Transfer their
+/// retained bytes, in command order, to this front door's JSON memory sink.
+/// A missing scope refuses rather than falling back to a process write.
+pub(super) fn evaluation(
+    execution: &fln::DefinitionExecution,
+) -> Result<(), fln::StdoutCaptureError> {
+    if let Some(text) = execution
+        .evaluation_output()
+        .filter(|text| !text.is_empty())
+    {
+        fln::StdoutCapture::append_current(text)?;
+    }
+    Ok(())
+}
+
+pub(super) fn error_disposition(error: fln::StdoutCaptureError) -> (&'static str, u8) {
+    match error {
+        fln::StdoutCaptureError::Allocation | fln::StdoutCaptureError::Limit { .. } => {
+            ("resource", 3)
+        }
+        fln::StdoutCaptureError::InvalidStdout | fln::StdoutCaptureError::InvalidStderr => {
+            ("capability", 5)
+        }
+        fln::StdoutCaptureError::ScopeUnavailable => ("internal-fault", 4),
+    }
+}
 
 pub(super) fn json(
     enabled: bool,

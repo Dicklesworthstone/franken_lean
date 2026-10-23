@@ -1,6 +1,7 @@
-//! Explicit, thread-local memory sinks for the reviewed Golem stdout callback.
+//! Explicit, thread-local memory sinks for reviewed Golem stream callbacks.
 //! No native FILE is created, closed, or redirected. A retained callback binds
-//! each scope to one validated stdout Handle; other Handles keep normal fwrite.
+//! each scope to validated stdout/optional stderr Handles; other Handles keep
+//! normal fwrite.
 
 use super::Obj;
 use std::cell::RefCell;
@@ -260,6 +261,9 @@ pub(crate) fn write_diagnostic_if_captured(bytes: &[u8]) -> Result<bool, StdoutC
         else {
             return Ok(false);
         };
+        if let Some(error) = frame.error {
+            return Err(error);
+        }
         // Lossy UTF-8 cannot be shorter than these bytes. Refuse an already
         // impossible request before allocating its normalized representation.
         let minimum = frame
@@ -274,8 +278,40 @@ pub(crate) fn write_diagnostic_if_captured(bytes: &[u8]) -> Result<bool, StdoutC
             frame.error.get_or_insert(error);
             return Err(frame.error.unwrap_or(error));
         }
-        let line = String::from_utf8_lossy(bytes);
-        append(frame, &[line.as_bytes(), b"\n"])?;
+        if std::str::from_utf8(bytes).is_ok() {
+            append(frame, &[bytes, b"\n"])?;
+        } else {
+            let normalized_len = bytes.utf8_chunks().try_fold(0usize, |n, chunk| {
+                n.checked_add(chunk.valid().len())?
+                    .checked_add(if chunk.invalid().is_empty() { 0 } else { 3 })
+            });
+            let requested = normalized_len
+                .and_then(|n| frame.escaped_bytes.checked_add(n))
+                .and_then(|n| n.checked_add(1));
+            if requested.is_none_or(|n| n > frame.limit) {
+                let error = StdoutCaptureError::Limit {
+                    limit: frame.limit,
+                    requested: requested.unwrap_or(usize::MAX),
+                };
+                frame.error = Some(error);
+                return Err(error);
+            }
+            let mut normalized = String::new();
+            if normalized
+                .try_reserve_exact(normalized_len.unwrap_or(0))
+                .is_err()
+            {
+                frame.error = Some(StdoutCaptureError::Allocation);
+                return Err(StdoutCaptureError::Allocation);
+            }
+            for chunk in bytes.utf8_chunks() {
+                normalized.push_str(chunk.valid());
+                if !chunk.invalid().is_empty() {
+                    normalized.push('\u{fffd}');
+                }
+            }
+            append(frame, &[normalized.as_bytes(), b"\n"])?;
+        }
         Ok(true)
     })
 }

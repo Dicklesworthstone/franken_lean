@@ -3325,7 +3325,7 @@ fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmEx
                     allowed: *limit as u64,
                     observed: *requested as u64,
                 })
-                .with_progress("stdout capture escaped-byte budget"),
+                .with_progress("native stream capture byte allowance"),
             ),
             StdoutCaptureError::Allocation => Stop::Inconclusive(
                 Inconclusive::dependency_unavailable("host allocation for stdout capture"),

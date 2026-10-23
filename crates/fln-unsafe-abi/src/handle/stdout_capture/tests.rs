@@ -149,3 +149,77 @@ fn capture_never_accepts_invalid_callback_string_or_world() {
     assert!(result.bytes.is_empty());
     assert_eq!(result.error, None);
 }
+
+#[test]
+fn isolated_capture_validates_both_streams_and_keeps_raw_byte_order() {
+    let _lock = crate::tests::lock();
+    let stdout = callback();
+    let stderr = Obj::stdio_stderr().unwrap().try_ctor_child(4).unwrap();
+    let outer = StdoutCapture::begin_isolated(100, true).unwrap();
+    let inner = StdoutCapture::begin_isolated(11, true).unwrap();
+    write(&stdout, "λ\0").unwrap();
+    write(&stderr, "🙂").unwrap();
+    assert!(crate::stdio::panic_message_via_stream(b"end"));
+    let result = inner.finish();
+    assert_eq!(result.error, None);
+    assert_eq!(result.bytes, "λ\0🙂end\n".as_bytes());
+    assert_eq!(StdoutCapture::current_error(), None);
+
+    // A stdout-only inner scope leaves stderr with its previous owner.
+    let inner = StdoutCapture::begin_isolated(1, false).unwrap();
+    write(&stderr, "outer-stderr").unwrap();
+    write(&stdout, "x").unwrap();
+    assert_eq!(inner.finish().bytes, b"x");
+    assert_eq!(outer.finish().bytes, b"outer-stderr");
+    assert_eq!(
+        StdoutCapture::append_current("no physical write"),
+        Err(StdoutCaptureError::ScopeUnavailable)
+    );
+}
+
+#[test]
+fn isolated_diagnostic_limit_retains_prefix_and_restores_outer_capture() {
+    let _lock = crate::tests::lock();
+    let stdout = callback();
+    let outer = StdoutCapture::begin(100).unwrap();
+    let inner = StdoutCapture::begin_isolated(4, true).unwrap();
+    write(&stdout, "ok").unwrap();
+    let expected = StdoutCaptureError::Limit {
+        limit: 4,
+        requested: 6,
+    };
+    assert!(crate::stdio::panic_message_via_stream(b"bad"));
+    assert_eq!(StdoutCapture::current_error(), Some(expected));
+    assert!(matches!(
+        write(&stdout, "x"),
+        Err(StdioPutStrError::Capture(error)) if error == expected
+    ));
+    let result = inner.finish();
+    assert_eq!(result.bytes, b"ok");
+    assert_eq!(result.error, Some(expected));
+    assert_eq!(StdoutCapture::current_error(), None);
+    // The outer JSON allowance still counts escaped bytes, independently of
+    // the inner raw-byte allowance and without replaying either stream.
+    StdoutCapture::append_current("\0\n").unwrap();
+    write(&stdout, "after").unwrap();
+    let result = outer.finish();
+    assert_eq!(result.error, None);
+    assert_eq!(result.bytes, b"\0\nafter");
+
+    let scope = StdoutCapture::begin_isolated(5, true).unwrap();
+    assert!(crate::stdio::panic_message_via_stream(b"x\xff"));
+    let result = scope.finish();
+    assert_eq!(result.error, None);
+    assert_eq!(result.bytes, "x\u{fffd}\n".as_bytes());
+    let scope = StdoutCapture::begin_isolated(4, true).unwrap();
+    assert!(crate::stdio::panic_message_via_stream(b"x\xff"));
+    let result = scope.finish();
+    assert!(result.bytes.is_empty());
+    assert_eq!(
+        result.error,
+        Some(StdoutCaptureError::Limit {
+            limit: 4,
+            requested: 5,
+        })
+    );
+}
