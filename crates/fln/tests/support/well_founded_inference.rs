@@ -194,6 +194,86 @@ pub(super) fn assert_automatic_termination(base: &Engine) {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+pub(super) fn assert_omitted_result_types(base: &Engine) {
+    let root = base.logical_root(&KVMap::new());
+    let mut failures = Vec::new();
+    for (definition, answer, expected) in [
+        (
+            "def steps (n : Nat) : Nat := if h : n < 99 then n else steps (n - 99)",
+            "def answer : Nat := steps 250",
+            ClosedVmValue::Scalar(52),
+        ),
+        (
+            "def steps (n : Nat) := if h : n < 99 then n else steps (n - 99)",
+            "def answer : Nat := steps 250",
+            ClosedVmValue::Scalar(52),
+        ),
+        (
+            "def steps (n : Nat) := if h : n < 99 then n else steps (n - 99)\ntermination_by n",
+            "def answer : Nat := steps 250",
+            ClosedVmValue::Scalar(52),
+        ),
+        (
+            "def carry (text : String) (n : Nat) := if h : 0 < n then carry text (n - 1) else text\ntermination_by n",
+            "def answer : String := carry \"inferred\" 3",
+            ClosedVmValue::String("inferred".to_string()),
+        ),
+    ] {
+        let source = format!("{definition}\n{answer}");
+        match base.execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            EngineExecutionLimits::new(super::limits().kernel),
+        ) {
+            Ok(result) => {
+                let result = result
+                    .into_complete()
+                    .expect("inferred computation finishes");
+                let values: Vec<_> = result
+                    .executions
+                    .iter()
+                    .filter_map(|execution| {
+                        fln::closed_vm_value(&execution.exit).expect("normal native VM exit")
+                    })
+                    .collect();
+                assert_eq!(values, vec![expected], "{source}");
+            }
+            Err(error) => failures.push(format!("{source}\n{error:?}")),
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    let unknown = b"def indeterminate (n : Nat) := if h : 0 < n then indeterminate (n - 1) else (fun x => x)\ntermination_by n";
+    let error = base
+        .check_source_files(
+            &[unknown],
+            &KVMap::new(),
+            SourceCheckLimits::new(super::limits()),
+        )
+        .expect_err("an unconstrained binder cannot supply a recursive result type");
+    if !format!("{error:?}").contains("UnresolvedHoles") {
+        failures.push(format!(
+            "the refusal must identify an unresolved type, not termination or resource exhaustion: {error:?}"
+        ));
+    }
+    let non_decreasing = b"def bad (n : Nat) := if h : 0 < n then bad n else 0";
+    let error = base
+        .check_source_files(
+            &[non_decreasing],
+            &KVMap::new(),
+            SourceCheckLimits::new(super::limits()),
+        )
+        .expect_err("inference cannot admit a non-decreasing recursive call");
+    assert!(
+        !matches!(
+            error.disposition().0,
+            "resource" | "inconclusive" | "internal-fault"
+        ),
+        "a non-decreasing definition must be refused semantically: {error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 fn cancelled(inputs: &[LinearConstraint], limits: OmegaLimits) -> OmegaOutcome {
     fln_anvil::omega::solve_with_cancel(inputs, limits, &mut || true)
 }

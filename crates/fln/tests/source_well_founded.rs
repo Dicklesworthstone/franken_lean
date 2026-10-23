@@ -438,6 +438,24 @@ fn native_automatic_well_founded_termination() {
         .expect("native well-founded inference checks finish");
 }
 
+#[test]
+fn native_well_founded_infers_omitted_result_types() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base =
+                import_closure_for(&lib, &["Init.WFTactics", "Init.Omega", "Init.WFComputable"]);
+            well_founded_inference::assert_omitted_result_types(&base);
+        })
+        .expect("spawn native omitted-result checking thread")
+        .join()
+        .expect("native omitted-result checks finish");
+}
+
 /// Product measures, supplied or inferred, in the same closure. A separate test, so a
 /// failure among the single-measure programs above does not hide these.
 #[test]
