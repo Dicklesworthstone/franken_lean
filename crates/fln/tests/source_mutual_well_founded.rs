@@ -285,6 +285,27 @@ fn assert_auxiliary(engine: &Engine, name: &str) {
         "{name} is a Nat.fix: {}",
         shape(body)
     );
+    // `fun x a => PSum.casesOn (motive := …) x alt₀ … a`, as the pin prints it.
+    let ExprNode::App { a: functional, .. } = body.node() else {
+        panic!("{name} applies the fixpoint to its functional");
+    };
+    let ExprNode::Lam {
+        body: functional, ..
+    } = functional.node()
+    else {
+        panic!("{name}'s functional binds the packed argument");
+    };
+    let ExprNode::Lam {
+        body: functional, ..
+    } = functional.node()
+    else {
+        panic!("{name}'s functional binds the continuation");
+    };
+    let rendered = shape(functional);
+    assert!(
+        rendered.starts_with("(PSum.casesOn ") && rendered.ends_with(" #0)"),
+        "{name}'s functional cases on the packed argument and passes the continuation: {rendered}"
+    );
 }
 
 /// `partial def <member>._unsafe_rec`, the pin's executable companions
@@ -599,5 +620,168 @@ end
         let refusal = refuse(base, source);
         eprintln!("incomplete hints: {refusal}");
         assert!(!base.environment().contains(&n("a")));
+    });
+}
+
+/// `vendor/lean4-src/tests/elab/955.lean`: measures that are themselves `match`es.
+#[test]
+fn upstream_955_match_measures() {
+    let source = "namespace Ex2
+mutual
+  def isEven : Nat → Bool
+    | 0 => true
+    | n+1 => isOdd n
+  termination_by n =>
+    match n with
+    | _ => n
+
+  def isOdd : Nat → Bool
+    | 0 => false
+    | n+1 => isEven n
+  termination_by n =>
+    match n with
+    | _ => n
+end
+end Ex2
+";
+    on_large_stack(move |base| {
+        oracle(source, true);
+        let engine = check(base, source);
+        assert_member(
+            &engine,
+            "Ex2.isOdd",
+            &["Ex2.isEven", "Ex2.isOdd"],
+            "(fun (Ex2.isEven._mutual (PSum.inr Nat Nat #0)))",
+        );
+        assert_auxiliary(&engine, "Ex2.isEven._mutual");
+        assert_eq!(
+            evaluate(&engine, "#eval Ex2.isEven 6"),
+            ClosedVmValue::Scalar(1)
+        );
+    });
+}
+
+/// `vendor/lean4-src/tests/elab/issue2925.lean`: member types that are
+/// definitions unfolding to function types, and a member with two varying
+/// arguments packed as a `PSigma`.
+#[test]
+fn upstream_issue2925_function_type_definitions() {
+    let source = "def FunType := Nat → Nat
+def Fun2Type := Nat → Nat → Nat
+
+mutual
+def foo : FunType
+  | .zero => 0
+  | .succ n => bar n
+termination_by n => n
+def bar : Nat → Nat
+  | .zero => 0
+  | .succ n => baz n 0
+termination_by n => n
+def baz : Fun2Type
+  | .zero, m => 0
+  | .succ n, m => foo n
+termination_by n _ => n
+end
+";
+    on_large_stack(move |base| {
+        let printed = oracle(&format!("{source}#print baz\n"), true);
+        assert!(
+            printed.contains("fun a a_1 => foo._mutual (PSum.inr (PSum.inr ⟨a, a_1⟩))"),
+            "{printed}"
+        );
+        let engine = check(base, source);
+        let order = ["foo", "bar", "baz"];
+        assert_member(
+            &engine,
+            "bar",
+            &order,
+            "(fun (foo._mutual (PSum.inr Nat (PSum Nat (PSigma Nat (fun Nat))) (PSum.inl Nat (PSigma Nat (fun Nat)) #0))))",
+        );
+        assert_member(
+            &engine,
+            "baz",
+            &order,
+            "(fun (fun (foo._mutual (PSum.inr Nat (PSum Nat (PSigma Nat (fun Nat))) (PSum.inr Nat (PSigma Nat (fun Nat)) (PSigma.mk Nat (fun Nat) #1 #0))))))",
+        );
+        assert_auxiliary(&engine, "foo._mutual");
+        assert_companions(&engine, &order);
+        assert_eq!(evaluate(&engine, "#eval foo 5"), ClosedVmValue::Scalar(0));
+    });
+}
+
+/// Outside the supported slice a group stays a typed refusal: never a resource
+/// stop, a fault, or a partial publication. The pin's verdict is recorded for
+/// each; where it accepts, this is a known gap, not parity.
+#[test]
+fn shapes_outside_the_slice_stay_typed_refusals() {
+    // `vendor/lean4-src/tests/elab/psumAtWF.lean`: the members auto-bind a
+    // universe (`α : Sort u_1`); the pin accepts.
+    let universe = "mutual
+
+def fn (f : α → α) (a : α) (n : Nat) : α :=
+  match n with
+  | 0 => a
+  | n+1 => gn f (f (f a)) (f a) n
+termination_by n
+
+def gn (f : α → α) (a b : α) (n : Nat) : α :=
+  match n with
+  | 0 => b
+  | n+1 => fn f (f b) n
+termination_by n
+
+end
+";
+    // A lexicographic measure; the pin accepts (`Prod.Lex`).
+    let lexicographic = "mutual
+def f (n : Nat) (b : Bool) : Nat := if b then f n false else if h : n = 0 then 0 else g (n - 1)
+termination_by (n, if b then 1 else 0)
+decreasing_by all_goals sorry
+def g (n : Nat) : Nat := f n true
+termination_by (n, 2)
+decreasing_by all_goals sorry
+end
+";
+    // `vendor/lean4-src/tests/elab_fail/mutwf1.lean`: the pin refuses both groups.
+    let failing = "namespace Ex2
+mutual
+  def f : Nat → Bool → Nat
+    | n, true  => 2 * f n false
+    | 0, false => 1
+    | n, false => n + g (n+1) -- Error
+  termination_by n b => (n, if b then 2 else 1)
+
+  def g (n : Nat) : Nat :=
+    if h : n ≠ 0 then
+      f (n-1) true
+    else
+      n
+  termination_by (n, 0)
+end
+end Ex2
+";
+    on_large_stack(move |base| {
+        for (source, accepted) in [(universe, true), (lexicographic, true), (failing, false)] {
+            oracle(source, accepted);
+            let root = base.logical_root(&KVMap::new());
+            let error = base
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("outside the supported slice:\n{source}"));
+            assert!(
+                !matches!(
+                    error.disposition().0,
+                    "resource" | "inconclusive" | "internal-fault"
+                ),
+                "a refusal, not a stop: {error:?}"
+            );
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+            eprintln!("outside the slice (pin accepts: {accepted}): {error:?}");
+        }
     });
 }
