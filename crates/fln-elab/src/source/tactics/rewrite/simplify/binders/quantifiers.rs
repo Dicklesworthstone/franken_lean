@@ -82,6 +82,44 @@ impl Context {
         ))
     }
 
+    /// Whether `rules` rewrite `α → True` to `True`, as the pin's `implies_true`
+    /// (`Init/SimpLemmas.lean:279`) does. Only such a rule takes the pin's simp from a
+    /// quantified result to `True`: under binders a reflexive leaf becomes `True` by `eq_self`,
+    /// which even `simp only` adds (`simpOnlyBuiltins`, `Lean/Elab/Tactic/Simp.lean:512`), and
+    /// `∀ y, True` is then left unsolved. A rule counts when it is a global selected forward
+    /// whose statement is `implies_true`'s; an applied instance (`implies_true Nat`) or a local
+    /// is not recognized, so such a set leaves the quantified goal open.
+    pub(in crate::source::tactics::rewrite::simplify) fn simp_rules_close_implications(
+        &mut self,
+        rules: &[SimpRule<'_>],
+    ) -> Result<bool, NatDefinitionElabError> {
+        for rule in rules {
+            let resolved;
+            let name = match rule {
+                SimpRule::Global(entry) if !entry.reverse => {
+                    entry.proof.as_ref().unwrap_or(&entry.declaration)
+                }
+                SimpRule::Explicit(explicit) if !explicit.reverse => {
+                    let Some(name) = self.simp_rule_global(explicit.syntax)? else {
+                        continue;
+                    };
+                    resolved = name;
+                    &resolved
+                }
+                _ => continue,
+            };
+            if self
+                .txn
+                .env
+                .find(name)
+                .is_some_and(|info| implies_true_statement(&info.constant_val().type_))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The same restricted reflexivity policy used at the top-level goal,
     /// applied under a heap-managed telescope. No arbitrary local assumption
     /// or unselected definition is used to complete a quantified proposition.
@@ -148,4 +186,29 @@ impl Context {
         }
         result
     }
+}
+
+/// `implies_true`'s statement, `∀ (α : Sort u), (α → True) = True` (`Init/SimpLemmas.lean:279`),
+/// read from a declaration's type.
+fn implies_true_statement(type_: &Expr) -> bool {
+    let is_true = |expr: &Expr| {
+        matches!(expr.node(), ExprNode::Const { name, levels }
+            if levels.is_empty() && *name == Name::from_components(["True"]))
+    };
+    let ExprNode::ForallE {
+        binder_type, body, ..
+    } = type_.node()
+    else {
+        return false;
+    };
+    let Some((level, domain, left, right)) = equality_target(body) else {
+        return false;
+    };
+    // A source declaration may state the domain as `Sort (imax u 0)`, the arrow's inferred sort.
+    matches!(binder_type.node(), ExprNode::Sort { level } if matches!(level.view(), LevelView::Param(_)))
+        && level.normalize() == Level::one()
+        && matches!(domain.node(), ExprNode::Sort { level } if level.normalize().is_zero())
+        && matches!(left.node(), ExprNode::ForallE { binder_type, body, .. }
+            if matches!(binder_type.node(), ExprNode::BVar { idx: 0 }) && is_true(body))
+        && is_true(&right)
 }

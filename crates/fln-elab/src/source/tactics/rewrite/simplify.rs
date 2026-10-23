@@ -1129,7 +1129,7 @@ impl Context {
             lctx: self.txn.lctx.clone(),
             introduced: Vec::new(),
         };
-        if let Some(value) = self.simp_reflexivity(&goal)? {
+        if let Some(value) = self.simp_reflexivity(&goal, rules)? {
             return Ok(Some(value));
         }
         if rules.is_empty() {
@@ -1191,7 +1191,7 @@ impl Context {
             }
             let value = match self.simp_selected_proof(&goal.target, rules)? {
                 Some(value) => Some(value),
-                None => self.simp_reflexivity(&goal)?,
+                None => self.simp_reflexivity(&goal, rules)?,
             };
             let Some(value) = value else {
                 return Ok(None);
@@ -1236,9 +1236,16 @@ impl Context {
     /// Check a candidate only after the shared automatic-closure policy admits
     /// it. Full K1 assignment conversion alone would unfold ordinary definitions
     /// that are absent from this tactic's explicit rule set.
+    ///
+    /// The pin closes a goal only once its simp result is `True` (`simpTargetCore`,
+    /// `Lean/Meta/Tactic/Simp/Main.lean:784`). A quantified goal whose leaf closes becomes
+    /// `∀ y, True` there, and `True` only through `implies_true`, so `rules` decide whether
+    /// it closes: `∀ y : Nat, y + 0 = y := by simp only [Nat.add_zero]` is "unsolved goals
+    /// ⊢ ∀ (y : Nat), True" at v4.32.0, and `by simp` accepts it.
     fn simp_reflexivity(
         &mut self,
         goal: &ProofGoal,
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let target = self.whnf_with_transparency(
             &goal.target,
@@ -1253,6 +1260,9 @@ impl Context {
                     .value,
             )
         } else if matches!(target.node(), ExprNode::ForallE { .. }) {
+            if !self.simp_rules_close_implications(rules)? {
+                return Ok(None);
+            }
             self.simp_quantified_reflexivity(goal, target)?
         } else {
             self.automatic_reflexivity_candidate(goal, false)?
@@ -1374,7 +1384,7 @@ impl Context {
                 self.close_proof_goal(goal, completion.value.clone())?;
             } else if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
                 self.close_proof_goal(goal, value)?;
-            } else if let Some(value) = self.simp_reflexivity(&goal)? {
+            } else if let Some(value) = self.simp_reflexivity(&goal, rules)? {
                 self.close_proof_goal(goal, value)?;
             } else if steps > 0 {
                 // Simplification can expose a non-reflexive remaining goal.

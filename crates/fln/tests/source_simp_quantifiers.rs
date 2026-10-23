@@ -33,18 +33,46 @@ fn quantified_rewrite_preserves_the_binder_and_does_not_introduce_a_local() {
     }
 }
 
+/// `implies_true`'s statement (`Init/SimpLemmas.lean:279`), which the seed does not declare. The
+/// pin closes a goal only once its simp result is `True`, and a quantified result `∀ x, True`
+/// becomes `True` only through such a rule, which `simp only` has only when it is listed. Run
+/// through the pinned `lean` v4.32.0 headerless (2026-10-23): the `simp only` programs below that
+/// omit it are rejected ("unsolved goals" or "`simp` made no progress"), and the programs checked
+/// as accepted here, which select it, are accepted there.
+const IMPLIES_TRUE: &str = "universe u\ntheorem implies_true_eq (α : Sort u) : (α -> True) = True :=\n  propext (Iff.intro (fun _ => True.intro) (fun _ _ => True.intro))\n";
+
 #[test]
 fn quantified_reflexivity_and_truth_close_without_widening_conversion() {
     let base = engine();
+    for source in [
+        "theorem t (A : Type) : (x : A) -> x = x := by simp only [implies_true_eq]",
+        "theorem t (A : Type) (B : A -> Type) : (a : A) -> (b : B a) -> b = b := by simp only [implies_true_eq]",
+        "theorem t (A : Type) : (a : A) -> True := by simp only [implies_true_eq]",
+        "theorem t (f g : Nat -> Nat) (h : (n : Nat) -> f n = g n) : (n : Nat) -> f n = g n := by simp only [h, implies_true_eq]",
+    ] {
+        check(&base, &format!("{IMPLIES_TRUE}{source}"));
+    }
     for source in [
         "theorem t (A : Type) : (x : A) -> x = x := by simp only []",
         "theorem t (A : Type) (B : A -> Type) : (a : A) -> (b : B a) -> b = b := by simp only []",
         "theorem t (A : Type) : (a : A) -> True := by simp only []",
         "theorem t (f g : Nat -> Nat) (h : (n : Nat) -> f n = g n) : (n : Nat) -> f n = g n := by simp only [h]",
+        "def wrapped (n : Nat) : Nat := n\ntheorem bad : (n : Nat) -> wrapped n = n := by simp only []",
     ] {
-        check(&base, source);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{source}"
+        );
     }
-    let source = "def wrapped (n : Nat) : Nat := n\ntheorem bad : (n : Nat) -> wrapped n = n := by simp only []";
+    // With the closing rule selected, the leaf still closes only by reducible conversion.
+    let source = format!(
+        "{IMPLIES_TRUE}def wrapped (n : Nat) : Nat := n\ntheorem bad : (n : Nat) -> wrapped n = n := by simp only [implies_true_eq]"
+    );
     assert!(
         base.check_source_files(
             &[source.as_bytes()],
@@ -62,7 +90,9 @@ fn nested_dependent_quantifiers_hypotheses_and_simpa_share_binder_rewriting() {
         "universe u v\ntheorem t (A : Sort u) (B : A -> Sort v) (f g : (a : A) -> B a -> Nat) (R : Nat -> Prop) (h : (a : A) -> (b : B a) -> f a b = g a b) (ready : (a : A) -> (b : B a) -> R (g a b)) : (a : A) -> (b : B a) -> R (f a b) := by simp only [h]; exact ready",
         "theorem t (f g : Nat -> Nat) (R : Nat -> Prop) (h : (n : Nat) -> f n = g n) (ready : (n : Nat) -> R (f n)) : (n : Nat) -> R (g n) := by simp only [h] at ready; exact ready",
         "theorem t (f g : Nat -> Nat) (R : Nat -> Prop) (h : (n : Nat) -> f n = g n) (ready : (n : Nat) -> R (f n)) : (n : Nat) -> R (g n) := by simpa only [h] using ready",
-        "theorem t (f g : Nat -> Nat) (R : Nat -> Prop) (h : (n : Nat) -> f n = g n) (ready : (n : Nat) -> R (f n)) : (n : Nat) -> R (g n) := by simp_all only [h]",
+        &format!(
+            "{IMPLIES_TRUE}theorem t (f g : Nat -> Nat) (R : Nat -> Prop) (h : (n : Nat) -> f n = g n) (ready : (n : Nat) -> R (f n)) : (n : Nat) -> R (g n) := by simp_all only [h, implies_true_eq]"
+        ),
         "theorem t (F G : Nat -> Nat -> Nat) (wrap : (Nat -> Nat) -> Prop) (h : (n x : Nat) -> F n x = G n x) (ready : (n : Nat) -> wrap (fun x => G n x)) : (n : Nat) -> wrap (fun x => F n x) := by simp only [h]; exact ready",
     ] {
         check(&base, source);
@@ -73,7 +103,10 @@ fn nested_dependent_quantifiers_hypotheses_and_simpa_share_binder_rewriting() {
 fn registered_rules_and_equivalences_keep_their_proof_paths_beneath_binders() {
     let base = engine();
     for source in [
-        "def wrapped (n : Nat) : Nat := n\n@[simp] theorem unwrap (n : Nat) : wrapped n = n := by rfl\ntheorem t : (n : Nat) -> wrapped n = n := by simp",
+        // The seed's default set has no `implies_true`; the pin's `Init` registers it.
+        &format!(
+            "{IMPLIES_TRUE}attribute [simp] implies_true_eq\ndef wrapped (n : Nat) : Nat := n\n@[simp] theorem unwrap (n : Nat) : wrapped n = n := by rfl\ntheorem t : (n : Nat) -> wrapped n = n := by simp"
+        ),
         "def wrapped (n : Nat) : Nat := n\n@[simp] theorem unwrap (n : Nat) : wrapped n = n := by rfl\ntheorem t (unwrap : False) : (fun n => wrapped n) = (fun n => n) := by simp",
         "theorem t (P Q : Nat -> Prop) (h : (n : Nat) -> (P n ↔ Q n)) (ready : (n : Nat) -> Q n) : (n : Nat) -> P n := by simp only [h]; exact ready",
         "theorem t (f g : Nat -> Nat) (h : (n : Nat) -> f n = g n) (ready : (fun n => f n) = g) : (fun n => g n) = g := by simp only [h] at ready; exact ready",
@@ -107,6 +140,8 @@ fn quantified_simp_cannot_capture_or_invent_premises() {
     }
     check(
         &base,
-        "theorem t (f g : Nat -> Nat) (P : Nat -> Prop) (h : (n : Nat) -> P n -> f n = g n) (hp : (n : Nat) -> P n) : (n : Nat) -> f n = g n := by simp only [h, hp]",
+        &format!(
+            "{IMPLIES_TRUE}theorem t (f g : Nat -> Nat) (P : Nat -> Prop) (h : (n : Nat) -> P n -> f n = g n) (hp : (n : Nat) -> P n) : (n : Nat) -> f n = g n := by simp only [h, hp, implies_true_eq]"
+        ),
     );
 }
