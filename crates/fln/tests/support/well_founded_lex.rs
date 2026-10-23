@@ -3,7 +3,6 @@
 //! search infers the product over Nat parameters.
 #![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, SourceCheckLimits};
-use fln_core::outcome::{InconclusiveCause, Outcome};
 
 // Independently evaluated by the pin with prelude, Init.WFComputable and
 // Init.Omega. Init.Data.Repr serves only the oracle's #eval output.
@@ -86,18 +85,20 @@ const INFERRED: &[(&str, &str, &str, usize)] = &[
         "swappedLexInferred 2 2",
         6,
     ),
-];
-
-/// The pin infers `termination_by (a, b, c)` and evaluates `nestedLexInferred 2 1 2` to 17.
-/// This search selects the same order, but every strict probe runs the default decreasing
-/// proof, about 121,000 heartbeats here, and then the body is elaborated again under the
-/// solution: measured 2026-10-20, inference spent 589,143 and that elaboration 219,444 of
-/// the 1,000,000 budget before the three final proofs, which exhaust it. The stop is a
-/// typed resource outcome, never a refusal; a cheaper default proof makes it pass.
-const INFERRED_OVER_BUDGET: &str = r#"def nestedLexInferred (a b c : Nat) : Nat :=
+    (
+        // The pin infers `termination_by (a, b, c)`. This search once exhausted the
+        // 1,000,000-heartbeat budget here (measured 2026-10-20: 589,143 in inference and
+        // 219,444 re-elaborating the body before the three final proofs); with the default
+        // decreasing proof's subtraction kept symbolic (834c3098) it completes.
+        "nestedLexInferred",
+        r#"def nestedLexInferred (a b c : Nat) : Nat :=
   if hc : 0 < c then nestedLexInferred a b (c - 1) + 1
   else if hb : 0 < b then nestedLexInferred a (b - 1) 2 + 1
-  else if ha : 0 < a then nestedLexInferred (a - 1) 1 2 + 1 else 0"#;
+  else if ha : 0 < a then nestedLexInferred (a - 1) 1 2 + 1 else 0"#,
+        "nestedLexInferred 2 1 2",
+        17,
+    ),
+];
 
 /// Inferred orders this search refuses, with the refusal's variant where it is the search's.
 /// The pin finds no order for `notLex`, where no parameter decreases a call without
@@ -234,24 +235,4 @@ pub(super) fn assert_automatic_lexicographic_refusals(base: &Engine) {
                 .contains(&Name::from_components(["automaticLexPrepared"]))
         );
     }
-    // Whichever budget runs out first decides the form: the elaborator's heartbeats stop
-    // the command, while omega's share returns an inconclusive check. Both are resource stops.
-    let outcome = base.check_source_files(
-        &[INFERRED_OVER_BUDGET.as_bytes()],
-        &KVMap::new(),
-        SourceCheckLimits::new(super::limits()),
-    );
-    let resource_stop = match &outcome {
-        Err(error) => error.disposition().0 == "resource",
-        Ok(Outcome::Inconclusive(reason)) => matches!(
-            &reason.cause,
-            InconclusiveCause::ResourceExhausted { usage } if usage.is_genuine_exhaustion()
-        ),
-        Ok(_) => false,
-    };
-    assert!(
-        resource_stop,
-        "nestedLexInferred: expected a resource stop: {outcome:?}"
-    );
-    assert_eq!(base.logical_root(&KVMap::new()), root);
 }
