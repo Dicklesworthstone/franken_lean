@@ -12090,6 +12090,20 @@ fn render_lean_source_commands(
         if let Some(failure) =
             source_execution_exit_failure(command_index, execution, SourcePresentation::Lean)
         {
+            if matches!(
+                source_evaluation::check(execution),
+                Err(source_evaluation::Error::Raised { .. })
+            ) {
+                let mut failure = failure;
+                failure.stdout =
+                    match source_evaluation::output_before_failure(&completed.batch.executions) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            return error.failure(command_index, SourcePresentation::Lean);
+                        }
+                    };
+                return failure;
+            }
             return failure;
         }
     }
@@ -12228,15 +12242,7 @@ fn render_lean_source_commands(
                 }
                 let formatted = match source_evaluation::formatted(execution) {
                     Ok(formatted) => formatted,
-                    Err(error) => {
-                        let mut failure = error.failure(command_index, SourcePresentation::Lean);
-                        // A checked IO exception occurs after its captured
-                        // effects. Retain those completed messages exactly once.
-                        if matches!(error, source_evaluation::Error::Raised { .. }) {
-                            failure.stdout = stdout;
-                        }
-                        return failure;
-                    }
+                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
                 match formatted {
                     Some(source_evaluation::PresentedEvaluation::Text(text)) => {

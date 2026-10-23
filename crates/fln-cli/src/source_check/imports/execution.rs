@@ -71,6 +71,35 @@ fn internal(detail: &str) -> Failure {
     Failure::new("internal-fault", detail, false, 4)
 }
 
+/// Preserve already completed effects in a JSON error without rerunning an
+/// action or allowing failed module evidence to reach a dependent module.
+fn failure_with_evaluation_output(
+    mut error: Failure,
+    presentation: Presentation,
+    program: &SourceProgramExecution,
+) -> MultiplexerOutput {
+    if error.class == "io-exception" && matches!(presentation, Presentation::Fln { json: true }) {
+        'prefix: for module in &program.modules {
+            for execution in &module.commands.batch.executions {
+                if let Err(capture) = crate::stdout_capture::evaluation(execution) {
+                    let (class, exit) = crate::stdout_capture::error_disposition(capture);
+                    error = Failure::new(
+                        class,
+                        &format!("evaluation stream transfer: {capture:?}"),
+                        false,
+                        exit,
+                    );
+                    break 'prefix;
+                }
+                if source_evaluation::check(execution).is_err() {
+                    break 'prefix;
+                }
+            }
+        }
+    }
+    failure(error, presentation)
+}
+
 fn module_error(error: fln::source_check::modules::SourceModuleCheckError) -> Failure {
     let (class, authority, exit) = error.disposition();
     Failure::new(class, &error.to_string(), authority, exit)
@@ -333,7 +362,7 @@ fn run_loaded(
                 Presentation::Fln { json } => {
                     let prepared = match prepare_publication(&publication, &completed, &inputs, &loaded) {
                         Ok(prepared) => prepared,
-                        Err(error) => return Some(failure(error, presentation)),
+                        Err(error) => return Some(failure_with_evaluation_output(error, presentation, &completed)),
                     };
                     // Validate and bound the complete report before linking
                     // either artifact. No recompile or second execution occurs.
@@ -342,7 +371,7 @@ fn run_loaded(
                             Ok(_) => MultiplexerOutput::success(stdout),
                             Err(error) => failure(error, presentation),
                         },
-                        Err(error) => failure(error, presentation),
+                        Err(error) => failure_with_evaluation_output(error, presentation, &completed),
                     }
                 }
             })
@@ -712,7 +741,15 @@ fn validate_lean_module(
     module: &Name,
     commands: &fln::SourceCommandBatchExecution,
 ) -> Result<(), MultiplexerOutput> {
-    validate_module_exits(module, commands).map_err(|error| failure(error, Presentation::Lean))?;
+    if let Err(error) = validate_module_exits(module, commands) {
+        let has_output = error.class == "io-exception";
+        let mut failed = failure(error, Presentation::Lean);
+        if has_output {
+            failed.stdout = source_evaluation::output_before_failure(&commands.batch.executions)
+                .map_err(|error| error.failure(0, SourcePresentation::Lean))?;
+        }
+        return Err(failed);
+    }
     if !commands.guards.is_empty() {
         let mut presented = render_lean_source_commands(commands, crate::WarningSink::Discard);
         if presented.exit_code != 0 {
@@ -979,7 +1016,7 @@ fn render_commands(
                         let (class, exit) = crate::stdout_capture::error_disposition(error);
                         Failure::new(
                             class,
-                            format!("evaluation stream transfer: {error:?}"),
+                            &format!("evaluation stream transfer: {error:?}"),
                             false,
                             exit,
                         )

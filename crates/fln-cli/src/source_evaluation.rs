@@ -274,6 +274,28 @@ pub(super) fn check(execution: &fln::DefinitionExecution) -> Result<(), Error> {
     }
 }
 
+/// Completed stream messages up to the first failed execution. This is used
+/// only when validation has already found an IO exception; the exception still
+/// prevents publication and dependent-module execution.
+pub(super) fn output_before_failure(
+    executions: &[fln::DefinitionExecution],
+) -> Result<String, Error> {
+    let mut output = String::new();
+    let mut budget = FormattedOutputBudget::new(16 * 1024 * 1024);
+    for execution in executions {
+        if let Some(text) = execution
+            .evaluation_output()
+            .filter(|text| !text.is_empty())
+        {
+            budget.append(text, &mut output, None)?;
+        }
+        if check(execution).is_err() {
+            break;
+        }
+    }
+    Ok(output)
+}
+
 #[derive(Debug)]
 pub(super) enum PresentedEvaluation {
     Text(String),
