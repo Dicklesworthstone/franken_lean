@@ -185,7 +185,11 @@ pub fn declaration_warning_offset(source: &[u8]) -> Option<usize> {
 /// bytes, so parsing it refuses it where the token starts. Every other refusal (an unterminated
 /// comment, string or identifier escape, which runs on past the command) still refuses the whole
 /// source.
-fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
+/// The tokens [`partition`] reads, with the one-token refusals it goes past (message and
+/// normalized position), which only the command holding them reports.
+type PartitionTokens = (Vec<LexedToken>, Vec<(&'static str, BytePos)>);
+
+fn partition_tokens(view: &SourceView) -> Result<PartitionTokens, DefinitionParseError> {
     let run = lex(view)?;
     let diagnostics: Vec<_> = run
         .events
@@ -202,14 +206,16 @@ fn partition_tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionPars
     if !diagnostics.is_empty() {
         return Err(NatDefinitionParseError::Lexical { diagnostics });
     }
-    Ok(run
-        .events
-        .into_iter()
-        .filter_map(|event| match event {
-            Event::Token(token) => Some(token),
-            _ => None,
-        })
-        .collect())
+    let mut refused = Vec::new();
+    let mut tokens = Vec::new();
+    for event in run.events {
+        match event {
+            Event::Token(token) => tokens.push(token),
+            Event::Refused { error, .. } => refused.push((error.message(), error.at())),
+            Event::Trivia(_) => {}
+        }
+    }
+    Ok((tokens, refused))
 }
 /// A refusal of one token that [`partition`] goes past, leaving it to the command that holds it.
 pub(crate) fn refusal_of_one_token(error: &fln_syntax::run::RunError) -> bool {
@@ -367,7 +373,7 @@ fn manual_link_refused(docstring: &str) -> bool {
 #[inline(never)]
 fn doc_comment_is_carried(
     view: &SourceView,
-    tokens: &[LexedToken],
+    (tokens, refused): (&[LexedToken], &[(&'static str, BytePos)]),
     index: usize,
     source_len: usize,
 ) -> Result<(), NatDefinitionParseError> {
@@ -379,6 +385,19 @@ fn doc_comment_is_carried(
         return Ok(());
     }
     let next = tokens.get(index + 1);
+    // Bytes the table cannot read right after the doc are what follows it: the pin stops there
+    // ("expected token", `/-- d -/ #guard_msgs …` without `#guard_msgs`'s module), not at the
+    // token after them.
+    if let Some(&(message, at)) = refused.iter().find(|(_, at)| {
+        *at >= token.extent.end() && next.is_none_or(|next| *at < next.extent.start())
+    }) {
+        return Err(NatDefinitionParseError::Lexical {
+            diagnostics: vec![ParseDiagnostic {
+                message,
+                at: view.to_original(at),
+            }],
+        });
+    }
     // A carrier the file itself declares (`Init/Meta.lean`'s `macro … "declare_simp_like_tactic"`)
     // is an identifier under its imports' table: the partition is one pass over the whole file,
     // before any of its declarations, so it reads the word by its text.
@@ -893,7 +912,7 @@ fn guard_msgs(
 pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let tokens = partition_tokens(&view)?;
+    let (tokens, refused) = partition_tokens(&view)?;
     let mut starts = Vec::new();
     let mut depth = 0_usize;
     let source_view = view.normalized();
@@ -951,7 +970,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // does, and only before what can carry it, as at the pin, which refuses
             // `/-- d -/ #eval e` at the `#eval`.
             if depth == 0 && command_line && !open_in && doc_comment(token) {
-                doc_comment_is_carried(&view, &tokens, index, source.len())?;
+                doc_comment_is_carried(&view, (&tokens, &refused), index, source.len())?;
                 starts.push(view.to_original(token.extent.start()).0);
                 current_open = false;
                 declaration_column = None;
