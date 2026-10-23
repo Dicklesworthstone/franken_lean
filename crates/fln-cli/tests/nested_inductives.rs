@@ -263,3 +263,34 @@ fn cases_splits_a_nested_family_as_at_the_pin() {
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, CASES_EXPECTED, "{stderr}");
 }
+
+#[test]
+fn executable_nested_matches_use_native_runtime_layouts() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Executable.lean");
+    let source = r#"prelude
+import Init.Data.Repr
+inductive RuntimeTree where
+  | leaf : Nat → RuntimeTree
+  | node : List RuntimeTree → RuntimeTree
+def RuntimeTree.isNode : RuntimeTree → Bool
+  | .leaf _ => false
+  | .node _ => true
+def RuntimeTree.width : RuntimeTree → Nat
+  | .leaf _ => 1
+  | .node children => List.length children
+#eval (RuntimeTree.leaf 3).isNode
+#eval (RuntimeTree.node (List.cons (RuntimeTree.leaf 4) List.nil)).isNode
+#eval (RuntimeTree.node (List.cons (RuntimeTree.leaf 4) (List.cons (RuntimeTree.leaf 7) List.nil))).width
+"#;
+    std::fs::write(&entry, source).unwrap();
+    let expected = "false\ntrue\n2\n";
+    let (code, stdout) = pinned(&lib, &entry).expect("actual pinned compiler required");
+    assert_eq!((code, stdout.as_str()), (0, expected));
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, expected, "{stderr}");
+}

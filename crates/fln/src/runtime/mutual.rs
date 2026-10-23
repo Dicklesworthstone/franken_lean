@@ -4,6 +4,7 @@ use super::*;
 use fln_core::{expr::FVarId, level::Level};
 use fln_env::constants::RecursorVal;
 mod fold;
+mod nested;
 
 pub(super) struct Fold {
     pub group: u32,
@@ -35,6 +36,9 @@ impl Preparation<'_> {
         levels: &[Level],
         args: &[Expr],
     ) -> Result<Option<Group>, IngressError> {
+        if rec.num_motives as usize > rec.all.len() {
+            return self.nested_group(rec, levels, args);
+        }
         if rec.is_unsafe
             || rec.all.len() < 2
             || rec.num_motives as usize != rec.all.len()

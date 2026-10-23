@@ -80,9 +80,11 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
             return Ok(None);
         };
+        // Nested fields are ordinary admitted container applications. The
+        // shared discovery worklist validates their entire representation
+        // graph before any provisional data anchor becomes executable.
         if family.is_unsafe
             || family.num_params as usize != parameters.len()
-            || family.num_nested != 0
             || !family.all.contains(name)
             || family.base.level_params.len() != levels.len()
         {

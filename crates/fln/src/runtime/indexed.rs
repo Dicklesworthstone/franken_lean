@@ -62,8 +62,10 @@ impl Preparation<'_> {
         levels: &[Level],
         parameters: &[Expr],
     ) -> Result<Option<(Vec<bool>, Expr)>, IngressError> {
+        // Nesting changes the recursor's motive group, not this family's
+        // parameter telescope. Uniformity is still established by the field
+        // and index checks before representation discovery publishes a layout.
         if family.is_unsafe
-            || family.num_nested != 0
             || family.base.level_params.len() != levels.len()
             || family.num_params as usize != parameters.len()
         {
