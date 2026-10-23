@@ -9,13 +9,15 @@
 //! not pretend otherwise, and does not infer namespaces from imported names,
 //! referenced constants, class metadata or extra runtime constant names. A
 //! re-export-only namespace is reconstructed from its own qualified aliases.
+//! A scoped registration also names its exact namespace, even when its
+//! declaration lives elsewhere and the namespace has no constants of its own.
 use super::*;
 
 /// `namespacesExt` is PRIVATE at the pin. Its key is not `Lean.namespacesExt`,
 /// nor a dotted string with a string-valued "0" component. The descriptor's
 /// name is constructed in vendored stage0/stdlib/Lean/Namespace.c, initFn's
 /// closed__13, from closed__3/5/7/10/11 (closed__10 is Name.num 0).
-fn extension_name() -> Name {
+pub(super) fn extension_name() -> Name {
     Name::str(
         Name::str(
             Name::num(Name::from_components(["_private", "Lean", "Namespace"]), 0),
@@ -30,14 +32,19 @@ impl Encoder {
         &self,
         constants: &[ConstantInfo],
         aliases: &[AliasEntry],
+        instances: &[InstanceEntry],
     ) -> WResult<Vec<Name>> {
         let mut names = HashSet::new();
-        for declared in constants
+        for mut namespace in constants
             .iter()
-            .map(|constant| &constant.constant_val().name)
-            .chain(aliases.iter().map(|alias| &alias.alias))
+            .map(|constant| constant.constant_val().name.parent())
+            .chain(aliases.iter().map(|alias| alias.alias.parent()))
+            .chain(
+                instances
+                    .iter()
+                    .filter_map(|instance| instance.scope.clone()),
+            )
         {
-            let mut namespace = declared.parent();
             while !namespace.is_anonymous() {
                 // Every previous walk finished its ancestor chain. A shared
                 // prefix therefore lets us stop, not repeatedly walk to root.
@@ -90,7 +97,8 @@ pub(super) fn encode(
 ) -> WResult<EncodedModule> {
     let header_bytes = build_header(header)?;
     let mut encoder = Encoder::new(budget, header.version)?;
-    let namespaces = encoder.declaration_namespaces(input.constants, &metadata.aliases)?;
+    let namespaces =
+        encoder.declaration_namespaces(input.constants, &metadata.aliases, &metadata.instances)?;
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
             && metadata.instances.is_empty()
@@ -214,6 +222,55 @@ mod tests {
     }
 
     #[test]
+    fn scoped_namespaces_include_the_scope_itself_without_using_the_target_parent() {
+        let escaped = Name::str(
+            Name::num(Name::from_components(["Feature.with.dot"]), 7),
+            "Inner",
+        );
+        let row = |scope| InstanceEntry {
+            declaration: name("Unrelated.candidate"),
+            value: Expr::const_(name("Unrelated.candidate"), vec![]),
+            priority: 1000,
+            synth_order: vec![],
+            keys: vec![InstanceKey::Const(name("Class"), 0)],
+            scope,
+        };
+        let encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
+        let rows = [
+            row(Some(name("Feature.Inner"))),
+            row(Some(escaped.clone())),
+            row(None),
+        ];
+        let actual = encoder.declaration_namespaces(&[], &[], &rows).unwrap();
+        let mut expected = vec![
+            name("Feature"),
+            name("Feature.Inner"),
+            escaped.clone(),
+            escaped.parent(),
+            escaped.parent().parent(),
+        ];
+        expected.sort_by(Name::quick_cmp);
+        assert_eq!(actual, expected);
+        assert!(!actual.contains(&name("Unrelated")));
+        assert!(!actual.contains(&name("Class")));
+        let limited = Encoder::new(
+            WriteBudget {
+                max_objects: 1,
+                ..WriteBudget::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            limited.declaration_namespaces(&[], &[], &rows),
+            Err(WriteError::Budget {
+                resource: WriteResource::Objects,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn proper_prefixes_are_unique_and_sorted_without_registering_the_leaf() {
         let constants: Vec<_> = ["Lib.Inner.one", "Lib.Inner.two", "Lib.Other.three", "root"]
             .into_iter()
@@ -223,13 +280,15 @@ mod tests {
         let mut expected = vec![name("Lib"), name("Lib.Inner"), name("Lib.Other")];
         expected.sort_by(Name::quick_cmp);
         assert_eq!(
-            encoder.declaration_namespaces(&constants, &[]).unwrap(),
+            encoder
+                .declaration_namespaces(&constants, &[], &[])
+                .unwrap(),
             expected
         );
         let mut reversed = constants;
         reversed.reverse();
         assert_eq!(
-            encoder.declaration_namespaces(&reversed, &[]).unwrap(),
+            encoder.declaration_namespaces(&reversed, &[], &[]).unwrap(),
             expected
         );
     }
@@ -239,7 +298,9 @@ mod tests {
         let parent = Name::num(Name::str(Name::anonymous(), "A.B"), 7);
         let constants = [constant(Name::str(parent.clone(), "value"))];
         let mut encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
-        let namespaces = encoder.declaration_namespaces(&constants, &[]).unwrap();
+        let namespaces = encoder
+            .declaration_namespaces(&constants, &[], &[])
+            .unwrap();
         assert!(namespaces.contains(&parent));
         assert!(namespaces.contains(&Name::str(Name::anonymous(), "A.B")));
         assert!(!namespaces.contains(&name("A")));
@@ -375,7 +436,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            limited.declaration_namespaces(&constants, &[]),
+            limited.declaration_namespaces(&constants, &[], &[]),
             Err(WriteError::Budget {
                 resource: WriteResource::Objects,
                 ..
@@ -383,7 +444,10 @@ mod tests {
         ));
         let fresh = Encoder::new(WriteBudget::default(), 2).unwrap();
         assert_eq!(
-            fresh.declaration_namespaces(&constants, &[]).unwrap().len(),
+            fresh
+                .declaration_namespaces(&constants, &[], &[])
+                .unwrap()
+                .len(),
             4
         );
     }

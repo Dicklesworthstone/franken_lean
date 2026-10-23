@@ -368,7 +368,21 @@ fn unsupported_effects_impossible_binders_and_annotations_publish_no_prefix() {
     let base = class(&empty, "Pick", ty());
     let env = axiom(&base, "scoped", c("Pick"));
     let scoped = scoped::register(&env, &n("Scope"), &n("scoped"), 1000).unwrap();
-    assert_eq!(registrations(&base, &scoped, 1_000_000).unwrap(), None);
+    let (rows, _) = registrations(&base, &scoped, 1_000_000).unwrap().unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].declaration, n("scoped"));
+    assert_eq!(rows.instances[0].scope, Some(n("Scope")));
+    assert_eq!(rows.instances[0].priority, 1000);
+    assert_eq!(
+        rows.instances[0].keys,
+        [discr_tree::Key::Const(n("Pick"), 0)]
+    );
+    assert!(
+        InstanceRegistry::read(&scoped)
+            .unwrap()
+            .candidates(&n("Pick"))
+            .is_empty()
+    );
     let imported = register(&base, "already", c("Pick"));
     let updated = set_instance(&imported, &n("already"), 2000).unwrap();
     assert_eq!(registrations(&imported, &updated, 1_000_000).unwrap(), None);
@@ -448,4 +462,59 @@ fn a_later_class_registration_cannot_rewrite_an_earlier_exported_key() {
     let env = register(&env, "earlier", app("C", c("h")));
     let changed = register_class(&env, &n("D")).unwrap();
     assert_eq!(registrations(&empty, &changed, 1_000_000).unwrap(), None);
+}
+
+#[test]
+fn scoped_export_preserves_registration_history_and_exact_budget_boundaries() {
+    let base = class(&Environment::new(), "Pick", ty());
+    let env = axiom(&axiom(&base, "zFirst", c("Pick")), "aSecond", c("Pick"));
+    let env = scoped::register(&env, &n("Feature.Inner"), &n("zFirst"), 1000).unwrap();
+    let env = scoped::register(&env, &n("Other"), &n("aSecond"), 2000).unwrap();
+    let env = scoped::register(&env, &n("Feature.Inner"), &n("zFirst"), 3000).unwrap();
+    let root = env.logical_root(&KVMap::new());
+    let (rows, work) = registrations(&base, &env, usize::MAX).unwrap().unwrap();
+    assert!(rows.classes.is_empty());
+    assert_eq!(
+        rows.instances
+            .iter()
+            .map(|row| (row.declaration.clone(), row.scope.clone(), row.priority))
+            .collect::<Vec<_>>(),
+        [
+            (n("zFirst"), Some(n("Feature.Inner")), 1000),
+            (n("aSecond"), Some(n("Other")), 2000),
+            (n("zFirst"), Some(n("Feature.Inner")), 3000),
+        ]
+    );
+    for row in &rows.instances {
+        assert_eq!(row.keys, [discr_tree::Key::Const(n("Pick"), 0)]);
+        assert!(row.synth_order.is_empty());
+    }
+    for cutoff in 0..work {
+        assert_eq!(
+            registrations(&base, &env, cutoff),
+            Err(InstanceRegistryError::Limit)
+        );
+    }
+    assert_eq!(
+        registrations(&base, &env, work).unwrap(),
+        Some((rows, work))
+    );
+    assert_eq!(env.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn scoped_export_keeps_imported_name_updates_and_scope_changes_unsupported() {
+    let base = class(&Environment::new(), "Pick", ty());
+    let declarations = axiom(&base, "candidate", c("Pick"));
+    let scoped = scoped::register(&declarations, &n("First"), &n("candidate"), 1000).unwrap();
+    let update = scoped::register(&scoped, &n("First"), &n("candidate"), 2000).unwrap();
+    assert_eq!(registrations(&scoped, &update, 1_000_000).unwrap(), None);
+    assert_eq!(
+        registrations(&declarations, &scoped, 1_000_000).unwrap(),
+        None
+    );
+    for namespace in ["Second", "First.Inner"] {
+        assert!(scoped::register(&scoped, &n(namespace), &n("candidate"), 1000).is_err());
+    }
+    assert!(set_instance(&scoped, &n("candidate"), 1000).is_err());
 }
