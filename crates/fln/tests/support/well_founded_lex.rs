@@ -86,15 +86,19 @@ const INFERRED: &[(&str, &str, &str, usize)] = &[
         "swappedLexInferred 2 2",
         6,
     ),
+    (
+        "nestedLexInferred",
+        INFERRED_NESTED,
+        "nestedLexInferred 2 3 4",
+        25,
+    ),
 ];
 
-/// The pin infers `termination_by (a, b, c)` and evaluates `nestedLexInferred 2 1 2` to 17.
-/// This search selects the same order, but every strict probe runs the default decreasing
-/// proof, about 121,000 heartbeats here, and then the body is elaborated again under the
-/// solution: measured 2026-10-20, inference spent 589,143 and that elaboration 219,444 of
-/// the 1,000,000 budget before the three final proofs, which exhaust it. The stop is a
-/// typed resource outcome, never a refusal; a cheaper default proof makes it pass.
-const INFERRED_OVER_BUDGET: &str = r#"def nestedLexInferred (a b c : Nat) : Nat :=
+/// The pin infers `termination_by (a, b, c)` and computes 25 at (2, 3, 4).
+/// This exhausted the ordinary elaboration budget on 2026-10-20; smart delta
+/// now checks it within the unchanged limits. Keep the computation positive
+/// and exercise exhaustion separately with an explicit caller work bound.
+const INFERRED_NESTED: &str = r#"def nestedLexInferred (a b c : Nat) : Nat :=
   if hc : 0 < c then nestedLexInferred a b (c - 1) + 1
   else if hb : 0 < b then nestedLexInferred a (b - 1) 2 + 1
   else if ha : 0 < a then nestedLexInferred (a - 1) 1 2 + 1 else 0"#;
@@ -234,12 +238,15 @@ pub(super) fn assert_automatic_lexicographic_refusals(base: &Engine) {
                 .contains(&Name::from_components(["automaticLexPrepared"]))
         );
     }
-    // Whichever budget runs out first decides the form: the elaborator's heartbeats stop
-    // the command, while omega's share returns an inconclusive check. Both are resource stops.
+    // A resource control must not require a valid program to stay expensive.
+    // The positive above uses ordinary limits; this genuine one-step kernel
+    // bound must stop without becoming acceptance or a semantic rejection.
+    let mut constrained = super::limits();
+    constrained.kernel.steps = 1;
     let outcome = base.check_source_files(
-        &[INFERRED_OVER_BUDGET.as_bytes()],
+        &[INFERRED_NESTED.as_bytes()],
         &KVMap::new(),
-        SourceCheckLimits::new(super::limits()),
+        SourceCheckLimits::new(constrained),
     );
     let resource_stop = match &outcome {
         Err(error) => error.disposition().0 == "resource",
@@ -251,7 +258,13 @@ pub(super) fn assert_automatic_lexicographic_refusals(base: &Engine) {
     };
     assert!(
         resource_stop,
-        "nestedLexInferred: expected a resource stop: {outcome:?}"
+        "nestedLexInferred: expected a resource stop: {}",
+        match &outcome {
+            Err(error) => format!("{}: {error:?}", error.disposition().0),
+            Ok(Outcome::Complete(_)) => "completed".to_string(),
+            Ok(Outcome::Inconclusive(reason)) => format!("inconclusive: {:?}", reason.cause),
+            Ok(Outcome::InternalFault(fault)) => format!("internal fault: {fault:?}"),
+        }
     );
     assert_eq!(base.logical_root(&KVMap::new()), root);
 }
