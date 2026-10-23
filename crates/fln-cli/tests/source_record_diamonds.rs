@@ -13,8 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A diamond through a common ancestor, a class diamond whose copied parent is an instance, and
-/// parents that share nothing (two subobjects).
+/// A diamond through a common ancestor, a class diamond whose copied parent is an instance,
+/// parents that share nothing (two subobjects), and a parametric copied parent's projection,
+/// whose value keeps the parameter's own binder (`fun α self`, `mkLambdaFVars params`) while its
+/// type makes it implicit.
 const DIAMOND: &str = r#"prelude
 import Init.Core
 structure A where
@@ -53,6 +55,15 @@ structure E where
   v : Nat
 structure F extends A, E
 #check F.mk
+structure PA (α : Type) where
+  a : α
+structure PB (α : Type) extends PA α where
+  b : α
+structure PC (α : Type) extends PA α where
+  c : α
+structure PD (α : Type) extends PB α, PC α where
+  d : α
+#print PD.toPC
 "#;
 
 /// The pin's output for [`DIAMOND`].
@@ -60,6 +71,8 @@ const DIAMOND_EXPECTED: &str = "D.mk (toB : B) (w a : Nat) : D
 D.toC : D → C
 @S.toR : {α : Type} → [self : S α] → R α
 F.mk (toA : A) (toE : E) : F
+@[reducible] def PD.toPC : {α : Type} → PD α → PC α :=
+fun α self => { toPA := self.toPA, c := self.c }
 ";
 
 /// A copied parent whose own parent overlaps nothing, which becomes a subobject of the record

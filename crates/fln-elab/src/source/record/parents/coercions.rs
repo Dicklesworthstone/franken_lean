@@ -34,7 +34,7 @@ impl Context {
     }
 
     /// Each copied parent's projection `D.toC` (the pin's `mkCoercionToCopiedParent`, vendored
-    /// `Lean/Elab/Structure.lean:1409-1440`): `fun {params} (self : D params) => C.mk params …`,
+    /// `Lean/Elab/Structure.lean:1409-1440`): `fun params (self : D params) => C.mk params …`,
     /// each field of the record read through its projection, an abbreviation. Between classes
     /// it is an instance (`addParentInstances`), and its receiver an instance binder; the
     /// names of those are returned too.
@@ -101,9 +101,11 @@ impl Context {
                 }
             }
             let record_error = |error| failure(SourceInferenceError::Record(error));
+            // `mkLambdaFVars params`: the value keeps each parameter's own binder, so it prints
+            // `fun α self => …`; only the type's become implicit (`inferImplicit`).
             let value = closer
                 .close(std::slice::from_ref(&receiver), value, true, false)
-                .and_then(|value| closer.close(&spec.parameters, value, true, true))
+                .and_then(|value| closer.close(&spec.parameters, value, true, false))
                 .map_err(record_error)?;
             let type_ = closer
                 .close(std::slice::from_ref(&receiver), type_, false, false)
