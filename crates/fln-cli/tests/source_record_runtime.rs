@@ -205,8 +205,9 @@ fn installed_record_snapshot_retains_all_checked_declarations() {
             .unwrap(),
     );
     assert!(report.contains("\"commands\":2"), "{report}");
-    // One block, two projections and one generated evaluation declaration.
-    assert!(report.contains("\"checker\":{\"admissions\":4"), "{report}");
+    // One block, two projections, the flat constructor, two auxiliary recursors,
+    // and one generated evaluation declaration each retain a checker receipt.
+    assert!(report.contains("\"checker\":{\"admissions\":7"), "{report}");
     let checked = success(
         Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["check-olean", "--json"])
