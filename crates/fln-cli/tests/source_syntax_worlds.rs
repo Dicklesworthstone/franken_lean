@@ -209,3 +209,40 @@ fn list_and_index_brackets_read_only_where_their_module_is_imported() {
         assert_eq!(code == 0, accepted, "{name}: {header}{program}");
     }
 }
+
+/// The `·` tactic is `Init.NotationExtra`'s syntax (`syntax (name := cdot) cdotTk
+/// tacticSeqIndentGt : tactic`), while `focus` is `Init.Tactics`', which `Init.Core` already
+/// imports. Over `prelude` + `import Init.SimpLemmas` the pin ends the `by` block at the first `·`
+/// ("unexpected token '·'; expected command") and reports the goals left open. Each program's
+/// verdict is the pinned v4.32.0's (2026-10-23).
+#[test]
+fn the_cdot_tactic_reads_only_where_its_module_is_imported() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let dot = "example {A : Prop} (h : A) : A ∧ A := by\n  constructor\n  · exact h\n  · exact h\n";
+    let focus = "example {A : Prop} (h : A) : A ∧ A := by\n  constructor\n  focus exact h\n  focus exact h\n";
+    for (name, header, program, accepted) in [
+        (
+            "cdot_simp_lemmas",
+            "prelude\nimport Init.SimpLemmas\n",
+            dot,
+            false,
+        ),
+        (
+            "cdot_notation_extra",
+            "prelude\nimport Init.NotationExtra\n",
+            dot,
+            true,
+        ),
+        (
+            "focus_simp_lemmas",
+            "prelude\nimport Init.SimpLemmas\n",
+            focus,
+            true,
+        ),
+        ("focus_core", "prelude\nimport Init.Core\n", focus, true),
+    ] {
+        let code = lean(&lib, &root, name, header, program);
+        assert_eq!(code == 0, accepted, "{name}: {header}{program}");
+    }
+}

@@ -234,7 +234,26 @@ fn by_equations(tokens: &[LexedToken], range: Range<usize>) -> bool {
     false
 }
 
+/// A tactic that takes a `tacticSeq` after its head, as `(keyword, kind)`. Every one but
+/// `set_option` is `Init` syntax (`Init/Tactics.lean`; `·` is `Init/NotationExtra.lean`'s,
+/// `decreasing_with` `Init/WFTactics.lean`'s), so a `prelude` file whose import closure does not
+/// declare its kind does not read it, as at the pin.
 fn control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'static str)> {
+    let (keyword, kind) = any_control_word(tokens, at)?;
+    (kind == "set_option" || crate::extensions::declares_kind(&control_kind(kind)))
+        .then_some((keyword, kind))
+}
+
+/// The node kind of a control word's `kind` as [`control_word`] spells it.
+fn control_kind(kind: &str) -> Name {
+    match (kind, kind.strip_prefix("_root_.")) {
+        ("cdot", _) => Name::from_components(["Lean", "cdot"]),
+        (_, Some(root)) => Name::from_components([root]),
+        _ => parser_kind(&["Tactic", kind]),
+    }
+}
+
+fn any_control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'static str)> {
     // `cdotTk := unicode("· ", ". ")`: the ASCII dot is the same focus.
     if symbol(tokens, at, "·") {
         Some(("·", "cdot"))
@@ -1109,11 +1128,7 @@ fn finish_control(
             vec![keyword, null_node(names), leaves.leaf(arrow)?, body],
         )
     } else {
-        let kind = match plan.kind.strip_prefix("_root_.") {
-            Some(root) => Name::from_components([root]),
-            None => parser_kind(&["Tactic", plan.kind]),
-        };
-        Syntax::node(kind, vec![keyword, body])
+        Syntax::node(control_kind(plan.kind), vec![keyword, body])
     })
 }
 
