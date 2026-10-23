@@ -972,8 +972,21 @@ impl<'a> Printer<'a> {
         let printed = self.subterm(e, outer);
         self.nested = false;
         // The root is always grouped (`formatCategory` is `fill (nest 2 …)` with no
-        // `isUngrouped` check), so a `fun` that is ungrouped as a child is grouped here.
-        let lambda = matches!(e.node(), ExprNode::Lam { .. }) && outer == 0;
+        // `isUngrouped` check), so a `fun` that is ungrouped as a child is grouped here. An
+        // ascription's anonymous `let` prints as its value, so the root is that value.
+        let mut root = e;
+        while let ExprNode::LetE {
+            decl_name,
+            value,
+            body,
+            ..
+        } = root.node()
+            && decl_name.is_anonymous()
+            && matches!(body.node(), ExprNode::BVar { idx: 0 })
+        {
+            root = value;
+        }
+        let lambda = matches!(root.node(), ExprNode::Lam { .. }) && outer == 0;
         printed.map(|doc| if lambda { node(doc) } else { doc })
     }
 

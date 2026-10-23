@@ -64,7 +64,8 @@ fun p => { toP := p, c := 3 } : P → Q
 
 /// `fun` parses at `maxPrec`, so as an application's last argument it is left bare; an
 /// application ending so is bracketed whole where a token follows it, and a field's `,` is not
-/// such a token (the pin's parenthesizer, measured 2026-10-22).
+/// such a token (the pin's parenthesizer, measured 2026-10-22). An ascribed `fun` is the root of
+/// its line, grouped, so it stays on one line.
 const TRAILING_FUN: &str = r#"prelude
 import Init.Core
 def ap (f : Nat → Nat) (n : Nat) : Nat := f n
@@ -77,6 +78,7 @@ def ap2 (n : Nat) (f : Nat → Nat) : Nat := f n
 #check 2 + ap2 1 fun x => x
 #check fun (g : (Nat → Nat) → Nat) => g fun x => x
 #check (ap2 1 fun x => x, 3)
+#check (fun (v : Nat) => v + 1 : Nat → Nat)
 "#;
 
 /// The pin's output for [`TRAILING_FUN`].
@@ -88,6 +90,7 @@ ap2 (ap2 1 fun x => x) fun y => y : Nat
 2 + ap2 1 fun x => x : Nat
 fun g => g fun x => x : ((Nat → Nat) → Nat) → Nat
 { fst := ap2 1 fun x => x, snd := 3 } : Nat × Nat
+fun v => v + 1 : Nat → Nat
 ";
 
 /// With `Init.NotationExtra` imported, its `@[app_unexpander]`s are registered: `Prod.mk` prints
