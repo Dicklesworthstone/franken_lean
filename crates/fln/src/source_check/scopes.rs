@@ -105,6 +105,7 @@ impl Scopes {
                 return self.transition_open(names, false, env, public_env);
             }
             ScopeCommand::OpenExplicit { namespace, names } => {
+                self.observe_aliases(env).map_err(TransitionError::Scope)?;
                 let resolved = self
                     .explicit_opens(env, &namespace, &names)
                     .map_err(TransitionError::Scope)?;
@@ -131,6 +132,7 @@ impl Scopes {
         public_env: Option<&Environment>,
     ) -> Result<(), TransitionError> {
         let mut next = self.current.clone();
+        self.observe_aliases(env).map_err(TransitionError::Scope)?;
         let mut public_instances = self.public_instances.clone();
         let registry =
             fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
@@ -204,11 +206,12 @@ impl Scopes {
     /// `elabExport` uses the same member resolver as an explicit open, and
     /// rejects a single namespace equal to the enclosing namespace.
     pub fn export_aliases(
-        &self,
+        &mut self,
         env: &Environment,
         namespace: &Name,
         names: &[Name],
     ) -> Result<Vec<(Name, Name)>, String> {
+        self.observe_aliases(env)?;
         let namespaces = self.resolve_open_in(&self.current, namespace)?;
         if namespaces.is_empty() {
             return Err(format!(
@@ -387,6 +390,17 @@ impl Scopes {
             }
         }
         Ok(scopes)
+    }
+
+    /// A re-export-only namespace has no constant from which to discover its
+    /// name. The validated alias journal provides its own proper prefixes;
+    /// target names must never manufacture namespaces in this module.
+    fn observe_aliases(&mut self, env: &Environment) -> Result<(), String> {
+        let table = fln_elab::aliases::AliasTable::read(env).map_err(|error| error.to_string())?;
+        for (alias, _) in table.entries() {
+            self.observe(alias);
+        }
+        Ok(())
     }
 
     fn observe(&mut self, name: &Name) {

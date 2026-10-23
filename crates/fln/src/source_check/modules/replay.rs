@@ -27,6 +27,7 @@ fn extension_error(
 pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> bool {
     fln_elab::instances::export::supports(descriptor)
         || fln_elab::instances::defaults::supports(descriptor)
+        || fln_elab::aliases::export::supports(descriptor)
         || fln_elab::protected_names::supports(descriptor)
         || fln_elab::aux_recursors::supports(descriptor)
         || fln_elab::noncomputable::supports(descriptor)

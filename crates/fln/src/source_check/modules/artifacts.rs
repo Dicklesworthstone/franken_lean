@@ -429,6 +429,27 @@ impl PendingArtifact {
                 metadata.defeq.push(tagged);
             }
         }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let aliases = fln_elab::aliases::export::registrations(base, checked, remaining).map_err(
+            |error| match error {
+                fln_elab::aliases::AliasError::Limit => SourceModuleCheckError::Limit {
+                    resource: "module work",
+                    limit: meter.limits.max_work,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::aliases::export::journal_name(),
+                    reason: "invalid alias metadata export",
+                },
+            },
+        )?;
+        meter.work(aliases.work)?;
+        meter.bytes(aliases.bytes_examined)?;
+        metadata
+            .aliases
+            .extend(aliases.entries.into_iter().map(|(alias, declaration)| {
+                fln_olean::source_extensions::AliasEntry { alias, declaration }
+            }));
         Ok(Self {
             name: name.clone(),
             imports,
