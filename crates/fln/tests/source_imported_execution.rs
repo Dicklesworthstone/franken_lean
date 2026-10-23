@@ -152,9 +152,11 @@ fn real_imports_execute_in_exact_module_worlds_and_keep_query_candidates_private
         // The imported library's private recursion helpers must remain in
         // each execution world, including calls reached through a source
         // dependency's exported definition.
+        // `Init.Prelude` declares no `[a, b]`, `::` or `+` notation (the pin refuses `[19]` there:
+        // "unexpected token '['"), so the program spells the constructors and `Nat.add`.
         let lists = [
-            ("Main", "prelude\nimport Lists\n#eval total (List.map (fun n => n + 1) combined)"),
-            ("Lists", "prelude\nimport Init.Prelude\ndef combined : List Nat := List.append [19] [21]\ndef total (xs : List Nat) : Nat := match xs with | [] => 0 | x :: tail => x + total tail"),
+            ("Main", "prelude\nimport Lists\n#eval total (List.map (fun n => Nat.add n 1) combined)"),
+            ("Lists", "prelude\nimport Init.Prelude\ndef combined : List Nat := List.append (List.cons 19 List.nil) (List.cons 21 List.nil)\ndef total (xs : List Nat) : Nat := match xs with | List.nil => 0 | List.cons x tail => Nat.add x (total tail)"),
         ];
         let list_program = run(&imported, &lists, "Main");
         assert_eq!(values(&list_program), [vec![], vec![42]]);
