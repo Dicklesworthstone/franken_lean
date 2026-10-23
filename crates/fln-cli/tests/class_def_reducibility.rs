@@ -7,7 +7,7 @@
 //! v4.32.0 in the same test and must print exactly what the pin prints.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 const HEADER: &str = "prelude\nimport Init.Core\n";
 
@@ -143,18 +143,31 @@ fn workspace() -> PathBuf {
     path
 }
 
-/// The stdout of this crate's `lean` and of the pinned `lean` on `HEADER` + `program`.
-fn outputs(lib: &Path, root: &Path, name: &str, program: &str) -> (String, String) {
+/// The runs of this crate's `lean` and of the pinned `lean` on `HEADER` + `program`.
+fn runs(lib: &Path, root: &Path, name: &str, program: &str) -> [(PathBuf, Output); 2] {
     let entry = format!("{name}.lean");
     std::fs::write(root.join(&entry), format!("{HEADER}{program}")).unwrap();
-    let run = |binary: &Path| {
-        let output = Command::new(binary)
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .expect("the pinned toolchain's lean");
+    [PathBuf::from(env!("CARGO_BIN_EXE_lean")), pinned].map(|binary| {
+        let output = Command::new(&binary)
             .arg(&entry)
             .current_dir(root)
             .env("LEAN_PATH", lib)
             .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
             .output()
             .expect("run lean");
+        (binary, output)
+    })
+}
+
+/// The stdout of this crate's `lean` and of the pinned `lean` on `HEADER` + `program`, both of
+/// which must accept it.
+fn outputs(lib: &Path, root: &Path, name: &str, program: &str) -> (String, String) {
+    let [ours, pinned] = runs(lib, root, name, program).map(|(binary, output)| {
         assert_eq!(
             output.status.code(),
             Some(0),
@@ -163,13 +176,59 @@ fn outputs(lib: &Path, root: &Path, name: &str, program: &str) -> (String, Strin
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("UTF-8 output")
+    });
+    (ours, pinned)
+}
+
+/// `#guard_msgs` expecting either warning is judged, as at the pin (upstream
+/// `tests/elab/classDefReducibilityAfterAttr.lean`): the matching guards pass and print nothing.
+const GUARDED: &str = "class Foo where
+  x : Nat
+
+/-- warning: Definition `baz` of class type must be marked with `@[reducible]` or `@[implicit_reducible]` -/
+#guard_msgs in
+def baz : Foo := ⟨42⟩
+
+#guard_msgs in
+@[reducible]
+def quux : Foo := ⟨42⟩
+
+/-- warning: Definition `unm` of class type must be marked with `@[reducible]` or `@[implicit_reducible]` -/
+#guard_msgs in
+def unm : Inhabited Nat := ⟨2⟩
+
+/-- warning: instance `unm` must be marked with `@[reducible]` or `@[implicit_reducible]` -/
+#guard_msgs in
+attribute [instance] unm
+";
+
+/// A guard expecting the warning for the wrong name fails at both.
+const MISGUARDED: &str = "class Foo where
+  x : Nat
+
+/-- warning: Definition `other` of class type must be marked with `@[reducible]` or `@[implicit_reducible]` -/
+#guard_msgs in
+def baz : Foo := ⟨42⟩
+";
+
+/// The exit codes of this crate's `lean` and of the pinned `lean` on `HEADER` + `program`.
+fn exit_codes(lib: &Path, root: &Path, name: &str, program: &str) -> (Option<i32>, Option<i32>) {
+    let [ours, pinned] = runs(lib, root, name, program).map(|(_, output)| output.status.code());
+    (ours, pinned)
+}
+
+#[test]
+fn guards_expecting_the_warnings_are_judged() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
     };
-    let pinned = lib
-        .parent()
-        .and_then(Path::parent)
-        .map(|toolchain| toolchain.join("bin/lean"))
-        .expect("the pinned toolchain's lean");
-    (run(Path::new(env!("CARGO_BIN_EXE_lean"))), run(&pinned))
+    let root = workspace();
+    let (ours, pinned) = outputs(&lib, &root, "guarded", GUARDED);
+    assert_eq!(ours, pinned, "guarded: {GUARDED}");
+    assert_eq!(ours, "", "the matching guards print nothing");
+    let (ours, pinned) = exit_codes(&lib, &root, "misguarded", MISGUARDED);
+    assert_eq!(pinned, Some(1), "the pin refuses the mismatched guard");
+    assert_eq!(ours, Some(1), "this door refuses it too: {MISGUARDED}");
 }
 
 #[test]

@@ -7558,8 +7558,8 @@ impl Engine {
                         }
                         // The pin passes such a guard by capturing the command's errors or
                         // warnings, whose text this engine does not reproduce. Running the command
-                        // here would turn the pin's pass into a rejection. The one warning it does
-                        // reproduce, "declaration uses `sorry`", is judged. Expected `trace:`
+                        // here would turn the pin's pass into a rejection. The warnings it does
+                        // reproduce ([`reproduced_warning`]) are judged. Expected `trace:`
                         // lines run: goal traces are reproduced and routed at trace severity, and
                         // the `lean` front door makes any mismatch against an expected trace a
                         // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
@@ -7568,8 +7568,7 @@ impl Engine {
                         // compared as the pin's (below). Other commands keep this refusal.
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
-                            line != "warning: declaration uses `sorry`"
-                                && line.starts_with("warning:")
+                            line.starts_with("warning:") && !reproduced_warning(line)
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error or warning message",
@@ -12499,6 +12498,24 @@ fn field_receiver_message(
          type `{base}{dots}` for which to substitute{receiver}\n\nNote: Such a parameter \
          must be explicit, or implicit with a unique name, to be used by field notation"
     ))
+}
+
+/// Whether a `#guard_msgs` docstring line is a warning this engine prints with the pin's text, so
+/// the guard over it is judged rather than refused: "declaration uses `sorry`", and the two
+/// reducibility warnings of [`linters`] (`warn.classDefReducibility`, vendored
+/// `Lean/Elab/MutualDef.lean:1246-1256`, and `addInstance`'s, `Lean/Meta/Instances.lean:281-289`).
+/// `addInstance`'s `@[expose]` warning is not reproduced, and its text does not match here.
+fn reproduced_warning(line: &str) -> bool {
+    const MARKED: &str = " must be marked with `@[reducible]` or `@[implicit_reducible]`";
+    line == "warning: declaration uses `sorry`"
+        || line
+            .strip_prefix("warning: Definition `")
+            .and_then(|rest| rest.strip_suffix(MARKED))
+            .is_some_and(|name| name.ends_with("` of class type"))
+        || line
+            .strip_prefix("warning: instance `")
+            .and_then(|rest| rest.strip_suffix(MARKED))
+            .is_some_and(|name| name.ends_with('`'))
 }
 
 /// Whether `guard` is the `#guard_msgs` of `command_index`, checks errors, and expects one.
