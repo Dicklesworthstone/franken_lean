@@ -175,6 +175,7 @@ fn checked_io_results_print_once_and_guard_isolated_effects() {
 #eval IO.eprintln "second"
 #eval (dbgTrace "traced" fun _ => (1 : Nat))
 #eval (panicCore (7 : Nat) "recover")
+#eval ([] : List Nat).head!
 #eval "after"
 "#
         ),
@@ -182,9 +183,12 @@ fn checked_io_results_print_once_and_guard_isolated_effects() {
     let captured = lean_io(&workspace, &streams, &lib);
     assert_eq!(captured.code, 0, "{captured:?}");
     assert!(captured.stderr.is_empty(), "{captured:?}");
+    // The pin observation disables backtraces: compare the original message
+    // and its stream, never host-dependent return addresses.
+    let list_panic = "PANIC at List.head! Init.Data.List.BasicAux:80:12: empty list";
     assert_eq!(
         captured.stdout,
-        "first\nsecond\ntraced\n1\nrecover\n7\n\"after\"\n"
+        format!("first\nsecond\ntraced\n1\nrecover\n7\n{list_panic}\n0\n\"after\"\n")
     );
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["run", "--json"])
@@ -201,7 +205,9 @@ fn checked_io_results_print_once_and_guard_isolated_effects() {
     assert!(json.starts_with('{') && json.ends_with("}\n"), "{json}");
     assert_eq!(json.matches("\"stdout\":").count(), 1, "{json}");
     assert!(
-        json.contains("\"stdout\":\"firstsecond\\ntraced\\nrecover\\n\""),
+        json.contains(&format!(
+            "\"stdout\":\"firstsecond\\ntraced\\nrecover\\n{list_panic}\\n\""
+        )),
         "{json}"
     );
 }
