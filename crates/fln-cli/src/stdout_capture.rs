@@ -129,15 +129,7 @@ fn capture_failure(
     error: fln::StdoutCaptureError,
     bytes: &[u8],
 ) -> MultiplexerOutput {
-    let (class, code) = match error {
-        fln::StdoutCaptureError::Allocation | fln::StdoutCaptureError::Limit { .. } => {
-            ("resource", 3)
-        }
-        fln::StdoutCaptureError::InvalidStdout | fln::StdoutCaptureError::InvalidStderr => {
-            ("capability", 5)
-        }
-        fln::StdoutCaptureError::ScopeUnavailable => ("internal-fault", 4),
-    };
+    let (class, code) = error_disposition(error);
     failure(
         schema,
         class,

@@ -87,6 +87,28 @@ fn json_import_probe_fallback_does_not_install_a_lingering_capture() {
 }
 
 #[test]
+fn isolated_output_is_transferred_once_and_escaped_by_the_json_owner() {
+    let result = json(true, "test", || {
+        let inner = fln::StdoutCapture::begin_isolated(9, true).unwrap();
+        write("λ\0\n");
+        let stderr = Obj::stdio_stderr().unwrap().try_ctor_child(4).unwrap();
+        stderr
+            .try_stdio_put_str(&Obj::mk_string("tail"), &Obj::mk_nat(0))
+            .unwrap();
+        let captured = inner.finish();
+        assert_eq!(captured.error, None);
+        assert_eq!(captured.bytes, "λ\0\ntail".as_bytes());
+        // The enclosing JSON sink sees nothing until presentation transfers
+        // the retained message; nested capture never tees into its parent.
+        fln::StdoutCapture::append_current(std::str::from_utf8(&captured.bytes).unwrap()).unwrap();
+        MultiplexerOutput::success("{}\n".to_owned())
+    });
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stderr.is_empty());
+    assert_eq!(result.stdout, "{\"stdout\":\"λ\\u0000\\ntail\"}\n");
+}
+
+#[test]
 fn json_panic_router_is_thread_local_and_keeps_process_error_json_clean() {
     const TEST: &str = "stdout_capture::tests::json_panic_router_is_thread_local_and_keeps_process_error_json_clean";
     const CHILD: &str = "FLN_JSON_PANIC_ROUTER_CASE";

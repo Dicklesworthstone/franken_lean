@@ -28,6 +28,8 @@ fn lean_io(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
         .arg(entry)
         .env("LEAN_PATH", lib)
         .env("FLN_IMPORT_REUSE_DIR", full_io_records(workspace))
+        .env("LEAN_BACKTRACE", "0")
+        .env_remove("LEAN_ABORT_ON_PANIC")
         .output()
         .expect("run the installed lean");
     let run = Run {
@@ -40,7 +42,7 @@ fn lean_io(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
 }
 
 #[test]
-fn checked_io_results_print_once_and_refuse_unprintable_or_guarded_actions_before_effects() {
+fn checked_io_results_print_once_and_guard_isolated_effects() {
     let Some(lib) = pinned_lib() else { return };
     let workspace = Workspace::new("lean-door-checked-io");
     let sentinel = workspace.write("sentinel.txt", "preserved");
@@ -117,34 +119,72 @@ fn checked_io_results_print_once_and_refuse_unprintable_or_guarded_actions_befor
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");
 
-    // IO stdout is not a guard message. Both selected result modes retain the
-    // explicit capability boundary, now reached before either action executes.
-    for (file, type_, result) in [
-        ("GuardUnit.lean", "Unit", "()"),
+    // Stream output is one info message before the separately printed value.
+    // A guarded action really executes once, including non-stream effects;
+    // the guard compares its isolated messages rather than suppressing IO.
+    for (file, type_, result, expected) in [
+        ("GuardUnit.lean", "Unit", "()", "info: guard-effect"),
         (
             "GuardFormat.lean",
             "PrintedIO",
-            "PrintedIO.mk \"must not render\"",
+            "PrintedIO.mk \"guard-value\"",
+            "info: guard-effect\n---\ninfo: guard-value",
         ),
     ] {
         let guarded = workspace.write(
             file,
             format!(
-                r#"{DEFINITIONS}#guard_msgs in
+                r#"{DEFINITIONS}/-- {expected} -/
+#guard_msgs in
 #eval (show IO {type_} from do
-  IO.FS.writeFile {source_path} "must not write"
+  IO.FS.writeFile {source_path} "guard ran"
   let stream ← IO.getStdout
-  stream.putStr "must not print\n"
+  stream.putStr "guard-effect\n"
   pure ({result}))
 "#
             ),
         );
-        let refused = lean_io(&workspace, &guarded, &lib);
-        assert_capability(&refused);
-        assert!(
-            refused.stderr.contains("`#guard_msgs` over an IO action"),
-            "{refused:?}"
-        );
-        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");
+        let checked = lean_io(&workspace, &guarded, &lib);
+        assert_eq!(checked.code, 0, "{checked:?}");
+        assert!(checked.stdout.is_empty(), "{checked:?}");
+        assert!(checked.stderr.is_empty(), "{checked:?}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"guard ran");
     }
+
+    let streams = workspace.write(
+        "Streams.lean",
+        format!(
+            r#"{DEFINITIONS}#eval IO.print "first"
+#eval IO.eprintln "second"
+#eval (dbgTrace "traced" fun _ => (1 : Nat))
+#eval (panicCore (7 : Nat) "recover")
+#eval "after"
+"#
+        ),
+    );
+    let captured = lean_io(&workspace, &streams, &lib);
+    assert_eq!(captured.code, 0, "{captured:?}");
+    assert!(captured.stderr.is_empty(), "{captured:?}");
+    assert_eq!(
+        captured.stdout,
+        "first\nsecond\ntraced\n1\nrecover\n7\n\"after\"\n"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json"])
+        .arg(&streams)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", full_io_records(&workspace))
+        .env("LEAN_BACKTRACE", "0")
+        .env_remove("LEAN_ABORT_ON_PANIC")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let json = String::from_utf8(output.stdout).unwrap();
+    assert!(json.starts_with('{') && json.ends_with("}\n"), "{json}");
+    assert_eq!(json.matches("\"stdout\":").count(), 1, "{json}");
+    assert!(
+        json.contains("\"stdout\":\"firstsecond\\ntraced\\nrecover\\n\""),
+        "{json}"
+    );
 }
