@@ -30,6 +30,7 @@ mod refine;
 mod relations;
 mod rewrite;
 mod search;
+mod split;
 mod trace;
 mod trivial;
 mod unfold;
@@ -83,6 +84,43 @@ pub enum TacticError {
     /// this engine's compiled recursor application does not stand for. Never caught by
     /// `first`/`try`: the pin's `unfold` succeeds there.
     UnfoldStuckMatch(Name),
+    /// `split t` (`evalSplit`, vendored src/Lean/Elab/Tactic/Split.lean): a term to split is
+    /// refused. `local` is the hypothesis a lone identifier names, which the pin's hint
+    /// suggests `split at` instead.
+    SplitTermUnsupported {
+        local: Option<Name>,
+    },
+    /// `split at` more than one location, the goal among them when `goal`.
+    SplitMultipleLocations {
+        goal: bool,
+        hypotheses: Vec<Name>,
+    },
+    /// `split` found no `if` or `match` in the goal that it could split.
+    SplitGoal {
+        hint: Option<&'static str>,
+    },
+    /// `split at h` found none in the type of `h`.
+    SplitHypothesis {
+        local: Name,
+        hint: Option<&'static str>,
+    },
+    /// `split at *` found none in the goal or in the hypotheses it tries.
+    SplitWildcard(Vec<Name>),
+    /// `split at h` naming no local.
+    SplitUnknownHypothesis(Name),
+    /// The first candidate is a `match`, which the pin splits with its matcher's splitter
+    /// (vendored src/Lean/Meta/Tactic/Split.lean). Not implemented here, and never caught by
+    /// `first`/`try`: the pin's `split` succeeds there.
+    SplitMatchUnsupported,
+    /// A decided conditional whose dictionary or `Bool` reads a variable bound inside the
+    /// goal: the pin's `simp` reduces it, this engine's reduction cannot abstract it. Never
+    /// caught, as above.
+    SplitBoundDecision,
+    /// A conditional whose condition a reduction rewrites, but whose dictionary (or a branch
+    /// binding its evidence) does not mention what changed: the pin's `ite_congr`/`dite_congr`
+    /// synthesize a new dictionary and cast the branches, which this engine's reduction does
+    /// not. Never caught, as above.
+    SplitDependentCondition,
     RewriteLocation,
     RewriteMetavariablePattern,
     SimplificationNoProgress,
@@ -214,6 +252,98 @@ impl std::fmt::Display for TacticError {
                 "unfold of `{}` where its match does not reduce, which the pin shows as a `match`",
                 name.to_display_string()
             ),
+            // The pin's words (vendored src/Lean/Elab/Tactic/Split.lean), without the goal it
+            // appends, and naming a hypothesis rather than printing its type.
+            Self::SplitTermUnsupported { local } => {
+                write!(
+                    f,
+                    "Tactic `split` failed: Specifying a term to split is not supported yet"
+                )?;
+                if let Some(local) = local {
+                    let local = local.to_display_string();
+                    write!(
+                        f,
+                        "\n\nHint: To apply `split` at the hypothesis `{local}`, use `split at {local}`:\n  split a\u{332}t\u{332} \u{332}{local}"
+                    )?;
+                }
+                Ok(())
+            }
+            Self::SplitMultipleLocations { goal, hypotheses } => {
+                let names: Vec<String> = hypotheses
+                    .iter()
+                    .map(|name| format!("`{}`", name.to_display_string()))
+                    .collect();
+                // `MessageData.andList`, after a word the pin joins without a space.
+                let list = match names.as_slice() {
+                    [] => String::new(),
+                    [one] => one.clone(),
+                    [first, second] => format!("{first} and {second}"),
+                    [init @ .., last] => format!("{}, and {last}", init.join(", ")),
+                };
+                write!(
+                    f,
+                    "Tactic `split` failed: Specifying multiple targets ({}{}{list}) is not supported\n\nHint: Specify a single target to split, or use `split at *` to split the first target that can be automatically split",
+                    if *goal { "the goal and " } else { "" },
+                    if hypotheses.len() == 1 {
+                        "hypothesis"
+                    } else {
+                        "hypotheses"
+                    }
+                )
+            }
+            Self::SplitGoal { hint } => {
+                write!(
+                    f,
+                    "Tactic `split` failed: Could not split an `if` or `match` expression in the goal"
+                )?;
+                write_split_hints(f, *hint)
+            }
+            Self::SplitHypothesis { local, hint } => {
+                write!(
+                    f,
+                    "Tactic `split` failed: Could not split an `if` or `match` expression in the type of `{}`",
+                    local.to_display_string()
+                )?;
+                write_split_hints(f, *hint)
+            }
+            Self::SplitWildcard(hypotheses) => {
+                if hypotheses.is_empty() {
+                    write!(
+                        f,
+                        "Tactic `split` failed: Could not split the goal, and no hypotheses that could be automatically split were found"
+                    )?;
+                } else {
+                    let names: Vec<String> = hypotheses
+                        .iter()
+                        .map(|name| format!("`{}`", name.to_display_string()))
+                        .collect();
+                    write!(
+                        f,
+                        "Tactic `split` failed: Could not split the goal or any of the following hypotheses: {}",
+                        names.join(", ")
+                    )?;
+                }
+                write!(
+                    f,
+                    "\n\nNote: `split at *` does not attempt to split at non-propositional hypotheses or those on which other hypotheses depend. It may still be possible to manually split a hypothesis using `split at`"
+                )?;
+                write_split_hints(f, None)
+            }
+            Self::SplitUnknownHypothesis(name) => {
+                write!(f, "Unknown identifier `{}`", name.to_display_string())
+            }
+            Self::SplitMatchUnsupported => write!(
+                f,
+                "split on a `match` expression is not implemented: the pin splits it with the matcher's splitter"
+            ),
+            Self::SplitBoundDecision => write!(
+                f,
+                "split cannot reduce a conditional whose decision reads a variable bound in the goal"
+            ),
+            Self::SplitDependentCondition => write!(
+                f,
+                "split cannot reduce a conditional inside the condition of another whose decision does not mention it"
+            ),
             Self::RewriteMetavariablePattern => {
                 write!(f, "rewrite pattern has an unresolved metavariable head")
             }
@@ -310,6 +440,24 @@ impl std::fmt::Display for TacticError {
 }
 fn error(reason: TacticError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Tactic(reason))
+}
+
+/// The hints the pin's `split` adds to a failure (vendored src/Lean/Elab/Tactic/Split.lean):
+/// `mkCasesHint` for a conjunction, pair or structure, then the `trace.split.failure` hint.
+fn write_split_hints(
+    f: &mut std::fmt::Formatter<'_>,
+    hint: Option<&'static str>,
+) -> std::fmt::Result {
+    if let Some(kind) = hint {
+        write!(
+            f,
+            "\n\nHint: If you meant to destruct this {kind}, use the `cases` tactic instead"
+        )?;
+    }
+    write!(
+        f,
+        "\n\nHint: Use `set_option trace.split.failure true` to display additional diagnostic information"
+    )
 }
 
 /// Application callers select the order of their *real* pending obligations.
@@ -1459,6 +1607,8 @@ impl Context {
                     goal,
                     apply: false,
                 });
+            } else if kind == &parser_kind(&["Tactic", "split"]) {
+                self.split_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "omega"]) {
                 let [keyword, config] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

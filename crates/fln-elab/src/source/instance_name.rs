@@ -172,7 +172,7 @@ impl Context {
     }
 
     /// Whether `e`'s type is a proposition (`isProof`). Unknown types are not proofs.
-    fn is_proof(&mut self, e: &Expr) -> Result<bool, NatDefinitionElabError> {
+    pub(super) fn is_proof(&mut self, e: &Expr) -> Result<bool, NatDefinitionElabError> {
         let Some(type_) = self.known_type(e)? else {
             return Ok(false);
         };
