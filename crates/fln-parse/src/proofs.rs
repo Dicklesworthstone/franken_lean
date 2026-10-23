@@ -327,6 +327,9 @@ pub(crate) fn tactic(
             "contradiction",
             "by_cases",
             "decide",
+            // `syntax (name := nativeDecide) "native_decide" optConfig : tactic`
+            // (`Init/Tactics.lean:1482`).
+            "native_decide",
             "skip",
             "trace_state",
             "trace",
@@ -380,6 +383,7 @@ pub(crate) fn tactic(
         // An imported token table may classify the tactic keyword as a symbol.
         // Do not change the lexer's policy for ordinary declaration names.
         TokenKind::Symbol(symbol) if symbol == "false_or_by_contra" => Some("false_or_by_contra"),
+        TokenKind::Symbol(symbol) if symbol == "native_decide" => Some("native_decide"),
         // `suffices` is a keyword token, not an identifier.
         TokenKind::Symbol(symbol) if symbol == "suffices" => Some("suffices"),
         TokenKind::Symbol(symbol) if symbol == "exists" => Some("exists"),
@@ -630,9 +634,9 @@ fn local_tactic(
                 vec![leaves.leaf(start + 1)?],
             ));
         }
-        // `decide` and `omega` are `"…" optConfig` (`Init/Tactics.lean`); the empty
-        // configuration is a node of its own in the pin's tree.
-        "decide" | "omega" => {
+        // `decide`, `native_decide` and `omega` are `"…" optConfig` (`Init/Tactics.lean`); the
+        // empty configuration is a node of its own in the pin's tree.
+        "decide" | "native_decide" | "omega" => {
             let (config, end) = config(leaves, view, tokens, start + 1, range.end)?;
             if end != range.end {
                 return Err(refusal(view, tokens, end));
@@ -768,6 +772,7 @@ fn local_tactic(
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",
         "rotate_right" => "rotateRight",
+        "native_decide" => "nativeDecide",
         _ => keyword,
     };
     Ok(Syntax::node(parser_kind(&["Tactic", kind]), args))

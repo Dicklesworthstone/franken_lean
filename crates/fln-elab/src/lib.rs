@@ -38,6 +38,7 @@ pub mod lctx;
 pub mod macro_inline;
 pub mod messages;
 pub mod mvar;
+pub mod native;
 pub mod noncomputable;
 pub mod perturbation;
 pub mod protected_names;

@@ -151,7 +151,13 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
-            SourceInferenceError::ArithmeticInconclusive(_) => ("inconclusive", false, 3),
+            SourceInferenceError::ArithmeticInconclusive(_)
+            | SourceInferenceError::NativeEvaluationInconclusive(_) => ("inconclusive", false, 3),
+            // A native evaluation this engine could not run is not a verdict on the source.
+            SourceInferenceError::NativeEvaluation(
+                fln_elab::native::NativeEvaluationError::Fault(_),
+            ) => ("internal-fault", false, 4),
+            SourceInferenceError::NativeEvaluation(_) => ("capability", false, 5),
             SourceInferenceError::EvaluationPrinting(_) => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,

@@ -192,12 +192,10 @@ pub const ROWS: &[Row] = &[
              `false` is exactly that, and under `true` it binds a subset of the pin's names",
         ),
     ),
-    row(
-        "Elab.async",
-        Bool(false),
-        "Lean/CoreM.lean:35",
-        Inert("it schedules elaboration; this engine's results do not depend on scheduling"),
-    ),
+    // Read by the names `native_decide` gives its axioms: a lone theorem's body is elaborated
+    // in a forked name generator when it holds (`elabAsync`, Lean/Elab/MutualDef.lean:1237-1243),
+    // which the command line sets when unset (Lean/Elab/Frontend.lean:265-266).
+    row("Elab.async", Bool(false), "Lean/CoreM.lean:35", Honored),
     row(
         "diagnostics.threshold",
         Nat(20),
@@ -836,6 +834,8 @@ mod tests {
         // `tactic.skipAssignedInstances`: matching/instance_args.rs;
         // source_simp_instance_matching exercises both values.
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
+        // `Elab.async`: the names `native_decide` gives its axioms (source.rs,
+        // tactics/decision.rs); `source_native_decide` sets it false.
         // `linter.*`: the unused-variables, deprecated-syntax and defProp warnings (`fln`,
         // `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
         // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
@@ -850,6 +850,7 @@ mod tests {
                 "maxHeartbeats",
                 "synthInstance.maxSize",
                 "autoImplicit",
+                "Elab.async",
                 "linter.all",
                 "linter.unusedVariables",
                 "linter.deprecated",

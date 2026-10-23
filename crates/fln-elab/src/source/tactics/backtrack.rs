@@ -81,8 +81,13 @@ impl<'a> Checkpoint<'a> {
     }
     pub fn restore(&self, context: &mut Context) {
         let spent = context.txn.budget.heartbeats_consumed;
+        // The pin's backtracking restores the environment but keeps the auxiliary-name
+        // generator (`Core.SavedState.restore`, vendored Lean/CoreM.lean:407-410), so a name
+        // an abandoned branch used is not handed out again.
+        let aux_names = context.aux_names.take();
         *context = (*self.context).clone();
         context.txn.budget.heartbeats_consumed = spent;
+        context.aux_names = aux_names;
     }
     pub fn retry(&self) -> bool {
         self.next < self.spec.branches.len()

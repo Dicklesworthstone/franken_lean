@@ -72,10 +72,18 @@ pub(crate) fn elaboration_outcome<T>(
         Ok(value) => return Ok(Outcome::Complete(value)),
         Err(error) => error,
     };
-    if let NatDefinitionElabError::Inference(SourceInferenceError::ArithmeticInconclusive(reason)) =
-        &error
+    if let NatDefinitionElabError::Inference(
+        SourceInferenceError::ArithmeticInconclusive(reason)
+        | SourceInferenceError::NativeEvaluationInconclusive(reason),
+    ) = &error
     {
         return Ok(Outcome::Inconclusive((**reason).clone()));
+    }
+    if let NatDefinitionElabError::Inference(SourceInferenceError::NativeEvaluation(
+        fln_elab::native::NativeEvaluationError::Fault(fault),
+    )) = &error
+    {
+        return Ok(Outcome::InternalFault(fault.clone()));
     }
     let kernel = match &error {
         NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)) => {
@@ -423,6 +431,7 @@ impl Engine {
                     parsed.syntax(),
                     fln_elab::source::ElaboratedDeclaration {
                         declaration: candidate,
+                        native_axioms: Vec::new(),
                         local_functions,
                         irreducible: false,
                         noncomputable: inferred_noncomputable,

@@ -25,6 +25,7 @@ pub fn elaborate_public_definition(
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
+        native_axioms: Vec::new(),
         local_functions,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,

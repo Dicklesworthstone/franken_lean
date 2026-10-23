@@ -7104,15 +7104,20 @@ impl Engine {
         }
         let scope = &scope;
         let name = fresh_generated_command_name(self.environment(), command_index)?;
+        // The axioms `native_decide` added while elaborating an example.
+        let mut native_axioms = Vec::new();
         let declaration = source_records::elaboration_outcome(match parsed.kind() {
-            SourceCommandKind::Example => fln_elab::source::scope::elaborate_example(
+            SourceCommandKind::Example => fln_elab::source::scope::elaborate_example_with_axioms(
                 parsed.syntax(),
                 name,
                 self.environment(),
                 limits.kernel,
                 scope,
             )
-            .map(|declaration| (declaration, Vec::new())),
+            .map(|(declaration, axioms)| {
+                native_axioms = axioms;
+                (declaration, Vec::new())
+            }),
             SourceCommandKind::Check
                 if scope != &fln_elab::source::scope::SourceScope::default() =>
             {
@@ -7146,15 +7151,38 @@ impl Engine {
                 });
             }
         };
+        // The scratch successor admits the axioms first, through both checkers, as the pin's
+        // `addDecl` adds them before the example citing them; it is discarded with the rest.
+        let environment_root = self.logical_root(options);
+        let scratch = if native_axioms.is_empty() {
+            None
+        } else {
+            match self.admit_declarations(&native_axioms, options, limits)? {
+                Outcome::Complete(admission) => Some(admission.engine),
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        };
+        // The check keeps the scope it was elaborated in, without the command's evaluator.
+        let mut scope = scope.clone();
+        scope.native = None;
         Ok(
-            match self.admit_declaration(declaration, options, limits)? {
+            match scratch.as_ref().unwrap_or(self).admit_declaration(
+                declaration,
+                options,
+                limits,
+            )? {
                 Outcome::Complete(admission) => Outcome::Complete(SourceCheck {
                     parsed,
                     declaration: admission.declaration,
                     checked_type,
-                    environment_root: admission.base_logical_root,
+                    environment_root: if scratch.is_some() {
+                        environment_root
+                    } else {
+                        admission.base_logical_root
+                    },
                     checker: admission.checker,
-                    scope: scope.clone(),
+                    scope,
                     section_variables,
                     notations: Default::default(),
                 }),
@@ -7774,7 +7802,6 @@ impl Engine {
                     ),
                 );
             }
-            let scoped = scope != fln_elab::source::scope::SourceScope::default();
             // Only an `example` or `#check` is judged by its error (below): the pin would still
             // add any other failing declaration, which this engine cannot reproduce.
             let guarded_error = guard_checks_expected_error(guards.last(), command_index);
@@ -7985,6 +8012,13 @@ impl Engine {
                             &scope,
                         )
                     } else {
+                        // An example's check admits the axioms `native_decide` adds into its
+                        // scratch successor, so the command's engine is its evaluator.
+                        let scope = if is_example {
+                            native_scope(&scope, &engine, options, limits)
+                        } else {
+                            scope.clone()
+                        };
                         engine
                             .check_parsed_source_command_in_scope(
                                 parsed,
@@ -8220,6 +8254,7 @@ impl Engine {
                         (
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
+                                native_axioms: Vec::new(),
                                 local_functions: Vec::new(),
                                 irreducible: false,
                                 noncomputable: false,
@@ -8243,19 +8278,14 @@ impl Engine {
                 })
             } else {
                 source_records::elaboration_outcome(match parsed.kind() {
-                    fln_parse::SourceCommandKind::Definition if scoped => {
+                    // This route admits the axioms `native_decide` adds before the declaration
+                    // (below), so the command's engine is its evaluator.
+                    fln_parse::SourceCommandKind::Definition => {
                         fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                             parsed.syntax(),
                             engine.environment(),
                             limits.kernel,
-                            &scope,
-                        )
-                    }
-                    fln_parse::SourceCommandKind::Definition => {
-                        fln_elab::elaborate_definition_with_effects_in_with_budget(
-                            parsed.syntax(),
-                            engine.environment(),
-                            limits.kernel,
+                            &native_scope(&scope, &engine, options, limits),
                         )
                     }
                     fln_parse::SourceCommandKind::Check
@@ -8289,6 +8319,7 @@ impl Engine {
             )?;
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
+                native_axioms,
                 local_functions,
                 irreducible,
                 noncomputable,
@@ -8416,7 +8447,26 @@ impl Engine {
                 || is_proof_definition
                 || uses_sorry
             {
-                let mut admission = match engine
+                // The axioms `native_decide` added come first, each through both checkers, as
+                // the pin's `addDecl` adds them before the declaration citing them
+                // (vendored `Lean/Meta/Native.lean:73-80`).
+                let axioms = if native_axioms.is_empty() {
+                    None
+                } else {
+                    match engine
+                        .admit_declarations(&native_axioms, options, limits.admission())
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error.into()),
+                            at: Some(original_offset),
+                        })? {
+                        Outcome::Complete(admission) => Some(admission),
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                };
+                let base = axioms.as_ref().map_or(&engine, |axioms| &axioms.engine);
+                let mut admission = match base
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -8445,7 +8495,7 @@ impl Engine {
                         )?;
                     admission.result_logical_root = admission.engine.logical_root(options);
                 }
-                let admission = match engine.finish_local_function_batch(
+                let mut admission = match engine.finish_local_function_batch(
                     admission,
                     &local_functions,
                     options,
@@ -8455,6 +8505,11 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                // One command, one transition: the axioms precede the declaration in it.
+                if let Some(axioms) = axioms {
+                    admission.base_logical_root = axioms.base_logical_root;
+                    admission.admissions.splice(0..0, axioms.admissions);
+                }
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
                     .map_err(|error| {
@@ -8466,6 +8521,16 @@ impl Engine {
                     admission,
                 });
                 continue;
+            }
+            if !native_axioms.is_empty() {
+                // An executed definition's record has no place for an axiom before it.
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`native_decide` in a definition this engine compiles",
+                    }),
+                    at: Some(original_offset),
+                });
             }
             let entry = if is_evaluation {
                 source_evaluation::Entry::Evaluation
@@ -12594,6 +12659,24 @@ fn guarded_elaboration_error(
             {
                 return Some(message);
             }
+            // `elabNativeDecideCore`'s message (vendored `Lean/Elab/Tactic/Decide.lean:60-64`),
+            // the proposition on its own indented lines (`indentExpr`).
+            if let fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::Tactic(
+                    fln_elab::source::TacticError::NativeDecideFalse {
+                        tactic,
+                        proposition,
+                    },
+                ),
+            ) = error
+                && let Ok(proposition) = pretty::goals::term_in_locals(env, scope, &[], proposition)
+            {
+                return Some(format!(
+                    "Tactic `{}` evaluated that the proposition\n  {}\nis false",
+                    tactic.to_display_string(),
+                    proposition.replace('\n', "\n  ")
+                ));
+            }
             Some(error.to_string())
         }
         _ => None,
@@ -12652,6 +12735,26 @@ fn reproduced_warning(line: &str) -> bool {
             .strip_prefix("warning: instance `")
             .and_then(|rest| rest.strip_suffix(MARKED))
             .is_some_and(|name| name.ends_with('`'))
+}
+
+/// `scope` with the command's engine as `native_decide`'s evaluator (`fln_elab::native`), for a
+/// route that admits the axioms it adds before the declaration citing them. The evaluation reads
+/// the options `set_option` set in this scope over the batch's, as an `#eval` does.
+fn native_scope(
+    scope: &fln_elab::source::scope::SourceScope,
+    engine: &Engine,
+    options: &KVMap,
+    limits: EngineExecutionLimits,
+) -> fln_elab::source::scope::SourceScope {
+    let mut merged = options.clone();
+    for (name, value) in scope.options.entries() {
+        merged.insert(name.clone(), value.clone());
+    }
+    let mut scope = scope.clone();
+    scope.native = Some(source_execution::CommandEvaluator::provider(
+        engine, &merged, limits,
+    ));
+    scope
 }
 
 /// Whether `guard` is the `#guard_msgs` of `command_index`, checks errors, and expects one.

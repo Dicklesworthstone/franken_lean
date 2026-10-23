@@ -861,6 +861,19 @@ const DEFAULTS_FLAGS_AND_PATTERN_BINDERS: &[Accepted] = &[
         source: "theorem s5 : 2 + 2 = 4 := by decide +kernel",
         tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `s5 []) (Command.declSig [] (Term.typeSpec ":" («term_=_» («term_+_» (num "2") "+" (num "2")) "=" (num "4")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig [(Tactic.configItem (Tactic.posConfigItem "+" `kernel))]))]))) (Termination.suffix [] []) [])))"#,
     },
+    // `native_decide` (`Init/Tactics.lean:1482`): s8–s10 captured the same way on 2026-10-23.
+    Accepted {
+        source: "theorem s8 : 2 + 2 = 4 := by native_decide",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `s8 []) (Command.declSig [] (Term.typeSpec ":" («term_=_» («term_+_» (num "2") "+" (num "2")) "=" (num "4")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.nativeDecide "native_decide" (Tactic.optConfig []))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem s9 : 2 + 2 = 4 := by decide +native",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `s9 []) (Command.declSig [] (Term.typeSpec ":" («term_=_» («term_+_» (num "2") "+" (num "2")) "=" (num "4")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.decide "decide" (Tactic.optConfig [(Tactic.configItem (Tactic.posConfigItem "+" `native))]))]))) (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "theorem s10 : 2 + 2 = 4 := by native_decide +revert",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `s10 []) (Command.declSig [] (Term.typeSpec ":" («term_=_» («term_+_» (num "2") "+" (num "2")) "=" (num "4")))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.nativeDecide "native_decide" (Tactic.optConfig [(Tactic.configItem (Tactic.posConfigItem "+" `revert))]))]))) (Termination.suffix [] []) [])))"#,
+    },
     Accepted {
         source: "def s6 : Nat × Nat → Nat := fun ⟨x, _⟩ => x",
         tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `s6 []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow («term_×_» `Nat "×" `Nat) "→" `Nat))]) (Command.declValSimple ":=" (Term.fun "fun" (Term.basicFun [(Term.anonymousCtor "⟨" [`x "," (Term.hole "_")] "⟩")] [] "=>" `x)) (Termination.suffix [] []) []) []))"#,

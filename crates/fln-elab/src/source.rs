@@ -54,6 +54,7 @@ mod record_terms;
 mod recursion;
 mod reduce;
 mod tactics;
+pub use tactics::TacticError;
 pub mod trace;
 
 use super::*;
@@ -143,6 +144,10 @@ pub enum SourceInferenceError {
     ConversionRefused(Box<Verdict>),
     Tactic(tactics::TacticError),
     ArithmeticInconclusive(Box<fln_core::outcome::Inconclusive>),
+    /// `native_decide`'s evaluation gave no answer about the proposition (`crate::native`).
+    NativeEvaluation(crate::native::NativeEvaluationError),
+    /// `native_decide`'s evaluation stopped before an answer (FL-INV-07).
+    NativeEvaluationInconclusive(Box<fln_core::outcome::Inconclusive>),
     UnresolvedHoles {
         count: usize,
     },
@@ -385,6 +390,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Tactic(error) => write!(f, "{error}"),
             Self::ArithmeticInconclusive(reason) => {
                 write!(f, "omega did not complete: {:?}", reason.cause)
+            }
+            Self::NativeEvaluation(error) => write!(f, "{error}"),
+            Self::NativeEvaluationInconclusive(reason) => {
+                write!(f, "native evaluation did not complete: {:?}", reason.cause)
             }
             Self::Record(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
@@ -692,6 +701,14 @@ struct Context {
     // Recursors the source names directly, which a compiled declaration may not apply
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
+    // The embedding engine's native evaluator (`crate::native`). Only an entry point that
+    // carries `native_axioms` on to admission sets it; elsewhere `native_decide` refuses typed.
+    native: Option<crate::native::NativeProvider>,
+    // The axioms `native_decide` added (the pin's `nativeEqTrue`), in order; rollback restores
+    // them, as it restores the pin's environment.
+    native_axioms: Vec<Declaration>,
+    // The pin's `DeclNameGenerator` for the declaration being elaborated (`mkAuxDeclName`).
+    aux_names: Option<tactics::AuxNames>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -776,6 +793,9 @@ impl Context {
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
             source_recursors: Vec::new(),
+            native: None,
+            native_axioms: Vec::new(),
+            aux_names: None,
         }
     }
 
@@ -4842,6 +4862,7 @@ pub fn elaborate_public_theorem(
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
+        native_axioms: Vec::new(),
         local_functions,
         irreducible: false,
         noncomputable: context.noncomputable_definition,
@@ -4963,6 +4984,10 @@ pub(super) fn definition(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElaboratedDeclaration {
     pub declaration: Declaration,
+    /// The axioms `native_decide` added while elaborating `declaration`, in order
+    /// (`crate::native`). The declaration cites them, so callers must admit every one,
+    /// through both checkers, before it.
+    pub native_axioms: Vec<Declaration>,
     /// Closed local recursive helpers. They grant no authority: callers must
     /// admit every helper and the owner atomically through both checkers.
     pub local_functions: Vec<Declaration>,
@@ -4980,7 +5005,8 @@ fn definition_scoped(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    definition_scoped_with_effects(syntax, environment, kernel, scope)
+    // The declaration alone is returned, so no axiom may be added: `native_decide` refuses.
+    definition_scoped_elaboration(syntax, environment, kernel, scope, false)
         .map(|elaborated| elaborated.declaration)
 }
 
@@ -4990,12 +5016,27 @@ fn definition_scoped_with_effects(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
+    // The result carries the axioms on to admission, so `native_decide` may run here.
+    definition_scoped_elaboration(syntax, environment, kernel, scope, true)
+}
+
+fn definition_scoped_elaboration(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+    native: bool,
+) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope);
+    if native {
+        context.native = scope.native.clone();
+    }
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
+        native_axioms: std::mem::take(&mut context.native_axioms),
         local_functions,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,
@@ -5432,6 +5473,20 @@ fn definition_in_context_named(
         return Err(failure(SourceInferenceError::ObservationComplete));
     }
     let name = &owned_name;
+    if context.aux_names.is_none() {
+        // `withDeclName` (vendored Lean/Elab/Term/TermElabM.lean:679-683) names auxiliaries after
+        // the declaration. A lone theorem's body is elaborated in a forked child generator when
+        // `Elab.async` holds, the command line's default (`elabAsync`, Lean/Elab/MutualDef.lean:
+        // 1237-1243; Lean/Elab/Frontend.lean:265-266).
+        let child = is_theorem
+            && context.partial.is_none()
+            && context.mutual_member.is_none()
+            && context
+                .txn
+                .options
+                .get_bool(&Name::from_components(["Elab", "async"]), true);
+        context.aux_names = Some(tactics::AuxNames::new(name.clone(), child));
+    }
     if is_axiom
         || context
             .partial

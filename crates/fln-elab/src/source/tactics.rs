@@ -34,6 +34,7 @@ mod split;
 mod trace;
 mod trivial;
 mod unfold;
+pub(in crate::source) use decision::AuxNames;
 pub(in crate::source) use refine::RefinementFrame;
 pub(in crate::source) use rewrite::SimpKeyCache;
 
@@ -63,6 +64,20 @@ pub enum TacticError {
     /// `decide` on a goal that still mentions a local after its let-bound locals are unfolded
     /// (the pin's `preprocessPropToDecide`; `decide +revert` is not read).
     DecideFreeVariables,
+    /// `native_decide` (or `decide +native`) ran the decision and it returned `false`
+    /// (`elabNativeDecideCore`, vendored Lean/Elab/Tactic/Decide.lean:57-68). The pin's message
+    /// prints the proposition, which needs the printer: the source door renders it.
+    NativeDecideFalse {
+        tactic: Name,
+        proposition: Expr,
+    },
+    /// `nativeEqTrue`'s refusal of a decision that still mentions a local or a metavariable,
+    /// as an instance found in the local context does (vendored Lean/Meta/Native.lean:38-41).
+    NativeDecideOpen {
+        tactic: Name,
+        decision: Expr,
+        metavariables: bool,
+    },
     NoGoals,
     UnsolvedGoals {
         count: usize,
@@ -219,6 +234,26 @@ impl std::fmt::Display for TacticError {
             Self::DecideFreeVariables => {
                 write!(f, "Expected type must not contain free variables")
             }
+            // The pin's words, without the proposition it prints between them.
+            Self::NativeDecideFalse { tactic, .. } => write!(
+                f,
+                "Tactic `{}` evaluated that the proposition is false",
+                tactic.to_display_string()
+            ),
+            Self::NativeDecideOpen {
+                tactic,
+                metavariables,
+                ..
+            } => write!(
+                f,
+                "Tactic `{}` failed: Cannot native decide proposition with {}",
+                tactic.to_display_string(),
+                if *metavariables {
+                    "metavariables"
+                } else {
+                    "free variables"
+                }
+            ),
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
             Self::SyntheticHoleOutsideRefine => write!(f, "synthetic proof holes require refine"),
@@ -1323,22 +1358,42 @@ impl Context {
                     return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
                 }
                 self.close_proof_goal(goal, value)?;
-            } else if kind == &parser_kind(&["Tactic", "decide"]) {
+            } else if kind == &parser_kind(&["Tactic", "decide"])
+                || kind == &parser_kind(&["Tactic", "nativeDecide"])
+            {
+                let native_tactic = kind == &parser_kind(&["Tactic", "nativeDecide"]);
                 let [keyword, config] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                expect_atom(keyword, "decide", "decision proof tactic")?;
-                // Only the empty configuration is supported.
-                let config = expect_node(
-                    config,
-                    &parser_kind(&["Tactic", "optConfig"]),
-                    1,
-                    "decide config",
+                expect_atom(
+                    keyword,
+                    if native_tactic {
+                        "native_decide"
+                    } else {
+                        "decide"
+                    },
+                    "decision proof tactic",
                 )?;
-                if !expect_null_args(&config[0], "decide config items")?.is_empty() {
-                    return Err(error(TacticError::MalformedScript));
+                if native_tactic {
+                    // `syntax (name := nativeDecide) "native_decide" optConfig : tactic`
+                    // (`Init/Tactics.lean:1482`). A world whose imports do not reach
+                    // `Init.Tactics` lacks it, and the pin does not read the word as a tactic.
+                    let syntax =
+                        Name::from_components(["Lean", "Parser", "Tactic", "nativeDecide"]);
+                    if !self.txn.env.contains(&syntax) {
+                        return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
+                    }
                 }
-                self.decide_proof_goal(goal)?;
+                // Only `native` is read from the configuration; `native_decide` sets it
+                // (`evalNativeDecide`, vendored Lean/Elab/Tactic/Decide.lean:186-189).
+                let native = self.decide_native_config(config)?;
+                if native_tactic {
+                    self.native_decide_proof_goal(goal, "native_decide")?;
+                } else if native {
+                    self.native_decide_proof_goal(goal, "decide")?;
+                } else {
+                    self.decide_proof_goal(goal)?;
+                }
             } else if kind == &parser_kind(&["Tactic", "constructor"])
                 || kind == &parser_kind(&["Tactic", "left"])
                 || kind == &parser_kind(&["Tactic", "right"])

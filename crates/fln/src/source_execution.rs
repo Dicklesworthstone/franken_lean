@@ -350,3 +350,75 @@ pub(super) fn verify_declarations(
     }
     Ok(())
 }
+
+/// `native_decide`'s evaluator for one source command (`fln_elab::native`). The command's own
+/// engine admits the elaborator's closed `Bool` definition into a scratch successor, compiles it
+/// and runs it on Golem through the door `#eval`'s values use, and discards the successor: the
+/// pin's `addAndCompile` and `evalConst` under `withoutModifyingEnv` (vendored
+/// `Lean/Meta/Native.lean:43-69`). It decides nothing about the proposition itself.
+pub(super) struct CommandEvaluator {
+    engine: Engine,
+    options: KVMap,
+    limits: EngineExecutionLimits,
+}
+
+impl CommandEvaluator {
+    /// The provider a command's scope carries, for `engine` as the command finds it.
+    pub(super) fn provider(
+        engine: &Engine,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> fln_elab::native::NativeProvider {
+        fln_elab::native::NativeProvider(std::sync::Arc::new(Self {
+            engine: engine.clone(),
+            options: options.clone(),
+            limits,
+        }))
+    }
+}
+
+impl fln_elab::native::NativeEvaluator for CommandEvaluator {
+    fn evaluate_bool(
+        &self,
+        definition: &fln_env::constants::DefinitionVal,
+    ) -> fln_elab::native::NativeEvaluation {
+        use fln_elab::native::NativeEvaluation;
+        let executed = self.engine.execute_definition_entry(
+            Declaration::Defn(definition.clone()),
+            &self.options,
+            self.limits,
+            source_evaluation::Entry::Value,
+        );
+        let execution = match executed {
+            Ok(Outcome::Complete(execution)) => execution,
+            Ok(Outcome::Inconclusive(reason)) => return NativeEvaluation::Inconclusive(reason),
+            Ok(Outcome::InternalFault(fault)) => return NativeEvaluation::InternalFault(fault),
+            // This engine's compiler covers a subset of the pin's: a refusal here is its own
+            // limit, never the pin's `addAndCompile` error.
+            Err(error) if source_check::classify(&error).0 == "internal-fault" => {
+                return NativeEvaluation::InternalFault(InternalFault::new(
+                    "native evaluation",
+                    error.to_string(),
+                ));
+            }
+            Err(error) => return NativeEvaluation::Unsupported(error.to_string()),
+        };
+        match &execution.exit {
+            VmExit::Returned(_) => match closed_vm_value(&execution.exit) {
+                Ok(Some(ClosedVmValue::Scalar(1))) => NativeEvaluation::Value(true),
+                Ok(Some(ClosedVmValue::Scalar(0))) => NativeEvaluation::Value(false),
+                other => NativeEvaluation::InternalFault(InternalFault::new(
+                    "native evaluation",
+                    format!("a closed `Bool` definition returned {other:?}"),
+                )),
+            },
+            // The pin's `panic` reports and continues with the default value; Golem stops.
+            VmExit::Panicked { message, .. } => NativeEvaluation::Unsupported(format!(
+                "the evaluation panicked (`{message}`), which the pin reports and continues past"
+            )),
+            VmExit::Refused { refusal, .. } => {
+                NativeEvaluation::Unsupported(format!("the VM refused the evaluation: {refusal}"))
+            }
+        }
+    }
+}

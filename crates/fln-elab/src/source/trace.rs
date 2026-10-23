@@ -55,6 +55,7 @@ pub fn elaborate_definition(
     Ok(ObservedDeclaration {
         candidate: ElaboratedDeclaration {
             declaration,
+            native_axioms: Vec::new(),
             local_functions,
             irreducible: context.well_founded_definition,
             noncomputable: context.noncomputable_definition,

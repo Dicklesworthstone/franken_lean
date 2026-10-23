@@ -94,6 +94,10 @@ pub struct SourceScope {
     /// The embedding engine's untrusted arithmetic accelerator. This capability
     /// is inherited by lexical scopes but is never exported as module metadata.
     pub arithmetic: Option<crate::arithmetic::ArithmeticProvider>,
+    /// The embedding engine's native evaluator for `native_decide` (`crate::native`): set by
+    /// the engine for the command it is about to elaborate, so it evaluates in that command's
+    /// world. Like [`Self::arithmetic`], never exported as module metadata.
+    pub native: Option<crate::native::NativeProvider>,
     /// Options `set_option` set and [`options::admit`] honors, until the end of the enclosing
     /// section or namespace. Every elaboration in this scope starts with them.
     pub options: KVMap,
@@ -530,6 +534,9 @@ impl Context {
     pub(super) fn scoped(env: &Environment, kernel: Budget, scope: &SourceScope) -> Self {
         let mut context = Self::new(env, kernel);
         context.source_scope = scope.clone();
+        // The evaluator is the entry point's to enable (`Context::native`): a route that does
+        // not carry the axioms on to admission must not run `native_decide`.
+        context.source_scope.native = None;
         context.txn.options = scope.options.clone();
         context.txn.lctx = scope.variables.locals().clone();
         context.next = scope.variables.next();
@@ -786,6 +793,21 @@ pub fn elaborate_example(
     example_in_context(syntax, name, &mut context)
 }
 
+/// [`elaborate_example`], with `native_decide` available: the axioms it added, in order
+/// (`crate::native`), which the caller admits into the scratch successor before the candidate.
+pub fn elaborate_example_with_axioms(
+    syntax: &Syntax,
+    name: Name,
+    env: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<(Declaration, Vec<Declaration>), NatDefinitionElabError> {
+    let mut context = Context::scoped(env, kernel, scope);
+    context.native = scope.native.clone();
+    let declaration = example_in_context(syntax, name, &mut context)?;
+    Ok((declaration, std::mem::take(&mut context.native_axioms)))
+}
+
 pub(super) fn example_in_context(
     syntax: &Syntax,
     name: Name,
@@ -796,6 +818,12 @@ pub(super) fn example_in_context(
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
         return Err(NatDefinitionElabError::InvalidGeneratedCheckName);
     }
+    // `mkDefViewOfExample` names the example `_example`, in any namespace, and auxiliaries
+    // after it (vendored Lean/Elab/DefView.lean).
+    context.aux_names = Some(super::tactics::AuxNames::new(
+        Name::from_components(["_example"]),
+        false,
+    ));
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -970,6 +998,7 @@ mod tests {
             local_simp: Vec::new(),
             frontier_recursors: false,
             arithmetic: None,
+            native: None,
             options: KVMap::new(),
         };
         let env = [
@@ -1165,6 +1194,7 @@ mod tests {
             local_simp: Vec::new(),
             frontier_recursors: false,
             arithmetic: None,
+            native: None,
             options: KVMap::new(),
         };
         let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
@@ -1243,6 +1273,7 @@ mod tests {
             local_simp: Vec::new(),
             frontier_recursors: false,
             arithmetic: None,
+            native: None,
             options: KVMap::new(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];
