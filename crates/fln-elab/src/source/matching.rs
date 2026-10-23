@@ -186,6 +186,33 @@ impl Context {
         Ok(explicit)
     }
 
+    /// How many of `constructor`'s fields are explicit: the arguments a pattern writes after its
+    /// explicit parameters.
+    fn explicit_field_binders(
+        &mut self,
+        constructor: &fln_env::constants::ConstructorVal,
+    ) -> Result<usize, NatDefinitionElabError> {
+        let mut type_ = &constructor.base.type_;
+        let mut explicit = 0;
+        for index in 0..constructor
+            .num_params
+            .saturating_add(constructor.num_fields)
+        {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_info, body, ..
+            } = type_.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if index >= constructor.num_params && *binder_info == BinderInfo::Default {
+                explicit += 1;
+            }
+            type_ = body;
+        }
+        Ok(explicit)
+    }
+
     /// Independent local indices can be generalized without inventing index
     /// equalities. Repeated, fixed and let-bound indices need an equation
     /// refinement compiler, so they are not silently treated as independent.
@@ -959,6 +986,9 @@ impl Context {
             } else {
                 (pattern, &[][..])
             };
+            // `c a ..`: every remaining argument is `_` (vendored `Lean/Elab/PatternVar.lean:
+            // 360-366`, and `App.lean:810-825` for a relative head); only the last may be `..`.
+            let (arguments, ellipsis) = application::split_ellipsis(arguments)?;
             let constructor_name = if head == &patterns::anonymous_head() {
                 // `⟨…⟩` names the family's only constructor (`elabAnonymousCtor`).
                 match constructors {
@@ -1021,6 +1051,13 @@ impl Context {
                     return Err(error(MatchError::UnsupportedFamily));
                 };
                 let parameters = self.explicit_parameter_binders(&constructor)?;
+                if ellipsis {
+                    let explicit = parameters + self.explicit_field_binders(&constructor)?;
+                    if fields.len() > explicit {
+                        return Err(error(MatchError::WrongArity));
+                    }
+                    fields.resize(explicit, None);
+                }
                 if fields.len() < parameters {
                     return Err(error(MatchError::WrongArity));
                 }

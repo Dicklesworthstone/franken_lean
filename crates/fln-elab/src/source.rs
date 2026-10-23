@@ -2913,10 +2913,13 @@ impl Context {
                         }
                         Task::Projection(field, arguments, expected, explicit, finish) => {
                             let receiver = values.pop().expect("receiver precedes projection");
+                            // `x.f ..` has no arguments to process: `hasArgs` counts positional
+                            // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
+                            // strict-implicit receiver is not instantiated before the lookup.
                             match self.resolve_field_path(
                                 receiver,
                                 &field,
-                                !arguments.is_empty(),
+                                !arguments.iter().all(application::is_ellipsis),
                             )? {
                                 record_terms::FieldResolution::Value(term)
                                     if arguments.is_empty() =>
