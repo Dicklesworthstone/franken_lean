@@ -6,10 +6,11 @@
 use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
-    ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
+    AliasEntry, ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
 };
 use std::collections::HashSet;
 
+mod aliases;
 mod defaults;
 mod instances;
 mod namespaces;
@@ -23,6 +24,8 @@ pub struct SourceMetadata {
     /// Chronological module-owned defaults, preserving repeated registrations
     /// and rows for candidates whose declarations belong to imported modules.
     pub defaults: Vec<DefaultEntry>,
+    /// Chronological module-owned `export` aliases, including imported targets.
+    pub aliases: Vec<AliasEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
     /// entries, one `Name` each. They are written sorted by `Name.quickLt`, the
     /// order the pin's `isTagged` binary-searches, so the pinned Reference
@@ -107,6 +110,9 @@ impl Encoder {
         }
         if !metadata.defaults.is_empty() {
             blocks.push(self.default_block(&metadata.defaults)?);
+        }
+        if !metadata.aliases.is_empty() {
+            blocks.push(self.alias_block(&metadata.aliases)?);
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.tagged_names_block(

@@ -473,3 +473,31 @@ fn protected_declarations_survive_into_the_olean_for_both_readers() {
         }
     }
 }
+
+#[test]
+fn export_alias_libraries_build_and_resolve_through_physical_lake_outputs() {
+    let package = Package::new(CONFIG);
+    package.write("Lib/Base.lean","prelude\nnamespace Original\ninductive Token where | mk\ndef identity (x : Token) : Token := x\nend Original\nexport Original (Token identity)");
+    package.write("Lib.lean","prelude\nimport Lib.Base\nnamespace Facade.Inner\nexport Original (Token identity)\nend Facade.Inner");
+    success(&package.build(&["+Lib:olean"]));
+    let base = std::fs::read(package.artifact("Lib.Base")).unwrap();
+    let bridge = std::fs::read(package.artifact("Lib")).unwrap();
+    assert_eq!(&bridge[..5], b"olean");
+    success(&package.build(&["+Lib:olean"]));
+    assert_eq!(std::fs::read(package.artifact("Lib.Base")).unwrap(), base);
+    assert_eq!(std::fs::read(package.artifact("Lib")).unwrap(), bridge);
+    let client = Package::new("name = \"aliasclient\"\n");
+    client.write("Use.lean","prelude\nimport Lib\nopen Facade.Inner\ntheorem useAlias (P : Token -> Prop) (x : Token) (h : P x) : P (identity x) := h");
+    let out = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json", "--import-posture", "recheck"])
+        .arg(client.0.join("Use.lean"))
+        .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+        .env("FLN_IMPORT_REUSE_DIR", client.0.join(".records"))
+        .output()
+        .unwrap();
+    let report = success(&out);
+    assert!(
+        report.contains("\"trust\":\"recheck\",\"admission\":\"council\""),
+        "{report}"
+    );
+}

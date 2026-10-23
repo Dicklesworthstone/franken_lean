@@ -1,13 +1,14 @@
 //! Namespace entries for modules written by the source pipeline.
 //!
 //! The pin's Lean.Namespace exports an Array Name, sorted by Name.quickLt.
-//! A qualified declaration registers its proper prefixes, independently of
-//! whether the source spelled a namespace command or a qualified declaration.
+//! Qualified declarations and aliases register their proper prefixes. Alias
+//! targets do not: their namespaces belong to the defining module.
 //! Merely writing the constants does not perform this registration on import.
 //!
 //! Empty namespaces cannot be reconstructed from constants. This module does
 //! not pretend otherwise, and does not infer namespaces from imported names,
-//! referenced constants, class metadata or extra runtime constant names.
+//! referenced constants, class metadata or extra runtime constant names. A
+//! re-export-only namespace is reconstructed from its own qualified aliases.
 use super::*;
 
 /// `namespacesExt` is PRIVATE at the pin. Its key is not `Lean.namespacesExt`,
@@ -25,10 +26,18 @@ fn extension_name() -> Name {
 }
 
 impl Encoder {
-    fn declaration_namespaces(&self, constants: &[ConstantInfo]) -> WResult<Vec<Name>> {
+    fn declaration_namespaces(
+        &self,
+        constants: &[ConstantInfo],
+        aliases: &[AliasEntry],
+    ) -> WResult<Vec<Name>> {
         let mut names = HashSet::new();
-        for constant in constants {
-            let mut namespace = constant.constant_val().name.parent();
+        for declared in constants
+            .iter()
+            .map(|constant| &constant.constant_val().name)
+            .chain(aliases.iter().map(|alias| &alias.alias))
+        {
+            let mut namespace = declared.parent();
             while !namespace.is_anonymous() {
                 // Every previous walk finished its ancestor chain. A shared
                 // prefix therefore lets us stop, not repeatedly walk to root.
@@ -81,11 +90,12 @@ pub(super) fn encode(
 ) -> WResult<EncodedModule> {
     let header_bytes = build_header(header)?;
     let mut encoder = Encoder::new(budget, header.version)?;
-    let namespaces = encoder.declaration_namespaces(input.constants)?;
+    let namespaces = encoder.declaration_namespaces(input.constants, &metadata.aliases)?;
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
             && metadata.instances.is_empty()
             && metadata.defaults.is_empty()
+            && metadata.aliases.is_empty()
             && metadata.protected.is_empty()
             && metadata.aux_recursors.is_empty()
             && metadata.noncomputable.is_empty()
@@ -213,12 +223,15 @@ mod tests {
         let mut expected = vec![name("Lib"), name("Lib.Inner"), name("Lib.Other")];
         expected.sort_by(Name::quick_cmp);
         assert_eq!(
-            encoder.declaration_namespaces(&constants).unwrap(),
+            encoder.declaration_namespaces(&constants, &[]).unwrap(),
             expected
         );
         let mut reversed = constants;
         reversed.reverse();
-        assert_eq!(encoder.declaration_namespaces(&reversed).unwrap(), expected);
+        assert_eq!(
+            encoder.declaration_namespaces(&reversed, &[]).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -226,7 +239,7 @@ mod tests {
         let parent = Name::num(Name::str(Name::anonymous(), "A.B"), 7);
         let constants = [constant(Name::str(parent.clone(), "value"))];
         let mut encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
-        let namespaces = encoder.declaration_namespaces(&constants).unwrap();
+        let namespaces = encoder.declaration_namespaces(&constants, &[]).unwrap();
         assert!(namespaces.contains(&parent));
         assert!(namespaces.contains(&Name::str(Name::anonymous(), "A.B")));
         assert!(!namespaces.contains(&name("A")));
@@ -362,13 +375,16 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            limited.declaration_namespaces(&constants),
+            limited.declaration_namespaces(&constants, &[]),
             Err(WriteError::Budget {
                 resource: WriteResource::Objects,
                 ..
             })
         ));
         let fresh = Encoder::new(WriteBudget::default(), 2).unwrap();
-        assert_eq!(fresh.declaration_namespaces(&constants).unwrap().len(), 4);
+        assert_eq!(
+            fresh.declaration_namespaces(&constants, &[]).unwrap().len(),
+            4
+        );
     }
 }
