@@ -65,7 +65,7 @@ impl Bracket {
             Bracket::Subtype => "}",
         }
     }
-    fn kind(self) -> Name {
+    pub(super) fn kind(self) -> Name {
         match self {
             Bracket::List => list_kind(),
             Bracket::Array => Name::from_components(["term#[_,]"]),

@@ -781,6 +781,9 @@ pub struct ActiveGrammar {
     /// Whether the imports' syntax is entered (see [`FileGrammar::own_syntax_only`]): only then
     /// does a census declaration missing here mean the file lacks it.
     imports_entered: bool,
+    /// The node kinds the header's import closure declares, entered or not; `None` where this
+    /// is no file's grammar, which then has Init's. See [`declares_kind`].
+    closure_kinds: Option<Arc<BTreeSet<Name>>>,
     /// The file's notation expansion, when built from a [`FileGrammar`].
     expander: Option<Expander>,
     /// The doc-comment options in effect.
@@ -1005,6 +1008,7 @@ impl ActiveGrammar {
             attrs,
             commands,
             imports_entered: true,
+            closure_kinds: None,
             expander: None,
             docs: DocOptions::default(),
         }
@@ -1189,6 +1193,8 @@ pub struct FileGrammar {
     expansions: Rc<Cell<u64>>,
     /// Whether the imports' syntax is entered, or only the file's own ([`Self::own_syntax_only`]).
     imports_entered: bool,
+    /// The node kinds the import closure declares, whether or not they are entered.
+    closure_kinds: Arc<BTreeSet<Name>>,
     scopes: Vec<FileScope>,
     cache: RefCell<GrammarCache>,
 }
@@ -1257,6 +1263,13 @@ impl FileGrammar {
                 _ => None,
             })
             .collect();
+        // A syntax declaration's name is its node kind, leading (`node`) or trailing
+        // (`trailingNode`, as `xs[i]`'s is).
+        let closure_kinds = imported
+            .iter()
+            .chain(scoped.values().flatten())
+            .map(|decl| decl.decl.clone())
+            .collect();
         Ok(FileGrammar {
             module,
             base_tokens: tokens.tokens_for(prelude, imports)?,
@@ -1284,6 +1297,7 @@ impl FileGrammar {
             interpolation_kinds: Arc::new(interpolation_kinds),
             expansions: Rc::new(Cell::new(0)),
             imports_entered: true,
+            closure_kinds: Arc::new(closure_kinds),
             scopes: vec![FileScope {
                 namespace: Name::anonymous(),
                 trail: Vec::new(),
@@ -1551,6 +1565,7 @@ impl FileGrammar {
             .source_categories
             .extend(self.declared_categories.keys().cloned());
         grammar.imports_entered = self.imports_entered;
+        grammar.closure_kinds = Some(Arc::clone(&self.closure_kinds));
         grammar.expander = Some(self.expander_for(&key.0));
         grammar.docs = docs;
         let grammar = Rc::new(grammar);
@@ -3244,6 +3259,19 @@ pub fn with_grammar<R>(grammar: &Rc<ActiveGrammar>, parse: impl FnOnce() -> R) -
 
 fn active() -> Option<Rc<ActiveGrammar>> {
     ACTIVE.with(|active| active.borrow().last().cloned())
+}
+
+/// Whether the file's import closure declares `kind`, an `Init` syntax that the term parser
+/// reads by hand (`[a, b]` is `Init.Data.List.Notation`'s, `xs[i]` `Init.GetElem`'s). A `prelude`
+/// file importing less than its declaring module does not have it, as at the pin. With no file
+/// grammar in effect the grammar is Init's, which declares it.
+pub(crate) fn declares_kind(kind: &Name) -> bool {
+    active().is_none_or(|grammar| {
+        grammar
+            .closure_kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(kind))
+    })
 }
 
 /// Call `lex` with the token table in effect: the active grammar's, or production's.

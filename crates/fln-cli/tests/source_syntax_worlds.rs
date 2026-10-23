@@ -163,3 +163,49 @@ fn a_prelude_file_reads_only_the_notation_its_imports_declare() {
         assert_eq!(code == 0, accepted, "{name}: {header}{program}");
     }
 }
+
+/// `[a, b]` is `Init.Data.List.Notation`'s syntax and `xs[i]` is `Init.GetElem`'s. Over
+/// `prelude` + `import Init.Core` neither is in scope, and the pin reads a `[` in a term only as
+/// an instance binder of an arrow, `[C α] → β` (`Term.depArrow`). Each program's verdict is the
+/// pinned v4.32.0's (2026-10-23).
+#[test]
+fn list_and_index_brackets_read_only_where_their_module_is_imported() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let core = "prelude\nimport Init.Core\n";
+    let list = "def l : List Nat := [1, 2]\n";
+    let index = "def g (xs : List Nat) (h : 0 < xs.length) : Nat := xs[0]\n";
+    let pattern = "def p3 : List Nat → Nat\n  | x@(y :: ys) => 0\n  | [] => 1\n";
+    for (name, header, program, accepted) in [
+        ("list_core", core, list, false),
+        (
+            "list_notation",
+            "prelude\nimport Init.Data.List.Notation\n",
+            list,
+            true,
+        ),
+        ("index_core", core, index, false),
+        (
+            "index_getelem",
+            "prelude\nimport Init.GetElem\n",
+            index,
+            true,
+        ),
+        ("pattern_core", core, pattern, false),
+        (
+            "pattern_notation",
+            "prelude\nimport Init.Data.List.Notation\n",
+            pattern,
+            true,
+        ),
+        (
+            "instance_arrow_core",
+            core,
+            "def f (g : [Inhabited Nat] → Nat) : Nat := g\n",
+            true,
+        ),
+    ] {
+        let code = lean(&lib, &root, name, header, program);
+        assert_eq!(code == 0, accepted, "{name}: {header}{program}");
+    }
+}

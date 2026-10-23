@@ -3820,8 +3820,19 @@ fn bounded_term_token(
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
         {
-            if !lists.open_index(tokens, frames, index) {
+            // Both readings are `Init` syntax, absent from a `prelude` file that does not
+            // import its declaring module, where `[` is no term.
+            let bracket = if lists.open_index(tokens, frames, index) {
+                collections::Bracket::Index
+            } else {
                 lists.open(frames, index, collections::Bracket::List);
+                collections::Bracket::List
+            };
+            if !extensions::declares_kind(&bracket.kind()) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: NatDefinitionExpectation::ScalarValue,
+                });
             }
         }
         Some(TokenKind::Symbol(symbol))

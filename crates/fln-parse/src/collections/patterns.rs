@@ -191,6 +191,10 @@ pub(crate) fn pattern(
                 values.push(tail);
             }
             Task::List(start, open, close, separators) => {
+                // `[a, b]` is `Init.Data.List.Notation`'s syntax, in patterns as in terms.
+                if !crate::extensions::declares_kind(&list_kind()) {
+                    return Err(refusal(view, tokens, open));
+                }
                 let elements = values.split_off(start);
                 let mut args = Vec::new();
                 for (index, element) in elements.into_iter().enumerate() {
