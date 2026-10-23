@@ -8,6 +8,8 @@ pub struct InstanceRegistration {
     pub declaration: Name,
     pub value: Expr,
     pub priority: u32,
+    /// The registration namespace, not necessarily the declaration's parent.
+    pub scope: Option<Name>,
     pub synth_order: Vec<u32>,
     pub keys: Vec<discr_tree::Key>,
 }
@@ -25,8 +27,8 @@ pub struct Registrations {
 /// Read the exact inherited prefix and module-owned suffix. Every visited row
 /// and decoded payload byte consumes work before allocation. An unchanged,
 /// shared persistent state returns immediately without inspecting its prefix.
-/// `None` refuses the entire operation: scoped registrations, imported-name
-/// overrides, or a type outside the exact supported indexing fragment.
+/// `None` refuses imported-name overrides or a type outside the exact supported
+/// indexing fragment. Scoped entries retain their namespace and remain dormant.
 pub fn registrations(
     base: &Environment,
     result: &Environment,
@@ -144,7 +146,7 @@ pub fn registrations(
         {
             return Err(InstanceRegistryError::Malformed);
         }
-        if owned && (base.contains(&declaration) || scope.is_some()) {
+        if owned && base.contains(&declaration) {
             return Ok(None);
         }
         if !owned && !base.contains(&declaration) {
@@ -155,7 +157,7 @@ pub fn registrations(
                 return Err(InstanceRegistryError::Malformed);
             }
         } else {
-            positions.insert(declaration.clone(), (class.clone(), scope));
+            positions.insert(declaration.clone(), (class.clone(), scope.clone()));
         }
         if !owned {
             continue;
@@ -190,6 +192,7 @@ pub fn registrations(
             declaration,
             value,
             priority,
+            scope,
             synth_order: derived.synth_order,
             keys: derived.keys,
         });

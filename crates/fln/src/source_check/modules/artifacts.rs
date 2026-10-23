@@ -227,7 +227,7 @@ impl PendingArtifact {
                 value: instance.value,
                 priority: instance.priority,
                 synth_order: instance.synth_order,
-                scope: None,
+                scope: instance.scope,
                 keys,
             });
         }
