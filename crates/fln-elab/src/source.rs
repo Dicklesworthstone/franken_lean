@@ -628,6 +628,9 @@ struct Context {
     omitted_results: Vec<recursion::OmittedResult>,
     recursion: Option<recursion::Recursion>,
     well_founded: Option<recursion::WellFounded>,
+    // Set while one member of a mutual well-founded group is elaborated against
+    // the group's shared fixpoint (`recursion::well_founded::mutual`).
+    mutual_member: Option<recursion::MutualMember>,
     // Set only after a top-level well-founded lowering succeeds. The source
     // declaration result carries this status to post-admission metadata.
     well_founded_definition: bool,
@@ -731,6 +734,7 @@ impl Context {
             omitted_results: Vec::new(),
             recursion: None,
             well_founded: None,
+            mutual_member: None,
             well_founded_definition: false,
             partial: None,
             noncomputable_definition: false,
@@ -824,6 +828,19 @@ impl Context {
     }
 
     fn constant(&mut self, name: &Name) -> Result<Typed, NatDefinitionElabError> {
+        // A mutual well-founded member's peers are the group's private recursive
+        // references, however they are spelled, never the group's header locals.
+        if let Some(recursion) = &self.well_founded
+            && recursion.is_mutual()
+            && let Some(reference) = recursion.target(name)
+        {
+            if recursion.proving {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::RecursionInDecreasingProof,
+                )));
+            }
+            return Ok(reference.clone());
+        }
         if let Some(term) = self.partial_group_reference(name)? {
             return Ok(term);
         }
@@ -1101,14 +1118,14 @@ impl Context {
                 return Ok(recursion.reference.clone());
             }
             if let Some(recursion) = &self.well_founded
-                && &recursion.name == name
+                && let Some(reference) = recursion.target(name)
             {
                 if recursion.proving {
                     return Err(failure(SourceInferenceError::Recursion(
                         recursion::RecursionError::RecursionInDecreasingProof,
                     )));
                 }
-                return Ok(recursion.reference.clone());
+                return Ok(reference.clone());
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
@@ -5476,7 +5493,12 @@ fn definition_in_context_named(
         termination,
         !is_theorem && !is_instance && !is_abbrev && !is_opaque,
     )?;
-    if context.partial.is_some()
+    // An ordinary mutual group judges its members' hints once its recursive
+    // components are known (`partial::group::ordinary`).
+    if context
+        .partial
+        .as_ref()
+        .is_some_and(|state| !state.ordinary)
         && !matches!(
             termination,
             None | Some(recursion::TerminationHint::Automatic)

@@ -165,6 +165,18 @@ impl Engine {
         match elaboration_outcome(partial.record_codegen(batch.engine.environment()))? {
             Outcome::Complete(environment) => {
                 batch.engine.environment = environment;
+                // Mutual well-founded members are `@[irreducible]` at the pin
+                // (`addPreDefAttributes`); their `_mutual` auxiliary is not.
+                for name in partial.irreducible() {
+                    let Some(declaration) = partial.declarations().iter().find(|declaration| {
+                        matches!(declaration, Declaration::Defn(definition) if &definition.base.name == name)
+                    }) else {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "an irreducible mutual member must be an admitted definition",
+                        });
+                    };
+                    elaboration::register_irreducible(&mut batch.engine, declaration)?;
+                }
                 batch.result_logical_root = batch.engine.logical_root(options);
                 Ok(Outcome::Complete(batch))
             }

@@ -532,7 +532,7 @@ impl Context {
                 });
             }
             if let Some(recursion) = &self.well_founded
-                && recursion.name == method
+                && let Some(reference) = recursion.target(&method)
             {
                 if recursion.proving {
                     return Err(failure(SourceInferenceError::Recursion(
@@ -540,7 +540,7 @@ impl Context {
                     )));
                 }
                 return Ok(FieldResolution::Method {
-                    function: recursion.reference.clone(),
+                    function: reference.clone(),
                     receiver,
                     base,
                 });

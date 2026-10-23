@@ -17,6 +17,10 @@ mod codegen_tests;
 pub struct ElaboratedPartial {
     declarations: Vec<Declaration>,
     noncomputable: BTreeSet<Name>,
+    /// Members of a mutual well-founded group, which the pin marks
+    /// `@[irreducible]` after admission (`addPreDefAttributes`,
+    /// Lean/Elab/PreDefinition/Mutual.lean). Never the `_mutual` auxiliary.
+    irreducible: BTreeSet<Name>,
     scope: SourceScope,
     budget: ElabBudget,
     kernel: Budget,
@@ -26,6 +30,12 @@ impl ElaboratedPartial {
     /// The entire atomic admission batch, including logical interfaces.
     pub fn declarations(&self) -> &[Declaration] {
         &self.declarations
+    }
+
+    /// The admitted definitions this result's caller must mark irreducible
+    /// once the whole batch has passed both checkers.
+    pub fn irreducible(&self) -> &BTreeSet<Name> {
+        &self.irreducible
     }
 
     /// Record supported, section-suppressed compilation failures on the actual
@@ -108,6 +118,12 @@ pub(super) struct State {
     pub kind: Kind,
     pub reference: Option<Reference>,
     pub group: Option<group::Group>,
+    /// A safe ordinary mutual group: its members' termination hints are the
+    /// group's to judge once its recursive components are known.
+    pub ordinary: bool,
+    /// The termination hint of the member elaborated in this context, as the
+    /// ordinary group's body pass found it.
+    pub member_hint: Option<recursion::MemberHint>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -222,6 +238,7 @@ pub fn elaborate(
         return Ok(ElaboratedPartial {
             declarations: vec![candidate],
             noncomputable,
+            irreducible: BTreeSet::new(),
             scope,
             budget: context.txn.budget,
             kernel,
@@ -259,6 +276,7 @@ pub fn elaborate(
     Ok(ElaboratedPartial {
         declarations: vec![logical, candidate],
         noncomputable,
+        irreducible: BTreeSet::new(),
         scope,
         budget: inhabitant_context.txn.budget,
         kernel,

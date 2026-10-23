@@ -7,8 +7,10 @@
 //! Fixed arguments are captured at their actual telescope positions. Missing
 //! measures try Nat parameters in the pin's telescope order, with active
 //! SizeOf and well-founded instances checked. Missing proofs use native
-//! simplification, assumptions and omega. Mutual groups and arbitrary
-//! SizeOf/lexicographic measure inference remain separate elaboration work.
+//! simplification, assumptions and omega. A mutual group whose members all
+//! have Nat measures shares one fixpoint (`mutual`); other mutual groups and
+//! arbitrary SizeOf/lexicographic measure inference remain separate work.
+pub(super) mod mutual;
 mod packing;
 mod relation;
 mod scopes;
@@ -79,6 +81,10 @@ pub(in crate::source) struct State {
     calls: HashMap<Expr, CachedCall>,
     goals: Vec<Obligation>,
     pub proving: bool,
+    /// The recursive group's members, when this is one member of a mutual
+    /// well-founded group. `name`, `reference` and `marker` are then this
+    /// member's own entry, and calls to every entry share the one fixpoint.
+    mutual: Option<mutual::Targets>,
 }
 
 /// The source branch closes before `decreasing_by` runs. Its term therefore
@@ -122,8 +128,33 @@ struct CachedCall {
 impl State {
     pub(in crate::source) fn hides(&self, local: &LocalDecl) -> bool {
         local.id == self.marker
+            || self
+                .mutual
+                .as_ref()
+                .is_some_and(|mutual| mutual.marks(&local.id))
             || local.user_name == self.continuation.user_name
             || self.proof_hidden.contains(&local.user_name)
+    }
+
+    /// The private recursive reference a source name denotes: this definition's
+    /// own, or, in a mutual group, any member's.
+    pub(in crate::source) fn target(&self, name: &Name) -> Option<&Typed> {
+        match &self.mutual {
+            Some(mutual) => mutual.reference(name),
+            None => (&self.name == name).then_some(&self.reference),
+        }
+    }
+
+    pub(in crate::source) fn is_mutual(&self) -> bool {
+        self.mutual.is_some()
+    }
+
+    /// Every private recursive marker of this fixpoint.
+    fn markers(&self) -> Vec<FVarId> {
+        match &self.mutual {
+            Some(mutual) => mutual.markers(),
+            None => vec![self.marker.clone()],
+        }
     }
 }
 
@@ -855,6 +886,7 @@ impl Context {
             calls: HashMap::new(),
             goals: Vec::new(),
             proving: false,
+            mutual: None,
         });
         let result = (|| {
             let term = self.term(syntax, Some(expected.clone()))?;
@@ -967,42 +999,12 @@ impl Context {
                         }
                     }
                 }
-                let proof_result = (|| {
-                    // Final cleanup has already inspected the raw InvImage.
-                    // Only now expose measure operands and local let values.
-                    let goals = self.normalize_decreasing_goals(goals)?;
-                    if hint.decreasing.is_some() {
-                        // The user's final script sees all obligations in the
-                        // original order, after inference has selected a measure.
-                        let state = self.start_decreasing_proof(&prepared, goals)?;
-                        self.run_decreasing_proof(&prepared, state)?;
-                    } else {
-                        for goal in goals {
-                            self.tick()?;
-                            let state = self.start_decreasing_proof(&prepared, vec![goal])?;
-                            self.run_decreasing_proof(&prepared, state)?;
-                        }
-                    }
-                    Ok::<_, NatDefinitionElabError>(())
-                })();
-                if let Err(problem) = proof_result {
+                if let Err(problem) =
+                    self.prove_decreasing_goals(&prepared, goals, hint.decreasing.is_some())
+                {
                     return Ok(Attempt::SelectedFailure(problem));
                 }
-                for obligation in obligations {
-                    self.tick()?;
-                    let proof = self.instantiate(&Expr::mvar(obligation.goal.id))?;
-                    self.require_resolved_terms(std::slice::from_ref(&proof))?;
-                    let closed =
-                        self.close_decreasing_capture(proof, &obligation.captures, true)?;
-                    self.txn
-                        .mvars
-                        .assign(
-                            obligation.transport,
-                            closed,
-                            AssignmentJustification::UserGiven,
-                        )
-                        .map_err(|_| failure(SourceInferenceError::Scope))?;
-                }
+                self.assign_decreasing_transports(obligations)?;
             }
             let mut value = self.instantiate(&value)?;
             self.require_resolved_terms(std::slice::from_ref(&value))?;
@@ -1044,6 +1046,55 @@ impl Context {
             self.well_founded_definition = true;
         }
         result
+    }
+
+    /// Run the selected decreasing proof: a supplied script once, on every
+    /// obligation in order; the default tactic once per obligation.
+    fn prove_decreasing_goals(
+        &mut self,
+        prepared: &Syntax,
+        goals: Vec<tactics::ProofGoal>,
+        supplied: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        // Final cleanup has already inspected the raw InvImage.
+        // Only now expose measure operands and local let values.
+        let goals = self.normalize_decreasing_goals(goals)?;
+        if supplied {
+            // The user's final script sees all obligations in the
+            // original order, after inference has selected a measure.
+            let state = self.start_decreasing_proof(prepared, goals)?;
+            self.run_decreasing_proof(prepared, state)?;
+        } else {
+            for goal in goals {
+                self.tick()?;
+                let state = self.start_decreasing_proof(prepared, vec![goal])?;
+                self.run_decreasing_proof(prepared, state)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each proved goal, closed over its call's captures, solves the call's
+    /// transported proof hole.
+    fn assign_decreasing_transports(
+        &mut self,
+        obligations: Vec<Obligation>,
+    ) -> Result<(), NatDefinitionElabError> {
+        for obligation in obligations {
+            self.tick()?;
+            let proof = self.instantiate(&Expr::mvar(obligation.goal.id))?;
+            self.require_resolved_terms(std::slice::from_ref(&proof))?;
+            let closed = self.close_decreasing_capture(proof, &obligation.captures, true)?;
+            self.txn
+                .mvars
+                .assign(
+                    obligation.transport,
+                    closed,
+                    AssignmentJustification::UserGiven,
+                )
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+        }
+        Ok(())
     }
 
     /// GuessLex's singleton shortcut counts every SizeOf and complex measure.
@@ -1917,14 +1968,9 @@ impl Context {
         &mut self,
         value: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
-        let Some(state) = &self.well_founded else {
-            return Ok(value.clone());
-        };
-        if !value.has_fvar() {
+        if self.well_founded.is_none() || !value.has_fvar() {
             return Ok(value.clone());
         }
-        let marker = state.marker.clone();
-        let arity = state.parameters.len();
         let mut head = value;
         let mut arguments = Vec::new();
         while let ExprNode::App { f, a } = head.node() {
@@ -1932,8 +1978,21 @@ impl Context {
             arguments.push(a.clone());
             head = f;
         }
-        if !matches!(head.node(), ExprNode::FVar { id } if id == &marker) || arguments.len() < arity
-        {
+        let ExprNode::FVar { id: head } = head.node() else {
+            return Ok(value.clone());
+        };
+        let state = self.well_founded.as_ref().expect("active recursive call");
+        // A mutual group's call names one member's entry: its arity, its own
+        // varying suffix and its packed domain, injected into the shared PSum.
+        let (marker, arity, target) = match &state.mutual {
+            Some(mutual) => match mutual.find(head) {
+                Some(target) => (head.clone(), mutual.arity(target), Some(target)),
+                None => return Ok(value.clone()),
+            },
+            None if head == &state.marker => (head.clone(), state.parameters.len(), None),
+            None => return Ok(value.clone()),
+        };
+        if arguments.len() < arity {
             return Ok(value.clone());
         }
         let state = self.well_founded.as_ref().expect("active recursive call");
@@ -1944,7 +2003,12 @@ impl Context {
         // Only an actual saturated self call needs these small snapshots.
         let fixed = state.fixed.clone();
         let measure_captures = state.measure_captures.clone();
-        let varying = state.varying.clone();
+        let varying = match (&state.mutual, target) {
+            (Some(mutual), Some(target)) => mutual.varying(target),
+            _ => state.varying.clone(),
+        };
+        let mutual = state.mutual.clone();
+        let markers = state.markers();
         let proof_inaccessible = state.proof_inaccessible.clone();
         arguments.reverse();
         for (index, parameter) in &fixed {
@@ -2003,9 +2067,18 @@ impl Context {
             self.tick()?;
             next_arguments.push(self.instantiate(&arguments[index])?);
         }
-        let next = self
-            .pack_well_founded_arguments(domain, &next_arguments)?
-            .value;
+        let next = match (&mutual, target) {
+            (Some(mutual), Some(target)) => {
+                let packed = self
+                    .pack_well_founded_arguments(&mutual.domain(target), &next_arguments)?
+                    .value;
+                self.inject_mutual_argument(domain, target, mutual.len(), packed)?
+            }
+            _ => {
+                self.pack_well_founded_arguments(domain, &next_arguments)?
+                    .value
+            }
+        };
         let at_next = self.substitute(body, &next)?;
         let at_next = self.whnf(&at_next)?;
         let ExprNode::ForallE {
@@ -2063,10 +2136,11 @@ impl Context {
         // subject to the ordinary escape check.
         let captures: Vec<_> = locals
             .into_iter()
-            .filter(|local| local.id != marker)
+            .filter(|local| !markers.contains(&local.id))
             .collect();
         let closed_type = self.close_decreasing_capture(goal.target.clone(), &captures, false)?;
-        if self.elimination_reads(&closed_type)?.contains(&marker) {
+        let reads = self.elimination_reads(&closed_type)?;
+        if markers.iter().any(|marker| reads.contains(marker)) {
             return Err(error(RecursionError::PartialApplication));
         }
         let transport_name = self.fresh_name()?;

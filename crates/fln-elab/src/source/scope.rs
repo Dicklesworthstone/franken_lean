@@ -521,10 +521,9 @@ impl Context {
                     .recursion
                     .as_ref()
                     .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
-                || self
-                    .well_founded
-                    .as_ref()
-                    .is_some_and(|r| &r.name == candidate && !held_back_recursion(candidate))
+                || self.well_founded.as_ref().is_some_and(|r| {
+                    r.target(candidate).is_some() && !held_back_recursion(candidate)
+                })
                 || (self.defining.as_ref() == Some(candidate) && !held_back_recursion(candidate))
                 || self
                     .partial
