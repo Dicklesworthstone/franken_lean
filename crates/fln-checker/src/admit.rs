@@ -95,6 +95,8 @@
 //! *outside* the engine: it calls the public [`infer_with`] and [`whnf_with`]
 //! entry points and never joins their recursion.
 
+#[cfg(test)]
+mod tests;
 mod uniform;
 mod universes;
 use universes::ReconstructionMode;
@@ -9951,23 +9953,21 @@ pub fn admit_quotient_with(
 /// delta-unfolded while checking against it. That is not a precaution this
 /// function takes; it is what `header` is.
 ///
-/// Built through `ConstantEnvironment::build` rather than a second construction
-/// path, so a predeclared environment cannot drift from an ordinary one.
+/// The immutable base has already passed environment validation. Each added
+/// header uses the ordinary validated extension path without rechecking the
+/// retained declarations or copying their bodies.
 fn predeclare_peers(
     environment: &ConstantEnvironment,
     block: &[ConstantEntry],
     skip: usize,
 ) -> Result<ConstantEnvironment, ()> {
-    let mut entries: Vec<ConstantEntry> = environment
-        .constants()
-        .map(|(name, declaration)| ConstantEntry::new(name.clone(), declaration.clone()))
-        .collect();
+    let mut scoped = environment.clone();
     for (index, entry) in block.iter().enumerate() {
         if index == skip {
             continue;
         }
         let declaration = entry.declaration();
-        entries.push(ConstantEntry::new(
+        let header = ConstantEntry::new(
             entry.name().clone(),
             ConstantDeclaration::header(
                 declaration.level_parameters().to_vec(),
@@ -9975,12 +9975,13 @@ fn predeclare_peers(
                 declaration.kind(),
                 declaration.safety(),
             ),
-        ));
+        );
+        match scoped.extend(header, EnvironmentBudget::unlimited()) {
+            EnvironmentOutcome::Complete { environment, .. } => scoped = environment,
+            _ => return Err(()),
+        }
     }
-    match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
-        EnvironmentOutcome::Complete { environment, .. } => Ok(environment),
-        _ => Err(()),
-    }
+    Ok(scoped)
 }
 
 /// KR-977a — the block is a well-formed set.
