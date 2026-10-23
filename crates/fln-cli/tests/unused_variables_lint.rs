@@ -190,6 +190,14 @@ const IDENTICAL: &[(&str, &str)] = &[
     ("indexed", INDEXED),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
+    // A structure instance's field name given a value (`x := 3`) does not read a local `x`; a
+    // field abbreviation (`{ x }`) does.
+    (
+        "struct_instance_fields",
+        "structure T where\n  x : Nat\n  y : Nat\ndef g (x : Nat) : T := { x := 3, y := 4 }\n\
+         def h (y : Nat) : T := { x := 3, y := 4 }\ndef ab (x : Nat) : T := { x, y := 4 }\n\
+         def v (x : Nat) : T := { x := x, y := 4 }\n",
+    ),
     (
         "pattern_vars_off",
         "set_option linter.unusedVariables.patternVars false\ndef p (o : Option Nat) : Nat :=\n  match o with\n  | some v => 0\n  | none => 1\n",
@@ -483,6 +491,43 @@ def a2 : C := { value := 40, proof := rfl, callback := fun n h => n + 2 }
     assert_eq!(
         ours.matches("is not explicitly referenced").count(),
         2,
+        "{ours}"
+    );
+}
+
+/// A `do` element binding the same name (`let s ← e`) shadows a `fun` binder in the elements
+/// after it. A binder read only after such a rebinding is unused (`elab/IRbug`), while one read
+/// in the rebinding's own value or before it is not. Each is as the pinned v4.32.0 prints it
+/// (2026-10-22).
+#[test]
+fn a_do_rebinding_shadows_an_outer_binder_as_the_pin_reads_it() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "def f (b : Bool) : Id String := do
+  let t ← pure \"t\"
+  (fun (s : String) => do
+    let s ← pure (if b then t else \"u\"); pure s) \"\"
+def g (b : Bool) : Id String := do
+  (fun (s : String) => do
+    let s ← pure (if b then s else \"u\"); pure s) \"\"
+def h (b : Bool) : Id String := do
+  (fun (s : String) => do
+    let r ← pure s
+    let s ← pure (if b then r else \"u\"); pure s) \"\"
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "do_shadowing",
+        "prelude\nimport Init.Control.Id\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        1,
         "{ours}"
     );
 }

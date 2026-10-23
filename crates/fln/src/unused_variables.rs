@@ -244,18 +244,59 @@ fn root(name: &Name) -> Name {
 
 /// Whether an identifier in `scope`, other than the binder at `at` itself, may refer to
 /// `name`. A named argument's name (`f (y := 5)`) names a parameter of `f`, never a local, so
-/// it is not one.
+/// it is not one. Nor is a structure instance's field name given a value (`{ x := 3 }`); a
+/// field abbreviation (`{ x }`) is `x := x`, which reads the local.
+///
+/// A `do` element binding the same name (`let s ← e`) shadows it in the elements after it,
+/// which therefore read the new binding; its own value is still read before it binds.
 fn referenced(scope: &Syntax, name: &Name, at: usize) -> bool {
+    referenced_except(scope, name, &[at])
+}
+
+fn referenced_except(scope: &Syntax, name: &Name, binders: &[usize]) -> bool {
     let mut pending = vec![scope];
     while let Some(node) = pending.pop() {
         match node {
             Syntax::Ident { val, .. } => {
-                if root(val) == *name && original_pos(node) != Some(at) {
+                if root(val) == *name
+                    && original_pos(node).is_none_or(|pos| !binders.contains(&pos))
+                {
                     return true;
                 }
             }
+            Syntax::Node { .. }
+                if is_kind(node, &["Term", "doSeqIndent"])
+                    || is_kind(node, &["Term", "doSeqBracketed"]) =>
+            {
+                let bracketed = usize::from(is_kind(node, &["Term", "doSeqBracketed"]));
+                let Some(items) = args(node).get(bracketed).map(args) else {
+                    continue;
+                };
+                for item in items {
+                    match args(item).first().and_then(do_binding) {
+                        Some((bound, pos)) if bound == *name => {
+                            let mut inner = binders.to_vec();
+                            inner.push(pos);
+                            if referenced_except(item, name, &inner) {
+                                return true;
+                            }
+                            break;
+                        }
+                        _ => {
+                            if referenced_except(item, name, binders) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // The brackets of `do { … }` hold no identifier.
+            }
             Syntax::Node { args, .. } if is_kind(node, &["Term", "namedArgument"]) => {
                 pending.extend(args.iter().skip(2));
+            }
+            Syntax::Node { args: fields, .. } if is_kind(node, &["Term", "structInstField"]) => {
+                let valued = fields.get(1).is_some_and(|rest| !args(rest).is_empty());
+                pending.extend(fields.iter().skip(usize::from(valued)));
             }
             Syntax::Node { args, .. } => pending.extend(args.iter()),
             Syntax::Atom { .. } | Syntax::Missing => {}
