@@ -1225,6 +1225,49 @@ fn literal_nat_offsets_refute_their_own_base_without_the_compiled_body() {
     }
 }
 
+#[test]
+fn symbolic_nat_subtraction_uses_smart_delta_and_keeps_neutral_conversions() {
+    // The small arithmetic seed intentionally gives sub/pred axiom headers.
+    // Symbolic delta needs their actual logical bodies and helper closure.
+    let mut base = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
+    for declaration in fln_elab::seed::imported_nat_intrinsic_model_declarations(
+        &Name::from_components(["Nat", "sub"]),
+    )
+    .expect("the pinned subtraction model exists")
+    {
+        publish_in(&mut base, declaration);
+    }
+    let x = local(&mut base, "symbolicSubtractionBase", nat());
+    for expression in [
+        nat_operation("sub", &[x.clone(), numeral(0)]),
+        nat_operation("sub", &[successor(x.clone()), numeral(1)]),
+    ] {
+        for (left, right) in [(&expression, &x), (&x, &expression)] {
+            let mut txn = base.clone();
+            let report = txn
+                .unify(left, right, default_budget())
+                .unwrap_or_else(|problem| panic!("{expression:?}: {problem:?}"));
+            assert!(report.expression_assignments.is_empty());
+            assert_semantics_unchanged(&txn, &base);
+        }
+    }
+    // A symbolic subtraction cannot convert to its input. The ordinary
+    // budget must yield a negative answer, rather than expand the compiled
+    // course-of-values body until the equality probe exhausts its fuel.
+    for k in [3, 99] {
+        let subtracted = nat_operation("sub", &[x.clone(), numeral(k)]);
+        for (left, right) in [(&subtracted, &x), (&x, &subtracted)] {
+            let mut txn = base.clone();
+            let result = txn.unify(left, right, default_budget());
+            assert!(
+                matches!(&result, Err(UnificationError::Deferred(_))),
+                "k={k}: {result:?}"
+            );
+            assert_semantics_unchanged(&txn, &base);
+        }
+    }
+}
+
 /// Two applications headed by different inductive types are never definitionally equal: the
 /// pin's `isDefEqApp` compares arguments only under one function. Decomposed here, the
 /// argument equations of `HEq Nat (x + y) Nat ?c =?= Eq Nat ?a.succ x` assigned `?c` and

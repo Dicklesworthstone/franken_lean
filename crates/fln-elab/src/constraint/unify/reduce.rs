@@ -651,7 +651,18 @@ impl Engine<'_> {
         }))
     }
 
-    fn unfold_delta(&mut self, candidate: DeltaCandidate) -> Result<Expr, UnificationError> {
+    fn unfold_delta(
+        &mut self,
+        candidate: DeltaCandidate,
+        locals: &LocalContext,
+    ) -> Result<Expr, UnificationError> {
+        // Default comparison delays outer delta until this rung. Use the same
+        // smart step as eager WHNF: unfolding the compiled recursor instead can
+        // expand a symbolic `n - k` before comparison ever sees its blocked head.
+        let head = Expr::const_(candidate.name.clone(), candidate.levels.clone());
+        if let Some(step) = self.nat_literal_step(&head, &candidate.arguments, locals)? {
+            return Ok(step);
+        }
         self.scan(&candidate.value)?;
         let value = crate::universe::parameters::instantiate(
             || self.meter.node(),
@@ -675,6 +686,7 @@ impl Engine<'_> {
         &mut self,
         left: &Expr,
         right: &Expr,
+        locals: &LocalContext,
     ) -> Result<Option<(Expr, Expr)>, UnificationError> {
         if self.budget.transparency != UnificationTransparency::Default {
             return Ok(None);
@@ -684,10 +696,10 @@ impl Engine<'_> {
         let (left_candidate, right_candidate) = match (left_candidate, right_candidate) {
             (None, None) => return Ok(None),
             (Some(candidate), None) => {
-                return Ok(Some((self.unfold_delta(candidate)?, right.clone())));
+                return Ok(Some((self.unfold_delta(candidate, locals)?, right.clone())));
             }
             (None, Some(candidate)) => {
-                return Ok(Some((left.clone(), self.unfold_delta(candidate)?)));
+                return Ok(Some((left.clone(), self.unfold_delta(candidate, locals)?)));
             }
             (Some(left), Some(right)) => (left, right),
         };
@@ -720,15 +732,17 @@ impl Engine<'_> {
             std::cmp::Ordering::Equal
         };
         match preference {
-            std::cmp::Ordering::Less => {
-                Ok(Some((self.unfold_delta(left_candidate)?, right.clone())))
-            }
-            std::cmp::Ordering::Greater => {
-                Ok(Some((left.clone(), self.unfold_delta(right_candidate)?)))
-            }
+            std::cmp::Ordering::Less => Ok(Some((
+                self.unfold_delta(left_candidate, locals)?,
+                right.clone(),
+            ))),
+            std::cmp::Ordering::Greater => Ok(Some((
+                left.clone(),
+                self.unfold_delta(right_candidate, locals)?,
+            ))),
             std::cmp::Ordering::Equal => Ok(Some((
-                self.unfold_delta(left_candidate)?,
-                self.unfold_delta(right_candidate)?,
+                self.unfold_delta(left_candidate, locals)?,
+                self.unfold_delta(right_candidate, locals)?,
             ))),
         }
     }

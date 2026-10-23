@@ -1083,7 +1083,7 @@ impl Engine<'_> {
                     // apparent cycle such as ?A = Identity ?A needs that rung
                     // before its occurs failure is final. Only a permitted
                     // delta step can retry; real cycles retain the same error.
-                    if let Some((left, right)) = self.lazy_delta(&left, &right)? {
+                    if let Some((left, right)) = self.lazy_delta(&left, &right, locals)? {
                         pending.push_front((left, right, locals.clone()));
                         return Ok(());
                     }
@@ -1121,7 +1121,7 @@ impl Engine<'_> {
         if self.try_definition_congruence(&left, &right, locals)? {
             return Ok(());
         }
-        if let Some((left, right)) = self.lazy_delta(&left, &right)? {
+        if let Some((left, right)) = self.lazy_delta(&left, &right, locals)? {
             pending.push_front((left, right, locals.clone()));
             return Ok(());
         }

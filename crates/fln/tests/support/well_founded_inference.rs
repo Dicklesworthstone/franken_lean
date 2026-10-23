@@ -218,6 +218,11 @@ pub(super) fn assert_omitted_result_types(base: &Engine) {
             "def answer : String := carry \"inferred\" 3",
             ClosedVmValue::String("inferred".to_string()),
         ),
+        (
+            "def indeterminate (n : Nat) := if h : 0 < n then indeterminate (n - 1) else (fun (x : Nat) => x)\ntermination_by n",
+            "def answer : Nat := indeterminate 3 52",
+            ClosedVmValue::Scalar(52),
+        ),
     ] {
         let source = format!("{definition}\n{answer}");
         match base.execute_source_definitions(

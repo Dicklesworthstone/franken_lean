@@ -1024,6 +1024,22 @@ impl Context {
         })();
         self.well_founded = None;
         self.txn.lctx = saved;
+        // An unannotated lambda can leave its domain hole in the branch
+        // context. Any pending inference pass may refuse that capture. Report
+        // the still-unknown omitted result after restoring the outer scope;
+        // resolved types and internal/resource failures keep their own error.
+        if matches!(&result,
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)))
+                if matches!(error.as_ref(), UnificationError::Deferred(
+                    UnificationDeferred::EscapingLocal(_))))
+            && self
+                .omitted_results
+                .iter()
+                .any(|omitted| omitted.body == expected)
+        {
+            let result_type = self.instantiate(&expected)?;
+            self.require_resolved_terms(std::slice::from_ref(&result_type))?;
+        }
         if matches!(&result, Ok(Attempt::Complete(_))) {
             self.well_founded_definition = true;
         }
