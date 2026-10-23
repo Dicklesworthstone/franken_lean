@@ -147,6 +147,7 @@ impl Engine<'_> {
             fact_cache: HashMap::new(),
             local_facts: local_facts::Cache::default(),
             nat_literals_valid: self.nat_literals_valid,
+            nat_sub_model_valid: self.nat_sub_model_valid,
             projection_registry: self.projection_registry.clone(),
             // A speculative argument guess cannot invoke an external owner:
             // its side effects are not part of this transaction's checkpoint.
@@ -175,6 +176,7 @@ impl Engine<'_> {
                 self.fact_cache = trial.fact_cache;
                 self.local_facts = trial.local_facts;
                 self.nat_literals_valid = trial.nat_literals_valid;
+                self.nat_sub_model_valid = trial.nat_sub_model_valid;
                 self.projection_registry = trial.projection_registry;
                 Ok(CongruenceResult::Solved)
             }
