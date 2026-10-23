@@ -70,11 +70,32 @@ fn root_ident(components: &[&str]) -> Syntax {
     }
 }
 
-/// `by first | done | assumption`: the alternatives of the pin's `get_elem_tactic`
-/// (`Init/Tactics.lean`) this frontend runs as the pin does. The pin then tries
-/// `get_elem_tactic_extensible` (`omega`, `simp +arith; done`, `trivial`, ...); here the
-/// `first` fails instead, and the index is refused.
+/// `by first | done | assumption | omega`: the pin's `get_elem_tactic` (`Init/Tactics.lean`)
+/// tries `done`, `assumption`, then `get_elem_tactic_extensible`, whose `macro_rules` include
+/// `omega` (vendored `Init/Tactics.lean:2573`; also `simp +arith; done`, `trivial`, the `Fin`
+/// and range rules). Only `omega` of
+/// those runs here, so an index proved here is proved at the pin; one it does not prove is
+/// refused.
 fn get_elem_tactic() -> Syntax {
+    // `"omega" optConfig`, with no configuration.
+    let omega = || {
+        Syntax::node(
+            Name::from_components(["group"]),
+            vec![
+                atom("|"),
+                Syntax::node(
+                    parser_kind(&["Tactic", "tacticSeq"]),
+                    vec![Syntax::node(
+                        parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                        vec![null(vec![Syntax::node(
+                            parser_kind(&["Tactic", "omega"]),
+                            vec![atom("omega"), null(Vec::new())],
+                        )])],
+                    )],
+                ),
+            ],
+        )
+    };
     let sequence = |tactic: Syntax| {
         Syntax::node(
             parser_kind(&["Tactic", "tacticSeq"]),
@@ -104,7 +125,11 @@ fn get_elem_tactic() -> Syntax {
                 parser_kind(&["Tactic", "first"]),
                 vec![
                     atom("first"),
-                    null(vec![alternative("done"), alternative("assumption")]),
+                    null(vec![
+                        alternative("done"),
+                        alternative("assumption"),
+                        omega(),
+                    ]),
                 ],
             )),
         ],

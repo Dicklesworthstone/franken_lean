@@ -28,6 +28,8 @@ struct Facts {
     pending: VecDeque<(Expr, Expr)>,
     processed: HashSet<Expr>,
     subtractions: HashSet<Expr>,
+    /// `Fin.val n i` atoms whose bound `i < n` is already a fact.
+    fins: HashSet<Expr>,
     linear: Vec<(Expr, Expr)>,
 }
 impl Facts {
@@ -36,6 +38,7 @@ impl Facts {
             pending,
             processed: HashSet::new(),
             subtractions: HashSet::new(),
+            fins: HashSet::new(),
             linear: Vec::new(),
         }
     }
@@ -409,6 +412,19 @@ impl Context {
                         ),
                     )?;
                 }
+            }
+            // The pin's `analyzeAtom` (vendored `Lean/Elab/Tactic/Omega/OmegaM.lean:178-179`): a
+            // `Fin.val n i` atom brings its bound `↑i < n`, `Fin.isLt n i`.
+            if !value.has_loose_bvars()
+                && let ExprNode::App { f, a: index } = value.node()
+                && let ExprNode::App { f: head, a: bound } = f.node()
+                && is_constant(head, "Fin.val")
+                && facts.fins.insert(value.clone())
+            {
+                facts.push(
+                    apply(constant("Nat.lt"), [value.clone(), bound.clone()]),
+                    apply(constant("Fin.isLt"), [bound.clone(), index.clone()]),
+                )?;
             }
             match value.node() {
                 ExprNode::App { f, a } => {

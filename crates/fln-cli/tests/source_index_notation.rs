@@ -5,9 +5,9 @@
 //! - `x[i]?` is `getElem? x i`;
 //! - `x[i]!` is `getElem! x i`.
 //!
-//! The proof is attempted only by the first alternatives of the pin's `get_elem_tactic`, `done` then
-//! `assumption`, which run here as they do there. Where the pin goes on to
-//! `get_elem_tactic_extensible` (`omega`, `simp +arith`, ...), the index is refused here. Every
+//! The proof is attempted by `done`, `assumption` and then `omega`, one of the pin's
+//! `get_elem_tactic_extensible` rules, where its closure declares it. Where the pin goes on to its
+//! other rules (`simp +arith`, `trivial`, ...), the index is refused here. Every
 //! program here was run through the pinned `lean` v4.32.0 with the same header first
 //! (2026-10-11), with the same verdict.
 #![forbid(unsafe_code)]
