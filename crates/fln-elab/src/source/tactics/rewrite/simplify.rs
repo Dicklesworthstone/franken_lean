@@ -882,8 +882,29 @@ impl Context {
                 }
             }
             rules.into_iter().map(SimpRule::Global).collect()
-        } else {
+        } else if dsimp {
             Vec::new()
+        } else {
+            // The pin's `simp only` set starts as `eq_self` and `iff_self` (`simpOnlyBuiltins`,
+            // `Lean/Elab/Tactic/Simp.lean:512,565`) before its arguments, so an erasure in them
+            // applies. The default set has both as `@[simp]` (`Init/SimpLemmas.lean:36,272`).
+            // An environment declaring neither (the source seed) keeps an empty set.
+            let mut builtins = Vec::new();
+            for name in [["eq_self"], ["iff_self"]] {
+                self.tick()?;
+                let declaration = Name::from_components(name);
+                if self.txn.env.contains(&declaration) {
+                    builtins.push(SimpRule::Global(scope::simp::SimpEntry {
+                        declaration,
+                        proof: None,
+                        // `@[simp]`'s default priority.
+                        priority: 1000,
+                        reverse: false,
+                        order: 0,
+                    }));
+                }
+            }
+            builtins
         };
         for _ in &defaults {
             self.tick()?;
@@ -1238,10 +1259,12 @@ impl Context {
     /// that are absent from this tactic's explicit rule set.
     ///
     /// The pin closes a goal only once its simp result is `True` (`simpTargetCore`,
-    /// `Lean/Meta/Tactic/Simp/Main.lean:784`). A quantified goal whose leaf closes becomes
-    /// `∀ y, True` there, and `True` only through `implies_true`, so `rules` decide whether
-    /// it closes: `∀ y : Nat, y + 0 = y := by simp only [Nat.add_zero]` is "unsolved goals
-    /// ⊢ ∀ (y : Nat), True" at v4.32.0, and `by simp` accepts it.
+    /// `Lean/Meta/Tactic/Simp/Main.lean:784`), every reflexive leaf having become `True` through
+    /// `eq_self` or `iff_self`, which are rules here too wherever they are declared. In the
+    /// source seed, which declares neither, the reflexive closing below stands in for them; a
+    /// quantified goal whose leaf closes is `∀ y, True` at the pin, and `True` only through
+    /// `implies_true`, so `rules` decide whether it closes: `∀ y : Nat, y + 0 = y := by simp
+    /// only [Nat.add_zero]` is "unsolved goals ⊢ ∀ (y : Nat), True" at v4.32.0.
     fn simp_reflexivity(
         &mut self,
         goal: &ProofGoal,
@@ -1259,7 +1282,13 @@ impl Context {
                 self.constant(&Name::from_components(["True", "intro"]))?
                     .value,
             )
+        } else if self.txn.env.contains(&Name::from_components(["eq_self"])) {
+            // Where `eq_self` is declared, `simp only` and the default set both carry it and
+            // `iff_self` as rules, which rewrite every reflexive leaf to `True`. The pin closes
+            // nothing else: `n = n` with `eq_self` erased, `HEq a a` and `n + 0 = n` stay open.
+            return Ok(None);
         } else if matches!(target.node(), ExprNode::ForallE { .. }) {
+            // The source seed declares no `eq_self`: reflexive leaves close here instead.
             if !self.simp_rules_close_implications(rules)? {
                 return Ok(None);
             }

@@ -585,6 +585,12 @@ impl Context {
         let Some((rule, alpha, pattern, holes, rule_instances)) = prepared? else {
             return Ok(None);
         };
+        // The pin's simp unifies at reducible transparency (`withReducible`,
+        // `Lean/Meta/Tactic/Simp/Types.lean:966`); a selection query here runs at `instances`,
+        // which unfolds `Nat.add` and so would close `n + 0 = n`. A pattern relating one
+        // variable to itself (`eq_self`'s `?a = ?a`, `iff_self`'s `?p ↔ ?p`) is a reflexivity
+        // test, so its occurrence's two sides must also agree at reducible transparency.
+        let reflexive = inside_out && reflexive_pattern(&pattern);
         let mut pending = vec![(target, false)];
         let mut visited = HashSet::new();
         while let Some((term, exit)) = pending.pop() {
@@ -625,7 +631,20 @@ impl Context {
             let mut trial = template.rewrite_trial();
             trial.txn.budget = self.txn.budget.clone();
             let attempt = (|| {
-                if !trial.match_rewrite_occurrence(&pattern, &alpha, term)? {
+                let matched = if reflexive {
+                    // The pattern selects `l = l` (or `l ↔ l`); whether `r` is `l` is the pin's
+                    // reducible test alone, which instances-transparency selection would widen.
+                    match reflexive_instance(term) {
+                        Some(instance) => {
+                            trial.reflexive_sides_agree(term)?
+                                && trial.match_rewrite_occurrence(&pattern, &alpha, &instance)?
+                        }
+                        None => false,
+                    }
+                } else {
+                    trial.match_rewrite_occurrence(&pattern, &alpha, term)?
+                };
+                if !matched {
                     return Ok(None);
                 }
                 if inside_out && !trial.synthesize_simp_rule_instances(&holes, &rule_instances)? {
@@ -714,6 +733,80 @@ impl Context {
         }
         Ok(None)
     }
+}
+
+impl Context {
+    /// Whether the two sides of an `=` or `↔` occurrence agree as the pin's reducible
+    /// `isDefEq` decides it, unfolding no local `let`. For `=` that is the automatic closure's
+    /// test, which adds the pin's `isDefEqOffset` (Nat offsets and closed literal arithmetic,
+    /// `Lean/Meta/Offset.lean`) to reducible conversion.
+    fn reflexive_sides_agree(&mut self, occurrence: &Expr) -> Result<bool, NatDefinitionElabError> {
+        if equality_target(occurrence).is_some() {
+            let mut check = self.rewrite_trial();
+            let agreed = (|| {
+                let hole = check.hole(occurrence.clone())?;
+                let ExprNode::MVar { id } = hole.node() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                let goal = ProofGoal {
+                    id: id.clone(),
+                    target: occurrence.clone(),
+                    lctx: check.txn.lctx.clone(),
+                    introduced: Vec::new(),
+                };
+                Ok(check
+                    .automatic_reflexivity_candidate(&goal, false)?
+                    .is_some())
+            })();
+            self.charge_rewrite_trial(&check);
+            return agreed;
+        }
+        let Some((left, right)) = reflexive_sides(occurrence) else {
+            return Ok(false);
+        };
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.zeta_delta = false;
+        budget.max_assignments = 0;
+        self.proof_types_match_with_budget(&left, &right, budget)
+    }
+}
+
+/// The two related sides of `@Eq α a b` or `Iff a b`.
+fn reflexive_sides(expr: &Expr) -> Option<(Expr, Expr)> {
+    if let Some((_, _, left, right)) = equality_target(expr) {
+        return Some((left, right));
+    }
+    let ExprNode::App { f, a: right } = expr.node() else {
+        return None;
+    };
+    let ExprNode::App { f, a: left } = f.node() else {
+        return None;
+    };
+    matches!(f.node(), ExprNode::Const { name, levels }
+        if levels.is_empty() && *name == Name::from_components(["Iff"]))
+    .then(|| (left.clone(), right.clone()))
+}
+
+/// `occurrence` with its right side replaced by its left: `@Eq α l l` or `Iff l l`.
+fn reflexive_instance(occurrence: &Expr) -> Option<Expr> {
+    if let Some((level, alpha, left, _)) = equality_target(occurrence) {
+        return Some(app(
+            Expr::const_(Name::from_components(["Eq"]), vec![level]),
+            [alpha, left.clone(), left],
+        ));
+    }
+    let (left, _) = reflexive_sides(occurrence)?;
+    Some(app(
+        Expr::const_(Name::from_components(["Iff"]), Vec::new()),
+        [left.clone(), left],
+    ))
+}
+
+/// A pattern whose two sides are one and the same metavariable.
+fn reflexive_pattern(pattern: &Expr) -> bool {
+    reflexive_sides(pattern).is_some_and(|(left, right)| {
+        matches!((left.node(), right.node()), (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) if a == b)
+    })
 }
 
 #[cfg(test)]

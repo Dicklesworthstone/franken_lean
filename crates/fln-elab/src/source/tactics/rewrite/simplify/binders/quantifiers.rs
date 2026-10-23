@@ -88,7 +88,8 @@ impl Context {
     /// which even `simp only` adds (`simpOnlyBuiltins`, `Lean/Elab/Tactic/Simp.lean:512`), and
     /// `∀ y, True` is then left unsolved. A rule counts when it is a global selected forward
     /// whose statement is `implies_true`'s; an applied instance (`implies_true Nat`) or a local
-    /// is not recognized, so such a set leaves the quantified goal open.
+    /// is not recognized, so such a set leaves the quantified goal open. Only an environment
+    /// without `eq_self` (the source seed) asks; elsewhere `implies_true` rewrites as a rule.
     pub(in crate::source::tactics::rewrite::simplify) fn simp_rules_close_implications(
         &mut self,
         rules: &[SimpRule<'_>],

@@ -82,6 +82,12 @@ impl Context {
         if !lhs.offset && !rhs.offset {
             return Ok(false);
         }
+        // An offset against a term that is neither an offset nor a numeral is undecided at the
+        // pin (`Lean/Meta/Offset.lean:136-139`), so reducible conversion alone decides it: `n + 0`
+        // is not `n` there, `Nat.add` being only implicit-reducible.
+        if lhs.offset != rhs.offset && !lhs.numeric && !rhs.numeric {
+            return Ok(false);
+        }
         if !(lhs.numeric && rhs.numeric)
             && (lhs.numeric != rhs.numeric
                 || !self.proof_types_match_with_budget(&lhs.base, &rhs.base, budget)?)

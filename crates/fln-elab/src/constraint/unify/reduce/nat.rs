@@ -508,10 +508,23 @@ impl Engine<'_> {
                 ));
             }
         }
+        // Against a bare symbolic term the pin's `isDefEqOffset` decides nothing
+        // (`Lean/Meta/Offset.lean:136-139`): only unfolding `Nat.add`, which is
+        // implicit-reducible, removes even a zero offset. Below `instances` that
+        // unfolding is unavailable, so `n + 0 =?= n` fails at reducible
+        // transparency, as simp's `eq_self` test does at the pin.
+        if matches!(
+            self.budget.transparency,
+            UnificationTransparency::None | UnificationTransparency::Abbreviations
+        ) && ((lhs.found && !rhs.found && !rhs.literal)
+            || (rhs.found && !lhs.found && !lhs.literal))
+        {
+            return Ok(None);
+        }
         // The pin cancels against another offset or a literal. A positive
         // one-sided offset against a bare symbolic term gives no new equation.
         // In particular, rewriting n = succ n to n = n+1 would cycle with delta
-        // on Nat.add. A zero offset may always remove its redundant wrapper.
+        // on Nat.add. A zero offset may otherwise remove its redundant wrapper.
         if (lhs.found
             && !rhs.found
             && !rhs.literal
