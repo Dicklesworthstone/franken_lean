@@ -8792,10 +8792,6 @@ impl Engine {
                 _ => None,
             };
             let environment = engine.environment();
-            let indexed_family = |name: &Name| {
-                matches!(environment.find(name),
-                    Some(ConstantInfo::Induct(family)) if family.num_indices > 0)
-            };
             // A constant this source declared is absent from the imported environment.
             let local = |name: &Name| {
                 engine
@@ -8818,19 +8814,27 @@ impl Engine {
                     .filter_map(|(name, info)| match info {
                         ConstantInfo::Ctor(ctor) => match environment.find(&ctor.induct) {
                             Some(ConstantInfo::Induct(family)) if family.num_indices > 0 => {
-                                Some(unused_variables::IndexedConstructor {
-                                    name: name.clone(),
-                                    local: local(name),
-                                    unread: unused_variables::unread_fields(
-                                        &ctor.base.type_,
-                                        ctor.num_params,
-                                        family.num_indices,
-                                        indexed_family,
-                                    ),
-                                })
+                                Some(unused_variables::IndexedConstructor::new(
+                                    name.clone(),
+                                    local(name),
+                                    ctor.induct.clone(),
+                                    &ctor.base.type_,
+                                    ctor.num_params,
+                                    family.num_indices,
+                                ))
                             }
                             _ => None,
                         },
+                        _ => None,
+                    })
+                    .collect(),
+                families: environment
+                    .constants()
+                    .filter_map(|(name, info)| match info {
+                        ConstantInfo::Induct(family) if family.num_indices > 0 => Some((
+                            name.clone(),
+                            (family.num_params as usize, family.num_indices as usize),
+                        )),
                         _ => None,
                     })
                     .collect(),
@@ -8859,12 +8863,33 @@ impl Engine {
                     let body_ran_tactics = declared.is_some_and(|(_, _, value, _)| {
                         unused_variables::omits_tactic_field(syntax, value, engine.environment())
                     });
+                    // A command compiled by well-founded recursion proves its decreasing goals
+                    // with tactics after its body, whose metavariable assignments the pin reads
+                    // for the body's binders' uses.
+                    let well_founded = linted.iter().filter(|(index, _)| *index == command).any(
+                        |(_, declaration)| match declaration {
+                            Declaration::Defn(value) => {
+                                unused_variables::applies_well_founded_fixpoint(&value.value)
+                            }
+                            Declaration::Thm(value) => {
+                                unused_variables::applies_well_founded_fixpoint(&value.value)
+                            }
+                            Declaration::Opaque(value) => {
+                                unused_variables::applies_well_founded_fixpoint(&value.value)
+                            }
+                            Declaration::Mutual(values) => values.iter().any(|value| {
+                                unused_variables::applies_well_founded_fixpoint(&value.value)
+                            }),
+                            _ => false,
+                        },
+                    );
                     let mut unused = Vec::new();
-                    if !body_ran_tactics {
+                    if !body_ran_tactics && !well_founded {
                         unused.extend(unused_variables::unused_pattern_variables(
                             syntax,
                             options,
                             &constructors,
+                            declared.map(|(_, type_, _, _)| type_),
                         ));
                         unused.extend(unused_variables::unused_fun_binders(
                             syntax,

@@ -44,9 +44,11 @@ def p6 (o : Option Nat) : Nat :=
 ";
 
 /// Patterns under an indexed family's constructor, where the index is a variable the match
-/// generalizes: the pin warns about the fields read here (`x`, `b : Fin (n + 1)`) and not about
-/// an index field (`k`) or one of an indexed family's type (`t`), which this door leaves
-/// unread. `Box.mk n` names no indexed constructor although `Tagged.mk` is spelled like it.
+/// refines: the pin's match elaborator records each alternative's last declared variable (`t`)
+/// as an alias of the refined index, which is used, and reads an index field (`k`) through the
+/// index's inaccessible term, so it warns about `x` and `b : Fin (n + 1)` only (vendored
+/// `Lean/Elab/Match.lean:828-831`). `Box.mk n` names no indexed constructor although
+/// `Tagged.mk` is spelled like it.
 /// Each family's constructors are spelled apart: the pin resolves a dotted head (`.cons`) by the
 /// expected type, which this door does not read, so constructors spelled alike are read together
 /// and only the fields all of them read stay decided.
@@ -80,6 +82,67 @@ def i4 {A : Type} {m : Nat} (v : IVec A m) : Nat :=
   | .inil => 0
 def i5 : Wrap Box → Nat
   | Wrap.wrap (Box.mk n) => 0
+";
+
+/// Equations over an indexed family, the shape of `elab/def2`. With the index bound by a
+/// leading `_` (`mapHead1`, `h2`, `q2`) the match refines nothing and every unused variable
+/// warns, `bv` included. With the index a variable bound outside the match (`h3`, `t1`, `t3`,
+/// `c1`, `tm`, `tn`) the pin refines it, and its match elaborator records each alternative's last
+/// declared pattern variable as an alias of that index, which the signature uses: `bv` in `h3`
+/// and `tn`, `a` in `c1` (`nil` declares nothing), but the hidden `_` in `t3` and a named
+/// pattern's equation in `t1`. `h2` and `h3` are `noncomputable` only because this engine's
+/// compiler refuses their dependent `Nat` recursor motive.
+const INDEXED_EQUATIONS: &str = "universe u
+inductive Vec (α : Type u) : Nat → Type u
+| nil  : Vec α 0
+| cons : α → {n : Nat} → Vec α n → Vec α (n+1)
+open Vec
+variable {α : Type u}
+variable (f : α → α → α)
+def mapHead1 : {n : Nat} → Vec α n → Vec α n → Vec α n
+| _, nil, nil => nil
+| _, cons a va, cons b bv => cons (f a b) va
+noncomputable def h2 : {n : Nat} → Vec Nat n → Vec Nat n → Nat
+| _, nil, nil => 0
+| _, cons a va, cons b bv => a + b
+noncomputable def h3 : Vec Nat n → Vec Nat n → Nat
+| nil, nil => 0
+| cons a va, cons b bv => a + b
+def t1 : Vec Nat n → Nat
+  | x@(cons h t) => h
+  | _ => 0
+def t3 : Vec Nat n → Nat
+  | cons a _ => 0
+  | _ => 1
+def c1 : Vec Nat n → Nat
+  | cons a nil => 0
+  | _ => 1
+def tm {m : Nat} (v : Vec Nat m) : Nat :=
+  match v with
+  | cons a va => 0
+  | nil => 1
+def tn : Vec Nat n → Nat
+  | cons a (cons b bv) => 0
+  | _ => 1
+def q2 : (n : Nat) → Vec Nat n → Nat
+  | _, cons a va => 0
+  | _, nil => 1
+";
+
+/// Under an indexed constructor whose index the match does not refine (an applied index, one
+/// bound by `_`) every unused variable warns; inside a named pattern the alias is the pattern's
+/// equation, so `t` warns too.
+const INDEXED_UNALIASED: &str = "inductive IVec (A : Type) : Nat → Type where
+  | nil : IVec A 0
+  | cons {n : Nat} (head : A) (tail : IVec A n) : IVec A (n + 1)
+def s1 {A : Type} {m : Nat} : IVec A (m + 1) → Nat
+  | .cons x t => 1
+def s2 {A : Type} : {n : Nat} → IVec A n → IVec A n → A → A
+  | _, .cons a va, .cons b bv, _ => a
+  | _, .nil, .nil, z => z
+def s3 {A : Type} {m : Nat} : IVec A m → Nat
+  | w@(.cons x t) => 1
+  | .nil => 0
 ";
 
 /// `fun` binders (plain, typed, grouped, a tuple pattern, `_`) and the binder of an implicit
@@ -188,6 +251,8 @@ const IDENTICAL: &[(&str, &str)] = &[
     ("locals", LOCALS),
     ("patterns", PATTERNS),
     ("indexed", INDEXED),
+    ("indexed_equations", INDEXED_EQUATIONS),
+    ("indexed_unaliased", INDEXED_UNALIASED),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
     // A structure instance's field name given a value (`x := 3`) does not read a local `x`; a
@@ -221,10 +286,12 @@ const IDENTICAL: &[(&str, &str)] = &[
 ];
 
 /// A tactic body with `where` helpers is left undecided: the pin warns about `m` here, and
-/// this door prints nothing for it rather than read a term the pin need not share. Under an
-/// indexed constructor whose index the match does not generalize (an applied index, one bound
-/// by `_`) or inside a named pattern, the pin warns about `t`, `va` and `bv` too, which this
-/// door leaves unread.
+/// this door prints nothing for it rather than read a term the pin need not share. Where this
+/// door bounds how many trailing variables the pin's match aliases rather than counting them,
+/// it reads fewer: two refined indices alias `bv` and the second `cons`'s hidden implicit, so the
+/// pin warns about `b`, which this door leaves unread (`t4`); a `match` whose discriminants'
+/// types it does not read is bounded by its constructors' indices, though `m` is a
+/// discriminant here and nothing is aliased (`tm2`).
 const SUBSET: &[(&str, &str)] = &[
     (
         "tactic_where",
@@ -233,18 +300,18 @@ where helper (k : Nat) : Nat := by exact k
 ",
     ),
     (
-        "indexed_unread",
-        "inductive IVec (A : Type) : Nat → Type where
-  | nil : IVec A 0
-  | cons {n : Nat} (head : A) (tail : IVec A n) : IVec A (n + 1)
-def s1 {A : Type} {m : Nat} : IVec A (m + 1) → Nat
-  | .cons x t => 1
-def s2 {A : Type} : {n : Nat} → IVec A n → IVec A n → A → A
-  | _, .cons a va, .cons b bv, _ => a
-  | _, .nil, .nil, z => z
-def s3 {A : Type} {m : Nat} : IVec A m → Nat
-  | w@(.cons x t) => 1
-  | .nil => 0
+        "indexed_bounded",
+        "inductive Vec (α : Type) : Nat → Type
+| nil  : Vec α 0
+| cons : α → {n : Nat} → Vec α n → Vec α (n+1)
+open Vec
+def t4 : Vec Nat n → Vec Nat m → Nat
+  | cons a va, cons b bv => 0
+  | _, _ => 1
+def tm2 {m : Nat} (v : Vec Nat m) : Nat :=
+  match m, v with
+  | _, cons a va => 0
+  | _, nil => 1
 ",
     ),
 ];
@@ -354,6 +421,8 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
         ("linted", LINTED, 4),
         ("patterns", PATTERNS, 6),
         ("indexed", INDEXED, 6),
+        ("indexed_equations", INDEXED_EQUATIONS, 12),
+        ("indexed_unaliased", INDEXED_UNALIASED, 8),
         ("functions", FUNCTIONS, 8),
         ("scopes", SCOPES, 7),
         ("tactics", TACTICS, 8),
@@ -493,6 +562,65 @@ def a2 : C := { value := 40, proof := rfl, callback := fun n h => n + 2 }
         2,
         "{ours}"
     );
+}
+
+/// A declaration compiled by well-founded recursion proves its decreasing goals with tactics
+/// after its body, and the pin's linter counts every variable their metavariable assignments
+/// hold as used, the body's own elaboration included. So `elab/879`'s and `elab/wfOmega`'s `h`
+/// warns nowhere, nor does an unused `fun` binder far from the recursive call, while the same
+/// shapes without well-founded recursion (`k`, and `s` by structural recursion) warn. As the
+/// pinned v4.32.0 prints it (2026-10-23). This door reads no binder of such a body: where the
+/// pin's metavariables reach no binder (`g14`'s `w`) it prints nothing, and a signature binder
+/// the compiled value carries (`g9`'s `u`) is not read as unused either.
+#[test]
+fn a_well_founded_body_is_read_as_the_pin_reads_it() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let header = "prelude\nimport Init.Omega\n";
+    let program = "variable (a : Nat)
+def foo1 (b c : Nat) := if h : b = 0 then a + c else foo1 (b - 1) c
+termination_by b
+def foo (n : Nat) :=
+  if h : n < 99 then 0 else foo (n - 99)
+def g (n : Nat) : Nat := if h : n = 7 then 0 else if n = 0 then 0 else g (n - 1)
+def g10 (n : Nat) : Nat := (fun (y : Nat) => 0) 1 + if n = 0 then 0 else g10 (n - 1)
+def k (n : Nat) : Nat := if h : n < 99 then 0 else 1
+def s : Nat → Nat
+  | 0 => 0
+  | n+1 => if h : n = 0 then 0 else s n
+";
+    let (ours, pinned) = outputs_under(&lib, &root, "well_founded", header, program);
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        2,
+        "{ours}"
+    );
+    let program = "def g9 (n : Nat) (u : Nat) : Nat := if n = 0 then 0 else g9 (n - 1) 0
+def g14 (n : Nat) : Nat :=
+  match n with
+  | 0 => 0
+  | k+1 => (fun (w : Nat) => g14 k) 3
+termination_by n
+";
+    let (ours, pinned) = outputs_under(&lib, &root, "well_founded_missing", header, program);
+    let pinned = messages(&pinned);
+    assert_eq!(
+        pinned
+            .iter()
+            .filter(|message| message.contains("is not explicitly referenced"))
+            .count(),
+        2,
+        "{pinned:?}"
+    );
+    for message in messages(&ours) {
+        assert!(
+            pinned.contains(&message),
+            "invented {message}\npin: {pinned:?}"
+        );
+    }
 }
 
 /// A `do` element binding the same name (`let s ← e`) shadows a `fun` binder in the elements

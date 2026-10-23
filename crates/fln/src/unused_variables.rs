@@ -19,14 +19,15 @@
 //! A command this increment cannot decide is not linted, exactly as before this
 //! module existed: the pin's warning is missing, never invented. That covers `sorry`
 //! (the pin skips the whole command); a tactic body of a recursive declaration or one with
-//! `where` helpers; every local binder whose scope holds a tactic block; and every binder
-//! form other than those read here.
-use fln_core::expr::{Expr, ExprNode};
+//! `where` helpers; every local binder whose scope holds a tactic block; every local binder of
+//! a command compiled by well-founded recursion ([`applies_well_founded_fixpoint`]); and every
+//! binder form other than those read here.
+use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
 use fln_core::options::KVMap;
 use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::Syntax;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A parser node kind, `Lean.Parser.<components>`.
 pub(crate) fn parser_kind(components: &[&str]) -> Name {
@@ -182,6 +183,50 @@ pub(crate) fn omits_tactic_field(
             }
         }
         match expr.node() {
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `value` applies a well-founded fixpoint (`WellFounded.fix`, `WellFounded.Nat.fix`):
+/// a declaration this engine compiled by well-founded recursion, as the pin does.
+///
+/// The pin then proves each recursive call's decreasing goal with a tactic after the body is
+/// elaborated, outside its `BodyInfo` (vendored `Lean/Elab/PreDefinition/WF/Fix.lean:205-208,
+/// 266`). Its linter keeps such a tactic's whole metavariable assignment
+/// (`Lean/Linter/UnusedVariables.lean:452-454`) and counts every variable in it as used
+/// (`:560`). That assignment still holds the body's own elaboration, where abstracting a `fun`,
+/// `let` or alternative binder over a pending metavariable assigns it `?n x`
+/// (`Lean/MetavarContext.lean:1207-1214`). Which binders that reaches depends on the pin's
+/// metavariables, measured 2026-10-23: `if h : n < 99 then 0 else foo (n - 99)` warns about
+/// nothing, nor does an unused `(fun (y : Nat) => 0) 1` far from the call, while
+/// `(fun (w : Nat) => g14 k) 3` (no metavariable under `w`) warns. So no binder of such a body
+/// is read here; its signature binders still are.
+pub(crate) fn applies_well_founded_fixpoint(value: &Expr) -> bool {
+    let fixpoints = [
+        Name::from_components(["WellFounded", "fix"]),
+        Name::from_components(["WellFounded", "Nat", "fix"]),
+    ];
+    let mut pending = vec![value];
+    let mut seen = HashSet::new();
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.node())) {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::Const { name, .. } if fixpoints.contains(name) => return true,
             ExprNode::App { f, a } => pending.extend([f, a]),
             ExprNode::Lam {
                 binder_type, body, ..
@@ -468,12 +513,8 @@ fn contains_atom_shallow(node: &Syntax, atom: &str) -> bool {
         .any(|child| matches!(child, Syntax::Atom { val, .. } if val == atom))
 }
 
-/// The pattern variables a `matchAlt`'s patterns bind, with their positions, or `None`
-/// when a pattern has a form this module does not read. An identifier is a variable unless
-/// it is qualified, heads an application, or is spelled like some constructor: the pin
-/// resolves it against the open namespaces, so any constructor spelling may be one.
 /// The environment's constructor spellings (the last component of each name), for telling a
-/// pattern variable from a constructor, and its indexed families' constructors.
+/// pattern variable from a constructor, and its indexed families with their constructors.
 pub(crate) struct Constructors {
     pub(crate) names: HashSet<String>,
     /// The spellings of the constructors this source declares, not imported: an unqualified or
@@ -481,76 +522,129 @@ pub(crate) struct Constructors {
     /// spelled alike (`List.Sublist.cons`).
     pub(crate) local: HashSet<String>,
     pub(crate) indexed: Vec<IndexedConstructor>,
+    /// Each family with indices: its numbers of parameters and of indices.
+    pub(crate) families: HashMap<Name, (usize, usize)>,
 }
 
-/// A constructor of a family with indices, and which of its explicit fields this module leaves
-/// unread in a pattern.
-///
-/// The pin's use of such a field depends on how its match elaborator treats the family's
-/// indices. Measured against the pinned v4.32.0 over `IVec A m` (`{n} (head : A)
-/// (tail : IVec A n) : IVec A (n + 1)`), with `m` a variable the match must generalize:
-/// `| .cons x t => 1` warns about `x` only. With an explicit index field (`cons (n : Nat) …`),
-/// `| .cons k x t => 1` warns about `x` only as well. Over `IVec A (m + 1)` or `IVec A 2`, or
-/// with the index bound by a `_` pattern, it warns about `x` and `t`. A field that is an
-/// index (`k`) or whose type is an indexed family (`t`) is therefore not read. Every other
-/// field (`x`, and `b : Fin (n + 1)` too) was warned about in every shape measured.
+/// A constructor of a family with indices, read from its type for the pin's match elaborator
+/// (see [`unused_pattern_variables`]).
 pub(crate) struct IndexedConstructor {
     pub(crate) name: Name,
     /// Whether this source declares it.
     pub(crate) local: bool,
-    /// One entry per explicit field, in order: `true` when the field is not read.
-    pub(crate) unread: Vec<bool>,
+    pub(crate) family: Name,
+    /// Its explicit fields, in order.
+    fields: Vec<Field>,
+    /// One entry per index of its family: whether its result type's index there is one of its
+    /// own fields, which unifies with any index a match leaves in place.
+    bare_indices: Vec<bool>,
 }
 
-/// Which explicit fields of `ctor` (with `num_params` parameters, of a family with
-/// `num_indices` indices) a pattern leaves unread: those occurring in the result type's
-/// indices, and those whose type is headed by a family `indexed` names.
-pub(crate) fn unread_fields(
-    type_: &Expr,
-    num_params: u32,
-    num_indices: u32,
-    indexed: impl Fn(&Name) -> bool,
-) -> Vec<bool> {
-    fn head(mut expr: &Expr) -> &Expr {
-        while let ExprNode::App { f, .. } = expr.node() {
-            expr = f;
+/// A constructor field, as a pattern filling it is declared.
+#[derive(Clone, Copy)]
+struct Field {
+    /// The result type's indices mention it: the pin's match solves an index from it, and reads
+    /// a variable filling it through that index's inaccessible term (`EVec.econs k x t`, measured
+    /// 2026-10-23).
+    index: bool,
+    /// Neither an index nor in a later field's type: nothing determines a `_` filling it, so it is
+    /// a pattern variable of its own.
+    free: bool,
+}
+
+impl IndexedConstructor {
+    /// `name`, a constructor of `family`, of type `type_` with `num_params` parameters, the family
+    /// having `num_indices` indices.
+    pub(crate) fn new(
+        name: Name,
+        local: bool,
+        family: Name,
+        type_: &Expr,
+        num_params: u32,
+        num_indices: u32,
+    ) -> Self {
+        let mut binders = Vec::new();
+        let mut result = type_;
+        loop {
+            match result.node() {
+                ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } => {
+                    binders.push((*binder_info, binder_type));
+                    result = body;
+                }
+                ExprNode::MData { expr, .. } => result = expr,
+                _ => break,
+            }
         }
-        expr
+        let mut args = Vec::new();
+        let mut applied = result;
+        while let ExprNode::App { f, a } = applied.node() {
+            args.push(a);
+            applied = f;
+        }
+        args.reverse();
+        let indices = &args[args.len().saturating_sub(num_indices as usize)..];
+        let total = binders.len();
+        let num_params = num_params as usize;
+        // The bound variable that, `depth` binders down, names binder `position`.
+        let bvar = |position: usize, depth: usize| u32::try_from(depth - 1 - position).ok();
+        let fields = (num_params.min(total)..total)
+            .filter_map(|position| {
+                let index = indices.iter().any(|index| {
+                    bvar(position, total).is_some_and(|bvar| index.has_loose_bvar(bvar))
+                });
+                let later = (position + 1..total).any(|later| {
+                    bvar(position, later).is_some_and(|bvar| binders[later].1.has_loose_bvar(bvar))
+                });
+                // Only explicit fields are written in a pattern without `@`.
+                (binders[position].0 == BinderInfo::Default).then_some(Field {
+                    index,
+                    free: !index && !later,
+                })
+            })
+            .collect();
+        let bare_indices = indices
+            .iter()
+            .map(|index| {
+                let mut index = *index;
+                while let ExprNode::MData { expr, .. } = index.node() {
+                    index = expr;
+                }
+                matches!(index.node(), ExprNode::BVar { idx }
+                    if usize::try_from(*idx).ok()
+                        .and_then(|idx| total.checked_sub(idx + 1))
+                        .is_some_and(|position| position >= num_params))
+            })
+            .collect();
+        Self {
+            name,
+            local,
+            family,
+            fields,
+            bare_indices,
+        }
     }
-    let mut binders = Vec::new();
-    let mut result = type_;
-    while let ExprNode::ForallE {
-        binder_type,
-        body,
-        binder_info,
-        ..
-    } = result.node()
-    {
-        binders.push((*binder_info, binder_type));
-        result = body;
-    }
-    let mut args = Vec::new();
-    let mut applied = result;
-    while let ExprNode::App { f, a } = applied.node() {
-        args.push(a);
-        applied = f;
-    }
-    // `args` runs from the last argument to the first: the indices come first.
-    let indices = &args[..(num_indices as usize).min(args.len())];
-    let total = binders.len();
-    binders
+}
+
+/// The field `position` names among the explicit fields of every constructor in `candidates`,
+/// merged so that only what all of them agree on is relied on.
+fn merged_field(candidates: &[&IndexedConstructor], position: usize) -> Field {
+    let fields: Vec<Option<&Field>> = candidates
         .iter()
-        .enumerate()
-        .skip(num_params as usize)
-        .filter(|(_, (info, _))| *info == fln_core::expr::BinderInfo::Default)
-        .map(|(position, (_, field_type))| {
-            let bvar = u32::try_from(total - 1 - position).unwrap_or(u32::MAX);
-            let index = indices.iter().any(|index| index.has_loose_bvar(bvar));
-            let family = matches!(head(field_type).node(),
-                ExprNode::Const { name, .. } if indexed(name));
-            index || family
-        })
-        .collect()
+        .map(|candidate| candidate.fields.get(position))
+        .collect();
+    Field {
+        index: fields
+            .iter()
+            .any(|field| field.is_none_or(|field| field.index)),
+        free: fields
+            .iter()
+            .all(|field| field.is_some_and(|field| field.free)),
+    }
 }
 
 fn components(name: &Name) -> Vec<String> {
@@ -568,43 +662,91 @@ fn components(name: &Name) -> Vec<String> {
 }
 
 impl Constructors {
-    /// The unread fields of the indexed constructors a pattern head written `head` may name,
-    /// merged, or `None` when it names none. A qualified head names the constructors whose
-    /// names end with it, an unqualified or dotted one every constructor spelled like it, so
-    /// the merge only ever leaves more unread.
-    fn unread(&self, head: &Name) -> Option<Vec<bool>> {
+    /// The indexed constructors a pattern head written `head` may name. A qualified head names
+    /// the constructors whose names end with it, an unqualified or dotted one every constructor
+    /// spelled like it (this source's own first), so the set only ever holds more than the pin
+    /// resolves.
+    fn candidates(&self, head: &Name) -> Vec<&IndexedConstructor> {
         let written = components(head);
-        let local = matches!(written.as_slice(), [spelling] if self.local.contains(spelling));
-        let mut merged: Option<Vec<bool>> = None;
-        for constructor in &self.indexed {
-            if !components(&constructor.name).ends_with(&written) || (local && !constructor.local) {
-                continue;
-            }
-            let merged = merged.get_or_insert_with(Vec::new);
-            for (index, &unread) in constructor.unread.iter().enumerate() {
-                match merged.get_mut(index) {
-                    Some(slot) => *slot |= unread,
-                    None => merged.push(unread),
-                }
-            }
+        // An anonymous identifier (a hygienic `(`'s) names nothing.
+        if written.is_empty() {
+            return Vec::new();
         }
-        merged
+        let local = matches!(written.as_slice(), [spelling] if self.local.contains(spelling));
+        self.indexed
+            .iter()
+            .filter(|constructor| {
+                components(&constructor.name).ends_with(&written) && (!local || constructor.local)
+            })
+            .collect()
+    }
+
+    /// The indexed constructors a pattern `head` (an identifier, `.c` or `@c`) may name.
+    fn head_candidates(&self, head: &Syntax) -> Vec<&IndexedConstructor> {
+        let written =
+            if is_kind(head, &["Term", "dotIdent"]) || is_kind(head, &["Term", "explicit"]) {
+                args(head).get(1)
+            } else {
+                Some(head)
+            };
+        match written {
+            Some(Syntax::Ident { val, .. }) => self.candidates(val),
+            _ => Vec::new(),
+        }
     }
 }
 
-fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<Vec<(Name, usize)>> {
-    let mut variables = Vec::new();
-    // Each pattern, and whether it lies under a named pattern `x@p`, where the pin warns about
-    // every unused field of an indexed constructor too (measured 2026-10-22).
-    let mut pending = vec![(patterns, false)];
-    while let Some((pattern, plain)) = pending.pop() {
+/// A pattern variable a match alternative declares, in the order the pin's match elaborator
+/// declares them (`altLHS.fvarDecls`, vendored `Lean/Elab/Match.lean:765-772`).
+enum Declared {
+    /// A variable the source names, at its offset. `index` when it fills a field of an indexed
+    /// constructor that the constructor's result index mentions: the pin reads it through the
+    /// inaccessible term the match solves that index to, so it is not read here.
+    Named { name: Name, at: usize, index: bool },
+    /// One the source does not name that is declared all the same: a `_` filling a field nothing
+    /// else determines (`cons a _`), or a named pattern's equation (`x@p` declares `x`, `p`'s
+    /// variables, then `h : x = p`; measured 2026-10-23).
+    Hidden,
+}
+
+/// The variables `patterns` declare, in order, or `None` when a pattern has a form this module
+/// does not read. An identifier is a variable unless it is qualified, heads an application, or
+/// is spelled like some constructor: the pin resolves it against the open namespaces, so any
+/// constructor spelling may be one. A variable the pin's unification may declare or not (an
+/// implicit field, a `_` it can solve) is left out: only declarations that surely follow a
+/// variable are counted after it ([`unused_pattern_variables`]).
+fn declarations(patterns: &[&Syntax], constructors: &Constructors) -> Option<Vec<Declared>> {
+    enum Step<'a> {
+        Pattern(&'a Syntax, Option<Field>),
+        Declare(Declared),
+    }
+    let mut declared = Vec::new();
+    // Last in, first out: each node's children are pushed in reverse, so they are walked in
+    // source order.
+    let mut pending: Vec<Step<'_>> = patterns
+        .iter()
+        .rev()
+        .map(|pattern| Step::Pattern(pattern, None))
+        .collect();
+    while let Some(step) = pending.pop() {
+        let (pattern, field) = match step {
+            Step::Declare(declaration) => {
+                declared.push(declaration);
+                continue;
+            }
+            Step::Pattern(pattern, field) => (pattern, field),
+        };
         match pattern {
             Syntax::Ident { val, .. } => {
                 if let LeafView::Str(text) = val.leaf_view()
                     && val.parent().is_anonymous()
                     && !constructors.names.contains(text)
                 {
-                    variables.push((val.clone(), original_pos(pattern)?));
+                    declared.push(Declared::Named {
+                        name: val.clone(),
+                        at: original_pos(pattern)?,
+                        index: field.is_some_and(|field| field.index),
+                    });
                 }
             }
             Syntax::Atom { .. } | Syntax::Missing => {}
@@ -612,62 +754,52 @@ fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<V
                 let kind = kind.to_display_string();
                 match kind.as_str() {
                     "null"
-                    | "Lean.Parser.Term.paren"
                     | "Lean.Parser.Term.anonymousCtor"
                     | "Lean.Parser.Term.tuple"
                     | "term_+_"
                     | "term_::_"
                     | "term[_]" => {
-                        pending.extend(args.iter().map(|arg| (arg, plain)));
+                        pending.extend(args.iter().rev().map(|arg| Step::Pattern(arg, None)));
+                    }
+                    // A parenthesized pattern fills the field the parentheses fill.
+                    "Lean.Parser.Term.paren" => {
+                        pending.extend(args.iter().rev().map(|arg| Step::Pattern(arg, field)));
                     }
                     // The head is a constructor or a `match_pattern` function, never bound.
                     "Lean.Parser.Term.app" => {
-                        let head = match args.first() {
-                            Some(Syntax::Ident { val, .. }) => Some(val.clone()),
-                            Some(head) if is_kind(head, &["Term", "dotIdent"]) => {
-                                match self::args(head).get(1) {
-                                    Some(Syntax::Ident { val, .. }) => Some(val.clone()),
-                                    _ => None,
-                                }
-                            }
-                            // `@C …` writes the implicit fields too, which `unread` does not
-                            // count: an indexed constructor's is not read at all.
-                            Some(head) if is_kind(head, &["Term", "explicit"]) => {
-                                if !plain
-                                    && let Some(Syntax::Ident { val, .. }) = self::args(head).get(1)
-                                    && constructors.unread(val).is_some()
-                                {
-                                    return None;
-                                }
-                                None
-                            }
-                            _ => None,
-                        };
-                        let unread = head
-                            .filter(|_| !plain)
-                            .and_then(|head| constructors.unread(&head));
-                        let Some(unread) = unread else {
-                            pending.extend(args.get(1).map(|arg| (arg, plain)));
-                            continue;
-                        };
+                        let head = args.first();
+                        let candidates = head
+                            .map(|head| constructors.head_candidates(head))
+                            .unwrap_or_default();
+                        // `@C …` writes the implicit fields too, whose declarations follow the
+                        // pin's unification: an indexed constructor's are not read at all.
+                        if head.is_some_and(|head| is_kind(head, &["Term", "explicit"]))
+                            && !candidates.is_empty()
+                        {
+                            return None;
+                        }
                         let fields = args.get(1).map(self::args).unwrap_or(&[]);
-                        for (index, field) in fields.iter().enumerate() {
-                            // A field past the constructor's explicit ones is not read either.
-                            if !unread.get(index).copied().unwrap_or(true) {
-                                pending.push((field, plain));
-                            }
+                        for (position, arg) in fields.iter().enumerate().rev() {
+                            let field = (!candidates.is_empty())
+                                .then(|| merged_field(&candidates, position));
+                            pending.push(Step::Pattern(arg, field));
                         }
                     }
                     "Lean.Parser.Term.namedPattern" => {
-                        pending.extend(args.first().map(|arg| (arg, plain)));
-                        pending.extend(args.get(3).map(|arg| (arg, true)));
+                        pending.push(Step::Declare(Declared::Hidden));
+                        pending.extend(args.get(3).map(|arg| Step::Pattern(arg, field)));
+                        pending.extend(args.first().map(|arg| Step::Pattern(arg, field)));
                     }
                     // The ascribed type is a term the pattern's variables may appear in.
                     "Lean.Parser.Term.typeAscription" => {
-                        pending.extend(args.get(1).map(|arg| (arg, plain)));
+                        pending.extend(args.get(1).map(|arg| Step::Pattern(arg, field)));
                     }
-                    "Lean.Parser.Term.hole"
-                    | "Lean.Parser.Term.ellipsis"
+                    "Lean.Parser.Term.hole" => {
+                        if field.is_some_and(|field| field.free) {
+                            declared.push(Declared::Hidden);
+                        }
+                    }
+                    "Lean.Parser.Term.ellipsis"
                     | "Lean.Parser.Term.dotIdent"
                     | "Lean.Parser.Term.hygienicLParen"
                     | "num"
@@ -679,39 +811,418 @@ fn pattern_variables(patterns: &Syntax, constructors: &Constructors) -> Option<V
             }
         }
     }
-    Some(variables)
+    Some(declared)
+}
+
+/// The pattern under parentheses, a type ascription and a named pattern's name: the one the
+/// discriminant's type is matched against.
+fn unwrapped(mut pattern: &Syntax) -> &Syntax {
+    loop {
+        let inner = if is_kind(pattern, &["Term", "paren"])
+            || is_kind(pattern, &["Term", "typeAscription"])
+        {
+            args(pattern).get(1)
+        } else if is_kind(pattern, &["Term", "namedPattern"]) {
+            args(pattern).get(3)
+        } else {
+            None
+        };
+        match inner {
+            Some(inner) => pattern = inner,
+            None => return pattern,
+        }
+    }
+}
+
+/// The indexed constructors `pattern` applies outside every indexed constructor's fields, each
+/// with its path from the pattern (empty at its top) and the constructors it may name.
+fn indexed_sites<'a>(
+    pattern: &Syntax,
+    constructors: &'a Constructors,
+) -> Vec<(Vec<usize>, Vec<&'a IndexedConstructor>)> {
+    let mut sites = Vec::new();
+    let mut pending = vec![(pattern, Vec::new())];
+    while let Some((node, path)) = pending.pop() {
+        let node = unwrapped(node);
+        let head = if is_kind(node, &["Term", "app"]) {
+            args(node).first()
+        } else {
+            Some(node)
+        };
+        let candidates = head
+            .map(|head| constructors.head_candidates(head))
+            .unwrap_or_default();
+        if !candidates.is_empty() {
+            sites.push((path, candidates));
+            continue;
+        }
+        for (index, child) in args(node).iter().enumerate() {
+            let mut path = path.clone();
+            path.push(index);
+            pending.push((child, path));
+        }
+    }
+    sites
+}
+
+/// A declaration's equations' discriminants: the leading binders of its type after the colon,
+/// at `start..start + count` in the admitted type's telescope, whose binder types `binders`
+/// holds outermost first.
+struct Discriminants<'a> {
+    binders: Vec<&'a Expr>,
+    start: usize,
+    count: usize,
+}
+
+/// The binders a type written after a declaration's colon leads with: each one's binder info
+/// and its name where the source names one, or `None` for a binder form not read here.
+fn leading_binders(mut written: &Syntax) -> Option<Vec<(BinderInfo, Option<Name>)>> {
+    let group = |binder: &Syntax| -> Option<Vec<(BinderInfo, Option<Name>)>> {
+        if is_kind(binder, &["Term", "instBinder"]) {
+            return Some(vec![(BinderInfo::InstImplicit, None)]);
+        }
+        let info = [
+            ("explicitBinder", BinderInfo::Default),
+            ("implicitBinder", BinderInfo::Implicit),
+            ("strictImplicitBinder", BinderInfo::StrictImplicit),
+        ]
+        .into_iter()
+        .find_map(|(kind, info)| is_kind(binder, &["Term", kind]).then_some(info))?;
+        args(args(binder).get(1)?)
+            .iter()
+            .map(|name| match name {
+                Syntax::Ident { val, .. } => Some((info, Some(val.clone()))),
+                _ if is_kind(name, &["Term", "hole"]) => Some((info, None)),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut binders = Vec::new();
+    loop {
+        if is_kind(written, &["Term", "arrow"]) {
+            binders.push((BinderInfo::Default, None));
+            written = args(written).get(2)?;
+        } else if is_kind(written, &["Term", "depArrow"]) {
+            binders.extend(group(args(written).first()?)?);
+            written = args(written).get(2)?;
+        } else if is_kind(written, &["Term", "forall"]) {
+            for binder in args(args(written).get(1)?) {
+                match binder {
+                    Syntax::Ident { val, .. } => {
+                        binders.push((BinderInfo::Default, Some(val.clone())));
+                    }
+                    _ if is_kind(binder, &["Term", "hole"]) => {
+                        binders.push((BinderInfo::Default, None));
+                    }
+                    _ => binders.extend(group(binder)?),
+                }
+            }
+            written = args(written).get(4)?;
+        } else if is_kind(written, &["Term", "paren"]) && args(written).len() == 3 {
+            written = args(written).get(1)?;
+        } else {
+            return Some(binders);
+        }
+    }
+}
+
+/// The discriminants of `declaration`'s own equations, `count` of them, read from its admitted
+/// `type_`: the type written after its colon closes the telescope, so its leading binders are
+/// the telescope's last ones, after section variables, automatically bound implicits and the
+/// signature's binders. `None` when the written type and the telescope disagree: in length,
+/// in a binder's kind, or in a name the telescope keeps as the source spelled it (this engine
+/// may name an equation's binders internally).
+fn equation_discriminants<'a>(
+    declaration: &Syntax,
+    type_: &'a Expr,
+    count: usize,
+) -> Option<Discriminants<'a>> {
+    let signature = args(declaration).iter().find(|part| {
+        is_kind(part, &["Command", "optDeclSig"]) || is_kind(part, &["Command", "declSig"])
+    })?;
+    let mut type_spec = args(signature).get(1)?;
+    if !is_kind(type_spec, &["Term", "typeSpec"]) {
+        type_spec = args(type_spec).first()?;
+    }
+    if !is_kind(type_spec, &["Term", "typeSpec"]) {
+        return None;
+    }
+    let written = leading_binders(args(type_spec).get(1)?)?;
+    let mut binders = Vec::new();
+    let mut admitted = Vec::new();
+    let mut expr = type_;
+    loop {
+        match expr.node() {
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                admitted.push((*binder_info, binder_name));
+                binders.push(binder_type);
+                expr = body;
+            }
+            ExprNode::MData { expr: inner, .. } => expr = inner,
+            _ => break,
+        }
+    }
+    let start = binders.len().checked_sub(written.len())?;
+    let agrees = written.iter().zip(&admitted[start..]).all(
+        |((info, name), (admitted_info, admitted_name))| {
+            let spelled = matches!(admitted_name.leaf_view(), LeafView::Str(_))
+                && admitted_name.parent().is_anonymous();
+            info == admitted_info
+                && name
+                    .as_ref()
+                    .is_none_or(|name| !spelled || name == *admitted_name)
+        },
+    );
+    (count <= written.len() && agrees).then_some(Discriminants {
+        binders,
+        start,
+        count,
+    })
+}
+
+/// `type_` as an application of an indexed family: the family and its index arguments.
+fn family_application<'a>(
+    mut type_: &'a Expr,
+    constructors: &'a Constructors,
+) -> Option<(&'a Name, Vec<&'a Expr>)> {
+    while let ExprNode::MData { expr, .. } = type_.node() {
+        type_ = expr;
+    }
+    let mut args = Vec::new();
+    let mut head = type_;
+    while let ExprNode::App { f, a } = head.node() {
+        args.push(a);
+        head = f;
+    }
+    args.reverse();
+    let ExprNode::Const { name, .. } = head.node() else {
+        return None;
+    };
+    let (num_params, num_indices) = *constructors.families.get(name)?;
+    (args.len() == num_params + num_indices).then(|| (name, args.split_off(num_params)))
+}
+
+/// How many trailing declarations of each of a match's alternatives the pin connects to
+/// variables its match elaborator added to `toClear` by refining a discriminant's index
+/// (`groups`: each alternative's pattern list). Exact for a declaration's own equations whose
+/// discriminants `discriminants` reads. Elsewhere it counts, per discriminant, the indices of
+/// the indexed constructors its patterns apply at distinct places, as if each refined a
+/// variable: more than the pin aliases, which only withholds a warning, unless a discriminant's
+/// type also holds variables depending on a refined index (`collectDeps`), which this module
+/// cannot see there (no such program measured).
+///
+/// The pin adds an index to the discriminants when a pattern's type fails to unify with a
+/// discriminant's because that index is a variable the match does not abstract (vendored
+/// `Lean/Elab/Match.lean:937-966`): a constructor whose result index there is no field of its
+/// own (`nil : Vec α 0`, `cons … : Vec α (n+1)`) against `Vec α n` with `n` no discriminant.
+/// Only a variable index joins `toClear` (`:965`), with the variables of the discriminants'
+/// types that depend on it (`collectDeps`, `:999-1011`). An index bound by an earlier
+/// discriminant (`{n : Nat} → Vec α n → …` matched by `_`) or applied (`Vec α (n+1)`) adds
+/// none. A constructor under another indexed constructor's fields is matched against a pattern
+/// variable's type, never refined.
+fn aliased_declarations(
+    groups: &[Vec<&Syntax>],
+    discriminants: Option<&Discriminants<'_>>,
+    constructors: &Constructors,
+) -> usize {
+    let count = groups.first().map_or(0, Vec::len);
+    let mut refined = std::collections::BTreeSet::new();
+    let mut bound = 0;
+    for discriminant in 0..count {
+        let position = discriminants.map(|discriminants| discriminants.start + discriminant);
+        let family = discriminants
+            .zip(position)
+            .and_then(|(discriminants, position)| {
+                family_application(discriminants.binders.get(position)?, constructors)
+            });
+        let mut paths: HashMap<Vec<usize>, usize> = HashMap::new();
+        for pattern in groups.iter().filter_map(|group| group.get(discriminant)) {
+            for (path, candidates) in indexed_sites(pattern, constructors) {
+                if let (true, Some((family, indices)), Some(discriminants), Some(position)) =
+                    (path.is_empty(), &family, discriminants, position)
+                {
+                    let own: Vec<&IndexedConstructor> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|candidate| candidate.family == **family)
+                        .collect();
+                    let own = if own.is_empty() { &candidates } else { &own };
+                    for (index, argument) in indices.iter().enumerate() {
+                        let mut argument = *argument;
+                        while let ExprNode::MData { expr, .. } = argument.node() {
+                            argument = expr;
+                        }
+                        // An index that is no variable adds none to `toClear`.
+                        let ExprNode::BVar { idx } = argument.node() else {
+                            continue;
+                        };
+                        let Some(target) = usize::try_from(*idx)
+                            .ok()
+                            .and_then(|idx| position.checked_sub(idx + 1))
+                        else {
+                            continue;
+                        };
+                        let abstracted = (discriminants.start
+                            ..discriminants.start + discriminants.count)
+                            .contains(&target);
+                        if !abstracted
+                            && own.iter().any(|constructor| {
+                                !constructor
+                                    .bare_indices
+                                    .get(index)
+                                    .copied()
+                                    .unwrap_or(false)
+                            })
+                        {
+                            refined.insert(target);
+                        }
+                    }
+                } else {
+                    let weight = candidates
+                        .iter()
+                        .filter_map(|candidate| constructors.families.get(&candidate.family))
+                        .map(|(_, indices)| *indices)
+                        .max()
+                        .unwrap_or(0);
+                    let slot = paths.entry(path).or_insert(0);
+                    *slot = (*slot).max(weight);
+                }
+            }
+        }
+        bound += paths.values().sum::<usize>();
+    }
+    // `collectDeps`: a variable of a discriminant's type whose own type depends on a refined
+    // index joins it, and so (over-approximating) does one depending on such a variable.
+    let mut dependents = 0;
+    if let Some(discriminants) = discriminants
+        && !refined.is_empty()
+    {
+        let mut tainted = vec![false; discriminants.start];
+        for position in 0..discriminants.start {
+            tainted[position] = refined.contains(&position)
+                || (0..position).any(|earlier| {
+                    tainted[earlier]
+                        && u32::try_from(position - 1 - earlier)
+                            .is_ok_and(|bvar| discriminants.binders[position].has_loose_bvar(bvar))
+                });
+        }
+        dependents = (0..discriminants.start)
+            .filter(|&outer| {
+                tainted[outer]
+                    && !refined.contains(&outer)
+                    && (discriminants.start..discriminants.start + discriminants.count).any(
+                        |position| {
+                            u32::try_from(position - 1 - outer).is_ok_and(|bvar| {
+                                discriminants
+                                    .binders
+                                    .get(position)
+                                    .is_some_and(|binder| binder.has_loose_bvar(bvar))
+                            })
+                        },
+                    )
+            })
+            .count();
+    }
+    refined.len() + dependents + bound
 }
 
 /// The unused pattern variables of `command`'s `match` alternatives and equations, in source
-/// order. The pin reads a pattern variable's uses only from elaborated references: the body
-/// it records abstracts every alternative's variables, so a reference in the alternative is
-/// the whole evidence, and an identifier with its name anywhere else in the alternative
-/// over-approximates it.
+/// order; `type_` is the declaration's admitted type. The pin reads a pattern variable's uses
+/// only from elaborated references: the body it records abstracts every alternative's
+/// variables, so a reference in the alternative is the whole evidence, and an identifier with
+/// its name anywhere else in the alternative over-approximates it.
+///
+/// Except for an alias. When the pin's match elaborator refines a discriminant's index (see
+/// [`aliased_declarations`]), it records each alternative's last declared pattern variables as
+/// aliases of the variables in `toClear`, pairing the two lists from their ends (vendored
+/// `Lean/Elab/Match.lean:828-831`), although the refined index's own pattern is prepended
+/// (`:956`). The linter then counts an alias used when the variable it aliases is
+/// (`Lean/Linter/UnusedVariables.lean:515-528`), and a refined index is one the discriminant's
+/// type, as written, names. So over `Vec Nat n` with `n` bound outside the match,
+/// `| cons a va, cons b bv => a + b` warns about `va` and not `bv`, `| cons a nil => 0` about
+/// nothing, and `| cons a _ => 0` about `a`; with `n` bound by a leading `_`, about `va` and
+/// `bv` (all measured 2026-10-23). A variable is read here only when at least as many surely
+/// declared variables follow it as the pin aliases.
 pub(crate) fn unused_pattern_variables(
     command: &Syntax,
     options: &KVMap,
     constructors: &Constructors,
+    type_: Option<&Expr>,
 ) -> Vec<UnusedBinder> {
     if !linted(options, Some("patternVars")) {
         return Vec::new();
     }
-    let alternatives = term_scopes(command, |node| {
-        is_kind(node, &["Term", "matchAlt"]).then_some(())
+    // The declaration's own equations, whose discriminants its type's leading binders give.
+    let declaration = scoped(command);
+    let equations = declaration
+        .and_then(|declaration| {
+            args(declaration)
+                .iter()
+                .find(|part| is_kind(part, &["Command", "declValEqns"]))
+        })
+        .and_then(|equations| args(equations).first())
+        .and_then(|alternatives| args(alternatives).first());
+    let lists = term_scopes(command, |node| {
+        is_kind(node, &["Term", "matchAlts"]).then_some(())
     });
     let mut unused = Vec::new();
-    for (alternative, ()) in alternatives {
-        let Some(patterns) = args(alternative).get(1) else {
-            continue;
-        };
-        let Some(variables) = pattern_variables(patterns, constructors) else {
-            continue;
-        };
-        for (name, at) in variables {
-            if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
+    for (list, ()) in lists {
+        // Each alternative's pattern lists: `| p, q | r, s => …` elaborates one per list.
+        let mut groups: Vec<(&Syntax, Vec<&Syntax>)> = Vec::new();
+        for alternative in args(args(list).first().unwrap_or(list))
+            .iter()
+            .filter(|node| is_kind(node, &["Term", "matchAlt"]))
+        {
+            let Some(lists) = args(alternative).get(1) else {
                 continue;
+            };
+            for patterns in args(lists).iter().filter(|node| node.kind().is_some()) {
+                groups.push((
+                    alternative,
+                    args(patterns)
+                        .iter()
+                        .filter(|pattern| !matches!(pattern, Syntax::Atom { .. }))
+                        .collect(),
+                ));
             }
-            if !referenced(alternative, &name, at) {
-                unused.push(UnusedBinder { at, name });
+        }
+        let count = groups.first().map_or(0, |(_, patterns)| patterns.len());
+        let discriminants = equations
+            .filter(|equations| std::ptr::eq(*equations, list))
+            .zip(declaration.zip(type_))
+            .and_then(|(_, (declaration, type_))| {
+                equation_discriminants(declaration, type_, count)
+            });
+        let patterns: Vec<Vec<&Syntax>> = groups
+            .iter()
+            .map(|(_, patterns)| patterns.clone())
+            .collect();
+        let aliased = aliased_declarations(&patterns, discriminants.as_ref(), constructors);
+        for (alternative, patterns) in &groups {
+            let Some(declared) = declarations(patterns, constructors) else {
+                continue;
+            };
+            for (position, declaration) in declared.iter().enumerate() {
+                let Declared::Named { name, at, index } = declaration else {
+                    continue;
+                };
+                if *index
+                    || declared.len() - position - 1 < aliased
+                    || matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_'))
+                {
+                    continue;
+                }
+                if !referenced(alternative, name, *at) {
+                    unused.push(UnusedBinder {
+                        at: *at,
+                        name: name.clone(),
+                    });
+                }
             }
         }
     }
@@ -747,8 +1258,17 @@ fn fun_binders(binders: &[Syntax], constructors: &Constructors) -> Option<Vec<(N
             names.extend(idents(binder)?);
         } else if is_kind(binder, &["Term", "tuple"]) || is_kind(binder, &["Term", "anonymousCtor"])
         {
-            // `fun (x, y) => …` matches on its argument: its names are pattern variables.
-            names.extend(pattern_variables(binder, constructors)?);
+            // `fun (x, y) => …` matches on its argument: its names are pattern variables. Under
+            // an indexed constructor the match may alias some (`unused_pattern_variables`), and
+            // the argument's type is not read here.
+            if !indexed_sites(binder, constructors).is_empty() {
+                return None;
+            }
+            for declared in declarations(&[binder], constructors)? {
+                if let Declared::Named { name, at, .. } = declared {
+                    names.push((name, at));
+                }
+            }
         } else if is_kind(binder, &["Term", "typeAscription"])
             || is_kind(binder, &["Term", "paren"])
         {
