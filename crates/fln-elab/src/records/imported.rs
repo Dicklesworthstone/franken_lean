@@ -1,4 +1,4 @@
-//! Imported structure identities bound to admitted constructors and projections.
+//! Source and imported structure identities bound to admitted declarations.
 //!
 //! This journal retains the pin's physical fields and direct extends-clause
 //! order. It does not guess parents from arbitrary field types, admit constants,
@@ -18,6 +18,7 @@ use fln_env::extensions::{
 use std::collections::{BTreeMap, BTreeSet};
 
 mod equality;
+pub mod export;
 pub use equality::same_interface;
 
 const MAGIC: &[u8] = b"FLNRIMP\x01";

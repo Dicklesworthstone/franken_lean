@@ -7,6 +7,7 @@ use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
+    StructureEntry, StructureField, StructureParent,
 };
 use std::collections::HashSet;
 
@@ -15,6 +16,7 @@ mod defaults;
 mod instances;
 mod namespaces;
 mod reducibility;
+mod structures;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -43,6 +45,9 @@ pub struct SourceMetadata {
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
+    /// Module-owned structure interfaces, including physical parent subobjects.
+    /// The writer preserves field/parent order and sorts only the pin's indexes.
+    pub structures: Vec<StructureEntry>,
 }
 
 /// Encode source journals and the namespaces implied by local declarations.
@@ -113,6 +118,9 @@ impl Encoder {
         }
         if !metadata.aliases.is_empty() {
             blocks.push(self.alias_block(&metadata.aliases)?);
+        }
+        if !metadata.structures.is_empty() {
+            blocks.push(self.structure_block(&metadata.structures)?);
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.tagged_names_block(

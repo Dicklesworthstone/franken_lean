@@ -11,15 +11,15 @@ use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::Budget;
 
-fn n(value: &str) -> Name {
+pub(super) fn n(value: &str) -> Name {
     Name::from_components(value.split('.'))
 }
 
-fn c(value: &str) -> Expr {
+pub(super) fn c(value: &str) -> Expr {
     Expr::const_(n(value), vec![])
 }
 
-fn publish(env: &Environment, declaration: Declaration) -> Environment {
+pub(super) fn publish(env: &Environment, declaration: Declaration) -> Environment {
     let Outcome::Complete(admitted) =
         admit(env, declaration, Budget::for_stack_bytes(2 * 1024 * 1024))
     else {
@@ -41,7 +41,7 @@ fn publish(env: &Environment, declaration: Declaration) -> Environment {
     }
 }
 
-fn local(label: &str, type_: Expr, style: BinderInfo) -> LocalDecl {
+pub(super) fn local(label: &str, type_: Expr, style: BinderInfo) -> LocalDecl {
     LocalDecl {
         id: FVarId(n(label)),
         user_name: n(label),
@@ -52,7 +52,7 @@ fn local(label: &str, type_: Expr, style: BinderInfo) -> LocalDecl {
     }
 }
 
-fn record(
+pub(super) fn record(
     env: &Environment,
     name: &str,
     parameters: Vec<LocalDecl>,
@@ -73,7 +73,7 @@ fn record(
     out
 }
 
-fn base() -> Environment {
+pub(super) fn base() -> Environment {
     let env = publish(
         &Environment::new(),
         crate::seed::nat_inductive_seed_declaration(),
@@ -115,7 +115,7 @@ fn field(record: &str, label: &str, subobject: Option<&str>, style: BinderInfo) 
     }
 }
 
-fn rows() -> Vec<StructureEntry> {
+pub(super) fn rows() -> Vec<StructureEntry> {
     vec![
         StructureEntry {
             name: n("Parent"),

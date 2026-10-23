@@ -37,10 +37,10 @@ pub struct FieldPath {
     pub path: Vec<(Name, u32)>,
 }
 
-fn extension_name() -> Name {
+pub(super) fn extension_name() -> Name {
     Name::from_components(["FrankenLean", "sourceRecordParents", "v1"])
 }
-fn descriptor() -> ExtensionDescriptor {
+pub(super) fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
         name: extension_name(),
         merge: MergeSemantics::AppendOrdered,
@@ -105,7 +105,7 @@ pub fn direct_fields(
     Ok(fields)
 }
 
-fn validate(
+pub(super) fn validate(
     env: &Environment,
     row: &RecordParent,
     remaining: &mut usize,
@@ -128,6 +128,29 @@ fn validate(
     }
     direct_fields(env, &row.parent, remaining)?;
     Ok(())
+}
+
+pub(super) fn decode(payload: &[u8]) -> Result<RecordParent, RecordError> {
+    let mut input = payload
+        .strip_prefix(MAGIC)
+        .ok_or(RecordError::InvalidTelescope)?;
+    let record = read_name(&mut input).map_err(codec_error)?;
+    let bytes = input.get(..4).ok_or(RecordError::InvalidTelescope)?;
+    let field = u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| RecordError::InvalidTelescope)?,
+    );
+    input = &input[4..];
+    let parent = read_name(&mut input).map_err(codec_error)?;
+    if !input.is_empty() {
+        return Err(RecordError::InvalidTelescope);
+    }
+    Ok(RecordParent {
+        record,
+        field,
+        parent,
+    })
 }
 
 impl RecordParents {
@@ -200,27 +223,7 @@ impl RecordParents {
             bytes_left = bytes_left
                 .checked_sub(entry.payload.len())
                 .ok_or(RecordError::ResourceLimit)?;
-            let mut input = entry
-                .payload
-                .strip_prefix(MAGIC)
-                .ok_or(RecordError::InvalidTelescope)?;
-            let record = read_name(&mut input).map_err(codec_error)?;
-            let bytes = input.get(..4).ok_or(RecordError::InvalidTelescope)?;
-            let field = u32::from_le_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| RecordError::InvalidTelescope)?,
-            );
-            input = &input[4..];
-            let parent = read_name(&mut input).map_err(codec_error)?;
-            if !input.is_empty() {
-                return Err(RecordError::InvalidTelescope);
-            }
-            let row = RecordParent {
-                record,
-                field,
-                parent,
-            };
+            let row = decode(&entry.payload)?;
             validate(env, &row, &mut remaining)?;
             registry.insert(row)?;
         }
