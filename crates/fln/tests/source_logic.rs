@@ -472,27 +472,21 @@ fn deriving_commands_are_refused_not_ignored() {
     );
 }
 
-/// Value aliases are supported; an ellipsis inside an aliased field is still
-/// outside the matrix compiler's supported constructor fragment.
+/// Value aliases are supported, and so is an ellipsis inside an aliased constructor field
+/// (`.inner ..`, the pin's `PatternVar.lean:360-366`). Both programs, with their `rfl` theorems,
+/// are accepted by the pinned v4.32.0 (2026-10-23).
 #[test]
-fn named_values_are_bound_but_constructor_field_ellipsis_stays_unsupported() {
+fn named_values_and_constructor_field_ellipses_are_bound() {
     check(
         "def np : List Nat → Nat\n  | l@(x :: _) => x\n  | [] => 0\n\
         theorem head : np [7, 8] = 7 := by rfl",
     );
-    let (engine, limits) = engine();
-    let source = "inductive T where\n  | leaf\n  | inner (l : T) (r : T)\n\
-         def np : T → T\n  | .inner l@(.inner ..) r@.leaf => .inner r l\n  | t => t\n";
-    assert!(
-        !matches!(
-            engine.check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            ),
-            Ok(fln::Outcome::Complete(_))
-        ),
-        "{source}"
+    check(
+        "inductive T where\n  | leaf\n  | inner (l : T) (r : T)\n\
+         def np : T → T\n  | .inner l@(.inner ..) r@.leaf => .inner r l\n  | t => t\n\
+         theorem np_swap : np (T.inner (T.inner T.leaf T.leaf) T.leaf) = \
+         T.inner T.leaf (T.inner T.leaf T.leaf) := by rfl\n\
+         theorem np_keep : np T.leaf = T.leaf := by rfl\n",
     );
 }
 
@@ -1191,18 +1185,41 @@ fn structure_modifiers_are_refused_not_dropped() {
     }
 }
 
-/// A bare binder (`def bb1 α [Inhabited α]`, `let f x := …`) and a pattern ellipsis
-/// (`.succ ..`) parse as the pin's trees; the checker reads neither, so it refuses each file,
-/// all of which the pin accepts.
+/// A pattern ellipsis (`.succ ..`, `.mk ..`) makes every remaining explicit field a hole, as the
+/// pin's `PatternVar.lean:360-366`; each program, with its `rfl` theorems, is accepted by the
+/// pinned v4.32.0 (2026-10-23).
 #[test]
-fn bare_binders_and_pattern_ellipses_are_refused_not_misread() {
+fn pattern_ellipses_are_read_as_the_pin_reads_them() {
+    check(
+        "def bb3 (n : Nat) : Nat :=\n  match n with\n  | .succ .. => 1\n  | .zero => 0\n\
+         theorem bb3_two : bb3 2 = 1 := by rfl\ntheorem bb3_zero : bb3 0 = 0 := by rfl\n",
+    );
+    check(
+        "inductive Pair where\n  | mk (a : Nat) (b : Nat)\n\
+         def bb6 (p : Pair) : Nat :=\n  match p with\n  | .mk .. => 1\n\
+         theorem bb6_one : bb6 (Pair.mk 1 2) = 1 := by rfl\n",
+    );
+    // This checker refuses a constructor pattern nested under `some` (`InvalidPattern`), with or
+    // without `..`: `some (Pair.mk _ _)` is refused the same way. The pin accepts both, and so
+    // does the `lean` door over the real `Init` (release build of 81c0479b, 2026-10-23).
+    for nested in ["Pair.mk ..", "Pair.mk _ _"] {
+        let source = format!(
+            "inductive Pair where\n  | mk (a : Nat) (b : Nat)\n\
+             def bb4 (o : Option Pair) : Nat :=\n  match o with\n  | some ({nested}) => 1\n  \
+             | none => 0\n"
+        );
+        assert!(refused(&source), "{source}");
+    }
+}
+
+/// A bare binder (`def bb1 α [Inhabited α]`, `let f x := …`) parses as the pin's tree; the
+/// checker does not read it, so it refuses each file, all of which the pin accepts.
+#[test]
+fn bare_binders_are_refused_not_misread() {
     let (engine, limits) = engine();
     for source in [
         "def bb1 α [Inhabited α] : α := default\n",
         "abbrev bb2 α β := α × β\n",
-        "def bb3 (n : Nat) : Nat :=\n  match n with\n  | .succ .. => 1\n  | .zero => 0\n",
-        "def bb4 (o : Option (Nat × Nat)) : Nat :=\n  match o with\n  | some (.mk ..) => 1\n  \
-         | none => 0\n",
         "def bb5 (n : Nat) : Nat :=\n  let f x := x + 1\n  f n\n",
     ] {
         assert!(
