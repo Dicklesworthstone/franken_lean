@@ -78,8 +78,38 @@ fn failure_with_evaluation_output(
     presentation: Presentation,
     program: &SourceProgramExecution,
 ) -> MultiplexerOutput {
-    if error.class == "io-exception" && matches!(presentation, Presentation::Fln { json: true }) {
+    let mut human_output = String::new();
+    if error.class == "io-exception"
+        && let Presentation::Fln { json } = presentation
+    {
         'prefix: for module in &program.modules {
+            if !json {
+                let prefix =
+                    source_evaluation::output_before_failure(&module.commands.batch.executions);
+                match prefix {
+                    Ok(prefix) => {
+                        if let Err(limit) = append(&mut human_output, &prefix) {
+                            error = limit;
+                            break 'prefix;
+                        }
+                    }
+                    Err(failed) => {
+                        let (class, authority, exit) = failed.disposition();
+                        error = Failure::new(class, &failed.to_string(), authority, exit);
+                        break 'prefix;
+                    }
+                }
+                if module
+                    .commands
+                    .batch
+                    .executions
+                    .iter()
+                    .any(|execution| source_evaluation::check(execution).is_err())
+                {
+                    break 'prefix;
+                }
+                continue;
+            }
             for execution in &module.commands.batch.executions {
                 if let Err(capture) = crate::stdout_capture::evaluation(execution) {
                     let (class, exit) = crate::stdout_capture::error_disposition(capture);
@@ -97,7 +127,9 @@ fn failure_with_evaluation_output(
             }
         }
     }
-    failure(error, presentation)
+    let mut failed = failure(error, presentation);
+    failed.stdout = human_output;
+    failed
 }
 
 fn module_error(error: fln::source_check::modules::SourceModuleCheckError) -> Failure {
