@@ -531,3 +531,37 @@ def h (b : Bool) : Id String := do
         "{ours}"
     );
 }
+
+/// The pin lints a query's term as it lints a declaration's: `#check`, `#eval` and `#reduce`
+/// warn about their unused binders, each warning after the command's own output (the linters
+/// run once the command has logged its messages). A query whose syntax holds `sorry` is not
+/// linted. As the pinned v4.32.0 prints it (2026-10-22).
+#[test]
+fn queries_are_linted_after_their_output_as_at_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "#check fun (y : Nat) => 3
+#eval (fun (z : Nat) => 3) 2
+#reduce (fun (w : Nat) => 3) 2
+#check (fun (v : Nat) => 3 : Nat → Nat)
+#check fun (u : Nat) (h : u = u) => u
+#check ∀ (q : Nat), True
+#check fun (r : Nat) => (sorry : Nat)
+example : Nat := (fun (e : Nat) => 3) 2
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "queries",
+        "prelude\nimport Init.Data.Repr\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        7,
+        "{ours}"
+    );
+}

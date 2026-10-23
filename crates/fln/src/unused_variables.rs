@@ -107,6 +107,18 @@ fn walk<'a>(syntax: &'a Syntax, mut visit: impl FnMut(&'a Syntax) -> bool) -> bo
     false
 }
 
+/// `#reduce`, `syntax (name := reduceCmd) "#reduce" reduceConfig term : command` in namespace
+/// `Lean` (vendored `Init/Notation.lean:766`).
+pub(crate) fn is_reduce(command: &Syntax) -> bool {
+    command.kind() == Some(&Name::from_components(["Lean", "reduceCmd"]))
+}
+
+/// The pin's `hasSorry` test (vendored `Lean/Linter/UnusedVariables.lean:471-475`): a command
+/// whose syntax holds a `sorry` term or tactic, or `admit`, is not linted.
+pub(crate) fn has_sorry(command: &Syntax) -> bool {
+    contains_atom(command, &["sorry", "admit"])
+}
+
 /// Whether a structure instance in `command` leaves out a field whose default is a proof, and
 /// `value` builds that structure. A field `h : P := by tac` is the pin's `autoParam`, filled by
 /// running its tactic while the body elaborates, so the pin then reads the body only through
@@ -389,6 +401,16 @@ fn decided(command: &Syntax) -> Option<(&Syntax, &Syntax, Body)> {
 /// ([`term_scopes`]). `decreasing_by` is the exception: its proofs are checked in the context
 /// of each recursive call, every local around the call in scope, so none is read here.
 fn scoped(command: &Syntax) -> Option<&Syntax> {
+    // A query's term (`#check`, `#eval`, `#reduce`) is read whole. One that runs a tactic (a
+    // block, `‹…›`, or an unproved `xs[i]`) is left undecided: how the pin reads the binders
+    // around it there is not measured.
+    if ["check", "eval"]
+        .iter()
+        .any(|kind| is_kind(command, &["Command", kind]))
+        || is_reduce(command)
+    {
+        return (!has_sorry(command) && !runs_tactics(command)).then_some(command);
+    }
     if !is_kind(command, &["Command", "declaration"]) {
         return None;
     }

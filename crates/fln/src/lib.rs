@@ -7415,6 +7415,7 @@ impl Engine {
                             ),
                             message: "using 'exit' to interrupt Lean".to_owned(),
                             severity: SourceSeverity::Warning,
+                            follows_output: false,
                         });
                     }
                     ScopeCommand::OpenIn {
@@ -7664,9 +7665,13 @@ impl Engine {
             // A command this parse does not read is not linted; its own path reports it. A
             // `mutual` block is linted member by member, each at its own offset in the block.
             let members = match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
+                // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
+                // binds variables as a declaration does.
                 Ok(parsed)
-                    if parsed.syntax().kind()
-                        == Some(&unused_variables::parser_kind(&["Command", "declaration"])) =>
+                    if ["declaration", "check", "eval"].iter().any(|kind| {
+                        parsed.syntax().kind()
+                            == Some(&unused_variables::parser_kind(&["Command", kind]))
+                    }) || unused_variables::is_reduce(parsed.syntax()) =>
                 {
                     vec![(fln_parse::BytePos(0), parsed.syntax().clone())]
                 }
@@ -7932,6 +7937,7 @@ impl Engine {
                                 at: original_offset,
                                 message,
                                 severity: SourceSeverity::Error,
+                                follows_output: false,
                             });
                             continue;
                         }
@@ -8064,6 +8070,7 @@ impl Engine {
                         at: original_offset,
                         message,
                         severity: SourceSeverity::Error,
+                        follows_output: false,
                     });
                 }
                 continue;
@@ -8563,6 +8570,7 @@ impl Engine {
                     ),
                     message: "declaration uses `sorry`".to_owned(),
                     severity: SourceSeverity::Warning,
+                    follows_output: false,
                 })
             })
             .collect();
@@ -8648,7 +8656,16 @@ impl Engine {
                     linters::deprecated_assignment_syntax(syntax, options)
                         .into_iter()
                         .collect();
-                if !sorry_commands.contains(&command) {
+                // The `:=` note is logged while the command elaborates; the linters after it.
+                let elaboration_notes = lints.len();
+                // The pin runs no linter after a command that logged an error.
+                let errored = guarded_errors
+                    .iter()
+                    .any(|error| error.command_index == command);
+                if !errored
+                    && !sorry_commands.contains(&command)
+                    && !unused_variables::has_sorry(syntax)
+                {
                     // A field filled by its tactic ran one inside the body, so the pin reads
                     // the body's binders only through its elaborated term.
                     let body_ran_tactics = declared.is_some_and(|(_, _, value, _)| {
@@ -8689,12 +8706,13 @@ impl Engine {
                         options,
                     ));
                 }
-                for lint in lints {
+                for (index, lint) in lints.into_iter().enumerate() {
                     warnings.push(SourceWarning {
                         command_index: command,
                         at: fln_parse::BytePos(offset.0 + lint.at),
                         message: lint.message,
                         severity: SourceSeverity::Warning,
+                        follows_output: index >= elaboration_notes,
                     });
                 }
             }
@@ -12364,6 +12382,9 @@ pub struct SourceWarning {
     pub at: fln_parse::BytePos,
     pub message: String,
     pub severity: SourceSeverity,
+    /// Logged by a linter after the command ran, so after any output the command printed
+    /// (`withLogging` runs the linters once the command's elaboration logged its messages).
+    pub follows_output: bool,
 }
 
 /// The severity a [`SourceWarning`] is logged at. An error is logged only for a command

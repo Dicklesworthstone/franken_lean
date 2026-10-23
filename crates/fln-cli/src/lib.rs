@@ -12151,7 +12151,12 @@ fn render_lean_source_commands(
             | fln::SourceCommandOutput::Check { command_index, .. }
             | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
-        while let Some(message) = messages.next_if(|message| message.command() <= command_index) {
+        // A command's linter warnings follow its output; they go out with the next output's
+        // messages, or after the last output.
+        while let Some(message) = messages.next_if(|message| {
+            message.command() < command_index
+                || (message.command() == command_index && !message.follows_output())
+        }) {
             if let Err(failure) =
                 message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output)
             {
