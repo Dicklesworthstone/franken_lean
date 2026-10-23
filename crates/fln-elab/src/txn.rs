@@ -133,7 +133,7 @@ pub struct TxnCheckpoint {
 }
 
 /// The explicit elaboration transaction state (`ElabTxn`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ElabTxn {
     pub env: Environment,
     pub lctx: LocalContext,
@@ -148,6 +148,42 @@ pub struct ElabTxn {
     pub budget: ElabBudget,
     /// The most recent exposed candidate, consumed with `take_exposed_candidate`.
     pub exposed_candidate: Option<ExposedCandidate>,
+    pub(crate) nat_sub_model_cache: crate::constraint::unify::NatSubModelCache,
+}
+
+// The model memo is operational state, like an already encoded digest. It
+// cannot change transaction meaning; its own reuse test binds declarations.
+// Exhaustive destructuring forces every future state field to be considered.
+impl PartialEq for ElabTxn {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            env,
+            lctx,
+            mvars,
+            universes,
+            constraints,
+            messages,
+            info_tree,
+            options,
+            decisions,
+            seed,
+            budget,
+            exposed_candidate,
+            nat_sub_model_cache: _,
+        } = self;
+        env == &other.env
+            && lctx == &other.lctx
+            && mvars == &other.mvars
+            && universes == &other.universes
+            && constraints == &other.constraints
+            && messages == &other.messages
+            && info_tree == &other.info_tree
+            && options == &other.options
+            && decisions == &other.decisions
+            && seed == &other.seed
+            && budget == &other.budget
+            && exposed_candidate == &other.exposed_candidate
+    }
 }
 
 impl ElabTxn {
@@ -165,6 +201,7 @@ impl ElabTxn {
             seed,
             budget: ElabBudget::default(),
             exposed_candidate: None,
+            nat_sub_model_cache: crate::constraint::unify::NatSubModelCache::default(),
         }
     }
 
@@ -274,6 +311,7 @@ impl ElabTxn {
                 self.options = child.options;
                 self.seed = child.seed;
                 self.exposed_candidate = child.exposed_candidate;
+                self.nat_sub_model_cache = child.nat_sub_model_cache;
                 Ok(None)
             }
             TxnOutcome::CommitDiagnosticsOnly => {

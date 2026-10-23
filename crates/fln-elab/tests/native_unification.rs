@@ -1270,13 +1270,63 @@ fn symbolic_nat_subtraction_uses_smart_delta_and_keeps_neutral_conversions() {
 }
 
 #[test]
+fn symbolic_nat_subtraction_reuses_only_a_completed_model_check() {
+    let mut base = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
+    for declaration in
+        fln_elab::seed::imported_nat_intrinsic_model_declarations(&Name::from_components([
+            "Nat", "sub",
+        ]))
+        .expect("the pinned subtraction model exists")
+    {
+        publish_in(&mut base, declaration);
+    }
+    let x = local(&mut base, "cachedSubtractionBase", nat());
+    let subtracted = nat_operation("sub", &[x.clone(), numeral(0)]);
+    let before = base.clone();
+    let mut small = default_budget();
+    small.max_steps = 500;
+    let mut incomplete = base.clone();
+    assert!(matches!(
+        incomplete.unify(&subtracted, &x, small),
+        Err(UnificationError::StepLimit { .. })
+    ));
+    assert!(matches!(
+        incomplete.unify(&subtracted, &x, small),
+        Err(UnificationError::StepLimit { .. })
+    ));
+    assert_semantics_unchanged(&incomplete, &before);
+    base.unify(&subtracted, &x, default_budget()).unwrap();
+    // Each call creates a new unifier, including on a transaction fork. Only
+    // a completed check of this immutable environment may avoid the walk.
+    for mut txn in [base.clone(), base] {
+        for (left, right) in [(&subtracted, &x), (&x, &subtracted)] {
+            txn.unify(left, right, small).unwrap();
+        }
+        let mut exhausted = small;
+        exhausted.max_steps = 0;
+        assert!(matches!(
+            txn.unify(&subtracted, &x, exhausted),
+            Err(UnificationError::StepLimit { limit: 0 })
+        ));
+        assert_semantics_unchanged(&txn, &before);
+    }
+}
+
+#[test]
 fn symbolic_nat_subtraction_preserves_a_custom_definition_body() {
+    let sub = Name::from_components(["Nat", "sub"]);
+    let declarations = fln_elab::seed::imported_nat_intrinsic_model_declarations(&sub)
+        .expect("the pinned subtraction model exists");
+    let mut validated = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
+    for declaration in declarations.clone() {
+        publish_in(&mut validated, declaration);
+    }
+    let x = local(&mut validated, "customSubtractionBase", nat());
+    let subtracted = nat_operation("sub", &[x.clone(), numeral(0)]);
+    validated.unify(&subtracted, &x, default_budget()).unwrap();
     for (changed, argument) in [("Nat.sub", 1), ("Nat.sub._f", 0)] {
         let mut base = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
-        let sub = Name::from_components(["Nat", "sub"]);
-        let declarations = fln_elab::seed::imported_nat_intrinsic_model_declarations(&sub)
-            .expect("the pinned subtraction model exists");
-        for mut declaration in declarations {
+        for mut declaration in declarations.clone() {
             if let fln_kernel::Declaration::Defn(definition) = &mut declaration
                 && definition.base.name == Name::from_components(changed.split('.'))
             {
@@ -1305,8 +1355,12 @@ fn symbolic_nat_subtraction_preserves_a_custom_definition_body() {
         // A valid prelude can supply this body under the same name and type.
         // The pin checks Eq.refl (Nat.succ n) at Nat.sub n Nat.zero for the
         // changed root. A changed functional must not inherit root validation.
-        let x = local(&mut base, "customSubtractionBase", nat());
-        let subtracted = nat_operation("sub", &[x.clone(), numeral(0)]);
+        // Keep a warm validation while replacing the complete environment by
+        // an equally large, valid one with a changed root or helper body.
+        // Name/count/signature-based memo keys would reuse the wrong result.
+        let mut warmed = validated.clone();
+        warmed.env = base.env;
+        let base = warmed;
         for (left, right) in [
             (&subtracted, &successor(x.clone())),
             (&successor(x.clone()), &subtracted),

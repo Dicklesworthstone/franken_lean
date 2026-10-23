@@ -100,6 +100,17 @@ impl Engine<'_> {
         if let Some(valid) = self.nat_sub_model_valid {
             return Ok(valid);
         }
+        self.meter.node()?;
+        if self
+            .work
+            .nat_sub_model_cache
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.has_same_declarations(&self.work.env))
+        {
+            self.nat_sub_model_valid = Some(true);
+            return Ok(true);
+        }
         static MODEL: std::sync::OnceLock<Option<Vec<ConstantInfo>>> = std::sync::OnceLock::new();
         let initialize = || {
             let mut entries = Vec::new();
@@ -194,6 +205,7 @@ impl Engine<'_> {
             }
         }
         self.nat_sub_model_valid = Some(true);
+        self.work.nat_sub_model_cache.snapshot = Some(self.work.env.clone());
         Ok(true)
     }
 

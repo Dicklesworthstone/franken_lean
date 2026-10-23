@@ -512,6 +512,22 @@ enum LiteralStep {
     Compare(Expr, Expr),
 }
 
+/// One fully validated immutable declaration snapshot. Cloning a transaction
+/// copies this memo; branches never share mutable cache state. It is not part
+/// of transaction equality and cannot publish a declaration or assignment.
+#[derive(Clone, Default)]
+pub(crate) struct NatSubModelCache {
+    snapshot: Option<fln_env::environment::Environment>,
+}
+
+impl std::fmt::Debug for NatSubModelCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatSubModelCache")
+            .field("validated", &self.snapshot.is_some())
+            .finish()
+    }
+}
+
 struct Engine<'a> {
     work: ElabTxn,
     budget: UnificationBudget,
@@ -1770,6 +1786,9 @@ impl ElabTxn {
             .checked_add(engine.meter.steps)
             .and_then(|consumed| consumed.checked_add(engine.pending.spent()))
             .ok_or(UnificationError::HeartbeatLimit)?;
+        // A completely checked immutable model is reusable even when the
+        // equation itself fails. No assignments or spent work are restored.
+        self.nat_sub_model_cache = engine.work.nat_sub_model_cache;
         result?;
         if cancelled() {
             return Err(UnificationError::Cancelled);

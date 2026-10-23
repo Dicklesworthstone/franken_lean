@@ -1028,6 +1028,13 @@ impl Environment {
         self.constants.contains_key(name)
     }
 
+    /// Whether the immutable declaration maps share the same root. This is an
+    /// O(1), sufficient cache-reuse test, not content equality. Independently
+    /// rebuilt equal maps may return false; extension changes are irrelevant.
+    pub fn has_same_declarations(&self, other: &Self) -> bool {
+        self.constants.is_same_structure(&other.constants)
+    }
+
     /// The constant named `name` with the digest this environment computed for
     /// it, to carry into another environment without re-hashing.
     pub fn entry(&self, name: &Name) -> Option<EnvironmentEntry> {

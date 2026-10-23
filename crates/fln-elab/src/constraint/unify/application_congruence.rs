@@ -159,6 +159,7 @@ impl Engine<'_> {
         };
         let generation = self.generation();
         let result = trial.solve(equations, &[], &[]);
+        self.work.nat_sub_model_cache = trial.work.nat_sub_model_cache.clone();
         let made_assignments = trial.generation() != generation;
         // Failed speculation consumes real work. Never reset cancellation,
         // unifier/node limits or the assignment check's typed non-answer.

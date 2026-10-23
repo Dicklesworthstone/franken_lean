@@ -575,8 +575,10 @@ impl Context {
                 Ok(Attempt::SelectedFailure(problem)) => return Err(problem),
                 Ok(Attempt::Lexicographic(order)) => {
                     let spent = self.txn.budget.heartbeats_consumed;
+                    let model_cache = self.txn.nat_sub_model_cache.clone();
                     *self = snapshot;
                     self.txn.budget.heartbeats_consumed = spent;
+                    self.txn.nat_sub_model_cache = model_cache;
                     // The solution is checked as `termination_by (x₁, x₂, …)` would be.
                     let selected = Hint {
                         aliases: Vec::new(),
@@ -606,8 +608,10 @@ impl Context {
                 Err(problem) => problem,
             };
             let spent = self.txn.budget.heartbeats_consumed;
+            let model_cache = self.txn.nat_sub_model_cache.clone();
             *self = snapshot.clone();
             self.txn.budget.heartbeats_consumed = spent;
+            self.txn.nat_sub_model_cache = model_cache;
             if !tactics::backtrack::recoverable(&problem) {
                 return Err(problem);
             }
@@ -665,6 +669,7 @@ impl Context {
             trial.well_founded_default_conversion(&actual, &expected)
         })();
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        self.txn.nat_sub_model_cache = trial.txn.nat_sub_model_cache;
         result
     }
 
@@ -690,6 +695,7 @@ impl Context {
             trial.well_founded_default_conversion(&size, &parameter)
         })();
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        self.txn.nat_sub_model_cache = trial.txn.nat_sub_model_cache;
         result
     }
 
@@ -731,8 +737,10 @@ impl Context {
                         return Err(failure(SourceInferenceError::Scope));
                     }
                     let spent = self.txn.budget.heartbeats_consumed;
+                    let model_cache = self.txn.nat_sub_model_cache.clone();
                     *self = snapshot.clone();
                     self.txn.budget.heartbeats_consumed = spent;
+                    self.txn.nat_sub_model_cache = model_cache;
                     varying = next;
                 }
             }
@@ -1142,6 +1150,7 @@ impl Context {
         // cleanup, but remove our equivalent beta/iota/projection redexes.
         let target = trial.reduce_decreasing_comparison(target, false);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        self.txn.nat_sub_model_cache = trial.txn.nat_sub_model_cache.clone();
         let target = target?;
         let (head, arguments) = operators::spine(&target);
         if !matches!(head.node(), ExprNode::Const { name, .. }
@@ -1152,6 +1161,9 @@ impl Context {
         }
         let equal = trial.well_founded_default_conversion(&arguments[0], &arguments[1]);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        // Repeated call comparisons deliberately roll back term assignments,
+        // but the completed immutable model check is still valid and paid for.
+        self.txn.nat_sub_model_cache = trial.txn.nat_sub_model_cache;
         if equal? {
             return Ok(Ok(CallRelation::Eq));
         }
@@ -1379,8 +1391,10 @@ impl Context {
             self.run_decreasing_proof(proof, state).map(|_| ())
         })();
         let spent = self.txn.budget.heartbeats_consumed;
+        let model_cache = self.txn.nat_sub_model_cache.clone();
         *self = snapshot;
         self.txn.budget.heartbeats_consumed = spent;
+        self.txn.nat_sub_model_cache = model_cache;
         result
     }
 
