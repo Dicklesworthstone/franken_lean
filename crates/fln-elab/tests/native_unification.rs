@@ -1230,10 +1230,11 @@ fn symbolic_nat_subtraction_uses_smart_delta_and_keeps_neutral_conversions() {
     // The small arithmetic seed intentionally gives sub/pred axiom headers.
     // Symbolic delta needs their actual logical bodies and helper closure.
     let mut base = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
-    for declaration in fln_elab::seed::imported_nat_intrinsic_model_declarations(
-        &Name::from_components(["Nat", "sub"]),
-    )
-    .expect("the pinned subtraction model exists")
+    for declaration in
+        fln_elab::seed::imported_nat_intrinsic_model_declarations(&Name::from_components([
+            "Nat", "sub",
+        ]))
+        .expect("the pinned subtraction model exists")
     {
         publish_in(&mut base, declaration);
     }
@@ -1265,6 +1266,62 @@ fn symbolic_nat_subtraction_uses_smart_delta_and_keeps_neutral_conversions() {
             );
             assert_semantics_unchanged(&txn, &base);
         }
+    }
+}
+
+#[test]
+fn symbolic_nat_subtraction_preserves_a_custom_definition_body() {
+    for (changed, argument) in [("Nat.sub", 1), ("Nat.sub._f", 0)] {
+        let mut base = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
+        let sub = Name::from_components(["Nat", "sub"]);
+        let declarations = fln_elab::seed::imported_nat_intrinsic_model_declarations(&sub)
+            .expect("the pinned subtraction model exists");
+        for mut declaration in declarations {
+            if let fln_kernel::Declaration::Defn(definition) = &mut declaration
+                && definition.base.name == Name::from_components(changed.split('.'))
+            {
+                let mut binders = Vec::new();
+                let mut tail = &definition.value;
+                while let ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } = tail.node()
+                {
+                    binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                    tail = body;
+                }
+                assert_eq!(binders.len(), if argument == 1 { 2 } else { 3 });
+                definition.value = binders
+                    .into_iter()
+                    .rev()
+                    .fold(successor(bvar(argument)), |body, (name, type_, info)| {
+                        Expr::lam(name, type_, body, info)
+                    });
+            }
+            publish_in(&mut base, declaration);
+        }
+        // A valid prelude can supply this body under the same name and type.
+        // The pin checks Eq.refl (Nat.succ n) at Nat.sub n Nat.zero for the
+        // changed root. A changed functional must not inherit root validation.
+        let x = local(&mut base, "customSubtractionBase", nat());
+        let subtracted = nat_operation("sub", &[x.clone(), numeral(0)]);
+        for (left, right) in [
+            (&subtracted, &successor(x.clone())),
+            (&successor(x.clone()), &subtracted),
+        ] {
+            let mut txn = base.clone();
+            txn.unify(left, right, default_budget())
+                .unwrap_or_else(|error| panic!("{changed}: {error:?}"));
+            assert_semantics_unchanged(&txn, &base);
+        }
+        let mut txn = base.clone();
+        assert!(matches!(
+            txn.unify(&subtracted, &x, default_budget()),
+            Err(UnificationError::Deferred(_))
+        ));
+        assert_semantics_unchanged(&txn, &base);
     }
 }
 

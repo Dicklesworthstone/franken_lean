@@ -93,6 +93,110 @@ impl NatOperation {
 }
 
 impl Engine<'_> {
+    /// Smart unfolding is a shortcut for this complete logical model, not an
+    /// interpretation attached to a user-chosen declaration name. Helpers must
+    /// agree too: replacing the functional while retaining the root changes it.
+    fn has_nat_sub_smart_model(&mut self) -> Result<bool, UnificationError> {
+        if let Some(valid) = self.nat_sub_model_valid {
+            return Ok(valid);
+        }
+        static MODEL: std::sync::OnceLock<Option<Vec<ConstantInfo>>> = std::sync::OnceLock::new();
+        let initialize = || {
+            let mut entries = Vec::new();
+            let sub = Name::from_components(["Nat", "sub"]);
+            let declarations = crate::seed::imported_nat_intrinsic_model_declarations(&sub)?;
+            for declaration in declarations {
+                match declaration {
+                    fln_kernel::Declaration::Defn(value) => {
+                        entries.push(ConstantInfo::Defn(value));
+                    }
+                    fln_kernel::Declaration::Inductive(block) => {
+                        entries.extend(block.types.into_iter().map(ConstantInfo::Induct));
+                        entries.extend(block.ctors.into_iter().map(ConstantInfo::Ctor));
+                        entries.extend(block.recursors.into_iter().map(ConstantInfo::Rec));
+                    }
+                    _ => return None,
+                }
+            }
+            (!entries.is_empty()).then_some(entries)
+        };
+        let model = MODEL.get_or_init(initialize);
+        let Some(model) = model else {
+            self.nat_sub_model_valid = Some(false);
+            return Ok(false);
+        };
+        for expected in model {
+            self.meter.node()?;
+            let Some(actual) = self.work.env.find(expected.name()) else {
+                self.nat_sub_model_valid = Some(false);
+                return Ok(false);
+            };
+            let a = actual.constant_val();
+            let b = expected.constant_val();
+            let metadata = a.level_params == b.level_params
+                && match (actual, expected) {
+                    (ConstantInfo::Defn(a), ConstantInfo::Defn(b)) => {
+                        a.hints == b.hints && a.safety == b.safety && a.all == b.all
+                    }
+                    (ConstantInfo::Induct(a), ConstantInfo::Induct(b)) => {
+                        a.num_params == b.num_params
+                            && a.num_indices == b.num_indices
+                            && a.all == b.all
+                            && a.ctors == b.ctors
+                            && a.num_nested == b.num_nested
+                            && a.is_rec == b.is_rec
+                            && a.is_unsafe == b.is_unsafe
+                            && a.is_reflexive == b.is_reflexive
+                    }
+                    (ConstantInfo::Ctor(a), ConstantInfo::Ctor(b)) => {
+                        a.induct == b.induct
+                            && a.cidx == b.cidx
+                            && a.num_params == b.num_params
+                            && a.num_fields == b.num_fields
+                            && a.is_unsafe == b.is_unsafe
+                    }
+                    (ConstantInfo::Rec(a), ConstantInfo::Rec(b)) => {
+                        a.all == b.all
+                            && a.num_params == b.num_params
+                            && a.num_indices == b.num_indices
+                            && a.num_motives == b.num_motives
+                            && a.num_minors == b.num_minors
+                            && a.rules.len() == b.rules.len()
+                            && a.k == b.k
+                            && a.is_unsafe == b.is_unsafe
+                    }
+                    _ => false,
+                };
+            let mut matches = metadata && same_terms(&a.type_, &b.type_, &mut self.meter)?;
+            if matches {
+                match (actual, expected) {
+                    (ConstantInfo::Defn(a), ConstantInfo::Defn(b)) => {
+                        matches = same_terms(&a.value, &b.value, &mut self.meter)?;
+                    }
+                    (ConstantInfo::Rec(a), ConstantInfo::Rec(b)) => {
+                        for (a, b) in a.rules.iter().zip(&b.rules) {
+                            self.meter.node()?;
+                            if a.ctor != b.ctor
+                                || a.nfields != b.nfields
+                                || !same_terms(&a.rhs, &b.rhs, &mut self.meter)?
+                            {
+                                matches = false;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !matches {
+                self.nat_sub_model_valid = Some(false);
+                return Ok(false);
+            }
+        }
+        self.nat_sub_model_valid = Some(true);
+        Ok(true)
+    }
+
     /// The constructor laws must be present, not an axiom merely named `Nat`.
     /// These fixed metadata checks do not require allocation-identity equality
     /// with the source seed, so an imported pin-shaped Nat works as well.
@@ -463,6 +567,9 @@ impl Engine<'_> {
         let wrapper = match self.nat_operation_signature(head, 2)? {
             Some(NatOperation::Add) => Name::from_components(["Nat", "succ"]),
             Some(NatOperation::Sub) => {
+                if !self.has_nat_sub_smart_model()? {
+                    return Ok(None);
+                }
                 let pred = Name::from_components(["Nat", "pred"]);
                 if !matches!(self.work.env.find(&pred), Some(ConstantInfo::Defn(info))
                     if info.safety == DefinitionSafety::Safe && info.base.level_params.is_empty())
