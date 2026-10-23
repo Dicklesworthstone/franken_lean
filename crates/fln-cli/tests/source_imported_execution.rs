@@ -973,14 +973,21 @@ fn print_shows_declarations_as_the_pin_does() {
     let refused_import = lean_door(&workspace, &imported, &lib);
     assert_eq!(refused_import.code, 5, "{refused_import:?}");
     assert!(refused_import.stdout.is_empty(), "{refused_import:?}");
-    // The pin prints `{ default := 7 }`; this door does not reproduce structure instances.
+    // An instance's value is a structure instance, printed as the pin prints it (measured
+    // 2026-10-22).
     let instance = workspace.write(
         "Instance.lean",
         "prelude\nimport Init.Core\ninstance foo : Inhabited Nat := ⟨7⟩\n#print foo\n",
     );
-    let refused = lean_door(&workspace, &instance, &lib);
-    assert_eq!(refused.code, 5, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
+    let printed = lean_door(&workspace, &instance, &lib);
+    assert_eq!(
+        (printed.code, printed.stdout.as_str()),
+        (
+            0,
+            "@[implicit_reducible] def foo : Inhabited Nat :=\n{ default := 7 }\n"
+        ),
+        "{printed:?}"
+    );
 }
 
 /// `#exit` is the pin's terminal command (`elabExit`, `Parser.isTerminalCommand`): it warns

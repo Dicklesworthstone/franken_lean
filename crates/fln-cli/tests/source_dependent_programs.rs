@@ -51,7 +51,16 @@ fn default_budget_runs_nested_dependent_apis_in_both_personalities_and_replay() 
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
-    assert_eq!(output.stdout, b"42\n");
+    // The pinned `lean` v4.32.0 warns about the unread `x` of `rest`'s match (2026-10-22).
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}:9:26: warning: Variable name `x` is not explicitly referenced.\n\nThe binding \
+             can be removed (if unused) or named `_` (if used implicitly).\n\nNote: This linter \
+             can be disabled with `set_option linter.unusedVariables false`\n42\n",
+            path.display()
+        )
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), EXAMPLE);
 }
 #[test]
