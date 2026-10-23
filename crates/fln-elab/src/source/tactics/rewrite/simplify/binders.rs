@@ -31,6 +31,14 @@ impl Context {
         rule: &SimpRule<'_>,
         premises: &[SimpRule<'_>],
     ) -> Result<Option<(Typed, Expr, bool)>, NatDefinitionElabError> {
+        if matches!(rule, SimpRule::Arith) {
+            if let Some((evidence, occurrence)) = self.simp_arith_evidence(target)? {
+                return Ok(Some((evidence, occurrence, false)));
+            }
+            return Ok(self
+                .simp_binder_rule(target, rule, premises)?
+                .map(|evidence| (evidence, target.clone(), false)));
+        }
         let mut term = self.selected_simp_term(rule)?;
         term.type_ = self.simp_premise_target(&term.type_, premises)?;
         let key = self.simp_rule_node_key(rule)?;
@@ -114,6 +122,14 @@ impl Context {
         rule: &SimpRule<'_>,
         premises: &[SimpRule<'_>],
     ) -> Result<Option<(Expr, Typed)>, NatDefinitionElabError> {
+        if matches!(rule, SimpRule::Arith) {
+            let Some((evidence, occurrence)) = self.simp_arith_evidence(body)? else {
+                return Ok(None);
+            };
+            return self
+                .simp_occurrence_equality(body, &occurrence, evidence, false)
+                .map(Some);
+        }
         let mut term = self.selected_simp_term(rule)?;
         term.type_ = self.simp_premise_target(&term.type_, premises)?;
         let key = self.simp_rule_node_key(rule)?;

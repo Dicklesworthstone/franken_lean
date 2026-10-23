@@ -3,6 +3,7 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod arith;
 mod binders;
 mod dsimp;
 mod locations;
@@ -29,13 +30,17 @@ pub(in crate::source) enum SimpRule<'a> {
     /// A wildcard selects a proof by local identity, not its display spelling.
     /// Location simplification remaps this identity when replacing the local.
     Local(FVarId),
+    /// `+arith`'s linear normalization (`arith.rs`), always the last rule: the pin's
+    /// `simpArith` runs after `rewritePost` (`Rewrite.lean:542-546`). It rewrites; it never
+    /// closes a goal by itself.
+    Arith,
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
-            Self::Local(_) => false,
+            Self::Local(_) | Self::Arith => false,
         }
     }
 }
@@ -375,6 +380,9 @@ impl Context {
         index: Option<&SimpTargetIndex>,
         side: SimpKeySide,
     ) -> bool {
+        if matches!(rule, SimpRule::Arith) {
+            return matches!(side, SimpKeySide::Rewrite);
+        }
         let (Some(index), SimpRule::Global(entry)) = (index, rule) else {
             return true;
         };
@@ -742,6 +750,8 @@ impl Context {
                     type_: local.type_.clone(),
                 })
             }
+            // Arithmetic normalization has no single proof term to select.
+            SimpRule::Arith => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -827,12 +837,27 @@ impl Context {
             },
             "simplification keyword",
         )?;
-        expect_default_config(config, "default simplification configuration")?;
+        // `dsimp`'s configuration has no `arith` field.
+        let arith = self.simp_arith_config(config, !dsimp)?;
         expect_empty_null(discharger, "default simplification discharger")?;
         if !simpa {
             let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
         }
+        let mut rules = self.simp_rule_selection(dsimp, only, arguments)?;
+        if arith {
+            rules.push(SimpRule::Arith);
+        }
+        Ok(rules)
+    }
+
+    /// The rules `simp_rules` selects, before `+arith`'s normalization joins them last.
+    fn simp_rule_selection<'a>(
+        &mut self,
+        dsimp: bool,
+        only: &'a Syntax,
+        arguments: &'a Syntax,
+    ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
         let use_default = match expect_null_args(only, "optional explicit simp set")? {
             [] => true,
             [only] => {

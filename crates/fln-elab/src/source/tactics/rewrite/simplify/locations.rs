@@ -41,7 +41,8 @@ impl Context {
         rule: &SimpRule<'_>,
         tagged: &mut Option<std::collections::BTreeSet<Name>>,
     ) -> Result<bool, NatDefinitionElabError> {
-        if matches!(rule, SimpRule::Local(_)) {
+        // A linear normalization's proof is a reflection proof, not `rfl`.
+        if matches!(rule, SimpRule::Local(_) | SimpRule::Arith) {
             return Ok(false);
         }
         let tagged = match tagged {
@@ -80,7 +81,7 @@ impl Context {
             return Err(error(TacticError::MalformedScript));
         };
         expect_atom(keyword, "simp_all", "whole-context simplification keyword")?;
-        expect_default_config(config, "default simplification configuration")?;
+        // The configuration is read, and `+arith` admitted, by the ordinary set parser.
         // Reuse the ordinary set parser without reparsing source or changing
         // the persistent registry. Its location slot is an empty null node.
         let no_location = Syntax::node(Name::from_components(["null"]), Vec::new());
@@ -135,6 +136,14 @@ impl Context {
             {
                 hypotheses.push(local.user_name.clone());
             }
+        }
+        // `+arith`'s normalization stays after every rule, the context's facts included.
+        if let Some(index) = rules
+            .iter()
+            .position(|rule| matches!(rule, SimpRule::Arith))
+        {
+            let arith = rules.remove(index);
+            rules.push(arith);
         }
         let locations = super::super::locations::RewriteLocations {
             hypotheses,
@@ -258,6 +267,24 @@ impl Context {
                             }
                         }
                         history.push(target);
+                        // A hypothesis simplified to `False` closes the goal (`applySimpResult`,
+                        // `Simp/Main.lean:808`): `False.elim` of the rewritten evidence.
+                        if is_false(&self.instantiate(&replacement.type_)?) {
+                            let target = self.instantiate(&goal.target)?;
+                            let sort = self
+                                .known_type(&target)?
+                                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                            let level = self.sort_level(&Typed {
+                                value: target.clone(),
+                                type_: sort,
+                            })?;
+                            self.constant(&Name::from_components(["False", "elim"]))?;
+                            let value = app(
+                                Expr::const_(Name::from_components(["False", "elim"]), vec![level]),
+                                [target, replacement.value],
+                            );
+                            return self.close_proof_goal(goal, value);
+                        }
                         // `SimpAll.main` asserts no hypothesis that became `True`: it leaves
                         // the goal, and its rewriting proof never enters the term.
                         let removed = HashSet::from([local.id.clone()]);
@@ -425,4 +452,9 @@ impl Context {
 fn is_true(type_: &Expr) -> bool {
     matches!(type_.node(), ExprNode::Const { name, levels }
         if levels.is_empty() && *name == Name::from_components(["True"]))
+}
+
+fn is_false(type_: &Expr) -> bool {
+    matches!(type_.node(), ExprNode::Const { name, levels }
+        if levels.is_empty() && *name == Name::from_components(["False"]))
 }
