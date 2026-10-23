@@ -8,13 +8,15 @@ use super::*;
 pub(super) enum Prefix {
     Binders(Box<term_binders::Prefix>),
     Assertion(Box<Assertion>),
-    /// `dbg_trace argument; body`: the argument and continuation occupy separate
-    /// phases on this same heap stack, including a line break in place of `;`.
+    /// `dbg_trace argument; body` or `assert! condition; body`: the argument and
+    /// continuation occupy separate heap phases, including a line break for `;`.
     DebugTrace(Box<DebugTrace>),
     Do(Box<term_do::Prefix>),
     /// `← e` (`Term.nestedAction`, `"← " doElem` at minimum precedence): the `←` token; its
     /// body is the rest of the enclosing group.
     Nested(usize),
+    /// `"panic! " termParser`: the message has minimum precedence.
+    Panic(usize),
     /// `return e` outside `do` (`Term.termReturn`, `"return" (ppSpace term)?`): the keyword; its
     /// body, possibly empty, is the rest of the enclosing group.
     Return(usize),
@@ -57,6 +59,7 @@ fn range_argument(mut head: Vec<(Syntax, usize)>, body: Syntax) -> (Syntax, usiz
 
 pub(super) struct DebugTrace {
     keyword: usize,
+    assertion: bool,
     argument: Option<Syntax>,
     separator: Option<usize>,
 }
@@ -249,15 +252,18 @@ impl Prefix {
         }
         let mut trace = DebugTrace {
             keyword,
+            assertion: word(tokens, keyword, "assert!"),
             argument: None,
             separator: None,
         };
         // The pin tries interpolatedStr before termParser. Even a string without
         // holes uses this branch; the closing quote finishes its whole argument.
-        if matches!(
-            tokens.get(*cursor).map(|token| &token.kind),
-            Some(TokenKind::Literal(fln_syntax::literal::LiteralKind::Str))
-        ) {
+        if !trace.assertion
+            && matches!(
+                tokens.get(*cursor).map(|token| &token.kind),
+                Some(TokenKind::Literal(fln_syntax::literal::LiteralKind::Str))
+            )
+        {
             let (argument, next) =
                 extensions::interpolated_term(leaves, view, tokens, *cursor, end)
                     .ok_or_else(|| refuse(view, tokens, *cursor))?;
@@ -413,6 +419,7 @@ impl Prefix {
             | Prefix::Assertion(_)
             | Prefix::DebugTrace(_)
             | Prefix::Nested(_)
+            | Prefix::Panic(_)
             | Prefix::Return(_)
             | Prefix::SetOption { .. }
             | Prefix::RangeArgument(_)
@@ -426,6 +433,7 @@ impl Prefix {
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
             Self::DebugTrace(p) => p.argument.is_some(),
             Self::Nested(_)
+            | Self::Panic(_)
             | Self::Return(_)
             | Self::SetOption { .. }
             | Self::RangeArgument(_)
@@ -438,6 +446,7 @@ impl Prefix {
             Self::Binders(p) => p.closes_header(tokens, at),
             Self::DebugTrace(p) => p.argument.is_none() && word(tokens, at, ";"),
             Self::Nested(_)
+            | Self::Panic(_)
             | Self::Return(_)
             | Self::SetOption { .. }
             | Self::RangeArgument(_)
@@ -486,6 +495,7 @@ impl Prefix {
             }
             Self::Assertion(p) => p,
             Self::Nested(_)
+            | Self::Panic(_)
             | Self::Return(_)
             | Self::SetOption { .. }
             | Self::RangeArgument(_)
@@ -550,9 +560,13 @@ impl Prefix {
                         expected: NatDefinitionExpectation::ScalarValue,
                     })?;
                 let syntax = Syntax::node(
-                    parser_kind(&["Term", "dbgTrace"]),
+                    parser_kind(&["Term", if p.assertion { "assert" } else { "dbgTrace" }]),
                     vec![
-                        atom(leaves, p.keyword, "dbg_trace")?,
+                        atom(
+                            leaves,
+                            p.keyword,
+                            if p.assertion { "assert!" } else { "dbg_trace" },
+                        )?,
                         argument,
                         separator(leaves, p.separator)?,
                         body,
@@ -568,6 +582,15 @@ impl Prefix {
                     vec![leaves.leaf(arrow)?, super::term_do::arrow_element(body)],
                 );
                 return Ok((syntax, arrow));
+            }
+            Self::Panic(keyword) => {
+                return Ok((
+                    Syntax::node(
+                        parser_kind(&["Term", "panic"]),
+                        vec![leaves.leaf(keyword)?, body],
+                    ),
+                    keyword,
+                ));
             }
             Self::RangeArgument(head) => return Ok(range_argument(head, body)),
             Self::StarRange(at, label) => {

@@ -59,8 +59,56 @@ pub(super) fn block_end(
 /// original group's offsets survive parser errors inside every member. None
 /// means this is an ordinary command, not an empty or malformed mutual group.
 pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError> {
-    Ok(parse_with_offsets(source)?
-        .map(|members| members.into_iter().map(|(_, syntax)| syntax).collect()))
+    Ok(parse_with_offsets(source)?.map(|members| {
+        members
+            .into_iter()
+            .map(|(offset, mut syntax)| {
+                // The elaborator receives the whole group's source site. Keep
+                // every member's positions relative to that same original file.
+                let span = |value: ByteSpan| {
+                    ByteSpan::new(
+                        BytePos(value.start().0 + offset.0),
+                        BytePos(value.end().0 + offset.0),
+                    )
+                    .expect("a member span remains inside its source group")
+                };
+                let shift = |info: &mut SourceInfo| match info {
+                    SourceInfo::Original {
+                        leading,
+                        pos,
+                        trailing,
+                        end_pos,
+                    } => {
+                        *leading = span(*leading);
+                        *trailing = span(*trailing);
+                        pos.0 += offset.0;
+                        end_pos.0 += offset.0;
+                    }
+                    SourceInfo::Synthetic { pos, end_pos, .. } => {
+                        pos.0 += offset.0;
+                        end_pos.0 += offset.0;
+                    }
+                    SourceInfo::None => {}
+                };
+                let mut pending = vec![&mut syntax];
+                while let Some(node) = pending.pop() {
+                    match node {
+                        Syntax::Node { info, args, .. } => {
+                            shift(info);
+                            pending.extend(args.iter_mut());
+                        }
+                        Syntax::Atom { info, .. } => shift(info),
+                        Syntax::Ident { info, raw_val, .. } => {
+                            shift(info);
+                            *raw_val = span(*raw_val);
+                        }
+                        Syntax::Missing => {}
+                    }
+                }
+                syntax
+            })
+            .collect()
+    }))
 }
 
 /// [`parse`], with each member's byte offset in `source`: a member's own positions are

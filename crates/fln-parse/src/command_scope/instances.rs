@@ -228,7 +228,7 @@ mod tests {
             "attribute [instance -1] d",
             "attribute [instance 0xff] d",
             "attribute [instance 1_000] d",
-            "attribute [instance high] d",
+            "attribute [instance higher] d",
             "attribute [instance 7 8] d",
             "attribute [instance, simp] d",
             "attribute [instance] d, e",

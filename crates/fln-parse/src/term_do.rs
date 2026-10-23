@@ -33,6 +33,7 @@ pub(super) struct Prefix {
 #[derive(Clone, Copy)]
 enum Statement {
     Action,
+    Assert(usize),
     Try {
         position: BytePos,
     },
@@ -433,6 +434,9 @@ impl Prefix {
                 keyword: at,
                 position: original_position(view, tokens, at),
             };
+        } else if word(tokens, at, "assert!") {
+            self.statement = Statement::Assert(at);
+            *cursor += 1;
         } else if word(tokens, at, "return") && bare_return(view, tokens, at, end) {
             self.statement = Statement::BareReturn {
                 keyword: at,
@@ -585,6 +589,10 @@ impl Prefix {
     ) -> Result<Syntax, NatDefinitionParseError> {
         Ok(match self.statement {
             Statement::Action => do_element(value),
+            Statement::Assert(at) => Syntax::node(
+                parser_kind(&["Term", "doAssert"]),
+                vec![atom(leaves, at, "assert!")?, value],
+            ),
             Statement::Try { position } => {
                 if !matches!(&value, Syntax::Node {kind, args, ..}
                     if kind == &parser_kind(&["Term", "doTry"]) && args.len() == 4)

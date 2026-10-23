@@ -1856,11 +1856,6 @@ fn finish_bounded_application(
                 Syntax::Atom { val, .. } if val == "no_index" => {
                     Some(parser_kind(&["Term", "noindex"]))
                 }
-                // `"panic! " (interpolatedStr(term) <|> term)` (`Term.panic`); an interpolated
-                // message is not read.
-                Syntax::Atom { val, .. } if val == "panic!" => {
-                    Some(parser_kind(&["Term", "panic"]))
-                }
                 // `syntax:max "↑" term:max : term` (`coeNotation`, `Init/Coe.lean`), at the root.
                 Syntax::Atom { val, .. } if val == "↑" => {
                     Some(Name::from_components(["coeNotation"]))
@@ -3729,7 +3724,8 @@ fn bounded_term_token(
             ))));
         }
         _ if grammar == DefinitionGrammar::Scalar
-            && term_locals::word(tokens, index, "dbg_trace") =>
+            && (term_locals::word(tokens, index, "dbg_trace")
+                || term_locals::word(tokens, index, "assert!")) =>
         {
             let prefix = term_locals::Prefix::debug_trace(
                 leaves,
@@ -3895,6 +3891,26 @@ fn bounded_term_token(
                 ));
         }
         Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "panic!" =>
+        {
+            frames.push(term_binders::frame(term_locals::Prefix::Panic(index)));
+        }
+        Some(TokenKind::Symbol(symbol))
+            if grammar == DefinitionGrammar::Scalar && symbol == "unreachable!" =>
+        {
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((
+                    Syntax::node(
+                        parser_kind(&["Term", "unreachable"]),
+                        vec![leaves.leaf(index)?],
+                    ),
+                    index,
+                ));
+        }
+        Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "nomatch" =>
         {
             cursor = push_nomatch(view, tokens, leaves, frames, index, range.end)?;
@@ -3932,7 +3948,6 @@ fn bounded_term_token(
                     || symbol == "inferInstanceAs"
                     || symbol == "@&"
                     || symbol == "no_index"
-                    || symbol == "panic!"
                     || symbol == "↑") =>
         {
             // `"inferInstanceAs" (("$" <|> "<|") term:minPrec <|> term:argPrec)`
@@ -6425,6 +6440,63 @@ mod nat_definition_tests {
             }
         }
         assert_eq!(traces, 256);
+    }
+
+    #[test]
+    fn panic_family_reads_full_messages_and_both_assert_continuations() {
+        for (source, kind) in [
+            ("def fail : Nat := panic! \"one\" ++ \"two\"", "panic"),
+            ("def fail : Nat := panic! toString (40 + 2)", "panic"),
+            ("def fail : Nat := unreachable!", "unreachable"),
+            ("def safe : Nat := assert! (1 == 1); 42", "assert"),
+            ("def safe : Nat :=\r\n  assert! (1 == 1)\r\n  42", "assert"),
+        ] {
+            let parsed = parse_definition(source.as_bytes()).expect(source);
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                definition_value(&parsed).kind(),
+                Some(&parser_kind(&["Term", kind])),
+                "{source}"
+            );
+        }
+        let parsed = parse_definition(b"def fail : Nat := panic! \"one\" ++ \"two\"").unwrap();
+        let Syntax::Node { args, .. } = definition_value(&parsed) else {
+            unreachable!()
+        };
+        assert_eq!(args.len(), 2);
+        assert_ne!(
+            args[1].kind(),
+            Some(&Name::from_components(["str"])),
+            "panic! must consume the complete message expression"
+        );
+    }
+
+    #[test]
+    fn panic_family_requires_messages_conditions_and_continuations() {
+        for source in [
+            "def fail : Nat := panic!",
+            "def fail : Nat := assert!",
+            "def fail : Nat := assert! true",
+            "def fail : Nat := assert! true;",
+            "def fail : Nat := assert! ; 42",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn panic_family_assert_sequences_use_heap_frames() {
+        let source = format!("def safe : Nat := {}42", "assert! true; ".repeat(256));
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        let mut pending = vec![definition_value(&parsed)];
+        let mut assertions = 0;
+        while let Some(node) = pending.pop() {
+            assertions += usize::from(node.kind() == Some(&parser_kind(&["Term", "assert"])));
+            if let Syntax::Node { args, .. } = node {
+                pending.extend(args);
+            }
+        }
+        assert_eq!(assertions, 256);
     }
 
     #[test]
