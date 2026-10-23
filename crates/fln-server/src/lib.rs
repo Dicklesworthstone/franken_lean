@@ -14,11 +14,12 @@
 //! retained under explicit document/byte limits and monotone client versions so
 //! textless saves can re-check the newest valid snapshot; malformed transitions
 //! invalidate stale retained source and close clears push diagnostics.
-//! `$/lean/plainGoal`, `textDocument/hover`, `textDocument/definition` and
-//! `textDocument/completion` are answered by `dispatch::semantic`, typed read-only
-//! queries over the accepted source snapshot; `$/lean/plainTermGoal` answers null.
-//! Lean RPC sessions (`$/lean/rpc/connect`, `$/lean/rpc/call`) are refused, and
-//! persistent elaboration/import state remains outside this bounded server slice.
+//! `$/lean/plainGoal`, `$/lean/plainTermGoal`, `textDocument/hover`,
+//! `textDocument/definition` and `textDocument/completion` use typed read-only
+//! queries through `dispatch::semantic`, with available checked proof states.
+//! Lean RPC uses bounded document-local sessions for interactive goals, term
+//! goals, diagnostics and presentation matching; other procedures are refused.
+//! Persistent elaboration/import state remains outside this server adapter.
 
 #![forbid(unsafe_code)]
 
