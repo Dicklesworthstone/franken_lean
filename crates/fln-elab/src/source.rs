@@ -670,6 +670,10 @@ struct Context {
     // Set once the definition's body refers to the definition itself, so it is
     // lowered as a recursion: the pin's `recExt` tag (`Lean/Meta/RecExt.lean`).
     recursive_definition: bool,
+    // Definitions whose structural lowering succeeded through the `brecOn` dictionary
+    // (`recursion/course.rs`). Each is compiled from its original body, as the pin compiles
+    // a structural pre-definition (`recursion::structural_companion`).
+    course_definitions: Vec<Name>,
     // Enabled only by the batch-only partial-definition entry point. A recursive
     // body needs its opaque logical interface AND its executable companion.
     partial: Option<partial::State>,
@@ -784,6 +788,7 @@ impl Context {
             mutual_member: None,
             well_founded_definition: false,
             recursive_definition: false,
+            course_definitions: Vec::new(),
             partial: None,
             noncomputable_definition: false,
             unfold_tactic: false,

@@ -159,6 +159,19 @@ impl Context {
                 }));
             }
         }
+        // A course-of-values definition's executable companion is admitted after every
+        // lifted helper its original body may call.
+        if let Declaration::Defn(definition) = owner
+            && definition.safety == DefinitionSafety::Safe
+            && self.course_definitions.contains(&definition.base.name)
+            && !self
+                .txn
+                .env
+                .contains(&Name::str(definition.base.name.clone(), "_unsafe_rec"))
+            && let Some(companion) = super::super::recursion::structural_companion(definition)
+        {
+            result.push(Declaration::Mutual(vec![companion]));
+        }
         Ok(result)
     }
 }

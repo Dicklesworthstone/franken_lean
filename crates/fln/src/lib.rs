@@ -10203,11 +10203,36 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        // A course-of-values structural definition carries its executable
+        // companion as a helper (`fln_elab::source::recursion::structural_companion`):
+        // the pin compiles the pre-definition, `f._unsafe_rec`, never the
+        // `brecOn` term. Compile that checked companion body instead.
+        let companion = match &admission.declaration {
+            Declaration::Defn(definition) if definition.safety == DefinitionSafety::Safe => {
+                let name = Name::str(definition.base.name.clone(), "_unsafe_rec");
+                helpers.iter().find_map(|helper| match helper {
+                    Declaration::Mutual(members)
+                        if members.len() == 1
+                            && members[0].base.name == name
+                            && members[0].safety == DefinitionSafety::Partial
+                            && members[0].base.type_ == definition.base.type_ =>
+                    {
+                        Some(members[0].value.clone())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        let expression = companion.clone().unwrap_or(expression);
         // An unsafe recursive definition is its own executable body. Its
         // recursive constant exists only in the checked successor, unlike a
         // safe source definition's already-admitted executable companion.
         // Never use an unchecked header to make the compiler accept the call.
-        let executable_environment = if matches!(&admission.declaration,
+        // A companion body names itself, so it is compiled where both checkers
+        // have admitted it.
+        let executable_environment = if companion.is_some()
+            || matches!(&admission.declaration,
             Declaration::Defn(definition) if definition.safety == DefinitionSafety::Unsafe)
         {
             admission.engine.environment()

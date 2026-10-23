@@ -26,6 +26,81 @@ impl Context {
         Ok((head, args))
     }
 
+    /// Assign every universe hole still open in `terms` or in the local context a fresh rigid
+    /// parameter, returning those parameters. An auto-bound `α : Sort ?u` keeps its hole until
+    /// the declaration generalizes it, and a kernel query refuses any hole. A conversion found
+    /// with rigid parameters holds under every later assignment, so the caller may decide with
+    /// it — and must restore the universe store afterwards: these assignments are not answers.
+    /// The names have a numeric component, which source cannot spell.
+    pub(super) fn rigid_open_universes(
+        &mut self,
+        terms: &[&Expr],
+    ) -> Result<Vec<Name>, NatDefinitionElabError> {
+        let mut pending = Vec::new();
+        for term in terms {
+            pending.push(self.instantiate(term)?);
+        }
+        for local in self.txn.lctx.decls().to_vec() {
+            self.tick()?;
+            pending.push(self.instantiate(&local.type_)?);
+            if let Some(value) = &local.value {
+                pending.push(self.instantiate(value)?);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut levels = Vec::new();
+        while let Some(expr) = pending.pop() {
+            self.tick()?;
+            if !expr.has_level_mvar() || !seen.insert(expr.allocation_identity()) {
+                continue;
+            }
+            match expr.node() {
+                ExprNode::Sort { level } => levels.push(level.clone()),
+                ExprNode::Const { levels: args, .. } => levels.extend(args.iter().cloned()),
+                ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type.clone(), body.clone()]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_.clone(), value.clone(), body.clone()]),
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    pending.push(expr.clone())
+                }
+                _ => {}
+            }
+        }
+        let mut holes = Vec::new();
+        while let Some(level) = levels.pop() {
+            self.tick()?;
+            match level.view() {
+                fln_core::level::LevelView::MVar(id) => {
+                    if !holes.contains(id) && !self.txn.universes.is_assigned(id) {
+                        holes.push(id.clone());
+                    }
+                }
+                fln_core::level::LevelView::Succ(inner) => levels.push(inner.clone()),
+                fln_core::level::LevelView::Max(a, b) | fln_core::level::LevelView::IMax(a, b) => {
+                    levels.extend([a.clone(), b.clone()])
+                }
+                _ => {}
+            }
+        }
+        let mut parameters = Vec::with_capacity(holes.len());
+        for (index, hole) in holes.into_iter().enumerate() {
+            self.tick()?;
+            let parameter = Name::num(Name::from_components(["_fln_open_universe"]), index as u64);
+            self.txn
+                .universes
+                .assign(hole, Level::param(parameter.clone()));
+            parameters.push(parameter);
+        }
+        Ok(parameters)
+    }
+
     fn course_apply(
         &mut self,
         function: Typed,
@@ -260,7 +335,13 @@ impl Context {
             result.value,
             false,
         );
-        self.finish_term(result, Some(&expected))
+        let result = self.finish_term(result, Some(&expected))?;
+        // A failed candidate restores the whole context, so only the selected lowering's
+        // definition is recorded here.
+        if !self.course_definitions.contains(&recursion.name) {
+            self.course_definitions.push(recursion.name.clone());
+        }
+        Ok(result)
     }
 
     pub(super) fn lower_course_call(
@@ -350,8 +431,20 @@ impl Context {
         );
         args[parameters] = Expr::fvar(canary.clone());
         let dictionary = args.into_iter().fold(head, Expr::app);
-        let selected =
-            self.search_course_dictionary(dictionary, Expr::fvar(below.id), &canary, &requested);
+        // Entries are compared generically over any universe the declaration has yet to
+        // generalize; the rigid stand-ins never outlive this search.
+        let universes = self.txn.universes.clone();
+        let mut terms = vec![&dictionary];
+        terms.extend(&requested);
+        let selected = self.rigid_open_universes(&terms).and_then(|_| {
+            self.search_course_dictionary(
+                dictionary.clone(),
+                Expr::fvar(below.id),
+                &canary,
+                &requested,
+            )
+        });
+        self.txn.universes = universes;
         self.txn.lctx = saved;
         let mut result = selected?.ok_or_else(|| error(RecursionError::NotDecreasing))?;
         for position in &recursion.varying {

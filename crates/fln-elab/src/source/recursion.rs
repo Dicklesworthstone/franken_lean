@@ -192,6 +192,79 @@ pub(super) fn structural_obligation_parameters(name: &Name) -> Option<usize> {
         .flatten()
 }
 
+/// The pin compiles a structural definition from its pre-definition, not from the `brecOn`
+/// term the kernel checks: `addAndCompilePartialRec` (vendored
+/// `Lean/Elab/PreDefinition/Basic.lean:280-295`, called from `Structural/Main.lean:198`)
+/// admits `f._unsafe_rec`, a `partial` definition whose body is the original one with each
+/// recursive call renamed to the companion. Here that body is the definition's original-body
+/// obligation (`structural_obligation_name`), read as `reduce.rs`'s `smart_unfolding` reads
+/// it: `self` is the companion applied to the parameters bound outside the header. The
+/// runtime already selects a linked companion (`fln::runtime::partial`), as it does for the
+/// pin's imported structural definitions. `None` when the value lacks that shape.
+pub(super) fn structural_companion(definition: &DefinitionVal) -> Option<DefinitionVal> {
+    let mut binders = Vec::new();
+    let mut body = &definition.value;
+    while let ExprNode::Lam {
+        binder_name,
+        binder_type,
+        body: inner,
+        binder_info,
+    } = body.node()
+    {
+        binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+        body = inner;
+    }
+    let ExprNode::LetE {
+        decl_name, value, ..
+    } = body.node()
+    else {
+        return None;
+    };
+    let header = structural_obligation_parameters(decl_name)?;
+    let ExprNode::Lam { body: checked, .. } = value.node() else {
+        return None;
+    };
+    let ExprNode::LetE {
+        value: original, ..
+    } = checked.node()
+    else {
+        return None;
+    };
+    let lambdas = u32::try_from(binders.len()).ok()?;
+    let outer = binders.len().checked_sub(header)?;
+    let name = Name::str(definition.base.name.clone(), "_unsafe_rec");
+    let levels = definition
+        .base
+        .level_params
+        .iter()
+        .cloned()
+        .map(Level::param)
+        .collect();
+    // Under the definition's lambdas the first parameter is `#(lambdas - 1)`.
+    let mut reference = Expr::const_(name.clone(), levels);
+    for position in 0..u32::try_from(outer).ok()? {
+        reference = Expr::app(reference, Expr::bvar(lambdas - 1 - position).ok()?);
+    }
+    let mut value = original.subst_loose(0, &[reference]).ok()?;
+    for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+        value = Expr::lam(binder_name, binder_type, value, binder_info);
+    }
+    if value.has_loose_bvars() || value.has_fvar() {
+        return None;
+    }
+    Some(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: definition.base.level_params.clone(),
+            type_: definition.base.type_.clone(),
+        },
+        value,
+        hints: ReducibilityHints::Opaque,
+        safety: fln_env::constants::DefinitionSafety::Partial,
+        all: vec![name],
+    })
+}
+
 /// Read the supported structural clause, never silently discard a well-founded
 /// measure or a `decreasing_by` proof. Shape checks match `elabTerminationHints`
 /// in the pinned `Lean/Elab/PreDefinition/TerminationHint.lean`.
@@ -351,7 +424,16 @@ impl Context {
                 .checked_add(1)
                 .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
             let measure = self.term(hint.measure, None)?;
-            let measure = self.finish(measure)?;
+            // An auto-bound `α : Sort ?u` keeps its universe hole until the declaration
+            // generalizes it. This whole query is rolled back, so the measure may be checked
+            // with each open universe as a rigid parameter (`rigid_open_universes`).
+            let measure = self.finish_open_universes(measure)?;
+            let open = self.rigid_open_universes(&[&measure.value, &measure.type_])?;
+            self.level_params.extend(open);
+            let measure = Typed {
+                value: self.instantiate(&measure.value)?,
+                type_: self.instantiate(&measure.type_)?,
+            };
             self.check_structural_measure(&measure)?;
             // The native source driver retains ascriptions as identity lets
             // so later reduction cannot erase an unchecked annotation. The

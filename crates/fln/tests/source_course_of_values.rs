@@ -144,6 +144,17 @@ fn deeper_list_tails_and_transparent_aliases_use_the_actual_dictionary() {
     );
 }
 
+/// An auto-bound `α : Sort ?u` keeps its universe hole until the declaration generalizes it.
+/// Dictionary entries and a `termination_by structural` measure are still compared, with each
+/// open universe as a rigid parameter; before that, the first fell back to well-founded
+/// recursion and the second was refused for unresolved universes.
+#[test]
+fn auto_bound_universes_still_select_dictionary_entries() {
+    check(
+        "inductive CourseList (A : Type u) where\n | nil : CourseList A\n | cons : A -> CourseList A -> CourseList A\ndef countAuto : CourseList α -> Nat\n | .nil => 0\n | .cons _ .nil => 1\n | .cons _ (.cons _ tail) => countAuto tail + 2\nexample : countAuto (.cons 1 (.cons 2 (.cons 3 .nil))) = 3 := rfl\ndef countHint (xs : CourseList α) : Nat := match xs with\n | .nil => 0\n | .cons _ .nil => 1\n | .cons _ (.cons _ tail) => countHint tail + 2\ntermination_by structural xs\ntheorem countHint_step (a b : α) (tail : CourseList α) : countHint (.cons a (.cons b tail)) = countHint tail + 2 := rfl\n",
+    );
+}
+
 #[test]
 fn changing_accumulators_remain_arguments_of_the_previous_result() {
     check(
