@@ -1,12 +1,15 @@
 //! The pin's other default-on warnings that need no elaboration state beyond a command's
 //! syntax and its admitted declaration: `linter.deprecated`'s note on `structure … :=`,
 //! `class … :=` and `inductive … :=` (`Lean/Elab/Structure.lean:341`,
-//! `Lean/Elab/Inductive.lean:88`), and `linter.defProp` (`Lean/Linter/DefProp.lean`).
+//! `Lean/Elab/Inductive.lean:88`), `linter.defProp` (`Lean/Linter/DefProp.lean`), and the two
+//! reducibility warnings a declaration's elaboration logs for an `instance` attribute and a
+//! class-typed `def` (`Lean/Meta/Instances.lean:281-289`, `Lean/Elab/MutualDef.lean:1246-1256`).
 //! The unused-variables linter has its own module.
 use crate::unused_variables::{linter_value, parser_kind};
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
+use fln_elab::reducibility::Reducibility;
 use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::Syntax;
 
@@ -146,16 +149,8 @@ pub(crate) fn definition_is_proposition(
     if !proposition {
         return None;
     }
-    let mut first = None;
-    let mut pending = vec![command];
-    while let Some(node) = pending.pop() {
-        if let Some(at) = original_pos(node) {
-            first = Some(first.map_or(at, |first: usize| first.min(at)));
-        }
-        pending.extend(args(node).iter());
-    }
     Some(Lint {
-        at: first?,
+        at: first_position(command)?,
         message: format!(
             "Definition `{}` is a proposition; use `theorem` instead of `def`\n\nNote: This linter \
              can be disabled with `set_option linter.defProp false`",
@@ -175,4 +170,160 @@ fn ends_in_prop_type(type_: &Expr) -> bool {
             _ => return false,
         }
     }
+}
+
+/// The offset of `syntax`'s first token, where the pin positions a message about it.
+fn first_position(syntax: &Syntax) -> Option<usize> {
+    let mut first = None;
+    let mut pending = vec![syntax];
+    while let Some(node) = pending.pop() {
+        if let Some(at) = original_pos(node) {
+            first = Some(first.map_or(at, |first: usize| first.min(at)));
+        }
+        pending.extend(args(node).iter());
+    }
+    first
+}
+
+/// The attribute instances of a declaration's own `@[…]` list, in order.
+fn attribute_instances(command: &Syntax) -> Vec<&Syntax> {
+    let [modifiers, _] = args(command) else {
+        return Vec::new();
+    };
+    match args(modifiers).get(1).and_then(|slot| args(slot).first()) {
+        Some(list) if is_kind(list, &["Term", "attributes"]) => args(list)
+            .get(1)
+            .map_or(&[][..], args)
+            .iter()
+            .step_by(2)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The status a reducibility attribute instance sets, as `fln_elab`'s source scope reads it.
+fn reducibility_attribute(attribute: &Syntax) -> Option<Reducibility> {
+    let [_, attribute] = args(attribute) else {
+        return None;
+    };
+    if !is_kind(attribute, &["Attr", "simple"]) {
+        return None;
+    }
+    let Some(Syntax::Ident { val, .. }) = args(attribute).first() else {
+        return None;
+    };
+    Some(match val.to_display_string().as_str() {
+        "reducible" => Reducibility::Reducible,
+        "irreducible" => Reducibility::Irreducible,
+        "semireducible" => Reducibility::Semireducible,
+        "implicit_reducible" | "instance_reducible" => Reducibility::ImplicitReducible,
+        _ => return None,
+    })
+}
+
+/// The offset of an `instance` attribute instance (`instance`, `scoped instance`,
+/// `local instance`, with or without a priority), at its `instance` keyword.
+fn instance_attribute(attribute: &Syntax) -> Option<usize> {
+    let [_, attribute] = args(attribute) else {
+        return None;
+    };
+    is_kind(attribute, &["Attr", "instance"])
+        .then(|| first_position(attribute))
+        .flatten()
+}
+
+/// The pin's text when the `instance` attribute is added to `name`, a definition that is
+/// neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
+pub(crate) fn unmarked_instance_message(name: &Name) -> String {
+    format!(
+        "instance `{}` must be marked with `@[reducible]` or `@[implicit_reducible]`",
+        crate::pretty::message_name(name)
+    )
+}
+
+/// The offsets of the `instance` attributes in a `def`'s or an `abbrev`'s own attribute list
+/// that the pin's `addInstance` warns about (`Lean/Meta/Instances.lean:281-289`): attributes
+/// apply in list order, so an `instance` before any `@[reducible]` or `@[implicit_reducible]`
+/// finds the declaration unmarked. An `abbrev`'s own `reducible` is added after its list
+/// (`mkDefViewOfAbbrev`), so it marks nothing in time. The caller decides that the declaration
+/// is a definition. An `instance` command marks its declaration `implicitReducible` before its
+/// attributes apply, and a `theorem` or an `opaque` is no definition: none of them is read.
+pub(crate) fn unmarked_instance_attributes(command: &Syntax) -> Vec<usize> {
+    let [_, declaration] = args(command) else {
+        return Vec::new();
+    };
+    if !is_kind(declaration, &["Command", "definition"])
+        && !is_kind(declaration, &["Command", "abbrev"])
+    {
+        return Vec::new();
+    }
+    let mut status = Reducibility::Semireducible;
+    let mut sites = Vec::new();
+    for attribute in attribute_instances(command) {
+        if let Some(next) = reducibility_attribute(attribute) {
+            status = next;
+        } else if let Some(at) = instance_attribute(attribute)
+            && !status.unfolds_at_instances()
+        {
+            sites.push(at);
+        }
+    }
+    sites
+}
+
+/// `warn.classDefReducibility` (`Lean/Elab/MutualDef.lean:1246-1256`, the option at `:1180`):
+/// a `def` (not an `abbrev`, `instance`, `theorem`, `example` or `opaque`) whose type, under its
+/// binders and through abbreviations (`isClass?`), is a class, unless the type's own head is
+/// `Decidable`, `DecidableEq` or `Setoid`, and whose attributes leave it neither `reducible`,
+/// `implicitReducible` nor `irreducible`. It is logged once the command's declarations are
+/// elaborated, before its linters run, at the command's first token. `is_class` answers for the
+/// class registry.
+pub(crate) fn class_definition_reducibility(
+    command: &Syntax,
+    name: &Name,
+    type_: &Expr,
+    env: &fln_env::environment::Environment,
+    is_class: impl FnOnce(&Name) -> bool,
+    options: &KVMap,
+) -> Option<Lint> {
+    if !options.get_bool(
+        &Name::from_components(["warn", "classDefReducibility"]),
+        true,
+    ) {
+        return None;
+    }
+    let [_, declaration] = args(command) else {
+        return None;
+    };
+    if !is_kind(declaration, &["Command", "definition"]) {
+        return None;
+    }
+    let status = attribute_instances(command)
+        .into_iter()
+        .filter_map(reducibility_attribute)
+        .next_back()
+        .unwrap_or(Reducibility::Semireducible);
+    if status != Reducibility::Semireducible {
+        return None;
+    }
+    let excluded = fln_elab::instances::result_head(type_).is_some_and(|head| {
+        ["Decidable", "DecidableEq", "Setoid"]
+            .iter()
+            .any(|excluded| head == Name::from_components([*excluded]))
+    });
+    if excluded {
+        return None;
+    }
+    let (_, class) = fln_elab::instances::instance_telescope(env, type_)?;
+    if !is_class(&class) {
+        return None;
+    }
+    Some(Lint {
+        at: first_position(command)?,
+        message: format!(
+            "Definition `{}` of class type must be marked with `@[reducible]` or \
+             `@[implicit_reducible]`",
+            crate::pretty::message_name(name)
+        ),
+    })
 }

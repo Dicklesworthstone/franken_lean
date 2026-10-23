@@ -16,6 +16,9 @@ pub struct InstanceAttribute {
     /// `attribute [-instance] x`: remove a currently active instance in this lexical scope.
     /// Priority and registration-kind fields do not describe this operation.
     pub erase: bool,
+    /// The `instance` (or `default_instance`) keyword's offset in the command, where the pin
+    /// positions a message about the attribute.
+    pub at: BytePos,
 }
 
 /// Inspect the existing scope-command token stream, preserving original source
@@ -113,6 +116,7 @@ pub(super) fn parse(
         is_default,
         local,
         erase: false,
+        at: original_position(view, tokens, keyword),
     }))
 }
 
@@ -135,6 +139,7 @@ mod tests {
         let parsed = attribute(source);
         assert!(parsed.scoped);
         assert_eq!(parsed.priority, 23);
+        assert_eq!(parsed.at, BytePos(source.find("instance").unwrap()));
         assert_eq!(
             parsed.declarations,
             [

@@ -7295,13 +7295,13 @@ impl Engine {
         // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
         let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
         // Each declaration's own syntax, offset and options, for the unused-variables linter, by
-        // command and, within a `mutual` block, by member.
-        let mut lint_sites: BTreeMap<
-            (usize, usize),
-            (fln_parse::BytePos, fln_syntax::tree::Syntax, KVMap),
-        > = BTreeMap::new();
+        // command and, within a `mutual` block, by member, with the block's `mutual` keyword.
+        let mut lint_sites: BTreeMap<(usize, usize), LintSite> = BTreeMap::new();
         // `#exit`'s warning (`elabExit`); the partition made it the last command.
         let mut exit_warning: Option<SourceWarning> = None;
+        // The pin's warning for each definition an `attribute [instance]` command adds while it
+        // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
+        let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
         let mut evaluation_indices = Vec::new();
         evaluation_indices
             .try_reserve_exact(command_count)
@@ -7603,6 +7603,21 @@ impl Engine {
                     | ScopeCommand::Export { .. }
                     | ScopeCommand::Reducibility(_) => {
                         grammar.observe(&control);
+                        // Read before the attribute applies: the status it finds is the
+                        // declaration's own.
+                        let unmarked: Vec<(fln_parse::BytePos, Name)> = match &control {
+                            ScopeCommand::Instance(attribute) => {
+                                source_check::instance_attributes::unmarked_definitions(
+                                    engine.environment(),
+                                    &scopes.current,
+                                    attribute,
+                                )
+                                .into_iter()
+                                .map(|name| (attribute.at, name))
+                                .collect()
+                            }
+                            _ => Vec::new(),
+                        };
                         match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
@@ -7628,6 +7643,15 @@ impl Engine {
                                 return Ok(Outcome::InternalFault(fault));
                             }
                         }
+                        instance_attribute_warnings.extend(unmarked.into_iter().map(
+                            |(at, name)| SourceWarning {
+                                command_index,
+                                at: fln_parse::BytePos(original_offset.0 + at.0),
+                                message: linters::unmarked_instance_message(&name),
+                                severity: SourceSeverity::Warning,
+                                follows_output: false,
+                            },
+                        ));
                     }
                 }
                 continue;
@@ -7664,23 +7688,30 @@ impl Engine {
             warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
             // A command this parse does not read is not linted; its own path reports it. A
             // `mutual` block is linted member by member, each at its own offset in the block.
-            let members = match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
-                // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
-                // binds variables as a declaration does.
-                Ok(parsed)
-                    if ["declaration", "check", "eval"].iter().any(|kind| {
-                        parsed.syntax().kind()
-                            == Some(&unused_variables::parser_kind(&["Command", kind]))
-                    }) || unused_variables::is_reduce(parsed.syntax()) =>
-                {
-                    vec![(fln_parse::BytePos(0), parsed.syntax().clone())]
-                }
-                _ => grammar
-                    .enter(|| fln_parse::command_scope::mutual::parse_with_offsets(command_source))
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default(),
-            };
+            let (members, block) =
+                match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
+                    // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
+                    // binds variables as a declaration does.
+                    Ok(parsed)
+                        if ["declaration", "check", "eval"].iter().any(|kind| {
+                            parsed.syntax().kind()
+                                == Some(&unused_variables::parser_kind(&["Command", kind]))
+                        }) || unused_variables::is_reduce(parsed.syntax()) =>
+                    {
+                        (vec![(fln_parse::BytePos(0), parsed.syntax().clone())], None)
+                    }
+                    _ => (
+                        grammar
+                            .enter(|| {
+                                fln_parse::command_scope::mutual::parse_with_offsets(command_source)
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                        fln_parse::command_scope::mutual::keyword_offset(command_source)
+                            .map(|at| fln_parse::BytePos(original_offset.0 + at.0)),
+                    ),
+                };
             for (member, (at, syntax)) in members.into_iter().enumerate() {
                 lint_sites.insert(
                     (command_index, member),
@@ -7688,6 +7719,7 @@ impl Engine {
                         fln_parse::BytePos(original_offset.0 + at.0),
                         syntax,
                         scope.options.clone(),
+                        block,
                     ),
                 );
             }
@@ -8556,47 +8588,54 @@ impl Engine {
                 sorry_commands.insert(command);
             }
         }
-        let mut warnings: Vec<SourceWarning> = sorry_commands
-            .iter()
-            .copied()
-            .filter_map(|command| {
-                let &(offset, source, warn) = warning_sites.get(&command)?;
-                warn.then(|| SourceWarning {
-                    command_index: command,
-                    at: fln_parse::BytePos(
-                        offset.0
-                            + fln_parse::command_scope::declaration_warning_offset(source)
-                                .unwrap_or(0),
-                    ),
-                    message: "declaration uses `sorry`".to_owned(),
-                    severity: SourceSeverity::Warning,
-                    follows_output: false,
-                })
-            })
-            .collect();
-        // The pin's `linter.unusedVariables` runs after each command that logged no error and
-        // contains no `sorry`. A seed world (no `sorryAx`) is this engine's own, not the pin's,
-        // and its renderings admit no warning.
-        if engine
+        // A seed world (no `sorryAx`) is this engine's own, not the pin's, and its renderings
+        // admit no warning but `sorry`'s.
+        let pin_world = engine
             .environment()
             .find(&Name::from_components(["sorryAx"]))
-            .is_some()
-        {
-            // A definition the stream compiled and published is an execution, not an admission
-            // row; an evaluation's execution declares nothing the user wrote.
-            let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
-            let linted: Vec<(usize, &Declaration)> = declarations
-                .iter()
-                .copied()
-                .chain(
-                    executions
-                        .iter()
-                        .zip(&execution_command_indices)
-                        .enumerate()
-                        .filter(|(index, _)| !evaluated.contains(index))
-                        .map(|(_, (execution, &command))| (command, &execution.declaration)),
-                )
-                .collect();
+            .is_some();
+        // A definition the stream compiled and published is an execution, not an admission
+        // row; an evaluation's execution declares nothing the user wrote.
+        let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
+        let linted: Vec<(usize, &Declaration)> = declarations
+            .iter()
+            .copied()
+            .chain(
+                executions
+                    .iter()
+                    .zip(&execution_command_indices)
+                    .enumerate()
+                    .filter(|(index, _)| !evaluated.contains(index))
+                    .map(|(_, (execution, &command))| (command, &execution.declaration)),
+            )
+            .collect();
+        // The pin's reducibility warnings are logged while a command elaborates, ahead of its
+        // `sorry` warning (reported with the kernel's check) and its linters.
+        let mut warnings: Vec<SourceWarning> = Vec::new();
+        if pin_world {
+            warnings.extend(instance_attribute_warnings);
+            warnings.extend(declaration_reducibility_warnings(
+                &lint_sites,
+                &linted,
+                engine.environment(),
+            ));
+        }
+        warnings.extend(sorry_commands.iter().copied().filter_map(|command| {
+            let &(offset, source, warn) = warning_sites.get(&command)?;
+            warn.then(|| SourceWarning {
+                command_index: command,
+                at: fln_parse::BytePos(
+                    offset.0
+                        + fln_parse::command_scope::declaration_warning_offset(source).unwrap_or(0),
+                ),
+                message: "declaration uses `sorry`".to_owned(),
+                severity: SourceSeverity::Warning,
+                follows_output: false,
+            })
+        }));
+        // The pin's `linter.unusedVariables` runs after each command that logged no error and
+        // contains no `sorry`.
+        if pin_world {
             // Every constructor spelling, for telling a pattern variable from a constructor, and
             // the indexed families' constructors with the fields a pattern leaves unread.
             let spelling = |name: &Name| match name.leaf_view() {
@@ -8647,7 +8686,7 @@ impl Engine {
                     })
                     .collect(),
             };
-            for (&(command, _), (offset, syntax, options)) in &lint_sites {
+            for (&(command, _), (offset, syntax, options, _)) in &lint_sites {
                 // In the pin's order: the `:=` note while the command elaborates (`sorry` does
                 // not suppress it), then the unused-variables linter (skipped with `sorry`),
                 // then `linter.defProp`.
@@ -12473,6 +12512,81 @@ fn guard_checks_expected_error(guard: Option<&SourceGuard>, command_index: usize
                 .lines()
                 .any(|line| line.trim_start().starts_with("error:"))
     })
+}
+
+/// A declaration the linters read: its offset in the file, its syntax, the options in force,
+/// and the offset of the `mutual` keyword of a block it is a member of.
+type LintSite = (
+    fln_parse::BytePos,
+    fln_syntax::tree::Syntax,
+    KVMap,
+    Option<fln_parse::BytePos>,
+);
+
+/// The pin's reducibility warnings for each declaration command, in command order: the
+/// `instance` attributes of its members' own lists that find a definition unmarked
+/// ([`linters::unmarked_instance_attributes`]), then its members' class-typed `def`s
+/// ([`linters::class_definition_reducibility`]), which the pin checks once every member is
+/// elaborated, at a `mutual` block's keyword.
+fn declaration_reducibility_warnings(
+    lint_sites: &BTreeMap<(usize, usize), LintSite>,
+    linted: &[(usize, &Declaration)],
+    environment: &Environment,
+) -> Vec<SourceWarning> {
+    let mut registry: Option<Option<fln_elab::instances::InstanceRegistry>> = None;
+    let warning = |command_index, at, message| SourceWarning {
+        command_index,
+        at,
+        message,
+        severity: SourceSeverity::Warning,
+        follows_output: false,
+    };
+    let mut warnings = Vec::new();
+    // The current command's class-typed definitions, which follow all its members' attributes.
+    let mut classes = Vec::new();
+    let mut current = None;
+    for (&(command, _), (offset, syntax, options, block)) in lint_sites {
+        if current != Some(command) {
+            warnings.append(&mut classes);
+            current = Some(command);
+        }
+        let Some((name, type_, _, _)) = linted_declaration(syntax, linted, command) else {
+            continue;
+        };
+        if matches!(environment.find(name), Some(ConstantInfo::Defn(_))) {
+            for at in linters::unmarked_instance_attributes(syntax) {
+                warnings.push(warning(
+                    command,
+                    fln_parse::BytePos(offset.0 + at),
+                    linters::unmarked_instance_message(name),
+                ));
+            }
+        }
+        let is_class = |class: &Name| {
+            registry
+                .get_or_insert_with(|| {
+                    fln_elab::instances::InstanceRegistry::read(environment).ok()
+                })
+                .as_ref()
+                .is_some_and(|registry| registry.is_class(class))
+        };
+        if let Some(lint) = linters::class_definition_reducibility(
+            syntax,
+            name,
+            type_,
+            environment,
+            is_class,
+            options,
+        ) {
+            classes.push(warning(
+                command,
+                block.unwrap_or(fln_parse::BytePos(offset.0 + lint.at)),
+                lint.message,
+            ));
+        }
+    }
+    warnings.append(&mut classes);
+    warnings
 }
 
 /// The admitted type and value `command` declares: the declaration named by its `declId`

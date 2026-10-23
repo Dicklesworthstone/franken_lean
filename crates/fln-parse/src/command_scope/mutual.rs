@@ -117,6 +117,16 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
     }))
 }
 
+/// The byte offset in `source` of a `mutual` block's keyword, where the pin positions a
+/// message about the whole block; `None` when `source` is not one.
+pub fn keyword_offset(source: &[u8]) -> Option<BytePos> {
+    let original = SourceText::from_utf8(source).ok()?;
+    let view = SourceView::of(&original);
+    let tokens = super::tokens(&view).ok()?;
+    let first = tokens.first()?;
+    word(&view, first, "mutual").then(|| view.to_original(first.extent.start()))
+}
+
 /// [`parse`], with each member's byte offset in `source`: a member's own positions are
 /// relative to its start, so this offset places them in the group.
 pub fn parse_with_offsets(
@@ -270,6 +280,17 @@ mod tests {
                 .collect::<String>()
         );
         assert!(parse(source.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_keyword_offset_is_the_original_mutual_token() {
+        let source = "-- 🦀 mutual\r\n/- mutual -/ mutual\r\n  def a : Nat := 1\r\nend";
+        assert_eq!(
+            keyword_offset(source.as_bytes()),
+            Some(BytePos(source.rfind("mutual\r\n").unwrap()))
+        );
+        assert_eq!(keyword_offset(b"def mutual : Nat := 1"), None);
+        assert_eq!(keyword_offset(b"\xff"), None);
     }
 
     #[test]

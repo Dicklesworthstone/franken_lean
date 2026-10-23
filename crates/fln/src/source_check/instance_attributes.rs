@@ -10,6 +10,39 @@ use fln_parse::command_scope::instances::InstanceAttribute;
 // aggregate journal length independently.
 const MAX_DECLARATIONS: usize = 4096;
 
+/// The declarations of `attribute` the pin's `addInstance` warns about
+/// (vendored `src/Lean/Meta/Instances.lean:281-289`): a definition whose reducibility status in
+/// `environment`, before the attribute applies, is neither `reducible` nor `implicitReducible`.
+/// Erasure and default candidates add no instance. A name that does not resolve is left to
+/// [`apply`], which refuses it. The `@[expose]` warning for a constant that was originally a
+/// definition (module system) is not reproduced.
+pub(crate) fn unmarked_definitions(
+    environment: &Environment,
+    scope: &SourceScope,
+    attribute: &InstanceAttribute,
+) -> Vec<Name> {
+    if attribute.erase || attribute.is_default {
+        return Vec::new();
+    }
+    let Ok(statuses) = fln_elab::reducibility::table(environment) else {
+        return Vec::new();
+    };
+    attribute
+        .declarations
+        .iter()
+        .filter_map(|requested| {
+            scope
+                .resolve(requested, |name| environment.contains(name))
+                .ok()
+                .flatten()
+        })
+        .filter(|name| {
+            matches!(environment.find(name), Some(ConstantInfo::Defn(_)))
+                && !statuses.status(name).unfolds_at_instances()
+        })
+        .collect()
+}
+
 pub(super) fn apply(
     environment: &Environment,
     scope: &SourceScope,

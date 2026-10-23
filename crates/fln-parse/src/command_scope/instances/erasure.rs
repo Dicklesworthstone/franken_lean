@@ -39,6 +39,7 @@ pub(super) fn parse(
         is_default: false,
         local: false,
         erase: true,
+        at: original_position(view, tokens, 3),
     }))
 }
 

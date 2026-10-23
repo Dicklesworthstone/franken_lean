@@ -360,11 +360,13 @@ pub const ROWS: &[Row] = &[
     ),
     // Read by the source executor: a declaration that uses `sorry` warns while it is true.
     row("warn.sorry", Bool(true), "Lean/AddDecl.lean:69", Honored),
+    // Read by the source executor: a class-typed `def` without a reducibility attribute warns
+    // while it is true.
     row(
         "warn.classDefReducibility",
         Bool(true),
         "Lean/Elab/MutualDef.lean:1180",
-        Silent,
+        Honored,
     ),
     row(
         "mvcgen.warning",
@@ -831,6 +833,8 @@ mod tests {
         // `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
         // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
         // `execute_source_command_stream`); `sorry_is_admitted_with_the_pins_warnings` sets it false.
+        // `warn.classDefReducibility`: the class-typed `def` warning (`fln`, `linters.rs`);
+        // `class_def_reducibility` sets it false.
         assert_eq!(
             honored,
             [
@@ -845,7 +849,8 @@ mod tests {
                 "linter.defProp",
                 "linter.unusedVariables.funArgs",
                 "linter.unusedVariables.patternVars",
-                "warn.sorry"
+                "warn.sorry",
+                "warn.classDefReducibility"
             ]
         );
     }

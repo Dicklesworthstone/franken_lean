@@ -2,7 +2,7 @@
 use super::*;
 pub(crate) mod grammar;
 pub mod inspect;
-mod instance_attributes;
+pub(crate) mod instance_attributes;
 pub mod modules;
 mod reducibility;
 pub(crate) mod scopes;

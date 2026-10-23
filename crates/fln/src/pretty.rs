@@ -444,6 +444,18 @@ fn is_token(text: &str) -> bool {
 /// `_inaccessible`), macro-scoped names and the delaborator's pseudo-syntax (`_`, `#…`,
 /// `?…`) print as they are.
 fn escaped_name(name: &Name) -> String {
+    escaped_name_with(name, is_token)
+}
+
+/// A name as the pin's `Name.toString` prints it, which no token forces to escape: the
+/// form `m!"{n}"` gives a name in a message (`MessageData.ofName`, vendored
+/// `src/Lean/Message.lean:276`; `Init/Data/ToString/Name.lean:123`).
+pub(crate) fn message_name(name: &Name) -> String {
+    escaped_name_with(name, |_| false)
+}
+
+/// [`escaped_name`] with `is_token` deciding which names read as tokens.
+fn escaped_name_with(name: &Name, is_token: impl Fn(&str) -> bool) -> String {
     // Components root first; `Err` is a numeric component.
     let mut parts: Vec<Result<String, u64>> = Vec::new();
     let mut current = name.clone();
