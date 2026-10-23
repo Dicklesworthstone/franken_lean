@@ -90,15 +90,39 @@ impl Indexer<'_> {
             return Err(InstanceRegistryError::InvalidInstance(declaration.clone()).into());
         }
         let mut target = info.constant_val().type_.clone();
+        // The pin's computeSynthOrder treats a generated projection's self
+        // binder as ready even when its implicit dictionary parameters are not
+        // assigned yet. Establish the exact admitted field/constructor/body
+        // identity before granting that exception; a lookalike is insufficient.
+        let projection = match info {
+            ConstantInfo::Defn(definition) => {
+                crate::records::projection::class_projection(self.env, definition, || {
+                    tick(self.remaining).map_err(Error::from)
+                })?
+            }
+            ConstantInfo::Thm(theorem) => {
+                let definition = fln_env::constants::DefinitionVal {
+                    base: theorem.base.clone(),
+                    value: theorem.value.clone(),
+                    hints: ReducibilityHints::Abbrev,
+                    safety: DefinitionSafety::Safe,
+                    all: theorem.all.clone(),
+                };
+                crate::records::projection::class_projection(self.env, &definition, || {
+                    tick(self.remaining).map_err(Error::from)
+                })?
+            }
+            _ => None,
+        };
+        let projection_self = projection
+            .filter(|projection| self.classes.contains(&projection.structure))
+            .map(|projection| projection.parameters);
         let definition_value = match info {
             ConstantInfo::Defn(definition) => Some(definition.value.clone()),
+            ConstantInfo::Thm(theorem) => Some(theorem.value.clone()),
             _ => None,
         };
         if let Some(definition_value) = definition_value {
-            // The native record builder closes a projection by wrapping its
-            // Expr::Proj value in lambdas. Projection-function synthesis has a
-            // special self-binder readiness rule; an ordinary schedule that
-            // happens to succeed is not evidence that its order is the same.
             let mut value = &definition_value;
             loop {
                 self.tick()?;
@@ -106,7 +130,9 @@ impl Indexer<'_> {
                     ExprNode::Lam { body, .. } => value = body,
                     ExprNode::MData { data, expr } if data.is_empty() => value = expr,
                     ExprNode::App { f, .. } => value = f,
-                    ExprNode::Proj { .. } => return Err(Error::Unsupported),
+                    ExprNode::Proj { .. } if projection_self.is_none() => {
+                        return Err(Error::Unsupported);
+                    }
                     _ => break,
                 }
             }
@@ -141,7 +167,7 @@ impl Indexer<'_> {
         if expected_class.is_some_and(|expected| expected != &class) {
             return Err(InstanceRegistryError::InvalidInstance(declaration.clone()).into());
         }
-        let synth_order = self.synth_order(&target)?;
+        let synth_order = self.synth_order(&target, projection_self)?;
         let keys = self.path(&target)?;
         Ok(DerivedIndex { keys, synth_order })
     }
@@ -320,7 +346,7 @@ impl Indexer<'_> {
         Ok(input)
     }
 
-    fn synth_order(&mut self, target: &Expr) -> Result<Vec<u32>> {
+    fn synth_order(&mut self, target: &Expr, projection_self: Option<usize>) -> Result<Vec<u32>> {
         // checkImpossibleInstance: every ordinary argument must be reachable
         // from the result or a prerequisite, transitively through their types.
         let mut possible = self.dependencies(target)?;
@@ -350,14 +376,16 @@ impl Indexer<'_> {
             for &index in &pending {
                 self.tick()?;
                 let type_ = self.locals[index].type_.clone();
-                if self.input_dependencies(&type_)?.is_subset(&assigned) {
+                if projection_self == Some(index)
+                    || self.input_dependencies(&type_)?.is_subset(&assigned)
+                {
                     ready = Some((index, type_));
                     break;
                 }
             }
             let Some((index, type_)) = ready else {
-                // No guessing of projection exceptions or option-disabled
-                // fallback order when this direct-class schedule stalls.
+                // No option-disabled fallback order when this checked
+                // direct-class schedule stalls.
                 return Err(Error::Unsupported);
             };
             pending.remove(&index);

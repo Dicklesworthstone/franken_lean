@@ -393,6 +393,48 @@ fn unsupported_effects_impossible_binders_and_annotations_publish_no_prefix() {
 }
 
 #[test]
+fn scoped_exports_preserve_namespaces_priorities_and_the_owned_suffix() {
+    let base = class(&Environment::new(), "Pick", ty());
+    let env = axiom(&base, "Scope.first", c("Pick"));
+    let env = scoped::register(&env, &n("Scope"), &n("Scope.first"), 500).unwrap();
+    let env = axiom(&env, "Other.second", c("Pick"));
+    let env = scoped::register(&env, &n("Other"), &n("Other.second"), 2000).unwrap();
+    let env = scoped::register(&env, &n("Scope"), &n("Scope.first"), 1000).unwrap();
+    let (rows, work) = registrations(&base, &env, usize::MAX).unwrap().unwrap();
+    assert_eq!(
+        rows.instances
+            .iter()
+            .map(|row| (row.declaration.clone(), row.scope.clone(), row.priority))
+            .collect::<Vec<_>>(),
+        [
+            (n("Scope.first"), Some(n("Scope")), 500),
+            (n("Other.second"), Some(n("Other")), 2000),
+            (n("Scope.first"), Some(n("Scope")), 1000),
+        ]
+    );
+    assert!(rows.instances.iter().all(|row| {
+        row.keys == [discr_tree::Key::Const(n("Pick"), 0)] && row.synth_order.is_empty()
+    }));
+    assert_eq!(
+        registrations(&base, &env, work).unwrap(),
+        Some((rows, work))
+    );
+    assert_eq!(
+        registrations(&base, &env, work - 1),
+        Err(InstanceRegistryError::Limit)
+    );
+    // An imported scoped entry stays inherited; only the new module's entry is
+    // emitted, and re-registering an imported declaration remains unsupported.
+    let extended = register(&env, "global", c("Pick"));
+    let (rows, _) = registrations(&env, &extended, usize::MAX).unwrap().unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].declaration, n("global"));
+    assert_eq!(rows.instances[0].scope, None);
+    let overridden = scoped::register(&env, &n("Scope"), &n("Scope.first"), 3000).unwrap();
+    assert_eq!(registrations(&env, &overridden, usize::MAX).unwrap(), None);
+}
+
+#[test]
 fn rewritten_prefix_and_zero_budget_are_typed_refusals_and_do_not_mutate_the_input() {
     let base = class(&Environment::new(), "Pick", ty());
     let env = register(&base, "local", c("Pick"));
@@ -417,7 +459,7 @@ fn rewritten_prefix_and_zero_budget_are_typed_refusals_and_do_not_mutate_the_inp
 }
 
 #[test]
-fn generated_projection_functions_do_not_guess_the_pins_special_synthesis_order() {
+fn unbound_projection_lookalikes_do_not_gain_the_pins_special_synthesis_order() {
     let env = class(&class(&Environment::new(), "Parent", ty()), "Child", ty());
     let name = n("Child.toParent");
     let env = env

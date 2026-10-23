@@ -34,7 +34,14 @@ fn source_records_generate_constructors_projections_and_real_proofs() {
     let text = "structure Point where\n  x : Nat\n  y : Nat\ndef point : Point := Point.mk 7 9\ntheorem x_ok : Point.x point = 7 := by rfl\ntheorem y_ok : Point.y point = 9 := by rfl";
     let result = check(&engine(), text);
     assert_eq!((result.commands, result.theorems), (4, 2));
-    for name in ["Point", "Point.mk", "Point.rec", "Point.x", "Point.y"] {
+    for name in [
+        "Point",
+        "Point.mk",
+        "Point.mk._flat_ctor",
+        "Point.rec",
+        "Point.x",
+        "Point.y",
+    ] {
         assert!(result.engine.environment().contains(&n(name)));
     }
     let info = result.engine.environment().find(&n("Point.x")).unwrap();
@@ -294,8 +301,14 @@ fn source_command_report_retains_every_checked_declaration_transition() {
         .unwrap()
         .into_complete()
         .unwrap();
-    // The block, two projections, and the two checked recursor auxiliaries.
-    assert_eq!(result.admissions.len(), 5);
+    // The block, two projections, the flat constructor, and two recursor auxiliaries.
+    assert_eq!(result.admissions.len(), 6);
+    assert!(result.admissions.iter().any(|admission| {
+        matches!(
+            &admission.declaration,
+            Declaration::Defn(definition) if definition.base.name == n("Point.mk._flat_ctor")
+        )
+    }));
     assert!(matches!(
         result.admissions[0].declaration,
         Declaration::Inductive(_)

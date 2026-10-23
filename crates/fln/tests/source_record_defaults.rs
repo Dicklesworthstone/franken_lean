@@ -184,21 +184,55 @@ fn forward_defaults_missing_required_fields_and_unresolved_values_refuse() {
     }
 }
 #[test]
-fn helper_like_names_do_not_register_defaults() {
+fn checked_helpers_follow_the_pin_only_for_registered_structure_interfaces() {
     let e = check(
         &engine(),
         "structure Plain where\n  value : Nat\ndef Plain.value._default : Nat := 91",
     )
     .engine;
+    // The pin's Lean/Structure.lean getFnForFieldUsing? looks up this checked
+    // helper once the structure identity exists, without a native default row.
     assert!(
-        e.check_source_files(
-            &[b"def absent : Plain := {}"],
+        RecordDefaults::read(e.environment())
+            .unwrap()
+            .helper(&Name::from_components(["Plain"]), 0)
+            .is_none()
+    );
+    check(
+        &e,
+        "def inferred : Plain := {}\ntheorem default_value : inferred.value = 91 := by rfl",
+    );
+    check(&e, "def explicit : Plain := { value := 4 }");
+
+    let bare = check(
+        &engine(),
+        "inductive Bare where | mk (value : Nat)\ndef Bare.value._default : Nat := 91",
+    )
+    .engine;
+    assert!(
+        bare.check_source_files(
+            &[b"def absent : Bare := {}"],
             &KVMap::new(),
             SourceCheckLimits::new(limits())
         )
         .is_err()
     );
-    check(&e, "def explicit : Plain := { value := 4 }");
+    check(&bare, "def explicit : Bare := { value := 4 }");
+
+    let wrong = check(
+        &engine(),
+        "structure Wrong where\n  value : Nat\ndef Wrong.value._default : Bool := Bool.true",
+    )
+    .engine;
+    assert!(
+        wrong
+            .check_source_files(
+                &[b"def absent : Wrong := {}"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err()
+    );
 }
 #[test]
 fn helper_collision_leaves_no_record_projection_or_registration_prefix() {
@@ -291,6 +325,12 @@ fn admission_root_includes_the_default_registration_and_helpers() {
         Some(&helper)
     );
     assert!(result.engine.environment().contains(&helper));
-    // The block, projection, default helper, recOn, and casesOn.
-    assert_eq!(result.admissions.len(), 5);
+    // The block, projection, flat constructor, default helper, recOn, and casesOn.
+    assert_eq!(result.admissions.len(), 6);
+    assert!(
+        result
+            .engine
+            .environment()
+            .contains(&Name::from_components(["Count", "mk", "_flat_ctor"]))
+    );
 }

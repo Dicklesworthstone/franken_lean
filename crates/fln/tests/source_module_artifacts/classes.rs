@@ -11,6 +11,8 @@ mod aliases;
 mod defaults;
 #[path = "instances.rs"]
 mod instances;
+#[path = "structures.rs"]
+mod structures;
 
 const CLASS: &str = "prelude\nclass Mapper (A : Type) where\n  apply : A -> A";
 

@@ -1,8 +1,10 @@
 //! Source record signatures elaborate through the same bidirectional context as
 //! ordinary definitions. Result universes follow field domains unless explicit.
 use super::*;
+mod flat;
 mod parents;
 use crate::records::defaults::{RecordDefault, helper_name};
+use crate::records::imported::{StructureEntry, StructureField, StructureParent};
 use crate::records::inheritance::RecordParent;
 use crate::records::{RecordBudget, RecordSpec, record_declarations};
 
@@ -17,6 +19,11 @@ pub struct SourceRecord {
     /// Parent metadata and instance registrations are published only after checking.
     pub parents: Vec<RecordParent>,
     pub parent_instances: Vec<Name>,
+    /// The generated, checked flat constructor used by pinned record notation.
+    pub flat_constructor: Name,
+    /// Authored structure identity, never inferred from a one-constructor inductive.
+    /// The caller registers it only after admitting the complete declaration batch.
+    pub structure: StructureEntry,
 }
 
 pub fn is_record(syntax: &Syntax) -> bool {
@@ -516,8 +523,43 @@ pub(super) fn elaborate_record_scoped(
     };
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
+    declarations.push(context.record_flat_constructor(&spec, &inheritance.parents, budget)?);
     declarations.extend(helpers);
     let parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
+    let subobjects: std::collections::BTreeMap<_, _> = inheritance
+        .parents
+        .iter()
+        .map(|parent| (parent.field as usize, &parent.parent))
+        .collect();
+    let mut fields = Vec::with_capacity(spec.fields.len());
+    for (index, field) in spec.fields.iter().enumerate() {
+        context.tick()?;
+        fields.push(StructureField {
+            name: field.user_name.clone(),
+            projection: spec.name.append_core(&field.user_name),
+            subobject: subobjects.get(&index).copied().cloned(),
+            binder_info: field.binder_info,
+        });
+    }
+    let mut parents = Vec::with_capacity(inheritance.parents.len());
+    for parent in &inheritance.parents {
+        context.tick()?;
+        let field = fields.get(parent.field as usize).ok_or_else(|| {
+            failure(SourceInferenceError::Record(
+                crate::records::RecordError::InvalidTelescope,
+            ))
+        })?;
+        parents.push(StructureParent {
+            name: parent.parent.clone(),
+            subobject: true,
+            projection: field.projection.clone(),
+        });
+    }
+    let structure = StructureEntry {
+        name: name.clone(),
+        fields,
+        parents,
+    };
     Ok(SourceRecord {
         name: name.clone(),
         is_class,
@@ -525,5 +567,7 @@ pub(super) fn elaborate_record_scoped(
         defaults,
         parents: inheritance.parents,
         parent_instances,
+        flat_constructor: Name::str(Name::str(name.clone(), "mk"), "_flat_ctor"),
+        structure,
     })
 }

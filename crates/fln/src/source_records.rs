@@ -977,11 +977,13 @@ impl Engine {
             // (Lean/Meta/Structure.lean:99–116). Ask K1 under its supplied budget
             // against each projection's exact, already checked predecessor;
             // the actual declaration name is still fresh in that environment.
-            // Defaults are ordinary definitions even when they return proofs.
+            // Defaults and flat constructors remain ordinary definitions even
+            // when they return proofs; consumers must instantiate their bodies.
             let mut predecessor = self;
             let mut proof_projection = false;
             for (index, admission) in batch.admissions.iter().enumerate() {
                 if let Declaration::Defn(definition) = &admission.declaration
+                    && definition.base.name != record.flat_constructor
                     && !record
                         .defaults
                         .iter()
@@ -1043,6 +1045,8 @@ impl Engine {
                     };
                     let status = if record.parent_instances.contains(&definition.base.name) {
                         fln_elab::reducibility::Reducibility::ImplicitReducible
+                    } else if definition.base.name == record.flat_constructor {
+                        fln_elab::reducibility::Reducibility::Reducible
                     } else if record.is_class
                         || record
                             .defaults
@@ -1081,9 +1085,9 @@ impl Engine {
                         ),
                     ))
                 })?;
-                batch.engine.environment = fln_elab::records::inheritance::register_parents(
+                batch.engine.environment = fln_elab::records::imported::register(
                     batch.engine.environment(),
-                    &record.parents,
+                    std::slice::from_ref(&record.structure),
                 )
                 .map_err(|error| {
                     EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(

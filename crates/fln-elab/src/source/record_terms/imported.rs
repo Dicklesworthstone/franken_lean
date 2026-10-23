@@ -104,6 +104,44 @@ impl Context {
         if structures.get(&root).is_none() {
             return Ok(None);
         }
+        // Native source defaults bind a physical constructor prefix. Preserve
+        // that checked contract for this record and its ancestors; the imported
+        // default path instead consumes the pin's flattened field dependencies.
+        let defaults = crate::records::defaults::RecordDefaults::read(&self.txn.env)
+            .map_err(|problem| failure(SourceInferenceError::Record(problem)))?;
+        let mut pending = vec![root.clone()];
+        let mut seen = BTreeSet::new();
+        while let Some(record) = pending.pop() {
+            self.tick()?;
+            if !seen.insert(record.clone()) {
+                continue;
+            }
+            if seen.len() > RecordBudget::default().max_binders {
+                return Err(limit());
+            }
+            // Native seed parents can have only a physical constructor journal.
+            // Their existing source path remains usable; artifact export separately
+            // requires complete interfaces for every owned record's parents.
+            let Some(row) = structures.get(&record) else {
+                return Ok(None);
+            };
+            for index in 0..row.fields.len() {
+                self.tick()?;
+                let index = u32::try_from(index).map_err(|_| limit())?;
+                if defaults.helper(&record, index).is_some() {
+                    return Ok(None);
+                }
+            }
+            for parent in row.parents.iter().map(|parent| &parent.name).chain(
+                row.fields
+                    .iter()
+                    .filter_map(|field| field.subobject.as_ref()),
+            ) {
+                self.tick()?;
+                pending.push(parent.clone());
+            }
+        }
+        let order = self.imported_parent_order(&structures, &root)?;
         let leaves = self.imported_record_leaves(&structures, &root)?;
         // Whole-parent syntax keeps the existing physical constructor path.
         // In particular, it keeps its checked once-only source bindings and
@@ -116,11 +154,7 @@ impl Context {
             return Ok(None);
         }
         let mut parents = Vec::new();
-        for name in self
-            .imported_parent_order(&structures, &root)?
-            .into_iter()
-            .skip(1)
-        {
+        for name in order.into_iter().skip(1) {
             self.tick()?;
             let path = self.imported_parent_path(&structures, &root, &name)?;
             let parent_leaves = self.imported_record_leaves(&structures, &name)?;
@@ -965,26 +999,21 @@ impl Context {
             if name != &projection.owner {
                 return Err(malformed());
             }
-            let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(&projection.name).cloned()
-            else {
-                return Err(malformed());
+            let (base, value) = match self.txn.env.find(&projection.name).cloned() {
+                Some(ConstantInfo::Defn(definition))
+                    if definition.safety == DefinitionSafety::Safe =>
+                {
+                    (definition.base, definition.value)
+                }
+                Some(ConstantInfo::Thm(theorem)) => (theorem.base, theorem.value),
+                _ => return Err(malformed()),
             };
-            if definition.safety != DefinitionSafety::Safe
-                || definition.base.level_params.len() != levels.len()
-            {
+            if base.level_params.len() != levels.len() {
                 return Err(malformed());
             }
             let mut projected = Typed {
-                value: self.instantiate_params(
-                    &definition.value,
-                    &definition.base.level_params,
-                    levels,
-                )?,
-                type_: self.instantiate_params(
-                    &definition.base.type_,
-                    &definition.base.level_params,
-                    levels,
-                )?,
+                value: self.instantiate_params(&value, &base.level_params, levels)?,
+                type_: self.instantiate_params(&base.type_, &base.level_params, levels)?,
             };
             parameters.push(receiver.value);
             for parameter in parameters {

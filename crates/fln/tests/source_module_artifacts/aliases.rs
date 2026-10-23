@@ -79,7 +79,7 @@ fn pinned_lean() -> Option<std::path::PathBuf> {
     Some(executable)
 }
 
-fn reference_import(built: &SourceModuleBuild, source: &str, accepted: bool) {
+pub(super) fn reference_import(built: &SourceModuleBuild, source: &str, accepted: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let Some(pin) = pinned_lean() else {

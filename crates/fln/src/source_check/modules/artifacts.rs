@@ -450,6 +450,51 @@ impl PendingArtifact {
             .extend(aliases.entries.into_iter().map(|(alias, declaration)| {
                 fln_olean::source_extensions::AliasEntry { alias, declaration }
             }));
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let structures = fln_elab::records::imported::export::registrations(
+            base, checked, remaining,
+        )
+        .map_err(|error| match error {
+            fln_elab::records::RecordError::ResourceLimit => SourceModuleCheckError::Limit {
+                resource: "module work",
+                limit: meter.limits.max_work,
+            },
+            _ => SourceModuleCheckError::Extension {
+                module: name.clone(),
+                extension: fln_elab::records::imported::export::journal_name(),
+                reason: "invalid structure interface metadata export",
+            },
+        })?;
+        meter.work(structures.work)?;
+        meter.bytes(structures.bytes_examined)?;
+        for row in structures.structures {
+            meter.work(1 + row.fields.len() + row.parents.len())?;
+            metadata
+                .structures
+                .push(fln_olean::source_extensions::StructureEntry {
+                    name: row.name,
+                    fields: row
+                        .fields
+                        .into_iter()
+                        .map(|field| fln_olean::source_extensions::StructureField {
+                            name: field.name,
+                            projection: field.projection,
+                            subobject: field.subobject,
+                            binder_info: field.binder_info,
+                            auto_param: None,
+                        })
+                        .collect(),
+                    parents: row
+                        .parents
+                        .into_iter()
+                        .map(|parent| fln_olean::source_extensions::StructureParent {
+                            name: parent.name,
+                            subobject: parent.subobject,
+                            projection: parent.projection,
+                        })
+                        .collect(),
+                });
+        }
         Ok(Self {
             name: name.clone(),
             imports,
