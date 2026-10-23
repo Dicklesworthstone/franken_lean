@@ -501,3 +501,91 @@ fn export_alias_libraries_build_and_resolve_through_physical_lake_outputs() {
         "{report}"
     );
 }
+
+#[test]
+fn scoped_instance_libraries_build_and_keep_scope_activation_after_import() {
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib/Base.lean",
+        "prelude\ninductive Token where | left | right\nclass Pick where\n  value : Token\n\
+         instance fallback : Pick := Pick.mk Token.left\nnamespace Regional\n\
+         scoped instance preferred : Pick := Pick.mk Token.right\nend Regional\n",
+    );
+    package.write("Lib.lean", "prelude\nimport Lib.Base\n");
+    success(&package.build(&["+Lib:olean"]));
+    let bytes = std::fs::read(package.artifact("Lib.Base")).unwrap();
+    success(&package.build(&["+Lib:olean"]));
+    assert_eq!(std::fs::read(package.artifact("Lib.Base")).unwrap(), bytes);
+    let client = Package::new("name = \"scopedclient\"\n");
+    let library = package.0.join(".lake/build/lib/lean");
+    let reference = std::env::var_os("FLN_REFERENCE_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/bin/lean")
+            })
+        })
+        .filter(|binary| binary.is_file());
+    assert!(
+        reference.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "FLN_REQUIRE_REFERENCE is set but the pinned Reference is absent"
+    );
+    let check_reference = |file: &str, accepted: bool| {
+        let Some(binary) = &reference else {
+            eprintln!("SKIP: pinned Reference absent; FrankenLean's verdict only");
+            return;
+        };
+        let reference_library = std::env::var_os("FLN_REFERENCE_LIB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| binary.parent().unwrap().parent().unwrap().join("lib/lean"));
+        let output = Command::new(binary)
+            .arg(client.0.join(file))
+            .env(
+                "LEAN_PATH",
+                std::env::join_paths([library.clone(), reference_library]).unwrap(),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "pinned Reference on {file}, importing FrankenLean's scoped instance: {output:?}"
+        );
+    };
+    for (index, (scope, expected)) in [("", "left"), ("open scoped Regional\n", "right")]
+        .into_iter()
+        .enumerate()
+    {
+        let file = format!("Use{index}.lean");
+        client.write(
+            &file,
+            format!(
+                "prelude\nimport Lib\n{scope}\
+                 theorem choiceProof (P : Token -> Prop) (h : P Token.{expected}) : P Pick.value := h\n"
+            ),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json", "--import-posture", "recheck"])
+            .arg(client.0.join(&file))
+            .env("LEAN_PATH", &library)
+            .env("FLN_IMPORT_REUSE_DIR", client.0.join(".records"))
+            .output()
+            .unwrap();
+        success(&output);
+        check_reference(&file, true);
+    }
+    client.write(
+        "Wrong.lean",
+        "prelude\nimport Lib\nopen scoped Regional\n\
+         theorem wrongProof (P : Token -> Prop) (h : P Token.left) : P Pick.value := h\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json", "--import-posture", "recheck"])
+        .arg(client.0.join("Wrong.lean"))
+        .env("LEAN_PATH", &library)
+        .env("FLN_IMPORT_REUSE_DIR", client.0.join(".records"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    check_reference("Wrong.lean", false);
+}

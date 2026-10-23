@@ -55,6 +55,80 @@ fn compiled_global_instances_drive_real_downstream_dictionary_selection() {
 }
 
 #[test]
+fn compiled_scoped_instances_activate_only_in_the_consumers_lexical_scope() {
+    let source = format!(
+        "{PICK}\ninstance fallback : Pick := Pick.mk Token.left\nnamespace Regional\nscoped instance preferred : Pick := Pick.mk Token.right\nend Regional"
+    );
+    let built = compiled(&[("Main", "prelude\nimport Lib"), ("Lib", &source)]);
+    let rows = metadata(&built.artifacts[0].bytes).instances;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].scope, None);
+    assert_eq!(rows[1].declaration, name("Regional.preferred"));
+    assert_eq!(rows[1].scope, Some(name("Regional")));
+    assert!(metadata(&built.artifacts[1].bytes).instances.is_empty());
+    let receipt = imported(&built);
+    for engine in [&built.checked.checked.engine, &receipt.engine] {
+        assert_choice(engine, "left");
+        engine
+            .check_source_files(
+                &[br#"
+section
+open scoped Regional
+def regionalChoice : Token := Pick.value
+def regionalProof (P : Token -> Prop) (h : P Token.right) : P regionalChoice := h
+end
+def restoredChoice : Token := Pick.value
+def restoredProof (P : Token -> Prop) (h : P Token.left) : P restoredChoice := h
+namespace Regional
+def namespaceChoice : Token := Pick.value
+def namespaceProof (P : Token -> Prop) (h : P Token.right) : P namespaceChoice := h
+end Regional
+"#],
+                &KVMap::new(),
+                limits().source,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert!(engine.check_source_files(
+            &[b"open scoped Regional\ndef choice : Token := Pick.value\ndef wrong (P : Token -> Prop) (h : P Token.left) : P choice := h"],
+            &KVMap::new(), limits().source,
+        ).is_err(), "opening the scope must select the scoped dictionary");
+    }
+}
+
+#[test]
+fn compiled_scoped_ties_follow_activation_order_and_reopening_is_idempotent() {
+    let source = format!(
+        "{PICK}\nnamespace Alpha\nscoped instance first : Pick := Pick.mk Token.left\nend Alpha\nnamespace Omega\nscoped instance second : Pick := Pick.mk Token.right\nend Omega"
+    );
+    let built = compiled(&[("Main", &source)]);
+    let receipt = imported(&built);
+    assert!(
+        receipt
+            .engine
+            .check_source_files(
+                &[b"def noScope : Token := Pick.value"],
+                &KVMap::new(),
+                limits().source,
+            )
+            .is_err(),
+        "an inactive scoped instance must not become a global fallback"
+    );
+    for (first, last, expected) in [("Alpha", "Omega", "right"), ("Omega", "Alpha", "left")] {
+        let source = format!(
+            "open scoped {first}\nopen scoped {last}\nopen scoped {first}\ndef chosen : Token := Pick.value\ndef chosenProof (P : Token -> Prop) (h : P Token.{expected}) : P chosen := h"
+        );
+        receipt
+            .engine
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits().source)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+    }
+}
+
+#[test]
 fn priority_updates_preserve_first_registration_order_for_equal_priority_instances() {
     let source = format!(
         "{PICK}\ninstance zFirst : Pick := Pick.mk Token.left\ninstance aSecond : Pick := Pick.mk Token.right\nattribute [instance 2000] zFirst\nattribute [instance 1000] zFirst"
