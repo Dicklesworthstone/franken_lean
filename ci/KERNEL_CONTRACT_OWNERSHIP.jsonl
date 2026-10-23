@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":665,"projection_hash":"30cecc976c22cf3349d0e57e23f553b5930505cf6d7e58cf046f508b37dc9791"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":680,"projection_hash":"ea4093b25b938216a1b260e7f4a19ebd08353c002cdadd91c1762acc6e3e0e27"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -105,6 +105,8 @@
 {"id":"fln-checker-mathlib-shapes-qne9"}
 {"id":"fln-ci-fixture-root-dev-host-path-8gdb"}
 {"id":"fln-ci-tests-need-pin-d3ci"}
+{"id":"fln-coercion-arrow-elaboration-chb4"}
+{"id":"fln-command-offset-loss-l7ij"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
 {"id":"fln-d18-product-half-rgsg"}
@@ -117,6 +119,7 @@
 {"id":"fln-decision-check-stack-lq8u"}
 {"id":"fln-default-instance-commit-rule-2709"}
 {"id":"fln-default-linters-unused-variables-mtnt"}
+{"id":"fln-deprecated-constant-warning-lx45"}
 {"id":"fln-derived-declaration-frontier-cj7s"}
 {"id":"fln-deriving-repr-ingress-closure-2gdf"}
 {"id":"fln-dyfz"}
@@ -125,11 +128,14 @@
 {"id":"fln-eeew"}
 {"id":"fln-eeyn"}
 {"id":"fln-ehb5"}
+{"id":"fln-ellipsis-argument-elaboration-wj22"}
 {"id":"fln-elp6"}
 {"id":"fln-env-merge-resource-envelope-9m74"}
 {"id":"fln-eq4k"}
+{"id":"fln-equation-lemmas-generation-silo"}
 {"id":"fln-ersf"}
 {"id":"fln-euo"}
+{"id":"fln-eval-sorry-false-accept-fj7c"}
 {"id":"fln-eval-stderr-capture-ay5r"}
 {"id":"fln-evidence-runner-bootstrap-btk"}
 {"id":"fln-ew20"}
@@ -147,6 +153,7 @@
 {"id":"fln-ffce"}
 {"id":"fln-field-notation-export-alias-zslx"}
 {"id":"fln-file-scale-t2-differential-5f1b"}
+{"id":"fln-first-order-approximation-context-locals-6esd"}
 {"id":"fln-fixture-retention-unbounded-evit"}
 {"id":"fln-fln-definition-auxiliary-names-lv0n"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
@@ -193,6 +200,7 @@
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-import-reuse-composes-4ngt"}
 {"id":"fln-in1"}
+{"id":"fln-index-proof-omega-fallback-ov8v"}
 {"id":"fln-infoview-rpc-procedures-my8l"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
@@ -252,6 +260,7 @@
 {"id":"fln-narm"}
 {"id":"fln-nested-actions-e60c"}
 {"id":"fln-nested-inductive-source-59sb"}
+{"id":"fln-nested-recursor-runtime-lowering-fno9"}
 {"id":"fln-nhf5"}
 {"id":"fln-nomatch-nofun-h78u"}
 {"id":"fln-noncomputable-check-false-refusal-bhf2"}
@@ -296,6 +305,7 @@
 {"id":"fln-reality-check-1013-wzr5"}
 {"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
+{"id":"fln-reduce-command-crqm"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-repr-ingress-lambda-application-xchs"}
 {"id":"fln-rfl-for-step-limit-63a9"}
@@ -309,17 +319,21 @@
 {"id":"fln-scoped-unknown-name-route-bl77"}
 {"id":"fln-selftest-symlink-blocks-bundle-4yhd"}
 {"id":"fln-set-option-t69b"}
+{"id":"fln-simp-at-hypothesis-order-vyxf"}
 {"id":"fln-simp-closer-reducible-i2ja"}
 {"id":"fln-simp-default-set-a4nb"}
 {"id":"fln-simp-unfold-indexed-4v9t"}
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
+{"id":"fln-sorry-warning-per-declaration-zzlc"}
+{"id":"fln-source-notation-unexpanders-727b"}
 {"id":"fln-sr2z"}
 {"id":"fln-staged-closure-partial-application-ug55"}
 {"id":"fln-stc1"}
 {"id":"fln-string-char-patterns-up6e"}
 {"id":"fln-structural-course-of-values-ofg4"}
 {"id":"fln-structural-fixed-prefix-bcvq"}
+{"id":"fln-structure-diamond-copied-parents-3ttt"}
 {"id":"fln-sv7x"}
 {"id":"fln-t705"}
 {"id":"fln-td9"}
@@ -337,6 +351,7 @@
 {"id":"fln-user-partial-unsafe-def-c3hh"}
 {"id":"fln-uuuz"}
 {"id":"fln-uyuz"}
+{"id":"fln-variable-binder-update-shadowing-7h8o"}
 {"id":"fln-vm35"}
 {"id":"fln-vneu"}
 {"id":"fln-vokf"}
