@@ -218,3 +218,63 @@ fn polymorphic_and_proof_structures_preserve_checked_interfaces() {
     }
     aliases::reference_import(&built, &format!("prelude\nimport Main\n{probe}"), true);
 }
+
+#[test]
+fn a_copied_parent_is_a_non_subobject_parent_the_pin_reads() {
+    let base = "prelude\ninductive Token where | left | right\n\
+        structure Root where\n  root : Token\n\
+        structure Left extends Root where\n  left : Token\n\
+        structure Right extends Root where\n  right : Token\n";
+    let child = "prelude\nimport Base\nstructure Both extends Left, Right where\n  both : Token\n";
+    let built = compiled(&[
+        ("Main", "prelude\nimport Child"),
+        ("Child", child),
+        ("Base", base),
+    ]);
+    let structures = metadata(&built.artifacts[1].bytes).structures;
+    assert_eq!(structures.len(), 1);
+    let both = &structures[0];
+    // The pin's `withStruct`: `Right` overlaps `Left` in `root`, so it is copied: its new
+    // field `right` joins the record, and `Both.toRight` is a definition, not a field.
+    assert_eq!(
+        both.fields
+            .iter()
+            .map(|field| (field.name.clone(), field.subobject.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (name("toLeft"), Some(name("Left"))),
+            (name("right"), None),
+            (name("both"), None)
+        ]
+    );
+    assert_eq!(
+        both.parents
+            .iter()
+            .map(|parent| (
+                parent.name.clone(),
+                parent.projection.clone(),
+                parent.subobject
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (name("Left"), name("Both.toLeft"), true),
+            (name("Right"), name("Both.toRight"), false)
+        ]
+    );
+    aliases::reference_import(
+        &built,
+        "prelude\nimport Main\n\
+        theorem copied (P : Token -> Prop) (h : P Token.right) :\n\
+          P (({ root := Token.left, left := Token.left, right := Token.right, both := Token.left } : Both).toRight.right) := h\n\
+        theorem shared (P : Token -> Prop) (h : P Token.left) :\n\
+          P (({ root := Token.left, left := Token.right, right := Token.right, both := Token.right } : Both).toRight.root) := h\n",
+        true,
+    );
+    aliases::reference_import(
+        &built,
+        "prelude\nimport Main\n\
+        theorem wrong (P : Token -> Prop) (h : P Token.left) :\n\
+          P (({ root := Token.left, left := Token.left, right := Token.right, both := Token.left } : Both).toRight.right) := h\n",
+        false,
+    );
+}
