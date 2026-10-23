@@ -23,6 +23,14 @@ The evidence matrix and Beads tracker remain authoritative where they carry stro
 
 ---
 
+## Evaluation stream capture continuation, 2026-10-23
+
+Existing bead `fln-eval-stderr-capture-ay5r` remains **in progress**. The implementation now connects bounded native stdout/optional-stderr capture to Lean/PreferRaw evaluations, retains each command's text separately from its value, and routes nonfatal panic/trace text through that sink. Golem stops on capture exhaustion before invoking a trace continuation. Human/JSON/guard presentation and IO-exception prefixes have drafts; Raw execution retains direct effects. This does not implement stdin isolation or expand the native-stream boundary.
+
+Evidence is bounded to explicit overlays over `84be90655954c9724f581157b6a6d42761f94d0d`. The corrected baseline runs one actual-library test and fails on escaped output. Source21 then passes all four stderr tests, including the unchanged Raw/replay control. Source23 passes all 456 boundary/VM package tests across 24 nonempty suites, with no failures, ignores or filters. Its compiler check finds one missing borrow in the CLI draft, corrected later. The initial zero-test baseline supplies no regression evidence. Actual v4.32.0 guard controls separately confirm default stderr capture and `stderrAsMessages := false`; they are oracle observations, not native CLI validation.
+
+Latest source25 has 25 explicit overlay paths, SHA-256 map `212a62960b2993d3df7f7bd398517375541f23730491f13b80df658b67322e35`. It includes the validation-path exception-prefix correction, command-local option restoration tests, and replacement of the historical guarded-IO limitation assertion with real execution/Raw controls. **These latest changes are not runtime-qualified.** Installed CLI and capture-suite requests refused before compilation for worker capacity. The source24 all-target attempt ends 143 without a completed check; cancellation/recovery and worker-storage failures are retained, not credited as passes. Required source25 UBS is red: 24 Rust files, one critical/5,073 warnings/1,882 info; the critical is the existing stderr fixture helper, with targeted-shadow Cargo context absent. Formatting passes. Original full Cargo, strict Clippy, real-root inventory, UBS-green and independent acceptance gates remain open; peer commits adopting these bytes supply no additional validation.
+
 ## Reality check, 2026-10-20
 
 **The independent checker and bounded native source toolchain are real. The complete drop-in toolchain and its architectural performance claims are not delivered.** This review read AGENTS.md and README.md in full, the complete comprehensive plan, the live work graph, subsystem implementations and their consumers, retained frontier receipts, and current GitHub gate results. It separates a source review from an executed binary observation.
