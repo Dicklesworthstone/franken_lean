@@ -2593,6 +2593,13 @@ fn run(
                         Ok(PreparedApply::Partial { function, captures }) => {
                             if let Some(message) = &application.trace {
                                 fln_rt::diagnostics::trace_message(message.as_bytes());
+                                if let Some(error) = fln_rt::obj::StdoutCapture::current_error() {
+                                    return stdio_apply_failure(
+                                        VmRefusal::NativeStdoutCapture { error },
+                                        steps,
+                                        peak_stack_depth,
+                                    );
+                                }
                             }
                             let value = make_golem_closure(program, function, captures)?;
                             let value =
@@ -2636,6 +2643,13 @@ fn run(
                             }
                             if let Some(message) = &application.trace {
                                 fln_rt::diagnostics::trace_message(message.as_bytes());
+                                if let Some(error) = fln_rt::obj::StdoutCapture::current_error() {
+                                    return stdio_apply_failure(
+                                        VmRefusal::NativeStdoutCapture { error },
+                                        steps,
+                                        peak_stack_depth,
+                                    );
+                                }
                             }
                             advance(current_frame_mut(&mut stack)?)?;
                             let next_depth = push_call(
@@ -2681,6 +2695,11 @@ fn run(
                                 };
                             set_register(current_frame_mut(&mut stack)?, dst, value)?;
                             advance(current_frame_mut(&mut stack)?)?;
+                        }
+                        Err(IntrinsicFailure::Refused(
+                            refusal @ VmRefusal::NativeStdoutCapture { .. },
+                        )) => {
+                            return stdio_apply_failure(refusal, steps, peak_stack_depth);
                         }
                         Err(IntrinsicFailure::Refused(refusal)) => {
                             return Ok(VmExit::Refused {
@@ -3311,12 +3330,12 @@ fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmEx
             StdoutCaptureError::Allocation => Stop::Inconclusive(
                 Inconclusive::dependency_unavailable("host allocation for stdout capture"),
             ),
-            StdoutCaptureError::InvalidStdout | StdoutCaptureError::ScopeUnavailable => {
-                Stop::InternalFault(InternalFault::new(
-                    "STDOUT-CAPTURE-SCOPE",
-                    "validated stdout capture lost its scope contract",
-                ))
-            }
+            StdoutCaptureError::InvalidStdout
+            | StdoutCaptureError::InvalidStderr
+            | StdoutCaptureError::ScopeUnavailable => Stop::InternalFault(InternalFault::new(
+                "STDOUT-CAPTURE-SCOPE",
+                "validated stdout capture lost its scope contract",
+            )),
         });
     }
     Ok(VmExit::Refused {

@@ -148,6 +148,49 @@ fn stderr_requires_independent_authority_even_after_a_warm_stream_layout() {
 }
 
 #[test]
+fn presented_evaluations_do_not_escape_their_command_streams() {
+    if std::env::var_os("FLN_REFERENCE_LIB").is_none() {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference library is required"
+        );
+        eprintln!("SKIP: set FLN_REFERENCE_LIB to the pinned lib/lean");
+        return;
+    }
+    let environment = source_fixture();
+    let environment = register_getter(
+        &register_getter(&environment, stdout::Getter::Stdout, false),
+        stdout::Getter::Stderr,
+        false,
+    );
+    let engine = Engine::from_environment(environment);
+    let root = engine.logical_root(&KVMap::new());
+    let capture = StdoutCapture::begin(4096).unwrap();
+    let result = engine
+        .execute_source_commands_with_presentation(
+            b"#eval IO.print \"first\"\n#eval IO.eprintln \"second\"\n#eval IO.print \"third\"",
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            crate::EvaluationPresentation::PreferRaw,
+        )
+        .unwrap()
+        .into_complete()
+        .expect("all three checked IO actions complete");
+    assert_eq!(result.batch.executions.len(), 3);
+    for execution in &result.batch.executions {
+        assert_unit_packet(&execution.exit);
+    }
+    let captured = capture.finish();
+    assert_eq!(captured.error, None);
+    assert!(
+        captured.bytes.is_empty(),
+        "evaluation output escaped its command: {:?}",
+        captured.bytes
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn checked_stderr_sources_are_deferred_separate_and_replayable() {
     const CHILD: &str = "FLN_STDERR_SOURCE_CHILD";
     const CASE: &str = "runtime::stdout::tests::input::stderr::checked_stderr_sources_are_deferred_separate_and_replayable";

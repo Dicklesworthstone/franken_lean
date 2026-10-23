@@ -7302,6 +7302,7 @@ impl Engine {
         // `#exit`'s warning (`elabExit`); the partition made it the last command.
         let mut exit_warning: Option<SourceWarning> = None;
         let mut evaluation_indices = Vec::new();
+        let mut evaluation_output_bytes = 0usize;
         evaluation_indices
             .try_reserve_exact(command_count)
             .map_err(|_| EngineExecutionError::AllocationFailure {
@@ -8225,6 +8226,7 @@ impl Engine {
             ) && guards
                 .last()
                 .is_some_and(|guard| guard.command_index == command_index)
+                && presentation == EvaluationPresentation::Raw
             {
                 // IO effects are not isolated into guard messages. Refuse
                 // before executing the action, never after its stdout or
@@ -8353,13 +8355,33 @@ impl Engine {
                 }
                 merged
             });
-            let mut execution = match engine.execute_definition_entry_with_helpers(
+            let capture = if is_evaluation && presentation != EvaluationPresentation::Raw {
+                let remaining = limits
+                    .max_evaluation_output_bytes
+                    .saturating_sub(evaluation_output_bytes);
+                let isolate_stderr = scoped_options
+                    .as_ref()
+                    .unwrap_or(options)
+                    .get_bool(&Name::from_components(["stderrAsMessages"]), true);
+                match StdoutCapture::begin_isolated(remaining, isolate_stderr) {
+                    Ok(capture) => Some(capture),
+                    Err(error) => return Ok(source_evaluation::capture_failure(error)),
+                }
+            } else {
+                None
+            };
+            let invoked = engine.execute_definition_entry_with_helpers(
                 declaration,
                 &local_functions,
                 scoped_options.as_ref().unwrap_or(options),
                 limits,
                 entry,
-            ) {
+            );
+            let captured = capture.map(StdoutCapture::finish);
+            if let Some(error) = captured.as_ref().and_then(|captured| captured.error) {
+                return Ok(source_evaluation::capture_failure(error));
+            }
+            let mut execution = match invoked {
                 Ok(Outcome::Complete(execution)) => execution,
                 Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
                 Ok(Outcome::InternalFault(fault)) => {
@@ -8373,6 +8395,19 @@ impl Engine {
                     });
                 }
             };
+            if let Some(captured) = captured {
+                evaluation_output_bytes = evaluation_output_bytes
+                    .checked_add(captured.bytes.len())
+                    .ok_or(EngineExecutionError::UnexpectedPublication {
+                        detail: "evaluation output accounting overflow",
+                    })?;
+                execution.evaluation_output =
+                    Some(String::from_utf8(captured.bytes).map_err(|_| {
+                        EngineExecutionError::UnexpectedPublication {
+                            detail: "evaluation capture violated its UTF-8 contract",
+                        }
+                    })?);
+            }
             source_records::apply_execution_effects(
                 &mut execution,
                 irreducible,
@@ -9907,6 +9942,7 @@ impl Engine {
             runtime_type,
             io_result_types,
             evaluation_presentation: None,
+            evaluation_output: None,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -11994,6 +12030,9 @@ pub struct EngineExecutionLimits {
     pub flbc_codec: CodecLimits,
     pub vm: VmExecutionLimits,
     pub source_modules: SourceModuleLimits,
+    /// Aggregate raw UTF-8 bytes retained from presented evaluation streams.
+    /// Raw evaluation APIs keep their direct effects and do not use this cap.
+    pub max_evaluation_output_bytes: usize,
 }
 
 impl EngineExecutionLimits {
@@ -12008,6 +12047,7 @@ impl EngineExecutionLimits {
             flbc_codec: CodecLimits::default(),
             vm: VmExecutionLimits::default(),
             source_modules: SourceModuleLimits::default(),
+            max_evaluation_output_bytes: 16 * 1024 * 1024,
         }
     }
 
@@ -12127,6 +12167,9 @@ pub struct DefinitionExecution {
     /// Set only by the opt-in source command adapter after executing a checked
     /// printer or a checked silent Unit action. Raw APIs never set this marker.
     evaluation_presentation: Option<EvaluationResultPresentation>,
+    /// Isolated stdout/stderr for an explicitly presented source evaluation.
+    /// None keeps the raw API's ordinary native stream behavior.
+    evaluation_output: Option<String>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.

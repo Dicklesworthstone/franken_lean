@@ -33,6 +33,9 @@ pub(super) fn panic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, Intrinsi
     expect_arity(row, args, 2)?;
     let message = string_value(&args[1], "panicCore", 1)?;
     fln_rt::diagnostics::report_panic(message.as_bytes());
+    if let Some(error) = fln_rt::obj::StdoutCapture::current_error() {
+        return Err(VmRefusal::NativeStdoutCapture { error }.into());
+    }
     Ok(IntrinsicResult::raw_object(args[0].clone_ref()))
 }
 

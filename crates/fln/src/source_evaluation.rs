@@ -11,6 +11,7 @@ use super::*;
 /// the supported Lean presentation through actual class instances.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvaluationPresentation {
+    /// Raw values and direct stream effects; the caller owns presentation.
     Raw,
     Lean,
     /// Keep supported scalar/list machine values; otherwise select an actual
@@ -81,6 +82,11 @@ impl fmt::Display for IoEvaluationProjectionError {
 impl std::error::Error for IoEvaluationProjectionError {}
 
 impl DefinitionExecution {
+    /// Native output isolated while the source evaluation ran, in write order.
+    /// Even an empty Some marks a completed isolation scope. This never reruns IO.
+    pub fn evaluation_output(&self) -> Option<&str> {
+        self.evaluation_output.as_deref()
+    }
     /// The supported message width when this execution is a checked Repr or
     /// ToString printer result. The VM result is `Std.Format`; ordinary values
     /// of that type and raw Strings never acquire this presentation marker.
@@ -141,6 +147,38 @@ impl DefinitionExecution {
                 exit,
             }
         }))
+    }
+}
+
+pub(super) fn capture_failure<T>(error: fln_rt::obj::StdoutCaptureError) -> Outcome<T> {
+    use fln_rt::obj::StdoutCaptureError;
+    match error {
+        StdoutCaptureError::Limit { limit, requested } => Outcome::Inconclusive(
+            fln_core::outcome::Inconclusive::resource(fln_core::outcome::ResourceUsage {
+                reason: fln_core::diag::ResourceReason::Memory {
+                    limit_bytes: limit as u64,
+                },
+                allowed: limit as u64,
+                observed: requested as u64,
+            })
+            .with_progress("evaluation output capture byte allowance"),
+        ),
+        StdoutCaptureError::Allocation => {
+            Outcome::Inconclusive(fln_core::outcome::Inconclusive::dependency_unavailable(
+                "host allocation for evaluation output capture",
+            ))
+        }
+        StdoutCaptureError::InvalidStdout | StdoutCaptureError::InvalidStderr => {
+            Outcome::Inconclusive(fln_core::outcome::Inconclusive::unsupported(
+                "evaluation stream is not a supported native stream",
+            ))
+        }
+        StdoutCaptureError::ScopeUnavailable => {
+            Outcome::InternalFault(fln_core::outcome::InternalFault::new(
+                "EVAL-CAPTURE-SCOPE",
+                "evaluation output capture lost its scope",
+            ))
+        }
     }
 }
 
