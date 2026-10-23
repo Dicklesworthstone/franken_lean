@@ -19,22 +19,23 @@ pub struct ExternAttribute {
     pub entries: Vec<ExternEntry>,
 }
 
-fn string(obj: &Obj) -> Result<String, DecodeError> {
+/// A `String` payload's text. Shared by the extern and deprecation decoders.
+pub(super) fn string(obj: &Obj) -> Result<String, DecodeError> {
     let Some((size, _, _, bytes)) = obj.try_string_view() else {
-        return Err(shape("extern payload is not a String"));
+        return Err(shape("payload is not a String"));
     };
     let Some(length) = size.checked_sub(1) else {
-        return Err(shape("extern String has no terminator"));
+        return Err(shape("String payload has no terminator"));
     };
     let Some(value) = bytes.get(..length) else {
-        return Err(shape("extern String has an invalid size"));
+        return Err(shape("String payload has an invalid size"));
     };
     if bytes.get(length) != Some(&0) {
-        return Err(shape("extern String has no terminator"));
+        return Err(shape("String payload has no terminator"));
     }
     std::str::from_utf8(value)
         .map(str::to_owned)
-        .map_err(|_| shape("extern String is not UTF-8"))
+        .map_err(|_| shape("String payload is not UTF-8"))
 }
 
 impl Reader {

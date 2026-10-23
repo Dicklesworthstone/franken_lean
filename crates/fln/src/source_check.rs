@@ -165,6 +165,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             | SourceInferenceError::ProtectedJournal(
                 fln_elab::protected_names::ProtectedError::Malformed,
             )
+            | SourceInferenceError::DeprecationJournal(
+                fln_elab::deprecations::DeprecationError::Malformed,
+            )
             | SourceInferenceError::AuxiliaryJournal(
                 fln_elab::aux_recursors::AuxRecursorError::Malformed,
             ) => ("internal-fault", false, 4),
@@ -172,6 +175,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
             | SourceInferenceError::ProtectedJournal(
                 fln_elab::protected_names::ProtectedError::Limit,
+            )
+            | SourceInferenceError::DeprecationJournal(
+                fln_elab::deprecations::DeprecationError::Limit,
             )
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
             | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)

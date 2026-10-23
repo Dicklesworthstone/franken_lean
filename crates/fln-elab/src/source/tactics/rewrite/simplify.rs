@@ -224,9 +224,16 @@ impl Context {
         let resolved = self
             .resolve_source_name(val)?
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
-        Ok((self.txn.lctx.find_by_user_name(&resolved).is_none()
-            && self.txn.env.contains(&resolved))
-        .then_some(resolved))
+        let global = self.txn.lctx.find_by_user_name(&resolved).is_none()
+            && self.txn.env.contains(&resolved);
+        // `resolveSimpIdTheorem?` resolves it with `Term.resolveId?`, which checks it.
+        if global {
+            self.note_deprecated(
+                &resolved,
+                super::super::super::deprecated::syntax_span(syntax),
+            )?;
+        }
+        Ok(global.then_some(resolved))
     }
 
     /// The pin elaborates a non-identifier simp argument as a theorem at once
@@ -252,6 +259,11 @@ impl Context {
             Ok(Some(trial.instantiate(&sort)?))
         })();
         self.charge_rewrite_trial(&trial);
+        // The pin elaborates a term rule once (`elabSimpArgs`): this trial is that elaboration
+        // for the deprecated constants it names, and [`Self::simp_rule_term`] checks none.
+        if let Some(uses) = trial.deprecated_uses.get(self.deprecated_uses.len()..) {
+            self.deprecated_uses.extend_from_slice(uses);
+        }
         let Ok(Some(sort)) = sort else {
             return Ok(());
         };
@@ -760,11 +772,18 @@ impl Context {
     /// Both declarations must still be in this branch. Following only direct
     /// local aliases preserves annotations and local shadowing; ordinary term
     /// applications continue to elaborate the full conditional hypothesis.
+    ///
+    /// A rule is elaborated at each use here, where the pin elaborates it once while reading the
+    /// arguments; that reading reported its deprecated constants (`simp_rules`), so none is
+    /// reported again.
     fn simp_rule_term(&mut self, syntax: &Syntax) -> Result<Typed, NatDefinitionElabError> {
         if let Some(term) = self.specialized_induction_rule(syntax)? {
             return Ok(term);
         }
-        self.term(syntax, None)
+        let check = std::mem::replace(&mut self.check_deprecated, false);
+        let term = self.term(syntax, None);
+        self.check_deprecated = check;
+        term
     }
 
     fn specialized_induction_rule(

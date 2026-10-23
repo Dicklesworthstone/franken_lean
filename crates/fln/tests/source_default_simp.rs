@@ -660,10 +660,10 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
 }
 
 /// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
-/// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
-/// change no checked meaning, and `macro_inline` and `extern`, recorded for the runtime, and
-/// refuses the rest.
-/// So no attribute is dropped and none is admitted without its meaning.
+/// implements one global `simp`, `@[deprecated]` and the code generator hints (`inline`,
+/// `specialize`, …), which change no checked meaning, and `macro_inline` and `extern`, recorded
+/// for the runtime, and refuses the rest. So no attribute is dropped and none is admitted without
+/// its meaning.
 #[test]
 fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     let base = engine();
@@ -673,7 +673,6 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
         "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
-        "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
         "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp] example : (0 : Nat) = 0 := by rfl",
@@ -721,6 +720,20 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
             .as_slice()
         )
     );
+    // `@[deprecated]` records its entry (`Lean/Linter/Deprecated.lean`): the pinned `lean`
+    // accepts this declaration, warning that the attribute names neither a replacement nor a
+    // message.
+    let deprecated = checked(
+        &base,
+        &["@[deprecated (since := \"2026-01-01\")] def x : Nat := 0"],
+    );
+    let entries = fln_elab::deprecations::Deprecations::read(deprecated.engine.environment())
+        .expect("a readable deprecation journal");
+    let entry = entries
+        .get(&Name::from_components(["x"]))
+        .expect("the declaration is deprecated");
+    assert_eq!(entry.since.as_deref(), Some("2026-01-01"));
+    assert!(entry.new_name.is_none() && entry.text.is_none());
 }
 
 /// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000

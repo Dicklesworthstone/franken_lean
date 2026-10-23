@@ -7004,6 +7004,19 @@ impl Engine {
                     )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
+                if let Some(declared) =
+                    source_records::declared_name(&admitted.declaration).cloned()
+                    && let Some(environment) = source_records::tag_deprecated(
+                        &admitted.engine,
+                        parsed.syntax(),
+                        &declared,
+                        &self.base_source_scope(),
+                        limits.kernel,
+                    )?
+                {
+                    admitted.engine.environment = environment;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
                 return self.finish_local_function_admission(
                     admitted,
                     &elaborated.local_functions,
@@ -7377,6 +7390,13 @@ impl Engine {
         // The pin's warning for each definition an `attribute [instance]` command adds while it
         // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
         let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
+        // The pin's deprecation warnings, logged while each command elaborates
+        // (`Linter.checkDeprecated`). This thread's elaborations publish their uses here; the
+        // uses of a command are read at the next step, before anything else runs, with the
+        // environment and scope the command left.
+        let deprecation_sink = fln_elab::deprecations::UseSink::install();
+        let mut deprecations: Vec<SourceWarning> = Vec::new();
+        let mut elaborated_command: Option<(usize, fln_parse::BytePos)> = None;
         let mut evaluation_indices = Vec::new();
         let mut evaluation_output_bytes = 0usize;
         evaluation_indices
@@ -7432,6 +7452,16 @@ impl Engine {
         // one. Keep that ownership separate from the innermost option map.
         let mut command_stderr_capture: Option<(usize, bool)> = None;
         while let Some(step) = queue.pop_front() {
+            if let Some((index, offset)) = elaborated_command.take() {
+                deprecations.extend(deprecation_warnings(
+                    deprecation_sink.take(),
+                    index,
+                    offset,
+                    engine.environment(),
+                    &scopes.current,
+                    limits.kernel,
+                )?);
+            }
             let (command_index, original_offset, command_source) = match step {
                 Step::Command(index, offset, source) => (index, offset, source),
                 Step::Scope(index, transition) => {
@@ -7457,6 +7487,7 @@ impl Engine {
                     continue;
                 }
             };
+            elaborated_command = Some((command_index, original_offset));
             // Consume each file boundary once, including when a temporary
             // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
@@ -7668,7 +7699,8 @@ impl Engine {
                         // compared as the pin's (below). Other commands keep this refusal.
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
-                            line.starts_with("warning:") && !reproduced_warning(line)
+                            line.starts_with("warning:")
+                                && !reproduced_warning(line, engine.environment())
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error or warning message",
@@ -8528,6 +8560,27 @@ impl Engine {
                         )?;
                     admission.result_logical_root = admission.engine.logical_root(options);
                 }
+                if let Some(declared) = admission
+                    .admissions
+                    .first()
+                    .and_then(|admitted| source_records::declared_name(&admitted.declaration))
+                    .cloned()
+                    && let Some(environment) = source_records::tag_deprecated(
+                        &admission.engine,
+                        parsed.syntax(),
+                        &declared,
+                        &scope,
+                        limits.kernel,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                {
+                    admission.engine.environment = environment;
+                    admission.result_logical_root = admission.engine.logical_root(options);
+                }
                 let mut admission = match engine.finish_local_function_batch(
                     admission,
                     &local_functions,
@@ -8692,6 +8745,27 @@ impl Engine {
                     .engine
                     .logical_root(scoped_options.as_ref().unwrap_or(options));
             }
+            if !is_evaluation
+                && let Some(declared) =
+                    source_records::declared_name(&execution.declaration).cloned()
+                && let Some(environment) = source_records::tag_deprecated(
+                    &execution.engine,
+                    parsed.syntax(),
+                    &declared,
+                    &scope,
+                    limits.kernel,
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?
+            {
+                execution.engine.environment = environment;
+                execution.result_logical_root = execution
+                    .engine
+                    .logical_root(scoped_options.as_ref().unwrap_or(options));
+            }
             if !is_evaluation {
                 scopes.admitted(&execution.declaration);
             }
@@ -8727,6 +8801,17 @@ impl Engine {
             }
         }
 
+        if let Some((index, offset)) = elaborated_command.take() {
+            deprecations.extend(deprecation_warnings(
+                deprecation_sink.take(),
+                index,
+                offset,
+                engine.environment(),
+                &scopes.current,
+                limits.kernel,
+            )?);
+        }
+        drop(deprecation_sink);
         let mut execution_indices = Vec::new();
         execution_indices
             .try_reserve_exact(execution_command_indices.len())
@@ -8793,7 +8878,8 @@ impl Engine {
             .collect();
         // The pin's reducibility warnings are logged while a command elaborates, ahead of its
         // `sorry` warning (reported with the kernel's check) and its linters.
-        let mut warnings: Vec<SourceWarning> = Vec::new();
+        // Deprecation warnings are logged while a command elaborates, ahead of its attributes'.
+        let mut warnings: Vec<SourceWarning> = deprecations;
         if pin_world {
             warnings.extend(instance_attribute_warnings);
             warnings.extend(declaration_reducibility_warnings(
@@ -12852,13 +12938,42 @@ fn field_receiver_message(
 }
 
 /// Whether a `#guard_msgs` docstring line is a warning this engine prints with the pin's text, so
-/// the guard over it is judged rather than refused: "declaration uses `sorry`", and the two
+/// the guard over it is judged rather than refused: "declaration uses `sorry`", the two
 /// reducibility warnings of [`linters`] (`warn.classDefReducibility`, vendored
-/// `Lean/Elab/MutualDef.lean:1246-1256`, and `addInstance`'s, `Lean/Meta/Instances.lean:281-289`).
-/// `addInstance`'s `@[expose]` warning is not reproduced, and its text does not match here.
-fn reproduced_warning(line: &str) -> bool {
+/// `Lean/Elab/MutualDef.lean:1246-1256`, and `addInstance`'s, `Lean/Meta/Instances.lean:281-289`),
+/// the old `:=` forms' notes (`Lean/Elab/Structure.lean:341`, `Lean/Elab/Inductive.lean:88`),
+/// `@[deprecated]`'s own two warnings (`Lean/Linter/Deprecated.lean:41-44`), and
+/// `Linter.checkDeprecated`'s for a constant `environment` records as deprecated
+/// ([`linters::deprecation_message`]). A deprecated option's warning has the same first line
+/// and is not reproduced: its name is no deprecated constant. `addInstance`'s `@[expose]`
+/// warning is not reproduced, and its text does not match here.
+fn reproduced_warning(line: &str, environment: &Environment) -> bool {
     const MARKED: &str = " must be marked with `@[reducible]` or `@[implicit_reducible]`";
+    const EXACT: [&str; 5] = [
+        "warning: `inductive ... :=` has been deprecated in favor of `inductive ... where`",
+        "warning: `structure ... :=` has been deprecated in favor of `structure ... where`.",
+        "warning: `class ... :=` has been deprecated in favor of `class ... where`.",
+        "warning: `[deprecated]` attribute should specify either a new name or a deprecation message",
+        "warning: `[deprecated]` attribute should specify the date or library version at which the deprecation was introduced, using `(since := \"...\")`",
+    ];
+    let deprecated_constant = || {
+        let Some((name, rest)) = line
+            .strip_prefix("warning: `")
+            .and_then(|rest| rest.split_once("` has been deprecated"))
+        else {
+            return false;
+        };
+        (rest.is_empty() || rest.starts_with(": "))
+            && !name.contains(['«', '»', '`'])
+            && fln_elab::deprecations::Deprecations::read(environment).is_ok_and(|entries| {
+                entries
+                    .get(&Name::from_components(name.split('.')))
+                    .is_some()
+            })
+    };
     line == "warning: declaration uses `sorry`"
+        || EXACT.contains(&line)
+        || deprecated_constant()
         || line
             .strip_prefix("warning: Definition `")
             .and_then(|rest| rest.strip_suffix(MARKED))
@@ -12902,6 +13017,48 @@ fn guard_checks_expected_error(guard: Option<&SourceGuard>, command_index: usize
     })
 }
 
+/// The pin's `Linter.checkDeprecated` warnings for the uses a command's elaborations published
+/// ([`linters::deprecation_message`], merged by
+/// [`fln_elab::deprecations::UseSink::take`]), in the order they were logged, at the syntax each
+/// use reports, offset by where the command's source starts. A use whose syntax has no position
+/// is refused rather than placed by guessing.
+fn deprecation_warnings(
+    uses: Vec<fln_elab::deprecations::DeprecatedUse>,
+    command_index: usize,
+    offset: fln_parse::BytePos,
+    environment: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    kernel: Budget,
+) -> Result<Vec<SourceWarning>, EngineExecutionError> {
+    let refusal = |feature| EngineExecutionError::BatchCommand {
+        index: command_index,
+        error: Box::new(EngineExecutionError::NotImplemented { feature }),
+        at: Some(offset),
+    };
+    let mut warnings = Vec::new();
+    for used in uses {
+        let Some((at, _)) = used.span else {
+            return Err(refusal(
+                "a deprecation warning at syntax without a source position",
+            ));
+        };
+        let Some(message) =
+            linters::deprecation_message(environment, scope, &used.constant, kernel)
+                .map_err(refusal)?
+        else {
+            continue;
+        };
+        warnings.push(SourceWarning {
+            command_index,
+            at: fln_parse::BytePos(offset.0 + at),
+            message,
+            severity: SourceSeverity::Warning,
+            follows_output: false,
+        });
+    }
+    Ok(warnings)
+}
+
 /// A declaration the linters read: its offset in the file, its syntax, the options in force,
 /// and the offset of the `mutual` keyword of a block it is a member of.
 type LintSite = (
@@ -12914,11 +13071,12 @@ type LintSite = (
     fln_elab::source::scope::SourceScope,
 );
 
-/// The pin's reducibility warnings for each declaration command, in command order: the
-/// `instance` attributes of its members' own lists that find a definition unmarked
-/// ([`linters::unmarked_instance_attributes`]), then its members' class-typed `def`s
-/// ([`linters::class_definition_reducibility`]), which the pin checks once every member is
-/// elaborated, at a `mutual` block's keyword.
+/// The pin's warnings while each declaration command's attributes apply and after, in command
+/// order: in attribute order, the `instance` attributes of its members' own lists that find a
+/// definition unmarked ([`linters::unmarked_instance_attributes`]) and a `@[deprecated]`'s own
+/// warnings (`deprecatedAttr`'s `getParam`, vendored `Lean/Linter/Deprecated.lean:41-44`); then
+/// its members' class-typed `def`s ([`linters::class_definition_reducibility`]), which the pin
+/// checks once every member is elaborated, at a `mutual` block's keyword.
 fn declaration_reducibility_warnings(
     lint_sites: &BTreeMap<(usize, usize), LintSite>,
     linted: &[(usize, &Declaration)],
@@ -12944,14 +13102,26 @@ fn declaration_reducibility_warnings(
         let Some((name, type_, _, _)) = linted_declaration(syntax, linted, command) else {
             continue;
         };
+        let mut attributes: Vec<(usize, String)> = Vec::new();
         if matches!(environment.find(name), Some(ConstantInfo::Defn(_))) {
-            for at in linters::unmarked_instance_attributes(syntax) {
-                warnings.push(warning(
-                    command,
-                    fln_parse::BytePos(offset.0 + at),
-                    linters::unmarked_instance_message(name),
-                ));
-            }
+            attributes.extend(
+                linters::unmarked_instance_attributes(syntax)
+                    .into_iter()
+                    .map(|at| (at, linters::unmarked_instance_message(name))),
+            );
+        }
+        if let Ok(Some(deprecated)) = fln_elab::source::deprecated_registration(syntax) {
+            attributes.extend(
+                deprecated
+                    .warnings()
+                    .into_iter()
+                    .map(|message| (deprecated.at, message.to_owned())),
+            );
+        }
+        // Stable: one attribute's own warnings keep their order.
+        attributes.sort_by_key(|(at, _)| *at);
+        for (at, message) in attributes {
+            warnings.push(warning(command, fln_parse::BytePos(offset.0 + at), message));
         }
         let is_class = |class: &Name| {
             registry

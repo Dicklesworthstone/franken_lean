@@ -15,6 +15,10 @@ mod character;
 mod codegen;
 mod coercions;
 mod collections;
+mod deprecated;
+pub use deprecated::{
+    DeprecatedAttribute, deprecated_registration, deprecation_entry, reducibly_same_type,
+};
 pub mod deriving;
 mod diagnostics;
 mod do_notation;
@@ -173,6 +177,8 @@ pub enum SourceInferenceError {
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
     ProtectedJournal(crate::protected_names::ProtectedError),
+    /// The deprecation journal refused an entry.
+    DeprecationJournal(crate::deprecations::DeprecationError),
     AuxiliaryJournal(crate::aux_recursors::AuxRecursorError),
     ResourceLimit,
     /// Private inspection stopped at a source boundary; never an admitted declaration.
@@ -442,6 +448,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
             Self::ProtectedJournal(error) => write!(f, "{error}"),
+            Self::DeprecationJournal(error) => write!(f, "{error}"),
             Self::AuxiliaryJournal(error) => write!(f, "{error}"),
             Self::ObservationComplete => {
                 write!(f, "source observation completed without admission")
@@ -654,6 +661,15 @@ struct Context {
     // Only explicitly generated/imported auxiliary declarations receive the
     // pin's eliminator elaboration; a declaration's suffix is insufficient.
     auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
+    // `@[deprecated]` declarations, re-read on the same terms as the protected set.
+    deprecation_cache: crate::deprecations::DeprecationCache,
+    // Each resolution of a deprecated constant, in elaboration order (`deprecated.rs`). Rollback
+    // restores it with the rest of the context, as the pin's `SavedState.restore` restores the
+    // message log; a completed elaboration publishes it.
+    deprecated_uses: Vec<crate::deprecations::DeprecatedUse>,
+    // The pin's `Term.Context.checkDeprecated`: off in the header and body of a declaration that
+    // is itself `@[deprecated]` (`withDeprecationContextFromAttrs`).
+    check_deprecated: bool,
     // Registered simp rules' discrimination keys, shared by speculative snapshots.
     simp_key_cache: tactics::SimpKeyCache,
     // The declaration being elaborated, when it is `protected`.
@@ -787,6 +803,9 @@ impl Context {
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
             auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
+            deprecation_cache: crate::deprecations::DeprecationCache::default(),
+            deprecated_uses: Vec::new(),
+            check_deprecated: true,
             simp_key_cache: tactics::SimpKeyCache::default(),
             protected_declaration: None,
             refinements: Vec::new(),
@@ -1143,7 +1162,7 @@ impl Context {
             // A template's name (macro-scoped) is a global once its scopes are erased, unless a
             // prefix of it, with its scopes, names a local the template bound.
             let hygienic = name.has_macro_scopes();
-            if hygienic && let Some(term) = self.hygienic_record_field(name, expected)? {
+            if hygienic && let Some(term) = self.hygienic_record_field(name, expected, syntax)? {
                 return Ok(term);
             }
             let resolved = self
@@ -1196,7 +1215,7 @@ impl Context {
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
-                if let Some(term) = self.qualified_record_field(name, expected)? {
+                if let Some(term) = self.qualified_record_field(name, expected, Some(syntax))? {
                     return Ok(term);
                 }
                 if name == &Name::from_components(["true"]) {
@@ -1206,6 +1225,7 @@ impl Context {
                     resolved = Name::from_components(["Bool", "false"]);
                 }
             }
+            self.note_deprecated(&resolved, deprecated::syntax_span(syntax))?;
             return self.constant(&resolved);
         }
         let value = elaborate_atom(syntax, &[], true, Some(&self.txn.env))?;
@@ -1904,7 +1924,8 @@ impl Context {
             Noindex,
             /// `↑e`'s value, made to have the expected type.
             Coerced(Option<Expr>),
-            Projection(Name, &'a [Syntax], Option<Expr>, bool, bool),
+            /// A field path, the syntax it is spelled at the end of, the arguments.
+            Projection(Name, &'a Syntax, &'a [Syntax], Option<Expr>, bool, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -2492,6 +2513,18 @@ impl Context {
                                     tasks.push(Task::Visit(first, None, true));
                                     continue;
                                 }
+                                // The pin's first elaboration of a pattern matrix's atomic
+                                // discriminants (`deprecated.rs`), then its first input.
+                                if kind == &parser_kind(&["Term", deprecated::RECHECK]) {
+                                    let [identifiers, value] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let identifiers =
+                                        expect_null_args(identifiers, "rechecked discriminants")?;
+                                    self.recheck_identifiers(identifiers)?;
+                                    tasks.push(Task::Visit(value, expected, finish));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "match"])
                                     || kind == &parser_kind(&["Term", "matchMatrix"])
                                     || kind == &parser_kind(&["Term", "ifThenElse"])
@@ -2499,6 +2532,7 @@ impl Context {
                                     || kind == &Name::from_components(["termDepIfThenElse"])
                                 {
                                     let parts = self.match_parts(syntax)?;
+                                    self.recheck_written_discriminant(&parts)?;
                                     let discriminant = parts.discriminant;
                                     tasks.push(Task::MatchDiscriminant(parts, expected));
                                     tasks.push(Task::Visit(discriminant, None, true));
@@ -2553,7 +2587,7 @@ impl Context {
                                         "pipeline projection arguments",
                                     )?;
                                     tasks.push(Task::Projection(
-                                        field, arguments, expected, false, finish,
+                                        field, &parts[2], arguments, expected, false, finish,
                                     ));
                                     tasks.push(Task::Visit(&parts[0], None, true));
                                     continue;
@@ -2564,6 +2598,7 @@ impl Context {
                                     let field = record_terms::projection_field(&parts[2])?;
                                     tasks.push(Task::Projection(
                                         field,
+                                        &parts[2],
                                         &[],
                                         expected,
                                         false,
@@ -3070,7 +3105,7 @@ impl Context {
                                 term
                             });
                         }
-                        Task::Projection(field, arguments, expected, explicit, finish) => {
+                        Task::Projection(field, at, arguments, expected, explicit, finish) => {
                             let receiver = values.pop().expect("receiver precedes projection");
                             // `x.f ..` has no arguments to process: `hasArgs` counts positional
                             // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
@@ -3079,6 +3114,7 @@ impl Context {
                                 receiver,
                                 &field,
                                 !arguments.iter().all(application::is_ellipsis),
+                                Some(at),
                             )? {
                                 record_terms::FieldResolution::Value(term)
                                     if arguments.is_empty() =>
@@ -3534,16 +3570,20 @@ impl Context {
                                 }
                             };
                             match receiver {
-                                Some(record_terms::FieldReceiver::Syntax(receiver, field)) => {
+                                Some(record_terms::FieldReceiver::Syntax(receiver, field, at)) => {
                                     tasks.push(Task::Projection(
-                                        field, arguments, expected, explicit, true,
+                                        field, at, arguments, expected, explicit, true,
                                     ));
                                     tasks.push(Task::Visit(receiver, None, true));
                                 }
-                                Some(record_terms::FieldReceiver::Elaborated(receiver, field)) => {
+                                Some(record_terms::FieldReceiver::Elaborated(
+                                    receiver,
+                                    field,
+                                    at,
+                                )) => {
                                     values.push(receiver);
                                     tasks.push(Task::Projection(
-                                        field, arguments, expected, explicit, true,
+                                        field, at, arguments, expected, explicit, true,
                                     ));
                                 }
                                 // `.c a b`: the head resolves against the expected type
@@ -5236,7 +5276,23 @@ fn definition_in_context(
     definition_in_context_named(syntax, context, None)
 }
 
+/// [`definition_elaboration`], with the pin's deprecation context: a declaration that is itself
+/// `@[deprecated]` reports no deprecated constant in its header or body
+/// (`withDeprecationContextFromAttrs`). The uses of a completed elaboration are published.
 fn definition_in_context_named(
+    syntax: &Syntax,
+    context: &mut Context,
+    generated_name: Option<Name>,
+) -> Result<Declaration, NatDefinitionElabError> {
+    if deprecated::deprecated_registration(syntax)?.is_some() {
+        context.check_deprecated = false;
+    }
+    let declaration = definition_elaboration(syntax, context, generated_name)?;
+    context.publish_deprecated_uses()?;
+    Ok(declaration)
+}
+
+fn definition_elaboration(
     syntax: &Syntax,
     context: &mut Context,
     generated_name: Option<Name>,
@@ -6105,7 +6161,19 @@ fn query_in(
     ))
 }
 
+/// [`query_elaboration`], whose completed elaboration publishes its deprecated uses.
 fn query_term(
+    syntax: &Syntax,
+    name: &Name,
+    context: &mut Context,
+    evaluate: bool,
+) -> Result<(Typed, Vec<Name>, Vec<usize>), NatDefinitionElabError> {
+    let query = query_elaboration(syntax, name, context, evaluate)?;
+    context.publish_deprecated_uses()?;
+    Ok(query)
+}
+
+fn query_elaboration(
     syntax: &Syntax,
     name: &Name,
     context: &mut Context,
@@ -6289,7 +6357,22 @@ fn query_term(
             &parts[1]
         }
     };
-    let mut term = context.term(argument, None)?;
+    // `#print c` and `#check c` name a global constant without elaborating it
+    // (`realizeGlobalConstWithInfos`, `elabCheckCore`), so they check no deprecation.
+    let names_constant = printed.is_some()
+        || (!evaluate
+            && matches!(argument, Syntax::Ident { val, .. }
+                if context.txn.lctx.find_by_user_name(val).is_none()
+                    && context
+                        .resolve_source_name(val)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|name| context.txn.env.contains(&name))));
+    let check_deprecated = context.check_deprecated;
+    context.check_deprecated = check_deprecated && !names_constant;
+    let term = context.term(argument, None);
+    context.check_deprecated = check_deprecated;
+    let mut term = term?;
     if evaluate {
         let (head, explicit) = context.explicit_application_head(argument)?;
         if !explicit

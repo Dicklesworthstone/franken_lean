@@ -113,6 +113,9 @@ pub struct SourceMetadataReport {
     pub pp_anonymous_constructor: usize,
     pub pp_nodot: usize,
     pub app_unexpanders: usize,
+    /// `@[deprecated]` entries on this module's own declarations (the pin's `deprecatedAttr`),
+    /// which name resolution reports from.
+    pub deprecations: usize,
     /// Unsupported scope, phase or proof forms; also named in `uninterpreted`.
     pub deferred_simps: usize,
     pub uninterpreted: Vec<Name>,
@@ -355,6 +358,7 @@ impl Engine {
                 Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
                 Name::from_components(metadata::INLINE_EXTENSION.split('.')),
                 metadata::namespace_extension_name(),
+                Name::from_components(metadata::DEPRECATED_EXTENSION.split('.')),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -404,6 +408,7 @@ impl Engine {
                 pp_anonymous_constructor: 0,
                 pp_nodot: 0,
                 app_unexpanders: 0,
+                deprecations: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -453,6 +458,7 @@ impl Engine {
                         17 => report.app_unexpanders = entries.len(),
                         18 => report.inline = entries.len(),
                         19 => report.namespaces = entries.len(),
+                        20 => report.deprecations = entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -492,6 +498,7 @@ impl Engine {
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
         let mut pp_nodot = decoded.pp_nodot.into_iter();
         let mut app_unexpanders = decoded.app_unexpanders.into_iter();
+        let mut deprecations = decoded.deprecations.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
@@ -762,6 +769,56 @@ impl Engine {
                             }
                         })?;
             }
+            if report.deprecations != 0 {
+                cancelled!("source-olean/deprecations");
+                let entries: Vec<_> = deprecations
+                    .by_ref()
+                    .take(report.deprecations)
+                    .map(|entry| fln_elab::deprecations::Deprecation {
+                        declaration: entry.declaration,
+                        new_name: entry.new_name,
+                        text: entry.text,
+                        since: entry.since,
+                    })
+                    .collect();
+                if entries.len() != report.deprecations {
+                    return Err(SourceOleanImportError::Internal(
+                        "deprecation count changed during decode",
+                    ));
+                }
+                // `ParametricAttribute.setParam` sets a parameter only on the module's own
+                // declaration.
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    entries.len(),
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for entry in &entries {
+                    cancelled!("source-olean/deprecation-owner");
+                    owners.validate(
+                        activation.environment(),
+                        &report.module,
+                        &entry.declaration,
+                    )?;
+                }
+                activation = activation
+                    .register_deprecations(&entries)
+                    .map_err(|error| {
+                        let declaration = match &error {
+                            fln_elab::deprecations::DeprecationError::UnknownDeclaration(name)
+                            | fln_elab::deprecations::DeprecationError::Duplicate(name) => {
+                                name.clone()
+                            }
+                            _ => report.module.clone(),
+                        };
+                        SourceOleanImportError::Metadata {
+                            module: report.module.clone(),
+                            declaration,
+                            reason: "a deprecation cannot be recorded",
+                        }
+                    })?;
+            }
             if report.noncomputable != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -1025,6 +1082,7 @@ impl Engine {
             || pp_anonymous_constructor.next().is_some()
             || pp_nodot.next().is_some()
             || app_unexpanders.next().is_some()
+            || deprecations.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
@@ -1178,6 +1236,10 @@ trait Registrar: Sized {
         self,
         tags: &[fln_elab::delaborator_tags::DelaboratorTag],
     ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError>;
+    fn register_deprecations(
+        self,
+        entries: &[fln_elab::deprecations::Deprecation],
+    ) -> std::result::Result<Self, fln_elab::deprecations::DeprecationError>;
     fn register_noncomputable(
         self,
         declaration: &Name,
@@ -1270,6 +1332,12 @@ impl Registrar for instances::imported::ImportActivation {
         tags: &[fln_elab::delaborator_tags::DelaboratorTag],
     ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
         self.register_delaborator_tags(tags)
+    }
+    fn register_deprecations(
+        self,
+        entries: &[fln_elab::deprecations::Deprecation],
+    ) -> std::result::Result<Self, fln_elab::deprecations::DeprecationError> {
+        self.register_deprecations(entries)
     }
     fn register_noncomputable(
         self,
@@ -1973,6 +2041,12 @@ pub(super) mod tests {
             tags: &[fln_elab::delaborator_tags::DelaboratorTag],
         ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
             fln_elab::delaborator_tags::register_module(&self.0, tags).map(Sequential)
+        }
+        fn register_deprecations(
+            self,
+            entries: &[fln_elab::deprecations::Deprecation],
+        ) -> std::result::Result<Self, fln_elab::deprecations::DeprecationError> {
+            fln_elab::deprecations::register_module(&self.0, entries).map(Sequential)
         }
         fn register_noncomputable(
             self,

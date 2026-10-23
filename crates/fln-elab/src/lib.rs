@@ -28,6 +28,7 @@ pub mod constraint;
 pub mod dataflow;
 pub mod decision;
 pub mod delaborator_tags;
+pub mod deprecations;
 pub mod effects;
 pub mod externs;
 pub mod implemented_by;

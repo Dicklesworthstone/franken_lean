@@ -796,6 +796,17 @@ impl Engine {
                         tag_executable(&batch.engine, &admitted.declaration, scope, &executable)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
+                if let Some(declared) = batch
+                    .admissions
+                    .first()
+                    .and_then(|admitted| declared_name(&admitted.declaration))
+                    .cloned()
+                    && let Some(environment) =
+                        tag_deprecated(&batch.engine, syntax, &declared, scope, limits.kernel)?
+                {
+                    batch.engine.environment = environment;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
                 return self.finish_local_function_batch(batch, &local_functions, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -1336,6 +1347,46 @@ pub(crate) fn tag_protected(
                 ),
             ))
         })
+}
+
+/// Record an admitted declaration's `@[deprecated …]` in the deprecation journal, after the
+/// council admitted it, as the pin's `deprecatedAttr` sets its parameter after type checking:
+/// later commands report the declaration's uses. `declared` is the admitted declaration, and its
+/// replacement resolves in its namespace. `None` when the command carries no such attribute. A
+/// refusal is the command's.
+pub(crate) fn tag_deprecated(
+    engine: &Engine,
+    syntax: &fln_syntax::tree::Syntax,
+    declared: &Name,
+    scope: &fln_elab::source::scope::SourceScope,
+    kernel: Budget,
+) -> Result<Option<Environment>, EngineExecutionError> {
+    let frontend =
+        |error| EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(error));
+    let Some(entry) =
+        fln_elab::source::deprecation_entry(syntax, declared, engine.environment(), kernel, scope)
+            .map_err(frontend)?
+    else {
+        return Ok(None);
+    };
+    fln_elab::deprecations::register_module(engine.environment(), &[entry])
+        .map(Some)
+        .map_err(|error| {
+            frontend(fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::DeprecationJournal(error),
+            ))
+        })
+}
+
+/// The admitted declaration a single-declaration command names, which its attributes describe.
+pub(crate) fn declared_name(declaration: &Declaration) -> Option<&Name> {
+    match declaration {
+        Declaration::Defn(value) => Some(&value.base.name),
+        Declaration::Thm(value) => Some(&value.base.name),
+        Declaration::Opaque(value) => Some(&value.base.name),
+        Declaration::Axiom(value) => Some(&value.base.name),
+        _ => None,
+    }
 }
 
 /// Bind a source noncomputable request to the declaration that just passed the council.

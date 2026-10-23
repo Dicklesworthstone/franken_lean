@@ -382,6 +382,8 @@ fn elaborate_command(
                 ))));
             }
         }
+        // The `variable` command's own elaboration, not a declaration's re-reading of it.
+        context.publish_deprecated_uses()?;
     }
     let mut lctx = LocalContext::new();
     for local in locals {

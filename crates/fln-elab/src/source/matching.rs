@@ -351,6 +351,48 @@ impl Context {
         })
     }
 
+    /// [`Self::recheck_identifiers`] for a single-discriminant `match` as written, before its
+    /// discriminant elaborates.
+    pub(super) fn recheck_written_discriminant(
+        &mut self,
+        parts: &MatchParts<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if !parts.written
+            || parts.generated
+            || parts.conditional.is_some()
+            || self.simple_match(parts.alternatives)
+        {
+            return Ok(());
+        }
+        self.recheck_identifiers(std::slice::from_ref(parts.discriminant))
+    }
+
+    /// `match d with | y => e` with `y` a pattern variable, which the pin elaborates as
+    /// `let y := d; e`, elaborating `d` once (`expandSimpleMatch`; `isPatternVar`: an
+    /// identifier naming no constructor).
+    pub(super) fn simple_match(&mut self, alternatives: &[Syntax]) -> bool {
+        let [alternative] = alternatives else {
+            return false;
+        };
+        let Syntax::Node { args, .. } = alternative else {
+            return false;
+        };
+        let Some(Syntax::Node { args: rows, .. }) = args.get(1) else {
+            return false;
+        };
+        let [Syntax::Node { args: row, .. }] = rows.as_slice() else {
+            return false;
+        };
+        let [Syntax::Ident { val, .. }] = row.as_slice() else {
+            return false;
+        };
+        let resolved = self.resolve_source_name(val).ok().flatten();
+        let constructor = resolved
+            .as_ref()
+            .is_some_and(|name| matches!(self.txn.env.find(name), Some(ConstantInfo::Ctor(_))));
+        !constructor && (val.parent().is_anonymous() || resolved.is_some())
+    }
+
     pub(super) fn match_apply(
         &mut self,
         mut function: Typed,

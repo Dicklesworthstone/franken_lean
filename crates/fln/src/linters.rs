@@ -327,3 +327,91 @@ pub(crate) fn class_definition_reducibility(
         ),
     })
 }
+
+/// The pin's `Linter.checkDeprecated` warning for a use of `constant` (vendored
+/// `Lean/Linter/Deprecated.lean:62-92`), named as the use's `scope` names constants: the
+/// entry's text, or its replacement with the notes on a different type, a different namespace
+/// or a protected replacement. `None` when `constant` is not deprecated in `environment`. A
+/// journal that cannot be read, or a type this printer cannot print, is a refusal, never a
+/// shorter message.
+pub(crate) fn deprecation_message(
+    environment: &fln_env::environment::Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    constant: &Name,
+    kernel: crate::Budget,
+) -> Result<Option<String>, &'static str> {
+    let deprecations = fln_elab::deprecations::Deprecations::read(environment)
+        .map_err(|_| "a readable deprecation journal")?;
+    let Some(entry) = deprecations.get(constant) else {
+        return Ok(None);
+    };
+    let mut printer = crate::pretty::Printer::in_scope(environment, scope);
+    let mut message = format!("`{}` has been deprecated", printer.full_name(constant));
+    let new_name = match (&entry.text, &entry.new_name) {
+        (Some(text), _) => {
+            message.push_str(": ");
+            message.push_str(text);
+            return Ok(Some(message));
+        }
+        (None, None) => return Ok(Some(message)),
+        (None, Some(new_name)) => new_name,
+    };
+    message.push_str(&format!(": Use `{}` instead", printer.full_name(new_name)));
+    let (Some(old), Some(new)) = (environment.find(constant), environment.find(new_name)) else {
+        return Ok(Some(message));
+    };
+    let (old_type, new_type) = (&old.constant_val().type_, &new.constant_val().type_);
+    if !fln_elab::source::reducibly_same_type(environment, old_type, new_type, kernel) {
+        let updated = printer
+            .indented(new_type)
+            .map_err(|crate::pretty::Unsupported(reason)| reason)?;
+        let original = printer
+            .indented(old_type)
+            .map_err(|crate::pretty::Unsupported(reason)| reason)?;
+        message.push_str(&format!(
+            "\n\nNote: The updated constant has a different type:{updated}\ninstead of{original}"
+        ));
+    }
+    let (old_prefix, new_prefix) = (constant.parent(), new_name.parent());
+    if old_prefix.is_anonymous() {
+        return Ok(Some(message));
+    }
+    // The namespace, then visibility, exclusively and in this order.
+    if old_prefix != new_prefix {
+        let example = match constant.leaf_view() {
+            fln_core::name::LeafView::Str(root) => format!(
+                " (e.g., from `x.{root}` to `{} x`)",
+                printer.display_name(new_name)
+            ),
+            _ => String::new(),
+        };
+        message.push_str(&format!(
+            "\n\nNote: The updated constant is in a different namespace. Dot notation may need to be changed{example}."
+        ));
+    } else {
+        let protected = fln_elab::protected_names::ProtectedNames::read(environment)
+            .map_err(|_| "a readable protected-declaration journal")?;
+        if !protected.contains(constant) && protected.contains(new_name) {
+            // `componentsRev`: the prefix's last component first.
+            let last = match new_prefix.leaf_view() {
+                fln_core::name::LeafView::Str(text) => Name::from_components([text]),
+                fln_core::name::LeafView::Num(value) => Name::num(Name::anonymous(), value),
+                fln_core::name::LeafView::Anonymous => Name::anonymous(),
+            };
+            let qualifier = if new_prefix.parent().is_anonymous() {
+                String::new()
+            } else {
+                format!(
+                    "at least the last component `{}` of ",
+                    crate::pretty::message_name(&last)
+                )
+            };
+            message.push_str(&format!(
+                "\n\nNote: `{}` is protected. References to this constant must include {qualifier}its prefix `{}` even when inside its namespace.",
+                printer.full_name(new_name),
+                crate::pretty::message_name(&new_prefix)
+            ));
+        }
+    }
+    Ok(Some(message))
+}

@@ -119,9 +119,11 @@ pub(super) enum FieldResolution {
     },
 }
 
+/// A field application's receiver and its field path, with the syntax the path is spelled at
+/// the end of (the field, or the whole dotted identifier), where a deprecated method is reported.
 pub(super) enum FieldReceiver<'a> {
-    Syntax(&'a Syntax, Name),
-    Elaborated(Typed, Name),
+    Syntax(&'a Syntax, Name, &'a Syntax),
+    Elaborated(Typed, Name, &'a Syntax),
 }
 
 /// Field methods are syntax sugar for a checked lambda. A field's result
@@ -237,12 +239,13 @@ impl Context {
             return Ok(Some(FieldReceiver::Syntax(
                 &parts[0],
                 projection_field(&parts[2])?,
+                &parts[2],
             )));
         }
         if let Syntax::Ident { val: name, .. } = syntax
-            && let Some((receiver, path)) = self.qualified_field_receiver(name)?
+            && let Some((receiver, path)) = self.qualified_field_receiver_at(name, Some(syntax))?
         {
-            return Ok(Some(FieldReceiver::Elaborated(receiver, path)));
+            return Ok(Some(FieldReceiver::Elaborated(receiver, path, syntax)));
         }
         Ok(None)
     }
@@ -252,11 +255,12 @@ impl Context {
         &mut self,
         name: &Name,
         expected: Option<&Expr>,
+        at: Option<&Syntax>,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        let Some((receiver, path)) = self.qualified_field_receiver(name)? else {
+        let Some((receiver, path)) = self.qualified_field_receiver_at(name, at)? else {
             return Ok(None);
         };
-        let field = self.resolve_field_path(receiver, &path, false)?;
+        let field = self.resolve_field_path(receiver, &path, false, at)?;
         Ok(Some(self.field_value(field, expected)?))
     }
 
@@ -268,6 +272,7 @@ impl Context {
         &mut self,
         name: &Name,
         expected: Option<&Expr>,
+        at: &Syntax,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let Ok(view) = fln_syntax::hygiene::extract_macro_scopes(name) else {
             return Ok(None);
@@ -311,7 +316,7 @@ impl Context {
                 .iter()
                 .rev()
                 .fold(Name::anonymous(), |path, part| path.append_core(part));
-            let field = self.resolve_field_path(receiver, &path, false)?;
+            let field = self.resolve_field_path(receiver, &path, false, Some(at))?;
             return Ok(Some(self.field_value(field, expected)?));
         }
         Ok(None)
@@ -319,9 +324,21 @@ impl Context {
 
     /// Splitting is reserved for identifiers that did not resolve as a whole.
     /// This preserves exact constants, local shadowing and escaped components.
+    #[cfg(test)]
     pub(super) fn qualified_field_receiver(
         &mut self,
         name: &Name,
+    ) -> Result<Option<(Typed, Name)>, NatDefinitionElabError> {
+        self.qualified_field_receiver_at(name, None)
+    }
+
+    /// [`Self::qualified_field_receiver`] for the identifier `at`: a receiver that is a constant
+    /// is a resolution the pin checks for deprecation (`elabAppFnResolutions`), at the
+    /// identifier's leading components (`identComponents`).
+    pub(super) fn qualified_field_receiver_at(
+        &mut self,
+        name: &Name,
+        at: Option<&Syntax>,
     ) -> Result<Option<(Typed, Name)>, NatDefinitionElabError> {
         if self.txn.lctx.find_by_user_name(name).is_some()
             || self.resolve_source_name(name)?.is_some()
@@ -361,6 +378,13 @@ impl Context {
             } else if let Some(resolved) = self.resolve_source_name(&prefix)?
                 && self.txn.env.contains(&resolved)
             {
+                let spans = super::deprecated::field_spans(at, name);
+                let head = spans
+                    .len()
+                    .checked_sub(suffix.len() + 1)
+                    .and_then(|last| spans.first().copied().flatten().zip(spans[last]))
+                    .map(|((start, _), (_, end))| (start, end));
+                self.note_deprecated(&resolved, head)?;
                 Some(self.constant(&resolved)?)
             } else {
                 None
@@ -381,43 +405,55 @@ impl Context {
         Ok(None)
     }
 
+    /// `at` is the syntax `path` is spelled at the end of, which places each field
+    /// ([`super::deprecated::field_spans`]).
     pub(super) fn resolve_field_path(
         &mut self,
         mut receiver: Typed,
         path: &Name,
         has_arguments: bool,
+        at: Option<&Syntax>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
         if let LeafView::Num(index) = path.leaf_view()
             && path.parent().is_anonymous()
         {
             let field = self.indexed_field(receiver.clone(), index)?;
-            return self.resolve_field(receiver, &field, has_arguments);
+            return self.resolve_field(receiver, &field, has_arguments, None);
         }
         let parts = scope::components(path).map_err(|_| failure(SourceInferenceError::Scope))?;
+        let spans = super::deprecated::field_spans(at, path);
         let Some((last, prefix)) = parts.split_last() else {
             return Err(failure(SourceInferenceError::Scope));
         };
-        for part in prefix {
+        for (index, part) in prefix.iter().enumerate() {
             self.tick()?;
-            let field =
-                self.resolve_field(receiver, &Name::from_components([part.as_str()]), false)?;
+            let field = self.resolve_field(
+                receiver,
+                &Name::from_components([part.as_str()]),
+                false,
+                spans.get(index).copied().flatten(),
+            )?;
             receiver = self.field_value(field, None)?;
         }
         self.resolve_field(
             receiver,
             &Name::from_components([last.as_str()]),
             has_arguments,
+            spans.last().copied().flatten(),
         )
     }
 
     /// Real fields retain priority over methods. A failed candidate cannot
     /// leak implicit assignments or instance choices into a method lookup.
     /// Non-lookup errors, including resource stops, are never swallowed.
+    /// `span` is the field's, where a deprecated method is reported (`LValResolution.const`'s
+    /// `withRef lval.getRef <| mkConst`).
     fn resolve_field(
         &mut self,
         mut receiver: Typed,
         field: &Name,
         has_arguments: bool,
+        span: Option<(usize, usize)>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
         self.flush(false)?;
         self.resolve_instances(false)?;
@@ -584,6 +620,7 @@ impl Context {
                 &protected,
             ) {
                 Ok(Some(method)) => {
+                    self.note_deprecated(&method, span)?;
                     return Ok(FieldResolution::Method {
                         function: self.constant(&method)?,
                         receiver,

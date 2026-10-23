@@ -18,11 +18,13 @@ use std::collections::BTreeSet;
 
 pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
-    CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, EXTERN_EXTENSION,
+    CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION, EXTERN_EXTENSION,
     IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
     REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
+mod deprecations;
+pub use deprecations::DeprecationEntry;
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
 mod simp;
@@ -206,6 +208,8 @@ pub struct SourceExtensions {
     pub pp_nodot: Vec<Name>,
     /// `@[app_unexpander]` registrations, in journal order.
     pub app_unexpanders: Vec<AppUnexpanderEntry>,
+    /// `@[deprecated]` registrations (the pin's `deprecatedAttr`), in journal order.
+    pub deprecations: Vec<DeprecationEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
     pub uninterpreted: Vec<Name>,
 }
@@ -564,6 +568,7 @@ pub fn decode(
         name(format::APP_UNEXPANDER_EXTENSION),
         name(format::INLINE_EXTENSION),
         namespace_extension_name(),
+        name(format::DEPRECATED_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -584,6 +589,7 @@ pub fn decode(
     let mut pp_nodot = BTreeSet::new();
     let mut structures = BTreeSet::new();
     let mut inline = BTreeSet::new();
+    let mut deprecated = BTreeSet::new();
     for block in blocks {
         if !seen.insert(block.name.clone()) {
             return Err(shape("duplicate extension block"));
@@ -716,7 +722,16 @@ pub fn decode(
                     // module windows intact; activation performs set lookup.
                     out.namespaces.push(namespace);
                 }
-                _ => unreachable!("twenty-one selected extension families"),
+                21 => {
+                    // `ParametricAttribute.setParam` refuses a second parameter for a
+                    // declaration, so a repeat is malformed.
+                    let entry = reader.deprecation(&obj)?;
+                    if !deprecated.insert(entry.declaration.clone()) {
+                        return Err(shape("declaration deprecated twice"));
+                    }
+                    out.deprecations.push(entry);
+                }
+                _ => unreachable!("twenty-two selected extension families"),
             }
         }
     }

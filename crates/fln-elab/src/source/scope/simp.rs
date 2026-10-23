@@ -354,6 +354,10 @@ pub fn registration(
         if reducibility_attribute(attribute)?.is_some() {
             continue;
         }
+        // Recorded once the declaration is admitted (`deprecated_registration`).
+        if super::super::deprecated::deprecated_attribute(attribute)?.is_some() {
+            continue;
+        }
         if simp.replace(attribute).is_some() {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "one simp attribute beside exposure attributes",

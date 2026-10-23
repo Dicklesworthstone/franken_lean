@@ -26,6 +26,7 @@
 //! src/Lean/Compiler/InlineAttrs.lean: sha256 a3599016d38e2128d6c1f3cc384a544540b33db1288221754700da42c7e7d01c
 //! src/Lean/Namespace.lean: sha256 2c57f58257d03fa961507c1cf7896dfdf15d22b47a8c3689d3bbaf0db09eab61
 //! stage0/stdlib/Lean/Namespace.c: sha256 8cf4f058beba378edd817ea2c953ce79b3219753a752392ae13544d95adcd528
+//! src/Lean/Linter/Deprecated.lean: sha256 a7f8f0d92b58d79b3b028eaeaad9f433f791a34517597f55654e7f5605b37c57
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -81,6 +82,12 @@ pub const STRUCTURE_FIELD_INFO: usize = 2;
 pub const STRUCTURE_PARENT_INFO: usize = 3;
 pub const STRUCTURE_POINTERS: usize = 4;
 pub const STRUCTURE_SCALAR_BYTES: usize = 0;
+
+pub const DEPRECATION_NEW_NAME_OPTION: usize = 0;
+pub const DEPRECATION_TEXT_OPTION: usize = 1;
+pub const DEPRECATION_SINCE_OPTION: usize = 2;
+pub const DEPRECATION_POINTERS: usize = 3;
+pub const DEPRECATION_SCALAR_BYTES: usize = 0;
 
 pub const SCOPE_GLOBAL: u8 = 0;
 pub const SCOPE_SCOPED: u8 = 1;
@@ -154,6 +161,11 @@ pub const INLINE_NOINLINE: usize = 1;
 pub const INLINE_MACRO_INLINE: usize = 2;
 pub const INLINE_INLINE_IF_REDUCE: usize = 3;
 pub const INLINE_ALWAYS_INLINE: usize = 4;
+pub const DEPRECATED_EXTENSION: &str = "Lean.Linter.deprecatedAttr";
+pub const OPTION_NONE: usize = 0;
+pub const OPTION_SOME: u8 = 1;
+pub const OPTION_SOME_VAL: usize = 0;
+pub const OPTION_SOME_POINTERS: usize = 1;
 pub const LIST_NIL: u8 = 0;
 pub const LIST_CONS: u8 = 1;
 pub const LIST_CONS_HEAD: usize = 0;

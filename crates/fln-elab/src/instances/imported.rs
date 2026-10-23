@@ -617,6 +617,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record one imported module's `@[deprecated]` entries. This journal, which name
+    /// resolution reports from, does not affect the kept class or instance state.
+    pub fn register_deprecations(
+        mut self,
+        entries: &[crate::deprecations::Deprecation],
+    ) -> Result<Self, crate::deprecations::DeprecationError> {
+        self.env = crate::deprecations::register_module(&self.env, entries)?;
+        Ok(self)
+    }
+
     /// Record a checked owning module's noncomputable tag. This changes no
     /// instance candidate or cached typeclass metadata.
     pub fn register_noncomputable(

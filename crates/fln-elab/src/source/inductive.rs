@@ -772,6 +772,7 @@ pub(super) fn elaborate_inductive_scoped(
         constructors,
         result_level,
     };
+    context.publish_deprecated_uses()?;
     // A field nesting the family under another inductive (`List T`) is built through the
     // kernel's nested translation, which the ordinary single-family builder refuses.
     if let Some(declaration) = crate::inductive::nested_inductive_declaration(

@@ -813,7 +813,7 @@ impl<'a> Printer<'a> {
     /// A constant by its whole name, as `#check c`'s signature heads it. The pin's
     /// `unresolveNameGlobal` with `fullNames` (vendored `Lean/ResolveName.lean`): a whole
     /// name that resolves to another declaration in this scope is `_root_.`-qualified.
-    fn full_name(&self, name: &Name) -> String {
+    pub(crate) fn full_name(&self, name: &Name) -> String {
         let Some(scope) = self.scope else {
             return escaped_name(name);
         };
@@ -953,6 +953,12 @@ impl<'a> Printer<'a> {
     /// `e` as the pin prints it in a message, broken at the pin's width.
     pub fn expr(&mut self, e: &Expr, outer: u32) -> Printed {
         self.doc(e, outer).map(|doc| doc.pretty(WIDTH))
+    }
+
+    /// `indentExpr e` (vendored `src/Lean/Message.lean`): `e` on its own line, nested by two.
+    pub(crate) fn indented(&mut self, e: &Expr) -> Printed {
+        self.doc(e, 0)
+            .map(|doc| Format::Line.then(doc).nest(2).pretty(WIDTH))
     }
 
     /// `#check e`'s line for a term that is not a constant: `e : type` (`m!"{e} : {type}"`,

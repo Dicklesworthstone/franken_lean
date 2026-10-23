@@ -738,3 +738,104 @@ fn real_notation_extra_decodes_its_app_unexpanders() {
         .unwrap();
     assert_eq!(prod.declaration, n("unexpandProdMk"));
 }
+
+/// The pinned `Init.Core` deprecates `Subtype.eq` and `PUnit.subsingleton` in favour of a new
+/// name, and the in-kernel reduction constants with a message (vendored `src/Init/Core.lean`):
+/// each is one `deprecatedAttr` entry, `(declaration, DeprecationEntry)`.
+#[test]
+fn real_core_decodes_its_deprecations() {
+    let lib = match std::env::var("FLN_REFERENCE_LIB") {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => match std::env::var("HOME") {
+            Ok(home) => std::path::PathBuf::from(home)
+                .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean"),
+            Err(_) => return,
+        },
+    };
+    let path = lib.join("Init/Core.olean");
+    let Ok(public) = std::fs::read(&path) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference library is required"
+        );
+        eprintln!("SKIP: pinned Reference lib/lean absent");
+        return;
+    };
+    let server = std::fs::read(path.with_extension("olean.server")).unwrap();
+    let private = std::fs::read(path.with_extension("olean.private")).unwrap();
+    let blocks = OleanView::parse_with_dependencies(&private, &[&public, &server])
+        .unwrap()
+        .extension_payloads(WalkBudget::default(), 32 << 20)
+        .unwrap();
+    let decoded = read(&blocks).unwrap();
+    let find = |declaration: &str| {
+        decoded
+            .deprecations
+            .iter()
+            .find(|entry| entry.declaration == n(declaration))
+            .unwrap_or_else(|| panic!("{declaration}: {:?}", decoded.deprecations))
+    };
+    let renamed = find("Subtype.eq");
+    assert_eq!(renamed.new_name, Some(n("Subtype.ext")));
+    assert_eq!(renamed.text, None);
+    assert_eq!(renamed.since.as_deref(), Some("2025-10-26"));
+    assert_eq!(find("PUnit.subsingleton").new_name, Some(n("PUnit.ext")));
+    for declaration in ["Lean.reduceBool", "Lean.reduceNat", "Lean.trustCompiler"] {
+        let entry = find(declaration);
+        assert_eq!(entry.new_name, None, "{declaration}");
+        assert_eq!(
+            entry.text.as_deref(),
+            Some(
+                "in-kernel native reduction is deprecated; assert native evaluations with axioms instead"
+            ),
+            "{declaration}"
+        );
+        assert_eq!(entry.since.as_deref(), Some("2026-02-01"), "{declaration}");
+    }
+}
+
+/// A deprecation entry is `(Name, DeprecationEntry)` with three `Option` fields; a declaration
+/// deprecated twice, a non-`Option` field and a non-`String` text are refused.
+#[test]
+fn deprecation_entries_decode_their_options_and_forgeries_refuse() {
+    let extension = "Lean.Linter.deprecatedAttr";
+    let some = |value: Obj| Obj::mk_ctor(1, vec![value], &[]);
+    let none = || Obj::mk_nat(0);
+    let pair = |declaration: &str, fields: Vec<Obj>| {
+        Obj::mk_ctor(
+            0,
+            vec![inject_name(&n(declaration)), Obj::mk_ctor(0, fields, &[])],
+            &[],
+        )
+    };
+    let entry = pair(
+        "Old.f",
+        vec![
+            some(inject_name(&n("New.f"))),
+            none(),
+            some(Obj::mk_string("2025-01-01")),
+        ],
+    );
+    let single = one(extension, &entry);
+    let decoded = read(&single).unwrap();
+    assert_eq!(decoded.deprecations.len(), 1);
+    let row = &decoded.deprecations[0];
+    assert_eq!(row.declaration, n("Old.f"));
+    assert_eq!(row.new_name, Some(n("New.f")));
+    assert_eq!(row.text, None);
+    assert_eq!(row.since.as_deref(), Some("2025-01-01"));
+    let mut repeated = single.clone();
+    repeated[0].entries.push(single[0].entries[0].clone());
+    assert!(matches!(read(&repeated), Err(DecodeError::Shape { .. })));
+    for (index, forged) in [
+        pair("Old.g", vec![none(), none()]),
+        pair("Old.g", vec![Obj::mk_nat(2), none(), none()]),
+        pair("Old.g", vec![none(), some(inject_name(&n("text"))), none()]),
+        pair("Old.g", vec![some(Obj::mk_string("New.g")), none(), none()]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(read(&one(extension, &forged)).is_err(), "forgery {index}");
+    }
+}
