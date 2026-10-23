@@ -1248,7 +1248,7 @@ impl Context {
                 else {
                     return Ok(None);
                 };
-                self.rewrite_transport(goal, term, &occurrence, reverse)
+                self.rewrite_transport(goal, term, &occurrence, reverse, false)
                     .map(Some)
             }
         }

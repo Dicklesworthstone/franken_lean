@@ -481,8 +481,18 @@ enum ImplicitInsertion<'a> {
 enum EquationPolicy {
     FinalAdmission,
     BeforeSelection,
+    /// A `rw` occurrence query: the pin's `kabstract` runs `isDefEq` under `Rewrite.Config`,
+    /// reducible transparency with offset constraints (vendored Init/Meta/Defs.lean:1732-1734,
+    /// Lean/Meta/Tactic/Rewrite.lean:47).
+    RewriteSelection,
     AfterSelection,
     DefaultInstance,
+}
+
+impl EquationPolicy {
+    fn selects(self) -> bool {
+        matches!(self, Self::BeforeSelection | Self::RewriteSelection)
+    }
 }
 
 #[derive(Clone)]
@@ -516,6 +526,12 @@ impl SourceEquation {
         Self {
             sides: (left, right),
             policy: EquationPolicy::BeforeSelection,
+        }
+    }
+    fn rewrite_selection(left: Expr, right: Expr) -> Self {
+        Self {
+            sides: (left, right),
+            policy: EquationPolicy::RewriteSelection,
         }
     }
     fn instance_result(left: Expr, right: Expr) -> Self {
@@ -1381,9 +1397,15 @@ impl Context {
         &mut self,
         pairs: &[(Expr, Expr)],
         allow_delta: bool,
+        rewrite: bool,
     ) -> Result<Result<(), UnificationError>, NatDefinitionElabError> {
         let mut budget = UnificationBudget::new(self.kernel);
-        if !allow_delta {
+        if rewrite {
+            // A `rw` occurrence query is the pin's `kabstract` `isDefEq` under
+            // `Rewrite.Config`: reducible transparency, offset constraints on.
+            budget.transparency = UnificationTransparency::Abbreviations;
+            budget.offset_constraints = true;
+        } else if !allow_delta {
             // A selection query (an instance candidate against its goal) is one
             // `isDefEq` at the pin's `instances` transparency (vendored
             // Lean/Meta/SynthInstance.lean `tryResolve`, :356; configured at :879),
@@ -1472,8 +1494,12 @@ impl Context {
             let allow_delta = self
                 .equations
                 .iter()
-                .all(|equation| equation.policy != EquationPolicy::BeforeSelection);
-            let deferred = match self.unify_pending_batch(&pairs, allow_delta)? {
+                .all(|equation| !equation.policy.selects());
+            let rewrite = self
+                .equations
+                .iter()
+                .any(|equation| equation.policy == EquationPolicy::RewriteSelection);
+            let deferred = match self.unify_pending_batch(&pairs, allow_delta, rewrite)? {
                 Ok(()) => {
                     self.equations.clear();
                     return Ok(());
@@ -1489,7 +1515,7 @@ impl Context {
             if self
                 .equations
                 .iter()
-                .any(|equation| equation.policy == EquationPolicy::BeforeSelection)
+                .any(|equation| equation.policy.selects())
             {
                 return if final_pass {
                     Err(failure(SourceInferenceError::Unification(Box::new(
@@ -1524,7 +1550,8 @@ impl Context {
                 }
                 match self.unify_pending_batch(
                     &[(left.clone(), right.clone())],
-                    equation.policy != EquationPolicy::BeforeSelection,
+                    !equation.policy.selects(),
+                    equation.policy == EquationPolicy::RewriteSelection,
                 )? {
                     Ok(()) => {}
                     Err(UnificationError::Deferred(_)) => {

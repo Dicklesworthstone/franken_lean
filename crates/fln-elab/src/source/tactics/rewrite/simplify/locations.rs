@@ -27,7 +27,7 @@ impl Context {
                 else {
                     return Ok(None);
                 };
-                self.rewrite_hypothesis_value(local, term, &occurrence, reverse)
+                self.rewrite_hypothesis_value(local, term, &occurrence, reverse, false)
                     .map(|replacement| Some((replacement, false)))
             }
         }

@@ -17,6 +17,27 @@ enum Occurrences<'a> {
     Admitted(&'a super::simplify::SimpKey),
 }
 
+/// The pin's `HeadIndex` (vendored Lean/HeadIndex.lean:28-36).
+#[derive(PartialEq, Eq)]
+pub(super) enum HeadIndex {
+    Local(FVarId),
+    Hole(MVarId),
+    Constant(Name),
+    Projection(Name, u64),
+    Literal(Literal),
+    Sort,
+    Lambda,
+    Forall,
+}
+
+/// Which subterms `rw` may abstract: the pin's `kabstract` keys.
+enum RewriteKey {
+    /// A local pattern is abstracted exactly where it occurs (`Expr.abstract`).
+    Local(FVarId),
+    /// The head symbol and argument count a candidate must share with the pattern.
+    Head(Option<(HeadIndex, usize)>),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RigidTypeHead {
     Sort,
@@ -239,26 +260,35 @@ impl Context {
         &mut self,
         left: &Expr,
         right: &Expr,
+        rewrite: bool,
     ) -> Result<(), NatDefinitionElabError> {
         self.tick()?;
         let left = self.instantiate(left)?;
         let right = self.instantiate(right)?;
+        let equation = if rewrite {
+            SourceEquation::rewrite_selection
+        } else {
+            SourceEquation::selection
+        };
         if let (Some(a), Some(b)) = (self.known_type(&left)?, self.known_type(&right)?)
             && (a.has_level_mvar() || b.has_level_mvar())
         {
-            self.equations.push(SourceEquation::selection(a, b));
+            self.equations.push(equation(a, b));
         }
-        self.equations.push(SourceEquation::selection(left, right));
+        self.equations.push(equation(left, right));
         Ok(())
     }
 
     /// Match the term and its type in ONE selection-policy transaction. Even
     /// ground equations must be established before a rule can be selected.
+    /// `rewrite` is `rw`'s query, the pin's `kabstract` `isDefEq` under
+    /// `Rewrite.Config` (reducible, offset constraints); otherwise `instances`.
     fn match_rewrite_occurrence(
         &mut self,
         pattern: &Expr,
         alpha: &Expr,
         occurrence: &Expr,
+        rewrite: bool,
     ) -> Result<bool, NatDefinitionElabError> {
         // Sorts, dependent function types and saturated admitted inductives
         // are rigid as terms too. Distinct heads cannot become equal through
@@ -283,8 +313,8 @@ impl Context {
         if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
         }
-        self.queue_rewrite_selection(&type_, alpha)?;
-        self.queue_rewrite_selection(occurrence, pattern)?;
+        self.queue_rewrite_selection(&type_, alpha, rewrite)?;
+        self.queue_rewrite_selection(occurrence, pattern, rewrite)?;
         self.flush(true)?;
         Ok(true)
     }
@@ -585,6 +615,19 @@ impl Context {
         let Some((rule, alpha, pattern, holes, rule_instances)) = prepared? else {
             return Ok(None);
         };
+        // `rw` abstracts like the pin's `kabstract` (vendored Lean/Meta/KAbstract.lean:30-55):
+        // a local pattern only at that local, any other only at a subterm with the pattern's
+        // head symbol and argument count.
+        let key = if inside_out {
+            None
+        } else {
+            let pattern = template.instantiate(&pattern)?;
+            self.charge_rewrite_trial(&template);
+            Some(match pattern.node() {
+                ExprNode::FVar { id } => RewriteKey::Local(id.clone()),
+                _ => RewriteKey::Head(self.rewrite_head_key(&pattern)?),
+            })
+        };
         // The pin's simp unifies at reducible transparency (`withReducible`,
         // `Lean/Meta/Tactic/Simp/Types.lean:966`); a selection query here runs at `instances`,
         // which unfolds `Nat.add` and so would close `n + 0 = n`. A pattern relating one
@@ -623,6 +666,14 @@ impl Context {
             if term.has_loose_bvars() {
                 continue;
             }
+            match &key {
+                Some(RewriteKey::Local(id)) if !matches!(term.node(), ExprNode::FVar { id: local } if local == id) =>
+                {
+                    continue;
+                }
+                Some(RewriteKey::Head(head)) if &self.rewrite_head_key(term)? != head => continue,
+                _ => {}
+            }
             if let Occurrences::Admitted(key) = occurrences
                 && !self.simp_node_admits(key, term)?
             {
@@ -637,12 +688,13 @@ impl Context {
                     match reflexive_instance(term) {
                         Some(instance) => {
                             trial.reflexive_sides_agree(term)?
-                                && trial.match_rewrite_occurrence(&pattern, &alpha, &instance)?
+                                && trial
+                                    .match_rewrite_occurrence(&pattern, &alpha, &instance, false)?
                         }
                         None => false,
                     }
                 } else {
-                    trial.match_rewrite_occurrence(&pattern, &alpha, term)?
+                    trial.match_rewrite_occurrence(&pattern, &alpha, term, !inside_out)?
                 };
                 if !matched {
                     return Ok(None);
@@ -736,6 +788,79 @@ impl Context {
 }
 
 impl Context {
+    /// `expression`'s `toHeadIndex` and `headNumArgs` (vendored Lean/HeadIndex.lean:55-112).
+    /// A `let` contributes its body; a body headed by its own bound variable takes the
+    /// value's head, as `toHeadIndexSlow` does. A source ascription `let _ : T := e; _`
+    /// (this elaborator's spelling of `(e : T)`, absent from the pin's term) is read as `e`.
+    /// `None` only for a loose bound variable.
+    pub(super) fn rewrite_head_key(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<(HeadIndex, usize)>, NatDefinitionElabError> {
+        let mut arguments = 0_usize;
+        let mut head = expression;
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, .. } => {
+                    arguments += 1;
+                    head = f;
+                }
+                ExprNode::LetE { value, .. } if is_ascription(head) => head = value,
+                ExprNode::LetE { body, .. } => head = body,
+                ExprNode::MData { expr, .. } => head = expr,
+                _ => break,
+            }
+        }
+        let mut head = expression.clone();
+        loop {
+            self.tick()?;
+            let next = match head.node() {
+                ExprNode::App { f, .. } => f.clone(),
+                ExprNode::MData { expr, .. } => expr.clone(),
+                ExprNode::LetE { value, .. } if is_ascription(&head) => value.clone(),
+                ExprNode::LetE { value, body, .. } => {
+                    let mut quick = body;
+                    while let ExprNode::App { f: inner, .. }
+                    | ExprNode::MData { expr: inner, .. }
+                    | ExprNode::LetE { body: inner, .. } = quick.node()
+                    {
+                        self.tick()?;
+                        quick = inner;
+                    }
+                    if matches!(quick.node(), ExprNode::BVar { .. }) {
+                        self.substitute(body, value)?
+                    } else {
+                        body.clone()
+                    }
+                }
+                ExprNode::FVar { id } => {
+                    return Ok(Some((HeadIndex::Local(id.clone()), arguments)));
+                }
+                ExprNode::MVar { id } => return Ok(Some((HeadIndex::Hole(id.clone()), arguments))),
+                ExprNode::Const { name, .. } => {
+                    return Ok(Some((HeadIndex::Constant(name.clone()), arguments)));
+                }
+                ExprNode::Proj {
+                    struct_name, idx, ..
+                } => {
+                    return Ok(Some((
+                        HeadIndex::Projection(struct_name.clone(), *idx),
+                        arguments,
+                    )));
+                }
+                ExprNode::Lit { literal } => {
+                    return Ok(Some((HeadIndex::Literal(literal.clone()), arguments)));
+                }
+                ExprNode::Sort { .. } => return Ok(Some((HeadIndex::Sort, arguments))),
+                ExprNode::Lam { .. } => return Ok(Some((HeadIndex::Lambda, arguments))),
+                ExprNode::ForallE { .. } => return Ok(Some((HeadIndex::Forall, arguments))),
+                ExprNode::BVar { .. } => return Ok(None),
+            };
+            head = next;
+        }
+    }
+
     /// Whether the two sides of an `=` or `↔` occurrence agree as the pin's reducible
     /// `isDefEq` decides it, unfolding no local `let`. For `=` that is the automatic closure's
     /// test, which adds the pin's `isDefEqOffset` (Nat offsets and closed literal arithmetic,
@@ -769,6 +894,12 @@ impl Context {
         budget.max_assignments = 0;
         self.proof_types_match_with_budget(&left, &right, budget)
     }
+}
+
+/// `let _ : T := e; _`, the term this elaborator keeps for a source ascription `(e : T)`.
+pub(super) fn is_ascription(expression: &Expr) -> bool {
+    matches!(expression.node(), ExprNode::LetE { decl_name, body, .. }
+        if decl_name.is_anonymous() && matches!(body.node(), ExprNode::BVar { idx: 0 }))
 }
 
 /// The two related sides of `@Eq α a b` or `Iff a b`.
@@ -958,7 +1089,7 @@ mod outcome_tests {
         let mut trial = ctx.rewrite_trial();
         trial.txn.budget.max_heartbeats = trial.txn.budget.heartbeats_consumed + 512;
         let problem = trial
-            .match_rewrite_occurrence(&pattern, &nat, &zero)
+            .match_rewrite_occurrence(&pattern, &nat, &zero, false)
             .unwrap_err();
         assert!(Context::rewrite_nonmatch(&problem), "{problem:?}");
         ctx.charge_rewrite_trial(&trial);
@@ -969,7 +1100,7 @@ mod outcome_tests {
         let mut same_head = ctx.rewrite_trial();
         assert!(
             same_head
-                .match_rewrite_occurrence(&pattern, &nat, &Expr::app(costly, zero.clone()),)
+                .match_rewrite_occurrence(&pattern, &nat, &Expr::app(costly, zero.clone()), false)
                 .unwrap()
         );
         assert_eq!(same_head.instantiate(&hole).unwrap(), zero);
@@ -1016,7 +1147,7 @@ mod outcome_tests {
         let before = ctx.txn.clone();
         ctx.txn.budget.max_heartbeats = 64;
         assert!(
-            !ctx.match_rewrite_occurrence(&pattern, &nat, &Expr::fvar(id))
+            !ctx.match_rewrite_occurrence(&pattern, &nat, &Expr::fvar(id), false)
                 .unwrap()
         );
         assert!(ctx.txn.budget.heartbeats_consumed < 64);
@@ -1055,7 +1186,7 @@ mod outcome_tests {
         let carrier = ctx.hole(Expr::sort(Level::one())).unwrap();
         assert_eq!(ctx.rigid_rewrite_type_head(&carrier).unwrap(), None);
         assert!(
-            ctx.match_rewrite_occurrence(&zero, &carrier, &zero)
+            ctx.match_rewrite_occurrence(&zero, &carrier, &zero, false)
                 .unwrap()
         );
         assert_eq!(ctx.instantiate(&carrier).unwrap(), nat);
@@ -1083,7 +1214,7 @@ mod outcome_tests {
             .add_param(id.clone(), id.0.clone(), equal, BinderInfo::Default);
         let term = Expr::fvar(id);
         let problem = ctx
-            .match_rewrite_occurrence(&term, &unequal, &term)
+            .match_rewrite_occurrence(&term, &unequal, &term, false)
             .unwrap_err();
         assert!(Context::rewrite_nonmatch(&problem));
         assert!(ctx.txn.mvars.assignments().is_empty());
@@ -1136,7 +1267,7 @@ mod outcome_tests {
         );
         let before = ctx.txn.clone();
         let problem = ctx
-            .match_rewrite_occurrence(&zero, &carrier, &one)
+            .match_rewrite_occurrence(&zero, &carrier, &one, false)
             .unwrap_err();
         assert!(Context::rewrite_nonmatch(&problem), "{problem:?}");
         assert_eq!(ctx.txn.mvars, before.mvars);
@@ -1148,7 +1279,7 @@ mod outcome_tests {
         let carrier = recovery.hole(Expr::sort(Level::one())).unwrap();
         assert!(
             recovery
-                .match_rewrite_occurrence(&zero, &carrier, &zero)
+                .match_rewrite_occurrence(&zero, &carrier, &zero, false)
                 .unwrap()
         );
         assert_eq!(
@@ -1165,7 +1296,7 @@ mod outcome_tests {
         let pattern = ctx.hole(carrier.clone()).unwrap();
         let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
         assert!(
-            ctx.match_rewrite_occurrence(&pattern, &carrier, &zero)
+            ctx.match_rewrite_occurrence(&pattern, &carrier, &zero, false)
                 .unwrap()
         );
         assert_eq!(

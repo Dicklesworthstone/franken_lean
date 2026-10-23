@@ -173,6 +173,7 @@ impl Context {
         rule: Typed,
         occurrence: &Expr,
         reverse: bool,
+        kabstract: bool,
     ) -> Result<Typed, NatDefinitionElabError> {
         let rule_type = self.whnf(&rule.type_)?;
         let (u, alpha, from, to) =
@@ -193,8 +194,11 @@ impl Context {
         }
         let original = self.instantiate(&local.type_)?;
         let marker = self.equality_local(alpha.clone())?;
-        let (template, matched) =
-            self.rewrite_template(&original, occurrence, &Expr::fvar(marker.id.clone()))?;
+        let (template, matched) = if kabstract {
+            self.rewrite_kabstract(&original, occurrence, &Expr::fvar(marker.id.clone()))?
+        } else {
+            self.rewrite_template(&original, occurrence, &Expr::fvar(marker.id.clone()))?
+        };
         if !matched {
             return Err(error(TacticError::RewriteNoMatch));
         }
@@ -356,7 +360,7 @@ impl Context {
                     .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                     .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
                 let replacement =
-                    self.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
+                    self.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse, true)?;
                 let (next, parent, value) =
                     self.replace_rewritten_hypothesis(goal, &local, replacement, false)?;
                 proof.work.push(Work::Close(parent, value));
@@ -381,7 +385,7 @@ impl Context {
                     .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
                     .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
                 let (next, value) =
-                    self.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
+                    self.rewrite_transport(&goal, term, &occurrence, rule.reverse, true)?;
                 proof.work.push(Work::Close(goal, value));
                 proof
                     .work
@@ -441,8 +445,13 @@ impl Context {
                     else {
                         return Ok(None);
                     };
-                    let replacement =
-                        trial.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
+                    let replacement = trial.rewrite_hypothesis_value(
+                        &local,
+                        term,
+                        &occurrence,
+                        rule.reverse,
+                        true,
+                    )?;
                     let (next, parent, value) = trial.replace_rewritten_hypothesis(
                         goal.clone(),
                         &local,
@@ -478,7 +487,7 @@ impl Context {
                     return Ok(None);
                 };
                 let (next, value) =
-                    trial.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
+                    trial.rewrite_transport(&goal, term, &occurrence, rule.reverse, true)?;
                 Ok(Some((next, value, premises)))
             })();
             self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;

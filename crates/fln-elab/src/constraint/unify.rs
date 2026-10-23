@@ -78,6 +78,11 @@ pub struct UnificationBudget {
     /// Enable the direct comparison of proofs of the same proposition. Fixed
     /// recursion parameters use the pin's `withoutProofIrrelevance` policy.
     pub proof_irrelevance: bool,
+    /// The pin's `offsetCnstrs` (`isDefEqOffset`, vendored Lean/Meta/Offset.lean:116):
+    /// Nat offsets and literals over the canonical class terms (`n + 1`, `2`) are
+    /// compared before either side is reduced. Only `rw`'s occurrence query sets it;
+    /// elsewhere offsets are still compared after delta exposes `Nat.add`.
+    pub offset_constraints: bool,
     /// A separate, caller-calibrated bound for each assignment's K1 check.
     pub kernel: Budget,
 }
@@ -92,6 +97,7 @@ impl UnificationBudget {
             transparency: UnificationTransparency::Abbreviations,
             zeta_delta: true,
             proof_irrelevance: true,
+            offset_constraints: false,
             kernel,
         }
     }
@@ -1006,6 +1012,28 @@ impl Engine<'_> {
         Ok(Some(LiteralStep::Compare(previous, argument.clone())))
     }
 
+    /// The pin's `isDefEqOffset` under `offsetCnstrs`, before delta: `true` when it decided
+    /// the equation or queued the equation with its common offset cancelled.
+    fn class_offset_step(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+        pending: &mut VecDeque<Equation>,
+    ) -> Result<bool, UnificationError> {
+        match self.class_offset_equation(left, right)? {
+            reduce::ClassOffset::Undecided => Ok(false),
+            reduce::ClassOffset::Equal => Ok(true),
+            reduce::ClassOffset::Refuted => Err(UnificationError::Deferred(
+                UnificationDeferred::UnsupportedEquation,
+            )),
+            reduce::ClassOffset::Equation(left, right) => {
+                pending.push_front((left, right, locals.clone()));
+                Ok(true)
+            }
+        }
+    }
+
     fn compare(
         &mut self,
         equation: &Equation,
@@ -1060,6 +1088,9 @@ impl Engine<'_> {
                 Err(error) => return Err(error),
             }
         }
+        if self.budget.offset_constraints && self.class_offset_step(left, right, locals, pending)? {
+            return Ok(());
+        }
         // At `instances` transparency the pin's `isExprDefEqExpensive` reduces
         // both sides with `whnfCore` alone. A shared head's arguments are then
         // compared before it is unfolded (`isDefEqDelta`'s `tryHeuristic`, or
@@ -1080,6 +1111,11 @@ impl Engine<'_> {
         let left = self.whnf_for_comparison(left, locals)?;
         let right = self.whnf_for_comparison(right, locals)?;
         if same_terms(&left, &right, &mut self.meter)? {
+            return Ok(());
+        }
+        if self.budget.offset_constraints
+            && self.class_offset_step(&left, &right, locals, pending)?
+        {
             return Ok(());
         }
         if let Some(child) = self

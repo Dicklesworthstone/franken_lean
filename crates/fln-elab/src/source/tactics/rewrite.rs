@@ -67,11 +67,19 @@ impl Context {
         Ok(rules)
     }
 
+    /// `rw`'s closing `try (with_reducible rfl)` (vendored Init/Tactics.lean:605-609) on the
+    /// rewritten goal: `Eq.refl` and `HEq.refl` at reducible transparency, and `Iff.refl` for
+    /// an `↔` goal where the environment declares it (`@[refl]` and `exact Iff.rfl`,
+    /// Init/Core.lean:1035,1042; `Lean.MVarId.applyRfl`, Lean/Meta/Tactic/Rfl.lean:67).
     pub(super) fn rewrite_reflexivity(
         &mut self,
         goal: &ProofGoal,
     ) -> Result<bool, NatDefinitionElabError> {
-        let Some(value) = self.automatic_reflexivity_candidate(goal, true)? else {
+        let value = match self.rewrite_iff_reflexivity(goal)? {
+            Some(value) => Some(value),
+            None => self.automatic_reflexivity_candidate(goal, true)?,
+        };
+        let Some(value) = value else {
             return Ok(false);
         };
         // Each rewrite created a separate child. Its parent's introduced-binder
@@ -90,6 +98,58 @@ impl Context {
                 )))
             })?;
         Ok(true)
+    }
+
+    /// `Iff.refl a` for a goal `a ↔ b` whose sides agree at reducible transparency, the
+    /// goal head read by `whnfR`. `None` for any other goal, or where `Iff.refl` is not
+    /// the pin's `(a : Prop) → a ↔ a`.
+    fn rewrite_iff_reflexivity(
+        &mut self,
+        goal: &ProofGoal,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.flush(false)?;
+        let target = self.whnf_with_transparency(
+            &goal.target,
+            UnificationTransparency::Abbreviations,
+            true,
+        )?;
+        let iff = Name::from_components(["Iff"]);
+        let ExprNode::App { f, a: right } = target.node() else {
+            return Ok(None);
+        };
+        let ExprNode::App { f: head, a: left } = f.node() else {
+            return Ok(None);
+        };
+        if !matches!(head.node(), ExprNode::Const { name, levels } if name == &iff && levels.is_empty())
+        {
+            return Ok(None);
+        }
+        let refl = Name::from_components(["Iff", "refl"]);
+        let statement = app(
+            Expr::const_(iff, Vec::new()),
+            [
+                Expr::bvar(0).expect("fixed binder"),
+                Expr::bvar(0).expect("fixed binder"),
+            ],
+        );
+        if !self.txn.env.find(&refl).is_some_and(|info| {
+            info.constant_val().level_params.is_empty()
+                && matches!(info.constant_val().type_.node(), ExprNode::ForallE {
+                    binder_type, body, binder_info: BinderInfo::Default, ..
+                } if binder_type == &Expr::sort(Level::zero()) && body == &statement)
+        }) {
+            return Ok(None);
+        }
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.zeta_delta = true;
+        if !self.proof_types_match_with_budget(left, right, budget)? {
+            return Ok(None);
+        }
+        Ok(Some(Expr::app(
+            Expr::const_(refl, Vec::new()),
+            left.clone(),
+        )))
     }
 
     /// Automatic tactic closure uses reducible transparency for both the goal
@@ -282,7 +342,7 @@ impl Context {
         } = self
             .instantiate_rewrite_rule(rule, &original_target, reverse, false, &[])?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
-        let (next_goal, value) = self.rewrite_transport(&goal, rule, &occurrence, reverse)?;
+        let (next_goal, value) = self.rewrite_transport(&goal, rule, &occurrence, reverse, true)?;
         proof.work.push(Work::Close(goal, value));
         // LIFO: the rewritten goal comes first, then this rule's premises in
         // telescope order. A later rule's premises precede earlier ones.
@@ -295,12 +355,15 @@ impl Context {
 
     /// Build one ordinary conversion/equality transport. The caller owns the
     /// continuation and must close introduced binders only after its child.
+    /// `kabstract` abstracts every instance of the occurrence as `rw` does
+    /// ([`Self::rewrite_kabstract`]); otherwise only its exact copies.
     fn rewrite_transport(
         &mut self,
         goal: &ProofGoal,
         rule: Typed,
         occurrence: &Expr,
         reverse: bool,
+        kabstract: bool,
     ) -> Result<(ProofGoal, Expr), NatDefinitionElabError> {
         let rule_type = self.whnf(&rule.type_)?;
         let (u, alpha, from, to) =
@@ -316,8 +379,11 @@ impl Context {
             return Err(error(TacticError::ExpectedEquality));
         }
         let marker = FVarId(self.fresh_name()?);
-        let (template, matched) =
-            self.rewrite_template(&target, pattern, &Expr::fvar(marker.clone()))?;
+        let (template, matched) = if kabstract {
+            self.rewrite_kabstract(&target, pattern, &Expr::fvar(marker.clone()))?
+        } else {
+            self.rewrite_template(&target, pattern, &Expr::fvar(marker.clone()))?
+        };
         if !matched {
             return Err(error(TacticError::RewriteNoMatch));
         }
@@ -382,6 +448,91 @@ impl Context {
         Ok((next_goal, value))
     }
 
+    /// `rw`'s abstraction of `occurrence` in `target`, as the pin's `kabstract` (vendored
+    /// Lean/Meta/KAbstract.lean:30-60) abstracts its instantiated pattern: a local only
+    /// where it occurs; otherwise, outside-in, every subterm without loose bound variables
+    /// that has the occurrence's head symbol and argument count and is its exact copy or
+    /// agrees with it at reducible transparency with offset constraints (`Rewrite.Config`).
+    /// An abstracted subterm's own subterms are not visited.
+    fn rewrite_kabstract(
+        &mut self,
+        target: &Expr,
+        occurrence: &Expr,
+        replacement: &Expr,
+    ) -> Result<(Expr, bool), NatDefinitionElabError> {
+        if matches!(occurrence.node(), ExprNode::FVar { .. }) {
+            return self.rewrite_template(target, occurrence, replacement);
+        }
+        let key = self.rewrite_head_key(occurrence)?;
+        let mut done = HashMap::<usize, (Expr, bool)>::new();
+        let mut work = vec![(target, false)];
+        while let Some((term, exit)) = work.pop() {
+            let identity = term.allocation_identity();
+            if done.contains_key(&identity) {
+                continue;
+            }
+            self.tick()?;
+            if !exit {
+                if !term.has_loose_bvars()
+                    && self.rewrite_head_key(term)? == key
+                    && self.rewrite_instance(term, occurrence)?
+                {
+                    done.insert(identity, (replacement.clone(), true));
+                    continue;
+                }
+                work.push((term, true));
+                work.extend(
+                    children(term)
+                        .into_iter()
+                        .flatten()
+                        .map(|child| (child, false)),
+                );
+                continue;
+            }
+            let changed = children(term)
+                .into_iter()
+                .flatten()
+                .any(|e| done[&e.allocation_identity()].1);
+            let value = if changed {
+                rebuild(term, |e: &Expr| {
+                    done.get(&e.allocation_identity())
+                        .expect("postorder child")
+                        .0
+                        .clone()
+                })
+            } else {
+                term.clone()
+            };
+            done.insert(identity, (value, changed));
+        }
+        Ok(done
+            .remove(&target.allocation_identity())
+            .expect("finished rewrite root"))
+    }
+
+    /// Whether `term` is an instance of the ground `occurrence` for `rw`: an exact copy,
+    /// or, both free of holes, equal at reducible transparency with the pin's offset
+    /// constraints, assigning nothing.
+    fn rewrite_instance(
+        &mut self,
+        term: &Expr,
+        occurrence: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.rewrite_same(term, occurrence)? {
+            return Ok(true);
+        }
+        if [term, occurrence]
+            .iter()
+            .any(|e| e.has_expr_mvar() || e.has_level_mvar())
+        {
+            return Ok(false);
+        }
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.offset_constraints = true;
+        budget.max_assignments = 0;
+        self.proof_types_match_with_budget(term, occurrence, budget)
+    }
+
     /// Allocation-memoized replacement of exact elaborated occurrences. The
     /// rule has no loose bvars, so no binder-dependent lift of it is required.
     pub(super) fn rewrite_template(
@@ -425,51 +576,7 @@ impl Context {
             let value = if !changed {
                 term.clone()
             } else {
-                match term.node() {
-                    ExprNode::App { f, a } => Expr::app(child(f), child(a)),
-                    ExprNode::Lam {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    } => Expr::lam(
-                        binder_name.clone(),
-                        child(binder_type),
-                        child(body),
-                        *binder_info,
-                    ),
-                    ExprNode::ForallE {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    } => Expr::forall_e(
-                        binder_name.clone(),
-                        child(binder_type),
-                        child(body),
-                        *binder_info,
-                    ),
-                    ExprNode::LetE {
-                        decl_name,
-                        type_,
-                        value,
-                        body,
-                        non_dep,
-                    } => Expr::let_e(
-                        decl_name.clone(),
-                        child(type_),
-                        child(value),
-                        child(body),
-                        *non_dep,
-                    ),
-                    ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr,
-                    } => Expr::proj(struct_name.clone(), *idx, child(expr)),
-                    _ => term.clone(),
-                }
+                rebuild(term, child)
             };
             done.insert(key, (value, changed));
         }
@@ -619,6 +726,55 @@ impl Context {
 }
 fn app<const N: usize>(head: Expr, args: [Expr; N]) -> Expr {
     args.into_iter().fold(head, Expr::app)
+}
+
+/// `term` with each child replaced by `child(it)`.
+fn rebuild(term: &Expr, child: impl Fn(&Expr) -> Expr) -> Expr {
+    match term.node() {
+        ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            binder_name.clone(),
+            child(binder_type),
+            child(body),
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            binder_name.clone(),
+            child(binder_type),
+            child(body),
+            *binder_info,
+        ),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Expr::let_e(
+            decl_name.clone(),
+            child(type_),
+            child(value),
+            child(body),
+            *non_dep,
+        ),
+        ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => Expr::proj(struct_name.clone(), *idx, child(expr)),
+        _ => term.clone(),
+    }
 }
 
 /// The operand positions of a Nat arithmetic class term, read by shape as the

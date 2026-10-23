@@ -13,6 +13,7 @@ mod string;
 
 use super::*;
 use fln_env::constants::RecursorVal;
+pub(super) use nat::ClassOffset;
 
 struct DeltaCandidate {
     name: Name,

@@ -307,11 +307,11 @@ fn generic_collection_laws_use_native_induction_and_checked_rewriting() {
         theorem append_nil.{u} {A : Type u} (xs : List A) : List.append xs List.nil = xs := by
           induction xs with
           | nil => rfl
-          | cons x tail ih => simp only [List.append]; rw [ih]
+          | cons x tail ih => simp only [List.append]; exact (by rw [ih] : List.cons x (List.append tail List.nil) = List.cons x tail)
         theorem map_identity.{u} {A : Type u} (xs : List A) : List.map (fun x => x) xs = xs := by
           induction xs with
           | nil => rfl
-          | cons x tail ih => simp only [List.map]; rw [ih]
+          | cons x tail ih => simp only [List.map]; exact (by rw [ih] : List.cons x (List.map (fun x => x) tail) = List.cons x tail)
         "#,
     );
 }

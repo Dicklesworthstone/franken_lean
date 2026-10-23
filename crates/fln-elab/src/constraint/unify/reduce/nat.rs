@@ -39,6 +39,75 @@ struct NatOffset {
     literal: bool,
 }
 
+/// The answer of the pin's `isDefEqOffset` (vendored Lean/Meta/Offset.lean:116-161) for one
+/// equation, read over the canonical class terms the frontend elaborates.
+pub(in crate::constraint::unify) enum ClassOffset {
+    /// Neither side is an offset or an evaluable literal: other rules decide.
+    Undecided,
+    /// Two literals, or an offset against a literal, that differ.
+    Refuted,
+    /// Two literals of the same value.
+    Equal,
+    /// The equation with the common offset cancelled.
+    Equation(Expr, Expr),
+}
+
+/// An `evalNat` operation: its operation, `Nat`'s function, class, method, monomorphic
+/// instance, and the heterogeneous instance wrapping it (empty for `NatPow`).
+type ClassOperation = (
+    NatOperation,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+/// The operation an `evalNat` term applies, after its instance test.
+enum ClassFrame {
+    Visit(Expr),
+    Apply(NatOperation),
+}
+
+/// `expression`'s head constant name and arguments, outermost annotation removed.
+fn class_spine(expression: &Expr) -> Option<(&Name, Vec<&Expr>)> {
+    let mut head = expression;
+    while let ExprNode::MData { expr, .. } = head.node() {
+        head = expr;
+    }
+    let mut arguments = Vec::new();
+    while let ExprNode::App { f, a } = head.node() {
+        arguments.push(a);
+        head = f;
+    }
+    arguments.reverse();
+    match head.node() {
+        ExprNode::Const { name, .. } => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+/// One of the pin's structural instance tests (vendored Lean/Meta/NatInstTesters.lean):
+/// the constant `path` applied to exactly `arity` arguments, whose argument at each
+/// position `inner` names is the argument-free constant named there.
+fn is_class_instance(
+    expression: &Expr,
+    path: &[&str],
+    arity: usize,
+    inner: &[(usize, &[&str])],
+) -> bool {
+    let Some((name, arguments)) = class_spine(expression) else {
+        return false;
+    };
+    name == &Name::from_components(path.iter().copied())
+        && arguments.len() == arity
+        && inner.iter().all(|(index, path)| {
+            arguments
+                .get(*index)
+                .is_some_and(|argument| is_class_instance(argument, path, 0, &[]))
+        })
+}
+
 fn has_offset_head(expression: &Expr) -> bool {
     let ExprNode::App { f, .. } = expression.node() else {
         return false;
@@ -750,5 +819,295 @@ impl Engine<'_> {
         Ok(Some(Expr::lit(Literal::Nat(
             fln_bignum::interop::literal_from_bignat(&result),
         ))))
+    }
+
+    /// The pin's `isDefEqOffset` (vendored Lean/Meta/Offset.lean:116-161), on the sides
+    /// as they stand: an offset `s + k` (`isOffset?`) or a literal (`evalNat`) on either
+    /// side cancels against the other side's, and two literals are compared. Instances are
+    /// tested structurally, a subset of the pin's `matchesInstance`.
+    pub(in crate::constraint::unify) fn class_offset_equation(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<ClassOffset, UnificationError> {
+        if !self.has_nat_literals()? {
+            return Ok(ClassOffset::Undecided);
+        }
+        let left = self.instantiate(left)?;
+        let right = self.instantiate(right)?;
+        let step = match self.class_offset(&left)? {
+            Some((s, k1)) => match self.class_offset(&right)? {
+                Some((t, k2)) => match k1.cmp(&k2) {
+                    std::cmp::Ordering::Equal => Some((s, t)),
+                    std::cmp::Ordering::Less => {
+                        let difference = self.combine_nat_offsets(&k2, &k1, true)?;
+                        self.class_offset_term(t, difference)?.map(|t| (s, t))
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let difference = self.combine_nat_offsets(&k1, &k2, true)?;
+                        self.class_offset_term(s, difference)?.map(|s| (s, t))
+                    }
+                },
+                None => match self.class_nat_value(&right)? {
+                    Some(v2) if v2 >= k1 => {
+                        let difference = self.combine_nat_offsets(&v2, &k1, true)?;
+                        self.class_numeral(difference)?.map(|t| (s, t))
+                    }
+                    Some(_) => return Ok(ClassOffset::Refuted),
+                    None => None,
+                },
+            },
+            None => match self.class_nat_value(&left)? {
+                Some(v1) => match self.class_offset(&right)? {
+                    Some((t, k2)) if v1 >= k2 => {
+                        let difference = self.combine_nat_offsets(&v1, &k2, true)?;
+                        self.class_numeral(difference)?.map(|s| (s, t))
+                    }
+                    Some(_) => return Ok(ClassOffset::Refuted),
+                    None => match self.class_nat_value(&right)? {
+                        Some(v2) if v1 == v2 => return Ok(ClassOffset::Equal),
+                        Some(_) => return Ok(ClassOffset::Refuted),
+                        None => None,
+                    },
+                },
+                None => None,
+            },
+        };
+        Ok(match step {
+            Some((s, t)) => ClassOffset::Equation(s, t),
+            None => ClassOffset::Undecided,
+        })
+    }
+
+    /// The pin's `isOffset?` (Offset.lean:87-106): `succ`, `Nat.add`, `Add.add` and
+    /// `HAdd.hAdd` at Nat's canonical instances, with an evaluable right operand, peeled
+    /// until the base is none of them. `None` unless at least one layer is peeled.
+    fn class_offset(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<(Expr, NatLit)>, UnificationError> {
+        let mut base = expression.clone();
+        let mut total = NatLit::from_u64(0);
+        let mut found = false;
+        loop {
+            self.meter.tick()?;
+            let Some((name, arguments)) = class_spine(&base) else {
+                break;
+            };
+            let add = |path: &[&str]| name == &Name::from_components(path.iter().copied());
+            let (next, operand) = if add(&["Nat", "succ"]) && arguments.len() == 1 {
+                (arguments[0].clone(), None)
+            } else if add(&["Nat", "add"]) && arguments.len() == 2 {
+                (arguments[0].clone(), Some(arguments[1].clone()))
+            } else if add(&["Add", "add"])
+                && arguments.len() == 4
+                && is_class_instance(arguments[1], &["instAddNat"], 0, &[])
+            {
+                (arguments[2].clone(), Some(arguments[3].clone()))
+            } else if add(&["HAdd", "hAdd"])
+                && arguments.len() == 6
+                && is_class_instance(arguments[3], &["instHAdd"], 2, &[(1, &["instAddNat"])])
+            {
+                (arguments[4].clone(), Some(arguments[5].clone()))
+            } else {
+                break;
+            };
+            let increment = match operand {
+                None => NatLit::from_u64(1),
+                Some(operand) => match self.class_nat_value(&operand)? {
+                    Some(value) => value,
+                    None => break,
+                },
+            };
+            total = self.combine_nat_offsets(&total, &increment, false)?;
+            base = next;
+            found = true;
+        }
+        Ok(found.then_some((base, total)))
+    }
+
+    /// The pin's `evalNat` (Offset.lean:26-61): literals, `Nat.zero`, numerals at
+    /// `instOfNatNat`, and the Nat operations and their class forms at Nat's canonical
+    /// instances (structural tests, as `Structural` there). A heap worklist, not recursion.
+    fn class_nat_value(&mut self, expression: &Expr) -> Result<Option<NatLit>, UnificationError> {
+        use NatOperation::*;
+        let mut frames = vec![ClassFrame::Visit(expression.clone())];
+        let mut values: Vec<NatLit> = Vec::new();
+        while let Some(frame) = frames.pop() {
+            self.meter.tick()?;
+            let term = match frame {
+                ClassFrame::Apply(operation) => {
+                    let operands = values.split_off(values.len() - operation.arity());
+                    let Some(result) = self.evaluate_nat(operation, &operands)? else {
+                        return Ok(None);
+                    };
+                    let ExprNode::Lit {
+                        literal: Literal::Nat(value),
+                    } = result.node()
+                    else {
+                        return Ok(None);
+                    };
+                    values.push(value.clone());
+                    continue;
+                }
+                ClassFrame::Visit(term) => term,
+            };
+            let mut stripped = &term;
+            while let ExprNode::MData { expr, .. } = stripped.node() {
+                stripped = expr;
+            }
+            if let ExprNode::Lit {
+                literal: Literal::Nat(value),
+            } = stripped.node()
+            {
+                values.push(value.clone());
+                continue;
+            }
+            let Some((name, arguments)) = class_spine(stripped) else {
+                return Ok(None);
+            };
+            let is = |path: &[&str]| name == &Name::from_components(path.iter().copied());
+            if arguments.is_empty() && is(&["Nat", "zero"]) {
+                values.push(NatLit::from_u64(0));
+                continue;
+            }
+            if is(&["OfNat", "ofNat"])
+                && arguments.len() == 3
+                && is_class_instance(arguments[2], &["instOfNatNat"], 1, &[])
+            {
+                frames.push(ClassFrame::Visit(arguments[1].clone()));
+                continue;
+            }
+            if is(&["Nat", "succ"]) && arguments.len() == 1 {
+                frames.push(ClassFrame::Apply(Succ));
+                frames.push(ClassFrame::Visit(arguments[0].clone()));
+                continue;
+            }
+            const BINARY: [ClassOperation; 6] = [
+                (Add, "add", "Add", "add", &["instAddNat"], &["instHAdd"]),
+                (Sub, "sub", "Sub", "sub", &["instSubNat"], &["instHSub"]),
+                (Mul, "mul", "Mul", "mul", &["instMulNat"], &["instHMul"]),
+                (Div, "div", "Div", "div", &["Nat", "instDiv"], &["instHDiv"]),
+                (Mod, "mod", "Mod", "mod", &["Nat", "instMod"], &["instHMod"]),
+                (Pow, "pow", "NatPow", "pow", &["instNatPowNat"], &[]),
+            ];
+            let mut operation = None;
+            for (kind, function, class, method, instance, heterogeneous) in BINARY {
+                let class_method = [class, method];
+                let heterogeneous_class = format!("H{class}");
+                let heterogeneous_method = format!("h{class}");
+                let operands = if is(&["Nat", function]) && arguments.len() == 2 {
+                    Some((arguments[0], arguments[1]))
+                } else if is(&class_method)
+                    && arguments.len() == 4
+                    && is_class_instance(arguments[1], instance, 0, &[])
+                {
+                    Some((arguments[2], arguments[3]))
+                } else if !heterogeneous.is_empty()
+                    && is(&[heterogeneous_class.as_str(), heterogeneous_method.as_str()])
+                    && arguments.len() == 6
+                    && is_class_instance(arguments[3], heterogeneous, 2, &[(1, instance)])
+                {
+                    Some((arguments[4], arguments[5]))
+                } else if matches!(kind, Pow)
+                    && is(&["Pow", "pow"])
+                    && arguments.len() == 5
+                    && is_class_instance(arguments[2], &["instPowNat"], 2, &[(1, instance)])
+                {
+                    Some((arguments[3], arguments[4]))
+                } else if matches!(kind, Pow)
+                    && is(&["HPow", "hPow"])
+                    && arguments.len() == 6
+                    && class_spine(arguments[3]).is_some_and(|(name, inner)| {
+                        name == &Name::from_components(["instHPow"])
+                            && inner.len() == 3
+                            && is_class_instance(inner[2], &["instPowNat"], 2, &[(1, instance)])
+                    })
+                {
+                    Some((arguments[4], arguments[5]))
+                } else {
+                    None
+                };
+                if let Some(operands) = operands {
+                    operation = Some((kind, operands));
+                    break;
+                }
+            }
+            let Some((kind, (left, right))) = operation else {
+                return Ok(None);
+            };
+            frames.push(ClassFrame::Apply(kind));
+            frames.push(ClassFrame::Visit(right.clone()));
+            frames.push(ClassFrame::Visit(left.clone()));
+        }
+        Ok(values.pop())
+    }
+
+    /// The pin's `mkNatLit` (vendored Lean/Expr.lean:750): `OfNat.ofNat Nat n (instOfNatNat
+    /// n)`, when the environment declares both constants.
+    fn class_numeral(&mut self, value: NatLit) -> Result<Option<Expr>, UnificationError> {
+        self.meter.tick()?;
+        let of_nat = Name::from_components(["OfNat", "ofNat"]);
+        let instance = Name::from_components(["instOfNatNat"]);
+        if self.work.env.find(&of_nat).is_none() || self.work.env.find(&instance).is_none() {
+            return Ok(None);
+        }
+        let literal = Expr::lit(Literal::Nat(value));
+        Ok(Some(
+            [
+                Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+                literal.clone(),
+                Expr::app(Expr::const_(instance, Vec::new()), literal),
+            ]
+            .into_iter()
+            .fold(Expr::const_(of_nat, vec![Level::zero()]), Expr::app),
+        ))
+    }
+
+    /// The pin's `mkOffset` (Offset.lean:108-114): `base` itself for a zero offset, the
+    /// numeral when `base` evaluates to zero, and otherwise `base + offset` as the frontend
+    /// spells it (`mkNatAdd`, vendored Lean/Expr.lean:2254).
+    fn class_offset_term(
+        &mut self,
+        base: Expr,
+        offset: NatLit,
+    ) -> Result<Option<Expr>, UnificationError> {
+        if offset.limbs_le().is_empty() {
+            return Ok(Some(base));
+        }
+        if self
+            .class_nat_value(&base)?
+            .is_some_and(|value| value.limbs_le().is_empty())
+        {
+            return self.class_numeral(offset);
+        }
+        let Some(numeral) = self.class_numeral(offset)? else {
+            return Ok(None);
+        };
+        let add = Name::from_components(["HAdd", "hAdd"]);
+        let heterogeneous = Name::from_components(["instHAdd"]);
+        let homogeneous = Name::from_components(["instAddNat"]);
+        if [&add, &heterogeneous, &homogeneous]
+            .iter()
+            .any(|name| self.work.env.find(name).is_none())
+        {
+            return Ok(None);
+        }
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let instance = Expr::app(
+            Expr::app(
+                Expr::const_(heterogeneous, vec![Level::zero()]),
+                nat.clone(),
+            ),
+            Expr::const_(homogeneous, Vec::new()),
+        );
+        Ok(Some(
+            [nat.clone(), nat.clone(), nat, instance, base, numeral]
+                .into_iter()
+                .fold(
+                    Expr::const_(add, vec![Level::zero(), Level::zero(), Level::zero()]),
+                    Expr::app,
+                ),
+        ))
     }
 }
