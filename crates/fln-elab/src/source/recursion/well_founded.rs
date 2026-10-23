@@ -749,15 +749,10 @@ impl Context {
         header_parameters: usize,
     ) -> Result<Attempt, NatDefinitionElabError> {
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
-        // An omitted result type is supported for structural recursion only: the fixpoint's
-        // motive over it exhausted the unification budget, so the refusal stays typed here.
-        if self
-            .omitted_results
-            .iter()
-            .any(|omitted| omitted.body == expected)
-        {
-            return Err(error(RecursionError::ResultTypeRequired));
-        }
+        // The body hole lives in the original parameter context. Only its
+        // abstracted form can be substituted at the fixpoint's varying
+        // arguments or used for recursive calls, as in structural recursion.
+        let reference = self.reference_result(&expected);
         if varying.is_empty() {
             return Err(error(RecursionError::WellFoundedArgumentRequired));
         }
@@ -770,7 +765,7 @@ impl Context {
         }
         let saved = self.txn.lctx.clone();
         let domain = self.well_founded_domain(&varying_parameters)?;
-        let motive = self.well_founded_motive(&varying_parameters, &domain, &expected)?;
+        let motive = self.well_founded_motive(&varying_parameters, &domain, &reference)?;
         let measure_fn =
             self.uncurry_well_founded_value(&varying_parameters, measure.value.clone())?;
         let current_arguments: Vec<_> = varying_parameters
@@ -814,7 +809,7 @@ impl Context {
             .find(&continuation_id)
             .expect("inserted well-founded continuation")
             .clone();
-        let mut reference_type = expected.clone();
+        let mut reference_type = reference;
         for local in parameters.iter().rev() {
             self.tick()?;
             reference_type = Expr::forall_e(
