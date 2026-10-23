@@ -979,13 +979,8 @@ impl<'a> Printer<'a> {
             }
             return self.subterm(e, outer);
         }
-        self.nested = true;
-        self.proofs = self.is_proof(e);
-        let printed = self.subterm(e, outer);
-        self.nested = false;
-        // The root is always grouped (`formatCategory` is `fill (nest 2 …)` with no
-        // `isUngrouped` check), so a `fun` that is ungrouped as a child is grouped here. An
-        // ascription's anonymous `let` prints as its value, so the root is that value.
+        // An ascription's anonymous `let` prints as its value, so the root is that value: the
+        // pin's `(e : T)` elaborates to `e` itself, and `e` decides `pp.proofs` there.
         let mut root = e;
         while let ExprNode::LetE {
             decl_name,
@@ -998,6 +993,12 @@ impl<'a> Printer<'a> {
         {
             root = value;
         }
+        self.nested = true;
+        self.proofs = self.is_proof(root);
+        let printed = self.subterm(e, outer);
+        self.nested = false;
+        // The root is always grouped (`formatCategory` is `fill (nest 2 …)` with no
+        // `isUngrouped` check), so a `fun` that is ungrouped as a child is grouped here.
         let lambda = matches!(root.node(), ExprNode::Lam { .. }) && outer == 0;
         printed.map(|doc| if lambda { node(doc) } else { doc })
     }
