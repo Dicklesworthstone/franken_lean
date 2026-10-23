@@ -78,6 +78,11 @@ pub enum TacticError {
     ExpectedEquality,
     RewriteNoMatch,
     UnfoldFailed(Name),
+    /// `unfold f` at an occurrence whose match the argument does not reduce. The pin rewrites
+    /// it by `f`'s unfold equation to a `match` (vendored `Lean/Meta/Tactic/Unfold.lean`), which
+    /// this engine's compiled recursor application does not stand for. Never caught by
+    /// `first`/`try`: the pin's `unfold` succeeds there.
+    UnfoldStuckMatch(Name),
     RewriteLocation,
     RewriteMetavariablePattern,
     SimplificationNoProgress,
@@ -202,6 +207,11 @@ impl std::fmt::Display for TacticError {
             Self::UnfoldFailed(name) => write!(
                 f,
                 "unfold failed for `{}` in the selected location",
+                name.to_display_string()
+            ),
+            Self::UnfoldStuckMatch(name) => write!(
+                f,
+                "unfold of `{}` where its match does not reduce, which the pin shows as a `match`",
                 name.to_display_string()
             ),
             Self::RewriteMetavariablePattern => {

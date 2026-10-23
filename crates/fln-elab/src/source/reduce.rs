@@ -421,6 +421,16 @@ impl Context {
             result => result,
         };
         let value = match unfolding {
+            // Only an occurrence applied to every parameter: the pin's unfold equation matches
+            // none other, and a bare or partial application is visited here as the function
+            // of the application that holds it.
+            SmartUnfolding::Folded
+                if self.unfold_tactic && arguments.len() >= lambda_count(&definition.value) =>
+            {
+                return Err(failure(SourceInferenceError::Tactic(
+                    tactics::TacticError::UnfoldStuckMatch(name.clone()),
+                )));
+            }
             SmartUnfolding::Folded => return Ok(term.clone()),
             SmartUnfolding::Plain => {
                 self.instantiate_params(&definition.value, &definition.base.level_params, levels)?
@@ -863,6 +873,17 @@ impl Context {
         }
         Ok(Some(result))
     }
+}
+
+/// The leading lambdas of a definition's value: the parameters its unfolding takes.
+fn lambda_count(value: &Expr) -> usize {
+    let mut count = 0;
+    let mut body = value;
+    while let ExprNode::Lam { body: inner, .. } = body.node() {
+        count += 1;
+        body = inner;
+    }
+    count
 }
 
 #[cfg(test)]

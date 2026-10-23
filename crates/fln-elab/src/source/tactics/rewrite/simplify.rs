@@ -53,7 +53,10 @@ impl Context {
         let mut changed = false;
         for syntax in names {
             self.tick()?;
-            match self.unfold_simp_term(syntax, false, &current)? {
+            self.unfold_tactic = true;
+            let unfolded = self.unfold_simp_term(syntax, false, &current);
+            self.unfold_tactic = false;
+            match unfolded? {
                 UnfoldResult::NotDefinition => {
                     let name = match syntax {
                         Syntax::Ident { val, .. } => val.clone(),

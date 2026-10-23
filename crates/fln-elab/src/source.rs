@@ -637,6 +637,10 @@ struct Context {
     // A supported compiler refusal suppressed by a noncomputable section.
     // Only the successful declaration result can carry it to post-admission metadata.
     noncomputable_definition: bool,
+    // Set while the `unfold` tactic expands a selection. The pin's `unfold` rewrites by the
+    // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
+    // compiled recursor application does not print as.
+    unfold_tactic: bool,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -730,6 +734,7 @@ impl Context {
             well_founded_definition: false,
             partial: None,
             noncomputable_definition: false,
+            unfold_tactic: false,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_coercions: Vec::new(),

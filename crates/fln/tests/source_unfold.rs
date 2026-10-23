@@ -111,3 +111,33 @@ fn unfold_refuses_missing_nondefinitions_and_unsafe_definitions_atomically() {
   exact True.intro"#,
     );
 }
+
+/// The pin's `unfold f` rewrites every occurrence of a structural definition by its unfold
+/// equation (vendored `Lean/Meta/Tactic/Unfold.lean`), so an occurrence whose match the argument
+/// does not reduce becomes a `match`. Over `fib (n + 2) = fib n + fib (n + 1)` it leaves
+/// `fib n + fib (n + 1) = (match n with …) + match n + 1 with …`, and `rfl` fails there
+/// (pinned v4.32.0, measured 2026-10-22). This engine's compiled recursor application is not
+/// that `match`, so such an `unfold` is refused, never left folded: folded, `rfl` would close it.
+/// An `unfold` whose occurrences all reduce is unchanged.
+#[test]
+fn unfold_refuses_an_occurrence_whose_match_does_not_reduce() {
+    let base = check(
+        &engine(),
+        r#"def fib : Nat → Nat
+  | 0 => 0
+  | 1 => 1
+  | n+2 => fib n + fib (n+1)"#,
+    );
+    reject(
+        &base,
+        r#"theorem bad (n : Nat) : fib (n+2) = fib n + fib (n+1) := by
+  unfold fib
+  rfl"#,
+    );
+    check(
+        &base,
+        r#"theorem result (n : Nat) (h : fib n + fib (n+1) = 3) : fib (n+2) = 3 := by
+  unfold fib
+  exact h"#,
+    );
+}
