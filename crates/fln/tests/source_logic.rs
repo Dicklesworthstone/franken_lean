@@ -1031,12 +1031,16 @@ fn matches_is_the_boolean_match() {
     );
 }
 
-/// `↑x` parses as the pin's `coeNotation`; the elaborator does not insert coercions, so it
-/// refuses the file after parsing, never reading `↑x` as `x`.
+/// `↑x` is the pin's `coeNotation` (`elabCoe`): `x` elaborates without an expected type and is
+/// then made to have the expected type. With the expected type `Nat`, `↑n` for `n : Nat` is `n`;
+/// with an unknown one it only unifies, so `def up' (n : Nat) := ↑n` has type `Nat → Nat`
+/// (pinned v4.32.0). An ill-typed operand stays refused.
 #[test]
-fn the_coercion_arrow_is_refused_after_parsing() {
+fn the_coercion_arrow_makes_its_term_have_the_expected_type() {
+    check("def up (n : Nat) : Nat := ↑n\ntheorem up_three : up 3 = 3 := rfl\n");
+    check("def up' (n : Nat) := ↑n\ntheorem up'_three : up' 3 = 3 := rfl\n");
     let (engine, limits) = engine();
-    let source = "def up (n : Nat) : Nat := ↑n\n";
+    let source = "def bad (n : Nat) : Nat := ↑(fun (x : Nat) => x)\n";
     match engine.check_source_files(
         &[source.as_bytes()],
         &KVMap::new(),

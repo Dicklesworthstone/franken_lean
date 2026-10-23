@@ -195,6 +195,28 @@ fun d => d.toC.w : D → Nat
 fun b => b.x : B → Nat
 ";
 
+/// The coercion arrow `↑e` (`elabCoe`): `e` elaborates without an expected type and is made to
+/// have the expected type. With none known it only unifies (`up2 : Nat → Nat`, `↑(3 : Nat)` is
+/// `3`); with `Int` expected a `Nat` is coerced, also as an operator's leaf, and prints `↑n`.
+const COERCION_ARROW: &str = r#"prelude
+import Init.Data.Int.Basic
+def up (n : Nat) : Nat := ↑n
+def up2 (n : Nat) := ↑n
+#check up2
+#check fun (n : Nat) => (↑n : Int)
+#check ↑(3 : Nat)
+example (n : Nat) : (↑n : Int) = Int.ofNat n := rfl
+def co3 (n : Nat) : Int := ↑n + 1
+#check co3
+"#;
+
+/// The pin's output for [`COERCION_ARROW`].
+const COERCION_ARROW_EXPECTED: &str = "up2 (n : Nat) : Nat
+fun n => ↑n : Nat → Int
+3 : Nat
+co3 (n : Nat) : Int
+";
+
 /// What this door refuses rather than print another way: a local type without fields (the pin
 /// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field with a default
 /// value (which the pin omits when the value equals it).
@@ -396,6 +418,26 @@ fn a_field_notation_object_drops_parent_projections_as_at_the_pin() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, PARENT_PROJECTIONS_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn the_coercion_arrow_coerces_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Coercions.lean");
+    std::fs::write(&entry, COERCION_ARROW).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, COERCION_ARROW_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, COERCION_ARROW_EXPECTED, "{stderr}");
 }
 
 #[test]

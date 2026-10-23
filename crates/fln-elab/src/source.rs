@@ -1805,6 +1805,8 @@ impl Context {
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
+            /// `↑e`'s value, made to have the expected type.
+            Coerced(Option<Expr>),
             Projection(Name, &'a [Syntax], Option<Expr>, bool, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -2439,6 +2441,16 @@ impl Context {
                                     ));
                                     continue;
                                 }
+                                // `↑e` (`elabCoe`, vendored `Lean/Elab/BuiltinNotation.lean:21-27`):
+                                // `e` elaborates without an expected type, then is made to have
+                                // the expected type, a coercion inserted where the types differ.
+                                if kind == &Name::from_components(["coeNotation"]) {
+                                    let parts = expect_node(syntax, kind, 2, "coercion notation")?;
+                                    expect_atom(&parts[0], "↑", "coercion arrow")?;
+                                    tasks.push(Task::Coerced(expected));
+                                    tasks.push(Task::Visit(&parts[1], None, true));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "typeAscription"]) {
                                     let parts = expect_node(syntax, kind, 5, "term ascription")?;
                                     expect_atom(&parts[2], ":", "ascription colon")?;
@@ -2958,6 +2970,16 @@ impl Context {
                             }
                             tasks.push(Task::AscribedValue(type_.value.clone(), expected, show));
                             tasks.push(Task::Visit(syntax, Some(type_.value), true));
+                        }
+                        Task::Coerced(expected) => {
+                            let term = values.pop().expect("coerced term visit");
+                            // The pin postpones `↑e` while its expected type is unknown. When it
+                            // is finally run with the type still a metavariable, the value only
+                            // unifies with it: `def up (n : Nat) := ↑n` is `n`, of type `Nat`,
+                            // and `#check ↑(3 : Nat)` prints `3 : Nat` (pinned v4.32.0). An
+                            // operator's `↑` leaf waits for the type the others give it
+                            // (`operators::postponed_leaf`).
+                            values.push(self.finish_term(term, expected.as_ref())?);
                         }
                         Task::AscribedValue(annotation, expected, show) => {
                             let term = values.pop().expect("ascribed term follows its annotation");

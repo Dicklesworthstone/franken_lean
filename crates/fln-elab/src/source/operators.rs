@@ -70,6 +70,8 @@ pub(super) fn postponed_leaf(syntax: &Syntax) -> bool {
         Syntax::Node { kind, args, .. } => {
             *kind == parser_kind(&["Term", "anonymousCtor"])
                 || *kind == parser_kind(&["Term", "dotIdent"])
+                // `↑e` (`elabCoe`'s `tryPostponeIfNoneOrMVar`).
+                || *kind == Name::from_components(["coeNotation"])
                 || (*kind == parser_kind(&["Term", "structInst"])
                     && args.len() == 6
                     && empty(&args[1])
