@@ -1230,10 +1230,11 @@ fn symbolic_nat_subtraction_uses_smart_delta_and_keeps_neutral_conversions() {
     // The small arithmetic seed intentionally gives sub/pred axiom headers.
     // Symbolic delta needs their actual logical bodies and helper closure.
     let mut base = ElabTxn::new(fln_env::environment::Environment::new(), KVMap::new(), 17);
-    for declaration in fln_elab::seed::imported_nat_intrinsic_model_declarations(
-        &Name::from_components(["Nat", "sub"]),
-    )
-    .expect("the pinned subtraction model exists")
+    for declaration in
+        fln_elab::seed::imported_nat_intrinsic_model_declarations(&Name::from_components([
+            "Nat", "sub",
+        ]))
+        .expect("the pinned subtraction model exists")
     {
         publish_in(&mut base, declaration);
     }
