@@ -179,28 +179,15 @@ impl Preparation<'_> {
         }
         let field = if let Some(field) = self.static_projection(family, index, receiver)? {
             field
+        } else if let Some(refolded) = self.nat_history_refold(index, receiver)? {
+            // Index refinement can expose an unfolded Nat course-of-values
+            // scaffold under an existing projection, including a receiver
+            // kept verbatim as a static argument (an equality endpoint). Its
+            // history component has no runtime layout at any major; refold
+            // the observed component to the `Nat.brecOn` it unfolds.
+            refolded
         } else {
-            // Index refinement can expose a zero Nat history under an
-            // existing projection. Select it before its constructor and
-            // callbacks acquire compiler-private identities. Every discarded
-            // field must still pass the ordinary inert projection check.
-            if !specialize::closed(receiver) {
-                return Ok(None);
-            }
-            let (head, args) = self.spine(receiver)?;
-            let ExprNode::Const { name, levels } = head.node() else {
-                return Ok(None);
-            };
-            if name != &super::name("Nat.rec") || levels.len() != 1 {
-                return Ok(None);
-            }
-            let Some(zero) = self.zero_nat_recursion(&args)? else {
-                return Ok(None);
-            };
-            let Some(field) = self.static_projection(family, index, &zero)? else {
-                return Ok(None);
-            };
-            field
+            return Ok(None);
         };
         // The selected field can come from an unfolded logical definition,
         // not from the already-erased input tree. Reapply the representation
