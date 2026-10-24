@@ -520,30 +520,54 @@ impl Context {
         ))
     }
 
-    /// Whether `type_`, a `do` block's expected type, can name a monad: it reduces to an
-    /// application, or is still unknown (a metavariable). The pin's `extractMonadInfo` refuses a
-    /// type that reaches neither by `whnfCore` and definition unfolding
-    /// (`Lean/Elab/Do/Basic.lean:741-760`). Whether the head is a monad is left to the binds.
-    pub(super) fn do_expected_type_applies(
+    /// The monad application a `do` block's expected type names, as the pin's `extractMonadInfo`
+    /// finds it (`Lean/Elab/Do/Basic.lean:743-757`): an application `m α` whose argument is a
+    /// type (`splitMonadApp?`, `:313-318`); otherwise `whnfCore`, then a metavariable head (a
+    /// monad still unknown), then one `unfoldDefinition?` step, each tried again. `None` is the
+    /// pin's refusal. The block is elaborated at the application found, so an alias of `IO Nat`
+    /// elaborates its statements in `IO`. A full WHNF instead would unfold `IO Nat` past its
+    /// application, through `EIO` and `EStateM`, to the function type underneath. Whether the
+    /// head is a monad is left to the binds.
+    pub(super) fn do_expected_monad_type(
         &mut self,
         type_: &Expr,
-    ) -> Result<bool, NatDefinitionElabError> {
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let mut type_ = self.instantiate(type_)?;
         loop {
             self.tick()?;
-            match type_.node() {
-                ExprNode::App { .. } | ExprNode::MVar { .. } => return Ok(true),
-                ExprNode::MData { expr, .. } => type_ = expr.clone(),
-                ExprNode::LetE { body, value, .. } => type_ = self.substitute(body, value)?,
-                _ => {
-                    let reduced = self.whnf(&type_)?;
-                    if reduced == type_ {
-                        return Ok(false);
-                    }
-                    type_ = reduced;
+            let mut bare = &type_;
+            while let ExprNode::MData { expr, .. } = bare.node() {
+                bare = expr;
+            }
+            if let ExprNode::App { a, .. } = bare.node() {
+                let argument = a.clone();
+                if self.is_type_argument(&argument)? {
+                    return Ok(Some(type_));
                 }
             }
+            let core = self.reduce_source_head(&type_, UnificationTransparency::None, true)?;
+            if core != type_ {
+                type_ = core;
+                continue;
+            }
+            if matches!(operators::spine(&type_).0.node(), ExprNode::MVar { .. }) {
+                return Ok(Some(type_));
+            }
+            match self.unfold_head_definition(&type_)? {
+                Some(unfolded) => type_ = unfolded,
+                None => return Ok(None),
+            }
         }
+    }
+
+    /// The pin's `isType`: the argument's type reduces to a sort. An argument whose type is not
+    /// known here is read as a type, so the binds decide.
+    fn is_type_argument(&mut self, argument: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let Some(type_) = self.known_type(argument)? else {
+            return Ok(true);
+        };
+        let type_ = self.whnf(&type_)?;
+        Ok(matches!(type_.node(), ExprNode::Sort { .. }))
     }
 
     // The top-level sequence and conditional branches share the same statement

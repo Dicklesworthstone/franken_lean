@@ -69,6 +69,24 @@ const ACCEPTED: &[(&str, &str)] = &[
         "do_pure_lets_under_run",
         "def w (x : Nat) : Nat := Id.run do\n  let y := x + x\n  pure (y * 2)\n",
     ),
+    // `extractMonadInfo` unfolds one definition at a time and stops at the first `m α`, so an
+    // alias of `IO Nat` is read as `IO Nat`, not reduced through `EStateM` to a function type.
+    (
+        "do_at_abbrev_alias",
+        "abbrev Act := IO Nat\ndef a : Act := do\n  let y := 1\n  pure (y + 2)\n",
+    ),
+    (
+        "do_at_def_alias",
+        "def Act := IO Nat\ndef a : Act := do\n  pure 3\n",
+    ),
+    (
+        "do_at_def_alias_with_effects",
+        "def IoActionAlias := IO Nat\ndef act : IoActionAlias := do\n  IO.println \"hi\"\n  return 42\n",
+    ),
+    (
+        "do_at_except_alias",
+        "def Res := Except String Nat\ndef r : Res := do\n  let y := 2\n  pure y\n",
+    ),
 ];
 
 const REFUSED: &[(&str, &str)] = &[
@@ -126,6 +144,16 @@ const REFUSED: &[(&str, &str)] = &[
     (
         "do_pure_let_at_bool",
         "def b : Bool := do\n  let y := true\n  y\n",
+    ),
+    // `splitMonadApp?` also needs the argument to be a type: `Fin 3` is an application of a
+    // number, and an alias of `Nat` unfolds to no application at all.
+    (
+        "do_at_application_of_a_value",
+        "def f : Fin 3 := do\n  let y : Fin 3 := 0\n  y\n",
+    ),
+    (
+        "do_at_alias_of_nat",
+        "def N := Nat\ndef n : N := do\n  let y := 1\n  y\n",
     ),
 ];
 

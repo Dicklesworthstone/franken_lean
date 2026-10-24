@@ -2221,20 +2221,26 @@ impl Context {
                                     continue;
                                 }
                                 // A whole `do` block (`do_notation::expand_do_node`): a known
-                                // expected type must reduce to an application, the pin's
-                                // `extractMonadInfo` (`Lean/Elab/Do/Basic.lean:741-760`); an
-                                // unknown one, or a metavariable head, is left to its binds.
+                                // expected type must name a monad application, the pin's
+                                // `extractMonadInfo` (`Lean/Elab/Do/Basic.lean:743-757`), and
+                                // the block is elaborated at that application. An unknown type
+                                // is left to its binds.
                                 if kind == &parser_kind(&["Term", "nativeDoBlock"]) {
                                     let [body] = args.as_slice() else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
-                                    if let Some(type_) = &expected
-                                        && !self.do_expected_type_applies(type_)?
-                                    {
-                                        return Err(failure(
-                                            SourceInferenceError::DoExpectedTypeNotMonad,
-                                        ));
-                                    }
+                                    let expected = match &expected {
+                                        Some(type_) => Some(
+                                            self.do_expected_monad_type(type_)?.ok_or_else(
+                                                || {
+                                                    failure(
+                                                        SourceInferenceError::DoExpectedTypeNotMonad,
+                                                    )
+                                                },
+                                            )?,
+                                        ),
+                                        None => None,
+                                    };
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
                                 }
