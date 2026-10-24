@@ -121,6 +121,20 @@ jobs:
         with:
           persist-credentials: false
 
+      # The publisher's existing host-wide lock is persistent across its fixture
+      # processes. A fresh hosted runner has no development-host /data/tmp.
+      - name: prepare the ownership publisher lock directory
+        shell: bash
+        run: |
+          lock_root=/data/tmp
+          if [[ ! -e "$lock_root" && ! -L "$lock_root" ]]; then
+            sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$lock_root"
+          fi
+          if [[ -L "$lock_root" || ! -d "$lock_root" || ! -w "$lock_root" ]]; then
+            echo "ownership publisher requires a real writable lock directory: $lock_root" >&2
+            exit 2
+          fi
+
       # UBS is Tribunal/engineering apparatus, never a FrankenLean runtime dependency.
       # Fetch one reviewed tree and verify the exact runner bytes before it reaches PATH.
       - name: checkout pinned UBS source

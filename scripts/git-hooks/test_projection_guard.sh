@@ -81,7 +81,13 @@ cp "$PUBLISHER" "$LAB/target/debug/kernel-ownership-publisher"
 export CARGO_TARGET_DIR="$LAB/target"
 
 write_source() { printf '%s\n' "$@" > .beads/issues.jsonl; }
-republish() { "$LAB/target/debug/kernel-ownership-publisher" --root . --wait-ms 30000 --robot >/dev/null; }
+republish() {
+    local result
+    if ! result=$("$LAB/target/debug/kernel-ownership-publisher" --root . --wait-ms 30000 --robot); then
+        printf 'harness: fixture publication failed\n%s\n' "$result" >&2
+        exit 2
+    fi
+}
 
 # This first lab isolates the projection law. Its prospective verification
 # validator is deliberately a total pass fixture; the second lab below uses the
