@@ -910,6 +910,9 @@ fn pattern(
         Tuple(usize, usize, Vec<usize>, usize),
         /// `x@p` (`Term.namedPattern`): the name and the `@`.
         Named(usize, usize),
+        /// `(field := p)` (`Term.namedArgument`): retain the label and parse its value
+        /// as a pattern, including nested constructors and aliases.
+        Argument(usize, usize),
         /// `(p : T)` (`Term.typeAscription`): the brackets and the colon; the type is a term.
         Ascription(usize, usize, usize),
         /// `..` as an application's last argument (`Term.ellipsis`): every remaining explicit
@@ -936,6 +939,19 @@ fn pattern(
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
+            Task::Argument(open, close) => {
+                let pattern = values.pop().expect("planned named constructor argument");
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "namedArgument"]),
+                    vec![
+                        leaves.leaf(open)?,
+                        leaves.leaf(open + 1)?,
+                        leaves.leaf(open + 2)?,
+                        pattern,
+                        leaves.leaf(close)?,
+                    ],
+                ));
+            }
             Task::Ascription(open, colon, close) => {
                 let pattern = values.pop().expect("planned ascribed pattern");
                 let type_ = bounded_term(
@@ -1116,6 +1132,14 @@ fn pattern(
                         return Err(refuse(view, tokens, close + 1));
                     }
                     let inner = range.start + 1..close;
+                    if inner.start + 2 < inner.end
+                        && matches!(tokens[inner.start].kind, TokenKind::Ident(_))
+                        && is_symbol(tokens, inner.start + 1, ":=")
+                    {
+                        tasks.push(Task::Argument(range.start, close));
+                        tasks.push(Task::Parse(inner.start + 2..close));
+                        continue;
+                    }
                     let elements = if inner.is_empty() {
                         Vec::new()
                     } else {

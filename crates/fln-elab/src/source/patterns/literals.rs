@@ -205,6 +205,7 @@ impl Context {
                         name: name.clone(),
                     },
                     syntax: Cow::Owned(identifier(name)),
+                    labels: vec![None; fields.len()],
                     fields,
                     ellipsis: false,
                 }));

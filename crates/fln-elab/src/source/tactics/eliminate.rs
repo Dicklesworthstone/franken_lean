@@ -683,7 +683,11 @@ impl Context {
             .elimination_reads(target)?
             .iter()
             .any(|id| dependents.contains(id));
-        Ok((generalized || motive).then_some(local))
+        // A private field column reused by another named/positional layout needs this
+        // constructor fact in later generated splits. These names are made by the matrix
+        // compiler; ordinary source locals still follow the pin's motive/dependency rule.
+        let shared = parts.generated && self.matrix_shared_columns.contains(&local.user_name);
+        Ok((generalized || motive || shared).then_some(local))
     }
 
     /// Whether `target` certainly lives outside `Prop`: its sort is a successor level.
@@ -1101,7 +1105,7 @@ impl Context {
                             .map(|name| name.unwrap_or_else(Name::anonymous))
                             .collect(),
                         body: AlternativeBody::Term(syntax),
-                        explicit_fields: true,
+                        explicit_fields: false,
                         exact_fields: true,
                         whole: None,
                     },

@@ -90,6 +90,14 @@ struct Model<'c> {
     applications: bool,
 }
 
+#[derive(Clone, Default)]
+struct Variables {
+    values: HashMap<Name, Expr>,
+    /// `PatternVar.collect` creates variable-type holes in this local-context order.
+    order: HashMap<Name, usize>,
+    types: Vec<(Name, Expr)>,
+}
+
 impl Context {
     /// Refuse a match the pin refuses for its patterns' types (module docs). `discriminants`
     /// are the elaborated discriminants (value, type) in order, `alternatives` its
@@ -353,6 +361,180 @@ fn with_offset(base: Option<Expr>, offset: u64) -> Expr {
 }
 
 impl Model<'_> {
+    /// Absolute constructor applications collect their fields in telescope order. Relative
+    /// heads are still unresolved at collection time: the pin visits their named values in
+    /// written order, then positional values (`PatternVar.lean:processCtorApp`). This matters
+    /// when an earlier variable's type would need a variable that has not entered scope yet.
+    fn variable_order(
+        &mut self,
+        row: &[&Syntax],
+    ) -> Result<HashMap<Name, usize>, NatDefinitionElabError> {
+        let mut scan: Vec<_> = row.iter().copied().collect();
+        let mut named = false;
+        while let Some(syntax) = scan.pop() {
+            self.cx.tick()?;
+            if syntax.kind() == Some(&parser_kind(&["Term", "namedArgument"])) {
+                named = true;
+                break;
+            }
+            if let Syntax::Node { args, .. } = syntax {
+                scan.extend(args);
+            }
+        }
+        if !named {
+            return Ok(HashMap::new());
+        }
+        let mut order = HashMap::new();
+        let mut pending: Vec<_> = row.iter().rev().copied().collect();
+        while let Some(syntax) = pending.pop() {
+            self.cx.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                pending.push(inner);
+                continue;
+            }
+            if let Some((name, inner)) = patterns::named::parts(syntax)? {
+                let index = order.len();
+                order.entry(name).or_insert(index);
+                pending.push(inner);
+                continue;
+            }
+            let (head, arguments) = match syntax {
+                Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "app"]) => {
+                    let [head, arguments] = args.as_slice() else {
+                        continue;
+                    };
+                    (
+                        head,
+                        expect_null_args(arguments, "constructor pattern arguments")?,
+                    )
+                }
+                Syntax::Node { kind, args, .. }
+                    if kind == &parser_kind(&["Term", "typeAscription"]) =>
+                {
+                    if let Some(pattern) = args.get(1) {
+                        pending.push(pattern);
+                    }
+                    continue;
+                }
+                _ => (syntax, &[][..]),
+            };
+            if head.kind() == Some(&parser_kind(&["Term", "dotIdent"])) {
+                let mut named = Vec::new();
+                let mut positional = Vec::new();
+                for argument in arguments {
+                    self.cx.tick()?;
+                    if let Some((_, value)) = patterns::arguments::named_argument(argument)? {
+                        named.push(value);
+                    } else if !application::is_ellipsis(argument) {
+                        positional.push(argument);
+                    }
+                }
+                named.extend(positional);
+                pending.extend(named.into_iter().rev());
+            } else if let Syntax::Ident { val, .. } = head {
+                let resolved = self
+                    .cx
+                    .resolve_source_name(val)?
+                    .unwrap_or_else(|| val.clone());
+                if let Some(constructor) = self.constructor(&resolved) {
+                    let arguments: Vec<_> = arguments.iter().collect();
+                    let fields = patterns::arguments::normalize(self.cx, &arguments, &constructor)?;
+                    pending.extend(
+                        fields
+                            .into_iter()
+                            .skip(constructor.num_params as usize)
+                            .flatten()
+                            .rev(),
+                    );
+                } else if arguments.is_empty()
+                    && !matches!(val.to_display_string().as_str(), "true" | "false")
+                {
+                    let index = order.len();
+                    order.entry(val.clone()).or_insert(index);
+                }
+            }
+        }
+        Ok(order)
+    }
+
+    fn variable_scope(
+        &mut self,
+        variables: &Variables,
+    ) -> Result<Option<(String, String)>, NatDefinitionElabError> {
+        if variables.order.is_empty() {
+            return Ok(None);
+        }
+        for (name, type_) in &variables.types {
+            self.cx.tick()?;
+            let Some(position) = variables.order.get(name) else {
+                continue;
+            };
+            let Some(type_) = self.inst(type_, 0)? else {
+                continue;
+            };
+            let mut pending = vec![type_.clone()];
+            while let Some(part) = pending.pop() {
+                self.cx.tick()?;
+                // Use the ordinary metered transparency policy, without publishing any
+                // assignments a pending instance in the caller could make during reduction.
+                // Model variables are neutral to this reducer. Charge speculative work even
+                // on refusal; a bound or an opaque family never grants capture permission.
+                let part = if matches!(
+                    part.node(),
+                    ExprNode::App { .. }
+                        | ExprNode::Const { .. }
+                        | ExprNode::LetE { .. }
+                        | ExprNode::MData { .. }
+                        | ExprNode::Proj { .. }
+                ) {
+                    let mut reduction = self.cx.clone();
+                    let result = reduction.whnf(&part);
+                    self.cx.txn.budget.heartbeats_consumed =
+                        reduction.txn.budget.heartbeats_consumed;
+                    result?
+                } else {
+                    part
+                };
+                match part.node() {
+                    ExprNode::App { f, a } => {
+                        pending.push(f.clone());
+                        pending.push(a.clone());
+                    }
+                    ExprNode::ForallE {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::Lam {
+                        binder_type, body, ..
+                    } => {
+                        pending.push(binder_type.clone());
+                        pending.push(body.clone());
+                    }
+                    ExprNode::Proj { expr, .. } => pending.push(expr.clone()),
+                    ExprNode::FVar { id } => {
+                        let Some(dependency) = self.names.get(id) else {
+                            continue;
+                        };
+                        if !variables
+                            .order
+                            .get(dependency)
+                            .is_some_and(|order| order >= position)
+                        {
+                            continue;
+                        }
+                        // The variable's type hole predates this local even when that local
+                        // is a proof. Proof irrelevance cannot extend a metavariable's scope.
+                        return Ok(Some((
+                            format!("?{}.type", name.to_display_string()),
+                            self.render(&type_, 0)?,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn run(
         &mut self,
         discriminants: &[(Expr, Expr)],
@@ -508,7 +690,10 @@ impl Model<'_> {
         for row in rows {
             self.assigned.clear();
             let mut values: Vec<(FVarId, Expr)> = Vec::new();
-            let mut variables = HashMap::new();
+            let mut variables = Variables {
+                order: self.variable_order(row)?,
+                ..Variables::default()
+            };
             for (position, discr) in discrs.iter().enumerate() {
                 self.cx.tick()?;
                 let mut expected = discr.slot.clone();
@@ -528,6 +713,9 @@ impl Model<'_> {
                 let saved = (self.assigned.clone(), variables.clone());
                 match self.pattern(syntax, &expected, true, &mut variables, 0)? {
                     Ok((value, _)) => {
+                        if let Some(mismatch) = self.variable_scope(&variables)? {
+                            return Ok(Round::Refused(mismatch));
+                        }
                         values.push((discr.placeholder.clone(), value));
                         continue;
                     }
@@ -903,7 +1091,7 @@ impl Model<'_> {
         syntax: &Syntax,
         expected: &Expr,
         ensure: bool,
-        variables: &mut HashMap<Name, Expr>,
+        variables: &mut Variables,
         depth: usize,
     ) -> Step<(Expr, Expr)> {
         self.cx.tick()?;
@@ -924,12 +1112,13 @@ impl Model<'_> {
             if let Some((name, inner)) = patterns::named::parts(syntax)? {
                 // The real matrix binds the alias to its checked receiver. It
                 // is not a fresh unification variable or a wildcard payload.
-                if variables.contains_key(&name) {
+                if variables.values.contains_key(&name) {
                     return Ok(Err(Stop::Unknown));
                 }
                 let id = self.fresh_id("v");
                 self.names.insert(id.clone(), name.clone());
-                variables.insert(name, Expr::fvar(id));
+                variables.types.push((name.clone(), expected.clone()));
+                variables.values.insert(name, Expr::fvar(id));
                 syntax = inner;
                 continue;
             }
@@ -1001,13 +1190,17 @@ impl Model<'_> {
                 } else if arguments.is_empty() && !val.is_anonymous() && val.parent().is_anonymous()
                 {
                     // A pattern variable: a local the pattern binds, never assigned.
-                    if variables.contains_key(val) {
+                    if variables.values.contains_key(val) {
                         return Ok(Err(Stop::Unknown));
                     }
                     let id = self.fresh_id("v");
                     self.names.insert(id.clone(), val.clone());
                     let variable = Expr::fvar(id);
-                    variables.insert(val.clone(), variable.clone());
+                    variables.types.push((val.clone(), expected.clone()));
+                    variables.values.insert(val.clone(), variable.clone());
+                    if let Some((actual, expected)) = self.variable_scope(variables)? {
+                        return Ok(Err(Stop::Mismatch(actual, expected)));
+                    }
                     return Ok(Ok((variable, expected.clone())));
                 } else {
                     return Ok(Err(Stop::Unknown));
@@ -1025,20 +1218,16 @@ impl Model<'_> {
         arguments: &[&Syntax],
         expected: &Expr,
         ensure: bool,
-        variables: &mut HashMap<Name, Expr>,
+        variables: &mut Variables,
         depth: usize,
     ) -> Step<(Expr, Expr)> {
         let Some(info) = self.constructor(constructor) else {
             return Ok(Err(Stop::Unknown));
         };
-        // `c a ..`: the pin makes every remaining argument a hole, in an order this model does
-        // not replay (vendored `Lean/Elab/PatternVar.lean:363-366`, `App.lean:810-825`).
-        if arguments
-            .iter()
-            .any(|argument| application::is_ellipsis(argument))
-        {
-            return Ok(Err(Stop::Unknown));
-        }
+        // The pin collects named fields in constructor telescope order, including implicit
+        // fields. Reordering source labels must not move a dependent pattern before its index
+        // or turn a rigid named index into an inferred wildcard.
+        let arguments = patterns::arguments::normalize(self.cx, arguments, &info)?;
         let levels = info
             .base
             .level_params
@@ -1048,7 +1237,7 @@ impl Model<'_> {
             .collect();
         let mut value = Expr::const_(constructor.clone(), levels);
         let mut type_ = info.base.type_.clone();
-        let mut remaining = arguments.iter();
+        let mut remaining = arguments.into_iter();
         let mut propagated = false;
         let mut binder = 0u32;
         while let ExprNode::ForallE {
@@ -1060,22 +1249,33 @@ impl Model<'_> {
         {
             self.cx.tick()?;
             let (binder_type, body) = (binder_type.clone(), body.clone());
-            let argument = if *binder_info == BinderInfo::Default {
+            let syntax = remaining
+                .next()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let parameter_hole = binder < info.num_params
+                && *binder_info != BinderInfo::Default
+                && syntax.is_some_and(|syntax| {
+                    matches!(syntax.kind(), Some(kind)
+                    if kind == &parser_kind(&["Term", "hole"])
+                        || kind == &parser_kind(&["Term", "syntheticHole"]))
+                });
+            let argument = if parameter_hole {
+                self.fresh_mvar()
+            } else if *binder_info == BinderInfo::Default || syntax.is_some() {
                 // An explicit parameter of the family (a promoted index) is an inaccessible
                 // position, which FrankenLean's lowering refuses by name; leave it there.
                 if binder < info.num_params {
                     return Ok(Err(Stop::Unknown));
                 }
-                let Some(syntax) = remaining.next() else {
-                    return Ok(Err(Stop::Unknown));
-                };
                 if !propagated {
                     propagated = true;
                     // `propagateExpectedType`, before the first explicit argument unless it is a
                     // hole: only when the result depends on no remaining argument.
-                    let hole = matches!(syntax.kind(), Some(kind)
+                    let hole = syntax.is_none_or(|syntax| {
+                        matches!(syntax.kind(), Some(kind)
                         if kind == &parser_kind(&["Term", "hole"])
-                            || kind == &parser_kind(&["Term", "syntheticHole"]));
+                            || kind == &parser_kind(&["Term", "syntheticHole"]))
+                    });
                     if !hole
                         && let Some(result) = result_type(&type_)
                         && self.def_eq(&result, expected)? == Answer::Unknown
@@ -1083,14 +1283,18 @@ impl Model<'_> {
                         return Ok(Err(Stop::Unknown));
                     }
                 }
-                let Some(binder_type) = self.inst(&binder_type, 0)? else {
-                    return Ok(Err(Stop::Unknown));
-                };
-                match self.pattern(syntax, &binder_type, true, variables, depth + 1)? {
-                    Ok((argument, _)) => argument,
-                    // A nested pattern is never refined: its mismatch is the pin's
-                    // `Application type mismatch`.
-                    Err(stop) => return Ok(Err(stop)),
+                if let Some(syntax) = syntax {
+                    let Some(binder_type) = self.inst(&binder_type, 0)? else {
+                        return Ok(Err(Stop::Unknown));
+                    };
+                    match self.pattern(syntax, &binder_type, true, variables, depth + 1)? {
+                        Ok((argument, _)) => argument,
+                        // A nested pattern is never refined: its mismatch is the pin's
+                        // `Application type mismatch`.
+                        Err(stop) => return Ok(Err(stop)),
+                    }
+                } else {
+                    self.fresh_mvar()
                 }
             } else {
                 self.fresh_mvar()

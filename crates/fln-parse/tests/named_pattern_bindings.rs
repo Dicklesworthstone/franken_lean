@@ -26,6 +26,41 @@ fn named() -> Name {
 }
 
 #[test]
+fn named_constructor_arguments_keep_labels_nested_patterns_and_original_spans() {
+    let source =
+        "def f : T -> Nat\r\n  | .mk («𝒃» /-label-/ := whole@(.some x)) (a := _) .. => x\r\n";
+    let parsed = parse_definition(source.as_bytes()).unwrap();
+    let arguments = nodes(
+        parsed.syntax(),
+        &Name::from_components(["Lean", "Parser", "Term", "namedArgument"]),
+    );
+    assert_eq!(arguments.len(), 2);
+    assert_eq!(arguments[0].len(), 5);
+    assert!(
+        matches!(&arguments[0][1], Syntax::Ident { val, .. } if val == &Name::from_components(["𝒃"]))
+    );
+    assert_eq!(arguments[0][3].kind(), Some(&named()));
+    assert_eq!(nodes(parsed.syntax(), &named()).len(), 1);
+    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    for argument in arguments {
+        for (index, spelling) in [(0, "("), (2, ":="), (4, ")")] {
+            let Syntax::Atom {
+                info: SourceInfo::Original { pos, end_pos, .. },
+                val,
+            } = &argument[index]
+            else {
+                panic!("named-argument punctuation must retain original spans")
+            };
+            assert_eq!(val, spelling);
+            assert_eq!(
+                &parsed.source_view().normalized().as_bytes()[pos.0..end_pos.0],
+                spelling.as_bytes()
+            );
+        }
+    }
+}
+
+#[test]
 fn collections_preserve_nested_aliases_as_constructor_arguments() {
     for (source, count) in [
         (

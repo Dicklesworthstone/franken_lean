@@ -307,3 +307,194 @@ fn stopped_admission_and_failed_proofs_publish_no_prefix_and_retry_deterministic
         assert_eq!(base.logical_root(&options), root);
     });
 }
+
+#[test]
+fn named_constructor_patterns_select_fields_in_telescope_order() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+inductive T where
+  | mk (a : Nat) (b : Bool) (c : Nat)
+def chosen : T -> Nat
+  | T.mk (b := true) (a := x) _ => x
+  | _ => 0
+def last (t : T) : Nat := match t with | .mk (c := z) .. => z
+def mixed : T -> Nat
+  | .mk (b := true) (a := x) _ => x
+  | .mk x false z => Nat.add x z
+def reordered : T -> Nat
+  | .mk (c := z) x (b := false) => Nat.add z x
+  | .mk (a := x) (c := _) (b := true) => x
+theorem chosenTrue : Eq (chosen (.mk 4 true 9)) 4 := rfl
+theorem chosenFalse : Eq (chosen (.mk 4 false 9)) 0 := rfl
+theorem lastValue : Eq (last (.mk 4 true 9)) 9 := rfl
+theorem mixedTrue : Eq (mixed (.mk 4 true 9)) 4 := rfl
+theorem mixedFalse : Eq (mixed (.mk 4 false 9)) 13 := rfl
+theorem reorderedTrue : Eq (reordered (.mk 4 true 9)) 4 := rfl
+theorem reorderedFalse : Eq (reordered (.mk 4 false 9)) 13 := rfl
+"#,
+        );
+    });
+}
+
+#[test]
+fn named_constructor_patterns_bind_implicit_and_nested_fields() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+inductive Box where
+  | mk {n : Nat} (value : Nat) : Box
+def unbox : Box -> Nat | .mk (n := n) v => Nat.add n v
+inductive Pack : Type 1 where
+  | mk {A : Type} (value : A) : Pack
+def typeOf : Pack -> Type | .mk (value := _) (A := A) => A
+def repack : Pack -> Pack | .mk (A := A) (value := x) => @Pack.mk A x
+def repackAbsolute : Pack -> Pack | Pack.mk (value := x) (A := A) => @Pack.mk A x
+def Ignore (A : Type) : Type := Nat
+inductive ErasedPack : Type 1 where
+  | mk {A : Type} (value : Ignore A) : ErasedPack
+def erasedValue : ErasedPack -> Nat | .mk (value := x) (A := A) => x
+inductive Inner where
+  | mk (left right : Nat)
+inductive Outer where
+  | mk (flag : Bool) (inside : Inner)
+def nested : Outer -> Nat
+  | .mk (inside := .mk (right := y) (left := x)) (flag := true) => Nat.add x y
+  | _ => 0
+def alias : Outer -> Nat
+  | whole@(.mk (inside := inner@(.mk (right := y) ..)) ..) => y
+def mixedNested : Outer -> Nat
+  | .mk (inside := .mk (left := 0) (right := y)) (flag := _) => y
+  | .mk _ (.mk x _) => x
+theorem implicitValue : Eq (unbox (.mk (n := 4) 9)) 13 := rfl
+theorem implicitType : Eq (typeOf (.mk (A := Nat) 7)) Nat := rfl
+theorem dependentField : Eq (repack (.mk (A := Nat) 7)) (.mk (A := Nat) 7) := rfl
+theorem absoluteOrder : Eq (repackAbsolute (.mk (A := Nat) 7)) (.mk (A := Nat) 7) := rfl
+theorem erasedDependency : Eq (erasedValue (.mk (A := Nat) (7 : Nat))) 7 := rfl
+theorem nestedValue : Eq (nested (.mk true (.mk 4 9))) 13 := rfl
+theorem nestedFallback : Eq (nested (.mk false (.mk 4 9))) 0 := rfl
+theorem aliasValue : Eq (alias (.mk false (.mk 4 9))) 9 := rfl
+theorem mixedNestedZero : Eq (mixedNested (.mk false (.mk 0 9))) 9 := rfl
+theorem mixedNestedSucc : Eq (mixedNested (.mk true (.mk 4 9))) 4 := rfl
+"#,
+        );
+    });
+}
+
+#[test]
+fn named_constructor_patterns_preserve_dependent_wildcard_refinement() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+inductive V : Nat -> Type where
+  | mk (n : Nat) (value : Nat) : V (Nat.succ n)
+def readValue (v : V 2) : Nat := match v with | .mk (value := x) (n := _) => x
+def equations : V 2 -> Nat | .mk (value := x) (n := _) => x
+theorem getValue : Eq (readValue (.mk 1 8)) 8 := rfl
+theorem equationValue : Eq (equations (.mk 1 8)) 8 := rfl
+"#,
+        );
+    });
+}
+
+#[test]
+fn named_constructor_pattern_errors_are_typed_and_publish_nothing() {
+    with_fixture(|base, compiler| {
+        let prefix = "inductive T where\n  | mk (a : Nat) (b : Bool) (c : Nat)\n";
+        let options = KVMap::new();
+        let root = base.logical_root(&options);
+        for (body, expected) in [
+            (
+                "def bad : T -> Nat | .mk (missing := x) .. => 0",
+                "InvalidNamedArgument",
+            ),
+            (
+                "def bad : T -> Nat | .mk (a := x) (a := y) .. => x",
+                "DuplicateNamedArgument",
+            ),
+            ("def bad : T -> Nat | .mk (a := x) => x", "WrongArity"),
+            (
+                "def bad : T -> Nat | .mk (a := x) y z extra => x",
+                "WrongArity",
+            ),
+            (
+                "def bad : T -> Nat | .mk (a := x) (c := x) .. => x",
+                "DuplicateVariable",
+            ),
+            (
+                "def bad : T -> Nat | .mk (a := true) .. => 0",
+                "TypeMismatch",
+            ),
+            (
+                "def bad : T -> Nat | .mk (b := true) (a := x) _ => x | .mk x false z => Nat.add x z | .mk _ (b := true) _ => unknownBody",
+                "UnreachableRow",
+            ),
+        ] {
+            let source = format!("{prefix}{body}\n");
+            oracle(compiler, &source, false);
+            let error = base
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}").contains(expected),
+                "{source}\n{error:?}"
+            );
+            assert_eq!(base.logical_root(&options), root);
+            assert!(!base.environment().contains(&Name::from_components(["T"])));
+        }
+        let source = "inductive V : Nat -> Type where\n  | mk (n : Nat) (value : Nat) : V (Nat.succ n)\ndef bad (v : V 2) : Nat := match v with | .mk (value := x) (n := n) => x\n";
+        oracle(compiler, source, false);
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("TypeMismatch"), "{error:?}");
+        assert_eq!(base.logical_root(&options), root);
+        for family in [
+            "def Family (A : Type) : Type := A",
+            "opaque Family (A : Type) : Type := A",
+        ] {
+            let source = format!(
+                "{family}\ninductive FamilyPack : Type 1 where\n  | mk (A : Type) (value : Family A) : FamilyPack\ndef bad : FamilyPack -> FamilyPack | .mk (value := x) (A := A) => FamilyPack.mk A x\n"
+            );
+            oracle(compiler, &source, false);
+            let error = base
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("TypeMismatch"),
+                "{source}\n{error:?}"
+            );
+            assert_eq!(base.logical_root(&options), root);
+        }
+        for source in [
+            "inductive FamilyPack : Type 1 where\n  | mk (F : Nat -> Type) (value : F 0) : FamilyPack\ndef bad : FamilyPack -> FamilyPack | .mk (value := x) (F := F) => FamilyPack.mk F x\n",
+            "inductive PredicatePack where\n  | mk (P : Nat -> Prop) (value : P 0) : PredicatePack\ndef bad : PredicatePack -> PredicatePack | .mk (value := x) (P := P) => PredicatePack.mk P x\n",
+            "opaque ProofFamily (h : (n : Nat) -> Eq n n) : Type := Nat\ninductive ProofPack where\n  | mk (h : (n : Nat) -> Eq n n) (value : ProofFamily h) : ProofPack\ndef bad : ProofPack -> ProofPack | .mk (value := x) (h := h) => ProofPack.mk h x\n",
+        ] {
+            oracle(compiler, source, false);
+            let error = base
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("TypeMismatch"),
+                "{source}\n{error:?}"
+            );
+            assert_eq!(base.logical_root(&options), root);
+        }
+        // The relative head's variables are collected in written named-argument order,
+        // unlike an absolute head. `x`'s type cannot refer to the later variable `A`.
+        let source = "inductive Pack : Type 1 where\n  | mk {A : Type} (value : A) : Pack\ndef bad : Pack -> Pack | .mk (value := x) (A := A) => @Pack.mk A x\n";
+        oracle(compiler, source, false);
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("TypeMismatch"), "{error:?}");
+        assert_eq!(base.logical_root(&options), root);
+    });
+}

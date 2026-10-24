@@ -6,6 +6,7 @@
 //! elaborator. Every original row has an elaboration witness: a redundant row
 //! cannot hide an ill-typed body when a generated fallback is unnecessary.
 use super::*;
+pub(super) mod arguments;
 mod coverage;
 mod functions;
 mod literals;
@@ -24,6 +25,8 @@ struct Constructor<'a> {
     head: Head,
     syntax: Cow<'a, Syntax>,
     fields: Vec<usize>,
+    /// Labels stay attached to their written fields until the typed backend resolves the head.
+    labels: Vec<Option<Name>>,
     /// Written with a trailing `..`: `fields` is a prefix, the rest are `_`.
     ellipsis: bool,
 }
@@ -563,7 +566,7 @@ impl Context {
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
-            Constructor(Head, Cow<'a, Syntax>, usize, bool),
+            Constructor(Head, Cow<'a, Syntax>, usize, Vec<Option<Name>>, bool),
             Named(Name),
         }
         let mut pending = vec![Task::Visit(syntax)];
@@ -576,13 +579,14 @@ impl Context {
                     values.push(arena.len());
                     arena.push(Pattern::Named { name, pattern });
                 }
-                Task::Constructor(head, syntax, start, ellipsis) => {
+                Task::Constructor(head, syntax, start, labels, ellipsis) => {
                     let fields = values.split_off(start);
                     values.push(arena.len());
                     arena.push(Pattern::Constructor(Constructor {
                         head,
                         syntax,
                         fields,
+                        labels,
                         ellipsis,
                     }));
                 }
@@ -607,6 +611,7 @@ impl Context {
                             },
                             Cow::Owned(anonymous_head()),
                             values.len(),
+                            vec![None; elements.len()],
                             false,
                         ));
                         pending.extend(elements.into_iter().rev().map(Task::Visit));
@@ -671,13 +676,35 @@ impl Context {
                         _ => None,
                     };
                     if let Some(head_key) = constructor {
+                        let mut labels = Vec::new();
+                        let mut fields = Vec::new();
+                        let mut names = HashSet::new();
+                        for argument in arguments {
+                            self.tick()?;
+                            match arguments::named_argument(argument)? {
+                                Some((name, value)) => {
+                                    if !names.insert(name.clone()) {
+                                        return Err(failure(
+                                            SourceInferenceError::DuplicateNamedArgument(name),
+                                        ));
+                                    }
+                                    labels.push(Some(name));
+                                    fields.push(value);
+                                }
+                                None => {
+                                    labels.push(None);
+                                    fields.push(argument);
+                                }
+                            }
+                        }
                         pending.push(Task::Constructor(
                             head_key,
                             Cow::Borrowed(head),
                             values.len(),
+                            labels,
                             ellipsis,
                         ));
-                        pending.extend(arguments.iter().rev().map(Task::Visit));
+                        pending.extend(fields.into_iter().rev().map(Task::Visit));
                     } else {
                         if !arguments.is_empty() || ellipsis {
                             return Err(invalid());
@@ -1029,19 +1056,39 @@ impl Context {
                         let Pattern::Constructor(constructor) = &arena[pattern] else {
                             unreachable!()
                         };
+                        let named = matrix.rows.iter().any(|row| {
+                            matches!(&arena[row.patterns[0]], Pattern::Constructor(other)
+                                if canonical[&other.head] == canonical[&constructor.head]
+                                    && other.labels.iter().any(Option::is_some))
+                        });
                         // A pattern without `..` fixes the head's arity in this column, and one
                         // with `..` may write a prefix of it. When every pattern of the head
                         // ends in `..`, the longest prefix is split here and the generated
                         // pattern keeps `..`, so the typed backend supplies the rest.
                         let mut exact = None;
-                        let mut written = 0;
+                        let mut slots = Vec::new();
+                        let mut layouts = HashMap::new();
                         for row in &matrix.rows {
                             self.tick()?;
                             if let Pattern::Constructor(other) = &arena[row.patterns[0]]
                                 && canonical[&other.head] == canonical[&constructor.head]
                             {
-                                written = written.max(other.fields.len());
-                                if !other.ellipsis {
+                                let mut layout = Vec::new();
+                                for slot in arguments::slots(&other.labels) {
+                                    self.tick()?;
+                                    let index = match slots.iter().position(|known| *known == slot)
+                                    {
+                                        Some(index) => index,
+                                        None => {
+                                            let index = slots.len();
+                                            slots.push(slot);
+                                            index
+                                        }
+                                    };
+                                    layout.push(index);
+                                }
+                                layouts.insert(row.patterns[0], layout);
+                                if !named && !other.ellipsis {
                                     if exact.is_some_and(|arity| arity != other.fields.len()) {
                                         return Err(invalid());
                                     }
@@ -1049,10 +1096,13 @@ impl Context {
                                 }
                             }
                         }
-                        if exact.is_some_and(|arity| arity < written) {
+                        if exact.is_some_and(|arity| arity < slots.len()) {
                             return Err(invalid());
                         }
-                        let fields: Vec<_> = (0..written)
+                        if slots.len() > 256 {
+                            return Err(failure(SourceInferenceError::ResourceLimit));
+                        }
+                        let fields: Vec<_> = (0..slots.len())
                             .map(|_| self.matrix_name())
                             .collect::<Result<_, _>>()?;
                         let mut rows = Vec::new();
@@ -1063,15 +1113,13 @@ impl Context {
                                 Pattern::Constructor(other)
                                     if canonical[&other.head] == canonical[&constructor.head] =>
                                 {
-                                    let omitted = fields.len() - other.fields.len();
-                                    copy.patterns.splice(
-                                        ..0,
-                                        other
-                                            .fields
-                                            .iter()
-                                            .copied()
-                                            .chain(std::iter::repeat_n(0, omitted)),
-                                    );
+                                    let mut columns = vec![0; fields.len()];
+                                    for (field, column) in
+                                        other.fields.iter().zip(&layouts[&row.patterns[0]])
+                                    {
+                                        columns[*column] = *field;
+                                    }
+                                    copy.patterns.splice(..0, columns);
                                 }
                                 Pattern::Constructor(_) => continue,
                                 Pattern::Literal(_) | Pattern::Named { .. } => {
@@ -1109,14 +1157,53 @@ impl Context {
                                 };
                             identifier(name)
                         };
-                        let mut arguments: Vec<_> = fields.into_iter().map(identifier).collect();
-                        if exact.is_none() {
-                            arguments.push(ellipsis());
-                        }
-                        let pattern = if arguments.is_empty() {
-                            head
+                        let pattern = if named {
+                            // Each row retains its argument layout. Only the ordinary typed
+                            // matcher can resolve `.mk`, validate labels, and identify columns
+                            // that select one field through different named/positional layouts.
+                            let mut rows = Vec::new();
+                            for row in &matrix.rows {
+                                self.tick()?;
+                                let Pattern::Constructor(other) = &arena[row.patterns[0]] else {
+                                    continue;
+                                };
+                                if canonical[&other.head] != canonical[&constructor.head] {
+                                    continue;
+                                }
+                                let mut args: Vec<_> = other
+                                    .labels
+                                    .iter()
+                                    .zip(&layouts[&row.patterns[0]])
+                                    .map(|(label, column)| {
+                                        arguments::argument(
+                                            label,
+                                            identifier(fields[*column].clone()),
+                                        )
+                                    })
+                                    .collect();
+                                if other.ellipsis {
+                                    args.push(ellipsis());
+                                }
+                                rows.push(null(args));
+                            }
+                            Syntax::node(
+                                parser_kind(&["Term", "matrixCtorPattern"]),
+                                vec![head, null(rows)],
+                            )
                         } else {
-                            Syntax::node(parser_kind(&["Term", "app"]), vec![head, null(arguments)])
+                            let mut arguments: Vec<_> =
+                                fields.into_iter().map(identifier).collect();
+                            if exact.is_none() {
+                                arguments.push(ellipsis());
+                            }
+                            if arguments.is_empty() {
+                                head
+                            } else {
+                                Syntax::node(
+                                    parser_kind(&["Term", "app"]),
+                                    vec![head, null(arguments)],
+                                )
+                            }
                         };
                         alternatives.push(Alternative { pattern });
                         branches.push(Matrix {
