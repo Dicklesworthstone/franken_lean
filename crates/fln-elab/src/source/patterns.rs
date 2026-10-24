@@ -1285,6 +1285,7 @@ impl Context {
             loops |= do_notation::is_while_loop(node);
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
+                || diagnostics::is_diagnostic(node)
                 || collections::is_notation(node)
                 || cdot::is_cdot(node)
                 || binders::is_exists(node)
@@ -1383,6 +1384,7 @@ impl Context {
                     };
                     // `·` first: collection notation would turn a tuple into `Prod.mk`.
                     let node = self.expand_cdot_node(node, pattern)?;
+                    let node = self.expand_diagnostic_node(node, original, pattern)?;
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
                     let node = self.expand_binder_predicate_node(node, pattern)?;

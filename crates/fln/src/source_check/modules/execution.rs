@@ -465,6 +465,7 @@ impl imported::SourceOleanImport {
                         Some(module.name),
                         public.as_mut(),
                         presentation,
+                        &[(module.source, Some(module.name))],
                     )
                     .map_err(|error| source_error(module.name, error))?
                 {

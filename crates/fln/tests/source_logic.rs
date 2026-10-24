@@ -1514,19 +1514,27 @@ fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
 #[test]
 fn an_inlined_let_shows_its_value_and_an_inlined_have_hides_it() {
     check("theorem shown : True := letI n : Nat := 7; have h : n = 7 := rfl; True.intro\n");
-    let (engine, limits) = engine();
-    let source = "theorem hidden : True := haveI n : Nat := 7; have h : n = 7 := rfl; True.intro\n";
-    assert!(
-        !matches!(
-            engine.check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            ),
-            Ok(fln::Outcome::Complete(_))
-        ),
-        "{source}"
+    check("theorem anonymousLet : True := let : Nat := 7; have h : this = 7 := rfl; True.intro\n");
+    check(
+        "theorem anonymousLetI : True := letI : Nat := 7; have h : this = 7 := rfl; True.intro\n",
     );
+    let (engine, limits) = engine();
+    for source in [
+        "theorem hidden : True := haveI n : Nat := 7; have h : n = 7 := rfl; True.intro\n",
+        "theorem anonymousRec : True := let rec : Nat := 7; True.intro\n",
+    ] {
+        assert!(
+            !matches!(
+                engine.check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits),
+                ),
+                Ok(fln::Outcome::Complete(_))
+            ),
+            "{source}"
+        );
+    }
 }
 
 /// `def d : T where fields` is `def d : T := { fields }` for any declaration, as for an instance

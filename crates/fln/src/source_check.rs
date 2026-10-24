@@ -7,6 +7,16 @@ pub mod modules;
 mod reducibility;
 pub(crate) mod scopes;
 
+pub(crate) fn source_site(
+    source: &[u8],
+) -> Result<fln_elab::source::scope::SourceSite, EngineExecutionError> {
+    fln_syntax::source::SourceText::from_utf8(source)
+        .map(fln_elab::source::scope::SourceSite::new)
+        .map_err(fln_parse::NatDefinitionParseError::Source)
+        .map_err(DefinitionFrontendError::Parse)
+        .map_err(EngineExecutionError::Frontend)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceCheckLimits {
     pub admission: EngineAdmissionLimits,
@@ -586,7 +596,7 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
-        self.check_source_files_recording(sources, options, limits, None, None, None, None)
+        self.check_source_files_recording(sources, options, limits, None, None, None, None, None)
     }
 
     // Module imports record only the candidates that survived ordinary admission.
@@ -601,6 +611,7 @@ impl Engine {
         private_module: Option<&Name>,
         source_module: Option<&Name>,
         mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
+        original_source: Option<(&[u8], fln_parse::BytePos)>,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         if sources.is_empty() {
             return Err(SourceCheckError::EmptyInput);
@@ -627,6 +638,10 @@ impl Engine {
         let mut theorems = 0;
         let mut final_scope = engine.base_source_scope();
         for (file, source) in sources.iter().enumerate() {
+            let (original, source_offset) =
+                original_source.unwrap_or((source, fln_parse::BytePos(0)));
+            let site = source_site(original)
+                .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
             // Global reducibility attributes may change only definitions authored
             // in this file, never declarations supplied by its predecessor.
             let file_base = engine.environment.clone();
@@ -674,6 +689,8 @@ impl Engine {
                         continue;
                     }
                 };
+                scopes.current.source_site =
+                    Some(site.at_offset(fln_parse::BytePos(source_offset.0 + start.0)));
                 let control =
                     grammar.enter(|| parse_control_command(command, start, file, count))?;
                 if let Some(control) = control {

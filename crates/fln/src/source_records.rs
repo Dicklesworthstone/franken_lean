@@ -214,12 +214,16 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let mut scope = scope.clone();
+        if scope.source_site.is_none() {
+            scope.source_site = Some(source_check::source_site(source)?);
+        }
         self.admit_parsed_command_in_scope(
             source,
             parse_scoped_command(source)?,
             options,
             limits,
-            scope,
+            &scope,
         )
     }
 

@@ -9,9 +9,48 @@ pub(super) mod visibility;
 use crate::aliases::AliasTable;
 use crate::protected_names::ProtectedNames;
 use fln_core::name::LeafView;
+use fln_syntax::source::{BytePos, SourceText};
+use fln_syntax::view::SourceView;
 pub use visibility::command_scope;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The source file and the original byte offset of the command being elaborated.
+/// Syntax positions belong to the normalized view; the offset remains in the raw
+/// file so partitioned commands and standalone commands use the same boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSite {
+    pub view: std::sync::Arc<SourceView>,
+    pub offset: BytePos,
+}
+
+impl SourceSite {
+    pub fn new(text: SourceText) -> Self {
+        Self {
+            view: std::sync::Arc::new(SourceView::of(&text)),
+            offset: BytePos(0),
+        }
+    }
+
+    pub fn at_offset(&self, offset: BytePos) -> Self {
+        Self {
+            view: self.view.clone(),
+            offset,
+        }
+    }
+
+    pub(super) fn syntax_offset(&self, local: BytePos) -> Option<BytePos> {
+        let start = self.view.from_original(self.offset).or_else(|| {
+            // A command slice may begin at the CR of a leading CRLF. Point
+            // mapping rejects that removed byte, but this is a slice boundary:
+            // it belongs at the normalized LF that the following byte retains.
+            let next = self.offset.0.checked_add(1)?;
+            self.view.from_original(BytePos(next))
+        })?;
+        let offset = start.0.checked_add(local.0)?;
+        (offset <= self.view.normalized().len_bytes()).then_some(BytePos(offset))
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq)]
 pub struct SourceScope {
     pub namespace: Name,
     /// A `module` file's declarations are private by default. This is the
@@ -22,6 +61,10 @@ pub struct SourceScope {
     /// `module` one. A legacy file's declarations stay public by default, but an explicit
     /// `private` one is named under this identity, as `mkPrivateName` names it.
     pub source_module: Option<Name>,
+    /// Location used by source terms such as `panic!` that embed their own position.
+    /// This is not an exported environment effect or admission authority.
+    /// Scope equality excludes this presentation-only metadata.
+    pub source_site: Option<SourceSite>,
     /// The enclosing public section's default, or the effective visibility of
     /// a single declaration after [`Self::for_declaration`]. Module identity is
     /// retained independently so private aliases still resolve locally.
@@ -54,6 +97,47 @@ pub struct SourceScope {
     /// Options `set_option` set and [`options::admit`] honors, until the end of the enclosing
     /// section or namespace. Every elaboration in this scope starts with them.
     pub options: KVMap,
+}
+
+impl PartialEq for SourceScope {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructure every field so adding a semantic scope effect requires an
+        // explicit equality decision. A location alone must not change admission
+        // dispatch through the existing `scope == SourceScope::default()` checks.
+        let Self {
+            namespace,
+            private_module,
+            source_module,
+            source_site: _,
+            public_declarations,
+            expose_definitions,
+            noncomputable_section,
+            opened,
+            explicit_opens,
+            universes,
+            variables,
+            instance_scopes,
+            local_simp,
+            frontier_recursors,
+            arithmetic,
+            options,
+        } = self;
+        namespace == &other.namespace
+            && private_module == &other.private_module
+            && source_module == &other.source_module
+            && public_declarations == &other.public_declarations
+            && expose_definitions == &other.expose_definitions
+            && noncomputable_section == &other.noncomputable_section
+            && opened == &other.opened
+            && explicit_opens == &other.explicit_opens
+            && universes == &other.universes
+            && variables == &other.variables
+            && instance_scopes == &other.instance_scopes
+            && local_simp == &other.local_simp
+            && frontier_recursors == &other.frontier_recursors
+            && arithmetic == &other.arithmetic
+            && options == &other.options
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -821,6 +905,51 @@ mod tests {
     fn n(s: &str) -> Name {
         Name::from_components(s.split('.'))
     }
+
+    #[test]
+    fn source_locations_do_not_change_semantic_scope_equality() {
+        let mut scope = SourceScope {
+            source_site: Some(SourceSite::new(
+                SourceText::from_utf8(b"\n#check Nat").unwrap(),
+            )),
+            ..SourceScope::default()
+        };
+        assert_eq!(scope, SourceScope::default());
+        scope.source_site = Some(
+            SourceSite::new(SourceText::from_utf8(b"\n\n#check Bool").unwrap())
+                .at_offset(BytePos(2)),
+        );
+        assert_eq!(scope, SourceScope::default());
+        scope.namespace = n("Different");
+        assert_ne!(scope, SourceScope::default());
+    }
+
+    #[test]
+    fn source_sites_map_normalized_syntax_after_original_crlf_boundaries() {
+        let prefix = "-- π\r\n";
+        let command = "#eval Id.run do\r\n  assert! false\r\n  return 42\r\n";
+        let source = format!("{prefix}{command}");
+        let site = SourceSite::new(SourceText::from_utf8(source.as_bytes()).unwrap())
+            .at_offset(BytePos(prefix.len()));
+        let local = BytePos(command.replace("\r\n", "\n").find("assert!").unwrap());
+        let offset = site.syntax_offset(local).unwrap();
+        let position = site.view.normalized().position_of(offset).unwrap();
+        assert_eq!((position.line, position.scalar_column), (2, 2));
+        assert_eq!(
+            site.view.to_original(offset).0,
+            source.find("assert!").unwrap()
+        );
+        assert_eq!(site.view.reconstruct_original(), source.as_bytes());
+
+        let blank = SourceSite::new(SourceText::from_utf8(b"\r\n#check Nat").unwrap());
+        let position = blank
+            .view
+            .normalized()
+            .position_of(blank.syntax_offset(BytePos(1)).unwrap())
+            .unwrap();
+        assert_eq!((position.line, position.scalar_column), (1, 0));
+    }
+
     /// The pin's `resolveGlobalName` consults `getAliases` beside declarations
     /// at each namespace and in each opened namespace; `_root_.x` is exact.
     #[test]
@@ -829,6 +958,7 @@ mod tests {
             namespace: n("Outer"),
             private_module: None,
             source_module: None,
+            source_site: None,
             public_declarations: false,
             expose_definitions: false,
             noncomputable_section: false,
@@ -1022,6 +1152,7 @@ mod tests {
         let scope = |namespace: &str, opened: &[&str]| SourceScope {
             private_module: None,
             source_module: None,
+            source_site: None,
             public_declarations: false,
             expose_definitions: false,
             noncomputable_section: false,
@@ -1099,6 +1230,7 @@ mod tests {
         let scope = SourceScope {
             private_module: None,
             source_module: None,
+            source_site: None,
             public_declarations: false,
             expose_definitions: false,
             noncomputable_section: false,

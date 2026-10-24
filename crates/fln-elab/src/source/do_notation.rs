@@ -294,6 +294,9 @@ impl Context {
             let actual = self
                 .known_type(&monad)?
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            // Match an ordinary checked monad argument: constrain the Pi's
+            // domain and codomain before their aggregate universe maximum.
+            self.constrain_telescope_universes(&actual, binder_type)?;
             self.constrain_type(&actual, binder_type)?;
             let type_ = self.substitute(body, &monad)?;
             function = Typed {
@@ -307,24 +310,36 @@ impl Context {
     /// Preserve the written result parameter of a monadic expected type before
     /// conversion can erase it. A monad need not be injective in its argument;
     /// this is a checked choice of Pure's value domain, not an equality theorem.
+    pub(super) fn do_pure_result_type(
+        &mut self,
+        expected: Option<&Expr>,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        let expected = self.instantiate(expected)?;
+        Ok(match expected.node() {
+            ExprNode::App { a, .. } => Some(a.clone()),
+            _ => None,
+        })
+    }
+
     pub(super) fn do_pure_result(
         &mut self,
         function: Typed,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let Some(expected) = expected else {
-            return Ok(function);
-        };
-        let expected = self.instantiate(expected)?;
-        let ExprNode::App { a: result, .. } = expected.node() else {
+        let Some(result) = self.do_pure_result_type(expected)? else {
             return Ok(function);
         };
         let function = self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
-        let function = self.coerce_function(function)?;
+        // Pure.pure already has a checked function telescope. Coercing it here
+        // would synthesize its dictionary before the result parameter below
+        // can relate its universe to an unannotated return value's universe.
         let ExprNode::ForallE { binder_type, .. } = function.type_.node() else {
             return Err(failure(SourceInferenceError::ExpectedFunction));
         };
-        self.constrain_type(binder_type, result)?;
+        self.constrain_type(binder_type, &result)?;
         Ok(function)
     }
 
@@ -544,6 +559,20 @@ impl Context {
     ) -> Result<Syntax, NatDefinitionElabError> {
         if element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"])) {
             return self.prepend_do_try(element, result, scope, terminal);
+        }
+        if element.kind() == Some(&parser_kind(&["Term", "nativeDoAssert"])) {
+            let mut parts = node(element, "nativeDoAssert", 2)?;
+            let panic = parts.pop().expect("assert failure");
+            let condition = parts.pop().expect("assert condition");
+            // The pin's seqToTerm wraps the remaining computation in assert!,
+            // so a failed assertion cannot execute that continuation.
+            let body = result.unwrap_or_else(|| {
+                call(
+                    false,
+                    vec![ident(Name::from_components(["_root_", "PUnit", "unit"]))],
+                )
+            });
+            return Ok(diagnostics::assertion(condition, body, panic));
         }
         if control::is_jump(&element) {
             // Never erase unchecked source following an unconditional exit.

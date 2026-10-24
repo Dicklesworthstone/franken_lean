@@ -16,6 +16,7 @@ mod codegen;
 mod coercions;
 mod collections;
 pub mod deriving;
+mod diagnostics;
 mod do_notation;
 mod dotted_ident;
 pub use dotted_ident::DottedIdentError;
@@ -559,6 +560,8 @@ struct Context {
     // returned at that boundary; no body or declaration is constructed.
     declaration_header_probe: Option<bool>,
     source_scope: SourceScope,
+    /// The pin's `getDeclName?`, independent of recursion's temporary owner.
+    diagnostic_declaration: Option<Name>,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
     // admission retains its existing error boundary.
@@ -705,6 +708,7 @@ impl Context {
             private_instance_body: false,
             declaration_header_probe: None,
             source_scope: SourceScope::default(),
+            diagnostic_declaration: None,
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
             deferred_local_functions: Vec::new(),
@@ -1815,6 +1819,7 @@ impl Context {
             DoBindJoinValue(LocalContext, FVarId, Name, Typed),
             DoNestedAnnotation(&'a Syntax, Option<Expr>, bool),
             DoAction(&'a [Syntax], Option<Expr>),
+            DoPureValue(Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
@@ -2012,6 +2017,19 @@ impl Context {
                     }
                     match task {
                         Task::RestoreOptions(options) => self.txn.options = options,
+                        Task::DoPureValue(expected) => {
+                            let argument = values.pop().expect("do return value visit");
+                            let monad = match &expected {
+                                Some(type_) => self.do_monad(type_)?,
+                                None => None,
+                            };
+                            let function = self.do_operation(false, monad)?;
+                            let function = self.do_pure_result(function, expected.as_ref())?;
+                            let function = self
+                                .insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
+                            let term = self.match_apply(function, argument)?;
+                            values.push(self.finish_application(term, expected.as_ref())?);
+                        }
                         Task::CheckArgument(syntax, expected, infer_exception_action) => {
                             if let Some(checkpoint) = postponed::Checkpoint::argument(
                                 self,
@@ -2221,6 +2239,22 @@ impl Context {
                                     if args.len() != if bind { 2 } else { 1 } {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }
+                                    if !bind {
+                                        // Check the value before creating Pure's dictionary.
+                                        // Its type can determine the monad's universe, as in
+                                        // `Id.run do return (42 : Nat)`. Keep the written
+                                        // result parameter even for a noninjective monad.
+                                        let value_type =
+                                            self.do_pure_result_type(expected.as_ref())?;
+                                        tasks.push(Task::DoPureValue(expected));
+                                        tasks.push(match value_type {
+                                            Some(type_) => {
+                                                Task::CheckArgument(&args[0], type_, false)
+                                            }
+                                            None => Task::Visit(&args[0], None, true),
+                                        });
+                                        continue;
+                                    }
                                     let monad = match &expected {
                                         Some(type_) => self.do_monad(type_)?,
                                         None => None,
@@ -2232,10 +2266,8 @@ impl Context {
                                         let function = self.do_operation(bind, monad)?;
                                         let function = if nested {
                                             self.do_nested_action_function(function, &args[1])?
-                                        } else if bind {
-                                            function
                                         } else {
-                                            self.do_pure_result(function, expected.as_ref())?
+                                            function
                                         };
                                         tasks.push(Task::Apply(
                                             function,
@@ -4369,12 +4401,14 @@ impl Context {
         )?;
         let name = if let Syntax::Ident { val: name, .. } = &id[0] {
             name.clone()
-        } else if opaque {
+        } else if !recursive {
+            // The pin's letIdLhs uses hygieneInfo for every omitted name,
+            // including `let : T := ...` and `letI : C := ...`.
             let hygiene = expect_node(
                 &id[0],
                 &Name::from_components(["hygieneInfo"]),
                 1,
-                "anonymous assertion hygiene",
+                "anonymous local binding hygiene",
             )?;
             if !matches!(&hygiene[0], Syntax::Ident { val, preresolved, .. } if val.is_anonymous() && preresolved.is_empty())
             {
@@ -5251,6 +5285,7 @@ fn definition_in_context_named(
     };
     context.local_function_lifting.parent =
         (!owned_name.is_anonymous()).then(|| owned_name.clone());
+    context.diagnostic_declaration = (!owned_name.is_anonymous()).then(|| owned_name.clone());
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
@@ -5345,6 +5380,7 @@ fn definition_in_context_named(
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         owned_name = context.generated_instance_name(&parameters, expected)?;
         context.local_function_lifting.parent = Some(owned_name.clone());
+        context.diagnostic_declaration = Some(owned_name.clone());
     }
     if is_instance && !hidden_instance {
         // Naming may consult the private predecessor only for collisions. Once
@@ -5895,6 +5931,26 @@ fn query_term(
     context: &mut Context,
     evaluate: bool,
 ) -> Result<(Typed, Vec<Name>, Vec<usize>), NatDefinitionElabError> {
+    if evaluate {
+        let module = context
+            .source_scope
+            .source_module
+            .clone()
+            .unwrap_or_default();
+        context.diagnostic_declaration = Some(Name::str(
+            Name::num(Name::from_components(["_private"]).append_core(&module), 0),
+            "_eval",
+        ));
+    } else {
+        let command = if syntax.kind() == Some(&parser_kind(&["Command", "synth"])) {
+            "_synth_cmd"
+        } else if syntax.kind() == Some(&Name::from_components(["Lean", "reduceCmd"])) {
+            "_reduce"
+        } else {
+            "_check"
+        };
+        context.diagnostic_declaration = Some(Name::from_components([command]));
+    }
     let expanded = context.expand_match_alternatives(syntax)?;
     let syntax = expanded.as_ref();
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {

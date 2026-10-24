@@ -6803,12 +6803,14 @@ impl Engine {
             .and_then(fln_parse::ParsedDefinition::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
+        let mut scope = self.base_source_scope();
+        scope.source_site = Some(source_check::source_site(source)?);
         let elaborated = match source_records::elaboration_outcome(
             fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
-                &self.base_source_scope(),
+                &scope,
             ),
         )? {
             Outcome::Complete(declaration) => declaration,
@@ -7096,6 +7098,11 @@ impl Engine {
         command_index: usize,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
+        let mut scope = scope.clone();
+        if scope.source_site.is_none() {
+            scope.source_site = Some(source_check::source_site(&parsed.reconstruct_original())?);
+        }
+        let scope = &scope;
         let name = fresh_generated_command_name(self.environment(), command_index)?;
         let declaration = source_records::elaboration_outcome(match parsed.kind() {
             SourceCommandKind::Example => fln_elab::source::scope::elaborate_example(
@@ -7221,6 +7228,7 @@ impl Engine {
             None,
             None,
             presentation,
+            &[(source, None)],
         )
     }
 
@@ -7260,12 +7268,23 @@ impl Engine {
         source_module: Option<&Name>,
         mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
         presentation: EvaluationPresentation,
+        source_files: &[(&[u8], Option<&Name>)],
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
         }
 
         let command_count = commands.len();
+        let sites = source_files
+            .iter()
+            .map(|(source, module)| source_check::source_site(source).map(|site| (site, *module)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if sites.len() != file_starts.len() + 1 {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "source command locations disagree with the file boundaries",
+            });
+        }
+        let mut source_file = 0usize;
         let mut executions = Vec::new();
         executions.try_reserve_exact(command_count).map_err(|_| {
             EngineExecutionError::AllocationFailure {
@@ -7389,6 +7408,7 @@ impl Engine {
             // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
                 file_starts.next();
+                source_file += 1;
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(&engine);
                 scopes.current.private_module = private_module.cloned();
@@ -7399,6 +7419,11 @@ impl Engine {
                     private_module.is_some(),
                 )?;
                 grammar.extend_scopes(&mut scopes);
+            }
+            let (site, module) = &sites[source_file];
+            scopes.current.source_site = Some(site.at_offset(original_offset));
+            if let Some(module) = module {
+                scopes.current.source_module = Some((*module).clone());
             }
             let control = grammar
                 .enter(|| fln_parse::command_scope::parse(command_source))
@@ -8867,7 +8892,7 @@ impl Engine {
         let definition_prefix = if commands.is_empty() {
             None
         } else {
-            match self.execute_source_commands(commands, options, limits, &[])? {
+            match self.execute_source_commands(commands, options, limits, &[], &[(source, None)])? {
                 Outcome::Complete(completed) => Some(completed),
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -8876,13 +8901,22 @@ impl Engine {
         let query_engine = definition_prefix
             .as_ref()
             .map_or(self, |completed| &completed.engine);
+        let mut query_scope = query_engine.base_source_scope();
+        query_scope.source_site =
+            Some(source_check::source_site(source)?.at_offset(terminal_offset));
         let checked = grammar
             .enter(|| {
                 let terminal = terminal
                     .expanded()
                     .map_err(DefinitionFrontendError::Parse)
                     .map_err(EngineExecutionError::Frontend)?;
-                query_engine.check_parsed_source_command(terminal, options, limits.admission(), 0)
+                query_engine.check_parsed_source_command_in_scope(
+                    terminal,
+                    options,
+                    limits.admission(),
+                    0,
+                    &query_scope,
+                )
             })
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: terminal_index,
@@ -8974,7 +9008,7 @@ impl Engine {
                 if terminal.kind() != fln_parse::SourceCommandKind::Check {
                     return Err(EngineExecutionError::TerminalCheckRequired);
                 }
-                query_source = Some((terminal_offset, terminal_source));
+                query_source = Some((terminal_offset, terminal, module.source));
                 terminal_index
             } else {
                 partitioned.commands.len()
@@ -9019,7 +9053,7 @@ impl Engine {
                 source,
             });
         }
-        let (query_offset, query_source) =
+        let (query_offset, query, original_source) =
             query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
         let completed = match self.execute_source_modules_internal(
             &rewritten,
@@ -9033,9 +9067,19 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let query_index = completed.executions.len() + completed.source_admissions.len();
+        let mut query_scope = completed.engine.base_source_scope();
+        query_scope.source_module = Some(entry.clone());
+        query_scope.source_site =
+            Some(source_check::source_site(original_source)?.at_offset(query_offset));
         let checked = completed
             .engine
-            .check_source_command(query_source, options, limits.admission())
+            .check_parsed_source_command_in_scope(
+                query,
+                options,
+                limits.admission(),
+                0,
+                &query_scope,
+            )
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: query_index,
                 error: Box::new(error),
@@ -9176,6 +9220,14 @@ impl Engine {
                 None,
                 None,
                 EvaluationPresentation::Raw,
+                &[(
+                    modules
+                        .iter()
+                        .find(|module| module.name == entry)
+                        .expect("validated entry module")
+                        .source,
+                    Some(entry),
+                )],
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -9205,6 +9257,8 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let mut scope = self.base_source_scope();
+        scope.source_site = Some(source_check::source_site(&parsed.reconstruct_original())?);
         if fln_elab::source::scope::simp::registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
@@ -9247,7 +9301,7 @@ impl Engine {
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
-                &self.base_source_scope(),
+                &scope,
             ),
         )? {
             Outcome::Complete(declaration) => declaration,
@@ -9369,6 +9423,7 @@ impl Engine {
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         let mut commands = Vec::new();
+        let mut source_files = Vec::new();
         let mut file_starts = Vec::new();
         file_starts.try_reserve_exact(sources.len()).map_err(|_| {
             EngineExecutionError::AllocationFailure {
@@ -9408,9 +9463,12 @@ impl Engine {
             if !commands.is_empty() && !partitioned.commands.is_empty() {
                 file_starts.push(commands.len());
             }
+            if !partitioned.commands.is_empty() {
+                source_files.push((*source, None));
+            }
             commands.extend(partitioned.commands);
         }
-        self.execute_source_commands(commands, options, limits, &file_starts)
+        self.execute_source_commands(commands, options, limits, &file_starts, &source_files)
     }
 
     /// Execute an exact, caller-named closed source-module import graph.
@@ -9672,6 +9730,11 @@ impl Engine {
                 None,
                 None,
                 EvaluationPresentation::Raw,
+                &order
+                    .iter()
+                    .filter(|index| !parsed[**index].commands.is_empty())
+                    .map(|index| (modules[*index].source, Some(modules[*index].name)))
+                    .collect::<Vec<_>>(),
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -9787,6 +9850,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
         file_starts: &[usize],
+        source_files: &[(&[u8], Option<&Name>)],
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         Ok(
             match self.execute_source_command_stream(
@@ -9799,6 +9863,7 @@ impl Engine {
                 None,
                 None,
                 EvaluationPresentation::Raw,
+                source_files,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.
