@@ -124,6 +124,9 @@ impl PartialEq for SourceScope {
             local_simp,
             frontier_recursors,
             arithmetic,
+            // The evaluator `native_decide` reaches is per-command plumbing the lean door
+            // supplies, never a scope effect: two scopes differing only by it are equal.
+            native: _,
             options,
         } = self;
         namespace == &other.namespace

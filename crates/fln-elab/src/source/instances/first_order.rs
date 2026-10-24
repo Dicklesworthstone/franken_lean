@@ -84,7 +84,7 @@ impl Context {
             // recursive `args.back!` comparison. Each equation is checked by
             // the ordinary transactional solver under Instances transparency.
             for (left, right) in suffix.iter().zip(&other_suffix) {
-                self.unify_pending_batch(&[(left.clone(), right.clone())], false)?
+                self.unify_pending_batch(&[(left.clone(), right.clone())], false, false)?
                     .map_err(|reason| {
                         failure(SourceInferenceError::Unification(Box::new(reason)))
                     })?;
@@ -92,7 +92,7 @@ impl Context {
             for argument in other_suffix.drain(suffix.len()..).rev() {
                 other = Expr::app(other, argument);
             }
-            self.unify_pending_batch(&[(head, other)], false)?
+            self.unify_pending_batch(&[(head, other)], false, false)?
                 .map_err(|reason| failure(SourceInferenceError::Unification(Box::new(reason))))?;
             approximated = true;
         }
